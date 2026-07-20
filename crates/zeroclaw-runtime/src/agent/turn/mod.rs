@@ -86,12 +86,50 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+pub struct ToolLoopWithCurrentTurn<'a> {
+    /// The resolved per-agent execution context: model binding, gated tool
+    /// registry, approval, observability, and resolved runtime knobs. Stable
+    /// for every turn to this agent; built once and reused. See
+    /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
+    pub exec: ResolvedAgentExecution<'a>,
+    pub history: &'a mut Vec<ChatMessage>,
+    pub current_turn: &'a mut Vec<ChatMessage>,
+    pub channel_name: &'a str,
+    pub channel_reply_target: Option<&'a str>,
+    pub cancellation_token: Option<CancellationToken>,
+    pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
+    pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    pub channel: Option<&'a dyn Channel>,
+    pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
+    pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
+    pub ingress: IngressContext,
+    /// The per-turn memory half for unified memory-context injection: the
+    /// handle, raw recall query, session scopes, and spawn-site suppression.
+    /// `None` for nested sub-turn sites and paths without a memory backend;
+    /// the injection decision itself is keyed on `ingress.origin`.
+    pub memory: Option<crate::agent::memory_inject::TurnMemory<'a>>,
+    /// Observer metadata: agent alias and turn id, stamped onto every
+    /// turn-level observer event so OTel spans correlate across the loop.
+    pub agent_alias: Option<&'a str>,
+    pub turn_id: &'a str,
+}
+
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
     /// for every turn to this agent; built once and reused. See
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
+    /// Full conversation transcript for this turn.
+    ///
+    /// **Contract**: the last `user`-role message in this history MUST be the
+    /// real user message for the current turn. The compatibility wrapper uses
+    /// this as the boundary between the durable past-turn prefix and the
+    /// mutable current-turn working set. Callers that retry (e.g. on
+    /// model-switch) should use [`run_tool_call_loop_with_current_turn`]
+    /// directly so the split boundary stays stable without re-discovery.
     pub history: &'a mut Vec<ChatMessage>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
@@ -102,7 +140,6 @@ pub struct ToolLoop<'a> {
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
-    pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
     pub ingress: IngressContext,
     /// The per-turn memory half for unified memory-context injection: the
@@ -160,10 +197,13 @@ async fn enforce_reported_budget(
     }
 }
 
-pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
-    let ToolLoop {
+pub async fn run_tool_call_loop_with_current_turn(
+    p: ToolLoopWithCurrentTurn<'_>,
+) -> Result<String> {
+    let ToolLoopWithCurrentTurn {
         exec,
         history,
+        current_turn,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -173,7 +213,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         collected_receipts,
         event_tx,
         mut steering,
-        mut new_messages_out,
         mut image_cache,
         ingress,
         memory,
@@ -209,10 +248,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     } = exec;
 
     let ingress_policy_cfg = IngressPolicy::default();
-    let p1_text = history
+    let p1_text = current_turn
         .iter()
-        .rev()
         .find(|m| m.role == "user")
+        .or_else(|| history.iter().rev().find(|m| m.role == "user"))
         .map_or("", |m| m.content.as_str());
     match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
         // DEFAULT — the only arm reachable under the default policy. Proceed
@@ -235,38 +274,32 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
-    if let Some(turn_memory) = &memory {
-        let has_session = turn_memory.sessions.iter().any(Option::is_some);
-        if let crate::agent::memory_inject::InjectPolicy::Inject {
+    let precomputed_memory_context: Option<String> = if let Some(turn_memory) = &memory
+        && let crate::agent::memory_inject::InjectPolicy::Inject {
             exclude_conversation,
         } = crate::agent::memory_inject::resolve_inject_policy(
             ingress.origin,
-            has_session,
+            turn_memory.sessions.iter().any(Option::is_some),
             turn_memory.suppress,
-        ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
-            // Idempotence: a model-switch retry re-enters the engine with the
-            // same history; the preamble must not stack.
-            && !history[last_user_idx]
-                .content
-                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
-        {
-            let scopes: Vec<Option<&str>> =
-                turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
-            let context = crate::agent::memory_inject::render_memory_context(
-                turn_memory.handle,
-                observer,
-                &turn_memory.query,
-                &scopes,
-                &turn_memory.cfg,
-                exclude_conversation,
-            )
-            .await;
-            if !context.is_empty() {
-                let existing = &history[last_user_idx].content;
-                history[last_user_idx].content = format!("{context}{existing}");
-            }
+        ) {
+        let scopes: Vec<Option<&str>> = turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+        let context = crate::agent::memory_inject::render_memory_context(
+            turn_memory.handle,
+            observer,
+            &turn_memory.query,
+            &scopes,
+            &turn_memory.cfg,
+            exclude_conversation,
+        )
+        .await;
+        if context.is_empty() {
+            None
+        } else {
+            Some(context)
         }
-    }
+    } else {
+        None
+    };
 
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -322,26 +355,23 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
-                // DEFAULT — append the injection to history exactly as today.
+                // DEFAULT — append the injection to the current turn exactly as today.
                 IngressDecision::Loop => {}
                 // Phase 3: frame as untrusted data; proceed as Loop until
                 // framing exists (behavior-identical).
                 IngressDecision::Annotate { .. } => {}
                 // Phase 2: divert this injection into the SOP run rather than
-                // history. Not reachable under the default policy.
+                // the current turn. Not reachable under the default policy.
                 IngressDecision::Gate { .. } => {
                     // TODO(PR C): route this steering message into the gated
-                    // SOP run instead of appending it to history.
+                    // SOP run instead of appending it to the current turn.
                 }
                 // Not reachable under the default policy; drop the injection
                 // (do not append it) when it is.
                 IngressDecision::Drop { .. } => continue,
             }
             let msg = ChatMessage::user(steering_message);
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.push(msg.clone());
-            }
-            history.push(msg);
+            current_turn.push(msg);
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -398,9 +428,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     )
                 );
             }
+            // Reserve budget for `current_turn` before trimming `history`:
+            // the provider sees `history + current_turn`, so trimming must
+            // leave enough headroom for the active turn's tokens.
+            let current_turn_estimate =
+                crate::agent::history::estimate_history_tokens(current_turn);
+            let history_budget = context_token_budget.saturating_sub(current_turn_estimate);
             let taken = std::mem::take(history);
-            let result =
-                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            let result = crate::agent::history_trim::trim_to_recent_turns(taken, history_budget);
             if result.trimmed {
                 let mut trimmed = result.history;
                 crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
@@ -493,8 +528,33 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
+        // Prepend the once-per-invocation memory context to the current turn's
+        // seed user message before merging into the provider-visible transcript.
+        // The context is rendered once before the loop (above); here we only
+        // splice it into a fresh clone so the durable `current_turn` stays clean.
+        // Anchoring to the first user message avoids mis-injecting into steering
+        // messages appended later in the same round.
+        let mut current_turn_with_memory: Vec<ChatMessage> = current_turn.clone();
+        if let Some(ref context) = precomputed_memory_context
+            && let Some(seed_user_idx) = current_turn_with_memory
+                .iter()
+                .position(|m| m.role == "user")
+        {
+            let existing = &current_turn_with_memory[seed_user_idx].content;
+            current_turn_with_memory[seed_user_idx].content = format!("{context}{existing}");
+        }
+
+        // Build the provider-visible merged transcript. A temporary owned Vec is
+        // required because downstream consumers need a contiguous slice and
+        // `current_turn` must remain mutable for assistant/tool-result appends
+        // after the provider call returns.
+        let mut merged: Vec<ChatMessage> =
+            Vec::with_capacity(history.len() + current_turn_with_memory.len());
+        merged.extend(history.iter().cloned());
+        merged.extend(current_turn_with_memory);
+
         let (vision_model_provider_box, degrade_strip_images) =
-            resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
+            resolve_vision_provider(model_provider, &merged, multimodal_config, provider_name)?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,
@@ -518,9 +578,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         } = iteration_tool_specs;
 
         refresh_prompt_anchor(history, use_native_tools);
+        if let Some(refreshed) = history.first() {
+            merged[0] = refreshed.clone();
+        }
 
         let prepared_messages = prepare_messages_for_iteration(
-            history,
+            &merged,
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
@@ -529,7 +592,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let llm_started_at = announce_llm_request(
             &ctx,
-            history,
+            &merged,
             active_model_provider,
             active_model_provider_name,
             active_model,
@@ -652,10 +715,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         interrupted.partial_text,
                         crate::i18n::get_required_cli_string("turn-stream-interrupted")
                     ));
-                    if let Some(out) = new_messages_out.as_deref_mut() {
-                        out.push(msg.clone());
-                    }
-                    history.push(msg);
+                    current_turn.push(msg);
                 }
                 // Same for a user cancel after visible streamed output —
                 // the pre-consolidation streaming engine committed the
@@ -668,10 +728,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         cancelled.partial_text,
                         crate::i18n::get_required_cli_string("turn-interrupted-by-user")
                     ));
-                    if let Some(out) = new_messages_out.as_deref_mut() {
-                        out.push(msg.clone());
-                    }
-                    history.push(msg);
+                    current_turn.push(msg);
                 }
                 return Err(e);
             }
@@ -728,10 +785,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                      tool-call schema, or answer in natural language if no tool is needed."
                         .to_string(),
                 );
-                if let Some(out) = new_messages_out.as_deref_mut() {
-                    out.push(msg.clone());
-                }
-                history.push(msg);
+                current_turn.push(msg);
                 continue;
             }
 
@@ -742,10 +796,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
             let msg = ChatMessage::assistant(fallback.to_string());
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.push(msg.clone());
-            }
-            history.push(msg);
+            current_turn.push(msg);
             return Ok(accumulated_display_text);
         }
 
@@ -796,14 +847,15 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
 
             let msg = ChatMessage::assistant(response_text.clone());
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.push(msg.clone());
-            }
-            history.push(msg);
+            current_turn.push(msg);
             if let Some(reported) = reported_input_tokens {
+                // `reported` covers history + current_turn, but the trimmer
+                // only sees history. Subtract current_turn's estimated token
+                // contribution so the scaled budget is not underestimated.
+                let ct_est = crate::agent::history::estimate_history_tokens(current_turn);
                 enforce_reported_budget(
                     history,
-                    reported as usize,
+                    (reported as usize).saturating_sub(ct_est),
                     context_token_budget,
                     event_tx.as_ref(),
                     observer,
@@ -1006,18 +1058,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             )?;
         }
 
-        let appended_from = history.len();
         append_tool_round_to_history(
-            history,
+            current_turn,
             assistant_history_content,
             &native_tool_calls,
             &individual_results,
             &tool_results,
             use_native_tools,
         );
-        if let Some(out) = new_messages_out.as_deref_mut() {
-            out.extend_from_slice(&history[appended_from..]);
-        }
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
@@ -1028,6 +1076,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             drive_live_sop_actions(
                 queued_sop_actions,
                 history,
+                current_turn,
                 model_provider,
                 provider_name,
                 model,
@@ -1058,7 +1107,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 channel,
                 collected_receipts,
                 event_tx.clone(),
-                new_messages_out.as_deref_mut(),
                 image_cache.as_deref_mut(),
                 agent_alias,
             )
@@ -1066,9 +1114,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
 
         if let Some(reported) = reported_input_tokens {
+            // `reported` covers history + current_turn, but the trimmer
+            // only sees history. Subtract current_turn's estimated token
+            // contribution so the scaled budget is not underestimated.
+            let ct_est = crate::agent::history::estimate_history_tokens(current_turn);
             enforce_reported_budget(
                 history,
-                reported as usize,
+                (reported as usize).saturating_sub(ct_est),
                 context_token_budget,
                 event_tx.as_ref(),
                 observer,
@@ -1080,6 +1132,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     finish_after_max_iterations(
         model_provider,
         history,
+        current_turn,
         provider_name,
         model,
         temperature,
@@ -1089,9 +1142,72 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         accumulated_display_text,
         turn_id,
         knobs,
-        new_messages_out,
     )
     .await
+}
+
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    let ToolLoop {
+        exec,
+        history,
+        channel_name,
+        channel_reply_target,
+        cancellation_token,
+        on_delta,
+        shared_budget,
+        channel,
+        collected_receipts,
+        event_tx,
+        steering,
+        image_cache,
+        memory,
+        ingress,
+        agent_alias,
+        turn_id,
+    } = p;
+
+    // Contract: callers guarantee the last user-role message in `history` is
+    // the real user message for the current turn. This boundary splits the
+    // durable past-turn prefix from the mutable current-turn working set.
+    //
+    // Callers that retry on errors (e.g. model-switch) should use the
+    // split-aware entry point (`run_tool_call_loop_with_current_turn`)
+    // directly so the split boundary is stable across retries without
+    // content inspection.
+    let split = history
+        .iter()
+        .rposition(|m| m.role == "user")
+        .unwrap_or(history.len());
+    let mut current_turn = history.split_off(split);
+
+    // Box the inner future so the compatibility wrapper's own async state
+    // machine stays small; the core loop's state machine can be large because
+    // of all the scope-wrapped call sites in channels/orchestrator.
+    let result = Box::pin(run_tool_call_loop_with_current_turn(
+        ToolLoopWithCurrentTurn {
+            exec,
+            history,
+            current_turn: &mut current_turn,
+            channel_name,
+            channel_reply_target,
+            cancellation_token,
+            on_delta,
+            shared_budget,
+            channel,
+            collected_receipts,
+            event_tx,
+            steering,
+            image_cache,
+            memory,
+            ingress,
+            agent_alias,
+            turn_id,
+        },
+    ))
+    .await;
+
+    history.extend(current_turn);
+    result
 }
 
 fn collect_callable_tool_names(
@@ -1183,6 +1299,7 @@ fn sop_step_excluded_tools(
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
     history: &mut Vec<ChatMessage>,
+    current_turn: &mut Vec<ChatMessage>,
     model_provider: &dyn ModelProvider,
     provider_name: &str,
     model: &str,
@@ -1213,7 +1330,6 @@ async fn drive_live_sop_actions(
     channel: Option<&dyn Channel>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
-    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     agent_alias: Option<&str>,
 ) -> Result<()> {
@@ -1229,10 +1345,11 @@ async fn drive_live_sop_actions(
                 } => {
                     let started_at = crate::sop::engine::now_iso8601();
                     let user_message = ChatMessage::user(context.clone());
-                    history.push(user_message.clone());
-                    if let Some(out) = new_messages_out.as_deref_mut() {
-                        out.push(user_message);
-                    }
+                    // SOP steps are part of the outer current turn under the
+                    // split-history contract. They are visible to the provider
+                    // alongside the turn that triggered them and are replayed
+                    // into persistent history with the rest of this turn.
+                    current_turn.push(user_message.clone());
 
                     let sop_excluded_tools = sop_step_excluded_tools(
                         &queued,
@@ -1247,54 +1364,56 @@ async fn drive_live_sop_actions(
                     let step_call_sink = crate::sop::executor::new_step_call_sink();
                     let step_output = crate::sop::executor::scope_step_call_sink(
                         step_call_sink.clone(),
-                        Box::pin(run_tool_call_loop(ToolLoop {
-                            exec: ResolvedAgentExecution::resolve(
-                                ResolvedModelAccess {
-                                    model_provider,
-                                    provider_name,
-                                    model,
-                                    temperature,
-                                },
-                                ResolvedIo {
-                                    tools_registry,
-                                    observer,
-                                    silent,
-                                    approval,
-                                    multimodal_config,
-                                    hooks,
-                                    activated_tools,
-                                    model_switch_callback: model_switch_callback.clone(),
-                                    receipt_generator,
-                                },
-                                ResolvedRuntimeKnobs {
-                                    max_tool_iterations,
-                                    excluded_tools: &sop_excluded_tools,
-                                    dedup_exempt_tools,
-                                    pacing,
-                                    strict_tool_parsing,
-                                    parallel_tools,
-                                    max_tool_result_chars,
-                                    context_token_budget,
-                                    knobs,
-                                },
-                            ),
-                            history,
-                            channel_name,
-                            channel_reply_target,
-                            cancellation_token: cancellation_token.clone(),
-                            on_delta: on_delta.clone(),
-                            shared_budget: shared_budget.clone(),
-                            channel,
-                            collected_receipts,
-                            event_tx: event_tx.clone(),
-                            steering: None,
-                            new_messages_out: new_messages_out.as_deref_mut(),
-                            image_cache: image_cache.as_deref_mut(),
-                            memory: None,
-                            ingress: IngressContext::sub_turn(),
-                            agent_alias,
-                            turn_id: &nested_turn_id,
-                        })),
+                        Box::pin(run_tool_call_loop_with_current_turn(
+                            ToolLoopWithCurrentTurn {
+                                exec: ResolvedAgentExecution::resolve(
+                                    ResolvedModelAccess {
+                                        model_provider,
+                                        provider_name,
+                                        model,
+                                        temperature,
+                                    },
+                                    ResolvedIo {
+                                        tools_registry,
+                                        observer,
+                                        silent,
+                                        approval,
+                                        multimodal_config,
+                                        hooks,
+                                        activated_tools,
+                                        model_switch_callback: model_switch_callback.clone(),
+                                        receipt_generator,
+                                    },
+                                    ResolvedRuntimeKnobs {
+                                        max_tool_iterations,
+                                        excluded_tools: &sop_excluded_tools,
+                                        dedup_exempt_tools,
+                                        pacing,
+                                        strict_tool_parsing,
+                                        parallel_tools,
+                                        max_tool_result_chars,
+                                        context_token_budget,
+                                        knobs,
+                                    },
+                                ),
+                                history,
+                                current_turn,
+                                channel_name,
+                                channel_reply_target,
+                                cancellation_token: cancellation_token.clone(),
+                                on_delta: on_delta.clone(),
+                                shared_budget: shared_budget.clone(),
+                                channel,
+                                collected_receipts,
+                                event_tx: event_tx.clone(),
+                                steering: None,
+                                image_cache: image_cache.as_deref_mut(),
+                                memory: None,
+                                ingress: IngressContext::sub_turn(),
+                                agent_alias,
+                                turn_id: &nested_turn_id,
+                            },
+                        )),
                     )
                     .await;
 

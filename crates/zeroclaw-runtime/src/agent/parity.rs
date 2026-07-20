@@ -164,7 +164,6 @@ async fn parity_l1_engine_honors_excluded_tools() {
         collected_receipts: None,
         event_tx: None,
         steering: None,
-        new_messages_out: None,
         image_cache: None,
         ingress: IngressContext::sub_turn(),
         memory: None,

@@ -120,7 +120,7 @@ pub async fn maybe_run_skill_review(
                 collected_receipts: Some(&receipts),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Per-transport
                 // stamping lands in a later phase.

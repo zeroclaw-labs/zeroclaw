@@ -2661,7 +2661,7 @@ impl DelegateTool {
                 collected_receipts,
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Per-transport
                 // stamping lands in a later phase.

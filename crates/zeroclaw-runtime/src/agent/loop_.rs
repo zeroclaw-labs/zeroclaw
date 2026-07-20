@@ -845,7 +845,6 @@ pub async fn agent_turn(
         collected_receipts: None,
         event_tx: None,
         steering: None,
-        new_messages_out: None,
         image_cache: None,
         // Origin and the per-turn memory half are threaded from the entry
         // point; source/transport/trust stay phase-1 placeholders until
@@ -899,6 +898,7 @@ pub use super::turn::{
     ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
 };
+pub use super::turn::{ToolLoopWithCurrentTurn, run_tool_call_loop_with_current_turn};
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
@@ -1798,7 +1798,7 @@ pub async fn run(
                                 collected_receipts: None,
                                 event_tx: None,
                                 steering: None,
-                                new_messages_out: None,
+
                                 image_cache: None,
                                 // Origin is threaded from the entry point;
                                 // source/transport/trust stay phase-1
@@ -2341,7 +2341,7 @@ pub async fn run(
                                     collected_receipts: None,
                                     event_tx: None,
                                     steering: None,
-                                    new_messages_out: None,
+
                                     image_cache: None,
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
@@ -4908,7 +4908,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -4982,7 +4982,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5063,7 +5063,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5149,7 +5149,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5220,7 +5220,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5294,7 +5294,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5369,7 +5369,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5431,7 +5431,7 @@ mod tests {
                 collected_receipts: None,
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+
                 image_cache: None,
                 memory: None,
                 ingress: ctx,
@@ -5570,8 +5570,12 @@ mod tests {
         async fn run_case(
             mem: &dyn zeroclaw_memory::Memory,
             origin: zeroclaw_api::ingress::TurnOrigin,
-        ) -> (String, Vec<(Option<String>, bool)>) {
-            let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+        ) -> (String, String, Vec<(Option<String>, bool)>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let model_provider = RecordingModelProvider {
+                requests: Arc::clone(&requests),
+                capabilities: ProviderCapabilities::default(),
+            };
             let mut history = vec![ChatMessage::user("what server?".to_string())];
             let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
             let observer = RecallCountingObserver::default();
@@ -5614,7 +5618,6 @@ mod tests {
                 collected_receipts: None,
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
                 image_cache: None,
                 memory: Some(crate::agent::memory_inject::TurnMemory {
                     handle: mem,
@@ -5630,9 +5633,16 @@ mod tests {
             .await
             .expect("turn should complete");
 
-            let user_msg = history
+            let durable_user_msg = history
                 .iter()
                 .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let provider_user_msg = requests
+                .lock()
+                .expect("requests lock should be valid")
+                .last()
+                .and_then(|req| req.iter().find(|m| m.role == "user"))
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
             let recalls = observer
@@ -5641,37 +5651,46 @@ mod tests {
                 .iter()
                 .map(|r| (r.query_summary.clone(), r.success))
                 .collect();
-            (user_msg, recalls)
+            (durable_user_msg, provider_user_msg, recalls)
         }
 
-        // User-facing origin: preamble injected, one successful recall event.
-        let (msg, recalls) = run_case(
+        // User-facing origin: provider sees the preamble, durable history stays
+        // clean, and exactly one successful recall event is emitted.
+        let (durable, provider, recalls) = run_case(
             &StaticRecallMemory,
             zeroclaw_api::ingress::TurnOrigin::Interactive,
         )
         .await;
-        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN));
-        assert!(msg.contains("- remembered: the server is prod-3"));
-        assert!(msg.ends_with("what server?"));
+        assert!(
+            !durable.contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+            "durable history must stay clean, got: {durable}"
+        );
+        assert_eq!(durable, "what server?");
+        assert!(provider.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN));
+        assert!(provider.contains("- remembered: the server is prod-3"));
+        assert!(provider.ends_with("what server?"));
         assert_eq!(recalls.len(), 1);
         assert!(recalls[0].1, "recall event must report success");
 
         // SubTurn origin: no injection, no recall, no event.
-        let (msg, recalls) = run_case(
+        let (durable, provider, recalls) = run_case(
             &StaticRecallMemory,
             zeroclaw_api::ingress::TurnOrigin::SubTurn,
         )
         .await;
-        assert_eq!(msg, "what server?");
+        assert_eq!(durable, "what server?");
+        assert_eq!(provider, "what server?");
         assert!(recalls.is_empty(), "sub-turns must not recall memory");
 
-        // Failing backend: turn proceeds bare, one failure event.
-        let (msg, recalls) = run_case(
+        // Failing backend: turn proceeds bare, durable history stays clean, one
+        // failure event.
+        let (durable, provider, recalls) = run_case(
             &FailingRecallMemory,
             zeroclaw_api::ingress::TurnOrigin::Interactive,
         )
         .await;
-        assert_eq!(msg, "what server?");
+        assert_eq!(durable, "what server?");
+        assert_eq!(provider, "what server?");
         assert_eq!(recalls.len(), 1);
         assert!(!recalls[0].1, "recall event must report failure");
     }
@@ -5736,7 +5755,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5810,7 +5829,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -5883,7 +5902,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6042,7 +6061,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6178,7 +6197,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -6334,7 +6353,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -6449,7 +6468,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6619,7 +6638,7 @@ mod tests {
             collected_receipts: None,
             event_tx: Some(event_tx),
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6725,7 +6744,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6815,7 +6834,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6897,7 +6916,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -6987,7 +7006,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7080,7 +7099,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7178,7 +7197,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7273,7 +7292,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -7368,7 +7387,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -7468,7 +7487,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -7558,7 +7577,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7652,7 +7671,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7748,7 +7767,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7830,7 +7849,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7916,7 +7935,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -7997,7 +8016,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8076,7 +8095,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8158,7 +8177,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8237,7 +8256,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8315,7 +8334,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8385,7 +8404,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8456,7 +8475,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8527,7 +8546,7 @@ mod tests {
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8600,7 +8619,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8678,7 +8697,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8768,7 +8787,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8841,7 +8860,7 @@ Done."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8917,7 +8936,7 @@ Done."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -8991,7 +9010,7 @@ Done."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9066,7 +9085,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9198,7 +9217,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9281,7 +9300,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9368,7 +9387,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9478,7 +9497,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9593,7 +9612,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9682,7 +9701,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -9782,7 +9801,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
@@ -10662,7 +10681,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -10764,7 +10783,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -10865,7 +10884,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -10966,7 +10985,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -11122,7 +11141,7 @@ This is an example, not an invocation."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -13438,7 +13457,7 @@ Let me check the result."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -13613,7 +13632,7 @@ Let me check the result."#;
                     collected_receipts: None,
                     event_tx: None,
                     steering: None,
-                    new_messages_out: None,
+
                     image_cache: None,
                     // Phase 1: stamp Internal/Trusted. Per-transport
                     // stamping lands in a later phase.
@@ -13687,7 +13706,7 @@ Let me check the result."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -13800,7 +13819,7 @@ Let me check the result."#;
                     collected_receipts: None,
                     event_tx: None,
                     steering: None,
-                    new_messages_out: None,
+
                     image_cache: None,
                     // Phase 1: stamp Internal/Trusted. Per-transport
                     // stamping lands in a later phase.
@@ -13879,7 +13898,7 @@ Let me check the result."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             // Phase 1: stamp Internal/Trusted until per-transport
             // stamping lands.
@@ -13965,7 +13984,7 @@ Let me check the result."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),
@@ -15106,7 +15125,7 @@ Let me check the result."#;
             collected_receipts: None,
             event_tx: None,
             steering: None,
-            new_messages_out: None,
+
             image_cache: None,
             memory: None,
             ingress: IngressContext::sub_turn(),

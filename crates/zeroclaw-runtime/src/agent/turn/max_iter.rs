@@ -13,7 +13,8 @@ use zeroclaw_providers::{ChatMessage, ModelProvider};
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
     model_provider: &dyn ModelProvider,
-    history: &mut Vec<ChatMessage>,
+    history: &[ChatMessage],
+    current_turn: &mut Vec<ChatMessage>,
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
@@ -23,7 +24,6 @@ pub(crate) async fn finish_after_max_iterations(
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
-    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
         WARN,
@@ -54,9 +54,9 @@ pub(crate) async fn finish_after_max_iterations(
         "Max iterations reached, requesting final summary"
     );
     let tool_calls_stripped =
-        crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
+        crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(current_turn);
     let tool_messages_removed =
-        crate::agent::history_pruner::remove_orphaned_tool_messages(history).removed;
+        crate::agent::history_pruner::remove_orphaned_tool_messages(current_turn).removed;
     if tool_calls_stripped > 0 || tool_messages_removed > 0 {
         ::zeroclaw_log::record!(
             WARN,
@@ -76,8 +76,7 @@ pub(crate) async fn finish_after_max_iterations(
          Summarize what you accomplished and what remains to be done."
             .to_string(),
     );
-    let summary_prompt_mirror = summary_prompt.clone();
-    history.push(summary_prompt);
+    current_turn.push(summary_prompt);
 
     enum SummaryCall {
         Cancelled,
@@ -85,8 +84,12 @@ pub(crate) async fn finish_after_max_iterations(
         Done(Result<zeroclaw_providers::ChatResponse>),
     }
     let summary_call = {
+        let mut summary_messages: Vec<ChatMessage> =
+            Vec::with_capacity(history.len() + current_turn.len());
+        summary_messages.extend(history.iter().cloned());
+        summary_messages.extend(current_turn.iter().cloned());
         let summary_request = zeroclaw_providers::ChatRequest {
-            messages: history,
+            messages: &summary_messages,
             tools: None, // No tools — force a text response
             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Clone::clone)
@@ -138,11 +141,11 @@ pub(crate) async fn finish_after_max_iterations(
 
     let resp = match summary_call {
         SummaryCall::Cancelled => {
-            history.pop();
+            current_turn.pop();
             return Err(ToolLoopCancelled.into());
         }
         SummaryCall::TimedOut(step_secs) => {
-            history.pop();
+            current_turn.pop();
             anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
         }
         SummaryCall::Done(Err(e)) => {
@@ -160,7 +163,7 @@ pub(crate) async fn finish_after_max_iterations(
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
-            history.pop();
+            current_turn.pop();
             anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
         }
         SummaryCall::Done(Ok(resp)) => resp,
@@ -168,15 +171,11 @@ pub(crate) async fn finish_after_max_iterations(
 
     let text = resp.text.unwrap_or_default();
     if text.is_empty() {
-        history.pop();
+        current_turn.pop();
         anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
     }
     let summary_msg = ChatMessage::assistant(text.clone());
-    if let Some(out) = &mut new_messages_out {
-        out.push(summary_prompt_mirror);
-        out.push(summary_msg.clone());
-    }
-    history.push(summary_msg);
+    current_turn.push(summary_msg);
     accumulated_display_text.push_str(&text);
     // Graceful shutdown with a visible reason so the user knows why the
     // agent stopped making progress.
@@ -250,12 +249,14 @@ mod graceful_summary_metering_tests {
     }
 
     async fn run_summary(provider: &CountingUsageProvider) -> anyhow::Result<String> {
-        let mut history = vec![ChatMessage::user("do the work")];
+        let history: Vec<ChatMessage> = Vec::new();
+        let mut current_turn = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
         finish_after_max_iterations(
             provider,
-            &mut history,
+            &history,
+            &mut current_turn,
             "custom",
             "test-model",
             None,
@@ -265,7 +266,6 @@ mod graceful_summary_metering_tests {
             String::new(),
             "trace-req-test",
             &knobs,
-            None,
         )
         .await
     }

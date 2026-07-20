@@ -462,7 +462,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         collected_receipts: None,
         event_tx: None,
         steering: None,
-        new_messages_out: None,
+
         image_cache: None,
         // Phase 1: stamp Internal/Trusted. Per-transport
         // stamping lands in a later phase.
@@ -844,7 +844,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 collected_receipts: None,
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Per-transport
                 // stamping lands in a later phase.
@@ -1097,7 +1097,7 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
         ..zeroclaw_config::schema::ResolvedRuntime::default()
     };
 
-    // Agent::turn (new_messages_out path)
+    // Agent::turn (current_turn replay path)
     let calls = Arc::new(AtomicUsize::new(0));
     let mut agent = build_agent_with_runtime(
         Box::new(ScriptedProvider::new(vec![

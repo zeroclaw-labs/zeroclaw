@@ -119,11 +119,11 @@ use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_f
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    ToolLoopWithCurrentTurn, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
     get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
-    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    register_eager_mcp_tool_if_allowed, run_tool_call_loop_with_current_turn, scope_session_key,
+    scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -5328,6 +5328,15 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
+    // Split history at the last user message to separate the durable
+    // past-turn prefix from the mutable current-turn working set. This
+    // boundary stays stable across model-switch retries without needing
+    // to re-discover it by content inspection.
+    let split = history
+        .iter()
+        .rposition(|m| m.role == "user")
+        .unwrap_or(history.len());
+    let mut current_turn = history.split_off(split);
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -5341,7 +5350,7 @@ async fn process_channel_message_body(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 };
-            let tool_loop = run_tool_call_loop(ToolLoop {
+            let tool_loop = run_tool_call_loop_with_current_turn(ToolLoopWithCurrentTurn {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -5373,6 +5382,7 @@ async fn process_channel_message_body(
                     },
                 ),
                 history: &mut history,
+                current_turn: &mut current_turn,
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),
@@ -5388,7 +5398,7 @@ async fn process_channel_message_body(
                     .map(|_| tool_receipts_collector.as_ref()),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+
                 image_cache: None,
                 // Channel-orchestrator dispatch; source/transport/trust stay
                 // placeholders, not yet stamped at the edge.
@@ -5526,6 +5536,9 @@ async fn process_channel_message_body(
         (llm_result, fb)
     })
     .await;
+
+    // Merge the completed current turn back into the durable history.
+    history.extend(current_turn);
 
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
