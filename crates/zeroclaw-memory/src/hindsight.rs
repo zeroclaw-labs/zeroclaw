@@ -16,38 +16,37 @@
 //! its own server-namespaced bank, the bank itself is the private-per-agent
 //! scope - no local agent_id column is needed.
 //!
-//! Configuration comes from the typed `[memory.hindsight]` section via
-//! [`HindsightMemory::from_config`]; the bearer token is resolved from the
-//! environment (or an inline non-committed `token`) so no secret lands in a
-//! committed config file. [`HindsightMemory::from_env`] is retained for entry
-//! points with no typed config in scope (CLI migration probes) and reads:
+//! Configuration comes from the typed `[memory.hindsight]` section via the
+//! single canonical constructor [`HindsightMemory::from_config`]; the bearer
+//! token is resolved from the environment (or an inline non-committed `token`)
+//! so no secret lands in a committed config file. Every selection and
+//! construction path (per-agent enum, install-wide `memory.backend =
+//! "hindsight"` string, CLI/migration, and status) routes through this one
+//! typed constructor, which re-validates the config
+//! ([`HindsightMemoryConfig::validate_self`]) before building, so no path can
+//! reach the refused default endpoint, a plaintext remote, or an invalid bank
+//! template. There is no env-only constructor: the typed config is the single
+//! source of truth for endpoint, token env, timeout, and bank derivation.
 //!
-//! | Env var             | Meaning                                   | Default |
-//! |---------------------|-------------------------------------------|---------|
-//! | `ZC_HINDSIGHT_TOKEN`| Bearer token (raw, no "Bearer " prefix)   | (required) |
-//! | `ZC_HINDSIGHT_BASE` | API base URL                              | `https://tokengate.appz.cloud/api/embedding/hindsight` |
-//! | `ZC_HINDSIGHT_BANK` | Explicit bank id (overrides per-agent)    | `zeroclaw-<alias>` |
-//! | `ZC_HINDSIGHT_TOP_K`| Default recall limit when caller passes 0 | `5` |
-//! | `ZC_HINDSIGHT_TIMEOUT_SECS`| Per-request HTTP timeout (bounds every call) | `30` |
-//! | `ZC_HINDSIGHT_SHARED_BANK`| Extra read-only bank merged into recall/list (never written) | (none) |
+//! Deletion (`forget` / `forget_for_agent`): mapped to the hindsight invalidate
+//! endpoint (`PATCH .../memories/{id}` with `state=invalidated`), a soft-delete
+//! so a first-class backend never silently declines a removal. The `key` the
+//! trait passes is the memory id the read paths surface (`id` and `key` are both
+//! set to the server id in `to_entry`). Deletion targets the private bank only -
+//! the same bank writes land in.
 //!
-//! Shared read bank: `ZC_HINDSIGHT_SHARED_BANK` names a second bank every
-//! agent can READ from (recall + list) but never WRITE to. Writes always land
-//! in the per-agent private `bank`, so personal memory stays isolated while a
-//! common household/shared bank is visible to all agents. This is the native
-//! mechanism for "private per agent + one shared bank both can read".
+//! Scope: this foundation slice is PRIVATE-ONLY. Each agent reads and writes
+//! exactly its own server-namespaced bank; there is no shared/system read tier
+//! here. Cross-agent shared/system tiers (and their authorization) live in the
+//! memory-tiers slice on top of this one.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use zeroclaw_config::schema::{
-    DEFAULT_HINDSIGHT_BASE_URL, DEFAULT_HINDSIGHT_TIMEOUT_SECS, DEFAULT_HINDSIGHT_TOKEN_ENV,
-    DEFAULT_HINDSIGHT_TOP_K, HindsightMemoryConfig,
+    DEFAULT_HINDSIGHT_TIMEOUT_SECS, DEFAULT_HINDSIGHT_TOP_K, HindsightMemoryConfig,
 };
-
-/// Env var naming the extra shared read-only bank (merged into recall/list).
-const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
 
 /// Percent-encode a single URL path segment (bank id or server-provided memory
 /// id). Encodes everything that is not an unreserved URL character so a bank
@@ -105,9 +104,6 @@ pub struct HindsightMemory {
     alias: String,
     base_url: String,
     bank: String,
-    /// Optional extra bank merged into recall/list as READ-ONLY. Writes never
-    /// touch it, so it acts as a shared bank all agents can read.
-    shared_bank: Option<String>,
     token: String,
     default_top_k: usize,
     client: reqwest::Client,
@@ -119,7 +115,6 @@ impl std::fmt::Debug for HindsightMemory {
             .field("alias", &self.alias)
             .field("base_url", &self.base_url)
             .field("bank", &self.bank)
-            .field("shared_bank", &self.shared_bank)
             .field("default_top_k", &self.default_top_k)
             .finish_non_exhaustive()
     }
@@ -129,19 +124,30 @@ impl HindsightMemory {
     /// Build a hindsight backend for `agent_alias` from the typed
     /// `[memory.hindsight]` config plus a per-agent `bank_id` override.
     ///
+    /// This is the SINGLE canonical constructor: per-agent selection, the
+    /// install-wide `memory.backend = "hindsight"` string path, CLI/migration,
+    /// and status all reach the backend through here. It re-runs
+    /// [`HindsightMemoryConfig::validate_self`] so an invalid endpoint (the
+    /// refused third-party default, a plaintext remote) or bank template cannot
+    /// be reached even when a caller skipped the per-agent config-load check.
+    ///
     /// The bearer token is resolved from the environment variable named by
     /// `cfg.token_env` first (the recommended path, keeping secrets out of the
     /// committed config), then from an inline `cfg.token` as an escape hatch
-    /// for non-committed local configs. The optional shared read-only bank
-    /// still comes from `ZC_HINDSIGHT_SHARED_BANK` so it can be toggled without
-    /// editing config.
-    ///
-    /// This is the primary constructor used by `create_memory_for_agent`.
+    /// for non-committed local configs.
     pub fn from_config(
         cfg: &HindsightMemoryConfig,
         agent_alias: &str,
         bank_override: &str,
     ) -> Result<Self> {
+        // Re-validate the typed config on EVERY construction path. The per-agent
+        // enum triggers `Config::validate` -> `validate_self`, but the
+        // install-wide string path and CLI/status construction do not, so the
+        // trust boundary (refused default endpoint, plaintext remote, invalid
+        // bank template) is enforced here rather than trusting the caller.
+        if let Err(msg) = cfg.validate_self() {
+            anyhow::bail!("memory backend 'hindsight' configuration is invalid: {msg}");
+        }
         let token = std::env::var(&cfg.token_env)
             .ok()
             .map(|s| s.trim().to_string())
@@ -161,10 +167,6 @@ impl HindsightMemory {
             })?;
         let base_url = cfg.base_url.trim().trim_end_matches('/').to_string();
         let bank = cfg.bank_for(agent_alias, bank_override);
-        let shared_bank = std::env::var(SHARED_BANK_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && *s != bank);
         let default_top_k = if cfg.top_k == 0 {
             DEFAULT_HINDSIGHT_TOP_K
         } else {
@@ -175,68 +177,9 @@ impl HindsightMemory {
             alias: agent_alias.to_string(),
             base_url,
             bank,
-            shared_bank,
             token,
             default_top_k,
             client: build_client(cfg.timeout_secs),
-        })
-    }
-
-    /// Build a hindsight backend for `agent_alias`, reading endpoint/token/bank
-    /// from the environment. The bank defaults to `zeroclaw-<alias>` unless
-    /// `ZC_HINDSIGHT_BANK` pins an explicit one. Retained for entry points with
-    /// no typed config in scope (e.g. CLI migration probes); the daemon path
-    /// uses [`HindsightMemory::from_config`].
-    pub fn from_env(agent_alias: &str) -> Result<Self> {
-        // The token env var name is the same canonical fact the typed config
-        // defaults `token_env` to, so consume it from the single source rather
-        // than re-hardcoding the literal here.
-        let token = std::env::var(DEFAULT_HINDSIGHT_TOKEN_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .with_context(|| {
-                format!(
-                    "memory backend 'hindsight' requires {DEFAULT_HINDSIGHT_TOKEN_ENV} \
-                     (the tokengate bearer token)"
-                )
-            })?;
-        let base_url = std::env::var("ZC_HINDSIGHT_BASE")
-            .ok()
-            .map(|s| s.trim().trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_HINDSIGHT_BASE_URL.to_string());
-        let bank = std::env::var("ZC_HINDSIGHT_BANK")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("zeroclaw-{agent_alias}"));
-        // Optional shared read-only bank; ignored if it equals the private bank.
-        let shared_bank = std::env::var("ZC_HINDSIGHT_SHARED_BANK")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && *s != bank);
-        let default_top_k = std::env::var("ZC_HINDSIGHT_TOP_K")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|k| *k > 0)
-            .unwrap_or(DEFAULT_HINDSIGHT_TOP_K);
-        // Per-request timeout: an explicit positive env override wins, else the
-        // canonical default. Bounds every outbound call on the env/CLI path too.
-        let timeout_secs = std::env::var("ZC_HINDSIGHT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|t| *t > 0)
-            .unwrap_or(DEFAULT_HINDSIGHT_TIMEOUT_SECS);
-
-        Ok(Self {
-            alias: agent_alias.to_string(),
-            base_url,
-            bank,
-            shared_bank,
-            token,
-            default_top_k,
-            client: build_client(timeout_secs),
         })
     }
 
@@ -247,14 +190,67 @@ impl HindsightMemory {
         &self.bank
     }
 
-    /// The optional shared read-only bank merged into recall/list.
-    #[must_use]
-    pub fn shared_bank(&self) -> Option<&str> {
-        self.shared_bank.as_deref()
+    /// URL of the private bank's memories collection (retain/write path). The
+    /// bank is percent-encoded as a path segment so a configurable override
+    /// containing reserved URL bytes (`/`, `?`, `#`, space) cannot write to a
+    /// different path than recall/list read from (which already encode).
+    fn memories_url(&self) -> String {
+        self.memories_url_for(&self.bank)
     }
 
-    fn memories_url(&self) -> String {
-        format!("{}/v1/default/banks/{}/memories", self.base_url, self.bank)
+    /// URL of a named bank's memories collection, with the bank percent-encoded
+    /// as a single path segment. The write path uses this so it encodes the
+    /// bank identically to the recall/list read paths.
+    fn memories_url_for(&self, bank: &str) -> String {
+        format!(
+            "{}/v1/default/banks/{}/memories",
+            self.base_url,
+            encode_segment(bank)
+        )
+    }
+
+    /// URL of a single memory item, used by the invalidate (soft-delete) PATCH.
+    /// Both the bank name and the server-provided memory id are percent-encoded
+    /// as path segments so a value containing reserved URL bytes cannot break
+    /// out of its segment.
+    fn memory_item_url_for(&self, bank: &str, id: &str) -> String {
+        format!(
+            "{}/v1/default/banks/{}/memories/{}",
+            self.base_url,
+            encode_segment(bank),
+            encode_segment(id)
+        )
+    }
+
+    /// Soft-delete (invalidate) a memory item in `bank` by id via
+    /// `PATCH .../memories/{id}` with `{"state":"invalidated"}`. Returns
+    /// `Ok(true)` when the server accepted the invalidation, `Ok(false)` for a
+    /// `404` (already gone / unknown id) so retention/hygiene degrade
+    /// gracefully. Other non-success statuses surface as an error; an empty id
+    /// is a no-op.
+    async fn invalidate_in_bank(&self, bank: &str, id: &str) -> Result<bool> {
+        if id.trim().is_empty() {
+            return Ok(false);
+        }
+        let resp = self
+            .client
+            .patch(self.memory_item_url_for(bank, id))
+            .bearer_auth(&self.token)
+            .json(&InvalidateBody {
+                state: "invalidated",
+            })
+            .send()
+            .await
+            .context("hindsight invalidate request failed")?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let body = bounded_error_body(resp).await;
+        anyhow::bail!("hindsight invalidate returned HTTP {status}: {body}");
     }
 
     fn recall_url_for(&self, bank: &str) -> String {
@@ -350,6 +346,12 @@ struct RetainBody<'a> {
 struct RecallBody<'a> {
     query: &'a str,
     limit: usize,
+}
+
+/// Body of the invalidate (soft-delete) PATCH: sets the item's lifecycle state.
+#[derive(serde::Serialize)]
+struct InvalidateBody<'a> {
+    state: &'a str,
 }
 
 // The recall score object's primary field is literally "final" (a Rust
@@ -529,25 +531,11 @@ impl Memory for HindsightMemory {
                 v
             });
         }
-        // Private bank (writes land here) is always recalled.
-        let mut entries = self
+        // Private-only foundation: recall exactly this agent's own bank. The
+        // shared/system read tiers live in the memory-tiers slice on top.
+        let entries = self
             .recall_bank(&self.bank, normalized, effective_limit)
             .await?;
-        // Shared read-only bank, if set, is merged in (read-only, never written).
-        if let Some(shared) = self.shared_bank.as_deref() {
-            let shared_entries = self
-                .recall_bank(shared, normalized, effective_limit)
-                .await?;
-            entries.extend(shared_entries);
-            // Highest score first, then keep the top slice.
-            entries.sort_by(|a, b| {
-                b.score
-                    .unwrap_or(f64::MIN)
-                    .partial_cmp(&a.score.unwrap_or(f64::MIN))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            entries.truncate(effective_limit);
-        }
         Ok(entries)
     }
 
@@ -561,22 +549,26 @@ impl Memory for HindsightMemory {
         _category: Option<&MemoryCategory>,
         _session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let mut entries = self.list_bank(&self.bank).await?;
-        if let Some(shared) = self.shared_bank.as_deref() {
-            entries.extend(self.list_bank(shared).await?);
-        }
+        // Private-only foundation: list exactly this agent's own bank.
+        let entries = self.list_bank(&self.bank).await?;
         Ok(entries)
     }
 
-    async fn forget(&self, _key: &str) -> Result<bool> {
-        // Deletion maps to hindsight invalidate (PATCH); not wired for the
-        // verification scope. Report "nothing removed" rather than error so the
-        // memory tools degrade gracefully.
-        Ok(false)
+    async fn forget(&self, key: &str) -> Result<bool> {
+        // Hindsight has no key-addressed delete: `key` is the memory id the
+        // read paths surface (both `id` and `key` on a `MemoryEntry` are set to
+        // the server id in `to_entry`). Soft-delete it in the private bank via
+        // the invalidate PATCH so a first-class backend never silently declines
+        // a removal. A `404` maps to `Ok(false)` so hygiene degrades
+        // gracefully.
+        self.invalidate_in_bank(&self.bank, key).await
     }
 
-    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> Result<bool> {
-        Ok(false)
+    async fn forget_for_agent(&self, key: &str, _agent_id: &str) -> Result<bool> {
+        // The bank is the per-agent scope, so agent_id is redundant here: the
+        // private bank already isolates this agent's rows. Forget by id in the
+        // private bank, same as `forget`.
+        self.invalidate_in_bank(&self.bank, key).await
     }
 
     async fn count(&self) -> Result<usize> {
@@ -630,7 +622,12 @@ impl Memory for HindsightMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Bank-per-agent already isolates; ignore the allowlist and recall.
+        // Private-only foundation: each agent's bank IS its isolation boundary,
+        // and config load rejects any cross-agent private-bank collision (see
+        // `Config::validate`), so distinct agents can never resolve to the same
+        // bank. There is therefore no cross-agent read to gate here and the
+        // allowlist is intentionally not consulted; cross-agent shared/system
+        // reads (and their authorization) are introduced by the tiers slice.
         self.recall(query, limit, session_id, since, until).await
     }
 }
@@ -661,7 +658,6 @@ mod tests {
             alias: "tester".to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             bank: bank.to_string(),
-            shared_bank: None,
             token: "test-token".to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             client: build_client(DEFAULT_HINDSIGHT_TIMEOUT_SECS),
@@ -706,6 +702,7 @@ mod tests {
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_ABSENT";
         unsafe { std::env::remove_var(env_name) };
         let cfg = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
             token: Some("inline-token-xyz".to_string()),
             ..HindsightMemoryConfig::default()
@@ -716,10 +713,51 @@ mod tests {
     }
 
     #[test]
+    fn from_config_rejects_refused_default_endpoint() {
+        // The single canonical constructor re-validates the typed config, so
+        // the refused third-party default endpoint cannot be reached even on a
+        // path (CLI/install-wide/status) that skipped `Config::validate`. A
+        // token is present so the failure is unambiguously the endpoint.
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_DEFAULT_EP";
+        unsafe { std::env::set_var(env_name, "tok") };
+        let cfg = HindsightMemoryConfig {
+            // Default base_url is the refused third-party endpoint.
+            token_env: env_name.to_string(),
+            ..HindsightMemoryConfig::default()
+        };
+        let err = HindsightMemory::from_config(&cfg, "scout", "").unwrap_err();
+        assert!(
+            err.to_string().contains("operator-owned"),
+            "constructor must refuse the default endpoint: {err}"
+        );
+        unsafe { std::env::remove_var(env_name) };
+    }
+
+    #[test]
+    fn from_config_rejects_plaintext_remote_endpoint() {
+        // Plaintext http:// to a remote host is refused by the constructor's
+        // re-validation on every path.
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_PLAINTEXT";
+        unsafe { std::env::set_var(env_name, "tok") };
+        let cfg = HindsightMemoryConfig {
+            base_url: "http://memory.example.com/hs".to_string(),
+            token_env: env_name.to_string(),
+            ..HindsightMemoryConfig::default()
+        };
+        let err = HindsightMemory::from_config(&cfg, "scout", "").unwrap_err();
+        assert!(
+            err.to_string().contains("https"),
+            "constructor must refuse a plaintext remote endpoint: {err}"
+        );
+        unsafe { std::env::remove_var(env_name) };
+    }
+
+    #[test]
     fn from_config_errors_without_any_token() {
         let env_name = "ZC_HINDSIGHT_TEST_TOKEN_MISSING";
         unsafe { std::env::remove_var(env_name) };
         let cfg = HindsightMemoryConfig {
+            base_url: "https://memory.example.com/hs".to_string(),
             token_env: env_name.to_string(),
             token: None,
             ..HindsightMemoryConfig::default()
@@ -951,7 +989,6 @@ mod tests {
             alias: "tester".to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             bank: bank.to_string(),
-            shared_bank: None,
             token: "test-token".to_string(),
             default_top_k: DEFAULT_HINDSIGHT_TOP_K,
             // 1s is comfortably above the mock's response latency floor yet far
@@ -1036,6 +1073,126 @@ mod tests {
         assert!(
             !recall.contains("banks/team/space"),
             "raw slash must not leak into the path: {recall}"
+        );
+        // The WRITE path (retain) must encode the bank identically, so a
+        // configurable override cannot POST to a different path than reads.
+        let write = mem.memories_url_for("team/space room");
+        assert!(
+            write.contains("team%2Fspace%20room") || write.contains("team%2Fspace+room"),
+            "write-path bank segment must be percent-encoded: {write}"
+        );
+        assert!(
+            !write.contains("banks/team/space"),
+            "raw slash must not leak into the write path: {write}"
+        );
+        // The invalidate PATCH url must encode both the bank and the memory id.
+        let item = mem.memory_item_url_for("bank", "id/with?reserved#chars");
+        assert!(
+            !item.contains("id/with?reserved#chars"),
+            "id segment must be percent-encoded: {item}"
+        );
+        assert!(
+            item.contains("id%2Fwith%3Freserved%23chars"),
+            "id reserved bytes must be encoded: {item}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_encodes_bank_on_the_write_path() {
+        // Regression: a bank override with reserved bytes must POST to the
+        // encoded path (same as recall/list read), not a raw-interpolated one.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/team%2Fspace/memories"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "team/space");
+        mem.store("fact", "PURPLE-OTTER-42", MemoryCategory::Core, None)
+            .await
+            .expect("store must hit the percent-encoded bank path");
+    }
+
+    #[tokio::test]
+    async fn forget_issues_invalidate_patch_to_private_bank() {
+        // forget(id) must PATCH .../memories/{id} on the PRIVATE bank with
+        // {"state":"invalidated"} and map a 2xx to Ok(true).
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/mem-123"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({ "state": "invalidated" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(
+            mem.forget("mem-123").await.expect("forget should succeed"),
+            "a 2xx invalidate must report the row removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_maps_404_to_false() {
+        // An unknown/already-gone id returns 404 -> Ok(false), so hygiene
+        // degrades gracefully instead of erroring.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(!mem.forget("missing").await.expect("404 must not error"));
+    }
+
+    #[tokio::test]
+    async fn forget_surfaces_server_error() {
+        // A 5xx is a real failure and must surface as an error (not a silent
+        // false), so the caller can retry/log.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/boom"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem.forget("boom").await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "5xx must surface the status: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_empty_id_is_a_noop() {
+        // No mock mounted: an empty id must not fire a request.
+        let mem = memory_for("http://127.0.0.1:1", "zeroclaw-test");
+        assert!(!mem.forget("   ").await.expect("empty id short-circuits"));
+    }
+
+    #[tokio::test]
+    async fn forget_for_agent_targets_private_bank_by_id() {
+        // forget_for_agent ignores agent_id (the bank is the per-agent scope)
+        // and invalidates by id in the private bank, same as forget.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/mem-9"))
+            .and(body_partial_json(json!({ "state": "invalidated" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(
+            mem.forget_for_agent("mem-9", "any-agent")
+                .await
+                .expect("forget_for_agent should succeed")
         );
     }
 

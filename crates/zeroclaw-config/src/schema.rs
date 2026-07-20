@@ -10653,9 +10653,12 @@ impl HindsightMemoryConfig {
     }
 
     /// Validate the section's own invariants. Called from `Config::validate`
-    /// only when at least one agent uses the hindsight backend, so installs
-    /// that never touch hindsight pay nothing and cannot be broken by it.
-    pub(crate) fn validate_self(&self) -> Result<(), String> {
+    /// when at least one agent uses the hindsight backend (or the install-wide
+    /// string selects it), so installs that never touch hindsight pay nothing
+    /// and cannot be broken by it. Also re-run by the `zeroclaw-memory` driver's
+    /// single canonical constructor so every construction path is validated
+    /// even when the caller skipped the config-load check.
+    pub fn validate_self(&self) -> Result<(), String> {
         let base = self.base_url.trim();
         if base.is_empty() {
             return Err("[memory.hindsight] base_url must not be empty".to_string());
@@ -20309,10 +20312,19 @@ impl Config {
             }
 
             // Hindsight backend: validate the shared `[memory.hindsight]`
-            // section once we see an agent that selects it. Skipped entirely
-            // for installs that never use hindsight, so its defaults can never
-            // break an unrelated config.
-            if agent.memory.backend == crate::multi_agent::MemoryBackendKind::Hindsight
+            // section once we see an agent that selects it, OR when the
+            // install-wide `[memory] backend = "hindsight"` string selects it
+            // for every agent. The install-wide compatibility path builds
+            // Hindsight in the runtime factory just like the per-agent enum, so
+            // its typed config must clear the same trust boundary (refused
+            // default endpoint, plaintext remote, invalid bank template) at
+            // load time rather than only failing later at construction. Skipped
+            // entirely for installs that never use hindsight, so its defaults
+            // can never break an unrelated config.
+            let install_wide_hindsight =
+                self.memory.backend.trim().eq_ignore_ascii_case("hindsight");
+            if (agent.memory.backend == crate::multi_agent::MemoryBackendKind::Hindsight
+                || install_wide_hindsight)
                 && let Err(msg) = self.memory.hindsight.validate_self()
             {
                 validation_bail!(
@@ -20350,6 +20362,47 @@ impl Config {
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
+                    );
+                }
+            }
+        }
+
+        // Private-bank collision invariant (Hindsight). Requiring `{agent}` in
+        // `bank_template` is not sufficient: `bank_for()` returns a per-agent
+        // `bank_id` override VERBATIM, and multiple aliases can therefore
+        // resolve to the same bank (whether via a colliding explicit override
+        // or an override equal to another agent's derived bank). Because the
+        // bank IS the per-agent privacy boundary and `recall_for_agents`
+        // ignores the allowlist, a shared resolved bank silently makes one
+        // agent's private memory readable/writable by another. Reject any
+        // cross-agent private-bank collision at load. Only agents that actually
+        // use Hindsight (per-agent enum or the install-wide string) participate.
+        {
+            let install_wide_hindsight =
+                self.memory.backend.trim().eq_ignore_ascii_case("hindsight");
+            let mut resolved_banks: std::collections::BTreeMap<String, &str> =
+                std::collections::BTreeMap::new();
+            let mut hs_aliases: Vec<&String> = self
+                .agents
+                .iter()
+                .filter(|(_, agent)| {
+                    install_wide_hindsight
+                        || agent.memory.backend == crate::multi_agent::MemoryBackendKind::Hindsight
+                })
+                .map(|(alias, _)| alias)
+                .collect();
+            hs_aliases.sort();
+            for alias in hs_aliases {
+                let agent = &self.agents[alias];
+                let bank = self.memory.hindsight.bank_for(alias, &agent.memory.bank_id);
+                if let Some(other) = resolved_banks.insert(bank.clone(), alias.as_str()) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.memory.bank_id"),
+                        "agents.{alias} and agents.{other} both resolve to the same Hindsight \
+                         private bank {bank:?}; each agent's bank is its privacy boundary, so \
+                         distinct agents must not share a resolved bank (check bank_id overrides \
+                         and bank_template)",
                     );
                 }
             }
@@ -33676,6 +33729,101 @@ allowed_users = []
         config
             .validate()
             .expect("valid per-agent template should validate");
+    }
+
+    /// Add a second Hindsight-capable agent `beta` to a base config, mirroring
+    /// how `multi_agent_test_config` builds `alpha`, so cross-agent invariants
+    /// (bank collisions) can be exercised with two agents.
+    fn add_second_agent(config: &mut Config, alias: &str) {
+        use crate::providers::ChannelRef;
+        let agent = AliasedAgentConfig {
+            channels: vec![ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert(alias.to_string(), agent);
+    }
+
+    #[test]
+    async fn validate_rejects_cross_agent_private_bank_collision_via_explicit_overrides() {
+        // Two agents with the SAME explicit bank_id override resolve to one
+        // bank. Because the bank is the privacy boundary, that silently shares
+        // one agent's private memory with the other. It must be refused even
+        // though bank_template still contains {agent}.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        for a in ["alpha", "beta"] {
+            let agent = config.agents.get_mut(a).unwrap();
+            agent.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+            agent.memory.bank_id = "team-shared".to_string();
+        }
+        let err = config
+            .validate()
+            .expect_err("colliding explicit bank_id overrides must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("same Hindsight") && msg.contains("team-shared"),
+            "expected cross-agent collision explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_override_colliding_with_another_agents_derived_bank() {
+        // beta pins bank_id to alpha's DERIVED bank (`zeroclaw-alpha`). alpha
+        // uses the template. They collide on `zeroclaw-alpha`, so beta could
+        // read/write alpha's private memory. Must be refused.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        config.memory.hindsight.bank_template = "zeroclaw-{agent}".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config.agents.get_mut("beta").unwrap().memory.bank_id = "zeroclaw-alpha".to_string();
+        let err = config
+            .validate()
+            .expect_err("override colliding with a derived bank must be refused");
+        assert!(
+            err.to_string().contains("zeroclaw-alpha"),
+            "expected the colliding bank in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_distinct_hindsight_banks_across_agents() {
+        // Two agents with distinct derived banks validate cleanly.
+        let mut config = multi_agent_test_config();
+        add_second_agent(&mut config, "beta");
+        config.memory.hindsight.base_url = "https://memory.example.com/hindsight".to_string();
+        for a in ["alpha", "beta"] {
+            config.agents.get_mut(a).unwrap().memory.backend =
+                crate::multi_agent::MemoryBackendKind::Hindsight;
+        }
+        config
+            .validate()
+            .expect("distinct per-agent banks should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_install_wide_hindsight_default_endpoint() {
+        // The install-wide `[memory] backend = "hindsight"` string selects
+        // Hindsight for every agent through the compatibility path. Its typed
+        // config must clear the same trust boundary at load time even when NO
+        // per-agent enum selects Hindsight: the default third-party endpoint
+        // must be refused.
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "hindsight".to_string();
+        // base_url stays at the refused default; no per-agent enum is Hindsight.
+        let err = config
+            .validate()
+            .expect_err("install-wide hindsight default endpoint must be refused");
+        assert!(
+            err.to_string().contains("operator-owned"),
+            "expected operator-owned endpoint explanation, got: {err}"
+        );
     }
 
     #[test]
