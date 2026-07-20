@@ -15348,7 +15348,7 @@ Let me check the result."#;
         let capturing = Arc::new(CapturingObserver::default());
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
-        let _ = agent_turn(
+        let result = agent_turn(
             &model_provider,
             &mut history,
             &tools_registry,
@@ -15376,7 +15376,9 @@ Let me check the result."#;
             Some("test-agent"),
             Some("pre-minted-turn"),
         )
-        .await;
+        .await
+        .expect("turn should succeed");
+        assert_eq!(result, "done");
 
         let events = capturing.events.lock();
         match events
@@ -15389,6 +15391,10 @@ Let me check the result."#;
             }
             _ => unreachable!(),
         }
+
+        // The bracket and the inner engine events must also agree on the
+        // full (channel, agent_alias, turn_id) triple with the pre-minted id.
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
     }
 
     /// `build_hardware_context` must forward the caller's TurnMeta onto the
