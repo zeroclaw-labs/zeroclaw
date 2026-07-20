@@ -3,8 +3,9 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
+const gatewayHost = process.env.ZEROCLAW_GATEWAY_HOST ?? "127.0.0.1";
 const gatewayPort = process.env.ZEROCLAW_GATEWAY_PORT ?? "42617";
-const gatewayTarget = `http://127.0.0.1:${gatewayPort}`;
+const gatewayTarget = `http://${gatewayHost}:${gatewayPort}`;
 
 // Extra Host header values the dev server will accept, comma-separated, e.g.
 // ZEROCLAW_WEB_ALLOWED_HOSTS=my-box.internal,dev.example.com. Unset → Vite default.
@@ -15,7 +16,29 @@ const allowedHosts = process.env.ZEROCLAW_WEB_ALLOWED_HOSTS
 
 export default defineConfig(({ command }) => ({
   base: command === "serve" ? "/" : "/_app/",
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    // Dev-only: the production gateway serves static assets under `/_app/*` by
+    // stripping that prefix and reading from `web/dist/` (see
+    // crates/zeroclaw-gateway/src/static_files.rs). Vite dev doesn't know about
+    // that prefix and would 404 on `/_app/logo.png`, so mirror the gateway's
+    // strip-prefix behaviour here. Keeps `${basePath}/_app/...` URLs in the SPA
+    // working identically in dev and prod without copying assets into a
+    // `public/_app/` mirror.
+    {
+      name: "zeroclaw-dev-app-prefix",
+      apply: "serve",
+      configureServer(server) {
+        server.middlewares.use((req, _res, next) => {
+          if (req.url?.startsWith("/_app/")) {
+            req.url = req.url.slice("/_app".length);
+          }
+          next();
+        });
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

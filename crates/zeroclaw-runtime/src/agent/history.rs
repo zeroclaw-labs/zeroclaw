@@ -11,15 +11,6 @@ use zeroclaw_providers::ChatMessage;
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
-// Matches a local image path that a tool printed as bare text so it can be
-// promoted to an `[IMAGE:…]` marker. Three rooted forms are recognized:
-//   - POSIX absolute:      `/path/to/a.png`
-//   - Windows drive:       `C:\path\a.png` or `C:/path/a.png`
-//   - Windows UNC share:   `\\server\share\a.png`
-// Only rooted paths are promoted; `is_existing_local_image_path` further
-// requires the path to be absolute and to point at a real file, so on
-// non-Windows hosts the Windows forms match here but are filtered out there
-// (their `is_absolute()` is false), leaving behavior unchanged off-Windows.
 static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
@@ -50,11 +41,6 @@ enum TruncationSide {
     Tail,
 }
 
-/// If `boundary` falls inside an `[IMAGE:...]` marker (i.e. between an
-/// unclosed `[IMAGE:` and its closing `]`), nudge it onto the nearest
-/// complete-marker boundary. The malformed half-marker is dropped into the
-/// truncated middle rather than emitted to the regex, which would otherwise
-/// silently fail to match and quietly lose the image.
 fn nudge_around_image_marker(s: &str, boundary: usize, side: TruncationSide) -> usize {
     const OPEN: &str = "[IMAGE:";
     if boundary == 0 || boundary >= s.len() {
@@ -96,14 +82,6 @@ fn nudge_around_image_marker(s: &str, boundary: usize, side: TruncationSide) -> 
     }
 }
 
-/// Truncate a tool result to `max_chars`, keeping head (2/3) + tail (1/3)
-/// with a marker in the middle. Returns input unchanged if within limit or
-/// `max_chars == 0` (disabled).
-///
-/// Boundaries are nudged inward when they would split an `[IMAGE:...]`
-/// marker, so the multimodal regex never sees a half-marker in the
-/// surviving head/tail. This matches the canonicalization step that runs
-/// immediately before truncation in `run_tool_call_loop`.
 pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     if max_chars == 0 || output.len() <= max_chars {
         return output.to_string();
@@ -157,13 +135,6 @@ fn is_existing_local_image_path(path: &str) -> bool {
             })
 }
 
-/// Collect the inner payloads of every explicit `[IMAGE:…]` marker already
-/// present in `output`. A bare path matching one of these must not be promoted
-/// into a *second* marker, otherwise the same image would be counted (and
-/// inlined) twice. This lets a tool emit both a durable human-readable path
-/// line and an explicit marker for the same file (e.g. `image_info`, which
-/// keeps a `File: <path>` line so the path survives in history after the image
-/// marker is stripped from older turns) without the pipeline double-counting.
 fn existing_marker_payloads(output: &str) -> std::collections::HashSet<&str> {
     const OPEN: &str = "[IMAGE:";
     let mut set = std::collections::HashSet::new();
@@ -227,19 +198,6 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
     rewritten
 }
 
-/// Tools whose output merely *lists* or *quotes* local filesystem paths
-/// (search hits, glob matches) rather than presenting an image as visual
-/// content. Their incidental image-file paths must NOT be auto-promoted to
-/// `[IMAGE:...]` markers: the agent loop counts the current iteration's
-/// tool-result markers (`multimodal::count_image_markers`) when deciding
-/// whether to switch to a vision provider, so a path echo here falsely
-/// triggers vision routing - producing a provider-capability error on a
-/// text-only provider. See PR #7345.
-///
-/// This is a denylist (default-allow): any other tool - including ones that
-/// genuinely *generate* or *fetch* an image and print its path (e.g.
-/// `image_gen`, `file_download`) - keeps canonicalization, so real
-/// tool-produced images still route to a configured vision provider.
 fn is_path_listing_tool(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
@@ -247,11 +205,6 @@ fn is_path_listing_tool(tool_name: &str) -> bool {
     )
 }
 
-/// Provenance-aware wrapper around [`canonicalize_tool_result_media_markers`].
-///
-/// Returns the output unchanged for path-listing tools (`is_path_listing_tool`)
-/// so their incidental image paths never become routable `[IMAGE:...]` markers;
-/// all other tools are canonicalized exactly as before.
 pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
     if is_path_listing_tool(tool_name) {
         output.to_string()
@@ -280,16 +233,35 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
+/// Estimate the token cost of a single message using the ~4 chars/token
+/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
+/// history and system-floor estimates stay in lock-step.
+fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    message.content.len().div_ceil(4) + 4
+}
+
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    history.iter().map(estimate_message_tokens).sum()
+}
+
+pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
-        .map(|m| {
-            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
-            m.content.len().div_ceil(4) + 4
-        })
+        .filter(|m| m.role == "system")
+        .map(estimate_message_tokens)
         .sum()
+}
+
+#[must_use]
+pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
+    let floor_s = system_floor.to_string();
+    let budget_s = budget.to_string();
+    crate::i18n::get_required_cli_string_with_args(
+        "history-trim-floor-exceeds-budget",
+        &[("floor", floor_s.as_str()), ("budget", budget_s.as_str())],
+    )
 }
 
 pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
@@ -335,15 +307,6 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-/// Trim conversation history to prevent unbounded growth.
-///
-/// Preserves: the system prompt (if any), the first user message (the framing
-/// anchor — losing it is what caused the silent-amnesia bug where models said
-/// "the first message I have is 'Continue'"), and the most recent
-/// `max_history` messages (minus one slot already taken by the anchor).
-///
-/// Drops from the middle. Emits a WARN with counts on every fire so silent
-/// amnesia is impossible to miss again.
 pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let non_system_count = if has_system {
@@ -454,12 +417,6 @@ pub fn load_interactive_session_history(
         state.history.insert(0, ChatMessage::system(system_prompt));
     }
 
-    // Self-heal persisted sessions that were written with orphaned
-    // tool_result messages (e.g. a crash mid-compaction, or a trim that
-    // dropped the assistant tool_use block but left its tool_result).
-    // Without this the next API call fails with 400 "unexpected tool_use_id
-    // found in tool_result blocks" and the session stays bricked until the
-    // file is deleted.
     remove_orphaned_tool_messages(&mut state.history);
 
     Ok(state.history)
@@ -478,6 +435,50 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_system_floor_counts_only_system_messages() {
+        let history = vec![
+            ChatMessage::system("You are helpful."), // 16 chars -> 4 + 4 = 8
+            ChatMessage::user("What is Rust?"),      // counted by history, not floor
+            ChatMessage::assistant("A language."),   // counted by history, not floor
+        ];
+        // Floor = system message only; conversation turns are prunable.
+        assert_eq!(estimate_system_floor_tokens(&history), 8);
+        assert!(estimate_system_floor_tokens(&history) < estimate_history_tokens(&history));
+    }
+
+    #[test]
+    fn estimate_system_floor_empty_and_no_system() {
+        assert_eq!(estimate_system_floor_tokens(&[]), 0);
+        let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
+        assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
+
+    #[test]
+    fn context_floor_remediation_names_budget_floor_and_runtime_profile_surface() {
+        let msg = context_floor_remediation(2000, 100);
+        // Names the resolved budget N the runtime actually used ...
+        assert!(
+            msg.contains("100"),
+            "remediation must name the resolved budget: {msg}"
+        );
+        // ... and the measured system floor ...
+        assert!(
+            msg.contains("2000"),
+            "remediation must name the system floor: {msg}"
+        );
+        // ... points at the config surface an operator can change ...
+        assert!(
+            msg.contains("[runtime_profiles"),
+            "remediation must point at the runtime-profile surface: {msg}"
+        );
+        // ... and never at the inert agent-inline knob
+        assert!(
+            !msg.contains("agent.max_context_tokens"),
+            "remediation must not reference the inert agent.max_context_tokens: {msg}"
+        );
+    }
 
     #[test]
     fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {
@@ -513,7 +514,7 @@ mod tests {
     fn canonicalize_for_skips_path_listing_tools() {
         // A search/listing tool that surfaces a real image path must be left
         // untouched - promoting it to [IMAGE:...] would falsely trigger vision
-        // routing (PR #7345).
+        // routing
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("hit.png");
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
@@ -547,12 +548,6 @@ mod tests {
 
     #[test]
     fn canonicalize_tool_result_media_markers_dedups_path_already_in_marker() {
-        // `image_info` emits a durable `File: <path>` line *and* an explicit
-        // `[IMAGE:<path>]` marker for the same file (so the path survives in
-        // history once the marker is stripped from older turns). The promoter
-        // must not wrap the bare `File:` path into a second marker, which would
-        // double-count the image. Order-independent: the bare path appears
-        // before the marker here.
         let input = "File: /tmp/pic.png\nFormat: png\n[IMAGE:/tmp/pic.png]";
         let output = canonicalize_tool_result_media_markers(input);
         assert_eq!(
@@ -566,11 +561,6 @@ mod tests {
         );
     }
 
-    /// Regression: when `truncate_tool_result`'s head boundary fell inside an
-    /// `[IMAGE:...]` marker, the head ended up containing a half-marker like
-    /// `[IMAGE:/very/long/pa` that the multimodal regex would silently fail
-    /// to match. The boundary now rewinds to the marker opener so the broken
-    /// half is dropped into the truncated middle. See PR #6183 review.
     #[test]
     fn truncate_tool_result_does_not_split_image_marker_at_head_boundary() {
         // 200-byte path → marker length 207 bytes. With max_chars=80 the
@@ -593,9 +583,6 @@ mod tests {
         );
     }
 
-    /// Regression: tail boundary previously could land inside an
-    /// `[IMAGE:...]` marker, leaving a stray closing `...png]` fragment in
-    /// the surviving tail. The boundary now advances past the closing `]`.
     #[test]
     fn truncate_tool_result_does_not_split_image_marker_at_tail_boundary() {
         // Marker placed near the end so tail_start (~max_chars / 3 from the
@@ -613,8 +600,6 @@ mod tests {
         );
     }
 
-    /// When a complete `[IMAGE:...]` marker fits naturally inside the
-    /// retained head, truncation must not damage it.
     #[test]
     fn truncate_tool_result_keeps_complete_marker_in_head() {
         let marker = "[IMAGE:/tmp/short.png]";

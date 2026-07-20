@@ -48,6 +48,7 @@ pub struct OtelObserver {
     memory_recall_count: Counter<u64>,
     memory_recall_duration: Histogram<f64>,
     memory_store_count: Counter<u64>,
+    memory_audit_count: Counter<u64>,
     rag_retrieve_count: Counter<u64>,
     rag_retrieve_duration: Histogram<f64>,
 
@@ -57,7 +58,6 @@ pub struct OtelObserver {
 
 impl OtelObserver {
     /// Create a new OTel observer exporting to the given OTLP endpoint.
-    ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
     pub(crate) fn new(
@@ -191,11 +191,6 @@ impl OtelObserver {
             .with_description("Current message queue depth")
             .build();
 
-        // ── Memory observability instruments (Unit 2 of memory-OTel PR) ──
-        // The OTel SDK's PeriodicReader is non-blocking: aggregations are
-        // updated synchronously in record_event, but export happens on a
-        // background interval. New instruments cannot back-pressure the
-        // runtime hot path under burst writes.
         let memory_recall_count = meter
             .u64_counter("zeroclaw.memory.recall.count")
             .with_description("Total memory.recall calls from the runtime boundary")
@@ -210,6 +205,11 @@ impl OtelObserver {
         let memory_store_count = meter
             .u64_counter("zeroclaw.memory.store.count")
             .with_description("Total memory.store calls from the runtime boundary")
+            .build();
+
+        let memory_audit_count = meter
+            .u64_counter("zeroclaw.memory.audit.count")
+            .with_description("Total memory audit trail actions")
             .build();
 
         let rag_retrieve_count = meter
@@ -243,6 +243,7 @@ impl OtelObserver {
             memory_recall_count,
             memory_recall_duration,
             memory_store_count,
+            memory_audit_count,
             rag_retrieve_count,
             rag_retrieve_duration,
             active_agent_spans: Mutex::new(HashMap::new()),
@@ -405,12 +406,6 @@ impl Observer for OtelObserver {
                     KeyValue::new("memory.hits", *num_entries as i64),
                     KeyValue::new("memory.success", *success),
                     KeyValue::new("duration_s", secs),
-                    // Partial GenAI-compatible attributes. The retrieval
-                    // operation value is canonical, but the surrounding
-                    // span (`SpanKind::Internal` and the `memory.recall`
-                    // name rather than `{operation} {data_source.id}`) is
-                    // shaped for ZeroClaw / Langfuse compatibility, not
-                    // strict OTel GenAI conformance.
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", backend.clone()),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
@@ -462,12 +457,6 @@ impl Observer for OtelObserver {
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
 
-                // NOTE: `rag.num_chunks` / `rag.num_boards` are
-                // ZeroClaw-specific. OTel GenAI semconv defines
-                // `gen_ai.operation.name = "retrieval"` but no canonical
-                // attribute for chunk count or domain partitioning yet.
-                // Revisit when the GenAI WG publishes retrieval-attribute
-                // extensions.
                 let mut span_attrs = vec![
                     KeyValue::new("rag.num_chunks", *num_chunks as i64),
                     KeyValue::new("rag.num_boards", *num_boards as i64),
@@ -514,12 +503,6 @@ impl Observer for OtelObserver {
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
 
-                // NOTE: OTel GenAI semconv has no canonical "store"
-                // operation value (canonical: chat, create_agent,
-                // embeddings, execute_tool, generate_content,
-                // invoke_agent, retrieval, text_completion). We omit
-                // `gen_ai.operation.name` and lean on `db.*` conventions
-                // instead.
                 let span_attrs = vec![
                     KeyValue::new("memory.category", category.clone()),
                     KeyValue::new("memory.backend", backend.clone()),
@@ -553,6 +536,45 @@ impl Observer for OtelObserver {
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.memory_store_count.add(1, &metric_attrs);
+            }
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                let secs = duration.as_secs_f64();
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+                let span_attrs = vec![
+                    KeyValue::new("memory.action", action.clone()),
+                    KeyValue::new("memory.backend", backend.clone()),
+                    KeyValue::new("memory.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("db.system", backend.clone()),
+                    KeyValue::new("db.operation", action.clone()),
+                ];
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("memory.audit")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+
+                let metric_attrs = [
+                    KeyValue::new("action", action.clone()),
+                    KeyValue::new("backend", backend.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.memory_audit_count.add(1, &metric_attrs);
             }
             ObserverEvent::LlmResponse {
                 model_provider,
@@ -887,23 +909,6 @@ impl Observer for OtelObserver {
     }
 }
 
-/// Clean content for display in agent-level OTel traces by removing metadata
-/// that obscures the actual user input or model output.
-///
-/// Only used for agent-level gen_ai.input.messages / gen_ai.output.messages in
-/// gen_ai.agent.invoke, NOT for individual llm.response spans.
-///
-/// Removes (only when both start and end tags are present):
-/// - Memory context blocks (`[Memory context]`...`[/Memory context]`)
-/// - Tool result blocks (`<tool_result>...</tool_result>`)
-/// - Thinking blocks (`<thinking>...</thinking>`)
-/// - Think blocks (</think>...`)
-///
-/// Removes (regex-based, no closing tag required):
-/// - Timestamps in brackets (`[2026-06-30 16:44:51 +08:00]`)
-/// - Tool results prefix (`[Tool results]`)
-///
-/// Returns the cleaned content, or the original if no patterns match.
 fn clean_for_display(content: &str) -> String {
     let mut cleaned = content.to_string();
 
@@ -965,12 +970,6 @@ fn clean_for_display(content: &str) -> String {
     cleaned.trim().to_string()
 }
 
-/// Process one aggregated agent-span message (the turn's first user input or
-/// last assistant output) into a GenAI semconv `gen_ai.input.messages` /
-/// `gen_ai.output.messages` entry: strip runtime enrichment via
-/// [`clean_for_display`], truncate under `Redacted`, then JSON-encode as
-/// `[{"role": <role>, "content": <text>}]`. Returns `None` when truncation
-/// drops the content entirely.
 fn process_agent_message(
     content: &str,
     role: &str,
@@ -1061,14 +1060,6 @@ fn tool_result_content_attrs(
     attrs
 }
 
-/// Build the OTel GenAI message-content attributes from a captured snapshot.
-/// Returns an empty vec when there is nothing to emit. Encoding matches the
-/// Langfuse-validated shape: system carried separately, system filtered out of
-/// `input.messages`, output as a single assistant message (text + tool calls).
-///
-/// `config` is the owning `OtelObserver`'s instance content policy; whether
-/// (and how) content is emitted is decided here, at the OTel export boundary,
-/// from that immutable per-observer config.
 fn message_attrs(
     messages: &Option<LlmMessageSnapshot>,
     config: OtelContentConfig,
@@ -1285,12 +1276,6 @@ mod tests {
         assert!(attrs.is_empty());
     }
 
-    // Note: OtelObserver::new() requires an OTLP endpoint.
-    // In tests we verify the struct creation fails gracefully
-    // when no collector is available, and test the observer interface
-    // by constructing with a known-unreachable endpoint (spans/metrics
-    // are buffered and exported asynchronously, so recording never panics).
-
     fn test_observer() -> OtelObserver {
         // Create with a dummy endpoint — exports will silently fail
         // but the observer itself works fine for recording. Content policy is
@@ -1421,13 +1406,6 @@ mod tests {
         obs.flush();
     }
 
-    /// Regression test for memory observability — the three new memory/RAG
-    /// event variants must accept fully populated payloads without panicking
-    /// and must exercise the optional `query_summary` field on
-    /// `MemoryRecall` and `RagRetrieve` (Some/None). We cannot assert on
-    /// exported span attributes here (OTLP pipeline runs asynchronously),
-    /// but verifying the recording path for all three arms is sufficient
-    /// regression coverage.
     #[test]
     fn memory_rag_events_do_not_panic() {
         let obs = test_observer();
@@ -1496,15 +1474,20 @@ mod tests {
             agent_alias: None,
             turn_id: None,
         });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(5),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "purge".into(),
+            backend: "qdrant".into(),
+            duration: Duration::from_millis(2),
+            success: false,
+        });
     }
 
-    /// Regression test for upstream issue #5980 — tool spans must accept a
-    /// populated `tool_call_id`, full `arguments`, and `result` without
-    /// panicking, including payloads large enough that naive attribute
-    /// encoding could truncate them. We can't assert on exported span
-    /// attributes here because the OTLP pipeline runs asynchronously, but
-    /// verifying the recording path handles all three optional fields
-    /// exercises the new gen_ai.tool.* code paths.
     #[test]
     fn tool_call_with_id_args_and_result_does_not_panic() {
         let obs = test_observer();
@@ -1845,15 +1828,6 @@ mod tests {
             "observer creation with empty headers must succeed"
         );
     }
-
-    // ── per-observer policy isolation regression tests ────────────────
-    //
-    // With the old process-global mutable policy, a later observer's config
-    // could override an earlier observer's privacy policy (last-writer-wins).
-    // Now that `OtelContentConfig` is an immutable, instance-owned value,
-    // each observer's policy is stable regardless of what other configs
-    // are constructed around it. The tests exercise the export-boundary
-    // helpers directly so they don't depend on a real OTLP exporter.
 
     #[test]
     fn genai_policy_off_is_not_changed_by_later_full_config() {

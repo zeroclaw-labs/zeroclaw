@@ -1,17 +1,5 @@
-//! CLI for alias CRUD — `zeroclaw {agents,providers,channels} {create,list,
-//! rename,delete}` (#7468 / #7175).
-//!
-//! Thin surface over the config-layer cascade in
-//! [`zeroclaw_config::alias_refs`]: `rename_with_cascade` / `delete_with_cascade`
-//! rewrite/scrub every reference and report the entry paths that changed; this
-//! module marks each dirty and persists via `Config::save_dirty` (which writes
-//! only marked paths). Plural groups (`agents`/`providers`/`channels`) are
-//! distinct from the singular `agent <alias>` run command, which is untouched.
-//!
-//! Providers and channels carry no owned non-config state, so their delete/
-//! rename is config-only. The agent owned-state cascade (memory / cron / acp /
-//! session rows + the workspace dir) is wired in a follow-up; until then agent
-//! delete/rename warn that owned state was not cascaded.
+//! CLI for alias CRUD: `zeroclaw {agents,providers,channels}
+//! {create,list,rename,delete}`.
 
 use anyhow::{Context, Result, bail};
 use zeroclaw::{AgentsCommands, ChannelsCommands, ProvidersCommands};
@@ -429,12 +417,6 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
     }
 }
 
-// ── agent owned-state cascade (feature-gated) ─────────────────────────────────
-// Memory / cron / acp / session rows + the workspace dir live in infra crates
-// the gateway owns; the CLI opens them from `data_dir` and reuses the gateway's
-// cascade coordinators. A `--no-default-features` build (no gateway/runtime)
-// falls back to a config-only cascade + a warning.
-
 /// Memory + optional session-backend handles opened from `data_dir` for the
 /// owned-state cascade.
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
@@ -517,18 +499,18 @@ async fn agent_delete_owned_state(
     // Archive the workspace dir alongside the owned-state exports. `workspace`
     // was resolved by the caller before the config entry was removed, so a
     // custom `workspace.path` is preserved (post-removal it would default).
-    if workspace.exists() {
-        if let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await {
-            let es = e.to_string();
-            eprintln!(
-                "{}",
-                mta(
-                    "cli-alias-warn-workspace-archive",
-                    &[("error", es.as_str())],
-                    "warning: workspace archive failed: {$error}"
-                )
-            );
-        }
+    if workspace.exists()
+        && let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await
+    {
+        let es = e.to_string();
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn-workspace-archive",
+                &[("error", es.as_str())],
+                "warning: workspace archive failed: {$error}"
+            )
+        );
     }
     let report = crate::gateway::agent_owned_state::cascade_owned_state(
         config,

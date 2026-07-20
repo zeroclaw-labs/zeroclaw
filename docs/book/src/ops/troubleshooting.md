@@ -140,7 +140,7 @@ zeroclaw quickstart
 
 </div>
 
-Or, to edit a single stale field instead of wiping everything, use `zeroclaw config set <key>=<value>` directly.
+Or, to edit a single stale field instead of wiping everything, use `zeroclaw config set <key> <value>` directly.
 
 ### Homebrew install: config path mismatch
 
@@ -263,8 +263,7 @@ For either:
 #### sh
 
 ```sh
-zeroclaw channel doctor discord
-zeroclaw channel doctor slack
+zeroclaw channel doctor
 ```
 
 </div>

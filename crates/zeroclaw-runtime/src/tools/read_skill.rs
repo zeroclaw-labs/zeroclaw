@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 /// Compact-mode helper for loading a skill's source file on demand.
@@ -80,7 +80,7 @@ impl Tool for ReadSkillTool {
 
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown skill '{requested}'. Available skills: {available}"
                 )),
@@ -90,7 +90,7 @@ impl Tool for ReadSkillTool {
         let Some(location) = skill.location.as_ref() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Skill '{}' has no readable source location.",
                     skill.name
@@ -101,12 +101,12 @@ impl Tool for ReadSkillTool {
         match tokio::fs::read_to_string(location).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             }),
             Err(err) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to read skill '{}' from {}: {err}",
                     skill.name,
@@ -212,12 +212,6 @@ description = "Ship safely"
 
     #[tokio::test]
     async fn script_skill_is_returned_when_allow_scripts_true() {
-        // Regression pin for #5697: a skill directory containing a script
-        // file (.sh) must be returned by read_skill when the tool was
-        // constructed with allow_scripts=true. Prior to the fix,
-        // ReadSkillTool forwarded a hardcoded None to
-        // load_skills_with_open_skills_settings, which unwrap_or(false)
-        // resolved to false, silently blocking the skill.
         let tmp = TempDir::new().unwrap();
         let mut config = config_for_tmp(&tmp);
         config.skills.allow_scripts = true;

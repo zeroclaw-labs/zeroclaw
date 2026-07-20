@@ -215,6 +215,19 @@ pub enum ObserverEvent {
         agent_alias: Option<String>,
         turn_id: Option<String>,
     },
+    /// A memory audit/operator action was recorded on the audit trail.
+    ///
+    /// Carries only bounded labels. The action is an audit verb such as
+    /// `"store"`, `"recall"`, or `"purge"`; raw memory keys and content
+    /// are intentionally excluded from this event.
+    MemoryAudit {
+        /// Bounded audit action name, safe to use as a metric label.
+        action: String,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`).
+        backend: String,
+        duration: Duration,
+        success: bool,
+    },
     /// A RAG retrieval pass has completed.
     ///
     /// Emitted after vector + keyword retrieval against the hardware
@@ -280,10 +293,10 @@ pub enum ObserverEvent {
     },
     /// Recovery from a failed deployment has completed.
     RecoveryCompleted { deploy_id: String },
-    /// The agent trimmed oldest whole turns from history to fit the context
-    /// token budget. Carries the cut accounting so dashboards and clients can
-    /// surface a visible "context was trimmed" signal instead of the agent
-    /// silently losing earlier turns.
+    /// The agent trimmed oldest whole turns from history to fit either the
+    /// context token budget or the configured message limit. Carries the cut
+    /// accounting so dashboards and clients can surface a visible "context was
+    /// trimmed" signal instead of the agent silently losing earlier turns.
     HistoryTrimmed {
         dropped_messages: usize,
         kept_turns: usize,
@@ -531,6 +544,12 @@ mod tests {
             agent_alias: Some("default".into()),
             turn_id: Some("turn-1".into()),
         };
+        let audit = ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(2),
+            success: true,
+        };
 
         match recall.clone() {
             ObserverEvent::MemoryRecall { turn_id, .. } => {
@@ -540,5 +559,6 @@ mod tests {
         }
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
+        assert!(matches!(audit.clone(), ObserverEvent::MemoryAudit { .. }));
     }
 }

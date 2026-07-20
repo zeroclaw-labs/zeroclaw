@@ -1,18 +1,4 @@
-//! Alias-bound attribution surface used by every emission in the
-//! workspace. Each "thing" that participates in an event (channel,
-//! agent, tool, cron job, model provider, memory backend, peer group,
-//! skill bundle, MCP bundle, session) implements [`Attributable`].
-//! Entry points open `attribution_span!(thing)` once at the start of
-//! their work; the `LogCaptureLayer` in `zeroclaw-log` walks the span
-//! scope and fills the typed attribution slots automatically.
-//!
-//! Adding a new variant: extend the relevant `Kind` enum (the variant
-//! name's snake_case form is the canonical `<type>` string via
-//! `strum::IntoStaticStr`), and — only if a new role family is needed —
-//! update the [`Role::composite_prefix`] / [`Role::attribution_field`]
-//! / [`Role::default_category`] match arms. No call-site changes.
-
-use strum_macros::IntoStaticStr;
+use strum_macros::{EnumIter, EnumString, IntoStaticStr};
 
 /// Trait every alias-bound "thing" implements once next to its struct.
 pub trait Attributable {
@@ -66,7 +52,7 @@ pub enum Role {
 }
 
 /// Channel implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumIter, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChannelKind {
     #[strum(serialize = "acp")]
@@ -82,6 +68,7 @@ pub enum ChannelKind {
     Discord,
     Email,
     Filesystem,
+    Git,
     GmailPush,
     #[strum(serialize = "imessage")]
     IMessage,
@@ -115,6 +102,54 @@ pub enum ChannelKind {
     WhatsappBusiness,
     WhatsappWeb,
     Plugin,
+}
+
+impl ChannelKind {
+    /// Whether this channel can deliver inbound events that fan into an SOP.
+    /// `Cli` is a local interactive session, not a background event source, and
+    /// `Plugin` is a synthetic attribution bucket; both are excluded. Everything
+    /// else is a real inbound channel a SOP can trigger on.
+    #[must_use]
+    pub fn inbound_capable(self) -> bool {
+        !matches!(self, Self::Cli | Self::Plugin)
+    }
+
+    /// Canonical snake_case wire string, single-sourced from `IntoStaticStr`.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// Serde adapter for `Option<ChannelKind>` that routes through the strum
+/// string form, so the wire token is single-sourced from the enum's
+/// `IntoStaticStr`/`EnumString` derives instead of a parallel serde map.
+pub mod channel_kind_opt_serde {
+    use super::ChannelKind;
+    use core::str::FromStr;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<ChannelKind>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(kind) => serializer.serialize_some(kind.as_wire()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ChannelKind>, D::Error> {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            Some(s) => ChannelKind::from_str(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Built-in tool implementations. Closed set — plugins that need their
@@ -347,6 +382,7 @@ impl Role {
             Self::Mcp => Some("mcp_bundle"),
             Self::Sop => Some("sop_name"),
             Self::Session => Some("session_key"),
+            Self::System => Some("system_alias"),
             _ => None,
         }
     }
@@ -446,5 +482,6 @@ mod tests {
                 .attribution_field()
                 .is_none()
         );
+        assert_eq!(Role::System.attribution_field(), Some("system_alias"));
     }
 }

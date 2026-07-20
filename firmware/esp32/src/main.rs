@@ -1,9 +1,4 @@
 //! ZeroClaw ESP32 firmware — JSON-over-serial peripheral.
-//!
-//! Listens for newline-delimited JSON commands on UART0, executes gpio_read/gpio_write,
-//! responds with JSON. Compatible with host ZeroClaw SerialPeripheral protocol.
-//!
-//! Protocol: same as STM32 — see docs/hardware-peripherals-design.md
 
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;

@@ -1,15 +1,15 @@
-/// Streaming events emitted during an agent turn.
-///
-/// Used by the gateway WebSocket handler to relay real-time updates to clients.
-/// Consumers that pattern-match on [`TurnEvent::ToolCall`] or
-/// [`TurnEvent::ToolResult`] should preserve the stable `id` field for
-/// call/result correlation.
+use crate::plan::PlanEntry;
+
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
-    Chunk { delta: String },
+    Chunk {
+        delta: String,
+    },
     /// A reasoning/thinking chunk from a thinking model (may arrive many times).
-    Thinking { delta: String },
+    Thinking {
+        delta: String,
+    },
     /// The agent is invoking a tool.
     ToolCall {
         /// Stable correlation ID shared with the matching [`TurnEvent::ToolResult`].
@@ -24,11 +24,9 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
-    /// The agent is waiting for the operator to approve, deny, or always-allow
-    /// a tool call. The transport (e.g. gateway WebSocket) is expected to
-    /// surface this to the operator and route the response back through the
-    /// same correlation `request_id`. The runtime tool loop pauses until that
-    /// answer arrives or the channel times out.
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
     ApprovalRequest {
         /// Correlation ID. The matching response frame must echo it.
         request_id: String,
@@ -40,21 +38,16 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
-    /// Older whole turns were dropped from the context window to fit the token
-    /// budget. Surfaces a user-visible "context was cut here" marker so trimming
-    /// is never silent. Emitted once per turn boundary when a trim occurs.
+    /// Older whole turns were dropped to fit either the context token budget or
+    /// the configured message limit. Surfaces a user-visible "context was cut
+    /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
     HistoryTrimmed {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
     },
-    /// Per-LLM-call token usage and cost.
-    ///
-    /// Emitted once per LLM response the agent loop processes; a single turn
-    /// that hops through tools may emit several `Usage` events, one per model
-    /// call. Consumers (e.g. the gateway WS handler) accumulate these into a
-    /// turn total before reporting back to the client. Absence means "usage
-    /// unavailable for this call" rather than zero.
+    /// Per-LLM-call token usage and cost; a turn may emit several, one per
+    /// model call. `None` means "unavailable for this call", not zero.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic
@@ -65,4 +58,29 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+}
+
+#[cfg(test)]
+mod plan_event_tests {
+    use super::*;
+    use crate::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+    #[test]
+    fn plan_turn_event_carries_entries() {
+        let ev = TurnEvent::Plan {
+            entries: vec![PlanEntry {
+                content: "Step one".to_string(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            }],
+        };
+        match ev {
+            TurnEvent::Plan { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].content, "Step one");
+            }
+            _ => panic!("expected TurnEvent::Plan"),
+        }
+    }
 }

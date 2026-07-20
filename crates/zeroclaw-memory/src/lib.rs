@@ -1,21 +1,5 @@
 #![allow(clippy::to_string_in_format_args)]
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
-//!
-//! ## Reserved Key Prefixes
-//!
-//! The following key prefixes are reserved for the auto-save system. Any memory
-//! stored under these keys will be **excluded from context assembly** by all
-//! three context-building paths (`build_context`, `DefaultMemoryLoader`, and
-//! `should_skip_memory_context_entry`). Do not use these prefixes for semantic
-//! memories that should surface in agent context.
-//!
-//! | Prefix | Purpose | Detection function |
-//! |---|---|---|
-//! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
-//! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
-//!
-//! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
-//! **not** filtered — they use different prefixes and are handled separately.
 
 /// Opening delimiter for recalled memory injected into provider context.
 pub const MEMORY_CONTEXT_OPEN: &str = "[Memory context]";
@@ -56,13 +40,14 @@ pub mod vector;
 
 pub use agent_scoped::AgentScopedMemory;
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
-#[allow(unused_imports)]
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
     MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
+#[allow(unused_imports)]
+pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -92,13 +77,15 @@ use zeroclaw_config::schema::{
 };
 
 #[cfg(feature = "memory-postgres")]
-fn build_postgres_memory(storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(
+    storage: &PostgresStorageConfig,
+) -> anyhow::Result<postgres::PostgresMemory> {
     use postgres::PostgresMemory;
     let db_url = storage
         .db_url
         .as_deref()
         .context("memory backend 'postgres' requires [storage.postgres.<alias>].db_url")?;
-    let memory = PostgresMemory::new(
+    PostgresMemory::new(
         "postgres",
         db_url,
         &storage.schema,
@@ -106,8 +93,7 @@ fn build_postgres_memory(storage: &PostgresStorageConfig) -> anyhow::Result<Box<
         storage.connect_timeout_secs,
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
-    )?;
-    Ok(Box::new(memory))
+    )
 }
 
 #[cfg(not(feature = "memory-postgres"))]
@@ -118,39 +104,63 @@ fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box
     )
 }
 
+/// Wrap the backend in the `AuditedMemory` decorator when
+/// `[memory] audit_enabled = true`; pass it through untouched otherwise
+/// (the default), so the flag-off path is byte-identical to an unwrapped
+/// backend.
+fn wrap_audit<M: Memory + 'static>(
+    memory: M,
+    workspace_dir: &Path,
+    audit_enabled: bool,
+) -> anyhow::Result<Box<dyn Memory>> {
+    if audit_enabled {
+        Ok(Box::new(AuditedMemory::new(memory, workspace_dir)?))
+    } else {
+        Ok(Box::new(memory))
+    }
+}
+
 fn create_memory_with_builders<F>(
     backend_name: &str,
     workspace_dir: &Path,
     mut sqlite_builder: F,
     unknown_context: &str,
+    audit_enabled: bool,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
 {
     match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
+        MemoryBackendKind::Sqlite => wrap_audit(sqlite_builder()?, workspace_dir, audit_enabled),
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
-            Ok(Box::new(LucidMemory::new("lucid", workspace_dir, local)))
+            wrap_audit(
+                LucidMemory::new("lucid", workspace_dir, local),
+                workspace_dir,
+                audit_enabled,
+            )
         }
         MemoryBackendKind::Postgres => {
-            // Postgres requires a typed `[storage.postgres.<alias>]` config, which this
-            // builder-only entry point does not receive. All supported call paths go
-            // through `create_memory_with_storage_and_routes`, which handles postgres via
-            // an early return. Fail loudly if a caller ever reaches this arm, rather than
-            // pretending to work with default configs that can never connect.
             anyhow::bail!(
                 "postgres backend requires storage config; \
                  call create_memory_with_storage_and_routes instead of create_memory_with_builders"
             )
         }
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
-            Ok(Box::new(MarkdownMemory::new("markdown", workspace_dir)))
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => wrap_audit(
+            MarkdownMemory::new("markdown", workspace_dir),
+            workspace_dir,
+            audit_enabled,
+        ),
+        MemoryBackendKind::None => {
+            wrap_audit(NoneMemory::new("none"), workspace_dir, audit_enabled)
         }
-        MemoryBackendKind::None => Ok(Box::new(NoneMemory::new("none"))),
         MemoryBackendKind::Unknown => {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
-            Ok(Box::new(MarkdownMemory::new("markdown", workspace_dir)))
+            wrap_audit(
+                MarkdownMemory::new("markdown", workspace_dir),
+                workspace_dir,
+                audit_enabled,
+            )
         }
     }
 }
@@ -172,10 +182,6 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
 }
 
-/// Auto-save key used for raw user messages captured per-turn.
-/// Re-injecting these into build_context causes exponential bloat: each recalled
-/// entry contains prior generations' context verbatim, growing unboundedly.
-/// Consolidated knowledge is already promoted to Core/Daily entries.
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "user_msg" || normalized.starts_with("user_msg_")
@@ -221,11 +227,6 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
-/// Embedding provider settings resolved from the canonical config, returned to
-/// callers that need to rebuild an embedder after a provider profile changes at
-/// runtime (`config/set`) — e.g. the runtime's memory-embedder refresh hook for
-/// #8359. `model_provider` is the literal factory input
-/// (`openai` / `openrouter` / `custom:<url>` / `none`), not a dotted catalog ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingSettings {
     pub model_provider: String,
@@ -234,13 +235,6 @@ pub struct EmbeddingSettings {
     pub api_key: Option<String>,
 }
 
-/// Resolve the embedding settings a memory backend would use right now, from
-/// the live `[memory]` config, `[[embedding_routes]]`, and provider catalog.
-///
-/// This mirrors the resolution performed when the backend is first constructed
-/// (dotted `<type>.<alias>` refs → concrete endpoint/key), so a long-lived
-/// memory handle can be refreshed after a `config/set` provider-profile change
-/// without a daemon restart. Pair with [`Memory::refresh_embedder`].
 pub fn resolve_embedding_settings(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -262,14 +256,6 @@ fn resolve_embedding_config(
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> ResolvedEmbeddingConfig {
-    // Key resolution precedence (highest first):
-    //   1. per-route `api_key` override (routed branch) / `[memory].embedding_api_key` (base branch)
-    //   2. the referenced provider profile's own key, when `model_provider`
-    //      is a dotted `<type>.<alias>` catalog ref (resolved in `resolve_provider_ref`)
-    //   3. the seed model provider's key, inherited via `api_key`
-    // (1)/(2) let embeddings keep their own credential when the chat model runs
-    // on a provider that carries no usable embedding key; (3) preserves the
-    // prior behavior verbatim when neither override nor a catalog ref applies.
     let inherited_api_key = api_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -346,35 +332,6 @@ fn resolve_embedding_config(
     )
 }
 
-/// Finalize an embedding profile, resolving a dotted `<type>.<alias>`
-/// `model_provider` reference against the canonical `providers.models`
-/// catalog.
-///
-/// The embeddings factory ([`embeddings::create_embedding_provider`]) only
-/// understands the literal providers `openai`, `openrouter`, and
-/// `custom:<base_url>`. An `[[embedding_routes]]` entry, however, points at a
-/// configured provider profile by dotted reference (e.g. `openai.default`),
-/// which passes config validation but matches none of those arms — so without
-/// this step it would silently fall through to [`embeddings::NoopEmbedding`]
-/// and degrade retrieval to keyword-only (issue #7949).
-///
-/// Resolution maps the dotted ref to the referenced profile's concrete
-/// endpoint and key:
-///   - an explicit `uri` override becomes `custom:<uri>`;
-///   - with no `uri`, an `openai` / `openrouter` family passes through so the
-///     factory applies its built-in family default endpoint.
-///
-/// Non-dotted providers (`openai`, `openrouter`, `custom:<url>`, `none`, or any
-/// empty/literal value) are returned unchanged. A dotted ref is logged loudly
-/// and left unresolved — never silently degraded — when it cannot be resolved
-/// (no catalog, or missing from `providers.models`) OR when it resolves to a
-/// family with no usable embeddings endpoint (a non-`openai`/`openrouter`
-/// family configured without a `uri`).
-///
-/// Key precedence: `explicit_api_key` (per-route / `[memory]` override) wins,
-/// then the referenced profile's own key, then `inherited_api_key` (the chat
-/// seed key). No provider state is cached: the key and endpoint are read from
-/// the live catalog on each call.
 fn resolve_provider_ref(
     model_provider: String,
     model: String,
@@ -424,14 +381,6 @@ fn resolve_provider_ref(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    // Map the resolved profile to a form the embeddings factory understands.
-    // An explicit `uri` becomes `custom:<uri>` (works for any OpenAI-compatible
-    // endpoint). With no `uri`, only `openai` / `openrouter` have a built-in
-    // default endpoint in the factory; any other resolved family has no
-    // embeddings endpoint to hit, so we must NOT pass its bare name through —
-    // that would silently fall back to `NoopEmbedding`. Report it loudly
-    // instead, leaving the reference unresolved (keyword-only), so a configured
-    // route never degrades in silence (issue #7949).
     let concrete_provider = match provider_cfg
         .uri
         .as_deref()
@@ -472,13 +421,6 @@ fn resolve_provider_ref(
     }
 }
 
-/// Factory: create the right memory backend from config
-///
-/// Passes no provider catalog, so a dotted `<type>.<alias>` embedding provider
-/// reference cannot be resolved through this entrypoint — callers that wire
-/// `[[embedding_routes]]` should use
-/// [`create_memory_with_storage_and_routes`] with the live
-/// `providers.models` catalog instead.
 pub fn create_memory(
     config: &MemoryConfig,
     workspace_dir: &Path,
@@ -494,19 +436,6 @@ pub fn create_memory(
     )
 }
 
-/// Factory: create memory with a resolved active storage backend and embedding routes.
-///
-/// Pass [`ActiveStorage::None`] when no typed storage config is needed (sqlite,
-/// markdown, lucid, none — all infer settings from the workspace). Postgres and
-/// Qdrant require their typed variants and will error if the wrong variant is
-/// supplied.
-///
-/// `providers` is the canonical `providers.models` catalog, used to resolve a
-/// dotted `<type>.<alias>` embedding `model_provider` reference (from
-/// `[[embedding_routes]]` or `[memory].embedding_provider`) to a concrete
-/// endpoint + key. Pass `None` only when no catalog is available (e.g. the
-/// bare [`create_memory`] entrypoint); dotted refs then stay unresolved and
-/// are logged rather than silently disabled.
 pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -598,6 +527,7 @@ pub fn create_memory_with_storage_and_routes(
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
             ));
+        let has_embedder = embedder.dimensions() > 0;
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder(
@@ -610,6 +540,18 @@ pub fn create_memory_with_storage_and_routes(
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
         )?;
+
+        if has_embedder {
+            reconcile_embedding_identity(
+                &mem,
+                &embeddings::EmbeddingIdentity {
+                    provider: resolved_embedding.model_provider.clone(),
+                    model: resolved_embedding.model.clone(),
+                    dimensions: resolved_embedding.dimensions,
+                },
+                config.auto_reindex_on_identity_change,
+            );
+        }
         Ok(mem)
     }
 
@@ -650,13 +592,11 @@ pub fn create_memory_with_storage_and_routes(
                 url, collection
             )
         );
-        return Ok(Box::new(QdrantMemory::new_lazy(
-            "qdrant",
-            &url,
-            &collection,
-            qdrant_api_key,
-            embedder,
-        )));
+        return wrap_audit(
+            QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder),
+            workspace_dir,
+            config.audit_enabled,
+        );
     }
 
     if matches!(backend_kind, MemoryBackendKind::Postgres) {
@@ -667,7 +607,18 @@ pub fn create_memory_with_storage_and_routes(
                  referenced by `memory.backend = \"postgres.<alias>\"`"
             ),
         };
-        return build_postgres_memory(pg_cfg);
+        #[cfg(feature = "memory-postgres")]
+        {
+            return wrap_audit(
+                build_postgres_memory(pg_cfg)?,
+                workspace_dir,
+                config.audit_enabled,
+            );
+        }
+        #[cfg(not(feature = "memory-postgres"))]
+        {
+            return build_postgres_memory(pg_cfg);
+        }
     }
 
     create_memory_with_builders(
@@ -682,7 +633,136 @@ pub fn create_memory_with_storage_and_routes(
             )
         },
         "",
+        config.audit_enabled,
     )
+}
+
+/// Outcome of a startup embedding-identity reconciliation.
+#[derive(Debug, PartialEq, Eq)]
+enum EmbeddingIdentityOutcome {
+    /// No identity was recorded (fresh store, or one predating identity
+    /// tracking): the current identity was adopted without touching vectors.
+    Adopted,
+    /// Stored identity matches the current config — nothing to do.
+    Match,
+    /// Stored identity differed: vectors were invalidated (set to NULL),
+    /// the embedding cache cleared, and the new identity stamped.
+    Invalidated(usize),
+    /// Reconciliation failed; the store is untouched and the error was
+    /// logged. Startup proceeds — recall degrades no further than it
+    /// already would, and the next boot retries.
+    Failed,
+}
+
+fn reconcile_embedding_identity(
+    mem: &SqliteMemory,
+    current: &embeddings::EmbeddingIdentity,
+    auto_reindex: bool,
+) -> EmbeddingIdentityOutcome {
+    let stored = match mem.stored_embedding_identity() {
+        Ok(stored) => stored,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "memory: failed to read stored embedding identity; skipping reconciliation"
+            );
+            return EmbeddingIdentityOutcome::Failed;
+        }
+    };
+
+    match stored {
+        None => match mem.record_embedding_identity(current) {
+            Ok(()) => EmbeddingIdentityOutcome::Adopted,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "memory: failed to record embedding identity; will retry next startup"
+                );
+                EmbeddingIdentityOutcome::Failed
+            }
+        },
+        Some(stored) if stored == *current => EmbeddingIdentityOutcome::Match,
+        Some(stored) => match mem.invalidate_embeddings_for_identity_change(current) {
+            Ok(invalidated) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "stored_identity": stored.to_string(),
+                            "current_identity": current.to_string(),
+                            "vectors_invalidated": invalidated,
+                        })),
+                    "memory: embedding identity changed; stored vectors invalidated and \
+                     embedding cache cleared (content retained). Semantic recall is \
+                     keyword-only until re-embedded — run `zeroclaw memory reindex`"
+                );
+                if auto_reindex && invalidated > 0 {
+                    spawn_auto_reindex(mem);
+                }
+                EmbeddingIdentityOutcome::Invalidated(invalidated)
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "stored_identity": stored.to_string(),
+                            "current_identity": current.to_string(),
+                            "error": format!("{e}"),
+                        })),
+                    "memory: embedding identity changed but invalidation failed; \
+                     store untouched, will retry next startup"
+                );
+                EmbeddingIdentityOutcome::Failed
+            }
+        },
+    }
+}
+
+/// Kick off the gated re-embed in the background after an identity
+/// migration, when `[memory] auto_reindex_on_identity_change` opts in.
+/// Outside an async runtime (no tokio context) the spawn is skipped and the
+/// operator is pointed at `zeroclaw memory reindex` instead.
+fn spawn_auto_reindex(mem: &SqliteMemory) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "memory: auto_reindex_on_identity_change is set but no async runtime is \
+             available here; run `zeroclaw memory reindex` to re-embed"
+        );
+        return;
+    };
+    let mem = mem.clone();
+    handle.spawn(async move {
+        match mem.reindex().await {
+            Ok(count) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"reembedded": count})),
+                    "memory: background re-embed after embedding identity change complete"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "memory: background re-embed after embedding identity change failed; \
+                     run `zeroclaw memory reindex` to retry"
+                );
+            }
+        }
+    });
 }
 
 pub fn create_memory_for_migration(
@@ -695,27 +775,17 @@ pub fn create_memory_for_migration(
         );
     }
 
+    // Migration writes bypass the audit trail: the imported rows are bulk
+    // history, not live memory operations.
     create_memory_with_builders(
         backend,
         workspace_dir,
         || SqliteMemory::new("sqlite", workspace_dir),
         " during migration",
+        false,
     )
 }
 
-/// Build the per-agent memory wrapper for `agent_alias`.
-///
-/// Wraps the appropriate inner backend with `AgentScopedMemory` (for
-/// SQL- and Qdrant-backed agents — single shared backend, agent_id
-/// column distinguishes rows) or `AgentScopedMarkdownMemory` (for
-/// Markdown-backed agents — per-agent dirs, peer set composed from
-/// the resolved `read_memory_from` allowlist). `NoneMemory` agents
-/// pass through unwrapped.
-///
-/// Cross-backend allowlist entries are rejected at config load, so by
-/// the time we get here every entry on
-/// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
-/// at a sibling on the same backend kind.
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -743,20 +813,33 @@ pub async fn create_memory_for_agent(
             });
         }
         let scoped = AgentScopedMarkdownMemory::new(agent_alias, own, peers);
-        return Ok(Arc::new(scoped));
+        // Route the composed per-agent wrapper through the same audit
+        // decision as the install-wide factory: with `[memory]
+        // audit_enabled = true` the wrapper's store/recall operations
+        // write `memory/audit.db` rows and emit the `memory.audit` event;
+        // default-off passes it through untouched (byte-identical). The
+        // audit db is rooted at the install `data_dir` (shared across
+        // agents), mirroring how the SQL/Qdrant/Lucid arms compose it.
+        return Ok(Arc::from(wrap_audit(
+            scoped,
+            &config.data_dir,
+            config.memory.audit_enabled,
+        )?));
     }
 
-    // None branch: nothing to scope, no agents-table lookup needed.
+    // None branch: nothing to scope, no agents-table lookup needed. Still
+    // route through the audit decision so an audit-enabled install records
+    // attempted store/recall operations on the no-op backend; the
+    // install-wide factory wraps `NoneMemory` the same way, and opt-in
+    // audit coverage must not become backend/path-dependent.
     if matches!(backend_kind, ConfigBackend::None) {
-        return Ok(Arc::new(NoneMemory::new("none")));
+        return Ok(Arc::from(wrap_audit(
+            NoneMemory::new("none"),
+            &config.data_dir,
+            config.memory.audit_enabled,
+        )?));
     }
 
-    // SQL / Qdrant / Lucid: single install-wide backend; the
-    // agent_id column (or payload field) carries the per-agent
-    // attribution. We synthesize the inner backend from the existing
-    // install-wide factory using the install workspace_dir, then wrap
-    // with AgentScopedMemory holding the agent's UUID + resolved
-    // allowlist UUIDs.
     let inner = create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
@@ -767,13 +850,6 @@ pub async fn create_memory_for_agent(
     )?;
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
-    // Resolve the bound agent's identifier + the allowlist
-    // identifiers via the trait method `ensure_agent_uuid`. SQL
-    // backends override to look up agents-table UUIDs; Markdown,
-    // Qdrant, None use the trait default that returns the alias
-    // verbatim (alias-keyed; no UUID indirection at the storage
-    // layer). The factory is therefore backend-agnostic past the
-    // Markdown branch above.
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
     let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
     for peer in &agent_cfg.workspace.read_memory_from {
@@ -835,6 +911,395 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
+    }
+
+    // ── Embedding identity reconciliation policy────
+
+    /// Embedder returning fixed vectors so store() persists real embeddings.
+    struct StaticEmbedding(usize);
+
+    #[async_trait::async_trait]
+    impl embeddings::EmbeddingProvider for StaticEmbedding {
+        fn name(&self) -> &str {
+            "static"
+        }
+        fn dimensions(&self) -> usize {
+            self.0
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.25f32; self.0]).collect())
+        }
+    }
+
+    fn static_sqlite(dir: &Path, dims: usize) -> SqliteMemory {
+        SqliteMemory::with_embedder(
+            "test",
+            dir,
+            Arc::new(StaticEmbedding(dims)),
+            0.7,
+            0.3,
+            1000,
+            None,
+            zeroclaw_config::schema::SearchMode::default(),
+        )
+        .unwrap()
+    }
+
+    fn ident(provider: &str, model: &str, dimensions: usize) -> embeddings::EmbeddingIdentity {
+        embeddings::EmbeddingIdentity {
+            provider: provider.into(),
+            model: model.into(),
+            dimensions,
+        }
+    }
+
+    fn embedded_rows(mem: &SqliteMemory) -> i64 {
+        let conn = mem.connection().lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn identity_adopted_on_fresh_store_then_matches() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        let id = ident("openai", "text-embedding-3-small", 4);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &id, false),
+            EmbeddingIdentityOutcome::Adopted
+        );
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &id, false),
+            EmbeddingIdentityOutcome::Match
+        );
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(id));
+    }
+
+    #[tokio::test]
+    async fn identity_adoption_on_legacy_store_keeps_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        // Rows written before identity tracking existed: vectors present,
+        // no recorded identity. Adoption must not invalidate them.
+        mem.store("legacy", "pre-existing row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&mem), 1);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false),
+            EmbeddingIdentityOutcome::Adopted
+        );
+        assert_eq!(embedded_rows(&mem), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_invalidates_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
+        mem.store("k1", "first row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k2", "second row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&mem), 2);
+
+        let new_id = ident("openai", "model-b", 4);
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &new_id, false),
+            EmbeddingIdentityOutcome::Invalidated(2)
+        );
+        assert_eq!(embedded_rows(&mem), 0);
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(new_id));
+
+        // Content was retained: rows are still recallable by keyword.
+        let hits = mem.recall("second", 10, None, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_dimension_change_alone_triggers_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &ident("openai", "model-a", 8), false),
+            EmbeddingIdentityOutcome::Invalidated(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_with_auto_reindex_reembeds_in_background() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
+        mem.store("k1", "auto reindex row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&mem), 1);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &ident("openai", "model-b", 4), true),
+            EmbeddingIdentityOutcome::Invalidated(1)
+        );
+
+        // The re-embed runs on the runtime in the background; poll briefly.
+        let mut restored = false;
+        for _ in 0..100 {
+            if embedded_rows(&mem) == 1 {
+                restored = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(restored, "background auto-reindex did not re-embed the row");
+    }
+
+    #[test]
+    fn keyword_only_factory_records_no_identity() {
+        let tmp = TempDir::new().unwrap();
+        // Default config: embedding_provider = "none" → NoopEmbedding.
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        drop(create_memory(&cfg, tmp.path(), None).unwrap());
+
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+    }
+
+    #[test]
+    fn factory_with_embedder_stamps_and_migrates_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            embedding_provider: "openai".into(),
+            embedding_model: "model-a".into(),
+            embedding_dimensions: 4,
+            ..MemoryConfig::default()
+        };
+        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            assert_eq!(
+                mem.stored_embedding_identity().unwrap(),
+                Some(ident("openai", "model-a", 4))
+            );
+        }
+
+        // Same config again → identity unchanged (Match path, no churn).
+        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+
+        // Model change → factory reconciles to the new identity.
+        cfg.embedding_model = "model-b".into();
+        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(
+            mem.stored_embedding_identity().unwrap(),
+            Some(ident("openai", "model-b", 4))
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_does_not_create_audit_db_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        assert!(!cfg.audit_enabled, "audit must stay opt-in by default");
+
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        mem.store("audit_off", "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(!tmp.path().join("memory").join("audit.db").exists());
+    }
+
+    #[tokio::test]
+    async fn factory_wraps_backend_with_audit_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        mem.store("audit_on", "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let _ = mem.recall("value", 5, None, None, None).await.unwrap();
+
+        let audit_db = tmp.path().join("memory").join("audit.db");
+        let conn = rusqlite::Connection::open(audit_db).unwrap();
+        let stores: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recalls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'recall'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stores, 1);
+        assert_eq!(recalls, 1);
+    }
+
+    /// Regression: an audit-enabled Markdown-backed agent built through
+    /// `create_memory_for_agent` (the production runtime/gateway/channel/
+    /// cron path) must write `memory/audit.db` rows, not just the
+    /// install-wide factory. Before the fix, the per-agent Markdown branch
+    /// returned the wrapper directly, skipping the audit decision entirely.
+    #[tokio::test]
+    async fn create_memory_for_agent_markdown_wraps_audit_when_enabled() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        // Both data_dir and config_path must be set: agent_workspace_dir
+        // resolves per-agent dirs from config_path.parent(), and the audit
+        // db is rooted at data_dir. Leaving config_path unset would write
+        // the agent workspace into the crate working tree.
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.audit_enabled = true;
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mem = create_memory_for_agent(&cfg, "scribe", None)
+            .await
+            .expect("per-agent markdown memory");
+        mem.store("agent_key", "agent value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let _ = mem.recall("agent", 5, None, None, None).await.unwrap();
+
+        let audit_db = cfg.data_dir.join("memory").join("audit.db");
+        let conn = rusqlite::Connection::open(audit_db).unwrap();
+        let stores: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recalls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'recall'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stores, 1, "markdown agent store must be audited");
+        assert_eq!(recalls, 1, "markdown agent recall must be audited");
+    }
+
+    /// Default-off must stay byte-identical for the per-agent Markdown
+    /// path: no wrapper, no `memory/audit.db` written.
+    #[tokio::test]
+    async fn create_memory_for_agent_markdown_audit_off_writes_no_db() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        assert!(!cfg.memory.audit_enabled, "audit is opt-in by default");
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mem = create_memory_for_agent(&cfg, "scribe", None)
+            .await
+            .expect("per-agent markdown memory");
+        mem.store("agent_key", "agent value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(!cfg.data_dir.join("memory").join("audit.db").exists());
+    }
+
+    /// The per-agent None branch is the same audit-skip class: the
+    /// install-wide factory wraps `NoneMemory`, so the per-agent path must
+    /// too. `NoneMemory::store` is a no-op, but the decorator records the
+    /// attempt before delegating, so the audit row must still exist.
+    #[tokio::test]
+    async fn create_memory_for_agent_none_wraps_audit_when_enabled() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.audit_enabled = true;
+        cfg.agents.insert(
+            "ghost".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::None,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mem = create_memory_for_agent(&cfg, "ghost", None)
+            .await
+            .expect("per-agent none memory");
+        mem.store("ghost_key", "dropped", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let audit_db = cfg.data_dir.join("memory").join("audit.db");
+        let conn = rusqlite::Connection::open(audit_db).unwrap();
+        let stores: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stores, 1, "none-backed agent store attempt must be audited");
     }
 
     #[test]
@@ -1027,7 +1492,7 @@ mod tests {
 
     #[test]
     fn resolve_embedding_settings_exposes_resolved_values_for_runtime_refresh() {
-        // The public runtime entry point (#8359) must surface the same resolved
+        // The public runtime entry pointmust surface the same resolved
         // literal provider/model/dims/key the constructor would use.
         let cfg = MemoryConfig {
             embedding_provider: "openai".into(),
@@ -1280,7 +1745,7 @@ mod tests {
             resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"), Some(&providers));
 
         // The dotted `<type>.<alias>` ref resolves to the referenced profile's
-        // concrete endpoint + key — not a silent NoopEmbedding (issue #7949).
+        // concrete endpoint + key — not a silent NoopEmbedding
         // The provider's own key beats the inherited chat-provider key.
         assert_eq!(
             resolved,
@@ -1496,11 +1961,6 @@ mod tests {
         assert_eq!(embedder.name(), "openai");
     }
 
-    /// The "not silent" contract is the WARN itself: a resolved-but-unusable
-    /// route must emit an operator-visible, structured diagnostic. Asserting
-    /// only the keyword-only fallback (as the sibling test does) would stay
-    /// green if the WARN were deleted — so capture the broadcast event and
-    /// assert its severity + stable `error_key`.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_embedding_config_no_endpoint_emits_loud_warning() {
