@@ -1713,9 +1713,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: Some(agent_alias.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 });
             }
 
@@ -2232,9 +2232,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
-                        channel: None,
-                        agent_alias: None,
-                        turn_id: None,
+                        channel: Some(channel_name.to_string()),
+                        agent_alias: Some(agent_alias.to_string()),
+                        turn_id: Some(turn_id.clone()),
                     });
                 }
 
