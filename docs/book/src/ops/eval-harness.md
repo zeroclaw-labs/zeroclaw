@@ -69,12 +69,53 @@ Each live case runs inside a sandbox:
 Because live output is non-deterministic and can embed workspace content, live runs
 belong in the planned `evals/live/` suite, not the gating regression suite.
 
+## Baselines and regression gating
+
+Suites have a kind, resolved from the directory name (or the `--suite-kind`
+override): a `capability` suite is tracked but never gating; everything else has
+**regression** semantics (must stay green).
+
+A **baseline** file (`zeroclaw-eval/baseline/v1`, stored under `evals/baselines/`)
+records each case's verdict and comparability key from a prior run:
+
+- `--write-baseline <file>` writes the current run as a baseline and exits with the
+  run's normal code.
+- `--baseline <file>` compares the current run against it, per case id.
+
+Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
+tool_surface)`:
+
+- A changed key reports `changed - refresh baseline` (Unverifiable) and is never
+  compared or gated.
+- Baseline pass and current fail on a comparable case is a **regression**,
+  classified by which categories flipped (response / tool / side-effect / budget).
+- Current pass and baseline fail is an **improvement** (reported, never gates); a
+  case only in the current run is **new**; a case only in the baseline is
+  **removed** (warned). Per-case token deltas are reported as a percentage and are
+  never gated.
+
+**Live flakiness rule:** in live mode, a comparable case that regressed is re-run
+once; if the re-run passes it is reported as `flaky (unconfirmed regression)` and
+does not gate. Replay flips the gate directly with no retry (it is deterministic).
+
+Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never a
+gate. To refresh a baseline after an intentional behavior change, re-run with
+`--write-baseline` and commit the updated file.
+
 ## Exit-code contract
 
-`zeroclaw eval run` exits `0` iff every case passed, and `1` otherwise (any
-failed check or run error). This is the CI gate: the process exit code is the
-signal. The same decision is exposed as the pure function
-`SuiteReport::exit_code()` so it can be tested at its real boundary.
+The process exit code is the CI gate, and it is suite-kind aware:
+
+- **Regression suite, no baseline:** `0` iff every case passed, else `1`.
+- **Regression suite, with `--baseline`:** `0` iff every failing case is excused,
+  i.e. `1` if any case fails that is not `Unverifiable` (comparability key changed)
+  or `flaky (unconfirmed regression)`. Confirmed per-case Pass to Fail flips gate;
+  aggregate score or token deltas never do.
+- **Capability suite:** always `0` unless a case ERRORED (a run error, not a check
+  failure), which still exits `1`.
+
+The decision is the pure function
+`SuiteReport::exit_code(kind, comparison)` so it can be tested at its real boundary.
 
 ## Run receipts and record dumps
 

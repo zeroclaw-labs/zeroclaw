@@ -1,14 +1,149 @@
 //! `zeroclaw eval` — run the agent evaluation harness.
 
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
+use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
 use zeroclaw_eval::{CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 
 /// Where failed-case records are auto-dumped on every run.
 pub const AUTO_DUMP_DIR: &str = "target/eval-last-run";
+
+/// Post-run options gathered from the `eval run` flags.
+pub struct FinalizeOpts {
+    pub format: OutputFormat,
+    pub dump_records: Option<PathBuf>,
+    pub baseline: Option<PathBuf>,
+    pub write_baseline: Option<PathBuf>,
+    pub suite_kind: Option<SuiteKind>,
+}
+
+/// Handle the post-run flow (dumps, baselines, comparison, printing) and return
+/// the process exit code. Kept together so `main` only wires flags.
+pub async fn finalize(
+    config: &Config,
+    mode: Mode,
+    suite_path: &Path,
+    report: SuiteReport,
+    opts: FinalizeOpts,
+) -> Result<i32> {
+    let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
+    print_report(&report, opts.format);
+
+    let wrote_auto = write_dumps(
+        &report,
+        opts.dump_records.as_deref(),
+        Path::new(AUTO_DUMP_DIR),
+    )?;
+    if wrote_auto && opts.format == OutputFormat::Table {
+        println!("  failed-case records: {AUTO_DUMP_DIR}/");
+    }
+
+    // --write-baseline: persist the run and exit with its normal code.
+    if let Some(path) = &opts.write_baseline {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, Baseline::from_report(&report).to_json())?;
+        return Ok(report.exit_code(kind, None));
+    }
+
+    // --baseline: compare, apply the live flakiness rule, and report.
+    let comparison = match &opts.baseline {
+        Some(path) => {
+            let baseline = Baseline::from_json(&std::fs::read_to_string(path)?)?;
+            let mut cmp = baseline::compare(&report, &baseline);
+            if mode == Mode::Live {
+                let rerun_passed =
+                    Box::pin(rerun_live_regressions(config, suite_path, &cmp)).await?;
+                let flaky = baseline::downgrade_flaky_regressions(&mut cmp, mode, &rerun_passed);
+                if opts.format == OutputFormat::Table {
+                    for id in &flaky {
+                        println!("  flaky (unconfirmed regression): {id}");
+                    }
+                }
+            }
+            if opts.format == OutputFormat::Table {
+                print_comparison(&cmp, kind, &report, &baseline);
+            }
+            Some(cmp)
+        }
+        None => {
+            if kind == SuiteKind::Capability && opts.format == OutputFormat::Table {
+                println!("  {}", report.capability_summary(None));
+            }
+            None
+        }
+    };
+
+    Ok(report.exit_code(kind, comparison.as_ref()))
+}
+
+/// Re-run each regressed case once against the same config, returning whether the
+/// single re-run passed, keyed by case id. Used only for live suites.
+async fn rerun_live_regressions(
+    config: &Config,
+    suite_path: &Path,
+    comparison: &baseline::BaselineComparison,
+) -> Result<BTreeMap<String, bool>> {
+    let regressed: Vec<&str> = comparison
+        .per_case
+        .iter()
+        .filter(|(_, c)| matches!(c, CaseComparison::Regression { .. }))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut out = BTreeMap::new();
+    if regressed.is_empty() {
+        return Ok(out);
+    }
+    let traces = zeroclaw_eval::case::load_suite(suite_path)?;
+    let deps = build_run_deps(config, Mode::Live)?;
+    for (_, trace) in &traces {
+        let id = trace.display_id();
+        if regressed.contains(&id) {
+            let passed = matches!(
+                Box::pin(zeroclaw_eval::run_case(trace, &deps)).await,
+                Ok(outcome) if outcome.grades.iter().all(|g| g.passed)
+            );
+            out.insert(id.to_string(), passed);
+        }
+    }
+    Ok(out)
+}
+
+/// Print a compact per-case comparison summary.
+fn print_comparison(
+    comparison: &baseline::BaselineComparison,
+    kind: SuiteKind,
+    report: &SuiteReport,
+    baseline: &Baseline,
+) {
+    println!("\n  baseline comparison:");
+    for (id, c) in &comparison.per_case {
+        let line = match c {
+            CaseComparison::New => "new".to_string(),
+            CaseComparison::Removed => "removed (warn) - in baseline, absent now".to_string(),
+            CaseComparison::Unverifiable => "changed - refresh baseline".to_string(),
+            CaseComparison::Improvement => "improvement".to_string(),
+            CaseComparison::FlakyUnconfirmed => "flaky (unconfirmed regression)".to_string(),
+            CaseComparison::Regression { categories } => {
+                let cats: Vec<&str> = categories.iter().map(|c| c.as_str()).collect();
+                format!("REGRESSION ({})", cats.join(", "))
+            }
+            CaseComparison::Unchanged { token_delta_pct } => match token_delta_pct {
+                Some(pct) => format!("unchanged (tokens {pct:+.0}%)"),
+                None => "unchanged".to_string(),
+            },
+        };
+        println!("    {id}: {line}");
+    }
+    if kind == SuiteKind::Capability {
+        println!("  {}", report.capability_summary(Some(baseline)));
+    }
+}
 
 /// Build the per-run dependencies for the requested mode, threading the loaded
 /// config so live mode can resolve its provider. Replay injects the deterministic

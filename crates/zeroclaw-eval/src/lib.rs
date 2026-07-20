@@ -1,5 +1,6 @@
 //! Agent evaluation harness for ZeroClaw.
 
+pub mod baseline;
 pub mod case;
 pub mod grader;
 pub mod live;
@@ -19,7 +20,7 @@ pub use runner::{CaseOutcome, RunDeps, ensure_live_provider, run_case, run_suite
 use std::str::FromStr;
 
 /// How an evaluation suite is executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Deterministic replay against scripted LLM responses — no network, no cost.
