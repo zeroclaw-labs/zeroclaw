@@ -37,7 +37,8 @@ Subagents must set their working directory to the repository root before shell o
 
 ## User-Facing Text
 
-- User-facing CLI, tool, onboarding, and dashboard text uses Fluent `fl!()` keys rather than bare literals.
+- User-facing runtime CLI, tool, and onboarding text uses Fluent `fl!()` keys rather than bare literals.
+- Zerocode uses its independent Fluent catalogue through its documented `crate::i18n` helpers. Web dashboard text follows the TypeScript `web/src/lib/i18n.ts` contract, not Rust `fl!()`.
 - Logs, tracing fields, and panic text remain English and use stable error keys where the logging contract requires them.
 - English Markdown is the documentation source of truth. Follow the documented localization workflow instead of editing generated translations by hand.
 

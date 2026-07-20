@@ -97,7 +97,7 @@ These files are consumed by skills or development tooling. Do not move or delete
 | File | Consumer |
 | --- | --- |
 | `docs/book/src/contributing/pr-review-protocol.md` | PR review skill |
-| `docs/book/src/maintainers/changelog-generation.md` | Changelog skill |
+| `.claude/skills/changelog-generation/SKILL.md` | Changelog skill loader and release runbook |
 | `docs/book/src/maintainers/reviewer-playbook.md` | Issue triage skill |
 | `docs/book/src/maintainers/pr-workflow.md` | Issue triage and maintainer workflow |
 | `docs/book/src/contributing/privacy.md` | Issue and PR privacy gates |
