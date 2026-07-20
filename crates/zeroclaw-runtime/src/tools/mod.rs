@@ -400,7 +400,10 @@ pub fn register_skill_tools_with_context_and_runtime(
     );
 }
 
-pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<dyn Tool>> {
+pub async fn collect_mcp_elevation_arcs(
+    registry: &Arc<McpRegistry>,
+    security: &Arc<zeroclaw_config::policy::SecurityPolicy>,
+) -> Vec<Arc<dyn Tool>> {
     let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
     for name in registry.tool_names() {
         if let Some(def) = registry.get_tool_def(&name).await {
@@ -408,6 +411,7 @@ pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<
                 name,
                 def,
                 Arc::clone(registry),
+                Arc::clone(security),
             )));
         }
     }

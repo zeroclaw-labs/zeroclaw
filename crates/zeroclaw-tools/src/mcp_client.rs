@@ -839,11 +839,16 @@ impl McpRegistry {
     }
 
     /// Execute a tool by prefixed name.
+    ///
+    /// Returns the raw JSON-RPC result value. Callers that surface the result
+    /// to the model should run
+    /// [`crate::embedded_resource::format_mcp_tool_result_for_model`] so
+    /// `resource`+`blob` content is materialized instead of pretty-printed.
     pub async fn call_tool(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String> {
+    ) -> Result<serde_json::Value> {
         let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -854,11 +859,9 @@ impl McpRegistry {
             );
             anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
         })?;
-        let result = self.servers[*server_idx]
+        self.servers[*server_idx]
             .call_tool(original_name, arguments)
-            .await?;
-        serde_json::to_string_pretty(&result)
-            .with_context(|| format!("failed to serialize result of MCP tool `{prefixed_name}`"))
+            .await
     }
 
     pub fn is_empty(&self) -> bool {

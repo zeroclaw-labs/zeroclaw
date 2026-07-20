@@ -1,7 +1,6 @@
 //! Materialize embedded `resource.blob` payloads into the session workspace.
-//! Store-agnostic: no RPC `SessionStore` / `file/attach`. Used by ACP inbound
-//! prompt intake; the store-agnostic helper is reusable by other protocol
-//! adapters.
+//! Store-agnostic: no RPC `SessionStore` / `file/attach`. Shared by ACP inbound
+//! and MCP tools/call postprocessing.
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -197,6 +196,102 @@ fn write_blob_atomic(
     Ok(())
 }
 
+/// Whether an MCP tools/call content item is a `resource` with a `blob` field.
+pub fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(|t| t.as_str()) == Some("resource")
+        && item
+            .get("resource")
+            .and_then(|r| r.get("blob"))
+            .and_then(|b| b.as_str())
+            .is_some()
+}
+
+/// Format an MCP `tools/call` result for the model.
+///
+/// When `content` contains any `type: "resource"` item with `blob`, materialize
+/// each blob under `{workspace}/uploads/`, and return provenance text (non-blob
+/// content) plus Document/IMAGE markers — never the raw base64. Results without
+/// resource blobs keep the existing pretty-printed JSON shape.
+pub fn format_mcp_tool_result_for_model(
+    result: &serde_json::Value,
+    workspace_dir: &Path,
+) -> Result<String, EmbeddedResourceError> {
+    let Some(content) = result.get("content").and_then(|c| c.as_array()) else {
+        return Ok(serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()));
+    };
+
+    if !content.iter().any(content_item_has_resource_blob) {
+        return Ok(serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        parts.push("[tool reported an error]".to_string());
+    }
+    for item in content {
+        let typ = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match typ {
+            "text" => {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    parts.push(text.to_string());
+                }
+            }
+            "resource" => {
+                let Some(res) = item.get("resource") else {
+                    continue;
+                };
+                if let Some(blob) = res.get("blob").and_then(|b| b.as_str()) {
+                    if let Some(text) = res.get("text").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                    {
+                        parts.push(text.to_string());
+                    }
+                    let uri = res.get("uri").and_then(|v| v.as_str());
+                    let mime = res.get("mimeType").and_then(|v| v.as_str());
+                    // Degrade per-item: a single malformed/oversized blob must not
+                    // discard sibling text or other valid blobs.
+                    match materialize_resource_blob(workspace_dir, uri, mime, blob) {
+                        Ok(materialized) => parts.push(materialized.marker),
+                        Err(e) => parts.push(format!("[attachment unavailable: {e}]")),
+                    }
+                } else if let Some(text) = res.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    parts.push(text.to_string());
+                }
+            }
+            "resource_link" => {
+                // Reference-only content: never has a blob. Emit a small marker;
+                // never embed base64.
+                let uri = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("link");
+                parts.push(format!("[link: {name} — {uri}]"));
+            }
+            "image" | "audio" => {
+                // Base64 lives in a `data` field; emit a concise marker so we never
+                // dump the raw payload into model-visible text.
+                let mime = item
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream");
+                parts.push(format!("[{typ} attachment: {mime}]"));
+            }
+            _ => {
+                // Leave unknown content types out of the rewritten surface so we
+                // never dump sibling base64 payloads alongside materialized blobs.
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(parts.join("\n\n"))
+    }
+}
+
 fn filename_from_uri(uri: Option<&str>) -> String {
     let Some(uri) = uri.map(str::trim).filter(|s| !s.is_empty()) else {
         return "upload.bin".to_string();
@@ -266,6 +361,7 @@ fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -386,5 +482,225 @@ mod tests {
             bytes,
             "length-only dedup handed back substituted content"
         );
+    }
+
+    #[test]
+    fn mcp_intake_materializes_blob_and_omits_base64() {
+        let dir = tempdir().unwrap();
+        let bytes = b"%PDF-1.4 fake";
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "Fetched original" },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("Fetched original"));
+        assert!(out.contains("[Document: report.pdf]"));
+        assert!(
+            !out.contains(&b64),
+            "base64 must not reach the model: {out}"
+        );
+        let uploads = dir.path().join("uploads");
+        assert!(uploads.exists());
+        let entries: Vec<_> = std::fs::read_dir(&uploads).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        let path = entries[0].as_ref().unwrap().path();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mcp_intake_image_blob_uses_image_marker() {
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img");
+        let result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///a.png",
+                    "mimeType": "image/png",
+                    "blob": b64,
+                }
+            }]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.starts_with("[IMAGE:"));
+        assert!(!out.contains(&b64));
+    }
+
+    #[test]
+    fn mcp_intake_bad_base64_degrades_per_item() {
+        // A single malformed blob must degrade to an inline marker, not Err.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///x.bin",
+                    "blob": "%%%",
+                }
+            }]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("[attachment unavailable:"));
+        assert!(out.to_lowercase().contains("base64"));
+    }
+
+    #[test]
+    fn mcp_intake_oversized_blob_degrades_per_item() {
+        let dir = tempdir().unwrap();
+        let big = vec![0u8; (MAX_EMBEDDED_FILE_BYTES as usize) + 1];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &big);
+        let result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///big.bin",
+                    "blob": b64,
+                }
+            }]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("[attachment unavailable:"));
+        assert!(out.contains("MB") || out.contains("limit"));
+    }
+
+    #[test]
+    fn mcp_intake_degrades_bad_blob_keeps_sibling_text() {
+        // Valid text sibling must survive when a neighbouring blob is malformed.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "keep me" },
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///x.bin", "blob": "%%%" }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("keep me"));
+        assert!(out.contains("[attachment unavailable:"));
+    }
+
+    #[test]
+    fn mcp_intake_resource_link_yields_link_marker() {
+        // resource_link (no blob) is rendered as a reference marker with its uri.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                },
+                {
+                    "type": "resource_link",
+                    "uri": "https://example.com/spec",
+                    "name": "The Spec",
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("[link: The Spec — https://example.com/spec]"));
+        assert!(!out.contains(&b64));
+    }
+
+    #[test]
+    fn mcp_intake_image_item_yields_marker_not_base64() {
+        // A non-resource `image` block emits a marker, never its base64 data.
+        let dir = tempdir().unwrap();
+        let doc_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
+        let img_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"this-is-the-raw-image-data",
+        );
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": doc_b64,
+                    }
+                },
+                {
+                    "type": "image",
+                    "data": img_b64,
+                    "mimeType": "image/png",
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("[image attachment: image/png]"));
+        assert!(
+            !out.contains(&img_b64),
+            "raw image base64 must not reach the model: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_iserror_yields_error_marker() {
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
+        let result = json!({
+            "isError": true,
+            "content": [
+                { "type": "text", "text": "boom" },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("[tool reported an error]"));
+        assert!(out.contains("boom"));
+    }
+
+    #[test]
+    fn mcp_intake_without_blob_keeps_pretty_json() {
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{ "type": "text", "text": "plain" }]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(out.contains("\"type\": \"text\"") || out.contains("\"type\":\"text\""));
+        assert!(out.contains("plain"));
+        assert!(!dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_gates_on_shape_not_tool_name() {
+        // Shape gate: resource+blob is enough; no tool-name checks.
+        assert!(content_item_has_resource_blob(&json!({
+            "type": "resource",
+            "resource": { "uri": "u", "blob": "YQ==" }
+        })));
+        assert!(!content_item_has_resource_blob(&json!({
+            "type": "resource",
+            "resource": { "uri": "u", "text": "hi" }
+        })));
+        assert!(!content_item_has_resource_blob(&json!({
+            "type": "text",
+            "text": "hi"
+        })));
     }
 }
