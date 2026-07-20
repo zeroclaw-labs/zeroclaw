@@ -749,13 +749,11 @@ impl AcpServer {
             Ok(agent) => agent,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
-                let model_provider = self
-                    .config
+                let model_provider = config
                     .agent(&agent_alias)
                     .map(|a| a.model_provider.to_string())
                     .unwrap_or_default();
-                let model = self
-                    .config
+                let model = config
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|mp| mp.model.clone())
                     .unwrap_or_default();
@@ -2649,11 +2647,7 @@ mod tests {
         );
         config.agents.insert(
             "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "openrouter.default".into(),
-                risk_profile: "default".into(),
-                ..Default::default()
-            },
+            dispatchable_test_agent("openrouter.default"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
