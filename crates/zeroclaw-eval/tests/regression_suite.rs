@@ -1,7 +1,7 @@
 //! The CI gate: every fixture in evals/regression must replay green.
 
 use std::path::PathBuf;
-use zeroclaw_eval::{Mode, run_suite};
+use zeroclaw_eval::{RunDeps, run_suite};
 
 fn regression_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals/regression")
@@ -9,7 +9,7 @@ fn regression_dir() -> PathBuf {
 
 #[tokio::test]
 async fn regression_suite_replays_green() {
-    let report = run_suite(&regression_dir(), Mode::Replay)
+    let report = run_suite(&regression_dir(), &RunDeps::replay())
         .await
         .expect("regression suite must load and run");
     assert!(

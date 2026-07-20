@@ -14,7 +14,7 @@ harness is configured under `[eval]` and invoked as a CLI subcommand.
 | Mode | What it does | Cost | CI |
 |---|---|---|---|
 | `replay` | Replays scripted LLM responses from the fixture through the agent loop. Fully deterministic, no network. | Free | Gated (default) |
-| `live` | Executes cases against a real provider (planned; see the live-mode section once it lands). | Real tokens | Never by default |
+| `live` | Executes cases against a real provider inside a per-case sandbox (see "Live mode"). | Real tokens | Never by default |
 
 ## Suite taxonomy
 
@@ -41,6 +41,33 @@ zeroclaw eval run --suite evals/regression --format json
 `--suite` overrides `[eval].suite_dir`; `--mode` overrides `[eval].mode`. Suite
 loading is non-recursive: only direct `*.json` children of the suite directory
 are cases.
+
+## Live mode
+
+Live mode (`--mode live`) runs each case against a real configured provider, so it
+costs real tokens and produces non-deterministic output. It is opt-in and never
+runs in CI by default. Enable it by setting `[eval].live_provider` to a dotted
+`providers.models` reference (e.g. `"anthropic.sonnet"`); an empty value keeps live
+mode disabled.
+
+A live case omits scripted `steps` (the provider produces the responses) and may
+declare `tools` it needs and a `setup.workspace_files` map to seed the workspace.
+The requested tools are intersected with `[eval].live_allowed_tools`; the default
+(empty) allows no real tools, so a case that needs tools requires the operator to
+opt in explicitly.
+
+Each live case runs inside a sandbox:
+
+| Control | Behavior |
+|---|---|
+| Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
+| Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`; empty allowlist yields only the harmless echo tool. |
+| Autonomy | `Supervised`, never `Full`. |
+| Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
+| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+
+Because live output is non-deterministic and can embed workspace content, live runs
+belong in the planned `evals/live/` suite, not the gating regression suite.
 
 ## Exit-code contract
 
