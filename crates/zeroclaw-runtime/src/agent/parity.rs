@@ -246,6 +246,7 @@ async fn parity_l2_builtin_filter_semantic_parity() {
         exclude_memory: false,
         list_deferred_mcp_specs: false,
         emit_assembly_logs: false,
+        mcp_registry: None,
     })
     .await;
     let seam_names = retained_names(&assembled.registry.into_inner());

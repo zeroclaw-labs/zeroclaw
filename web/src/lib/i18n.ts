@@ -1400,6 +1400,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_call_prefix': '[Tool Call]',
     'agent.tool_result_prefix': '[Tool Result]',
     'agent.error_prefix': '[Error]',
+    'agent.history_trimmed': 'Earlier conversation history was trimmed: {reason} ({dropped} messages dropped; {kept} turns kept).',
+    'agent.history_trimmed_unknown_reason': 'history limit exceeded',
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',
     'agent.copy_message': 'Copy message',

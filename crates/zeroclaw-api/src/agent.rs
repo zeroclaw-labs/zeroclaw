@@ -38,9 +38,9 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
-    /// Older whole turns were dropped from the context window to fit the token
-    /// budget. Surfaces a user-visible "context was cut here" marker so trimming
-    /// is never silent. Emitted once per turn boundary when a trim occurs.
+    /// Older whole turns were dropped to fit either the context token budget or
+    /// the configured message limit. Surfaces a user-visible "context was cut
+    /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
     HistoryTrimmed {
         dropped_messages: usize,
         kept_turns: usize,
