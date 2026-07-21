@@ -13,7 +13,88 @@ SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir`
 
 Each SOP must have `SOP.toml`. `SOP.md` is optional, but runs with no parsed steps will fail validation.
 
-## 2. `SOP.toml`
+## 2. Authoring Boundary
+
+The file-backed representation still contains a manifest file plus `SOP.md`.
+This page intentionally does not enumerate manifest fields or provide
+hand-authored manifest examples.
+
+Use this page for the syntax that remains visible when reviewing, validating, or
+debugging SOPs: `SOP.md` step bullets, trigger field summaries generated from
+the runtime schema, and `condition` expressions. Before running a generated or
+checked-in SOP, validate it with `zeroclaw sop validate <name>`.
+
+`SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
+`triggers`, and its execution knobs. The concurrency-admission fields govern what
+happens when a trigger arrives while this SOP's execution slots are full:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. |
+| `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
+| `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
+
+`admission_policy` values (`SopAdmissionPolicy`, snake_case):
+
+- `parallel` (default) - admit up to `max_concurrent`; a trigger that cannot admit
+  now is **deferred** (surfaced for backpressure/redelivery on the trigger's
+  transport), never silently dropped. Best for independent work (e.g.
+  PR-approval SOPs).
+- `hold` - serialize: admit only when no run of this SOP is active or parked;
+  other triggers are deferred. For pipelines whose pre-approval steps must not
+  overlap.
+- `coalesce` - collapse a concurrent trigger onto the already-in-flight run (the
+  in-flight run's latest state already covers it).
+- `drop` - legacy fire-and-forget: a trigger that cannot admit is dropped.
+  Explicit opt-in only; never the default.
+
+A deferred trigger's recovery is transport-dependent - there is no in-engine
+durable pending-trigger queue in this version (that is a separate follow-up):
+
+- **AMQP** (`durable_ack = true`, SOP-only dispatch): the delivery is nacked
+  (`requeue = true`) so the broker retries it once there is room.
+- **AMQP combined `sop_and_agent_loop`**: the agent side already consumed the
+  delivery, so a backpressured SOP overflow is logged loudly and ACKed (not
+  redelivered), to avoid double-running the agent side.
+- **MQTT / cron / filesystem / channel-router** (and any other headless source
+  that only logs its dispatch results): no per-message redelivery, so a
+  deferred trigger is dropped after a loud log (the next
+  scheduled/published/observed trigger is the only recovery).
+
+```toml
+[sop]
+name = "deploy-prod"
+description = "Production deploy with approval"
+version = "1.0.0"
+max_concurrent = 1
+admission_policy = "hold"
+max_pending_approvals = 8
+
+[[triggers]]
+type = "manual"
+```
+
+Approval broker groups and policies live in the main ZeroClaw config, not in
+per-SOP `SOP.toml` files. A step can reference a configured policy by name with
+`- policy: prod` in `SOP.md`:
+
+```toml
+[sop.approval.groups.release]
+members = ["http:<paired-token-subject>", "agent:release-bot"]
+
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+escalation_route = "oncall"
+```
+
+`[sop.approval.groups.*]` members are approval identities, not account names.
+Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
+`agent:<alias>`) to grant approval rights on one transport only, or bare
+(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+approval surfaces use the paired-token subject; the current CLI approval path
+(`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
+membership yet.
 
 ## 3. `SOP.md` Step Format
 
@@ -28,9 +109,39 @@ Steps are parsed from the `## Steps` section.
 2. **Deploy** — Run deployment command.
    - tools: shell
    - requires_confirmation: true
+   - policy: prod
    - input: {"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}
    - output: {"type":"object","required":["digest"],"properties":{"digest":{"type":"string"}}}
    - next: 3
+```
+
+Routing and approval bullets can be combined in the same `SOP.md` steps:
+
+```md
+## Steps
+
+1. **Classify event** — Inspect the incoming payload.
+   - output: {"type":"object","required":["severity"],"properties":{"severity":{"type":"string"}}}
+   - when: $.steps.1.severity == "critical"
+   - next: 2
+
+2. **Prepare summary** — Build the operator-facing remediation plan.
+   - depends_on: 1
+   - on_failure: retry:2
+   - next: 3
+
+3. **Approval gate** — Require explicit approval before changing state.
+   - kind: checkpoint
+   - requires_confirmation: true
+   - next: 4
+
+4. **Apply remediation** — Execute the approved action.
+   - tools: shell
+   - allow-tools: shell
+   - on_failure: goto:5
+
+5. **Notify operator** — Send a failure notice for follow-up.
+   - tools: http_request
 ```
 
 Parser behavior:
@@ -39,13 +150,50 @@ Parser behavior:
 - Leading bold text (`**Title**`) becomes step title.
 - `- tools:` maps to `suggested_tools`.
 - `- requires_confirmation: true` enforces approval for that step.
+- `- kind:` accepts `execute` (default) or `checkpoint`. A checkpoint step
+  pauses deterministic execution at that step. Use `requires_confirmation: true`
+  when a step must require approval in any execution mode.
 - `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
+- `- when:` is a routing guard evaluated against accumulated completed-step
+  outputs after the current step finishes. When it does not match, the run
+  completes instead of dispatching another step.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- when:` guards an explicit `- next:` jump; when the condition is false, the
+  run advances to the next linear step (`current_step + 1`) instead of completing.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
+- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
+  that gates this step's approval with required-group membership and quorum. Omit
+  it for an unpoliced gate. A step that names a policy absent from
+  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
+  clearing on a single approval.
+
+### `[sop.approval]` policies and route delivery
+
+A policy may also route its approval out of band to a channel, so an approver can
+act without watching the surface that started the run:
+
+```toml
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+# Delivered when a run PARKS at a gate this policy governs.
+request_route = "discord.ops:123456789012345678"
+# Delivered only if that gate later TIMES OUT (a distinct second route).
+escalation_route = "discord.oncall:987654321098765432"
+```
+
+Both routes are `channel:recipient`: `channel` is a configured channel's map key
+(`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
+channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
+and never blocks or clears the gate - the approval itself still comes back through
+the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
+approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
+(where channels are configured); leave them unset (or empty) to notify only the
+originating surface, which is the default.
 
 ### Step Contract Enforcement
 
@@ -86,6 +234,20 @@ stored SOP proposals, capture completed run context into a candidate procedure,
 and apply an approved proposal to `SOP.toml`/`SOP.md`. Write-back only happens
 through the explicit `apply` action.
 
+### Run Durability
+
+The `[sop]` config also controls whether run state survives a daemon restart:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `persist_runs` | `true` | Persist run state - including runs parked at a HITL approval or a deterministic checkpoint - so they survive a restart. Set `false` for an in-memory-only, non-durable engine. |
+| `run_store_backend` | `"sqlite"` | Durable backend when `persist_runs` is true. `sqlite` writes `runs.db` under the run-state dir. |
+
+`persist_runs = true` is the default so a parked HITL approval is not lost on
+restart (`build_sop_engine` falls back to an in-memory store with a loud log if
+the durable backend cannot open, so this is default-safe); `persist_runs = false`
+is the documented opt-out for an ephemeral engine.
+
 ## 4. Trigger Types
 
 {{#sop-trigger-index}}
@@ -94,11 +256,78 @@ For the live-versus-unwired status of each source and the transport details, see
 
 ## 5. Condition Syntax
 
-`condition` is evaluated fail-closed (invalid condition/payload => no match).
+Trigger `condition` fields and step `when:` guards use the same expression
+grammar. Trigger conditions evaluate against the event payload. Step `when:`
+guards evaluate against accumulated completed-step outputs in this shape:
 
-- JSON path comparisons: `$.value > 85`, `$.status == "critical"`
-- Direct numeric comparisons: `> 0` (useful for simple payloads)
-- Operators: `>=`, `<=`, `!=`, `>`, `<`, `==`
+```json
+{
+  "steps": {
+    "1": {
+      "severity": "critical"
+    }
+  }
+}
+```
+
+Evaluation is fail-closed for invalid conditions, missing payloads, unresolved
+JSON paths, and direct numeric comparisons whose payload or comparand is not a
+number. An empty condition matches unconditionally.
+
+### JSON Path Form
+
+A condition beginning with `$` compares a value inside a JSON payload:
+`$.path.to.field <op> <value>`.
+
+| Expression | Payload | Matches |
+|---|---|---|
+| `$.value > 85` | `{"value":90}` | yes |
+| `$.value >= 85` | `{"value":85}` | yes |
+| `$.temp < 25` | `{"temp":20}` | yes |
+| `$.temp <= 25` | `{"temp":25}` | yes |
+| `$.status == "critical"` | `{"status":"critical"}` | yes |
+| `$.status != "error"` | `{"status":"ok"}` | yes |
+| `$.count == 42` | `{"count":42}` | yes |
+| `$.data.sensor.value > 85` | `{"data":{"sensor":{"value":87.3}}}` | yes |
+| `$.readings.1 == 20` | `{"readings":[10,20,30]}` | yes |
+| `$.active == "true"` | `{"active":true}` | yes |
+| `$.nonexistent > 0` | `{"value":90}` | no |
+
+Path rules:
+
+- Use dot-separated segments. Array elements use a numeric segment such as
+  `$.readings.1`; bracket syntax is not supported.
+- Missing keys, out-of-range array indexes, invalid JSON, and empty payloads
+  fail closed.
+- There are no wildcards, filters, recursive descent, or built-in variables.
+
+### Direct Numeric Form
+
+A condition with no leading `$` compares the whole payload as a number. This is
+useful for scalar event payloads.
+
+| Expression | Payload | Matches |
+|---|---|---|
+| `> 0` | `1` | yes |
+| `> 0` | `0` | no |
+| `>= 5` | `6` | yes |
+| `< 100` | `50` | yes |
+| `== 42` | `42` | yes |
+| `!= 0` | `1` | yes |
+| `> 3.14` | `3.15` | yes |
+| `> 0` | `not a number` | no |
+
+### Operators
+
+A comparison uses one operator, matched longest-first: `>=`, `<=`, `!=`, `==`,
+`>`, `<`. JSON-path comparisons try numeric comparison first. If both sides
+parse as numbers, they compare numerically; otherwise values compare as strings.
+Surrounding double quotes on the comparand are stripped, so quote string
+literals: `$.status == "critical"`. Direct numeric conditions are numeric-only:
+if either side does not parse as a number, there is no match.
+
+A condition is a single comparison. Logical combinators such as `AND`, `OR`,
+and `NOT` are not supported.
 
 ## 6. Validation
 

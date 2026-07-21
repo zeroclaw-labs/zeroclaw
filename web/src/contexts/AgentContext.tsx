@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, listProps, getStatus, getSessionMessages, getSessionState, abortSession, deleteSession } from '@/lib/api';
+import { ApiError, HttpError, UnauthorizedError, getProp, putProp, listProps, getStatus, getSessionMessages, getSessionState, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -36,6 +36,8 @@ export interface ChatMessage {
    * as fake assistant replies on reload. See #7137.
    */
   ephemeral?: boolean;
+  /** User-visible lifecycle notice, rendered distinctly from agent output. */
+  notice?: boolean;
 }
 
 interface AgentContextValue {
@@ -84,6 +86,28 @@ export function useAgent() {
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
 const SESSION_RECOVERY_POLL_MS = 500;
+const SESSION_RECOVERY_MAX_POLL_MS = 4_000;
+const SESSION_RECOVERY_MAX_FAILURES = 6;
+
+function sessionRecoveryStatus(error: unknown): number | null {
+  if (
+    error instanceof ApiError
+    || error instanceof HttpError
+    || error instanceof UnauthorizedError
+  ) {
+    return error.status;
+  }
+  return null;
+}
+
+function isTerminalSessionRecoveryError(error: unknown): boolean {
+  const status = sessionRecoveryStatus(error);
+  return status !== null
+    && status >= 400
+    && status < 500
+    && status !== 408
+    && status !== 429;
+}
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -380,6 +404,27 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         break;
       }
 
+      case 'history_trimmed': {
+        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
+        const content = t('agent.history_trimmed')
+          .replace('{reason}', reason)
+          .replace('{dropped}', String(msg.dropped_messages ?? 0))
+          .replace('{kept}', String(msg.kept_turns ?? 0));
+        localMessageMutationVersionRef.current += 1;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: generateUUID(),
+            role: 'agent' as const,
+            content,
+            timestamp: new Date(),
+            ephemeral: true,
+            notice: true,
+          },
+        ]);
+        break;
+      }
+
       case 'approval_request': {
         // Supervised-mode tool consent prompt. Backend parks on a oneshot
         // until we send `approval_response`; if the socket closes or the
@@ -454,20 +499,40 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // while its session-state request is still in flight.
     setTyping(true);
 
-    let sessionState;
-    while (isCurrent()) {
-      try {
-        sessionState = await getSessionState(sessionIdRef.current);
-        break;
-      } catch {
-        // Lifecycle uncertainty is fail-closed. The endpoint returns idle for
-        // a genuinely new session, so errors here are transient/auth failures
-        // rather than evidence that it is safe to accept another prompt.
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, SESSION_RECOVERY_POLL_MS);
-        });
+    let recoveryFailures = 0;
+    let recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
+    const readSessionState = async () => {
+      while (isCurrent()) {
+        try {
+          const state = await getSessionState(sessionIdRef.current);
+          recoveryFailures = 0;
+          recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
+          return state;
+        } catch (recoveryError) {
+          recoveryFailures += 1;
+          if (
+            isTerminalSessionRecoveryError(recoveryError)
+            || recoveryFailures >= SESSION_RECOVERY_MAX_FAILURES
+          ) {
+            // Lifecycle uncertainty remains fail-closed: surface the failure,
+            // but leave typing=true so another prompt cannot start while the
+            // canonical turn state is unknown.
+            if (isCurrent()) setError(t('agent.session_recovery_error'));
+            return null;
+          }
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, recoveryDelayMs);
+          });
+          recoveryDelayMs = Math.min(
+            recoveryDelayMs * 2,
+            SESSION_RECOVERY_MAX_POLL_MS,
+          );
+        }
       }
-    }
+      return null;
+    };
+
+    let sessionState = await readSessionState();
     if (!sessionState || !isCurrent()) return;
     if (sessionState.state === 'running') {
       setPendingApproval(null);
@@ -477,12 +542,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           setTimeout(resolve, SESSION_RECOVERY_POLL_MS);
         });
         if (!isCurrent()) return;
-        try {
-          sessionState = await getSessionState(sessionIdRef.current);
-        } catch {
-          // Keep the UI read-only while lifecycle state is temporarily unknown.
-          continue;
-        }
+        sessionState = await readSessionState();
+        if (!sessionState) return;
       }
     }
     if (!isCurrent()) return;

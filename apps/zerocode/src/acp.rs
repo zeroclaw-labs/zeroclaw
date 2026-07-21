@@ -70,6 +70,10 @@ impl Acp {
         self.inner.wants_quit_chord()
     }
 
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        self.inner.take_help_request()
+    }
+
     pub(crate) fn exit_browse_mode(&mut self) {
         self.inner.exit_browse_mode();
     }
