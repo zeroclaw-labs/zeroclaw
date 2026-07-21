@@ -21,6 +21,10 @@ task_local! {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn maybe_run_skill_review(
+    // Full config, for resolving the configured `vision_model_provider`'s
+    // alias-specific options on the review fork's vision route. `None` on
+    // configless (test) paths; the production caller (`run`) threads `Some`.
+    full_config: Option<&zeroclaw_config::schema::Config>,
     workspace_dir: PathBuf,
     config: SkillImprovementConfig,
     allow_scripts: bool,
@@ -91,6 +95,7 @@ pub async fn maybe_run_skill_review(
                         silent: true,
                         approval: None,
                         multimodal_config: multimodal,
+                        config: full_config,
                         hooks: None,
                         activated_tools: None,
                         model_switch_callback: None,

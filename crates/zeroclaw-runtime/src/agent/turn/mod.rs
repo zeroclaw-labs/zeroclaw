@@ -210,6 +210,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         silent,
         approval,
         multimodal_config,
+        config,
         max_tool_iterations,
         hooks,
         excluded_tools,
@@ -518,20 +519,25 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (vision_model_provider_box, degrade_strip_images) =
-            resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
+        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
+            config,
+            model_provider,
+            history,
+            multimodal_config,
+            provider_name,
+            model,
+        )?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,
             &str,
             &str,
-        ) = if let Some(ref vp_box) = vision_model_provider_box {
-            let vp_name = multimodal_config
-                .vision_model_provider
-                .as_deref()
-                .unwrap_or(provider_name);
-            let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
-            (vp_box.as_ref(), vp_name, vm)
+        ) = if let Some(ref resolved) = vision_model_provider_box {
+            (
+                resolved.provider.as_ref(),
+                resolved.provider_name.as_str(),
+                resolved.model.as_str(),
+            )
         } else {
             (model_provider, provider_name, model)
         };
@@ -1065,6 +1071,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 silent,
                 approval,
                 multimodal_config,
+                config,
                 max_tool_iterations,
                 hooks,
                 excluded_tools,
@@ -1499,6 +1506,9 @@ async fn drive_live_sop_actions(
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    // Full config so the live-SOP sub-turn's vision route resolves the configured
+    // `vision_model_provider`'s alias options, exactly as the enclosing turn does.
+    config: Option<&zeroclaw_config::schema::Config>,
     max_tool_iterations: usize,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
@@ -1782,6 +1792,7 @@ async fn drive_live_sop_actions(
                                             silent,
                                             approval: eff_approval,
                                             multimodal_config,
+                                            config,
                                             hooks,
                                             activated_tools: eff_activated,
                                             model_switch_callback: model_switch_callback.clone(),
@@ -2776,6 +2787,7 @@ mod sop_step_reassembly_tests {
             true,
             None,
             &zeroclaw_config::schema::MultimodalConfig::default(),
+            None,
             5,
             None,
             &[],
