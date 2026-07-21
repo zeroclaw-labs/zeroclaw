@@ -857,6 +857,52 @@ impl QQChannel {
         Ok((upload_resp.file_info, upload_resp.ttl))
     }
 
+    /// Build the request body for a markdown text message (msg_type=2).
+    ///
+    /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
+    /// `send_text_markdown` so the body shape (including the optional
+    /// `msg_id` for passive group replies — see PR #9180 / tracker #7872)
+    /// can be asserted directly in tests.
+    fn build_text_markdown_body(content: &str, in_reply_to: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
+            "markdown": {
+                "content": content,
+            },
+            "msg_type": 2,
+            "msg_seq": next_msg_seq(),
+        });
+
+        // Include msg_id for passive group replies to avoid active-message permission requirements
+        if let Some(msg_id) = in_reply_to {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        body
+    }
+
+    /// Build the request body for a media message (msg_type=7).
+    ///
+    /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
+    /// `send_media_message` so the body shape (including the optional
+    /// `msg_id` for passive group replies — see PR #9180 / tracker #7872)
+    /// can be asserted directly in tests.
+    fn build_media_message_body(file_info: &str, in_reply_to: Option<&str>) -> serde_json::Value {
+        let mut body = json!({
+            "msg_type": 7,
+            "media": {
+                "file_info": file_info,
+            },
+            "msg_seq": next_msg_seq(),
+        });
+
+        // Include msg_id for passive group replies to avoid active-message permission requirements
+        if let Some(msg_id) = in_reply_to {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        body
+    }
+
     /// Send a media message (msg_type=7) with an already-uploaded file_info.
     async fn send_media_message(
         &self,
@@ -870,18 +916,7 @@ impl QQChannel {
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let mut body = json!({
-            "msg_type": 7,
-            "media": {
-                "file_info": file_info,
-            },
-            "msg_seq": next_msg_seq(),
-        });
-
-        // Include msg_id for passive group replies to avoid active-message permission requirements
-        if let Some(msg_id) = in_reply_to {
-            body["msg_id"] = json!(msg_id);
-        }
+        let body = Self::build_media_message_body(file_info, in_reply_to);
 
         let resp = self
             .http_client()
@@ -1234,18 +1269,7 @@ impl QQChannel {
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let mut body = json!({
-            "markdown": {
-                "content": content,
-            },
-            "msg_type": 2,
-            "msg_seq": next_msg_seq(),
-        });
-
-        // Include msg_id for passive group replies to avoid active-message permission requirements
-        if let Some(msg_id) = in_reply_to {
-            body["msg_id"] = json!(msg_id);
-        }
+        let body = Self::build_text_markdown_body(content, in_reply_to);
 
         let resp = self
             .http_client()
@@ -2197,6 +2221,73 @@ allowed_users = ["user1"]
         });
         assert_eq!(body["msg_type"], 7);
         assert_eq!(body["media"]["file_info"], file_info);
+    }
+
+    // --- Regression coverage for #7872: triggering msg_id propagation ---
+    //
+    // The tests above (`test_send_media_body_msg_type_7`,
+    // `test_send_body_uses_markdown_msg_type`) construct lookalike JSON
+    // bodies inline and would still pass if `build_media_message_body`
+    // or `build_text_markdown_body` dropped or corrupted the `msg_id`
+    // field. The tests below exercise the actual helpers that
+    // `send_media_message` and `send_text_markdown` use to build the
+    // outgoing request body, so removing the msg_id propagation would
+    // break them.
+
+    #[test]
+    fn regression_text_markdown_body_includes_msg_id_for_reply() {
+        let body = QQChannel::build_text_markdown_body("hello", Some("trigger_msg_42"));
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert_eq!(
+            body["msg_id"], "trigger_msg_42",
+            "passive group replies must echo the triggering msg_id \
+             (tracker #7872 / PR #9180) so QQ treats the message as a \
+             passive reply rather than an active send"
+        );
+    }
+
+    #[test]
+    fn regression_text_markdown_body_omits_msg_id_when_no_reply() {
+        let body = QQChannel::build_text_markdown_body("hello", None);
+
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hello");
+        assert!(
+            body.get("msg_id").is_none(),
+            "proactive (non-reply) sends must not carry an msg_id \
+             field — a stray msg_id would cause QQ to try to attach \
+             the message to a stale thread"
+        );
+    }
+
+    #[test]
+    fn regression_media_message_body_includes_msg_id_for_reply() {
+        let body = QQChannel::build_media_message_body("cached_file_info", Some("trigger_msg_99"));
+
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], "cached_file_info");
+        assert_eq!(
+            body["msg_id"], "trigger_msg_99",
+            "passive group media replies must echo the triggering \
+             msg_id (tracker #7872 / PR #9180) — same contract as the \
+             text path, since send_attachment threads in_reply_to \
+             through to send_media_message"
+        );
+    }
+
+    #[test]
+    fn regression_media_message_body_omits_msg_id_when_no_reply() {
+        let body = QQChannel::build_media_message_body("cached_file_info", None);
+
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], "cached_file_info");
+        assert!(
+            body.get("msg_id").is_none(),
+            "proactive (non-reply) media sends must not carry an msg_id \
+             field — same contract as the text path"
+        );
     }
 
     // --- compose_message_content tests (now async) ---
