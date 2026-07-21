@@ -13,9 +13,9 @@ messaging.
 
 {{#peer-group msteams}}
 
-Allowlist entries match the sender's **Entra (Azure AD) object ID** — stable
+Allowlist entries match the sender's **Entra (Azure AD) object ID** (stable
 across chats, visible under **Microsoft Entra ID → Users → (user) → Object
-ID** — or the raw Teams channel-scoped `29:…` ID carried on each message.
+ID**) or the raw Teams channel-scoped `29:…` ID carried on each message.
 Matching is case-insensitive.
 
 ## Quickstart
@@ -93,19 +93,19 @@ and must use distinct ports.
 Every activity POST from Teams carries a Bot Framework service JWT. The
 listener validates the RS256 signature against the issuer's published JWKS
 (fetched via OpenID discovery, cached, refreshed on key rotation), the
-audience (must equal `app_id`), the issuer, and expiry — all **before** the
+audience (must equal `app_id`), the issuer, and expiry, all **before** the
 request body is parsed. Requests that fail any check are rejected with 401.
 
 ## Message gating
 
 Inbound messages pass three gates, in order:
 
-1. `allow_dms` — when `false`, personal (1:1) chat messages are dropped
+1. `allow_dms`: when `false`, personal (1:1) chat messages are dropped
    entirely.
-2. `mention_only` — group-chat and team-channel messages must @-mention the
+2. `mention_only`: group-chat and team-channel messages must @-mention the
    bot (default on). Personal chats always bypass this gate; a DM is
    definitionally addressed to the bot.
-3. **Peer-group allowlist** — the sender must match the channel's peer group
+3. **Peer-group allowlist**: the sender must match the channel's peer group
    (empty group = deny everyone, `"*"` = allow everyone).
 
 `<at>…</at>` mention tags and HTML entities are stripped from the text before
@@ -118,7 +118,7 @@ Set `stream_mode = "partial"` for progressive responses:
 - **Personal chats** use Teams' native streaming protocol: a gray
   in-progress bubble shows status lines ("thinking", tool activity) and
   accumulating response text, then is replaced by the final message. Status
-  history disappears once the final message lands — this matches the
+  history disappears once the final message lands; this matches the
   built-in Copilot experience. The stream opens lazily on the first real
   status line or content chunk, so the bubble never flashes a `...`
   placeholder; answers that finish before any intermediate update arrive as
@@ -129,7 +129,7 @@ Set `stream_mode = "partial"` for progressive responses:
   answer is only an edit.
 
 Personal-chat updates are throttled by `draft_update_interval_ms` (default
-1000 ms — Teams rate-limits streaming updates to roughly one per second).
+1000 ms; Teams rate-limits streaming updates to roughly one per second).
 
 `stream_mode = "multi_message"` sends the response as separate messages at
 paragraph boundaries instead.
