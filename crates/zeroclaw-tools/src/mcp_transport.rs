@@ -125,12 +125,18 @@ pub trait McpTransportConn: Send + Sync {
 /// pooled for the daemon's lifetime, so one that is never polled again would
 /// otherwise stay defunct until shutdown.
 pub struct StdioTransport {
+    /// Write half of the server's stdin pipe. Held in an `Option` so teardown can
+    /// drop it: closing the pipe is what delivers EOF, and an EOF-driven server
+    /// needs that to exit on its own before the grace period lapses.
+    ///
+    /// Declared before `kill_tx` so an implicit drop of the transport closes this
+    /// pipe before the monitor is signalled, matching the order `close()` uses.
+    stdin: Option<tokio::process::ChildStdin>,
     /// Asks the monitor task to shut the server down (graceful exit within a
     /// grace period, then force-kill). Sending on it — or dropping it when the
     /// transport is dropped — triggers reaping; a server that exits on its own
     /// is reaped by the task regardless.
     kill_tx: Option<oneshot::Sender<()>>,
-    stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
@@ -188,7 +194,7 @@ impl StdioTransport {
         Ok((
             Self {
                 kill_tx: Some(kill_tx),
-                stdin,
+                stdin: Some(stdin),
                 stdout_lines,
             },
             pid,
@@ -196,15 +202,19 @@ impl StdioTransport {
     }
 
     async fn send_raw(&mut self, line: &str) -> Result<()> {
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::Error::msg("MCP server stdin already closed"))?;
+        stdin
             .write_all(line.as_bytes())
             .await
             .context("failed to write to MCP server stdin")?;
-        self.stdin
+        stdin
             .write_all(b"\n")
             .await
             .context("failed to write newline to MCP server stdin")?;
-        self.stdin.flush().await.context("failed to flush stdin")?;
+        stdin.flush().await.context("failed to flush stdin")?;
         Ok(())
     }
 
@@ -266,11 +276,20 @@ impl McpTransportConn for StdioTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
-        // Signal EOF so a well-behaved server exits (and reaps its own
-        // children), then ask the monitor task to reap it — force-killing only
-        // if it overstays the grace period. The reap runs in the task and its
-        // outcome is logged there, so this returns once shutdown is requested.
-        let _ = self.stdin.shutdown().await;
+        // Deliver EOF so a well-behaved server exits on its own (and reaps its
+        // own children), then ask the monitor task to reap it — force-killing
+        // only if it overstays the grace period. The reap runs in the task and
+        // its outcome is logged there, so this returns once shutdown is
+        // requested.
+        //
+        // Dropping the handle is what closes the pipe. `AsyncWriteExt::shutdown`
+        // is a no-op on a `ChildStdin` and leaves the write end open, so an
+        // EOF-driven server would never see the close and would always be
+        // force-killed instead of exiting gracefully.
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.flush().await;
+            drop(stdin);
+        }
         if let Some(tx) = self.kill_tx.take() {
             let _ = tx.send(());
         }
@@ -1603,6 +1622,11 @@ mod tests {
     /// zombie stays visible with state `Z`, and a still-running process stays
     /// visible in some other state, so only genuine reaping empties the output.
     /// Returns `false` if the pid is still present after the timeout.
+    ///
+    /// The probe fails closed: `ps` reports "no such process" only by exiting
+    /// non-zero with empty output, so a probe that errors or is unsupported
+    /// panics instead of being read as a successful disappearance. Otherwise a
+    /// broken probe would make every reap assertion below pass vacuously.
     #[cfg(unix)]
     async fn wait_until_reaped(pid: u32) -> bool {
         for _ in 0..200 {
@@ -1610,8 +1634,17 @@ mod tests {
                 .args(["-o", "stat=", "-p", &pid.to_string()])
                 .output()
                 .expect("run ps");
-            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-                return true;
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stat = stdout.trim();
+            match (out.status.code(), stat.is_empty()) {
+                // Listed with a state: still in the process table (running or zombie).
+                (Some(0), false) => {}
+                // Not listed: the pid is gone, so the process was reaped.
+                (Some(1), true) => return true,
+                other => panic!(
+                    "ps probe for pid {pid} is unusable ({other:?}, stdout {stat:?}, stderr {:?})",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1724,30 +1757,38 @@ mod tests {
         // Liveness is derived from the monitor task rather than from a `Child`
         // the transport owns, so it must still report a live server as healthy
         // and flip once that server exits and is reaped.
+        //
+        // The exit here is the server's own: the transport is neither closed nor
+        // dropped, so `kill_tx` is still held throughout. That is what makes this
+        // a test of the liveness signal — teardown would clear `kill_tx` outright
+        // and the final assertion would hold no matter what the monitor observed.
         let config = McpServerConfig {
             name: "health-lifetime".into(),
             transport: McpTransport::Stdio,
+            // Blocks on the read until the request below, then exits on its own.
+            args: vec!["-c".into(), "IFS= read -r _line; exit 0".into()],
             command: "sh".into(),
-            args: vec!["-c".into(), "cat".into()],
             ..Default::default()
         };
         let (mut transport, pid) =
             StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
         let pid = pid.expect("pid");
 
+        // Deterministically alive: the server cannot have exited before it is fed
+        // a line.
         assert!(
             transport.health_check(),
             "a running server must report healthy"
         );
 
-        transport.close().await.expect("close");
+        transport.send_raw("{}").await.expect("send request");
         assert!(
             wait_until_reaped(pid).await,
-            "MCP server pid {pid} not reaped after close()"
+            "MCP server pid {pid} not reaped after exiting on its own"
         );
         assert!(
             !transport.health_check(),
-            "a reaped server must not report healthy"
+            "a server that exited on its own must not report healthy"
         );
     }
 
@@ -1756,11 +1797,25 @@ mod tests {
     async fn stdio_close_reaps_server_process() {
         // `cat` stays alive until its stdin is closed, so close() drives the
         // graceful-exit-then-reap path.
+        //
+        // Reaping alone cannot tell a graceful exit from the force-kill
+        // fallback — both end with the pid gone. The server therefore writes a
+        // marker only *after* its stdin reaches EOF: a SIGKILL at the end of the
+        // grace period would take it down before that write, so the marker is
+        // what proves close() actually delivered EOF.
+        let marker = std::env::temp_dir().join(format!(
+            "zeroclaw-mcp-close-eof-{}.marker",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
         let config = McpServerConfig {
             name: "reap-on-close".into(),
             transport: McpTransport::Stdio,
             command: "sh".into(),
-            args: vec!["-c".into(), "cat".into()],
+            args: vec![
+                "-c".into(),
+                format!("cat >/dev/null; printf eof > {}", marker.display()),
+            ],
             ..Default::default()
         };
         let (mut transport, pid) =
@@ -1772,6 +1827,15 @@ mod tests {
         assert!(
             wait_until_reaped(pid).await,
             "MCP server pid {pid} not reaped after close()"
+        );
+        // The marker write precedes the server's exit, so by the time the pid is
+        // gone a graceful exit must already have left it behind.
+        let exited_on_eof = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            exited_on_eof,
+            "close() did not deliver EOF: the server was force-killed instead of \
+             exiting on its own"
         );
     }
 
