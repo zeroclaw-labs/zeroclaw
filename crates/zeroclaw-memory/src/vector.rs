@@ -63,6 +63,14 @@ pub struct ScoredResult {
     pub final_score: f32,
 }
 
+/// Hybrid merge: combine vector and keyword results with weighted fusion.
+///
+/// Normalizes each score set to [0, 1], then fuses each candidate using only
+/// the modalities it actually has. The contributing weights are normalized so
+/// a keyword-only candidate is not penalized merely because another candidate
+/// has a vector score (and vice versa).
+///
+/// Deduplicates by id, keeping the best score from each source.
 pub fn hybrid_merge(
     vector_results: &[(String, f32)],  // (id, cosine_similarity)
     keyword_results: &[(String, f32)], // (id, bm25_score)
@@ -109,9 +117,21 @@ pub fn hybrid_merge(
     let mut results: Vec<ScoredResult> = map
         .into_values()
         .map(|mut r| {
-            let vs = r.vector_score.unwrap_or(0.0);
-            let ks = r.keyword_score.unwrap_or(0.0);
-            r.final_score = vector_weight * vs + keyword_weight * ks;
+            let mut weighted_score = 0.0;
+            let mut present_weight = 0.0;
+            if let Some(score) = r.vector_score {
+                weighted_score += vector_weight * score;
+                present_weight += vector_weight;
+            }
+            if let Some(score) = r.keyword_score {
+                weighted_score += keyword_weight * score;
+                present_weight += keyword_weight;
+            }
+            r.final_score = if present_weight > f32::EPSILON {
+                weighted_score / present_weight
+            } else {
+                0.0
+            };
             r
         })
         .collect();

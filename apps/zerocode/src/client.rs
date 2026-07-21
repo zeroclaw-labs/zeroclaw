@@ -1,8 +1,7 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
 //!
-//! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
-//! plumbing the daemon uses for bidirectional calls.
+//! Uses local JSON-RPC transport types so `zerocode` stays an RPC-only surface.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -2758,6 +2757,62 @@ pub struct StatusResult {
     pub server_version: String,
     pub protocol_version: u64,
     pub active_sessions: usize,
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    #[serde(default)]
+    pub config_file: Option<String>,
+    #[serde(default)]
+    pub config_kind: Option<String>,
+    #[serde(default)]
+    pub local_ipc_endpoint: Option<String>,
+}
+
+#[cfg(test)]
+mod dashboard_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_result_decodes_runtime_context_fields() {
+        let value = serde_json::json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 2,
+            "config_dir": "/tmp/zeroclaw-profile",
+            "config_file": "/tmp/zeroclaw-profile/config.toml",
+            "config_kind": "temporary",
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+        });
+
+        let status: StatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(status.config_dir.as_deref(), Some("/tmp/zeroclaw-profile"));
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some("/tmp/zeroclaw-profile/config.toml")
+        );
+        assert_eq!(status.config_kind.as_deref(), Some("temporary"));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some("/tmp/zeroclaw-profile/data/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn status_result_decodes_legacy_payload_without_runtime_context() {
+        let value = serde_json::json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 2
+        });
+
+        let status: StatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(status.server_version, "0.8.4");
+        assert_eq!(status.config_dir, None);
+        assert_eq!(status.config_file, None);
+        assert_eq!(status.config_kind, None);
+        assert_eq!(status.local_ipc_endpoint, None);
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
