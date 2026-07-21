@@ -5826,9 +5826,11 @@ mod tests {
             }))
             .await
             .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
-        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.code, AUTH_REQUIRED);
         assert!(
-            err.message.contains("rejected_self_approval"),
+            err.message.contains(&crate::i18n::get_required_cli_string(
+                "sop-rpc-decision-unauthorized",
+            )),
             "approval_mode rejection must surface, got: {}",
             err.message
         );

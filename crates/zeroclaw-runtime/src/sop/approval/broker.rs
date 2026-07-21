@@ -355,11 +355,14 @@ impl ApprovalBroker {
             StepPolicy::MissingNamed(name) => {
                 return Ok(Some(BrokerOutcome::PolicyMissing { name }));
             }
-            StepPolicy::Unpoliced => return Ok(None),
-            StepPolicy::Named { name, config } => (name, config),
+            StepPolicy::Unpoliced => None,
+            StepPolicy::Named { name, config } => Some((name, config)),
         };
 
-        if let Some(group) = policy.1.required_group.as_deref().filter(|g| !g.is_empty())
+        if let Some(group) = policy
+            .as_ref()
+            .and_then(|(_, config)| config.required_group.as_deref())
+            .filter(|g| !g.is_empty())
             && !self
                 .resolver
                 .is_member(engine.approval_config(), principal, group)
@@ -374,6 +377,9 @@ impl ApprovalBroker {
                 ResolveOutcome::RejectedSelfApproval,
             )));
         }
+        let Some(policy) = policy else {
+            return Ok(None);
+        };
 
         if matches!(decision, ApprovalDecision::Deny { .. }) {
             return Ok(None);
