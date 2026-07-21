@@ -174,6 +174,7 @@ impl WasmChannel {
         limits: crate::component::PluginLimits,
         authorizer: SenderAuthorizer,
     ) -> Result<Self> {
+        services.resolve_config(endpoint.scope())?;
         let factory = ChannelInstanceFactory {
             endpoint: endpoint.clone(),
             component: Arc::new(load_component(component)?),

@@ -4557,6 +4557,7 @@ async fn process_channel_message_body(
                 zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
                 Some(&topic),
                 Some(&msg.content),
+                None,
             )
             .await;
         }
@@ -5404,7 +5405,15 @@ async fn process_channel_message_body(
                 }),
                 ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
+                // Live channel-daemon SOP path: re-assemble a nested step's
+                // agent when it delegates to a different agent, so the step runs
+                // with that agent's own gated tools/policy/MCP scope rather than
+                // this turn's.
+                sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+                    config: ctx.prompt_config.as_ref(),
+                }),
             });
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
@@ -7799,6 +7808,8 @@ struct ActiveChannelAliases {
     /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
     /// explicit-binding mode: only enabled owners' bindings count.
     enabled_bindings: HashSet<String>,
+    /// Bindings declared by all agents, including disabled owners. Their
+    /// presence prevents legacy fallback from activating disabled channels.
     all_known_bindings: HashSet<String>,
 }
 
@@ -7811,11 +7822,13 @@ impl ActiveChannelAliases {
     }
 
     /// True when bindings exist somewhere in the config but every owner is
-    /// `enabled = false`. Thebug fires when this returns true.
+    /// `enabled = false`.
     fn disabled_owners_exist(&self) -> bool {
         !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
     }
 
+    /// Computes the canonical channel-binding view used by collection and
+    /// startup checks; disabled owners never make their channels active.
     fn compute(config: &Config) -> Self {
         Self {
             enabled_bindings: config
@@ -19078,6 +19091,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         observer.record_event(
             &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
                 tool: "file_write".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
@@ -19107,6 +19121,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         observer.record_event(
             &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
                 tool: "file_read".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
@@ -19147,6 +19162,7 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         let mk_event = || zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "file_read".to_string(),
             tool_call_id: None,
             arguments: Some(r#"{"path":"/a"}"#.to_string()),
