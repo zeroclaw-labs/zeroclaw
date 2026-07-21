@@ -2215,7 +2215,7 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
 }
 
 fn load_cached_model_preview(
-    install_root_dir: &Path,
+    data_dir: &Path,
     agent_workspace_dir: &Path,
     provider_name: &str,
 ) -> Vec<String> {
@@ -2228,7 +2228,7 @@ fn load_cached_model_preview(
 
     // Check the shared cache location first (written by `zeroclaw models refresh`),
     // then fall back to the agent workspace for backward compatibility.
-    let shared_path = install_root_dir.join("state").join(MODEL_CACHE_FILE);
+    let shared_path = data_dir.join("state").join(MODEL_CACHE_FILE);
     let agent_path = agent_workspace_dir.join("state").join(MODEL_CACHE_FILE);
 
     for cache_path in [&shared_path, &agent_path] {
@@ -2387,7 +2387,7 @@ async fn create_resilient_model_provider_nonblocking(
 
 fn build_models_help_response(
     current: &ChannelRouteSelection,
-    install_root_dir: &Path,
+    data_dir: &Path,
     agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
@@ -2420,11 +2420,8 @@ fn build_models_help_response(
         }
     }
 
-    let cached_models = load_cached_model_preview(
-        install_root_dir,
-        agent_workspace_dir,
-        &current.model_provider,
-    );
+    let cached_models =
+        load_cached_model_preview(data_dir, agent_workspace_dir, &current.model_provider);
     if cached_models.is_empty() {
         response.push('\n');
         response.push_str(&channel_runtime_cli_string_with_args(
@@ -2522,7 +2519,7 @@ fn build_config_text_response(
 /// Build a Slack Block Kit JSON payload for the `/config` interactive UI.
 fn build_config_block_kit(
     current: &ChannelRouteSelection,
-    install_root_dir: &Path,
+    data_dir: &Path,
     agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
@@ -2552,11 +2549,7 @@ fn build_config_block_kit(
         })
         .collect();
 
-    let cached = load_cached_model_preview(
-        install_root_dir,
-        agent_workspace_dir,
-        &current.model_provider,
-    );
+    let cached = load_cached_model_preview(data_dir, agent_workspace_dir, &current.model_provider);
     for model_id in cached {
         if !model_options.iter().any(|o| {
             o.get("value")
@@ -2797,7 +2790,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowModel => {
             let mut resp = build_models_help_response(
                 &current,
-                ctx.prompt_config.install_root_dir().as_path(),
+                ctx.prompt_config.data_dir.as_path(),
                 ctx.workspace_dir.as_path(),
                 &ctx.model_routes,
             );
@@ -2907,7 +2900,7 @@ async fn handle_runtime_command_if_needed(
             if msg.channel == "slack" {
                 let blocks_json = build_config_block_kit(
                     &current,
-                    ctx.prompt_config.install_root_dir().as_path(),
+                    ctx.prompt_config.data_dir.as_path(),
                     ctx.workspace_dir.as_path(),
                     &ctx.model_routes,
                 );
@@ -11623,6 +11616,45 @@ mod tests {
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[test]
+    fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
+        // `config_path` and `data_dir` deliberately live under unrelated
+        // temp roots, so `config_path.parent()` (the old install-root-derived
+        // path) cannot accidentally coincide with `data_dir`. This proves the
+        // reader follows the canonical data directory, matching the writer
+        // in `zeroclaw-runtime::doctor::persist_model_cache`.
+        let config_root = TempDir::new().unwrap();
+        let data_root = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let state_dir = data_root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache = zeroclaw_config::schema::ModelCacheState {
+            entries: vec![zeroclaw_config::schema::ModelCacheEntry {
+                model_provider: "ollama.default".to_string(),
+                models: vec!["llama3".to_string()],
+            }],
+        };
+        std::fs::write(
+            state_dir.join(MODEL_CACHE_FILE),
+            serde_json::to_string_pretty(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let found =
+            load_cached_model_preview(data_root.path(), agent_workspace.path(), "ollama.default");
+        assert_eq!(found, vec!["llama3".to_string()]);
+
+        // The stale install-root-derived path (config_path's parent) must
+        // NOT be where the cache is found, since it differs from `data_dir`.
+        let not_found =
+            load_cached_model_preview(config_root.path(), agent_workspace.path(), "ollama.default");
+        assert!(
+            not_found.is_empty(),
+            "cache must not be visible under config_path's parent when it differs from data_dir"
+        );
+    }
 
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {

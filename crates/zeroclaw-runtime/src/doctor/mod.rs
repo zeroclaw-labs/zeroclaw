@@ -381,15 +381,16 @@ fn create_doctor_model_provider(
 /// Persist the fetched model catalog to the shared cache location so that
 /// `/model` can display available models without a live probe.
 ///
-/// The cache is written to `<install_root_dir>/state/models_cache.json` — a
-/// shared location outside any agent workspace. Both the CLI writer and the
-/// channel reader resolve this same path via [`Config::install_root_dir`].
+/// The cache is written to `<data_dir>/state/models_cache.json` — the
+/// canonical instance-wide runtime-state directory (databases, daemon
+/// state), honoring `ZEROCLAW_DATA_DIR` overrides. Both the CLI writer and
+/// the channel reader resolve this same path via [`Config::data_dir`].
 fn persist_model_cache(
     config: &Config,
     provider_name: &str,
     models: &[String],
 ) -> anyhow::Result<()> {
-    let cache_dir = config.install_root_dir().join("state");
+    let cache_dir = config.data_dir.join("state");
     std::fs::create_dir_all(&cache_dir).context("Failed to create state dir for model cache")?;
 
     let cache_path = cache_dir.join(MODEL_CACHE_FILE);
@@ -1978,6 +1979,7 @@ mod tests {
     fn config_with_install_root(tmp: &TempDir) -> Config {
         Config {
             config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().to_path_buf(),
             ..Config::default()
         }
     }
