@@ -5,6 +5,8 @@ use std::ops::Range;
 use std::sync::OnceLock;
 use zeroclaw_config::schema::LeakDetectionConfig;
 
+use super::detection::{DetectionConfidence, DetectionMatch, sanitize_excerpt};
+
 /// Minimum token length considered for high-entropy detection.
 const ENTROPY_TOKEN_MIN_LEN: usize = 24;
 
@@ -33,6 +35,195 @@ pub enum LeakResult {
         redacted: String,
     },
 }
+
+// ─── Shared credential-pattern definitions (single source of truth) ─────────
+//
+// Structured credential patterns are defined once here and consumed by both
+// the legacy `scan` projection (via the `check_*` methods) and the typed
+// `detect` API [I7]. Private keys (PEM markers) and high-entropy heuristics
+// keep their bespoke logic and are handled directly by `detect`.
+
+/// Structured-credential regex groups shared by `scan` and `detect`. Each entry
+/// carries the confidence the typed `detect` API attaches: structured
+/// key-shaped patterns are `High` (they identify a specific credential format),
+/// keyword-anchored generic secrets are `Medium` (a weaker signal that must not
+/// reach the screening `Denial` disposition on its own). `scan` ignores the
+/// confidence field.
+fn api_key_patterns() -> &'static [(Regex, &'static str, DetectionConfidence)] {
+    static PATTERNS: OnceLock<Vec<(Regex, &'static str, DetectionConfidence)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            // Stripe
+            (
+                Regex::new(r"sk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
+                "Stripe secret key",
+                DetectionConfidence::High,
+            ),
+            (
+                Regex::new(r"pk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
+                "Stripe publishable key",
+                DetectionConfidence::High,
+            ),
+            // OpenAI
+            (
+                Regex::new(r"sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}").unwrap(),
+                "OpenAI API key",
+                DetectionConfidence::High,
+            ),
+            (
+                Regex::new(r"sk-[a-zA-Z0-9]{48,}").unwrap(),
+                "OpenAI-style API key",
+                DetectionConfidence::High,
+            ),
+            // Anthropic
+            (
+                Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
+                "Anthropic API key",
+                DetectionConfidence::High,
+            ),
+            // Groq
+            (
+                Regex::new(r"gsk_[a-zA-Z0-9]{20,}").unwrap(),
+                "Groq API key",
+                DetectionConfidence::High,
+            ),
+            // Google
+            (
+                Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
+                "Google API key",
+                DetectionConfidence::High,
+            ),
+            // GitHub
+            (
+                Regex::new(r"gh[pousr]_[a-zA-Z0-9]{36,}").unwrap(),
+                "GitHub token",
+                DetectionConfidence::High,
+            ),
+            (
+                Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(),
+                "GitHub PAT",
+                DetectionConfidence::High,
+            ),
+            // Generic — keyword-anchored, weaker signal. A README placeholder
+            // like `api_key: your_api_key_here_placeholder` matches this; it is
+            // Medium so it warns rather than denying the install on its own.
+            (
+                Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
+                "Generic API key",
+                DetectionConfidence::Medium,
+            ),
+        ]
+    })
+}
+
+fn aws_patterns() -> &'static [(Regex, &'static str, DetectionConfidence)] {
+    static PATTERNS: OnceLock<Vec<(Regex, &'static str, DetectionConfidence)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            (
+                Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
+                "AWS Access Key ID",
+                DetectionConfidence::High,
+            ),
+            // Keyword-anchored — Medium (weaker signal, placeholder-prone).
+            (
+                Regex::new(r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#)
+                    .unwrap(),
+                "AWS Secret Access Key",
+                DetectionConfidence::Medium,
+            ),
+        ]
+    })
+}
+
+fn generic_secret_patterns() -> &'static [(Regex, &'static str)] {
+    static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            (
+                Regex::new(r#"(?i)password[=:]\s*['"]*[^\s'"]{8,}"#).unwrap(),
+                "Password in config",
+            ),
+            (
+                Regex::new(r#"(?i)secret[=:]\s*['"]*[a-zA-Z0-9_-]{16,}"#).unwrap(),
+                "Secret value",
+            ),
+            (
+                Regex::new(r#"(?i)token[=:]\s*['"]*[a-zA-Z0-9_.-]{20,}"#).unwrap(),
+                "Token value",
+            ),
+        ]
+    })
+}
+
+fn db_url_patterns() -> &'static [(Regex, &'static str, DetectionConfidence)] {
+    static PATTERNS: OnceLock<Vec<(Regex, &'static str, DetectionConfidence)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            // A connection URL with an embedded `user:pass@` is a strong,
+            // structured credential shape → High.
+            (
+                Regex::new(r"postgres(ql)?://[^:]+:[^@]+@[^\s]+").unwrap(),
+                "PostgreSQL connection URL",
+                DetectionConfidence::High,
+            ),
+            (
+                Regex::new(r"mysql://[^:]+:[^@]+@[^\s]+").unwrap(),
+                "MySQL connection URL",
+                DetectionConfidence::High,
+            ),
+            (
+                Regex::new(r"mongodb(\+srv)?://[^:]+:[^@]+@[^\s]+").unwrap(),
+                "MongoDB connection URL",
+                DetectionConfidence::High,
+            ),
+            (
+                Regex::new(r"redis://[^:]+:[^@]+@[^\s]+").unwrap(),
+                "Redis connection URL",
+                DetectionConfidence::High,
+            ),
+        ]
+    })
+}
+
+fn jwt_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    // JWT: three base64url-encoded parts separated by dots
+    PATTERN.get_or_init(|| {
+        Regex::new(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*").unwrap()
+    })
+}
+
+fn bot_token_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"/bot[0-9]+:[A-Za-z0-9_-]+").unwrap())
+}
+
+/// PEM private-key block markers `(begin, end, label)`, shared by `scan`'s
+/// redaction and `detect`'s span reporting. Labels are the human names
+/// `scan` already reported, kept stable so existing behavior is unchanged.
+const PRIVATE_KEY_MARKERS: &[(&str, &str, &str)] = &[
+    (
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----END RSA PRIVATE KEY-----",
+        "RSA private key",
+    ),
+    (
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----END EC PRIVATE KEY-----",
+        "EC private key",
+    ),
+    (
+        "-----BEGIN PRIVATE KEY-----",
+        "-----END PRIVATE KEY-----",
+        "Private key",
+    ),
+    (
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----END OPENSSH PRIVATE KEY-----",
+        "OpenSSH private key",
+    ),
+];
 
 /// Credential leak detector for outbound content.
 #[derive(Debug, Clone)]
@@ -154,57 +345,9 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        static API_KEY_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-        let regexes = API_KEY_PATTERNS.get_or_init(|| {
-            vec![
-                // Stripe
-                (
-                    Regex::new(r"sk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
-                    "Stripe secret key",
-                ),
-                (
-                    Regex::new(r"pk_(live|test)_[a-zA-Z0-9]{24,}").unwrap(),
-                    "Stripe publishable key",
-                ),
-                // OpenAI
-                (
-                    Regex::new(r"sk-[a-zA-Z0-9]{20,}T3BlbkFJ[a-zA-Z0-9]{20,}").unwrap(),
-                    "OpenAI API key",
-                ),
-                (
-                    Regex::new(r"sk-[a-zA-Z0-9]{48,}").unwrap(),
-                    "OpenAI-style API key",
-                ),
-                // Anthropic
-                (
-                    Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
-                    "Anthropic API key",
-                ),
-                // Groq
-                (Regex::new(r"gsk_[a-zA-Z0-9]{20,}").unwrap(), "Groq API key"),
-                // Google
-                (
-                    Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
-                    "Google API key",
-                ),
-                // GitHub
-                (
-                    Regex::new(r"gh[pousr]_[a-zA-Z0-9]{36,}").unwrap(),
-                    "GitHub token",
-                ),
-                (
-                    Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(),
-                    "GitHub PAT",
-                ),
-                // Generic
-                (
-                    Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
-                    "Generic API key",
-                ),
-            ]
-        });
-
-        for (regex, name) in regexes {
+        // Patterns are defined once in `api_key_patterns()` (shared with the
+        // typed `detect` API); scan ignores the per-pattern confidence.
+        for (regex, name, _confidence) in api_key_patterns() {
             collect_regex_redactions(
                 content,
                 regex,
@@ -225,24 +368,7 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        static AWS_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-        let regexes = AWS_PATTERNS.get_or_init(|| {
-            vec![
-                (
-                    Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-                    "AWS Access Key ID",
-                ),
-                (
-                    Regex::new(
-                        r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
-                    )
-                    .unwrap(),
-                    "AWS Secret Access Key",
-                ),
-            ]
-        });
-
-        for (regex, name) in regexes {
+        for (regex, name, _confidence) in aws_patterns() {
             collect_regex_redactions(
                 content,
                 regex,
@@ -263,25 +389,7 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        static SECRET_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-        let regexes = SECRET_PATTERNS.get_or_init(|| {
-            vec![
-                (
-                    Regex::new(r#"(?i)password[=:]\s*['"]*[^\s'"]{8,}"#).unwrap(),
-                    "Password in config",
-                ),
-                (
-                    Regex::new(r#"(?i)secret[=:]\s*['"]*[a-zA-Z0-9_-]{16,}"#).unwrap(),
-                    "Secret value",
-                ),
-                (
-                    Regex::new(r#"(?i)token[=:]\s*['"]*[a-zA-Z0-9_.-]{20,}"#).unwrap(),
-                    "Token value",
-                ),
-            ]
-        });
-
-        for (regex, name) in regexes {
+        for (regex, name) in generic_secret_patterns() {
             if self.sensitivity > 0.5 {
                 collect_regex_redactions(
                     content,
@@ -304,31 +412,9 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        // PEM-encoded private keys
-        let key_patterns = [
-            (
-                "-----BEGIN RSA PRIVATE KEY-----",
-                "-----END RSA PRIVATE KEY-----",
-                "RSA private key",
-            ),
-            (
-                "-----BEGIN EC PRIVATE KEY-----",
-                "-----END EC PRIVATE KEY-----",
-                "EC private key",
-            ),
-            (
-                "-----BEGIN PRIVATE KEY-----",
-                "-----END PRIVATE KEY-----",
-                "Private key",
-            ),
-            (
-                "-----BEGIN OPENSSH PRIVATE KEY-----",
-                "-----END OPENSSH PRIVATE KEY-----",
-                "OpenSSH private key",
-            ),
-        ];
-
-        for (begin, end, name) in key_patterns {
+        // PEM markers are defined once in `PRIVATE_KEY_MARKERS` (shared with the
+        // typed `detect` API).
+        for &(begin, end, name) in PRIVATE_KEY_MARKERS {
             let mut search_from = 0;
             let mut matched = false;
 
@@ -380,15 +466,9 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        static JWT_PATTERN: OnceLock<Regex> = OnceLock::new();
-        let regex = JWT_PATTERN.get_or_init(|| {
-            // JWT: three base64url-encoded parts separated by dots
-            Regex::new(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*").unwrap()
-        });
-
         collect_regex_redactions(
             content,
-            regex,
+            jwt_pattern(),
             protected_spans,
             "JWT token",
             "[REDACTED_JWT]",
@@ -405,29 +485,7 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        static DB_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-        let regexes = DB_PATTERNS.get_or_init(|| {
-            vec![
-                (
-                    Regex::new(r"postgres(ql)?://[^:]+:[^@]+@[^\s]+").unwrap(),
-                    "PostgreSQL connection URL",
-                ),
-                (
-                    Regex::new(r"mysql://[^:]+:[^@]+@[^\s]+").unwrap(),
-                    "MySQL connection URL",
-                ),
-                (
-                    Regex::new(r"mongodb(\+srv)?://[^:]+:[^@]+@[^\s]+").unwrap(),
-                    "MongoDB connection URL",
-                ),
-                (
-                    Regex::new(r"redis://[^:]+:[^@]+@[^\s]+").unwrap(),
-                    "Redis connection URL",
-                ),
-            ]
-        });
-
-        for (regex, name) in regexes {
+        for (regex, name, _confidence) in db_url_patterns() {
             collect_regex_redactions(
                 content,
                 regex,
@@ -447,13 +505,9 @@ impl LeakDetector {
         patterns: &mut Vec<String>,
         redactions: &mut Vec<Redaction>,
     ) {
-        static BOT_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
-        let regex =
-            BOT_TOKEN_PATTERN.get_or_init(|| Regex::new(r"/bot[0-9]+:[A-Za-z0-9_-]+").unwrap());
-
         collect_regex_redactions(
             content,
-            regex,
+            bot_token_pattern(),
             protected_spans,
             "Bot token",
             "/bot[REDACTED_BOT_TOKEN]",
@@ -510,6 +564,153 @@ impl LeakDetector {
             }
         }
     }
+
+    /// Typed credential detection for the install-screening layer (1B).
+    ///
+    /// Returns one [`DetectionMatch`] per credential hit with its byte span and
+    /// a redacted excerpt. Confidence encodes match quality so the screening
+    /// layer can gate disposition (structured credential shapes are `High` and
+    /// warrant denial; keyword-anchored generic secrets are `Medium`;
+    /// entropy-heuristic tokens are `Low`/`Medium`). Shares the same compiled
+    /// pattern sets as [`scan`](Self::scan) [I7].
+    ///
+    /// Redacted excerpts never contain the raw credential: structured and
+    /// entropy matches are replaced by a `[REDACTED …]` marker; only the small,
+    /// non-secret keyword label (e.g. `password=…`) is shown for generic
+    /// secrets, with the value elided [I10].
+    pub fn detect(&self, content: &str) -> Vec<DetectionMatch> {
+        let mut matches = Vec::new();
+
+        // Structured credentials. Key-shaped patterns are High and warrant
+        // denial; keyword-anchored generic entries carry Medium so a README
+        // placeholder does not block an install on its own.
+        for group in [api_key_patterns(), aws_patterns(), db_url_patterns()] {
+            for (regex, label, confidence) in group {
+                for m in regex.find_iter(content) {
+                    matches.push(DetectionMatch {
+                        label,
+                        confidence: *confidence,
+                        span: m.start()..m.end(),
+                        redacted_excerpt: format!("[REDACTED {label}]"),
+                    });
+                }
+            }
+        }
+        for m in jwt_pattern().find_iter(content) {
+            matches.push(DetectionMatch {
+                label: "JWT token",
+                confidence: DetectionConfidence::High,
+                span: m.start()..m.end(),
+                redacted_excerpt: "[REDACTED JWT]".to_string(),
+            });
+        }
+        for m in bot_token_pattern().find_iter(content) {
+            matches.push(DetectionMatch {
+                label: "Bot token",
+                confidence: DetectionConfidence::High,
+                span: m.start()..m.end(),
+                redacted_excerpt: "[REDACTED bot token]".to_string(),
+            });
+        }
+
+        // PEM private-key blocks → High confidence.
+        for (begin, end, label) in PRIVATE_KEY_MARKERS {
+            if let Some(start_idx) = content.find(begin)
+                && let Some(end_rel) = content[start_idx..].find(end)
+            {
+                let end_idx = start_idx + end_rel + end.len();
+                matches.push(DetectionMatch {
+                    label,
+                    confidence: DetectionConfidence::High,
+                    span: start_idx..end_idx,
+                    redacted_excerpt: "[REDACTED private key]".to_string(),
+                });
+            }
+        }
+
+        // Keyword-anchored generic secrets → Medium confidence. The value is
+        // elided; only the sanitized keyword prefix is shown.
+        for (regex, label) in generic_secret_patterns() {
+            for m in regex.find_iter(content) {
+                let keyword = m.as_str().split(['=', ':']).next().unwrap_or("");
+                matches.push(DetectionMatch {
+                    label,
+                    confidence: DetectionConfidence::Medium,
+                    span: m.start()..m.end(),
+                    redacted_excerpt: format!("{}=[REDACTED]", sanitize_excerpt(keyword)),
+                });
+            }
+        }
+
+        // High-entropy tokens → Low/Medium confidence (heuristic). Reuse the
+        // same URL/media/receipt stripping as `scan` so path segments are not
+        // mistaken for credentials.
+        let entropy_threshold = 3.5 + self.sensitivity * 1.25;
+        static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
+        static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let media_re = MEDIA_MARKER_PATTERN.get_or_init(|| {
+            Regex::new(r"\[(IMAGE|VIDEO|VOICE|AUDIO|DOCUMENT|FILE):[^\]]*\]").unwrap()
+        });
+        static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let receipt_re =
+            RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
+        // Build a masked copy the same length as `content` so byte spans line
+        // up: replace stripped regions with spaces rather than deleting them.
+        let mut masked = content.to_string();
+        for re in [url_re, media_re, receipt_re] {
+            masked = re
+                .replace_all(&masked, |caps: &regex::Captures| " ".repeat(caps[0].len()))
+                .into_owned();
+        }
+        for m in token_spans(&masked) {
+            let token = &content[m.clone()];
+            if token.len() >= ENTROPY_TOKEN_MIN_LEN
+                && shannon_entropy(token) >= entropy_threshold
+                && has_mixed_alpha_digit(token)
+            {
+                matches.push(DetectionMatch {
+                    label: "High-entropy token",
+                    // Entropy is a heuristic: Medium at/above threshold+1 bit,
+                    // Low otherwise. Either stays sub-Denial in screening.
+                    confidence: if shannon_entropy(token) >= entropy_threshold + 1.0 {
+                        DetectionConfidence::Medium
+                    } else {
+                        DetectionConfidence::Low
+                    },
+                    span: m,
+                    redacted_excerpt: "[REDACTED high-entropy token]".to_string(),
+                });
+            }
+        }
+
+        matches
+    }
+}
+
+/// True when `c` is part of a candidate credential token (alphanumeric plus
+/// the common credential punctuation). Shared by the token extractor and the
+/// span variant so both split identically.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '/'
+}
+
+/// Byte spans of candidate tokens in `content` (the range variant of
+/// [`extract_candidate_tokens`], used by the typed `detect` API).
+fn token_spans(content: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, c) in content.char_indices() {
+        if is_token_char(c) {
+            start.get_or_insert(idx);
+        } else if let Some(s) = start.take() {
+            spans.push(s..idx);
+        }
+    }
+    if let Some(s) = start {
+        spans.push(s..content.len());
+    }
+    spans
 }
 
 /// Extract candidate tokens by splitting on characters outside the
@@ -838,6 +1039,18 @@ mod tests {
             }
             LeakResult::Clean => panic!("Should detect AWS key"),
         }
+    }
+
+    #[test]
+    fn scan_does_not_panic_on_reversed_private_key_markers() {
+        // An END marker appearing before the BEGIN marker used to slice
+        // content[start..end] with start > end and panic. scan() runs on
+        // attacker/model-influenced outbound content, so it must not crash.
+        let detector = LeakDetector::new();
+        let content = "-----END PRIVATE KEY-----junk-----BEGIN PRIVATE KEY-----";
+        // Must return, not panic. A well-ordered block is absent, so the
+        // reversed markers are not treated as a redactable key block.
+        let _ = detector.scan(content);
     }
 
     #[test]
@@ -1296,5 +1509,137 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             detector.scan("connection reset by peer"),
             LeakResult::Clean
         ));
+    }
+
+    // ─── Task 1A: typed detect API ───────────────────────────────────────────
+
+    #[test]
+    fn detect_structured_key_is_high_confidence_with_correct_span() {
+        let detector = LeakDetector::new();
+        let content = "config: AKIAIOSFODNN7EXAMPLE trailing";
+        let matches = detector.detect(content);
+        let aws = matches
+            .iter()
+            .find(|m| m.label.contains("AWS"))
+            .expect("AWS access key id must be detected");
+        assert_eq!(aws.confidence, DetectionConfidence::High);
+        // The span must cover exactly the credential token.
+        assert_eq!(&content[aws.span.clone()], "AKIAIOSFODNN7EXAMPLE");
+        // The excerpt must never contain the raw credential.
+        assert!(!aws.redacted_excerpt.contains("AKIA"));
+    }
+
+    #[test]
+    fn detect_keyword_anchored_generics_are_medium_not_high() {
+        // Regression: keyword-anchored patterns (`api_key: …`, `aws_secret…`)
+        // are weaker signals prone to placeholder false positives; they must be
+        // Medium so screening does not raise them to a Denial on their own.
+        let detector = LeakDetector::new();
+
+        let api = detector.detect("api_key: your_api_key_here_placeholder123");
+        let generic = api
+            .iter()
+            .find(|m| m.label == "Generic API key")
+            .expect("generic api key must be detected");
+        assert_eq!(generic.confidence, DetectionConfidence::Medium);
+
+        let aws = detector.detect("aws_secret_access_key=abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+        let secret = aws
+            .iter()
+            .find(|m| m.label == "AWS Secret Access Key")
+            .expect("aws secret must be detected");
+        assert_eq!(secret.confidence, DetectionConfidence::Medium);
+
+        // A structured, key-shaped credential in the same group stays High.
+        let structured = detector.detect("AKIAIOSFODNN7EXAMPLE");
+        assert!(
+            structured
+                .iter()
+                .any(|m| m.confidence == DetectionConfidence::High),
+            "structured AWS access key id must remain High"
+        );
+    }
+
+    #[test]
+    fn detect_private_key_span_covers_the_block() {
+        let detector = LeakDetector::new();
+        let content = "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\nafter";
+        let matches = detector.detect(content);
+        let key = matches
+            .iter()
+            .find(|m| m.label.contains("private key"))
+            .expect("private key must be detected");
+        assert_eq!(key.confidence, DetectionConfidence::High);
+        let block = &content[key.span.clone()];
+        assert!(block.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(block.ends_with("-----END RSA PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn detect_generic_secret_is_medium_and_elides_value() {
+        let detector = LeakDetector::new();
+        let matches = detector.detect("password: hunter2secret");
+        let secret = matches
+            .iter()
+            .find(|m| m.label.contains("Password"))
+            .expect("generic password must be detected");
+        assert_eq!(secret.confidence, DetectionConfidence::Medium);
+        assert!(!secret.redacted_excerpt.contains("hunter2secret"));
+    }
+
+    #[test]
+    fn detect_entropy_token_is_sub_high_confidence() {
+        let detector = LeakDetector::new();
+        let content = "credential: aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let matches = detector.detect(content);
+        let entropy = matches
+            .iter()
+            .find(|m| m.label == "High-entropy token")
+            .expect("high-entropy token must be detected");
+        assert!(
+            entropy.confidence != DetectionConfidence::High,
+            "entropy heuristic must stay sub-High so it never forces a denial"
+        );
+        assert_eq!(
+            &content[entropy.span.clone()],
+            "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"
+        );
+    }
+
+    #[test]
+    fn detect_ignores_url_path_segments() {
+        let detector = LeakDetector::new();
+        // Same case scan() treats as Clean — the typed API must agree.
+        let content =
+            "See https://example.org/documents/2024-report-a1b2c3d4e5f6g7h8i9j0.pdf for details";
+        assert!(
+            detector.detect(content).is_empty(),
+            "URL path segments must not be flagged: {:?}",
+            detector.detect(content)
+        );
+    }
+
+    #[test]
+    fn detect_clean_text_is_empty() {
+        let detector = LeakDetector::new();
+        assert!(
+            detector
+                .detect("A skill that formats JSON nicely.")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn token_spans_index_the_right_substrings() {
+        let content = "foo.bar:baz-qux";
+        for span in token_spans(content) {
+            let tok = &content[span.clone()];
+            assert!(tok.chars().all(is_token_char), "bad token {tok:?}");
+        }
+        let toks: Vec<&str> = token_spans(content)
+            .into_iter()
+            .map(|s| &content[s])
+            .collect();
+        assert_eq!(toks, vec!["foo", "bar", "baz-qux"]);
     }
 }

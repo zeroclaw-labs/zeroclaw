@@ -517,6 +517,27 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
+        /// Accept the content screening risk for the exact staged tree whose
+        /// hash was printed on a prior aborted install. The install proceeds
+        /// only if the source still serves that same content.
+        #[arg(long, value_name = "HASH")]
+        accept_risk: Option<String>,
+        /// Replace an already-installed skill of the same name via a journaled
+        /// swap (update/reinstall) instead of failing that it exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Screen a skill source for prompt-injection / credential / remote-exec /
+    /// encoding-smuggling signals without installing it
+    Screen {
+        /// Source URL, registry name, or local path to screen
+        source: String,
+    },
+    /// Verify installed skills against their install receipts (detects local
+    /// edits and upstream content swaps)
+    Verify {
+        /// Skill name to verify; omit to verify all installed skills
+        name: Option<String>,
     },
     /// Remove an installed skill
     Remove {

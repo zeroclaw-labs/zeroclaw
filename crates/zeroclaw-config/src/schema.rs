@@ -5849,6 +5849,68 @@ pub enum SkillsPromptInjectionMode {
     Compact,
 }
 
+/// What install screening does when it finds a denial-worthy signal in a
+/// **remote** skill source (ClawHub / git / registry). Source of truth for the
+/// remote screening disposition — created here.
+///
+/// - `off`: skip screening entirely.
+/// - `warn`: run screening and print the report, but never block.
+/// - `confirm` (default): denial-impact findings require a content-bound
+///   override before the install proceeds.
+/// - `block`: denial-impact findings cannot be overridden.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillScreenRemoteAction {
+    Off,
+    Warn,
+    #[default]
+    Confirm,
+    Block,
+}
+
+/// What install screening does for a **local** skill source. Local transport
+/// is not trusted provenance, but must never block a developer's own iteration
+/// loop, so the strongest local action is `warn`. Source of truth — created
+/// here.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillScreenLocalAction {
+    Off,
+    #[default]
+    Warn,
+}
+
+/// Install-boundary content screening configuration
+/// (`[skills.install_screening]` section). One knob per source class — there is
+/// no separate `enabled` bool (two knobs would be two truths); `off` is the
+/// disabled state of each action.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.install_screening"]
+#[serde(default)]
+pub struct SkillInstallScreeningConfig {
+    /// Disposition for remote sources (ClawHub / git / registry).
+    /// Default: `confirm`.
+    pub remote_action: SkillScreenRemoteAction,
+    /// Disposition for local-path sources. Default: `warn`.
+    pub local_action: SkillScreenLocalAction,
+}
+
+impl Default for SkillInstallScreeningConfig {
+    fn default() -> Self {
+        Self {
+            remote_action: SkillScreenRemoteAction::Confirm,
+            local_action: SkillScreenLocalAction::Warn,
+        }
+    }
+}
+
 /// An external, user-configured skill registry ZeroClaw can install from.
 ///
 /// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
@@ -5970,6 +6032,11 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Install-boundary content screening (prompt-injection / credential /
+    /// remote-exec / encoding-smuggling signals) for skill installs.
+    #[serde(default)]
+    #[nested]
+    pub install_screening: SkillInstallScreeningConfig,
     /// Autonomous skill creation from successful multi-step task executions.
     #[serde(default)]
     #[nested]

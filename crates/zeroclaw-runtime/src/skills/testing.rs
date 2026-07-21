@@ -1,11 +1,24 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(windows)]
-use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::security::constrained_runner::{ConstrainedRunner, warn_if_unsandboxed};
+use crate::security::traits::{NoopSandbox, Sandbox};
 
 const TEST_FILE_NAME: &str = "TEST.sh";
+
+/// Wall-clock budget for a single `TEST.sh` case. A skill test that runs
+/// longer than this is killed and reported as a failure — previously these
+/// commands had no timeout and inherited the daemon environment.
+const TEST_CASE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-stream capture cap for a `TEST.sh` command. Generous (the legacy path
+/// captured unbounded output) but still bounded so a runaway command cannot
+/// exhaust memory; when a stream hits the cap the failure output says so, so a
+/// pattern that appears past the cap does not fail silently.
+const TEST_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 
 /// Result of running all tests for a single skill.
 #[derive(Debug, Clone)]
@@ -88,13 +101,19 @@ fn pattern_matches(output: &str, pattern: &str) -> bool {
     output.contains(pattern)
 }
 
-/// Run a single test case and return a possible failure.
-fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<TestFailure> {
+/// Run a single test case under the [`ConstrainedRunner`] and return a
+/// possible failure.
+fn run_test_case(
+    case: &TestCase,
+    skill_dir: &Path,
+    sandbox: &Arc<dyn Sandbox>,
+    verbose: bool,
+) -> Option<TestFailure> {
     if verbose {
         println!("    running: {}", case.command);
     }
 
-    let result = build_test_command(&case.command, skill_dir).output();
+    let result = build_test_runner(&case.command, skill_dir, sandbox).run();
 
     let output = match result {
         Ok(o) => o,
@@ -109,23 +128,46 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
         }
     };
 
-    let actual_exit = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
+    let actual_exit = if output.timed_out {
+        -1
+    } else {
+        output.exit_code.unwrap_or(-1)
+    };
+    let combined = if output.timed_out {
+        format!(
+            "{}{}\n{}",
+            output.stdout,
+            output.stderr,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-test-timeout",
+                &[("seconds", &TEST_CASE_TIMEOUT.as_secs().to_string())],
+            )
+        )
+    } else if output.output_truncated {
+        format!(
+            "{}\n{}",
+            output.combined(),
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-test-output-truncated",
+                &[("bytes", &TEST_OUTPUT_CAP_BYTES.to_string())],
+            )
+        )
+    } else {
+        output.combined()
+    };
 
     if verbose {
-        if !stdout.is_empty() {
-            println!("    stdout: {}", stdout.trim());
+        if !output.stdout.is_empty() {
+            println!("    stdout: {}", output.stdout.trim());
         }
-        if !stderr.is_empty() {
-            println!("    stderr: {}", stderr.trim());
+        if !output.stderr.is_empty() {
+            println!("    stderr: {}", output.stderr.trim());
         }
         println!("    exit: {actual_exit}");
     }
 
-    let exit_ok = actual_exit == case.expected_exit;
-    let pattern_ok = pattern_matches(&combined, &case.expected_pattern);
+    let exit_ok = !output.timed_out && actual_exit == case.expected_exit;
+    let pattern_ok = !output.timed_out && pattern_matches(&combined, &case.expected_pattern);
 
     if exit_ok && pattern_ok {
         None
@@ -135,28 +177,86 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
             expected_exit: case.expected_exit,
             actual_exit,
             expected_pattern: case.expected_pattern.clone(),
-            actual_output: combined.to_string(),
+            actual_output: combined,
         })
     }
 }
 
+/// Build the constrained runner for one `TEST.sh` command: `sh -c <cmd>`
+/// (`cmd /C` on Windows), confined to `skill_dir`, env-scrubbed, timed, and
+/// output-capped, wrapped by the active `sandbox` backend.
+///
+/// On Windows the command is passed via `raw_arg` (not `.args`), so `cmd.exe`
+/// receives the `/C "<command>"` form verbatim under its own quoting rules —
+/// std's MSVC-style escaping mangles commands containing quotes — and
+/// `CREATE_NO_WINDOW` keeps a console from flashing while preserving that contract.
 #[cfg(windows)]
-fn build_test_command(command: &str, skill_dir: &Path) -> Command {
-    let mut cmd = windows_std_cmd_shell_command(command);
-    cmd.current_dir(skill_dir);
-    cmd
+fn build_test_runner(
+    command: &str,
+    skill_dir: &Path,
+    sandbox: &Arc<dyn Sandbox>,
+) -> ConstrainedRunner {
+    let runner = ConstrainedRunner::new("cmd")
+        .windows_raw_arg("/C")
+        .windows_raw_arg(zeroclaw_config::platform::native::windows_cmd_shell_raw_arg(command))
+        .windows_no_window()
+        .workdir(skill_dir)
+        .timeout(TEST_CASE_TIMEOUT)
+        .output_cap_bytes(TEST_OUTPUT_CAP_BYTES)
+        .sandbox(sandbox.clone());
+    with_inherited_home(runner)
 }
 
 #[cfg(not(windows))]
-fn build_test_command(command: &str, skill_dir: &Path) -> Command {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
-    cmd.current_dir(skill_dir);
-    cmd
+fn build_test_runner(
+    command: &str,
+    skill_dir: &Path,
+    sandbox: &Arc<dyn Sandbox>,
+) -> ConstrainedRunner {
+    let runner = ConstrainedRunner::new("sh")
+        .arg("-c")
+        .arg(command)
+        .workdir(skill_dir)
+        .timeout(TEST_CASE_TIMEOUT)
+        .output_cap_bytes(TEST_OUTPUT_CAP_BYTES)
+        .sandbox(sandbox.clone());
+    with_inherited_home(runner)
 }
 
-/// Test a single skill by parsing and running its TEST.sh.
+/// Forward the daemon's `HOME` to the scrubbed child so a `TEST.sh` case that
+/// resolves `~` or reads user config works, without re-exposing the rest of the
+/// inherited environment. `HOME` is a path, not a secret; the runner's
+/// allowlist keeps everything else stripped.
+fn with_inherited_home(runner: ConstrainedRunner) -> ConstrainedRunner {
+    match std::env::var_os("HOME") {
+        Some(home) => runner.with_home(home),
+        None => runner,
+    }
+}
+
+/// Test a single skill by parsing and running its TEST.sh under the active
+/// sandbox backend. When the backend provides no OS isolation
+/// (`NoopSandbox`), a one-line warning is printed so operators know the
+/// commands ran unconfined.
 pub fn test_skill(skill_dir: &Path, skill_name: &str, verbose: bool) -> Result<SkillTestResult> {
+    test_skill_with_sandbox(skill_dir, skill_name, verbose, &default_sandbox())
+}
+
+/// Default sandbox for skill testing when the caller has no policy-resolved
+/// backend to pass: no OS isolation. TEST.sh execution then prints the
+/// unsandboxed warning. (A policy-driven backend arrives with the detonation
+/// work; this keeps the migration behavior-preserving.)
+fn default_sandbox() -> Arc<dyn Sandbox> {
+    Arc::new(NoopSandbox)
+}
+
+/// [`test_skill`] with an explicit sandbox backend.
+pub fn test_skill_with_sandbox(
+    skill_dir: &Path,
+    skill_name: &str,
+    verbose: bool,
+    sandbox: &Arc<dyn Sandbox>,
+) -> Result<SkillTestResult> {
     let test_file = skill_dir.join(TEST_FILE_NAME);
     if !test_file.exists() {
         return Ok(SkillTestResult {
@@ -179,8 +279,12 @@ pub fn test_skill(skill_dir: &Path, skill_name: &str, verbose: bool) -> Result<S
         failures: Vec::new(),
     };
 
+    if !cases.is_empty() {
+        warn_if_unsandboxed(sandbox, skill_name);
+    }
+
     for case in &cases {
-        match run_test_case(case, skill_dir, verbose) {
+        match run_test_case(case, skill_dir, sandbox, verbose) {
             None => result.tests_passed += 1,
             Some(failure) => result.failures.push(failure),
         }
@@ -191,6 +295,15 @@ pub fn test_skill(skill_dir: &Path, skill_name: &str, verbose: bool) -> Result<S
 
 /// Test all skills that have a TEST.sh file within the given skill directories.
 pub fn test_all_skills(skills_dirs: &[PathBuf], verbose: bool) -> Result<Vec<SkillTestResult>> {
+    test_all_skills_with_sandbox(skills_dirs, verbose, &default_sandbox())
+}
+
+/// [`test_all_skills`] with an explicit sandbox backend.
+pub fn test_all_skills_with_sandbox(
+    skills_dirs: &[PathBuf],
+    verbose: bool,
+    sandbox: &Arc<dyn Sandbox>,
+) -> Result<Vec<SkillTestResult>> {
     let mut results = Vec::new();
 
     for dir in skills_dirs {
@@ -223,7 +336,7 @@ pub fn test_all_skills(skills_dirs: &[PathBuf], verbose: bool) -> Result<Vec<Ski
                 );
             }
 
-            let r = test_skill(&path, &skill_name, verbose)?;
+            let r = test_skill_with_sandbox(&path, &skill_name, verbose, sandbox)?;
             results.push(r);
         }
     }

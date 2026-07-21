@@ -93,6 +93,43 @@ cli-skills-install-tier-community =
     and run `zeroclaw skills audit {$name}` before granting any
     permissions or running it in production.
 
+cli-skills-test-no-sandbox = { "  " }warning: running TEST.sh for '{$context}' without OS-level sandboxing — skill commands run with only environment scrubbing, a timeout, and output caps.
+cli-skills-screen-staged-hash = Staged content hash: {$hash}
+cli-skills-screen-blocked = Install blocked: screening found denial-impact signals and the policy is set to block (no override). Review the report above.
+cli-skills-screen-accept-hint = Screening flagged blocking signals (a denial-impact finding or an unscanned file). To install this exact content anyway, re-run with: --accept-risk={$hash}
+cli-skills-screen-confirm-prompt = Install this skill despite the screening findings above?
+cli-skills-screen-declined = Install declined; no changes made.
+cli-skills-screen-found-blocking = Screening found blocking signals (a denial-impact finding or an unscanned file) in this source.
+cli-skills-screen-content-changed = The source served different content than the hash you accepted (an upstream swap between staging and acceptance). The new screening report and staged hash are shown below; review them before re-accepting.
+cli-skills-screen-source-missing = Source path does not exist: {$source}
+cli-skills-screen-report-header = Screening report (ruleset v{$version}): {$scanned} file(s) scanned, {$findings} finding(s), {$unscanned} unscanned.
+cli-skills-screen-report-finding = { "  " }[{$impact}] {$category} ({$confidence} confidence) in {$file}: {$excerpt}
+cli-skills-screen-report-unscanned-header = { "  " }Unscanned files (not covered by screening):
+cli-skills-screen-report-unscanned-item = { "    " }- {$file} ({$reason})
+cli-skills-install-destination-exists = Destination skill already exists: {$path}
+cli-skills-install-destination-symlink = Destination skill path is a symlink (refusing to follow): {$path}
+cli-skills-git-name-underivable = Could not derive a skill directory name from git source: {$source}
+cli-skills-test-timeout = [command exceeded the {$seconds}s test timeout and was killed]
+cli-skills-test-output-truncated = [output truncated at the {$bytes}-byte capture cap; a matching pattern past this point will not be seen]
+cli-skills-receipt-write-failed = { "  " }warning: failed to write install receipt for '{$name}': {$error}. The skill is installed but 'zeroclaw skills verify' will report it as having no receipt.
+cli-skills-verify-ok = {$name}: matches receipt.
+cli-skills-verify-modified = {$name}: modified (local changes or upstream swap — reinstall to restore).
+cli-skills-verify-no-receipt = {$name}: no receipt (pre-provenance install).
+cli-skills-verify-found-modified = One or more skills differ from their install receipts.
+cli-skills-test-remote-refused = { "  " }Refusing to run TEST.sh for remote-origin skill '{$name}' without OS-level sandboxing. Its functional tests execute skill-authored commands; run them only once a sandbox backend is available.
+cli-skills-update-identical = { "  " }Update: the source content is identical to the installed skill; reinstalling in place.
+cli-skills-update-version-changed = { "  " }Update: version {$old} → {$new} ({$added} added, {$removed} removed, {$changed} changed file(s)).
+cli-skills-update-content-swap = { "  " }Update warning: the content changed but the version ({$version}) did not — {$added} added, {$removed} removed, {$changed} changed file(s). This is the shape of an upstream content swap; review before accepting.
+cli-skills-git-scheme-rejected = Refusing to install skill from '{$source}': the '{$scheme}://' transport provides no integrity in transit (cleartext or unauthenticated). Use an https:// or ssh:// (git@...) remote instead.
+cli-skills-git-bad-host = Refusing to install skill from '{$source}': the remote host begins with '-', which git/ssh would interpret as a command-line option.
+cli-skills-git-clone-timeout = Git clone of '{$source}' exceeded the {$seconds}s budget and was terminated.
+cli-skills-git-pull-timeout = Git pull of the skills registry exceeded the {$seconds}s budget and was terminated.
+cli-skills-git-registry-clone-timeout = Git clone of the skills registry exceeded the {$seconds}s budget and was terminated.
+cli-skills-git-tree-too-large = Cloned skill tree rejected: {$bytes} bytes exceeds the {$max} byte install budget.
+cli-skills-install-locked = Another install of skill '{$name}' appears to be in progress (lock file: {$path}). Wait for it to finish, or remove the lock file if no install is running.
+cli-skills-install-stale-lock-reclaimed = warning: reclaimed a stale install lock for skill '{$name}' left behind by an interrupted install.
+cli-skills-install-staging-mutated = Staged skill content changed after the security checks ran ({$path}); aborting the install. Retry the install.
+
 cli-skills-add-scaffolded = Scaffolded skill {$target} at {$dir}
 
 cli-skills-bundle-add-prompt =

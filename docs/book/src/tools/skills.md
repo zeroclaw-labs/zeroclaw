@@ -191,7 +191,7 @@ zeroclaw skills test --verbose
 
 </div>
 
-`zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
+`zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust. Skills installed from a remote source (ClawHub, Git, or a registry) are refused by `skills test` until an OS-level sandbox backend is available, because their functional tests execute skill-authored commands.
 
 If `zeroclaw skills list` shows a skill but the agent does not use it, check the runtime view:
 
@@ -208,6 +208,59 @@ zeroclaw skills list --agent default
 When the skill appears only in the global group, install it into a bundle and ensure the agent lists that bundle in `agents.<alias>.skill_bundles`.
 
 For a worked example that turns a built-in tool into a reusable operator workflow, see [using relationship memory from skills](./relationship-memory-skill-template.md).
+
+## Install screening
+
+Beyond the structural audit (script safety, below), remote installs are screened for content-level risk before the skill is promoted into your workspace: prompt-injection prose, embedded credential material, remote-execution patterns (such as `curl … | sh`), and encoding smuggling (malformed Unicode TAG runs, variation-selector byte channels, zero-width joiners, bidirectional controls). Screening is a **screening signal**, not a guarantee: static analysis cannot catch a payload constructed to evade it, and files it cannot read as text (binary, oversized, non-UTF-8, nested archives) are listed as unscanned rather than silently passed.
+
+Screening is configured under `[skills.install_screening]`. `remote_action` (`off` | `warn` | `confirm` | `block`, default `confirm`) governs ClawHub/Git/registry installs; `local_action` (`off` | `warn`, default `warn`) governs local-path installs and never blocks your own iteration loop. Under `confirm`, a denial-impact finding (a malformed Unicode TAG run or a high-confidence embedded credential) or an unscanned file (binary, oversized, non-UTF-8, or a nested archive, which is a blind spot a payload could hide in) stops the install and prints the report plus a **staged content hash**. To proceed you accept that exact content: on an interactive terminal by confirming the prompt, or non-interactively by re-running with `--accept-risk=<hash>`. The acceptance is content-bound: the re-run re-fetches and re-hashes, so if the source now serves different bytes the stale acceptance is rejected. Under `block`, a denial cannot be overridden.
+
+Screen a source without installing it:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills screen clawhub:release-check
+```
+
+</div>
+
+`zeroclaw skills screen` stages the source, prints the full report (including any unscanned files), and exits non-zero on anything the default (`confirm`) install gate would refuse to install silently: a denial-impact finding **or** an unscanned file. It can therefore be used as a CI preflight that agrees with `skills install`.
+
+## Install receipts and verification
+
+Each successful install writes a receipt to a daemon-owned state directory (`<install root>/state/skill-receipts/`, outside the agent-writable workspace) recording the sanitized source, an immutable resolution (the Git commit SHA or downloaded-artifact SHA-256), a content tree hash, and what screening observed. Verify installed skills against their receipts:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills verify release-check
+zeroclaw skills verify
+```
+
+</div>
+
+Verification recomputes the content tree hash and reports `matches receipt`, `modified` (a local edit or an upstream content swap; reinstall to restore), or `no receipt` (a pre-provenance install). Receipts detect content swaps and accidental edits; they are **not** tamper-proof against a process running as the same user, which can rewrite both a skill and its receipt.
+
+## Updating a skill
+
+Reinstall over an existing skill with `--force`, which performs a journaled swap (the current skill is moved aside, the new one promoted, and the old content restored if the promotion fails):
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills install --force clawhub:release-check
+```
+
+</div>
+
+The update is reviewed against the prior receipt. A version bump proceeds as an ordinary update; a content change that keeps the same version is flagged as a content swap and requires a content-bound override (the same `--accept-risk=<hash>` flow as screening); identical content is a no-op.
 
 ## Prompt-triggered capability suggestions
 

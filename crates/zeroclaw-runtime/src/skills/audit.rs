@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use super::constants::{SKILL_DEPRECATED_MANIFESTS, SKILL_MANIFEST_FILENAME};
 
-const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
+pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SkillAuditOptions {
@@ -103,14 +103,23 @@ pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillA
     Ok(report)
 }
 
-fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
     let mut out = Vec::new();
 
     while let Some(current) = stack.pop() {
         out.push(current.clone());
 
-        if !current.is_dir() {
+        // Use `symlink_metadata` (never follows) rather than `Path::is_dir`
+        // (which does): a symlinked directory must be returned to the caller as
+        // a leaf so the caller's own symlink check can flag/reject it, but the
+        // walk must NOT descend through it into files outside the tree. A
+        // `Path::is_dir` here let `skills screen <dir>` walk a `ln -s /` into an
+        // arbitrary-filesystem read.
+        let is_real_dir = std::fs::symlink_metadata(&current)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if !is_real_dir {
             continue;
         }
 
