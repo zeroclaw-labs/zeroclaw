@@ -1,12 +1,6 @@
 //! Deferred MCP tool loading — stubs and activated-tool tracking.
-//!
-//! When `mcp.deferred_loading` is enabled, MCP tool schemas are NOT eagerly
-//! included in the LLM context window. Instead, only lightweight stubs (name +
-//! description) are exposed in the system prompt. The LLM must call the built-in
-//! `tool_search` tool to fetch full schemas, which moves them into the
-//! [`ActivatedToolSet`] for the current conversation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::mcp_client::McpRegistry;
@@ -180,11 +174,6 @@ impl ActivatedToolSet {
         self.tools.get(name).cloned()
     }
 
-    /// Resolve an activated tool by exact name first, then by unique MCP suffix.
-    ///
-    /// Some model_providers occasionally strip the `<server>__` prefix when calling a
-    /// deferred MCP tool after `tool_search` activation. When the suffix maps to
-    /// exactly one activated tool, allow that call to proceed.
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
         if let Some(tool) = self.get(name) {
             return Some(tool);
@@ -239,6 +228,14 @@ pub fn build_deferred_tools_section_filtered(
     deferred: &DeferredMcpToolSet,
     policy: Option<&crate::tool_search::ToolAccessPolicy>,
 ) -> String {
+    build_deferred_tools_section_excluding(deferred, policy, &HashSet::new())
+}
+
+pub fn build_deferred_tools_section_excluding(
+    deferred: &DeferredMcpToolSet,
+    policy: Option<&crate::tool_search::ToolAccessPolicy>,
+    exclude: &HashSet<String>,
+) -> String {
     if deferred.is_empty() {
         return String::new();
     }
@@ -254,6 +251,9 @@ pub fn build_deferred_tools_section_filtered(
     out.push_str("<available-deferred-tools>\n");
     let mut count = 0;
     for stub in &deferred.stubs {
+        if exclude.contains(&stub.prefixed_name) {
+            continue;
+        }
         if let Some(p) = policy
             && !p.is_tool_allowed(&stub.prefixed_name)
         {
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn activated_set_tracks_activation() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -332,7 +332,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn activated_set_resolves_unique_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -376,7 +376,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn activated_set_rejects_ambiguous_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool(&'static str);
         impl ::zeroclaw_api::attribution::Attributable for FakeTool {
@@ -417,7 +417,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -518,6 +518,46 @@ mod tests {
             section.contains("tool_search"),
             "section must mention tool_search for multi-server setups"
         );
+    }
+
+    #[test]
+    fn build_deferred_section_excluding_omits_named_stubs() {
+        let stubs = vec![
+            make_stub("fs__read_file", "Read a file"),
+            make_stub("git__status", "Git status"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
+        let section = build_deferred_tools_section_excluding(&set, None, &exclude);
+        assert!(
+            !section.contains("fs__read_file"),
+            "pre-activated stub must not be advertised as deferred"
+        );
+        assert!(section.contains("git__status"));
+    }
+
+    #[test]
+    fn build_deferred_section_excluding_all_returns_empty() {
+        let stubs = vec![make_stub("fs__read_file", "Read a file")];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
+        assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
     }
 
     #[test]

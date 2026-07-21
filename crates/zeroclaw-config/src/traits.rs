@@ -3,6 +3,13 @@
 /// into persisted config.
 pub const UNSET_DISPLAY: &str = "<unset>";
 
+/// Return whether a submitted display value represents no configured value.
+#[must_use]
+pub fn is_unset_display_value(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value == UNSET_DISPLAY
+}
+
 /// Describes a single secret field discovered via `#[derive(Configurable)]`.
 #[derive(Debug, Clone)]
 pub struct SecretFieldInfo {
@@ -73,18 +80,7 @@ pub enum PropKind {
     AliasRef,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
-    /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
-    /// `Vec<PeripheralBoardConfig>`). Round-tripped on the wire as a JSON array of
-    /// objects; the dashboard renders a per-row sub-form using the JSON Schema
-    /// from `OPTIONS /api/config` to discover the element type's field shape.
-    /// Schema v3 / #5947 will migrate the load-bearing ones (mcp.servers etc.)
-    /// to `HashMap<String, T>` keyed tables; until then this kind covers them.
     ObjectArray,
-    /// A struct-shaped scalar field (e.g. `Option<ModelPricing>`). Round-tripped
-    /// on the wire as a JSON object; the dashboard renders a sub-form for the
-    /// inner fields using the JSON Schema from `OPTIONS /api/config`. Distinct
-    /// from `String`, which inserts the raw value as a TOML string and breaks
-    /// the serde round-trip for typed structs.
     Object,
 }
 
@@ -204,13 +200,6 @@ impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
     const PROP_KIND: PropKind = PropKind::Object;
 }
 
-// Vec<struct> fields are surfaced as PropKind::ObjectArray — each
-// element renders as a per-row sub-form on the dashboard rather than a
-// chip. The Configurable derive routes `<Vec<T> as HasPropKind>::PROP_KIND`
-// for every Vec field, so a missing impl here surfaces as a "trait bound
-// not satisfied" compile error pointing at the field. Add the impl in
-// the same module that defines the type if traits.rs's crate scope is
-// too narrow.
 impl HasPropKind for Vec<crate::schema::ClassificationRule> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
@@ -268,14 +257,6 @@ pub enum CredentialSurfaceClass {
     RequiresFollowUp,
 }
 
-/// Tab grouping for config fields and UI surfaces. Each variant maps to a
-/// tab in the TUI and gateway dashboard. Serializes to its PascalCase
-/// variant name on the wire.
-///
-/// Field-partition tabs (`Connection`, `Model`, …) are used as `#[tab(...)]`
-/// annotations on schema structs. Composite tabs (`Personality`, `Skills`,
-/// `PeerGroups`, `Costs`) are rendered by dedicated UI components but share
-/// the same enum so both frontends speak one vocabulary.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -396,6 +377,10 @@ pub struct PropFieldInfo {
     pub tab: ConfigTab,
     /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
     pub alias_source: Option<AliasSource>,
+    /// Whether this field is marked `#[multiline]`, a hint that surfaces
+    /// should render a multi-line text area (e.g. a PEM key body) rather
+    /// than a single-line input.
+    pub multiline: bool,
 }
 
 impl PropKind {
@@ -435,12 +420,6 @@ impl std::fmt::Debug for PropFieldInfo {
     }
 }
 
-/// Mask and restore secret fields on config structs.
-///
-/// Automatically implemented by `#[derive(Configurable)]` for any struct that
-/// has fields annotated with `#[secret]` or `#[nested]`. A blanket impl covers
-/// `HashMap<String, T: MaskSecrets>` so the trait propagates through alias maps
-/// without any per-type boilerplate.
 pub trait MaskSecrets {
     fn mask_secrets(&mut self);
     fn restore_secrets_from(&mut self, current: &Self);
@@ -480,18 +459,6 @@ pub fn is_masked_secret(value: &str) -> bool {
     value == MASKED_SECRET
 }
 
-/// Per-field secret operations the `Configurable` derive emits for every
-/// `#[secret]` field. Generalizes mask / restore / encrypt / decrypt / is_set
-/// across the supported shapes — `String`, `Option<String>`, `Vec<String>`,
-/// `HashMap<String, String>`, and `Option<HashMap<String, String>>` — so adding
-/// a new shape is a single trait impl rather than a fourth branch in the macro.
-///
-/// `encrypt_in_place` and `decrypt_in_place` are idempotent: encrypting an
-/// already-`enc2:`-prefixed value or decrypting a plaintext value is a no-op,
-/// detected via [`crate::security::SecretStore::is_encrypted`]. The `field`
-/// argument is the dotted config-path (e.g. `mcp.servers`); the impls suffix
-/// per-element coordinates (`[<idx>]` for `Vec`, `.<key>` for `HashMap`) so
-/// error messages point at the exact failed entry.
 pub trait SecretField {
     /// Replace each non-empty inner string with [`MASKED_SECRET`].
     fn mask(&mut self);
@@ -842,28 +809,19 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
-    /// For `Kind::List` Vec sections that declared `#[natural_key = "<f>"]`
-    /// (the per-element editor opt-in shipped with the `mcp.servers`
-    /// per-field editor), this is the snake_case field name on the inner
-    /// type that holds the alias used to address each element — e.g.
-    /// `"name"` for `[[mcp.servers]]`. The incremental TOML writer
-    /// (`apply_dirty_path` in `schema.rs`) reads this to walk a
-    /// `<section>.<alias>.<inner>` dirty path through an array of tables.
-    /// Without it, the writer flat-faceplants on `as_table()` at the
-    /// alias segment and silently drops the edit on the floor.
-    ///
-    /// `None` for HashMap sections (alias *is* the TOML key, no further
-    /// hint needed) and for plain `Vec<T>` sections without
-    /// `#[natural_key]` (legacy whole-array `ObjectArray` round-trip,
-    /// no per-element addressing).
+    /// Optional natural key used to address entries in list-backed sections.
     pub natural_key: Option<&'static str>,
+    /// Whether this section's map key is a `#[resource_key]` — a value
+    /// drawn from another domain (a model id, tool name, …) that may
+    /// itself contain dots, rather than a short operator-chosen alias
+    /// validated by `validate_alias_key`. Consumers that split a dotted
+    /// prop path into "map key" + "field name" by first-dot-boundary
+    /// MUST exclude `resource_key` sections: naive splitting corrupts a
+    /// resource key like `gpt-4.1` into a bogus alias `gpt-4` plus a
+    /// nonsense tail `1`.
+    pub resource_key: bool,
 }
 
-/// Serializable wire representation of a config field for API consumers
-/// (RPC dispatch, gateway, TUI). Single source of truth — replaces the
-/// gateway's local `ListEntry` and the RPC dispatch's ad-hoc JSON.
-///
-/// Built from [`PropFieldInfo`] via [`ConfigFieldEntry::from_prop_field`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConfigFieldEntry {
     pub path: String,
@@ -886,6 +844,10 @@ pub struct ConfigFieldEntry {
     pub tab: ConfigTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_source: Option<AliasSource>,
+    /// Surface hint from `#[multiline]`: render a multi-line text area
+    /// instead of a single-line input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multiline: bool,
 }
 
 impl ConfigFieldEntry {
@@ -918,15 +880,11 @@ impl ConfigFieldEntry {
             section,
             tab: info.tab,
             alias_source: info.alias_source,
+            multiline: info.multiline,
         }
     }
 }
 
-/// One row emitted by the `Configurable` derive's `nested_option_entries()`
-/// method — every `#[nested] Option<XConfig>` field on a struct shows up here
-/// with its `present` bit and the per-field `#[display_name = "..."]` /
-/// `#[description = "..."]` metadata. The integrations registry consumes
-/// this verbatim instead of carrying its own per-field hand-list.
 #[derive(Debug, Clone, Copy)]
 pub struct NestedOptionEntry {
     /// snake_case field name on the parent struct (e.g. `"telegram"`,
@@ -1149,11 +1107,6 @@ mod secret_field_tests {
 
     #[test]
     fn hashmap_with_only_empty_values_is_not_set() {
-        // The trait contract for `is_set` is "at least one non-empty inner
-        // string". A map carrying placeholder keys with empty values has no
-        // secret material to encrypt or mask, so it must report not-set —
-        // otherwise the dashboard would render `***MASKED***` over a blank
-        // header row.
         let h: HashMap<String, String> = HashMap::from([
             ("Authorization".into(), String::new()),
             ("X-Trace".into(), String::new()),
@@ -1185,5 +1138,55 @@ mod secret_field_tests {
             msg.contains("mcp.servers.foo.headers.Authorization"),
             "error must include field path; got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_key_tests {
+    // Pins `MapKeySection::resource_key`, the discriminator that
+    // `ensure_map_key_for_prop_path` (in the `zeroclawlabs` binary crate)
+    // filters on: `true` for sections keyed by a value drawn from another
+    // domain (a model id, tool name, …) that may itself contain dots;
+    // `false` for sections keyed by a short operator-chosen alias.
+    use crate::schema::Config;
+
+    fn resource_key_of(path: &str) -> bool {
+        Config::map_key_sections()
+            .into_iter()
+            .find(|section| section.path == path)
+            .unwrap_or_else(|| panic!("no map_key_sections() entry for `{path}`"))
+            .resource_key
+    }
+
+    #[test]
+    fn cost_rate_sections_are_resource_keyed() {
+        for path in [
+            "cost.rates.tools",
+            "cost.rates.providers.models.openai",
+            "cost.rates.providers.tts.openai",
+            "cost.rates.providers.transcription.openai",
+        ] {
+            assert!(
+                resource_key_of(path),
+                "`{path}` prices a resource id (model/voice/tool name), \
+                 so its map key must be marked #[resource_key]"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_keyed_sections_are_not_resource_keyed() {
+        for path in [
+            "risk_profiles",
+            "peer_groups",
+            "channels.telegram",
+            "providers.models.openai",
+        ] {
+            assert!(
+                !resource_key_of(path),
+                "`{path}` is keyed by an operator-chosen alias, not a \
+                 resource id, so it must not be marked #[resource_key]"
+            );
+        }
     }
 }

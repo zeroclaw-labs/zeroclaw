@@ -1,17 +1,4 @@
 //! `cargo xtask web` — drive the web dashboard build from cargo.
-//!
-//! Subcommands:
-//!   gen-api  — render the gateway's OpenAPI 3.1 spec in-process, write
-//!              it to `target/openapi.json` (gitignored), and feed it to
-//!              `npx openapi-typescript` to produce
-//!              `web/src/lib/api-generated.ts`. Neither file is
-//!              committed; both are derived artifacts.
-//!   install  — `npm install` in `web/`.
-//!   build    — gen-api + `npm run build` (vite production bundle).
-//!   dev      — gen-api + `npm run dev` (vite dev server).
-//!   check    — gen-api + `npx tsc -b` (typecheck without bundling).
-//!
-//!
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -70,11 +57,6 @@ fn npm_install(web_dir: &Path) -> Result<()> {
     run_cmd(Command::new(bin("npm")).current_dir(web_dir).arg("install"))
 }
 
-/// Whether `web/node_modules` is missing or stale relative to `package-lock.json`.
-///
-/// npm writes a `node_modules/.package-lock.json` sentinel after every successful
-/// install. If it's absent, or if the checked-in `package-lock.json` is newer
-/// (a pull or merge updated dependencies), the install needs to re-run.
 fn node_modules_needs_install(web_dir: &Path) -> bool {
     let node_modules = web_dir.join("node_modules");
     if !node_modules.exists() {
@@ -125,11 +107,25 @@ fn gen_api(web_dir: &Path, spec_path: &Path) -> Result<()> {
             .with_context(|| format!("create parent directory {}", parent.display()))?;
     }
 
-    let spec = serde_json::to_string(&zeroclaw_gateway::openapi::build_spec())
-        .context("serialize openapi spec to JSON")?;
+    let spec_value = zeroclaw_gateway::openapi::build_spec();
+    let spec = serde_json::to_string(&spec_value).context("serialize openapi spec to JSON")?;
     std::fs::write(spec_path, &spec)
         .with_context(|| format!("write openapi spec to {}", spec_path.display()))?;
     println!("==> gen-api → {}", out_abs.display());
+
+    let desc_rel = PathBuf::from("src/lib/api-descriptions.ts");
+    let desc_abs = web_dir.join(&desc_rel);
+    let desc_ts = render_descriptions(&spec_value);
+    std::fs::write(&desc_abs, &desc_ts)
+        .with_context(|| format!("write field descriptions to {}", desc_abs.display()))?;
+    println!("==> gen-api → {}", desc_abs.display());
+
+    let enums_rel = PathBuf::from("src/lib/api-enums.ts");
+    let enums_abs = web_dir.join(&enums_rel);
+    let enums_ts = render_enum_values(&spec_value);
+    std::fs::write(&enums_abs, &enums_ts)
+        .with_context(|| format!("write enum values to {}", enums_abs.display()))?;
+    println!("==> gen-api → {}", enums_abs.display());
 
     let spec_arg = spec_path
         .to_str()
@@ -152,6 +148,161 @@ fn bin(tool: &str) -> String {
         format!("{tool}.cmd")
     } else {
         tool.to_string()
+    }
+}
+
+/// Collect the string variants of a schema whether it uses top-level `enum`,
+/// `oneOf`/`anyOf` `const` strings, or `oneOf`/`anyOf` `enum` string arrays.
+/// Object variants (e.g. `StepFailure::Goto`) contribute nothing. Preserves
+/// spec order and drops duplicates so pickers render one row per variant.
+fn collect_string_enum_members(schema: &serde_json::Value) -> Vec<String> {
+    let mut members: Vec<String> = Vec::new();
+    let mut push = |value: &str| {
+        let owned = value.to_string();
+        if !members.contains(&owned) {
+            members.push(owned);
+        }
+    };
+
+    if schema.get("type").and_then(|t| t.as_str()) == Some("string")
+        && let Some(variants) = schema.get("enum").and_then(|e| e.as_array())
+    {
+        for value in variants.iter().filter_map(|v| v.as_str()) {
+            push(value);
+        }
+    }
+
+    for key in ["oneOf", "anyOf"] {
+        let Some(variants) = schema.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for variant in variants {
+            if variant.get("type").and_then(|t| t.as_str()) != Some("string") {
+                continue;
+            }
+            if let Some(value) = variant.get("const").and_then(|c| c.as_str()) {
+                push(value);
+            }
+            if let Some(inner) = variant.get("enum").and_then(|e| e.as_array()) {
+                for value in inner.iter().filter_map(|v| v.as_str()) {
+                    push(value);
+                }
+            }
+        }
+    }
+
+    members
+}
+
+/// Extract `{ SchemaName: [variant, ...] }` for every schema whose top-level
+/// shape is a string `enum`, so option pickers walk the spec instead of
+/// retyping variant lists. The Rust enums remain the single source of truth.
+fn render_enum_values(spec: &serde_json::Value) -> String {
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    let schemas = spec
+        .get("components")
+        .and_then(|c| c.get("schemas"))
+        .and_then(|s| s.as_object());
+
+    if let Some(schemas) = schemas {
+        for (name, schema) in schemas {
+            let members = collect_string_enum_members(schema);
+            if !members.is_empty() {
+                out.insert(name.clone(), members);
+            }
+        }
+    }
+
+    let mut body = String::new();
+    body.push_str(
+        "// GENERATED by `cargo web gen-api` from the gateway OpenAPI spec.\n\
+         // Enum variant lists are sourced from Rust enums; do not edit by hand\n\
+         // and do not retype variant lists in components.\n\n\
+         export type EnumValues = Record<string, readonly string[]>;\n\n\
+         export const enumValues: EnumValues = ",
+    );
+    let json = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string());
+    body.push_str(&json);
+    body.push_str(
+        ";\n\n\
+         /** Variant list for a generated string enum, or an empty array. */\n\
+         export function enumMembers(schema: string): readonly string[] {\n\
+         \x20 return enumValues[schema] ?? [];\n\
+         }\n",
+    );
+    body
+}
+
+/// Extract `{ SchemaName: { field: description } }` from the OpenAPI spec so the
+/// frontend renders tooltips from the Rust `///` docs at runtime. TypeScript
+/// `@description` JSDoc is erased at build time and unreadable at runtime; this
+/// projects the same spec into a real data module. The Rust doc comments remain
+/// the single source of truth, nothing is retyped on the frontend.
+fn render_descriptions(spec: &serde_json::Value) -> String {
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+
+    let schemas = spec
+        .get("components")
+        .and_then(|c| c.get("schemas"))
+        .and_then(|s| s.as_object());
+
+    if let Some(schemas) = schemas {
+        for (name, schema) in schemas {
+            let mut fields: BTreeMap<String, String> = BTreeMap::new();
+            collect_property_descriptions(schema, &mut fields);
+            if !fields.is_empty() {
+                out.insert(name.clone(), fields);
+            }
+        }
+    }
+
+    let mut body = String::new();
+    body.push_str(
+        "// GENERATED by `cargo web gen-api` from the gateway OpenAPI spec.\n\
+         // Field help text is sourced from Rust `///` doc comments; do not edit\n\
+         // by hand and do not duplicate help text in components.\n\n\
+         export type FieldDescriptions = Record<string, Record<string, string>>;\n\n\
+         export const fieldDescriptions: FieldDescriptions = ",
+    );
+    let json = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string());
+    body.push_str(&json);
+    body.push_str(
+        ";\n\n\
+         /** Help text for one field of a generated schema, or undefined. */\n\
+         export function fieldHelp(schema: string, field: string): string | undefined {\n\
+         \x20 return fieldDescriptions[schema]?.[field];\n\
+         }\n",
+    );
+    body
+}
+
+/// Merge every `properties.<field>.description` found in a schema (including its
+/// `oneOf` / `anyOf` variants, so serde-tagged enums like `SopTrigger` surface
+/// each variant's field docs) into `fields`.
+fn collect_property_descriptions(
+    schema: &serde_json::Value,
+    fields: &mut std::collections::BTreeMap<String, String>,
+) {
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (field, prop) in props {
+            if let Some(desc) = prop.get("description").and_then(|d| d.as_str()) {
+                fields
+                    .entry(field.clone())
+                    .or_insert_with(|| desc.to_string());
+            }
+        }
+    }
+    for key in ["oneOf", "anyOf", "allOf"] {
+        if let Some(variants) = schema.get(key).and_then(|v| v.as_array()) {
+            for variant in variants {
+                collect_property_descriptions(variant, fields);
+            }
+        }
     }
 }
 

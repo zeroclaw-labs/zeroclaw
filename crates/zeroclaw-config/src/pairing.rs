@@ -1,13 +1,3 @@
-// Gateway pairing mode — first-connect authentication.
-//
-// On startup the gateway generates a one-time pairing code printed to the
-// terminal. The first client must present this code via `X-Pairing-Code`
-// header on a `POST /pair` request. The server responds with a bearer token
-// that must be sent on all subsequent requests via `Authorization: Bearer <token>`.
-//
-// Already-paired tokens are persisted in config so restarts don't require
-// re-pairing.
-
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -42,11 +32,6 @@ pub enum GeneratePairingCodeError {
     PairingDisabled,
 }
 
-/// Manages pairing state for the gateway.
-///
-/// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
-/// in config files. When a new token is generated, the plaintext is returned
-/// to the client once, and only the hash is retained.
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
@@ -61,16 +46,6 @@ pub struct PairingGuard {
 }
 
 impl PairingGuard {
-    /// Create a new pairing guard.
-    ///
-    /// If `require_pairing` is true and no tokens exist yet, a fresh
-    /// pairing code is generated and printed to the terminal. Once
-    /// paired, no code is generated on restart — operators can use
-    /// `generate_new_pairing_code()` or the CLI to create one on demand.
-    ///
-    /// Existing tokens are accepted in both forms:
-    /// - Plaintext (`zc_...`): hashed on load for backward compatibility
-    /// - Already hashed (64-char hex): stored as-is
     pub fn new(require_pairing: bool, existing_tokens: &[String]) -> Self {
         let tokens: HashSet<String> = existing_tokens
             .iter()
@@ -228,15 +203,6 @@ impl PairingGuard {
         tokens.iter().cloned().collect()
     }
 
-    /// Revoke a paired token by plaintext. Returns true if removed.
-    ///
-    /// Test/convenience wrapper that hashes the plaintext, then defers to
-    /// [`revoke_token_hash`](Self::revoke_token_hash). Production revoke paths
-    /// already hold the hash (the device registry stores it) and should call
-    /// `revoke_token_hash` directly rather than re-hashing the plaintext.
-    ///
-    /// In-memory only; the caller must persist `tokens()` to config or a
-    /// restart will resurrect the token from disk.
     pub fn revoke_token(&self, token: &str) -> bool {
         let hashed = hash_token(token);
         let mut tokens = self.paired_tokens.lock();
@@ -249,12 +215,6 @@ impl PairingGuard {
         tokens.remove(token_hash)
     }
 
-    /// Revoke every paired token at once. Returns the number of tokens
-    /// invalidated. This is the "rotate after compromise — nuke everything"
-    /// path: when an operator does not know which token leaked, the only safe
-    /// action is to invalidate all of them and force every client to re-pair.
-    /// The caller must persist `tokens()` to config so a daemon restart does
-    /// not resurrect the revoked set.
     pub fn revoke_all_tokens(&self) -> usize {
         let mut tokens = self.paired_tokens.lock();
         let count = tokens.len();
@@ -263,7 +223,6 @@ impl PairingGuard {
     }
 
     /// Generate a new pairing code that pairs an additional client.
-    ///
     /// Does not revoke existing tokens. To rotate a compromised token,
     /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.
     pub fn generate_new_pairing_code(&self) -> Option<String> {
@@ -275,13 +234,6 @@ impl PairingGuard {
         Some(new_code)
     }
 
-    /// Generate a new pairing code only when no code is already pending.
-    ///
-    /// Returns `Ok(code)` on success, `Err(GeneratePairingCodeError::Pending)`
-    /// when the slot is already occupied, and
-    /// `Err(GeneratePairingCodeError::PairingDisabled)` when pairing is off.
-    /// The check + write is atomic — concurrent callers cannot both observe
-    /// the slot vacant and then both write into it.
     pub fn generate_pairing_code_if_vacant(&self) -> Result<String, GeneratePairingCodeError> {
         if !self.require_pairing {
             return Err(GeneratePairingCodeError::PairingDisabled);
@@ -330,14 +282,6 @@ fn prune_failed_attempts(map: &mut HashMap<String, FailedAttemptState>, now: Ins
 
 /// Generate a 6-digit numeric pairing code using cryptographically secure randomness.
 fn generate_code() -> String {
-    // UUID v4 uses getrandom (backed by /dev/urandom on Linux, BCryptGenRandom
-    // on Windows) — a CSPRNG. We extract 4 bytes from it for a uniform random
-    // number in [0, 1_000_000).
-    //
-    // Rejection sampling eliminates modulo bias: values above the largest
-    // multiple of 1_000_000 that fits in u32 are discarded and re-drawn.
-    // The rejection probability is ~0.02%, so this loop almost always exits
-    // on the first iteration.
     const UPPER_BOUND: u32 = 1_000_000;
     const REJECT_THRESHOLD: u32 = (u32::MAX / UPPER_BOUND) * UPPER_BOUND;
 
@@ -352,12 +296,6 @@ fn generate_code() -> String {
     }
 }
 
-/// Generate a cryptographically-adequate bearer token with 256-bit entropy.
-///
-/// Uses `rand::rng()` which is backed by the OS CSPRNG
-/// (/dev/urandom on Linux, BCryptGenRandom on Windows, SecRandomCopyBytes
-/// on macOS). The 32 random bytes (256 bits) are hex-encoded for a
-/// 64-character token, providing 256 bits of entropy.
 fn generate_token() -> String {
     let bytes: [u8; 32] = rand::random();
     format!("zc_{}", hex::encode(bytes))
@@ -374,22 +312,6 @@ fn is_token_hash(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Constant-time string comparison to prevent timing attacks.
-///
-/// This function is critical to the security of the pairing mechanism:
-/// when verifying the one-time pairing code, timing side-channels could
-/// allow an attacker to deduce the correct code character-by-character.
-///
-/// Implementation details that ensure constant-time execution:
-/// 1. Does not short-circuit on length mismatch — always iterates over
-///    the longer input to avoid leaking length information via timing.
-/// 2. Uses bitwise AND (&) instead of logical AND (&&) to ensure both
-///    comparisons always execute, preventing timing variations that could
-///    reveal whether the length check or byte comparison failed first.
-///
-/// SECURITY NOTE: The use of `&` instead of `&&` is intentional and
-/// required for constant-time behavior. Do not change to `&&` or clippy
-/// suggestions that would reintroduce short-circuit evaluation.
 #[allow(clippy::needless_bitwise_bool)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
@@ -816,9 +738,6 @@ mod tests {
 
     // ── Token revocation ─────────────────────────────────────
 
-    /// Regression: revoked tokens MUST stop authenticating immediately.
-    /// This was the GHSA-f385-f6h2-3gqj follow-up gap — rotation surfaces
-    /// generated new codes but never removed the old token.
     #[test]
     async fn revoked_token_no_longer_authenticates() {
         let guard = PairingGuard::new(true, &[]);
@@ -831,8 +750,6 @@ mod tests {
         assert!(!guard.is_paired());
     }
 
-    /// Enforcement: persisted view (`tokens()`) drops the revoked entry,
-    /// so a daemon restart cannot resurrect it from `gateway.paired_tokens`.
     #[test]
     async fn revoked_token_is_dropped_from_persistence_view() {
         let guard = PairingGuard::new(true, &[]);
@@ -861,7 +778,6 @@ mod tests {
         assert!(guard.is_authenticated("zc_a"));
     }
 
-    /// Enforcement: revoking one paired client must not affect siblings.
     #[test]
     async fn revoke_is_scoped_to_target_token() {
         let guard = PairingGuard::new(true, &["zc_keep".into(), "zc_drop".into()]);
@@ -870,8 +786,6 @@ mod tests {
         assert!(!guard.is_authenticated("zc_drop"));
     }
 
-    /// `revoke_all_tokens` invalidates every paired token and reports the
-    /// count. This is the "rotate after compromise — nuke everything" path.
     #[test]
     async fn revoke_all_tokens_invalidates_every_token() {
         let guard = PairingGuard::new(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
@@ -900,9 +814,6 @@ mod tests {
         assert_eq!(guard.pairing_code().as_deref(), Some(code.as_str()));
     }
 
-    /// Regression: the check + write must be atomic. The earlier rotate
-    /// handler did `if pairing_code().is_some() { … } else { generate() }`
-    /// across two lock acquisitions; this test fails on that pattern.
     #[test]
     async fn generate_pairing_code_if_vacant_refuses_when_slot_occupied() {
         let guard = PairingGuard::new(true, &[]);
