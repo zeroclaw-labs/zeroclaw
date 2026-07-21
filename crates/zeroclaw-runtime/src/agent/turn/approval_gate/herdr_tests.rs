@@ -92,6 +92,7 @@ fn build_ctx<'a>(
         channel: Some(channel.as_ref()),
         turn_id: "turn-1",
         agent_alias: None,
+        parent_agent_alias: None,
     }
 }
 

@@ -670,6 +670,7 @@ pub(crate) mod tests {
             messages_count: 1,
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: None,
         });
         calls.lock().clear();
@@ -866,6 +867,7 @@ pub(crate) mod tests {
             messages_count: 1,
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: Some(parent_turn_id.to_string()),
         };
         let parent_end = ObserverEvent::AgentEnd {
@@ -899,6 +901,7 @@ pub(crate) mod tests {
             messages_count: 1,
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: Some(child_turn_id.to_string()),
         };
         let child_end = ObserverEvent::AgentEnd {
