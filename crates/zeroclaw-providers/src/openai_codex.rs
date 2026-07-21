@@ -2527,8 +2527,8 @@ data: [DONE]
     #[test]
     fn build_function_call_item_sanitizes_invalid_arguments_to_empty_object() {
         // Pins that the openai_codex call site of `sanitize_tool_arguments`
-        // is wired in. The helper contract itself
-        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        // is wired in. The helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
         let call = ProviderToolCall {
             id: "call_bad".to_string(),
             name: "shell".to_string(),
