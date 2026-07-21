@@ -734,14 +734,37 @@ async fn history_trims_after_max_messages() {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
-    // System prompt (1) + trimmed messages
-    // Should not exceed max_history + 1 (system prompt)
+    let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+    let retained_messages: Vec<_> = agent
+        .history()
+        .iter()
+        .filter(|message| match message {
+            ConversationMessage::Chat(chat) => chat.role != "system" && chat.content != breadcrumb,
+            _ => true,
+        })
+        .collect();
+
     assert!(
-        agent.history().len() <= max_history + 1,
-        "History length {} exceeds max {} + 1 (system)",
-        agent.history().len(),
+        retained_messages.len() <= max_history,
+        "Retained history length {} exceeds max {}",
+        retained_messages.len(),
         max_history,
     );
+    let mut turns = retained_messages.chunks_exact(2);
+    assert!(
+        turns.remainder().is_empty(),
+        "history must retain whole turns"
+    );
+    assert!(turns.all(|turn| matches!(
+        turn,
+        [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
+            if user.role == "user" && assistant.role == "assistant"
+    )));
+    assert!(agent.history().iter().any(|message| matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "user" && chat.content.ends_with("msg 10")
+    )));
 
     // System prompt should always be preserved
     let first = &agent.history()[0];

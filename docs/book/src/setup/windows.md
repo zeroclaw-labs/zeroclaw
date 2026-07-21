@@ -82,12 +82,12 @@ cargo install --locked --path .
 zeroclaw quickstart
 ```
 
-### Option 4: Scoop (currently stale)
+### Option 4: Scoop (verify before use)
 
-> ⚠️ **The Scoop manifest in the repo is pinned to v0.5.9** (23 patch releases behind master). Until a release-time CI hook bumps it, prefer Option 1 or 3. If you do use Scoop and hit issues, please open a PR against `dist/scoop/zeroclaw.json`.
+> ⚠️ **Verify the Scoop manifest before use.** The checked-in manifest can declare the current package version while retaining an older static download URL. Until release automation keeps both fields aligned, prefer the manual prebuilt path above or build from source.
 
 ```
-scoop install zeroclaw     # currently installs an older release; see warning above
+scoop install zeroclaw     # verify the resolved release URL first; see warning above
 zeroclaw quickstart
 ```
 
