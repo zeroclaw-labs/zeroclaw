@@ -3915,8 +3915,8 @@ mod tests {
     }
 
     mod media_filename_resolution {
-        use super::super::inbound::{build_transcription_manager, resolve_media_filename};
         use super::super::inbound::MediaCategory;
+        use super::super::inbound::{build_transcription_manager, resolve_media_filename};
         use zeroclaw_config::schema::TranscriptionConfig;
 
         // Loopback fixture URL matching the existing `transcription.rs` tests;
