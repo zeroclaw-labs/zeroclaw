@@ -44,6 +44,7 @@ import {
   approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
+  isApprovalOnlyWildcard,
   isAlwaysAskWildcardLocked,
   isMcpAutoAdmitted,
   realAllowedTools,
@@ -195,7 +196,7 @@ export default function ToolPermissionGrid({
   }
 
   function setAuth(name: string, next: AuthState) {
-    if (disabled) return;
+    if (disabled || isApprovalOnlyWildcard(name)) return;
     if (next === 'allow' && !strict) return; // no-op: explicit Allow only means something in strict mode
     onChange(applyAuthState(value, name, next, strict));
   }
@@ -249,7 +250,8 @@ export default function ToolPermissionGrid({
     );
   }
 
-  const allowedCount = filtered.filter((r) => {
+  const authorizationRows = filtered.filter((r) => !isApprovalOnlyWildcard(r.name));
+  const allowedCount = authorizationRows.filter((r) => {
     const s = authState(r.name);
     return strict ? s === 'allow' : s !== 'deny';
   }).length;
@@ -259,6 +261,7 @@ export default function ToolPermissionGrid({
   const listId = id ? `${id}-rows` : undefined;
   const customInputId = id ? `${id}-custom-tool` : undefined;
   const canAddCustom = !disabled && customName.trim().length > 0;
+  const customNameIsApprovalOnlyWildcard = isApprovalOnlyWildcard(customName.trim());
   // full/readonly bypass approval PROMPTS, but the approval lists stay live
   // (editable) because they still take effect on other runtime paths. A visible
   // banner - not a row lock - identifies them as stored overrides.
@@ -315,7 +318,7 @@ export default function ToolPermissionGrid({
           </span>
         </div>
         <span className="font-mono text-xs text-pc-text-secondary [font-variant-numeric:tabular-nums]">
-          {allowedCount}/{filtered.length}
+          {allowedCount}/{authorizationRows.length}
           {t('tool_permission_grid.summary_suffix')}
         </span>
       </div>
@@ -355,7 +358,7 @@ export default function ToolPermissionGrid({
             <button
               type="button"
               onClick={() => addCustom('deny')}
-              disabled={!canAddCustom}
+              disabled={!canAddCustom || customNameIsApprovalOnlyWildcard}
               title={t('tool_permission_grid.add_deny_title')}
               aria-label={t('tool_permission_grid.add_deny_title')}
               className="flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-status-error/30 text-status-error transition-colors hover:bg-status-error/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -365,7 +368,7 @@ export default function ToolPermissionGrid({
             <button
               type="button"
               onClick={() => addCustom('allow')}
-              disabled={!canAddCustom}
+              disabled={!canAddCustom || customNameIsApprovalOnlyWildcard}
               title={t('tool_permission_grid.add_allow_title')}
               aria-label={t('tool_permission_grid.add_allow_title')}
               className="flex h-9 w-9 items-center justify-center rounded-[var(--radius-md)] border border-status-success/30 text-status-success transition-colors hover:bg-status-success/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -637,7 +640,8 @@ function PermissionRow({
   onAuth: (next: AuthState) => void;
   onAppr: (next: ApprState) => void;
 }) {
-  const denied = authState === 'deny';
+  const approvalOnlyWildcard = isApprovalOnlyWildcard(row.name);
+  const denied = !approvalOnlyWildcard && authState === 'deny';
   const allowDisabled = disabled || !strict;
   const approvalDisabled = disabled || denied || alwaysAskWildcardLocked;
   const authAxisLabel = `${row.name} ${t('tool_permission_grid.col_authorization')}`;
@@ -669,37 +673,46 @@ function PermissionRow({
         <span className="sm:hidden text-[10px] font-semibold uppercase tracking-wider text-pc-text-faint">
           {t('tool_permission_grid.col_authorization')}
         </span>
-        <Segmented<AuthState>
-          value={authState}
-          disabled={disabled}
-          ariaLabel={authAxisLabel}
-          onChange={onAuth}
-          options={[
-            { value: 'deny', icon: X, tone: 'error', title: t('tool_permission_grid.auth_deny_title') },
-            {
-              value: 'inherit',
-              icon: Minus,
-              tone: 'neutral',
-              optionDisabled: mcpAutoAdmitted,
-              title: mcpAutoAdmitted
-                ? t('tool_permission_grid.auth_inherit_mcp_title')
-                : strict
-                  ? t('tool_permission_grid.auth_inherit_blocked_title')
-                  : t('tool_permission_grid.auth_inherit_open_title'),
-            },
-            {
-              value: 'allow',
-              icon: Check,
-              tone: 'success',
-              optionDisabled: allowDisabled,
-              title: mcpAutoAdmitted
-                ? t('tool_permission_grid.auth_allow_mcp_title')
-                : allowDisabled
-                  ? t('tool_permission_grid.auth_allow_disabled_title')
-                  : t('tool_permission_grid.auth_allow_title'),
-            },
-          ]}
-        />
+        {approvalOnlyWildcard ? (
+          <span
+            className="inline-flex h-7 items-center text-xs text-pc-text-faint"
+            aria-label={t('tool_permission_grid.auth_approval_only')}
+          >
+            {t('tool_permission_grid.auth_approval_only')}
+          </span>
+        ) : (
+          <Segmented<AuthState>
+            value={authState}
+            disabled={disabled}
+            ariaLabel={authAxisLabel}
+            onChange={onAuth}
+            options={[
+              { value: 'deny', icon: X, tone: 'error', title: t('tool_permission_grid.auth_deny_title') },
+              {
+                value: 'inherit',
+                icon: Minus,
+                tone: 'neutral',
+                optionDisabled: mcpAutoAdmitted,
+                title: mcpAutoAdmitted
+                  ? t('tool_permission_grid.auth_inherit_mcp_title')
+                  : strict
+                    ? t('tool_permission_grid.auth_inherit_blocked_title')
+                    : t('tool_permission_grid.auth_inherit_open_title'),
+              },
+              {
+                value: 'allow',
+                icon: Check,
+                tone: 'success',
+                optionDisabled: allowDisabled,
+                title: mcpAutoAdmitted
+                  ? t('tool_permission_grid.auth_allow_mcp_title')
+                  : allowDisabled
+                    ? t('tool_permission_grid.auth_allow_disabled_title')
+                    : t('tool_permission_grid.auth_allow_title'),
+              },
+            ]}
+          />
+        )}
       </div>
 
       <div className="flex items-center justify-between gap-2 sm:block">

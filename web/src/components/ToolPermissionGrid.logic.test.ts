@@ -3,11 +3,13 @@ import test from 'node:test';
 
 import {
   APPROVAL_WILDCARD,
+  applyAuthState,
   applyApprovalState,
   applyCustomPermission,
   approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
+  isApprovalOnlyWildcard,
   isMcpAutoAdmitted,
   normalizeAutonomyLevel,
   profileLevelFromDraft,
@@ -117,6 +119,30 @@ test('approval wildcards follow runtime precedence', () => {
       alwaysAskSet: exactAskOverridesAutoWildcard.alwaysAskSet,
     }),
     'ask',
+  );
+});
+
+test('approval wildcard cannot enter authorization arrays through grid actions', () => {
+  const base: ToolPermissionGridValue = {
+    allowedTools: [],
+    excludedTools: [],
+    autoApprove: [],
+    alwaysAsk: [],
+  };
+
+  assert.equal(isApprovalOnlyWildcard(APPROVAL_WILDCARD), true);
+  assert.equal(isApprovalOnlyWildcard('shell'), false);
+  assert.strictEqual(applyAuthState(base, APPROVAL_WILDCARD, 'deny', false), base);
+  assert.strictEqual(applyAuthState(base, APPROVAL_WILDCARD, 'allow', true), base);
+  assert.equal(applyCustomPermission(base, APPROVAL_WILDCARD, 'deny'), null);
+  assert.equal(applyCustomPermission(base, ` ${APPROVAL_WILDCARD} `, 'allow'), null);
+  assert.deepEqual(
+    applyCustomPermission(base, APPROVAL_WILDCARD, 'ask')?.alwaysAsk,
+    [APPROVAL_WILDCARD],
+  );
+  assert.deepEqual(
+    applyCustomPermission(base, APPROVAL_WILDCARD, 'auto')?.autoApprove,
+    [APPROVAL_WILDCARD],
   );
 });
 

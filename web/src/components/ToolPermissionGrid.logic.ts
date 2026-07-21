@@ -26,6 +26,10 @@ export function isMcpToolName(name: string): boolean {
   return name !== NONE_SENTINEL && name.includes('__');
 }
 
+export function isApprovalOnlyWildcard(name: string): boolean {
+  return name === APPROVAL_WILDCARD;
+}
+
 export function effectiveAuthState({
   name,
   strict,
@@ -131,6 +135,8 @@ export function applyAuthState(
   next: AuthState,
   strict: boolean,
 ): ToolPermissionGridValue {
+  if (isApprovalOnlyWildcard(name)) return value;
+
   const nextExcluded = value.excludedTools.filter((item) => item !== name);
   const nextRealAllow = new Set(realAllowedTools(value.allowedTools));
   nextRealAllow.delete(name);
@@ -194,6 +200,10 @@ export function applyCustomPermission(
 ): ToolPermissionGridValue | null {
   const name = rawName.trim();
   if (name.length === 0 || name === NONE_SENTINEL) return null;
+
+  if (isApprovalOnlyWildcard(name) && (target === 'deny' || target === 'allow')) {
+    return null;
+  }
 
   if (target === 'deny') {
     return applyAuthState(value, name, 'deny', value.allowedTools.length > 0);
