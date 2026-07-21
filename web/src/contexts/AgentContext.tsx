@@ -133,6 +133,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const pendingContentRef = useRef('');
   const pendingThinkingRef = useRef('');
   const capturedThinkingRef = useRef('');
+  // Set when any `tool_call` frame arrives during the current turn. Lets the
+  // done/message handler tell "empty completion with tool calls" (normal — the
+  // tool cards are the visible record) from "empty completion with nothing at
+  // all" (needs a no-output diagnostic). Mirrors zerocode's turn_had_tool_calls.
+  const turnHadToolCallRef = useRef(false);
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
@@ -246,7 +251,14 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // assistant bubble. Ref: #6702.
         const content = raw_content.trim();
         const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
-        if (content) {
+        // Reasoning-only turns: some models (GLM, Qwen, DeepSeek) put their
+        // whole output in reasoning_content and return empty content with no
+        // tool calls. Without this the turn ends silently — the Thinking block
+        // vanishes and no bubble appears, so the user thinks it hung. When
+        // thinking is present, commit the message even with empty content so
+        // the reasoning stays visible alongside an (empty) answer bubble. The
+        // #6702 case (whitespace content + tool_calls, no thinking) still skips.
+        if (content || thinking) {
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -257,6 +269,23 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               thinking,
               markdown: true,
               timestamp: new Date(),
+            },
+          ]);
+        } else if (!turnHadToolCallRef.current) {
+          // Nothing at all — no content, no reasoning, no tool calls — but the
+          // turn completed cleanly. Render a diagnostic so the user knows the
+          // turn finished rather than silently vanishing. When tool calls ran,
+          // their cards are the visible record, so no diagnostic is needed.
+          // Mirrors zerocode's zc-turn-no-output fallback (#8779).
+          localMessageMutationVersionRef.current += 1;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: generateUUID(),
+              role: 'agent',
+              content: t('agent.turn_no_output'),
+              timestamp: new Date(),
+              ephemeral: true,
             },
           ]);
         }
@@ -276,6 +305,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         pendingContentRef.current = '';
         pendingThinkingRef.current = '';
         capturedThinkingRef.current = '';
+        turnHadToolCallRef.current = false;
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
@@ -293,6 +323,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         if (!msg.name) {
           break;
         }
+        turnHadToolCallRef.current = true;
         const toolName = msg.name;
         const toolArgs = msg.args;
         localMessageMutationVersionRef.current += 1;
@@ -421,6 +452,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         pendingContentRef.current = '';
         pendingThinkingRef.current = '';
         capturedThinkingRef.current = '';
+        turnHadToolCallRef.current = false;
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
@@ -606,6 +638,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       setTyping(true);
       pendingContentRef.current = '';
       pendingThinkingRef.current = '';
+      turnHadToolCallRef.current = false;
       localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,
