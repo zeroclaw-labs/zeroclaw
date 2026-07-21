@@ -1864,7 +1864,7 @@ pub enum NebiusEndpoint {
 impl ModelEndpoint for NebiusEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "https://api.studio.nebius.ai/v1",
+            Self::Default => "https://api.tokenfactory.nebius.com/v1",
         }
     }
 }
