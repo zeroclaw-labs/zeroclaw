@@ -2799,7 +2799,9 @@ async fn handle_plugin_webhook(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    use zeroclaw_api::webhook::{RawWebhook, WebhookOutcome, WebhookReject};
+    use zeroclaw_api::webhook::{
+        MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookOutcome, WebhookReject,
+    };
 
     let rate_key =
         client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
@@ -2867,7 +2869,22 @@ async fn handle_plugin_webhook(
     {
         // Verification handshake (Slack url_verification / WhatsApp hub.challenge)
         // → 200 with the plugin-supplied body; ordinary events → 200 empty.
-        Ok(Ok(Ok(WebhookOutcome::Body(body)))) => (StatusCode::OK, body).into_response(),
+        Ok(Ok(Ok(WebhookOutcome::Body(body)))) if body.len() <= MAX_WEBHOOK_RESPONSE_BODY_BYTES => {
+            (StatusCode::OK, body).into_response()
+        }
+        Ok(Ok(Ok(WebhookOutcome::Body(_)))) | Ok(Ok(Err(WebhookReject::InvalidResponse))) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "plugin_webhook_invalid_response",
+                        "path": path,
+                    })),
+                "plugin produced an invalid webhook response"
+            );
+            (StatusCode::BAD_GATEWAY, "invalid plugin webhook response").into_response()
+        }
         Ok(Ok(Ok(WebhookOutcome::Ack))) => StatusCode::OK.into_response(),
         Ok(Ok(Err(WebhookReject::Unauthorized(detail)))) => {
             ::zeroclaw_log::record!(
@@ -5044,6 +5061,44 @@ mod tests {
             .expect("plugin route is infallible");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_text(response).await, "echo-me-42");
+        worker.await.expect("verification worker completes");
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_never_emits_oversized_plugin_response() {
+        use zeroclaw_api::webhook::{
+            MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookRegistry, WebhookOutcome,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let (sink, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+        let worker = zeroclaw_spawn::spawn!(async move {
+            let raw = rx.recv().await.expect("route sends verification request");
+            let _ = raw.reply.send(Ok(WebhookOutcome::Body(
+                "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES + 1),
+            )));
+        });
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/plugin/fixture?challenge=small-request")
+            .body(Body::empty())
+            .expect("valid verification request");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 14], 30_307))));
+        let response = plugin_webhook_test_router(state, registry)
+            .oneshot(request)
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_text(response).await,
+            "invalid plugin webhook response"
+        );
         worker.await.expect("verification worker completes");
     }
 

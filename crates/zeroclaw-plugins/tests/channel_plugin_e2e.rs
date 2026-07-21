@@ -21,7 +21,8 @@ use std::time::Duration;
 use serde_json::Value;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_api::webhook::{
-    RawWebhook, WebhookCancellation, WebhookIdempotency, WebhookOutcome, WebhookReject,
+    MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookCancellation, WebhookIdempotency,
+    WebhookOutcome, WebhookReject,
 };
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
@@ -461,6 +462,67 @@ async fn webhook_challenge_returns_body_without_delivery_or_reservation() {
             .await
             .is_err(),
         "a response-only challenge must not reach the agent queue"
+    );
+
+    listener.abort();
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
+}
+
+#[tokio::test]
+async fn oversized_webhook_challenge_is_rejected_before_host_clone() {
+    let wasm = fixture();
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror(
+            "fixture",
+            "default",
+            &wasm,
+            &[PluginPermission::ConfigRead],
+            "test-secret",
+            test_limits(),
+            allow_all(),
+        )
+        .await
+        .expect("fixture instantiates"),
+    );
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("fixture emits configure echo")
+        .expect("listener remains active");
+
+    let oversized = "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES + 1);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            method: "GET".to_string(),
+            query: format!("challenge={oversized}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            cancellation: WebhookCancellation::new(),
+            idempotency: None,
+            reply: reply_tx,
+        })
+        .await
+        .expect("sink accepts oversized verification response");
+    assert!(matches!(
+        reply_rx.await,
+        Ok(Err(WebhookReject::InvalidResponse))
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err(),
+        "an oversized response-only challenge must not reach the agent queue"
     );
 
     listener.abort();

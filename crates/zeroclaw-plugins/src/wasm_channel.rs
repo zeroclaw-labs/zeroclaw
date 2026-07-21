@@ -31,7 +31,10 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
-use zeroclaw_api::webhook::{RawWebhook, WEBHOOK_REPLY_CHANNEL, WebhookOutcome, WebhookReject};
+use zeroclaw_api::webhook::{
+    MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WEBHOOK_REPLY_CHANNEL, WebhookOutcome,
+    WebhookReject,
+};
 
 /// Host-supplied sender authorization for normalized inbound messages.
 ///
@@ -738,7 +741,25 @@ impl Channel for WasmChannel {
                             let response = if cancellation.is_cancelled() {
                                 Err(WebhookReject::Timeout)
                             } else {
-                                Ok(WebhookOutcome::Body(message.content.clone()))
+                                let bounded = bounded_webhook_response(&message.content);
+                                if bounded.is_err() {
+                                    ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Inbound
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "channel_ref": webhook_channel_ref,
+                                                "error_key": "plugin_webhook_response_too_large",
+                                                "response_bytes": message.content.len(),
+                                                "max_response_bytes": MAX_WEBHOOK_RESPONSE_BODY_BYTES,
+                                            })),
+                                            "channel plugin webhook response exceeded host limit"
+                                        );
+                                }
+                                bounded
                             };
                             let _ = reply.send(response);
                             continue;
@@ -1291,6 +1312,15 @@ fn reserved_webhook_headers(
     headers
 }
 
+/// Materialize a guest response only after enforcing the public egress limit,
+/// so oversized content is never cloned into a host-owned HTTP outcome.
+fn bounded_webhook_response(body: &str) -> Result<WebhookOutcome, WebhookReject> {
+    if body.len() > MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+        return Err(WebhookReject::InvalidResponse);
+    }
+    Ok(WebhookOutcome::Body(body.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,6 +1366,21 @@ mod tests {
             out.iter().any(|(k, v)| k == "x-fixture-secret" && v == "s"),
             "legitimate inbound headers are preserved"
         );
+    }
+
+    #[test]
+    fn webhook_response_is_bounded_before_host_materialization() {
+        let at_limit = "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES);
+        assert!(matches!(
+            bounded_webhook_response(&at_limit),
+            Ok(WebhookOutcome::Body(body)) if body.len() == MAX_WEBHOOK_RESPONSE_BODY_BYTES
+        ));
+
+        let oversized = "x".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES + 1);
+        assert!(matches!(
+            bounded_webhook_response(&oversized),
+            Err(WebhookReject::InvalidResponse)
+        ));
     }
 
     #[test]

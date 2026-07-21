@@ -62,6 +62,13 @@ impl WebhookIdempotency {
 /// `channel`-interface signature change, so existing plugins need no rebuild.
 pub const WEBHOOK_REPLY_CHANNEL: &str = "__webhook_reply__";
 
+/// Maximum UTF-8 byte length of a plugin-supplied webhook response body.
+///
+/// Verification challenges are short opaque values. Keeping this limit at the
+/// shared host/gateway boundary prevents a guest's much larger linear-memory
+/// allowance from becoming an equally large public HTTP response.
+pub const MAX_WEBHOOK_RESPONSE_BODY_BYTES: usize = 4 * 1024;
+
 /// A raw inbound webhook the gateway received on `/plugin/<path>`, plus a
 /// one-shot the plugin side resolves so the HTTP handler can pick a status code.
 pub struct RawWebhook {
@@ -107,6 +114,9 @@ pub enum WebhookReject {
     Unauthorized(String),
     /// The plugin could not decode the payload → the gateway replies 400.
     BadRequest(String),
+    /// The plugin produced an invalid public response → the gateway replies
+    /// with a fixed 502 response that contains no guest-controlled detail.
+    InvalidResponse,
     /// The request lifetime ended before plugin decoding completed → 504.
     Timeout,
 }
