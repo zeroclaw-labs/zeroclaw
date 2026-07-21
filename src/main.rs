@@ -478,6 +478,79 @@ impl LogLevel {
     }
 }
 
+/// Subcommands for `zeroclaw eval calibrate`.
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum EvalCalibrateCommands {
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(about = "Blindly label LLM-judge run records for calibration")]
+    Label {
+        #[arg(
+            long,
+            value_name = "PATH",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Judge-run JSONL file, or a directory containing judge-runs.jsonl"
+        )]
+        records: PathBuf,
+
+        #[arg(
+            long,
+            value_name = "PATH",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Append-only labels JSONL path (defaults under evals/calibration/labels)"
+        )]
+        labels: Option<PathBuf>,
+
+        #[arg(
+            long,
+            value_name = "NAME",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Human labeler name (defaults to git config user.name)"
+        )]
+        labeler: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "REF",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Judge reference to label when records contain multiple judges"
+        )]
+        judge_ref: Option<String>,
+    },
+
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(about = "Finalize labels into an LLM-judge calibration file")]
+    Finalize {
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long, value_name = "PATH", help = "Labels JSONL file to finalize")]
+        labels: PathBuf,
+
+        #[arg(
+            long,
+            value_name = "PATH",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Calibration JSON output path (defaults under evals/calibration)"
+        )]
+        out: Option<PathBuf>,
+
+        #[arg(
+            long,
+            value_name = "FRACTION",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Refuse to emit when agreement is below this fraction"
+        )]
+        min_agreement: Option<f64>,
+
+        #[arg(
+            long,
+            value_name = "NAME",
+            // i18n-exempt: clap derive help — framework requires a compile-time literal
+            help = "Override the labeler recorded in the calibration file"
+        )]
+        labeler: Option<String>,
+    },
+}
+
 /// Subcommands for `zeroclaw eval`.
 #[cfg(feature = "agent-runtime")]
 #[derive(Subcommand, Debug)]
@@ -516,6 +589,13 @@ enum EvalCommands {
         // i18n-exempt: clap derive help — framework requires a compile-time literal
         #[arg(long)]
         suite_kind: Option<String>,
+    },
+
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(about = "Calibrate an LLM judge against blind human labels")]
+    Calibrate {
+        #[command(subcommand)]
+        calibrate_command: EvalCalibrateCommands,
     },
 }
 
@@ -5249,6 +5329,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 .await?;
                 std::process::exit(code);
             }
+            EvalCommands::Calibrate { calibrate_command } => match calibrate_command {
+                EvalCalibrateCommands::Label {
+                    records,
+                    labels,
+                    labeler,
+                    judge_ref,
+                } => commands::eval_calibrate::label::run(records, labels, labeler, judge_ref),
+                EvalCalibrateCommands::Finalize {
+                    labels,
+                    out,
+                    min_agreement,
+                    labeler,
+                } => commands::eval_calibrate::finalize::run(labels, out, min_agreement, labeler),
+            },
         },
 
         Commands::Config { config_command } => match config_command {
@@ -8142,6 +8236,86 @@ mod tests {
             probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--"])),
             None
         );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn cli_parses_all_eval_calibrate_label_arguments() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "eval",
+            "calibrate",
+            "label",
+            "--records",
+            "runs/judge-runs.jsonl",
+            "--labels",
+            "labels/human.jsonl",
+            "--labeler",
+            "Reviewer",
+            "--judge-ref",
+            "provider.alias:model-v1",
+        ])
+        .expect("eval calibrate label arguments should parse");
+
+        let Commands::Eval { eval_command } = cli.command else {
+            panic!("expected eval command");
+        };
+        let EvalCommands::Calibrate { calibrate_command } = eval_command else {
+            panic!("expected calibrate command");
+        };
+        let EvalCalibrateCommands::Label {
+            records,
+            labels,
+            labeler,
+            judge_ref,
+        } = calibrate_command
+        else {
+            panic!("expected label command");
+        };
+        assert_eq!(records, PathBuf::from("runs/judge-runs.jsonl"));
+        assert_eq!(labels, Some(PathBuf::from("labels/human.jsonl")));
+        assert_eq!(labeler.as_deref(), Some("Reviewer"));
+        assert_eq!(judge_ref.as_deref(), Some("provider.alias:model-v1"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn cli_parses_all_eval_calibrate_finalize_arguments() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "eval",
+            "calibrate",
+            "finalize",
+            "--labels",
+            "labels/final.jsonl",
+            "--out",
+            "calibration/judge.json",
+            "--min-agreement",
+            "0.91",
+            "--labeler",
+            "Final Reviewer",
+        ])
+        .expect("eval calibrate finalize arguments should parse");
+
+        let Commands::Eval { eval_command } = cli.command else {
+            panic!("expected eval command");
+        };
+        let EvalCommands::Calibrate { calibrate_command } = eval_command else {
+            panic!("expected calibrate command");
+        };
+        let EvalCalibrateCommands::Finalize {
+            labels,
+            out,
+            min_agreement,
+            labeler,
+        } = calibrate_command
+        else {
+            panic!("expected finalize command");
+        };
+        assert_eq!(labels, PathBuf::from("labels/final.jsonl"));
+        assert_eq!(out, Some(PathBuf::from("calibration/judge.json")));
+        assert_eq!(min_agreement, Some(0.91));
+        assert_eq!(labeler.as_deref(), Some("Final Reviewer"));
     }
 
     #[test]

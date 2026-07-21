@@ -264,6 +264,8 @@ pub struct JudgeDeps {
     pub model: String,
     pub judge_ref: String,
     pub gates: bool,
+    /// Canonical per-suite collection of judge results eligible for calibration.
+    pub records_sink: std::sync::Arc<std::sync::Mutex<Vec<crate::calibration::JudgeRunRecord>>>,
 }
 
 /// Grades per-dimension LLM-judge rubrics with one isolated judge call each.
@@ -381,6 +383,26 @@ impl Grader for JudgeGrader {
                     )
                     .diagnostic(),
                     Some((score, false, reason)) => {
+                        let record = crate::calibration::JudgeRunRecord::new(
+                            crate::calibration::JudgeRunRecordInput {
+                                judge_ref: self.deps.judge_ref.clone(),
+                                case_id: run.case_id.clone(),
+                                case_hash: run.case_hash.clone(),
+                                rubric_name: rubric.name.clone(),
+                                rubric_text: rubric.rubric.clone(),
+                                threshold: rubric.threshold,
+                                task_turns: self.task_turns.clone(),
+                                final_response: run.final_response.clone(),
+                                score,
+                                reason: reason.clone(),
+                            },
+                        );
+                        let mut records = match self.deps.records_sink.lock() {
+                            Ok(records) => records,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        records.push(record);
+
                         let passed = score >= rubric.threshold;
                         let detail = if passed {
                             format!("score={score:.2}")
@@ -660,7 +682,7 @@ mod tests {
             schema: crate::record::RECORD_SCHEMA.to_string(),
             mode: crate::Mode::Replay,
             case_id: "test".to_string(),
-            case_hash: String::new(),
+            case_hash: "case-hash".to_string(),
             provider_ref: "scripted".to_string(),
             tool_surface: Vec::new(),
             sandbox: crate::record::SandboxStamp {
@@ -937,20 +959,35 @@ mod tests {
         rubrics: Vec<crate::case::JudgeRubric>,
         gates: bool,
     ) -> Vec<GradeResult> {
+        judge_grade_with_records(replies, rubrics, gates).await.0
+    }
+
+    async fn judge_grade_with_records(
+        replies: &[&str],
+        rubrics: Vec<crate::case::JudgeRubric>,
+        gates: bool,
+    ) -> (Vec<GradeResult>, Vec<crate::calibration::JudgeRunRecord>) {
+        let records_sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let deps = JudgeDeps {
             provider: judge_provider(replies),
             model: "m".to_string(),
             judge_ref: "judge.m:x".to_string(),
             gates,
+            records_sink: records_sink.clone(),
         };
         let grader = JudgeGrader {
             rubrics,
             task_turns: vec!["do the task".to_string()],
             deps,
         };
-        grader
+        let grades = grader
             .grade(&run("final response", &[], true), &dummy_ctx())
-            .await
+            .await;
+        let records = match records_sink.lock() {
+            Ok(records) => records.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        (grades, records)
     }
 
     #[tokio::test]
@@ -1012,11 +1049,22 @@ mod tests {
 
     #[tokio::test]
     async fn judge_gate_with_calibration_flips_exit() {
-        // gates=true models judge_gate on with a calibration file present.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("judge.json");
+        let calibration = crate::calibration::CalibrationFile {
+            schema: crate::calibration::CALIBRATION_SCHEMA.to_string(),
+            judge_ref: "judge.m:x".to_string(),
+            labeled_records: crate::calibration::MIN_CALIBRATION_RECORDS,
+            agreement: 0.9,
+            labeler: "tester".to_string(),
+            date: "2026-07-21".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&calibration).unwrap()).unwrap();
+        let gates = crate::calibration::load_calibration(&path, "judge.m:x").is_ok();
         let g = judge_grade(
             &[r#"{"score":0.5,"unknown":false,"reason":"weak"}"#],
             vec![rubric("h", 0.7)],
-            true,
+            gates,
         )
         .await;
         assert!(!g[0].passed);
@@ -1024,6 +1072,70 @@ mod tests {
             !g[0].diagnostic,
             "gated judge grade must count toward the gate"
         );
+    }
+
+    #[tokio::test]
+    async fn judge_gate_with_invalid_calibration_stays_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("judge.json");
+        let calibration = crate::calibration::CalibrationFile {
+            schema: crate::calibration::CALIBRATION_SCHEMA.to_string(),
+            judge_ref: "judge.m:x".to_string(),
+            labeled_records: crate::calibration::MIN_CALIBRATION_RECORDS - 1,
+            agreement: 1.0,
+            labeler: "tester".to_string(),
+            date: "2026-07-21".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&calibration).unwrap()).unwrap();
+        let gates = crate::calibration::load_calibration(&path, "judge.m:x").is_ok();
+        let grades = judge_grade(
+            &[r#"{"score":0.5,"unknown":false,"reason":"weak"}"#],
+            vec![rubric("h", 0.7)],
+            gates,
+        )
+        .await;
+        assert!(!grades[0].passed);
+        assert!(
+            grades[0].diagnostic,
+            "an invalid calibration must not make the judge grade gating"
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_records_sink_captures_only_calibratable_results() {
+        let (grades, records) = judge_grade_with_records(
+            &[
+                r#"{"score":0.83,"unknown":false,"reason":"solid"}"#,
+                r#"{"score":0.1,"unknown":true,"reason":"insufficient evidence"}"#,
+            ],
+            vec![
+                rubric("helpfulness", 0.8),
+                rubric("unknown", 0.5),
+                rubric("transport", 0.5),
+            ],
+            false,
+        )
+        .await;
+
+        assert_eq!(grades.len(), 3);
+        assert_eq!(
+            records.len(),
+            1,
+            "unknown and transport errors are excluded"
+        );
+        let record = &records[0];
+        assert_eq!(record.schema, crate::calibration::JUDGE_RECORD_SCHEMA);
+        assert_eq!(record.judge_ref, "judge.m:x");
+        assert_eq!(record.case_id, "test");
+        assert_eq!(record.case_hash, "case-hash");
+        assert_eq!(record.rubric_name, "helpfulness");
+        assert_eq!(record.rubric_text, "grade it");
+        assert_eq!(record.threshold, 0.8);
+        assert_eq!(record.task_turns, ["do the task"]);
+        assert_eq!(record.final_response, "final response");
+        assert_eq!(record.score, 0.83);
+        assert!(record.judge_pass);
+        assert_eq!(record.reason, "solid");
     }
 
     #[tokio::test]

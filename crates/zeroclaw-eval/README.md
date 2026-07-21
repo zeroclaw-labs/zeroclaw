@@ -65,5 +65,7 @@ sandboxed tool registry for live evals is a later phase.
 - `observer::RecordingObserver` — captures tool-call outcomes and token usage.
 - `grader` — non-panicking `GradeResult` checks (the `Grader` trait is the
   extension point for side-effect/budget/LLM-judge graders in later phases).
+- `calibration` — structured judge-run and human-label schemas, JSONL helpers,
+  agreement statistics, and strict calibration-file validation.
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.
