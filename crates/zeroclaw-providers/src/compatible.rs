@@ -1461,8 +1461,7 @@ impl StreamToolCallAccumulator {
         let name = self.name?;
         // Route through the shared `sanitize_tool_arguments` helper so the
         // normalization contract (empty/whitespace → "{}", invalid JSON →
-        // WARN + "{}", valid JSON → passthrough) has a single source of
-        // truth.
+        // WARN + "{}", valid JSON → passthrough) has a single source of truth.
         let normalized_arguments = sanitize_tool_arguments(&name, &self.arguments);
 
         Some(ProviderToolCall {
@@ -3517,7 +3516,7 @@ mod tests {
         assert_eq!(sanitize_tool_arguments("f", r#"{"path":"/tmp"#), "{}");
         // Trailing junk
         assert_eq!(sanitize_tool_arguments("f", r#"{"x":1}garbage"#), "{}");
-        // Empty input
+        // Truncated (the observed failure case from the field)
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
     }
 
