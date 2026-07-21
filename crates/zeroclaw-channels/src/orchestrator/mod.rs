@@ -23446,8 +23446,7 @@ This is an example JSON object for profile settings."#;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle =
-            spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
 
         // Cancel first so the supervisor sees the signal, then drop the
         // receiver to unblock listen() so it returns Ok(()).
@@ -23465,7 +23464,10 @@ This is an example JSON object for profile settings."#;
         // via the Ok(()) + is_cancelled guard (1 call). Either is valid;
         // what matters is that it did not restart.
         let count = calls.load(Ordering::SeqCst);
-        assert!(count <= 1, "listener ran more than once; unexpected restart");
+        assert!(
+            count <= 1,
+            "listener ran more than once; unexpected restart"
+        );
     }
 
     /// A clean `Ok(())` return before cancellation is triggered is an
@@ -23482,8 +23484,7 @@ This is an example JSON object for profile settings."#;
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle =
-            spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
 
         // Give the listener time to return Ok(()) and the supervisor to
         // bump restart_count before the backoff sleep.
@@ -23491,9 +23492,7 @@ This is an example JSON object for profile settings."#;
 
         let snapshot = zeroclaw_runtime::health::snapshot_json();
         let component = &snapshot["components"]["channel:test-clean-return-restart"];
-        let restart_count = component["restart_count"]
-            .as_u64()
-            .unwrap_or(0);
+        let restart_count = component["restart_count"].as_u64().unwrap_or(0);
         assert!(
             restart_count >= 1,
             "clean return before cancel must trigger restart, got {restart_count}"
