@@ -346,12 +346,26 @@ async fn handle_socket(
     let mut stored_messages = Vec::new();
     // Serialise with concurrent HTTP requests sharing the same session.
     // Guard is scoped to the setup section only — it drops before the
-    // first message handler acquires the queue again (L587 / L736).
+    // first message handler acquires the queue again during turn processing.
     {
-        let _setup_guard = state.session_queue.acquire(&session_key).await.ok();
+        let _setup_guard = match state.session_queue.acquire(&session_key).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                let err_frame = serde_json::json!({
+                    "type": "error",
+                    "message": e.to_string(),
+                    "code": session_queue_ws_error_code(&e),
+                });
+                let _ = sender
+                    .send(Message::Text(err_frame.to_string().into()))
+                    .await;
+                let _ = sender.close().await;
+                return;
+            }
+        };
         if let Some(ref backend) = state.session_backend {
-            if let Ok(Some(stored_alias)) = backend.get_session_agent_alias(&session_key) {
-                if stored_alias != agent_alias {
+            match backend.get_session_agent_alias(&session_key) {
+                Ok(Some(stored_alias)) if stored_alias != agent_alias => {
                     let err_frame = serde_json::json!({
                         "type": "error",
                         "code": "SESSION_AGENT_MISMATCH",
@@ -365,6 +379,33 @@ async fn handle_socket(
                     let _ = sender.close().await;
                     return;
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    if !backend.load(&session_key).is_empty() {
+                        let err_frame = serde_json::json!({
+                            "type": "error",
+                            "code": "SESSION_OWNERSHIP_UNSUPPORTED",
+                            "message": "Cannot resume session: backend does not track agent ownership"
+                        });
+                        let _ = sender
+                            .send(Message::Text(err_frame.to_string().into()))
+                            .await;
+                        let _ = sender.close().await;
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let err_frame = serde_json::json!({
+                        "type": "error",
+                        "code": "SESSION_METADATA_ERROR",
+                        "message": "Failed to read session metadata"
+                    });
+                    let _ = sender
+                        .send(Message::Text(err_frame.to_string().into()))
+                        .await;
+                    let _ = sender.close().await;
+                    return;
+                }
+                _ => {}
             }
             let messages = backend.load(&session_key);
             if !messages.is_empty() {
@@ -381,7 +422,24 @@ async fn handle_socket(
             if effective_name.is_none() {
                 effective_name = backend.get_session_name(&session_key).unwrap_or(None);
             }
-            let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+            match backend.set_session_agent_alias(&session_key, &agent_alias) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    // Backend doesn't support ownership — already warned above if session had data.
+                }
+                Err(e) => {
+                    let err_frame = serde_json::json!({
+                        "type": "error",
+                        "code": "SESSION_METADATA_WRITE_ERROR",
+                        "message": format!("Failed to persist session ownership: {e}")
+                    });
+                    let _ = sender
+                        .send(Message::Text(err_frame.to_string().into()))
+                        .await;
+                    let _ = sender.close().await;
+                    return;
+                }
+            }
         }
     }
 
@@ -917,7 +975,7 @@ fn needs_onboarding_ws_error(
 ///   [`is_global_chat_event`]) — currently just `cron_result`.
 ///
 /// Everything else (observability telemetry, log records, error broadcasts
-/// from unrelated subsystems, …) is dropped. Before 7151 this defaulted to
+/// from unrelated subsystems, …) is dropped. The original default was
 /// `None => true`, which leaked `BroadcastObserver` telemetry — including a
 /// red `error` bubble — into every active chat user's view.
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
@@ -945,7 +1003,7 @@ fn is_global_chat_event(event: &serde_json::Value) -> bool {
 /// Defense-in-depth check for observability telemetry frames that leak onto
 /// the chat broadcast bus.
 ///
-/// After 7151 the primary defense is [`event_matches_session`]'s inverted
+/// The primary defense is [`event_matches_session`]'s inverted
 /// default — any frame without `session_id` is dropped unless explicitly
 /// whitelisted. This helper exists as a belt-and-braces guard for the case
 /// where a future emitter forgets `session_id` *and* its event type collides
@@ -1094,7 +1152,7 @@ async fn process_chat_message(
                     // (stream end) or `Err(_)` repeatedly. A bare `continue`
                     // hot-loops the select; cancel the turn so `turn_fut`
                     // resolves with `ToolLoopCancelled` and `tokio::join!`
-                    // below can return. See 6514.
+                    // below can return.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
@@ -1466,10 +1524,10 @@ mod tests {
 
     #[test]
     fn event_matches_session_defaults_drops_unwhitelisted_no_session_frames() {
-        // The pre-7151 contract was `None => true`, which silently leaked
+        // The original contract was `None => true`, which silently leaked
         // every BroadcastObserver telemetry frame (including `error`) into
-        // every chat WebSocket. The fix flips the default; verify each
-        // observed-in-the-wild leak shape is now blocked.
+        // every chat WebSocket. The current contract flips the default;
+        // verify each observed-in-the-wild leak shape is now blocked.
         for ty in [
             "agent_start",
             "agent_end",
@@ -1717,7 +1775,7 @@ mod tests {
         );
     }
 
-    // Regression for 6514. The mid-turn `client_msg` arm in `forward_fut`
+    // The mid-turn `client_msg` arm in `forward_fut`
     // must (a) classify stream-end / close / error frames as "client gone"
     // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
     // can return — a bare `continue` hot-loops the select forever.
@@ -1792,7 +1850,7 @@ mod tests {
         );
     }
 
-    // ── 7126 regression ──────────────────────────────────────────────
+    // ── Deleted-session regression ────────────────────────────────────
     //
     // A `SessionBackend` mock that pretends the session has been deleted
     // (`session_exists` → false). `persist_conversation_messages` must

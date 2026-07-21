@@ -415,7 +415,7 @@ pub fn build_spec() -> serde_json::Value {
                         "in": "header",
                         "required": false,
                         "schema": { "type": "string" },
-                        "description": "Client-supplied request identifier. Echoed in the response."
+                        "description": "Server-generated unique request identifier (UUID). Not read from the client header."
                     }
                 ],
                 "requestBody": {
@@ -436,7 +436,7 @@ pub fn build_spec() -> serde_json::Value {
                             "text/event-stream": {
                                 "schema": {
                                     "type": "string",
-                                    "description": "SSE stream; each chunk is a chat.completion.chunk JSON object terminated by data: [DONE]"
+                                    "description": "SSE stream; each chunk is a chat.completion.chunk JSON object terminated by data: [DONE]. On failure or cancellation, an in-band error object is emitted, optionally followed by usage data (if stream_options.include_usage was requested), then [DONE]."
                                 }
                             }
                         }

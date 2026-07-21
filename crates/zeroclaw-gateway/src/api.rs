@@ -1587,22 +1587,30 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-/// Derive the canonical storage key for a client-visible session ID.
+/// Resolve a session key from a caller-supplied ID by consulting the backend.
 ///
-/// Accepts three forms:
-/// - Bare gateway ID → prefixed with `gw_` after sanitization.
-/// - Already-canonical `gw_` key → sanitized in place.
-/// - Channel composite key (contains `_`) → sanitized without `gw_` prefix.
-fn canonical_session_key(id: &str) -> String {
-    // Already canonical: `gw_` prefix or channel key (contains `_`).
-    if id.starts_with("gw_") || id.contains('_') {
+/// Strategy (in order):
+/// 1. `gw_` prefix → already a full gateway key (identity after sanitize).
+/// 2. Try `gw_{sanitize(id)}` — covers callers using the `session_id` display
+///    form returned by `GET /api/sessions`.
+/// 3. Try `sanitize(id)` bare — covers channel keys.
+/// 4. Default to `gw_{sanitize(id)}` — new or not-yet-created gateway sessions.
+fn resolve_session_key(
+    id: &str,
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+) -> String {
+    if id.starts_with("gw_") {
         return zeroclaw_api::session_keys::sanitize_session_key(id);
     }
-    // Bare gateway ID — prepend `gw_`.
-    format!(
-        "gw_{}",
-        zeroclaw_api::session_keys::sanitize_session_key(id)
-    )
+    let bare = zeroclaw_api::session_keys::sanitize_session_key(id);
+    let gw_key = format!("gw_{}", bare);
+    if backend.session_exists(&gw_key) {
+        return gw_key;
+    }
+    if backend.session_exists(&bare) {
+        return bare;
+    }
+    gw_key
 }
 
 // ── Session API handlers ─────────────────────────────────────────
@@ -1693,7 +1701,7 @@ pub async fn handle_api_session_messages(
     // Accept either the full DB key (channel-driven sessions like
     // `discord.clamps_…`) or the stripped form (legacy callers that pass
     // just the UUID for gateway sessions).
-    let session_key = canonical_session_key(&id);
+    let session_key = resolve_session_key(&id, backend.as_ref());
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1741,7 +1749,7 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = canonical_session_key(&id);
+    let session_key = resolve_session_key(&id, backend.as_ref());
     if !backend
         .list_sessions()
         .iter()
@@ -1823,7 +1831,7 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = canonical_session_key(&id);
+    let session_key = resolve_session_key(&id, backend.as_ref());
 
     let token = state
         .cancel_tokens
@@ -1842,7 +1850,25 @@ pub async fn handle_api_session_delete(
 
     // Hold the session queue so any in-flight turn finishes persistence
     // before the session is deleted, preventing resurrection.
-    let _guard = state.session_queue.acquire(&session_key).await.ok();
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Session is busy, retry after current turn completes"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     match backend.delete_session(&session_key) {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
@@ -1887,7 +1913,7 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = canonical_session_key(&id);
+    let session_key = resolve_session_key(&id, backend.as_ref());
 
     // Verify the session exists before renaming
     let sessions = backend.list_sessions();
@@ -1961,7 +1987,7 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = canonical_session_key(&id);
+    let session_key = resolve_session_key(&id, backend.as_ref());
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -2000,7 +2026,13 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = canonical_session_key(&id);
+    let session_key = match state.session_backend.as_ref() {
+        Some(backend) => resolve_session_key(&id, backend.as_ref()),
+        None => format!(
+            "gw_{}",
+            zeroclaw_api::session_keys::sanitize_session_key(&id)
+        ),
+    };
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
@@ -2062,7 +2094,7 @@ pub(crate) mod tests {
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
-    use zeroclaw_providers::ModelProvider;
+    use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     #[derive(Default)]
@@ -4673,35 +4705,175 @@ pub(crate) mod tests {
         }
     }
 
-    // ── canonical_session_key ───────────────────────────────────
+    // ── resolve_session_key ───────────────────────────────────
 
     #[test]
-    fn canonical_session_key_preserves_gw_prefixed_key() {
-        assert_eq!(canonical_session_key("gw_foo"), "gw_foo");
-        assert_eq!(canonical_session_key("gw_test-session"), "gw_test-session");
-    }
-
-    #[test]
-    fn canonical_session_key_preserves_channel_key() {
+    fn resolve_session_key_preserves_gw_prefixed_key() {
+        // Step 1: gw_ prefix → identity (sanitized).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        assert_eq!(resolve_session_key("gw_foo", backend), "gw_foo");
         assert_eq!(
-            canonical_session_key("discord.clamps_user123"),
-            "discord_clamps_user123"
+            resolve_session_key("gw_test-session", backend),
+            "gw_test-session"
         );
-        assert_eq!(canonical_session_key("slack.thread_42"), "slack_thread_42");
+        assert_eq!(resolve_session_key("gw_foo.bar", backend), "gw_foo_bar");
     }
 
     #[test]
-    fn canonical_session_key_prefixes_bare_id() {
-        assert_eq!(canonical_session_key("my-session"), "gw_my-session");
+    fn resolve_session_key_backend_based_disambiguation() {
+        // Steps 2-4: consult backend to disambiguate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // No sessions exist: bare ID → gw_ prefix (step 4).
+        assert_eq!(resolve_session_key("my-session", backend), "gw_my-session");
         assert_eq!(
-            canonical_session_key("550e8400-e29b-41d4-a716-446655440000"),
+            resolve_session_key("550e8400-e29b-41d4-a716-446655440000", backend),
             "gw_550e8400-e29b-41d4-a716-446655440000"
         );
+
+        // Create a gw_ session: gw_{id} lookup should find it (step 2).
+        store
+            .append("gw_my-session", &ChatMessage::user("hello"))
+            .unwrap();
+        assert_eq!(resolve_session_key("my-session", backend), "gw_my-session");
+
+        // Create a channel key: bare lookup should find it (step 3).
+        store
+            .append("discord_clamps_user123", &ChatMessage::user("hi"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("discord_clamps_user123", backend),
+            "discord_clamps_user123"
+        );
     }
 
     #[test]
-    fn canonical_session_key_sanitizes_special_characters() {
-        assert_eq!(canonical_session_key("gw_foo.bar"), "gw_foo_bar");
-        assert_eq!(canonical_session_key("my session"), "gw_my_session");
+    fn resolve_session_key_sanitizes_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Spaces and dots are sanitized; no session exists → gw_ prefix (step 4).
+        assert_eq!(resolve_session_key("my session", backend), "gw_my_session");
+    }
+
+    // ── DELETE handler session_queue serialization tests ─────────────
+
+    #[tokio::test]
+    async fn delete_waits_for_session_queue_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_del_block",
+                &zeroclaw_providers::ChatMessage::user("hello"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_del_block").await.unwrap();
+
+        let response_fut = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("del_block".to_string()),
+        );
+        tokio::pin!(response_fut);
+
+        // DELETE must block behind the active guard
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "DELETE should block behind active session queue guard"
+        );
+        // Session still exists while guard is held
+        assert!(backend.session_exists("gw_del_block"));
+
+        drop(session_guard);
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("DELETE should complete after guard released")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // Session is now deleted
+        assert!(!backend.session_exists("gw_del_block"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_429_when_queue_full() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let mut state = test_state_with_session_backend(config, backend.clone());
+        // max_queue_depth=1: acquire the single slot, DELETE gets QueueFull
+        state.session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(1, 30, 600),
+        );
+        backend
+            .append("gw_del_full", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        // Fill the only slot — second acquire will be QueueFull
+        let _guard = state.session_queue.acquire("gw_del_full").await.unwrap();
+
+        let response =
+            handle_api_session_delete(State(state), HeaderMap::new(), Path("del_full".to_string()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Session was NOT deleted (queue guard not acquired)
+        assert!(backend.session_exists("gw_del_full"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_409_when_queue_times_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let mut state = test_state_with_session_backend(config, backend.clone());
+        // lock_timeout_secs=0: acquire times out immediately
+        state.session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(8, 0, 600),
+        );
+        backend
+            .append(
+                "gw_del_timeout",
+                &zeroclaw_providers::ChatMessage::user("hi"),
+            )
+            .unwrap();
+        // Hold the guard so the DELETE's acquire will time out
+        let _guard = state.session_queue.acquire("gw_del_timeout").await.unwrap();
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("del_timeout".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // Session was NOT deleted (timeout → fail-closed)
+        assert!(backend.session_exists("gw_del_timeout"));
     }
 }

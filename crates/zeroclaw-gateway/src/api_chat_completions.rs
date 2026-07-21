@@ -330,6 +330,14 @@ fn add_request_id_header(mut response: Response, request_id: &str) -> Response {
     response
 }
 
+fn add_session_key_header(mut response: Response, session_id: &str) -> Response {
+    response.headers_mut().insert(
+        HeaderName::from_static("x-session-key"),
+        HeaderValue::from_str(session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    response
+}
+
 fn add_rate_limit_headers(
     mut response: Response,
     limit: u32,
@@ -434,14 +442,25 @@ pub async fn handle_chat_completions(
     request: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let session_id_from_header = extract_session_key(&headers);
+    let session_id = session_id_from_header
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_key = format!(
+        "gw_{}",
+        zeroclaw_api::session_keys::sanitize_session_key(&session_id)
+    );
 
     let Json(request) = match request {
         Ok(req) => req,
         Err(e) => {
             let msg = format!("Invalid request: {}", e.body_text());
-            return add_request_id_header(
-                error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
-                &request_id,
+            return add_session_key_header(
+                add_request_id_header(
+                    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
+                    &request_id,
+                ),
+                &session_id,
             );
         }
     };
@@ -464,6 +483,7 @@ pub async fn handle_chat_completions(
             HeaderName::from_static("retry-after"),
             HeaderValue::from(RATE_LIMIT_WINDOW_SECS),
         );
+        resp = add_session_key_header(resp, &session_id);
         return resp;
     }
 
@@ -481,47 +501,47 @@ pub async fn handle_chat_completions(
         } else {
             "api_error"
         };
-        return add_request_id_header(error_response(status, err_type, msg), &request_id);
+        return add_session_key_header(
+            add_request_id_header(error_response(status, err_type, msg), &request_id),
+            &session_id,
+        );
     }
 
     if let Err(e) = validate_request(&request) {
-        return add_request_id_header(e, &request_id);
+        return add_session_key_header(add_request_id_header(e, &request_id), &session_id);
     }
     if let Err(e) = validate_unsupported_params(&request) {
-        return add_request_id_header(e, &request_id);
+        return add_session_key_header(add_request_id_header(e, &request_id), &session_id);
     }
-
-    let session_key_from_header = extract_session_key(&headers);
-    let session_id = session_key_from_header
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let session_key = format!(
-        "gw_{}",
-        zeroclaw_api::session_keys::sanitize_session_key(&session_id)
-    );
 
     let config = state.config.read().clone();
 
     let agent_alias = match agent_alias_from_model(&request.model, &config) {
         Ok(alias) => alias,
         Err(e) => {
-            return add_request_id_header(
-                error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &e),
-                &request_id,
+            return add_session_key_header(
+                add_request_id_header(
+                    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &e),
+                    &request_id,
+                ),
+                &session_id,
             );
         }
     };
 
     if config.agent(&agent_alias).is_none() {
-        return add_request_id_header(
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!(
-                    "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+        return add_session_key_header(
+            add_request_id_header(
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!(
+                        "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
+                    ),
                 ),
+                &request_id,
             ),
-            &request_id,
+            &session_id,
         );
     }
 
@@ -530,13 +550,16 @@ pub async fn handle_chat_completions(
         .and_then(|(_, _, cfg)| cfg.model.as_deref().filter(|m| !m.trim().is_empty()))
         .is_none()
     {
-        return add_request_id_header(
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "Agent not configured — complete onboarding at /onboard",
+        return add_session_key_header(
+            add_request_id_header(
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "Agent not configured — complete onboarding at /onboard",
+                ),
+                &request_id,
             ),
-            &request_id,
+            &session_id,
         );
     }
 
@@ -562,13 +585,16 @@ pub async fn handle_chat_completions(
             Ok(a) => a,
             Err(e) => {
                 let sanitized = sanitize_api_error(&e.to_string());
-                return add_request_id_header(
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal_error",
-                        &sanitized,
+                return add_session_key_header(
+                    add_request_id_header(
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal_error",
+                            &sanitized,
+                        ),
+                        &request_id,
                     ),
-                    &request_id,
+                    &session_id,
                 );
             }
         };
@@ -590,7 +616,7 @@ pub async fn handle_chat_completions(
     let session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
         Err(e) => {
-            return add_request_id_header(
+            let mut resp = add_request_id_header(
                 error_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     "rate_limit_error",
@@ -598,31 +624,69 @@ pub async fn handle_chat_completions(
                 ),
                 &request_id,
             );
+            resp = add_rate_limit_headers(resp, chat_rate_limit, 0, reset_ts);
+            resp.headers_mut().insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from(RATE_LIMIT_WINDOW_SECS),
+            );
+            return add_session_key_header(resp, &session_id);
         }
     };
 
     if let Some(ref backend) = state.session_backend {
         // Session agent_alias consistency check — must run BEFORE loading
         // history to prevent cross-agent context contamination.
-        if session_key_from_header.is_some() {
-            if let Ok(Some(stored_alias)) = backend.get_session_agent_alias(&session_key) {
-                if stored_alias != agent_alias {
-                    return add_request_id_header(
-                        error_response(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request_error",
-                            &format!(
-                                "Session belongs to agent '{stored_alias}', not '{agent_alias}'"
+        if session_id_from_header.is_some() {
+            match backend.get_session_agent_alias(&session_key) {
+                Ok(Some(stored_alias)) if stored_alias != agent_alias => {
+                    return add_session_key_header(
+                        add_request_id_header(
+                            error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request_error",
+                                &format!(
+                                    "Session belongs to agent '{stored_alias}', not '{agent_alias}'"
+                                ),
                             ),
+                            &request_id,
                         ),
-                        &request_id,
+                        &session_id,
                     );
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    if !backend.load(&session_key).is_empty() {
+                        return add_session_key_header(
+                            add_request_id_header(
+                                error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid_request_error",
+                                    "Cannot resume session: backend does not track agent ownership",
+                                ),
+                                &request_id,
+                            ),
+                            &session_id,
+                        );
+                    }
+                }
+                Err(_) => {
+                    return add_session_key_header(
+                        add_request_id_header(
+                            error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal_error",
+                                "Failed to read session metadata",
+                            ),
+                            &request_id,
+                        ),
+                        &session_id,
+                    );
+                }
+                _ => {}
             }
         }
 
         // Load history only after confirming the session belongs to this agent.
-        if session_key_from_header.is_some() && !request_has_authoritative_history {
+        if session_id_from_header.is_some() && !request_has_authoritative_history {
             let messages = backend.load(&session_key);
             if !messages.is_empty() {
                 agent.seed_history(&messages);
@@ -644,7 +708,12 @@ pub async fn handle_chat_completions(
         }
         _ => {
             match resolve_tool_specs(&request.tool_choice, &request.tools, &configured_tools) {
-                Err(e) => return add_request_id_header(e, &request_id),
+                Err(e) => {
+                    return add_session_key_header(
+                        add_request_id_header(e, &request_id),
+                        &session_id,
+                    );
+                }
                 Ok(Some(specs)) => {
                     if specs.is_empty() {
                         agent.disable_tools();
@@ -660,7 +729,25 @@ pub async fn handle_chat_completions(
     }
 
     if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+        match backend.set_session_agent_alias(&session_key, &agent_alias) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                // Backend doesn't support ownership — already warned above if session had data.
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": &session_key,
+                            "agent_alias": &agent_alias,
+                            "error": format!("{e}"),
+                        })),
+                    "Failed to persist session ownership metadata"
+                );
+            }
+        }
     }
 
     // Resolve a per-request memory handle for consolidation, mirroring the
@@ -1119,7 +1206,7 @@ async fn blocking_mode(
                 .error
                 .clone()
                 .unwrap_or_else(|| "agent task terminated unexpectedly".to_string());
-            let resp = add_request_id_header(
+            let mut resp = add_request_id_header(
                 error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
@@ -1127,7 +1214,8 @@ async fn blocking_mode(
                 ),
                 &request_id,
             );
-            add_rate_limit_headers(resp, rate_limit, rate_limit_remaining, rate_limit_reset)
+            resp = add_rate_limit_headers(resp, rate_limit, rate_limit_remaining, rate_limit_reset);
+            add_session_key_header(resp, &session_id)
         }
         crate::turn_runner::TurnStatus::Cancelled => {
             // Blocking mode has no streaming body to drop, so a client
@@ -1140,7 +1228,7 @@ async fn blocking_mode(
                 .error
                 .clone()
                 .unwrap_or_else(|| "agent turn cancelled".to_string());
-            let resp = add_request_id_header(
+            let mut resp = add_request_id_header(
                 error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
@@ -1148,7 +1236,8 @@ async fn blocking_mode(
                 ),
                 &request_id,
             );
-            add_rate_limit_headers(resp, rate_limit, rate_limit_remaining, rate_limit_reset)
+            resp = add_rate_limit_headers(resp, rate_limit, rate_limit_remaining, rate_limit_reset);
+            add_session_key_header(resp, &session_id)
         }
     }
 }
@@ -2188,7 +2277,7 @@ mod tests {
         );
     }
 
-    // ── SSE wire-level regression tests (Blocking 4a/4b) ──
+    // ── SSE wire-level regression tests ──
     //
     // `chunk_json` is the testable inner layer of `make_chunk` that
     // builds the SSE delta JSON. These tests prove the wire shape
@@ -2198,7 +2287,7 @@ mod tests {
 
     #[test]
     fn chunk_json_no_tool_calls_in_content_chunk() {
-        // Blocking 4a: the content chunk delta must NOT have tool_calls.
+        // The content chunk delta must NOT carry tool_calls.
         let v = super::chunk_json("id-1", 1, "m", None, Some("hello".into()), None, None);
         let delta = &v["choices"][0]["delta"];
         assert_eq!(delta["content"], "hello");
@@ -2211,7 +2300,7 @@ mod tests {
 
     #[test]
     fn chunk_json_no_content_nor_tool_calls_in_stop_chunk() {
-        // Blocking 4a + 4b: the terminal stop chunk delta must be empty.
+        // The terminal stop chunk delta must be empty (no content, no tool_calls).
         let v = super::chunk_json("id-1", 1, "m", None, None, None, Some("stop"));
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
         let delta = &v["choices"][0]["delta"];

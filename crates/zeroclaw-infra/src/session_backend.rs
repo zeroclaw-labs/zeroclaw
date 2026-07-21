@@ -179,19 +179,27 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Record the agent alias that owns a session. Called on WebSocket
-    /// handshake when the alias is known. No-op for backends that don't
-    /// track per-agent attribution.
+    /// handshake when the alias is known. Backends that don't support
+    /// per-agent attribution return `Unsupported` (fail-closed).
     fn set_session_agent_alias(
         &self,
         _session_key: &str,
         _agent_alias: &str,
     ) -> std::io::Result<()> {
-        Ok(())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session agent alias tracking not supported by this backend; cross-agent session isolation is unavailable",
+        ))
     }
 
     /// Get the agent alias associated with a session, if recorded.
+    /// Backends that don't support per-agent attribution return
+    /// `Unsupported` (fail-closed).
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
-        Ok(None)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session agent alias tracking not supported by this backend; cross-agent session isolation is unavailable",
+        ))
     }
 
     fn set_session_context(

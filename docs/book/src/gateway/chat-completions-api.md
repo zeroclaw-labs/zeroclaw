@@ -100,6 +100,24 @@ data: {"id":"chatcmpl-<uuid>","object":"chat.completion.chunk","created":...,"mo
 data: [DONE]
 ```
 
+### Error and Cancellation Events
+
+When a streaming request fails or is cancelled, the SSE stream emits:
+
+1. An in-band error event
+2. An optional usage chunk (if `stream_options.include_usage` was requested)
+3. The `[DONE]` terminator
+
+**Wire format:**
+
+```
+data: {"error":{"message":"...","type":"internal_error","code":null,"param":null,"status":500}}
+data: {"id":"...","object":"chat.completion.chunk","choices":[],"usage":{...}}
+data: [DONE]
+```
+
+The error `type` is always `internal_error`. Cancellation and server errors produce the same wire shape.
+
 **Streaming response field descriptions**:
 
 | Field | Type | Description |
@@ -120,8 +138,8 @@ data: [DONE]
 | Header | Description | Condition |
 |--------|-------------|-----------|
 | `Content-Type` | `application/json` or `text/event-stream` | Always |
-| `X-Request-ID` | Unique request identifier (UUID) | Always |
-| `x-session-key` | Session ID (without `gw_` prefix) | **Always returned** (even if client doesn't provide one) |
+| `X-Request-ID` | Server-generated unique request identifier (UUID). The client-supplied `x-request-id` header is not read or echoed. | Always |
+| `x-session-key` | Session ID (without `gw_` prefix) | **Always returned** (generated server-side if not provided by client) |
 | `X-RateLimit-Limit` | Max requests per minute | On success & 429 |
 | `X-RateLimit-Remaining` | Remaining request allowance | On success & 429 |
 | `X-RateLimit-Reset` | Rate limit reset timestamp | On success & 429 |
@@ -260,8 +278,8 @@ x-session-key: <session-id>
 **Important notes**:
 ```
 📌 x-session-key is always returned in the HTTP Response Header (both streaming and non-streaming)
-📌 Returned session_key does NOT include the "gw_" prefix
-📌 Server storage auto-adds the "gw_" prefix internally
+📌 The x-session-key header value does NOT include the "gw_" prefix
+📌 Server storage auto-adds the "gw_" prefix to form the internal session key
 📌 Recommendation: Generate and send x-session-key on first request, then reuse it
 ```
 
@@ -591,8 +609,8 @@ The following parameters are **not supported** per-request and will return a **4
 | Header | Description | Condition |
 |--------|-------------|-----------|
 | `Content-Type` | Response content type | Always (`application/json` or `text/event-stream`) |
-| `X-Request-ID` | Unique request identifier (UUID) | Always |
-| `x-session-key` | Session ID (without `gw_` prefix) | **Always returned** |
+| `X-Request-ID` | Server-generated unique request identifier (UUID). The client-supplied `x-request-id` header is not read or echoed. | Always |
+| `x-session-key` | Session ID (without `gw_` prefix) | **Always returned** (generated server-side if not provided by client) |
 | `X-RateLimit-Limit` | Max requests per minute (config: `chat_rate_limit_per_minute`) | On success & 429 |
 | `X-RateLimit-Remaining` | Remaining request allowance | On success & 429 |
 | `X-RateLimit-Reset` | Rate limit reset Unix timestamp | On success & 429 |
@@ -916,7 +934,7 @@ This ensures a tool outside the requested subset can never run, regardless of wh
 
 ### 1. Session Management
 
-- **Client-generated session_key**: Especially for streaming, generate a UUID and send `x-session-key`
+- **Client-generated session ID**: Especially for streaming, generate a UUID as the `x-session-key` header value
 - **Reuse sessions**: Use the same `x-session-key` for multi-turn conversations (with single-message mode)
 - **Full history for stateless clients**: Provide complete message history in `messages` (> 1 entry), no session needed
 - **Avoid excessive history**: Long histories increase token consumption and response latency
@@ -938,6 +956,7 @@ This ensures a tool outside the requested subset can never run, regardless of wh
 - **Simple conversations**: Use `x-session-key` + single message, rely on backend auto-load
 - **Precise context control**: Provide full `messages` array (> 1 entry) for consistent context
 - **System prompts**: Pass via `system` role messages; they don't affect session persistence
+- **Cross-transport sessions**: WebSocket connections load session history once at connection setup and reuse the in-memory agent for subsequent turns. If HTTP chat completions endpoints modify the same session while a WebSocket connection is open, the WebSocket's next turn will not reflect HTTP-side changes. Use separate sessions for different transports to avoid inconsistency.
 
 ### 5. Tool Control
 

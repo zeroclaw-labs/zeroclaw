@@ -186,8 +186,8 @@ where
         // the marker assistant message to `new_messages` on cancel, so persist
         // `error.new_messages` directly.
         if let Some(ref backend) = state.session_backend {
-            // 7126: `DELETE /api/sessions/{id}` cancels the token and wipes the
-            // session row; skip every write when the session no longer exists to
+            // `DELETE /api/sessions/{id}` cancels the token and removes the
+            // session; skip every write when the session no longer exists to
             // avoid resurrecting it.
             let still_exists = backend.session_exists(session_key);
             if still_exists {
@@ -211,7 +211,7 @@ where
             }
         }
 
-        // 7126: only touch state for sessions that still exist.
+        // Only touch state for sessions that still exist (DELETE may have removed them).
         if let Some(ref backend) = state.session_backend
             && backend.session_exists(session_key)
         {
@@ -224,7 +224,7 @@ where
             "model": turn_model,
         }));
 
-        // 6001: trace cancelled turns so `zeroclaw doctor` sees them.
+        // Trace cancelled turns so `zeroclaw doctor` sees them.
         let trace_name = format!("gateway_{}_turn", channel_name);
         ::zeroclaw_log::record!(
             INFO,
@@ -351,7 +351,7 @@ where
                 "model": turn_model,
             }));
 
-            // 6001: trace gateway turns for `zeroclaw doctor`.
+            // Trace gateway turns for `zeroclaw doctor`.
             let total_tokens = match (total_input_tokens, total_output_tokens) {
                 (Some(i), Some(o)) => Some(i.saturating_add(o)),
                 (Some(i), None) => Some(i),
@@ -415,7 +415,7 @@ where
             );
             let sanitized = zeroclaw_providers::sanitize_api_error(&e.error.to_string());
 
-            // 6001: trace failed turns; turn_id cross-references costs.jsonl.
+            // Trace failed turns; turn_id cross-references costs.jsonl.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -450,8 +450,8 @@ where
 
 /// Persist the turn's `new_messages` to the session backend.
 ///
-/// 7126: skip writes when the session was deleted mid-turn, to avoid
-/// resurrecting the row `DELETE /api/sessions/{id}` just wiped.
+/// Skip writes when the session was deleted mid-turn, to avoid
+/// resurrecting the session `DELETE /api/sessions/{id}` just removed.
 pub(crate) fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
@@ -459,8 +459,8 @@ pub(crate) fn persist_conversation_messages(
 ) {
     // `append` uses `create(true)` — on the first turn the file is
     // created automatically. Deleted-session protection is handled by
-    // the caller-side `session_exists` checks in the cancelled path
-    // (turn_runner.rs L191, L205, L215).
+    // the caller-side `session_exists` checks that return early with an
+    // error before reaching this code path.
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
