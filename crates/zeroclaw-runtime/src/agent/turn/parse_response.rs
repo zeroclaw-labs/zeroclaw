@@ -140,6 +140,7 @@ pub(crate) async fn interpret_chat_response(
         output_tokens: resp_output_tokens,
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
         // Credential-scrubbed prompt/completion content for OTel GenAI export;
         // `None` unless the `observability-otel` feature is active.
@@ -428,6 +429,7 @@ mod cost_usd_regression_tests {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let ctx = TurnCtx {
+            parent_agent_alias: None,
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,

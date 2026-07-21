@@ -769,6 +769,12 @@ impl DelegateTool {
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
+                // Delegate: targets are short-lived independent chat
+                // sessions with no cross-turn reuse contract, so the
+                // per-call `connect_all` is the correct choice. The
+                // daemon heartbeat worker is the only `mcp_registry`
+                // supplier.
+                mcp_registry: None,
             },
         )
         .await;
@@ -2614,6 +2620,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
@@ -2627,6 +2634,12 @@ impl DelegateTool {
                         silent: true,
                         approval: None,
                         multimodal_config: &self.multimodal_config,
+                        // Full config so the delegated sub-agent's vision route
+                        // resolves the configured `vision_model_provider`'s alias
+                        // options (the `vision` override, endpoint URI, credentials),
+                        // exactly as the parent turn does. `None` only on the
+                        // configless test builder (`root_config` unset).
+                        config: self.root_config.as_deref(),
                         hooks: None,
                         // Thread the target's deferred-MCP activated set so `tool_search`
                         // can activate the target's deferred tools mid-turn (Some only for
@@ -2668,6 +2681,7 @@ impl DelegateTool {
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(

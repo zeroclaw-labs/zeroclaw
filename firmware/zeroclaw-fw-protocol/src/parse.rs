@@ -72,7 +72,7 @@ pub fn has_cmd(line: &[u8], cmd: &[u8]) -> bool {
 
 /// Extract the `"id"` string value from a JSON line into `out`.
 /// Returns the number of bytes written. Falls back to `"0"` if not found.
-pub fn copy_id<'a>(line: &[u8], out: &'a mut [u8]) -> usize {
+pub fn copy_id(line: &[u8], out: &mut [u8]) -> usize {
     let prefix = b"\"id\":\"";
     if line.len() < prefix.len() + 1 {
         out[0] = b'0';

@@ -538,6 +538,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -706,6 +708,7 @@ mod tests {
             .advance_step(
                 &run_id,
                 SopStepResult {
+                    effective_agent: None,
                     step_number: 1,
                     status: SopStepStatus::Completed,
                     output: format!("used {redaction_fixture}"),

@@ -273,7 +273,7 @@ Configure a tunnel by setting the top-level `[tunnel]` `tunnel_provider` (overri
 
 ## Kubernetes
 
-Helm chart templates are published to the [zeroclaw-templates](https://github.com/zeroclaw-labs/zeroclaw-templates) repo. Typical manifest fragment:
+Sample Kubernetes manifests are provided in the [`deploy-k8s/`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/deploy-k8s) directory. Typical manifest fragment:
 
 ```yaml
 apiVersion: apps/v1

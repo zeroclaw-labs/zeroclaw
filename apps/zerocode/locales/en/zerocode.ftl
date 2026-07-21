@@ -12,6 +12,7 @@ zc-chrome-summary-cpu = cpu
 zc-chrome-summary-loading = loading
 
 zc-app-help-cycle-mode = Cycle mode
+zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
 
@@ -93,7 +94,6 @@ zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
 zc-input-placeholder-chat = Type to chat
 
-zc-input-help-slash-commands = Slash commands
 zc-input-help-completions-navigate = Navigate completions
 zc-input-help-completions-accept = Accept
 zc-input-help-completions-dismiss = Dismiss
@@ -108,6 +108,7 @@ zc-input-clipboard-error = Clipboard error: { $error }
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.
+zc-turn-no-output = Turn completed with no output.
 zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
 zc-queue-title = Queue ({ $count })
 zc-queue-empty-list = No queued messages.
@@ -176,6 +177,15 @@ zc-dashboard-memory-not-configured = Memory is not configured yet. Use Quickstar
 zc-dashboard-search-action-apply = apply
 zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
+zc-dashboard-agent-rename-action-apply = rename
+zc-dashboard-agent-rename-action-cancel = cancel
+zc-dashboard-agent-rename-hint = rename
+zc-dashboard-agent-rename-prefix = rename:
+zc-dashboard-agent-rename-empty = Agent name cannot be empty
+zc-dashboard-agent-rename-unchanged = Agent name unchanged
+zc-dashboard-agent-rename-success = Renamed { $from } to { $to }
+zc-dashboard-agent-rename-success-warnings = Renamed { $from } to { $to } with warnings: { $warnings }
+zc-dashboard-agent-rename-failed = Rename failed: { $error }
 
 zc-dashboard-label-connected = Connected
 zc-dashboard-label-daemon = Daemon
@@ -282,7 +292,6 @@ zc-dashboard-run-pending-status = running
 zc-dashboard-run-pending-window = starting now
 zc-dashboard-run-pending-output = Manual trigger in progress…
 
-
 zc-dashboard-yes = yes
 zc-dashboard-no = no
 zc-dashboard-enabled = enabled
@@ -379,6 +388,7 @@ zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
+zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
 zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
@@ -445,6 +455,8 @@ zc-chat-approval-action-edit = Edit
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
+zc-chat-copy-message = [Copy]
+zc-chat-copy-message-copied = [Copied]
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

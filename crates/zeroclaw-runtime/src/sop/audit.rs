@@ -210,6 +210,7 @@ mod tests {
 
     fn test_step_result(n: u32) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: n,
             status: SopStepStatus::Completed,
             output: format!("Step {n} completed"),
