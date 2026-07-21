@@ -1362,6 +1362,11 @@ pub enum SessionUpdateEvent {
         /// at cancel point (Cancelled).
         content: String,
     },
+    /// Emitted whenever older whole turns were dropped from structured history
+    /// to fit a token budget or message cap. Surfaces a user-visible "context
+    /// was cut here" marker so trimming is never silent. `dropped_messages` is
+    /// the count of conversation messages removed; `kept_turns` is how many
+    /// whole turns remained after the cut.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: usize,

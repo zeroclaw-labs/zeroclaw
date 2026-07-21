@@ -43,6 +43,21 @@ use crate::observer_bridge;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+/// Top-level marker stamped onto a broadcast frame when it carries
+/// `ephemeral_attributes` (short-lived pairing secrets deep-merged into the
+/// live copy). Broadcast consumers use it to withhold the frame from any
+/// stream that is not bearer-authenticated — the frame's secrets must fail
+/// closed rather than ride an unauthenticated `/api/events` subscriber. It is
+/// stamped only on the broadcast copy (never the persisted value, which drops
+/// `ephemeral_attributes` via `serde(skip)`) and is stripped by the SSE layer
+/// before delivery, so the public event shape is unchanged.
+pub const EPHEMERAL_BROADCAST_MARKER: &str = "_ephemeral_credentials";
+
+/// Capacity of the bounded mpsc between `record_event` and the worker.
+/// Sized for high-throughput agent turns (each turn can emit 20-100 events)
+/// while keeping the queue's RSS footprint bounded. When the queue is full
+/// the producer drops the event with a `tracing::warn!` rather than
+/// blocking the async task.
 const QUEUE_CAPACITY: usize = 1024;
 
 /// Worker calls `sync_all` after every N successful writes (in addition
@@ -360,7 +375,23 @@ pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> 
     })
 }
 
+/// Emit one event. Always fans out to the broadcast hook + tracing event.
+/// If persistence is enabled, hands the serialized value to the disk
+/// worker via a bounded `try_send`. The hot path performs no file I/O.
+///
+/// The broadcast copy carries `ephemeral_attributes` deep-merged into
+/// `attributes` (live SSE consumers may render short-lived pairing
+/// credentials); the persisted copy never does — `LogEvent` marks the
+/// field `serde(skip)`, so the serialized value below is credential-free
+/// by construction.
+///
+/// This is the function the `record!` macro expands into. Direct callers
+/// (the schema migration tool, tests) can invoke it too, but production
+/// code should go through the macro so the `tracing::event!` carries the
+/// correct `file:line` source info.
 pub fn record_event(event: LogEvent) {
+    // `serde(skip)` on `ephemeral_attributes` keeps this value — the one
+    // that reaches disk — free of broadcast-only secrets.
     let value = match serde_json::to_value(&event) {
         Ok(v) => v,
         Err(err) => {
@@ -376,7 +407,17 @@ pub fn record_event(event: LogEvent) {
     observer_bridge::forward(&event);
 
     if let Some(hook) = current_broadcast_hook() {
-        let _ = hook.send(value.clone());
+        let mut broadcast_value = value.clone();
+        if !event.ephemeral_attributes.is_null() {
+            merge_ephemeral_into_attributes(&mut broadcast_value, &event.ephemeral_attributes);
+            // Mark the frame so a broadcast consumer that cannot authenticate
+            // its subscribers (an unauthenticated `/api/events` stream) fails
+            // closed on the pairing secret instead of fanning it out.
+            if let Value::Object(map) = &mut broadcast_value {
+                map.insert(EPHEMERAL_BROADCAST_MARKER.to_string(), Value::Bool(true));
+            }
+        }
+        let _ = hook.send(broadcast_value);
     }
 
     let Some(state) = current_state() else {
@@ -404,6 +445,71 @@ pub fn record_event(event: LogEvent) {
     }
 }
 
+/// True when a broadcast frame was stamped with [`EPHEMERAL_BROADCAST_MARKER`]
+/// by [`record_event`] — i.e. it carries broadcast-only pairing secrets (QR
+/// payloads, pair codes) deep-merged into `attributes`.
+///
+/// Every consumer of the shared broadcast bus (the gateway SSE stream, the RPC
+/// `logs/subscribe` forwarder) uses this to fail closed on the credential
+/// unless it can prove its subscriber is authenticated.
+pub fn frame_carries_ephemeral_credentials(value: &Value) -> bool {
+    value
+        .get(EPHEMERAL_BROADCAST_MARKER)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Strip the internal [`EPHEMERAL_BROADCAST_MARKER`] from a broadcast frame
+/// before it is delivered to a consumer, so the public event shape is
+/// unchanged. Returns whether the marker was present.
+pub fn strip_ephemeral_broadcast_marker(value: &mut Value) -> bool {
+    value
+        .as_object_mut()
+        .and_then(|obj| obj.remove(EPHEMERAL_BROADCAST_MARKER))
+        .is_some()
+}
+
+/// Deep-merge the event's `ephemeral_attributes` into the broadcast
+/// value's `attributes` object. Ephemeral keys win on conflict (they are
+/// the fresher, call-site-provided data). Only object-into-object merges
+/// recurse; any other shape replaces wholesale.
+fn merge_ephemeral_into_attributes(broadcast_value: &mut Value, ephemeral: &Value) {
+    let Some(root) = broadcast_value.as_object_mut() else {
+        return;
+    };
+    let attributes = root
+        .entry("attributes".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    deep_merge(attributes, ephemeral);
+}
+
+fn deep_merge(target: &mut Value, incoming: &Value) {
+    match (target, incoming) {
+        (Value::Object(target_map), Value::Object(incoming_map)) => {
+            for (key, incoming_child) in incoming_map {
+                match target_map.get_mut(key) {
+                    Some(target_child) => deep_merge(target_child, incoming_child),
+                    None => {
+                        target_map.insert(key.clone(), incoming_child.clone());
+                    }
+                }
+            }
+        }
+        (target_slot, incoming_value) => {
+            *target_slot = incoming_value.clone();
+        }
+    }
+}
+
+/// Serialize one event as a single JSONL line (terminated with `\n`) to the
+/// provided buffered writer. Pure helper: does not open, flush, or fsync the
+/// file — the caller owns the [`BufWriter`] lifecycle.
+///
+/// Used by the production append path (`append_line`). The rolling trim path
+/// (`trim_to_last_entries`) writes the original JSONL bytes from the
+/// line-buffered reader directly, so it stays inline rather than going
+/// through this helper (re-serializing would risk non-byte-identical output
+/// for non-canonical input, e.g. reordered keys or whitespace).
 fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<()> {
     serde_json::to_writer(&mut *writer, value).context("serializing log line")?;
     writer.write_all(b"\n").context("writing newline")?;
@@ -765,6 +871,106 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_attributes_reach_broadcast_but_never_disk() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        ev.message = Some("qr ready".to_string());
+        ev.attributes = serde_json::json!({
+            "login": { "state": "qr", "channel": "wechat.assistant" }
+        });
+        ev.ephemeral_attributes = serde_json::json!({
+            "login": { "qr_payload": "SECRET-QR-PAYLOAD" }
+        });
+        record_event(ev);
+
+        // Broadcast copy: ephemeral fields deep-merged into attributes.
+        let broadcast = rx.try_recv().expect("broadcast copy delivered");
+        assert_eq!(
+            broadcast["attributes"]["login"]["qr_payload"],
+            "SECRET-QR-PAYLOAD"
+        );
+        assert_eq!(broadcast["attributes"]["login"]["state"], "qr");
+
+        // Persisted copy: the credential never lands on disk.
+        flush_for_test().unwrap();
+        let path = runtime_trace_path().unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("SECRET-QR-PAYLOAD"),
+            "persisted JSONL must not contain ephemeral credentials: {contents}"
+        );
+        assert!(
+            contents.contains("\"state\":\"qr\""),
+            "persisted JSONL keeps the lifecycle state: {contents}"
+        );
+        let line: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert!(line["attributes"]["login"].get("qr_payload").is_none());
+        assert!(line.get("ephemeral_attributes").is_none());
+        // The broadcast-only fail-closed marker also never reaches disk.
+        assert!(line.get(EPHEMERAL_BROADCAST_MARKER).is_none());
+
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    /// A frame carrying `ephemeral_attributes` is stamped with the
+    /// fail-closed marker on the broadcast copy so an SSE layer that cannot
+    /// authenticate its subscribers can withhold the pairing secret. A frame
+    /// with no ephemeral attributes is never stamped.
+    #[test]
+    fn broadcast_frame_marks_ephemeral_credentials_for_fail_closed_delivery() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        let mut with_secret = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        with_secret.attributes = serde_json::json!({ "login": { "state": "qr" } });
+        with_secret.ephemeral_attributes =
+            serde_json::json!({ "login": { "qr_payload": "SECRET-QR-PAYLOAD" } });
+        record_event(with_secret);
+        let framed = rx.try_recv().expect("broadcast copy delivered");
+        assert_eq!(
+            framed[EPHEMERAL_BROADCAST_MARKER], true,
+            "credential-bearing frame must be marked for fail-closed delivery: {framed}"
+        );
+
+        let mut no_secret = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        no_secret.attributes = serde_json::json!({ "login": { "state": "connected" } });
+        record_event(no_secret);
+        let plain = rx.try_recv().expect("broadcast copy delivered");
+        assert!(
+            plain.get(EPHEMERAL_BROADCAST_MARKER).is_none(),
+            "credential-free frame must not be marked: {plain}"
+        );
+
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn deep_merge_prefers_ephemeral_on_conflict_and_recurses() {
+        let mut target = serde_json::json!({
+            "login": { "state": "qr", "attempt": 1 },
+            "other": "kept"
+        });
+        let incoming = serde_json::json!({
+            "login": { "qr_payload": "p", "attempt": 2 }
+        });
+        deep_merge(&mut target, &incoming);
+        assert_eq!(target["login"]["state"], "qr");
+        assert_eq!(target["login"]["qr_payload"], "p");
+        assert_eq!(target["login"]["attempt"], 2);
+        assert_eq!(target["other"], "kept");
+    }
+
+    #[test]
     fn disabled_storage_does_not_write_file() {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -908,6 +1114,13 @@ mod tests {
         let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
         ev.message = Some(msg.to_string());
         record_event(ev);
+        // JSONL fsync runs off the async hot path, so `record_event` returns
+        // before the line is on disk. Tests that assert on the log file
+        // immediately after emitting must flush first (the explicit idiom used
+        // throughout this module); folding it into `emit` keeps every
+        // emit-then-read test correct — notably the `reinit_*` tests, which
+        // read the file right after emitting.
+        flush_for_test().unwrap();
     }
 
     fn set_mtime(path: &Path, when: SystemTime) {

@@ -769,6 +769,12 @@ impl DelegateTool {
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
+                // Delegate: targets are short-lived independent chat
+                // sessions with no cross-turn reuse contract, so the
+                // per-call `connect_all` is the correct choice. The
+                // daemon heartbeat worker is the only `mcp_registry`
+                // supplier.
+                mcp_registry: None,
             },
         )
         .await;

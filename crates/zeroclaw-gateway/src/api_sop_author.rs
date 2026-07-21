@@ -244,6 +244,18 @@ pub async fn handle_sop_run(
                 )
                     .into_response();
             }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced {
+                existing_run_id, ..
+            } => {
+                return Json(serde_json::json!({ "run_id": existing_run_id })).into_response();
+            }
             zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {}
         }
     }
@@ -335,6 +347,21 @@ pub async fn handle_sop_decide(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    // Derive the transport-authenticated approval subject (the paired-token hash)
+    // from the validated bearer, mirroring the /admin/sop approval route's
+    // `authorize`, so the broker can enforce a required-group / quorum policy on this
+    // authoring surface instead of resolving an anonymous `http(None)` past it. Gated
+    // on `require_pairing`: when pairing is OFF every token is a no-op pass-through, so
+    // deriving an identity from an unauthenticated header would let any caller fabricate
+    // an approval subject - fall back to `http(None)` (which fails a required-group
+    // policy closed) in that mode, matching `authorize`.
+    let subject = state
+        .pairing
+        .require_pairing()
+        .then(|| crate::api::extract_bearer_token(&headers))
+        .flatten()
+        .and_then(|t| state.pairing.authenticate_and_hash(t));
+    let principal = zeroclaw_runtime::sop::approval::ApprovalPrincipal::http(subject);
     let decision: zeroclaw_runtime::sop::approval::ApprovalDecision =
         match serde_json::from_value(decision_value) {
             Ok(d) => d,
@@ -392,13 +419,22 @@ pub async fn handle_sop_decide(
         let status = guard.get_run(&run_id).map(|r| r.status);
         match status {
             Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
-                use zeroclaw_runtime::sop::approval::{ApprovalPrincipal, ResolveOutcome};
-                match guard.resolve_gate(&run_id, decision, ApprovalPrincipal::http(None)) {
-                    Ok(ResolveOutcome::Resumed(action)) => {
+                use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
+                // Route through the broker (membership + quorum), not `resolve_gate`
+                // directly, otherwise this authoring surface would
+                // clear a policied approval gate without enforcing group membership or
+                // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
+                match guard.resolve_via_broker(&run_id, decision, principal) {
+                    Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
                         resumed_action = Some(*action);
                     }
-                    Ok(ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved) => {}
-                    Ok(ResolveOutcome::NotWaiting) => {
+                    Ok(BrokerOutcome::Resolved(
+                        ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved,
+                    )) => {}
+                    Ok(
+                        BrokerOutcome::Resolved(ResolveOutcome::NotWaiting)
+                        | BrokerOutcome::NotWaiting,
+                    ) => {
                         return (
                             StatusCode::CONFLICT,
                             Json(serde_json::json!({
@@ -407,11 +443,43 @@ pub async fn handle_sop_decide(
                         )
                             .into_response();
                     }
-                    Ok(ResolveOutcome::RejectedSelfApproval) => {
+                    Ok(BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)) => {
                         return (
                             StatusCode::FORBIDDEN,
                             Json(serde_json::json!({
                                 "error": "approval_mode forbids this principal from clearing the gate"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Ok(BrokerOutcome::NotAuthorized { required_group }) => {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": format!("not authorized: requires group '{required_group}'")
+                            })),
+                        )
+                            .into_response();
+                    }
+                    // A step naming an absent policy is a server-side config defect:
+                    // fail closed (gate left waiting), never a silent clear.
+                    Ok(BrokerOutcome::PolicyMissing { name }) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("approval policy '{name}' is not configured (gate left waiting)")
+                            })),
+                        )
+                            .into_response();
+                    }
+                    // The vote counted but quorum is not yet met: the gate stays
+                    // waiting for the remaining approvers.
+                    Ok(BrokerOutcome::PendingQuorum { have, need }) => {
+                        return (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({
+                                "outcome": format!("pending_quorum ({have}/{need})"),
+                                "run_id": run_id,
                             })),
                         )
                             .into_response();

@@ -152,9 +152,10 @@ impl SopRunStore for SqliteRunStore {
     }
 
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
-        let g = self.lock()?;
+        let mut g = self.lock()?;
         let json = serde_json::to_string(terminal)?;
-        let existing: Option<(i64, String)> = g
+        let tx = g.transaction().map_err(sql_err)?;
+        let existing: Option<(i64, String)> = tx
             .query_row(
                 "SELECT revision, json FROM sop_runs WHERE run_id=?1",
                 params![run_id],
@@ -165,7 +166,7 @@ impl SopRunStore for SqliteRunStore {
         if let Some((rev, existing_json)) = existing {
             guard_revision(run_id, rev as u64, &existing_json, terminal.revision, &json)?;
         }
-        g.execute(
+        tx.execute(
             "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
              VALUES (?1, ?2, 1, ?3, ?4)
              ON CONFLICT(run_id) DO UPDATE SET
@@ -181,8 +182,9 @@ impl SopRunStore for SqliteRunStore {
             ],
         )
         .map_err(sql_err)?;
-        g.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id])
+        tx.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id])
             .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 

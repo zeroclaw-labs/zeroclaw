@@ -338,15 +338,20 @@ Once `publish` completes, confirm:
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
+[ ] Prebuilt Docker and generated Docker matrix jobs are green
 ```
 
 `CHANGELOG-next.md` is intentionally left on `master` after the release: the
 publish job only reads it as the release body, it does not delete it. The next
 release cycle overwrites it, so no manual cleanup is required.
 
-You do not need to manually verify Docker or the distribution channels
-unless a job in the workflow run shows red. Check the workflow run summary; if
-all jobs are green, you are done.
+For the normal `workflow_dispatch` path, Docker Publish runs synchronously
+inside the stable release workflow. You do not need a separate Docker check if
+all release jobs are green. If a maintainer instead starts the release by
+pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
+confirm that sibling run is green before treating container publication as
+complete. Distribution channels need separate attention only when their jobs
+show red.
 
 Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
 published artifacts can follow

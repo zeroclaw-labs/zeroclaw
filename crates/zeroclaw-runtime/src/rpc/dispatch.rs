@@ -493,6 +493,14 @@ impl RpcDispatcher {
         }
     }
 
+    async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
+        if let Some(event) = event
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+        {
+            let _ = self.rpc.send_raw(notification).await;
+        }
+    }
+
     /// Flush dirty config paths to disk. Clone the config out of the
     /// lock (parking_lot guards are !Send), save to disk, then write
     /// the clone (with cleared dirty set) back.
@@ -998,8 +1006,8 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
             initialize_mcp,
@@ -1137,10 +1145,17 @@ impl RpcDispatcher {
                             ));
                         }
                         message_count = data.messages.len();
-                        self.ctx
+                        let seed_event = self
+                            .ctx
                             .sessions
-                            .seed_conversation_history(&session_id, data.messages)
+                            .seed_conversation_history_with_event(&session_id, data.messages)
                             .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
                         if let Some(ref store) = self.ctx.acp_session_store {
                             let store = store.clone();
                             let sid = session_id.clone();
@@ -1207,7 +1222,12 @@ impl RpcDispatcher {
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
-                        self.ctx.sessions.seed_history(&session_id, &stored).await;
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_history_with_event(&session_id, &stored)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
                         message_count = stored.len();
                     }
                 }
@@ -1438,7 +1458,6 @@ impl RpcDispatcher {
             }
         };
 
-        let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -1447,8 +1466,8 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
             false,
@@ -1484,10 +1503,12 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
-        self.ctx
+        let seed_event = self
+            .ctx
             .sessions
-            .seed_conversation_history(sid, data.messages)
+            .seed_conversation_history_with_event(sid, data.messages)
             .await;
+        self.forward_seed_event(sid, seed_event).await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -1599,12 +1620,6 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        let pre_history_len = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            self.ctx.sessions.history_len(sid).await.unwrap_or(0)
-        } else {
-            0
-        };
-
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1780,40 +1795,15 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && matches!(
-                        outcome,
-                        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. })
-                    )
-                    && let Some(new_msgs) = self
-                        .ctx
-                        .sessions
-                        .history_slice_from(sid, pre_history_len)
-                        .await
-                    && !new_msgs.is_empty()
+                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
                 {
-                    let store = store.clone();
-                    let sid_owned = sid.to_string();
-                    let persisted = tokio::task::spawn_blocking(move || {
-                        store.append_turn(&sid_owned, &new_msgs)
-                    })
-                    .await;
-                    let error = match persisted {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(join) => Some(join.to_string()),
-                    };
-                    if let Some(detail) = error {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                            "Failed to persist ACP turn"
-                        );
-                    }
+                        "Failed to persist ACP turn"
+                    );
                 }
             }
             crate::rpc::types::ChatMode::Chat => {
@@ -3769,7 +3759,21 @@ impl RpcDispatcher {
                     biased;
                     _ = rpc.closed() => break,
                     event = rx.recv() => match event {
-                        Ok(event) => {
+                        Ok(mut event) => {
+                            // Pairing secrets (QR payloads, one-shot pair codes)
+                            // ride the shared broadcast bus stamped with the
+                            // ephemeral marker. `logs/subscribe` is NOT the
+                            // bearer-authenticated SSE surface those credentials
+                            // are scoped to — a fresh remote RPC client can
+                            // `initialize` and subscribe over WSS without the
+                            // gateway bearer check — so fail closed: withhold
+                            // marked frames entirely and strip the internal
+                            // marker from everything else (public shape
+                            // unchanged). See `zeroclaw_gateway::sse`.
+                            if zeroclaw_log::frame_carries_ephemeral_credentials(&event) {
+                                continue;
+                            }
+                            zeroclaw_log::strip_ephemeral_broadcast_marker(&mut event);
                             let notification =
                                 JsonRpcNotification::new(notification::LOGS_EVENT, event);
                             if let Ok(json) = serde_json::to_string(&notification)
@@ -4042,6 +4046,16 @@ impl RpcDispatcher {
                 crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
                 | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
                     return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::Coalesced {
+                    existing_run_id, ..
+                } => {
+                    return to_result(SopRunResponse {
+                        run_id: existing_run_id.clone(),
+                    });
                 }
                 crate::sop::dispatch::DispatchResult::NoMatch => {}
             }
@@ -4420,6 +4434,31 @@ fn truncate_memory_previews(
 /// so the meter freezes at the default even when the profile is set higher.
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
     cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
+/// Persist the exact turn delta captured before structured history trimming.
+/// Empty and failed turns intentionally remain no-ops.
+async fn persist_acp_turn(
+    store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: &str,
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<String> {
+    let messages = match outcome {
+        Ok(TurnOutcome::Completed { messages, .. })
+        | Ok(TurnOutcome::Cancelled { messages, .. })
+            if !messages.is_empty() =>
+        {
+            messages.clone()
+        }
+        _ => return None,
+    };
+    let store = Arc::clone(store);
+    let session_id = session_id.to_string();
+    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join) => Some(join.to_string()),
+    }
 }
 
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
@@ -5121,6 +5160,77 @@ mod tests {
         assert!(
             !names.contains(&"tool_search") && !names.contains(&"remote__domains.list"),
             "ACP session must skip MCP init (no `tool_search`, no MCP tools); tools: {names:?}"
+        );
+    }
+
+    /// Blocking regression: a fresh remote RPC client that reaches
+    /// `logs/subscribe` (an unauthenticated surface — a new WSS client can
+    /// `initialize` and subscribe without the gateway bearer) must never
+    /// receive a pairing credential off the shared broadcast bus, while
+    /// ordinary log frames still forward with the internal marker stripped.
+    #[tokio::test]
+    async fn logs_subscribe_fails_closed_on_pairing_credentials() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let config = zeroclaw_config::schema::Config::default();
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx.clone());
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
+
+        assert!(
+            d.handle_logs_subscribe().await.is_ok(),
+            "a fresh client should be able to subscribe"
+        );
+
+        // Marker-stamped credential frame (as `record_event` stamps a QR login
+        // event) followed by an ordinary lifecycle frame.
+        let credential = serde_json::json!({
+            "source": "observability",
+            "attributes": { "login": { "state": "qr", "qr_payload": "SECRET-QR-PAYLOAD" } },
+            zeroclaw_log::EPHEMERAL_BROADCAST_MARKER: true,
+        });
+        let plain = serde_json::json!({
+            "source": "observability",
+            "type": "tool_call",
+            "tool": "SENTINEL-LIVE",
+        });
+        event_tx.send(credential).expect("send credential frame");
+        event_tx.send(plain).expect("send plain frame");
+
+        // Collect forwarded notifications until the sentinel arrives or the
+        // budget elapses.
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, writer_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let hit = msg.contains("SENTINEL-LIVE");
+                    seen.push_str(&msg);
+                    if hit {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            seen.contains("SENTINEL-LIVE"),
+            "an ordinary lifecycle frame must still forward over logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains("SECRET-QR-PAYLOAD"),
+            "a remote RPC client must never obtain a pairing credential via logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
+            "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
         );
     }
 
@@ -6398,6 +6508,93 @@ mod tests {
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
+    #[tokio::test]
+    async fn seed_trim_event_is_forwarded_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 1,
+            reason: "message cap".into(),
+        };
+
+        dispatcher
+            .forward_seed_event("restored-session", Some(event))
+            .await;
+
+        let raw = rx
+            .try_recv()
+            .expect("restored history trim must notify the active client");
+        let notification: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], "restored-session");
+        assert_eq!(notification["params"]["dropped_messages"], 4);
+        assert!(
+            rx.try_recv().is_err(),
+            "one seed trim must emit exactly one notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_appends_complete_pretrim_delta_at_cap() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "trim-at-cap";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let existing = (0..50)
+            .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
+            .collect::<Vec<_>>();
+        store.append_turn(sid, &existing).unwrap();
+
+        let new_messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("new-user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new-assistant")),
+        ];
+        let outcome = Ok(TurnOutcome::Completed {
+            text: "new-assistant".into(),
+            messages: new_messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(restored.messages.len(), 52);
+        assert_eq!(
+            serde_json::to_value(&restored.messages[50..]).unwrap(),
+            serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_skips_empty_and_failed_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "no-turn-delta";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let empty = Ok(TurnOutcome::Cancelled {
+            partial_text: String::new(),
+            messages: Vec::new(),
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+
+        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
     fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
         use zeroclaw_config::schema::{AliasedAgentConfig, DelegateTargetConfig};
@@ -7656,6 +7853,63 @@ mod tests {
         );
 
         wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    #[tokio::test]
+    async fn existing_session_uses_reloaded_structured_history_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .max_history_messages = Some(2);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old assistant"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new assistant"),
+        ]);
+
+        assert!(
+            matches!(event, Some(TurnEvent::HistoryTrimmed { .. })),
+            "an existing session must observe the reloaded runtime-profile cap"
+        );
+        assert!(!agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat) if chat.content == "old user"
+        )));
+        assert!(agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "new assistant"
+        )));
     }
 
     #[tokio::test]
