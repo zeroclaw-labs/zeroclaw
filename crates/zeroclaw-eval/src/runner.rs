@@ -309,6 +309,7 @@ mod tests {
             model: "m".to_string(),
             judge_ref: "judge.m:x".to_string(),
             gates: false,
+            records_sink: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         let outcome = run_case(&trace, &deps).await.unwrap();
         // The case budget reflects only the agent's tokens, never the judge's.
