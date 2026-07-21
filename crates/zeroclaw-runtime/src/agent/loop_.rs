@@ -302,7 +302,15 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
-pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+/// Append a pre-rendered pinned-MCP-resources section onto the system-prompt
+/// MCP accumulator (`deferred_section`).
+///
+/// This MUST be called *after* the `deferred_loading` branch, which reassigns
+/// `deferred_section` with `=` (via `build_deferred_tools_section_filtered`)
+/// and would otherwise clobber any earlier-pushed pinned content. Centralizing
+/// the append keeps both `run()` and `process_message()` consistent and pins
+/// the ordering invariant in one testable place. No-op for an empty section.
+pub fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
     if pinned_section.is_empty() {
         return;
     }
@@ -1919,10 +1927,10 @@ pub async fn run(
                                     query: effective_msg.clone(),
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
-                                    cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                        min_relevance_score: config.memory.min_relevance_score,
-                                        ..Default::default()
-                                    },
+                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                        &config.memory,
+                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                    ),
                                 }),
                                 ingress: IngressContext::from_origin(origin),
                                 agent_alias: Some(agent_alias),
@@ -2468,10 +2476,10 @@ pub async fn run(
                                         query: effective_input.clone(),
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                            min_relevance_score: config.memory.min_relevance_score,
-                                            ..Default::default()
-                                        },
+                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                            &config.memory,
+                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                        ),
                                     }),
                                     ingress: IngressContext::from_origin(origin),
                                     agent_alias: Some(agent_alias),
@@ -3287,10 +3295,10 @@ pub async fn process_message(
                         query: effective_message.clone(),
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
-                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                            min_relevance_score: config.memory.min_relevance_score,
-                            ..Default::default()
-                        },
+                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                            &config.memory,
+                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                        ),
                     }),
                     Some(agent_alias),
                     Some(SopStepReassembly { config: &config }),

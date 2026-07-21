@@ -197,10 +197,15 @@ Both routes are `channel:recipient`: `channel` is a configured channel's map key
 (`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
 channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
 and never blocks or clears the gate - the approval itself still comes back through
-the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
-approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
-(where channels are configured); leave them unset (or empty) to notify only the
-originating surface, which is the default.
+an authenticated approve/deny surface whose principal can satisfy the policy's
+group and quorum requirements. Routes fire only in the daemon (where channels are
+configured); leave them unset (or empty) to notify only the originating surface,
+which is the default.
+
+Route delivery has no durable retry queue. A daemon exit before the asynchronous
+send completes, or a channel send failure, can lose the notice without changing
+the parked gate. Operators can inspect pending runs with `zeroclaw sop pending`
+and contact an eligible approver through an authenticated approval surface.
 
 ### Step Contract Enforcement
 

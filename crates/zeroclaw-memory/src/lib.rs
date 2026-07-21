@@ -34,6 +34,7 @@ pub mod policy_gate;
 pub mod postgres;
 pub mod qdrant;
 pub mod redact;
+pub mod rerank;
 pub mod response_cache;
 pub mod retrieval;
 pub mod scanned;
@@ -62,6 +63,7 @@ pub use policy::PolicyEnforcer;
 #[allow(unused_imports)]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
+pub use rerank::{RerankConfig, RerankStrategy};
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
