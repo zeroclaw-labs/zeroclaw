@@ -1251,6 +1251,30 @@ impl SecurityPolicy {
                     | "wmic"
                     | "sc"
                     | "netsh"
+                    // PowerShell-native destructive, process, and network commands.
+                    | "remove-item"
+                    | "clear-content"
+                    | "set-content"
+                    | "add-content"
+                    | "out-file"
+                    | "start-process"
+                    | "stop-process"
+                    | "invoke-webrequest"
+                    | "invoke-restmethod"
+                    | "invoke-expression"
+                    | "invoke-command"
+                    // Common aliases for the commands above. Aliases already
+                    // covered by the cross-platform table are not repeated.
+                    | "erase"
+                    | "rd"
+                    | "ri"
+                    | "saps"
+                    | "start"
+                    | "spps"
+                    | "kill"
+                    | "iwr"
+                    | "irm"
+                    | "iex"
             ) {
                 return CommandRiskLevel::High;
             }
@@ -1299,7 +1323,10 @@ impl SecurityPolicy {
                 }),
                 "touch" | "mkdir" | "mv" | "cp" | "ln"
                 // Windows medium-risk equivalents
-                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink" => true,
+                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink"
+                // PowerShell-native mutation commands and common aliases
+                | "new-item" | "copy-item" | "move-item" | "rename-item"
+                | "ni" | "cpi" | "mi" | "rni" | "md" => true,
                 _ => false,
             };
 
@@ -2916,6 +2943,75 @@ mod tests {
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
         );
+    }
+
+    #[test]
+    fn command_risk_classifies_powershell_commands() {
+        let p = default_policy();
+        for command in [
+            "Remove-Item important.txt",
+            "Set-Content output.txt value",
+            "Start-Process calc.exe",
+            "Invoke-WebRequest https://example.com",
+            "ri important.txt",
+            "iwr https://example.com",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::High,
+                "PowerShell-native command should be high risk: {command}"
+            );
+        }
+
+        for command in [
+            "New-Item output.txt",
+            "Copy-Item from.txt to.txt",
+            "ni output.txt",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "PowerShell-native mutation should be medium risk: {command}"
+            );
+        }
+
+        for command in ["Write-Output safe", "Get-Date", "Get-ChildItem"] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "read-only PowerShell command should stay low risk: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_blocks_powershell_native_command_via_wildcard() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let error = p
+            .validate_command_execution("Remove-Item important.txt", true)
+            .expect_err("PowerShell-native high-risk commands must be blocked");
+        assert!(error.contains("high-risk"));
+    }
+
+    #[test]
+    fn validate_command_allows_low_risk_powershell_command_via_wildcard() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let risk = p
+            .validate_command_execution("Write-Output safe", false)
+            .expect("low-risk PowerShell commands should not require approval");
+        assert_eq!(risk, CommandRiskLevel::Low);
     }
 
     #[test]

@@ -39,7 +39,12 @@ pub enum WindowsShellKind {
 /// trailing `.exe`/`.cmd`/`.bat` extension is stripped before matching.
 pub fn windows_shell_kind(shell: &str) -> WindowsShellKind {
     let file = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
-    let stem = file.rsplit_once('.').map_or(file, |(stem, _ext)| stem);
+    let stem = match file.rsplit_once('.') {
+        Some((stem, ext)) if matches!(ext.to_ascii_lowercase().as_str(), "exe" | "cmd" | "bat") => {
+            stem
+        }
+        _ => file,
+    };
     match stem.to_ascii_lowercase().as_str() {
         "powershell" | "pwsh" => WindowsShellKind::PowerShell,
         _ => WindowsShellKind::Cmd,
@@ -554,6 +559,17 @@ mod tests {
             WindowsShellKind::PowerShell
         );
         assert_eq!(windows_shell_kind("PWSH.EXE"), WindowsShellKind::PowerShell);
+    }
+
+    #[test]
+    fn windows_shell_kind_strips_only_executable_suffixes() {
+        assert_eq!(
+            windows_shell_kind("powershell.cmd"),
+            WindowsShellKind::PowerShell
+        );
+        assert_eq!(windows_shell_kind("pwsh.bat"), WindowsShellKind::PowerShell);
+        assert_eq!(windows_shell_kind("pwsh.txt"), WindowsShellKind::Cmd);
+        assert_eq!(windows_shell_kind("powershell.com"), WindowsShellKind::Cmd);
     }
 
     #[test]

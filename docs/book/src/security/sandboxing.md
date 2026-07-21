@@ -69,6 +69,8 @@ shell = "pwsh"        # PowerShell 7+   -> pwsh -NoProfile -NonInteractive -Comm
 
 `powershell` and `pwsh` (as a bare name resolved via `PATH`, or an absolute path such as `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`) run through PowerShell; any other value (including the default `sh` and an explicit `cmd`) runs through `cmd.exe /C`, matching the historical behaviour. Only an empty/whitespace value is rejected; the interpreter is located at spawn time.
 
+The shell tool, shell-backed skill tools, and cron/schedule shell jobs all use this runtime selection. Security policy classifies the submitted script with one cross-shell command table before it starts, including PowerShell-native cmdlets and aliases. Read-only PowerShell cmdlets follow the normal low-risk path; native mutation, process, and network commands are classified as medium or high risk and follow the configured allowlist, autonomy, and approval gates. Scheduled cron runs are never pre-approved.
+
 Only applies to the native runtime kind. Docker uses its container's shell, and Android (always `/system/bin/sh`) ignores the setting and does not validate it.
 
 ## Per-backend notes

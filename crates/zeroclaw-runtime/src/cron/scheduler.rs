@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
@@ -1127,12 +1126,20 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match build_cron_shell_command(&job.command, &config.data_dir) {
-        Ok(mut cmd) => match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => return (false, format!("spawn error: {e}")),
-        },
-        Err(e) => return (false, format!("shell setup error: {e}")),
+    let mut command =
+        match crate::cron::build_configured_shell_command(config, &job.command, &config.data_dir) {
+            Ok(command) => command,
+            Err(error) => return (false, format!("shell setup error: {error}")),
+        };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return (false, format!("spawn error: {error}")),
     };
 
     match time::timeout(timeout, child.wait_with_output()).await {
@@ -1153,22 +1160,6 @@ async fn run_job_command_with_timeout(
             format!("job timed out after {}s", timeout.as_secs_f64()),
         ),
     }
-}
-
-fn build_cron_shell_command(
-    command: &str,
-    workspace_dir: &std::path::Path,
-) -> anyhow::Result<Command> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -2413,9 +2404,13 @@ mod tests {
     }
 
     #[test]
-    fn build_cron_shell_command_uses_sh_non_login() {
+    #[cfg(not(target_os = "windows"))]
+    fn build_cron_shell_command_uses_configured_runtime() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let cmd = build_cron_shell_command("echo cron-test", &workspace).unwrap();
+        let cmd =
+            crate::cron::build_configured_shell_command(&config, "echo cron-test", &workspace)
+                .unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("echo cron-test"));
         assert!(debug.contains("\"sh\""), "should use sh: {debug}");
@@ -2428,13 +2423,35 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn build_cron_shell_command_executes_successfully() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let mut cmd = build_cron_shell_command("echo cron-ok", &workspace).unwrap();
+        let mut cmd =
+            crate::cron::build_configured_shell_command(&config, "echo cron-ok", &workspace)
+                .unwrap();
         let output = cmd.output().await.unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("cron-ok"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn build_cron_shell_command_uses_configured_powershell() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let workspace = std::env::temp_dir();
+        let cmd = crate::cron::build_configured_shell_command(
+            &config,
+            "Write-Output cron-ok",
+            &workspace,
+        )
+        .unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("powershell"));
+        assert!(debug.contains("-Command"));
+        assert!(!debug.contains("cmd.exe"));
     }
 
     #[tokio::test]

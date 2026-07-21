@@ -80,6 +80,16 @@ pub fn validate_shell_command_with_security(
         })
 }
 
+/// Build a cron shell command from the configured runtime without spawning it.
+pub(crate) fn build_configured_shell_command(
+    config: &Config,
+    command: &str,
+    workspace_dir: &std::path::Path,
+) -> Result<tokio::process::Command> {
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    runtime.build_shell_command(command, workspace_dir)
+}
+
 pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
     let Some(delivery) = delivery else {
         return Ok(());

@@ -751,6 +751,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_policy_blocks_powershell_native_high_risk_command() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "Remove-Item important.txt"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "PowerShell-native operation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
     async fn shell_blocks_readonly() {
         let tool = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
         let result = tool
