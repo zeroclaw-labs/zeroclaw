@@ -1056,3 +1056,15 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 
+# ── Evaluation harness ──
+cli-eval-failed-case-records =   failed-case records: {$dir}/
+cli-eval-flaky-unconfirmed-regression =   flaky (unconfirmed regression): {$id}
+cli-eval-baseline-comparison =   baseline comparison:
+cli-eval-comparison-new = new
+cli-eval-comparison-removed = removed (warn) - in baseline, absent now
+cli-eval-comparison-unverifiable = changed - refresh baseline
+cli-eval-comparison-improvement = improvement
+cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
+cli-eval-comparison-regression = REGRESSION ({$categories})
+cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
+cli-eval-comparison-unchanged = unchanged
