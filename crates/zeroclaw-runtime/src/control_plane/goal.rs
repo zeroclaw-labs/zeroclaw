@@ -870,6 +870,7 @@ pub fn bind_current_goal_task(task_id: &str) -> bool {
             }
         })
         .unwrap_or(false)
+}
 
 /// Durably stop the exact active goal after a provider boundary reports that
 /// its usage cannot be attributed. The task-local admission context supplies
