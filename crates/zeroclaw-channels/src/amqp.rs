@@ -897,7 +897,6 @@ tr7J6RKtO4OsZS/2KoYL8M+o
     /// backpressured and `dispatch_sop_event` returns a `Deferred` result.
     fn sop_handles_at_exec_slot_full() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
         use zeroclaw_runtime::sop::SopStepKind;
-        use zeroclaw_runtime::sop::engine::now_iso8601;
         use zeroclaw_runtime::sop::types::{
             Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopTrigger,
         };
