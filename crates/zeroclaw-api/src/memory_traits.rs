@@ -216,6 +216,10 @@ impl StoreOptions {
         self.tenant_id = Some(tenant_id.into());
         self
     }
+
+    pub fn requires_full_options_storage(&self) -> bool {
+        self.kind.is_some() || self.pinned || self.tenant_id.is_some()
+    }
 }
 
 /// Read-side memory store telemetry.
@@ -541,8 +545,10 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 
     /// Store a memory entry with the full additive metadata surface.
     ///
-    /// Default delegates through the existing metadata method and intentionally
-    /// ignores fields that older backends do not yet persist.
+    /// Default delegates through the existing metadata method for namespace and
+    /// importance only. Backends that do not override this must fail explicitly
+    /// when callers pass typed/full metadata, rather than silently discarding
+    /// data needed by later typed-memory readers.
     async fn store_with_options(
         &self,
         key: &str,
@@ -551,6 +557,12 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         session_id: Option<&str>,
         options: StoreOptions,
     ) -> anyhow::Result<()> {
+        if options.requires_full_options_storage() {
+            anyhow::bail!(
+                "memory backend '{}' does not support StoreOptions kind/pinned/tenant_id; use a backend that overrides store_with_options",
+                self.name()
+            );
+        }
         self.store_with_metadata(
             key,
             content,
@@ -558,6 +570,40 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
             session_id,
             options.namespace.as_deref(),
             options.importance,
+        )
+        .await
+    }
+
+    /// Store a memory entry with full metadata and an explicit agent UUID.
+    ///
+    /// The compatibility default preserves agent attribution through the
+    /// established `store_with_agent` path for namespace and importance only.
+    /// Backends that persist the full `StoreOptions` surface override this
+    /// method so wrappers do not have to choose between attribution and typed
+    /// metadata.
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if options.requires_full_options_storage() {
+            anyhow::bail!(
+                "memory backend '{}' does not support agent-attributed StoreOptions kind/pinned/tenant_id; use a backend that overrides store_with_options_and_agent",
+                self.name()
+            );
+        }
+        self.store_with_agent(
+            key,
+            content,
+            category,
+            session_id,
+            options.namespace.as_deref(),
+            options.importance,
+            agent_id,
         )
         .await
     }
@@ -763,5 +809,143 @@ mod tests {
         );
         assert!(parsed.pinned);
         assert_eq!(parsed.tenant_id.as_deref(), Some("tenant-1"));
+    }
+
+    struct LegacyOptionsMemory;
+
+    impl crate::attribution::Attributable for LegacyOptionsMemory {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Memory(crate::attribution::MemoryKind::InMemory)
+        }
+
+        fn alias(&self) -> &str {
+            "legacy-options"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for LegacyOptionsMemory {
+        fn name(&self) -> &str {
+            "legacy-options"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn compatibility_defaults_reject_full_store_options() {
+        let memory = LegacyOptionsMemory;
+        memory
+            .store_with_options(
+                "metadata-only",
+                "metadata only",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default()
+                    .with_namespace("ops")
+                    .with_importance(0.7),
+            )
+            .await
+            .expect("namespace/importance compatibility path remains supported");
+
+        let err = memory
+            .store_with_options(
+                "typed",
+                "typed",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_kind(MemoryKind::Semantic(SemanticSubtype::Decision)),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not support StoreOptions"));
+
+        let err = memory
+            .store_with_options_and_agent(
+                "typed-agent",
+                "typed agent",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_kind(MemoryKind::Semantic(SemanticSubtype::Decision)),
+                Some("agent-uuid"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support agent-attributed StoreOptions")
+        );
     }
 }

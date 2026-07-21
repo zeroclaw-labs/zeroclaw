@@ -5880,6 +5880,31 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_for_native_round_trips_tool_call_extra_content() {
+        let extra_content = serde_json::json!({
+            "google": {
+                "thought_signature": "sig_1"
+            }
+        });
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}",
+                "extra_content": extra_content.clone()
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+
+        assert_eq!(tool_calls[0].extra_content.as_ref(), Some(&extra_content));
+    }
+
+    #[test]
     fn groq_outbound_omits_reasoning_replay_but_default_preserves_it() {
         let history_json = serde_json::json!({
             "content": "I will check",
