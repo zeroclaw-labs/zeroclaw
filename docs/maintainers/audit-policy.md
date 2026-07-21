@@ -111,12 +111,16 @@ bump):
 - **`instant` (`RUSTSEC-2024-0384`)**: informational-only unmaintained
   advisory. Same drift; tracking #8519.
 
-Resolved (no longer in `Cargo.lock` at all — safe to drop from both
-files, or already dropped):
+Resolved (safe to drop from both files — either the crate is gone
+from `Cargo.lock` entirely, or every locked version is patched /
+unaffected by the advisory):
 
-- **`rand` (`RUSTSEC-2026-0097`)**: re-entrancy unsoundness; the
-  0.8.x copy affected by this advisory is no longer resolved by any
-  workspace crate.
+- **`rand` (`RUSTSEC-2026-0097`)**: re-entrancy unsoundness in a
+  custom global logger. `Cargo.lock` still resolves `rand` 0.8.6,
+  0.9.4, and 0.10.1 — the crate is not absent — but the
+  [advisory](https://rustsec.org/advisories/RUSTSEC-2026-0097.html)
+  marks all three of those versions as patched, so no locked copy is
+  affected and the ignore is no longer needed.
 
 **Process for this category:**
 
@@ -129,10 +133,12 @@ files, or already dropped):
   graph no longer needs it — that is a graph fact, not a lockfile fact,
   and it can change on the next dependency bump or feature change
   without the crate leaving `Cargo.lock`. It only drops out of
-  `audit.toml` once the crate is gone from `Cargo.lock` entirely.
-  Removing an audit-only entry while the crate is still resolvable
-  reintroduces the CI failure this doc exists to prevent — always
-  check `Cargo.lock` directly, not just `cargo deny`'s last result.
+  `audit.toml` once the crate is either gone from `Cargo.lock`
+  entirely or every locked version of it is patched/unaffected per the
+  advisory. Removing an audit-only entry while a still-affected
+  version remains resolvable reintroduces the CI failure this doc
+  exists to prevent — always check `Cargo.lock` and the advisory's
+  patched-version range directly, not just `cargo deny`'s last result.
 
 ---
 
@@ -143,8 +149,10 @@ files, or already dropped):
   macro/font helpers, `bincode`, and `instant` are no longer needed in
   `deny.toml` (removed from the resolved dependency graph) but remain
   audit-only ignores in `.cargo/audit.toml` until they're gone from
-  `Cargo.lock`. `rand` is fully resolved and removed from both files.
-  Remaining deny+audit live ignore: `rustls-pemfile`. Remaining
+  `Cargo.lock`. `rand` is removed from both files because every
+  locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
+  not because the crate left `Cargo.lock`. Remaining deny+audit live
+  ignore: `rustls-pemfile`. Remaining
   audit-only ignores: `rustls-webpki` (4) plus the 20 lockfile-stale
   entries above.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
@@ -178,6 +186,14 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-07-21: Corrected the `rand` rationale: `Cargo.lock` still
+  resolves `rand` 0.8.6, 0.9.4, and 0.10.1, so the crate was never
+  absent from the lockfile. The ignore is removed from both files
+  because `RUSTSEC-2026-0097` marks all three locked versions as
+  patched, not because `rand` disappeared. Reworded the "Resolved"
+  category and its process bullet to state the actual removal
+  criterion: crate absent from `Cargo.lock`, *or* every locked version
+  patched/unaffected per the advisory.
 - 2026-07-19: Corrected the 07-06 pass, which removed 20 entries from
   `.cargo/audit.toml` (`unic-*`, `proc-macro-error2`, `derivative`,
   `instant`, `bincode`, `glib`, all 10 GTK3 stack entries) that were
@@ -186,13 +202,15 @@ two tools have drifted again. Open or update the tracking issue.
   `deny.toml`, where `cargo deny`'s resolved graph still doesn't need
   them even after the `zeroclaw-desktop` (Tauri) reintroduction in PR
   #8565 (`cargo deny check advisories`/`bans` verified clean). `rand`
-  (`RUSTSEC-2026-0097`) is confirmed fully out of `Cargo.lock` and
-  stays removed from both files.
+  (`RUSTSEC-2026-0097`) stays removed from both files: it is still
+  resolved in `Cargo.lock` (0.8.6, 0.9.4, 0.10.1), but the advisory
+  marks all three of those versions as patched, so no ignore is
+  needed.
 - 2026-07-06: Removed advisory ignores from `deny.toml` for crates no
   longer in `cargo deny`'s resolved dependency graph: `unic-*`
   (5 entries), `proc-macro-error2`, `derivative`, `instant`, `bincode`,
-  `glib`, all GTK3 stack entries, `rand` (0.8.x no longer resolved),
-  and the `rustls-webpki` entries (0.102.x no longer in resolved
+  `glib`, all GTK3 stack entries, `rand` (all locked versions patched
+  per the advisory), and the `rustls-webpki` entries (0.102.x no longer in resolved
   graph). Remaining deny+audit ignore: `rustls-pemfile` (1). Remaining
   audit-only ignores: `rustls-webpki` (4 entries; in `Cargo.lock` but
   not in resolved dep graph). Closes the Security CI gate failure from
