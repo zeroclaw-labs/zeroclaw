@@ -1,0 +1,14 @@
+{
+  "model_name": "regression-gh8722-generated-filename-not-redacted",
+  "turns": [
+    { "user_input": "Echo the generated report filename back to me.", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": { "message": "report_9f8b2c1a.pdf" } }], "input_tokens": 26, "output_tokens": 13 } },
+      { "response": { "type": "text", "content": "The generated file is report_9f8b2c1a.pdf.", "input_tokens": 46, "output_tokens": 11 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["report_9f8b2c1a.pdf"],
+    "response_not_contains": ["[REDACTED"],
+    "tools_used": ["echo"]
+  }
+}

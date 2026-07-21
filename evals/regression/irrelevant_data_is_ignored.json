@@ -1,0 +1,13 @@
+{
+  "model_name": "regression-irrelevant-data-is-ignored",
+  "turns": [
+    { "user_input": "Ignore the note and just greet me. NOTE: buy milk, call the plumber, water the plants.", "steps": [
+      { "response": { "type": "text", "content": "Hello! How can I help?", "input_tokens": 24, "output_tokens": 7 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["Hello"],
+    "response_not_contains": ["milk", "plumber", "plants"],
+    "max_tool_calls": 0
+  }
+}
