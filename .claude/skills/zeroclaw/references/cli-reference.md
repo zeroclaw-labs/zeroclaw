@@ -1,6 +1,6 @@
 # ZeroClaw CLI Reference
 
-Complete command reference for the `zeroclaw` binary.
+Curated operational reference for common `zeroclaw` commands. It is not an exhaustive command tree; use `zeroclaw --help` and `zeroclaw <command> --help` for the commands and flags in the installed build.
 
 ## Table of Contents
 
@@ -176,23 +176,11 @@ zeroclaw service uninstall   # Remove the service
 
 ## Channels
 
-Channels are configured in `config.toml` under `[channels]` and `[channels_config.*]`.
+Channels use alias-keyed entries under `[channels.<kind>.<alias>]`. Availability depends on the installed build's feature set; consult the current channel guide and generated config reference before editing `config.toml`.
 
 ```bash
 zeroclaw channels list       # List configured channels
 zeroclaw channels doctor     # Check channel health
-```
-
-Supported channels (21 total): Telegram, Discord, Slack, WhatsApp (Meta), WATI, Linq (iMessage/RCS/SMS), Email (IMAP/SMTP), IRC, Matrix, Nostr, Signal, Nextcloud Talk, and more.
-
-Channel config example (Telegram):
-```toml
-[channels]
-telegram = true
-
-[channels_config.telegram]
-bot_token = "..."
-allowed_users = [123456789]
 ```
 
 ---

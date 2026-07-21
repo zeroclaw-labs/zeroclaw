@@ -1606,13 +1606,16 @@ impl WeChatChannel {
             qr_refresh_count += 1;
             if qr_refresh_count > MAX_QR_REFRESH {
                 let max = MAX_QR_REFRESH.to_string();
-                anyhow::bail!(
-                    "{}",
-                    wechat_cli_string_with_args(
-                        "cli-wechat-qr-expired-giving-up",
-                        &[("max", &max)],
-                    )
+                let reason = wechat_cli_string_with_args(
+                    "cli-wechat-qr-expired-giving-up",
+                    &[("max", &max)],
                 );
+                crate::login_events::LoginEvent::Failed { reason: &reason }.emit(
+                    self.name(),
+                    &self.alias,
+                    "WeChat QR login gave up after repeated expiry",
+                );
+                anyhow::bail!("{reason}");
             }
 
             // Fetch QR code
@@ -1669,6 +1672,17 @@ impl WeChatChannel {
             } else {
                 qrcode_img_url
             };
+            crate::login_events::LoginEvent::Qr {
+                payload: qr_payload,
+                image_url: (!qrcode_img_url.is_empty()).then_some(qrcode_img_url),
+                attempt: Some(qr_refresh_count),
+                max_attempts: Some(MAX_QR_REFRESH),
+            }
+            .emit(
+                self.name(),
+                &self.alias,
+                "WeChat login QR code ready (scan with the WeChat app)",
+            );
             match render_login_qr(qr_payload) {
                 Ok(qr) => println!("{qr}"),
                 Err(err) => {
@@ -1759,6 +1773,11 @@ impl WeChatChannel {
                     "scaned" => {
                         if !scanned_printed {
                             println!("  {}", wechat_cli_string("cli-wechat-scanned-confirm"));
+                            crate::login_events::LoginEvent::Scanned.emit(
+                                self.name(),
+                                &self.alias,
+                                "WeChat QR code scanned — waiting for in-app confirmation",
+                            );
                             scanned_printed = true;
                         }
                     }
@@ -1766,6 +1785,15 @@ impl WeChatChannel {
                         println!(
                             "  {}",
                             wechat_cli_string("cli-wechat-qr-expired-refreshing")
+                        );
+                        crate::login_events::LoginEvent::Expired {
+                            attempt: qr_refresh_count,
+                            max_attempts: MAX_QR_REFRESH,
+                        }
+                        .emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login QR code expired",
                         );
                         break; // Will loop back and get a new QR code
                     }
@@ -1796,6 +1824,11 @@ impl WeChatChannel {
                             .map(String::from);
 
                         println!("  {}", wechat_cli_string("cli-wechat-connected"));
+                        crate::login_events::LoginEvent::Connected.emit(
+                            self.name(),
+                            &self.alias,
+                            "WeChat login confirmed — channel connected",
+                        );
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
