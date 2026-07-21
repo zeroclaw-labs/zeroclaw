@@ -102,6 +102,7 @@ mod tests {
             passed,
             detail: detail.to_string(),
             category: GradeCategory::Response,
+            diagnostic: false,
         }
     }
 
@@ -112,6 +113,8 @@ mod tests {
             record: None,
             grades,
             error: error.map(str::to_string),
+            repeat: None,
+            cluster: None,
         }
     }
 
