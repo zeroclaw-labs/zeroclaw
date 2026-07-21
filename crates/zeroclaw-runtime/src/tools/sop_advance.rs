@@ -153,6 +153,9 @@ impl Tool for SopAdvanceTool {
                 output: output.to_string(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                // Agent-reported advance of the current inline step; the tool
+                // has no resolved alias context of its own.
+                effective_agent: None,
                 tool_calls: Vec::new(),
             };
             let step_result_clone = step_result.clone();

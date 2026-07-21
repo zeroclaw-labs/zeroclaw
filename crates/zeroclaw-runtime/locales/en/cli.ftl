@@ -1055,4 +1055,9 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
-
+sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
+sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
+sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
+sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
+sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
