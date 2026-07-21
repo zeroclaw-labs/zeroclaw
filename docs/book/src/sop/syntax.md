@@ -24,6 +24,78 @@ debugging SOPs: `SOP.md` step bullets, trigger field summaries generated from
 the runtime schema, and `condition` expressions. Before running a generated or
 checked-in SOP, validate it with `zeroclaw sop validate <name>`.
 
+`SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
+`triggers`, and its execution knobs. The concurrency-admission fields govern what
+happens when a trigger arrives while this SOP's execution slots are full:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. |
+| `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
+| `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
+
+`admission_policy` values (`SopAdmissionPolicy`, snake_case):
+
+- `parallel` (default) - admit up to `max_concurrent`; a trigger that cannot admit
+  now is **deferred** (surfaced for backpressure/redelivery on the trigger's
+  transport), never silently dropped. Best for independent work (e.g.
+  PR-approval SOPs).
+- `hold` - serialize: admit only when no run of this SOP is active or parked;
+  other triggers are deferred. For pipelines whose pre-approval steps must not
+  overlap.
+- `coalesce` - collapse a concurrent trigger onto the already-in-flight run (the
+  in-flight run's latest state already covers it).
+- `drop` - legacy fire-and-forget: a trigger that cannot admit is dropped.
+  Explicit opt-in only; never the default.
+
+A deferred trigger's recovery is transport-dependent - there is no in-engine
+durable pending-trigger queue in this version (that is a separate follow-up):
+
+- **AMQP** (`durable_ack = true`, SOP-only dispatch): the delivery is nacked
+  (`requeue = true`) so the broker retries it once there is room.
+- **AMQP combined `sop_and_agent_loop`**: the agent side already consumed the
+  delivery, so a backpressured SOP overflow is logged loudly and ACKed (not
+  redelivered), to avoid double-running the agent side.
+- **MQTT / cron / filesystem / channel-router** (and any other headless source
+  that only logs its dispatch results): no per-message redelivery, so a
+  deferred trigger is dropped after a loud log (the next
+  scheduled/published/observed trigger is the only recovery).
+
+```toml
+[sop]
+name = "deploy-prod"
+description = "Production deploy with approval"
+version = "1.0.0"
+max_concurrent = 1
+admission_policy = "hold"
+max_pending_approvals = 8
+
+[[triggers]]
+type = "manual"
+```
+
+Approval broker groups and policies live in the main ZeroClaw config, not in
+per-SOP `SOP.toml` files. A step can reference a configured policy by name with
+`- policy: prod` in `SOP.md`:
+
+```toml
+[sop.approval.groups.release]
+members = ["http:<paired-token-subject>", "agent:release-bot"]
+
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+escalation_route = "oncall"
+```
+
+`[sop.approval.groups.*]` members are approval identities, not account names.
+Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
+`agent:<alias>`) to grant approval rights on one transport only, or bare
+(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+approval surfaces use the paired-token subject; the current CLI approval path
+(`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
+membership yet.
+
 ## 3. `SOP.md` Step Format
 
 Steps are parsed from the `## Steps` section.
@@ -37,6 +109,7 @@ Steps are parsed from the `## Steps` section.
 2. **Deploy** — Run deployment command.
    - tools: shell
    - requires_confirmation: true
+   - policy: prod
    - input: {"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}
    - output: {"type":"object","required":["digest"],"properties":{"digest":{"type":"string"}}}
    - next: 3
@@ -92,6 +165,35 @@ Parser behavior:
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
+- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
+  that gates this step's approval with required-group membership and quorum. Omit
+  it for an unpoliced gate. A step that names a policy absent from
+  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
+  clearing on a single approval.
+
+### `[sop.approval]` policies and route delivery
+
+A policy may also route its approval out of band to a channel, so an approver can
+act without watching the surface that started the run:
+
+```toml
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+# Delivered when a run PARKS at a gate this policy governs.
+request_route = "discord.ops:123456789012345678"
+# Delivered only if that gate later TIMES OUT (a distinct second route).
+escalation_route = "discord.oncall:987654321098765432"
+```
+
+Both routes are `channel:recipient`: `channel` is a configured channel's map key
+(`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
+channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
+and never blocks or clears the gate - the approval itself still comes back through
+the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
+approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
+(where channels are configured); leave them unset (or empty) to notify only the
+originating surface, which is the default.
 
 ### Step Contract Enforcement
 
@@ -131,6 +233,20 @@ Procedural memory is opt-in. When enabled, `sop_workshop` can create and inspect
 stored SOP proposals, capture completed run context into a candidate procedure,
 and apply an approved proposal to `SOP.toml`/`SOP.md`. Write-back only happens
 through the explicit `apply` action.
+
+### Run Durability
+
+The `[sop]` config also controls whether run state survives a daemon restart:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `persist_runs` | `true` | Persist run state - including runs parked at a HITL approval or a deterministic checkpoint - so they survive a restart. Set `false` for an in-memory-only, non-durable engine. |
+| `run_store_backend` | `"sqlite"` | Durable backend when `persist_runs` is true. `sqlite` writes `runs.db` under the run-state dir. |
+
+`persist_runs = true` is the default so a parked HITL approval is not lost on
+restart (`build_sop_engine` falls back to an in-memory store with a loud log if
+the durable backend cannot open, so this is default-safe); `persist_runs = false`
+is the documented opt-out for an ephemeral engine.
 
 ## 4. Trigger Types
 

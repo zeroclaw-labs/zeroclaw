@@ -4557,6 +4557,7 @@ async fn process_channel_message_body(
                 zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
                 Some(&topic),
                 Some(&msg.content),
+                None,
             )
             .await;
         }

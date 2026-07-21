@@ -4047,6 +4047,16 @@ impl RpcDispatcher {
                 | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
                     return Err(rpc_err(INVALID_PARAMS, reason.clone()));
                 }
+                crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::Coalesced {
+                    existing_run_id, ..
+                } => {
+                    return to_result(SopRunResponse {
+                        run_id: existing_run_id.clone(),
+                    });
+                }
                 crate::sop::dispatch::DispatchResult::NoMatch => {}
             }
         }

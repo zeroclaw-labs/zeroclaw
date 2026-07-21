@@ -11,7 +11,7 @@ See [RFC process](./rfcs.md) for larger changes that need design discussion befo
 For anything larger than a typo fix:
 
 1. **Check the issue tracker.** Someone may already be working on it or have filed a related discussion.
-2. **Read `AGENTS.md`.** The repo's root `AGENTS.md` is the canonical source of convention: risk tiers, PR discipline, anti-patterns, and review standards live there.
+2. **Read `AGENTS.md`.** The repo root contains the compact, always-loaded contract. Use [Coding agent guidelines](./agent-guidelines.md) for detailed risk, stability, source-of-truth, and skill-discovery references.
 3. **Use the [Architecture and contribution map](./architecture-map.md)** for anything that touches architecture, config, security, workflow, governance, CI, release behavior, or AI-assisted contribution policy.
 4. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
 
