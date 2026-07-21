@@ -37,6 +37,7 @@ pub async fn finalize(
     opts: FinalizeOpts,
 ) -> Result<i32> {
     let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
+    let history_suite_dir = history_suite_dir(suite_path);
     print_report(&report, opts.format);
 
     let wrote_auto = write_dumps(
@@ -69,7 +70,7 @@ pub async fn finalize(
             &report,
             HistoryRun {
                 recorded_at: chrono::Utc::now(),
-                suite_dir: suite_path.display().to_string(),
+                suite_dir: history_suite_dir.clone(),
                 suite_kind: kind,
                 mode,
                 provider_ref: provider_ref.to_string(),
@@ -119,7 +120,7 @@ pub async fn finalize(
         &report,
         HistoryRun {
             recorded_at: chrono::Utc::now(),
-            suite_dir: suite_path.display().to_string(),
+            suite_dir: history_suite_dir,
             suite_kind: kind,
             mode,
             provider_ref: provider_ref.to_string(),
@@ -143,6 +144,47 @@ pub async fn finalize(
     }
 
     Ok(report.exit_code(kind, comparison.as_ref()))
+}
+
+/// Retain a useful logical suite reference without embedding an absolute host
+/// workspace path. Relative invocations are preserved unless they traverse a
+/// parent; absolute paths under the current directory become relative, and
+/// other absolute paths fall back to their final component.
+fn history_suite_dir(suite_path: &Path) -> String {
+    let safe_path = if suite_path.is_absolute() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| suite_path.strip_prefix(cwd).ok())
+            .filter(|path| is_safe_logical_suite_path(path))
+    } else if is_safe_logical_suite_path(suite_path) {
+        Some(suite_path)
+    } else {
+        None
+    };
+
+    safe_path
+        .map(|path| path.components().collect::<PathBuf>())
+        .or_else(|| {
+            std::fs::canonicalize(suite_path)
+                .ok()
+                .and_then(|path| path.file_name().map(PathBuf::from))
+        })
+        .or_else(|| suite_path.file_name().map(PathBuf::from))
+        .map_or_else(String::new, |path| path.display().to_string())
+}
+
+fn is_safe_logical_suite_path(path: &Path) -> bool {
+    let mut has_name = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => has_name = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::ParentDir => return false,
+        }
+    }
+    has_name
 }
 
 fn resolved_history_dir(override_dir: Option<&Path>, configured_dir: &str) -> Option<PathBuf> {
@@ -766,6 +808,28 @@ mod tests {
         assert!(written.is_none());
         assert!(!writer_called.get());
         assert!(resolved_history_dir(None, &config.eval.history_dir).is_none());
+    }
+
+    #[test]
+    fn history_suite_dir_omits_absolute_workspace_prefix() {
+        let cwd = std::env::current_dir().expect("test process has a current directory");
+        let inside = cwd.join("evals").join("regression");
+        assert_eq!(
+            history_suite_dir(&inside),
+            Path::new("evals").join("regression").display().to_string()
+        );
+
+        let outside = tempfile::tempdir().expect("outside suite root");
+        let outside_suite = outside.path().join("private-identity").join("capability");
+        assert_eq!(history_suite_dir(&outside_suite), "capability");
+        assert!(!history_suite_dir(&outside_suite).contains("private-identity"));
+
+        let traversing = cwd.join("..").join("private-identity").join("capability");
+        assert_eq!(history_suite_dir(&traversing), "capability");
+        assert!(!history_suite_dir(&traversing).contains("private-identity"));
+
+        assert!(!history_suite_dir(Path::new(".")).is_empty());
+        assert!(!history_suite_dir(Path::new("..")).is_empty());
     }
 
     #[tokio::test]

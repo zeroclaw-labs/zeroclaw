@@ -221,8 +221,11 @@ Each receipt records the UTC time, git SHA and dirty flag when available,
 ZeroClaw version, suite identity and kind, mode, provider reference, pass counts,
 the report's suite-level repeat confidence interval, and transcript-free per-case
 results. Case results include comparability keys, verdict and score, per-check
-booleans, token and duration metrics, repeat statistics, and the baseline
-comparison class when `--baseline` was used.
+booleans under privacy-safe approved check-kind/ordinal identifiers, token and duration
+metrics, repeat statistics, and the baseline comparison class when `--baseline`
+was used. Absolute suite paths are reduced to a process-relative logical path
+when possible, or otherwise to the final suite component, so receipts do not
+retain host workspace paths.
 
 History receipts never contain `final_response`, conversation `history`, grade
 details, provider error payloads, or workspace content. They are designed for
