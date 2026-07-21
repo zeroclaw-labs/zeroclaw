@@ -1,74 +1,16 @@
 #!/usr/bin/env python3
 """Migrate SkillForge-emitted SKILL.toml files to the [forge] table layout.
 
-Background
-----------
-Issue #6128 made the `[skill]` block of `SKILL.toml` strict
-(`#[serde(deny_unknown_fields)]`). The SkillForge integrator
-(`crates/zeroclaw-runtime/src/skillforge/integrate.rs`) used to emit its
-provenance fields — `source`, `owner`, `language`, `license`, `stars`,
-`updated_at` — and the nested sub-tables `[skill.requirements]` /
-`[skill.metadata]` directly inside `[skill]`. After PR #6209 (which closes
-both #6128 and #6210), those fields live under a top-level sibling
-`[forge]` table instead. This script migrates existing on-disk
-SKILL.toml files to the new layout so that operators with
-`auto_integrate = true` are not surprised by silent skill load failures.
+Lifts SkillForge provenance keys (source, owner, language, license, stars,
+updated_at) plus [skill.requirements] / [skill.metadata] out of [skill]
+and into a new top-level [forge] table. Idempotent: files that already
+have a [forge] table are skipped.
 
-What it does
-------------
-For each `SKILL.toml` it finds:
+Usage:
+    python3 scripts/migrate-skill-toml.py /path/to/skills/          # dry-run
+    python3 scripts/migrate-skill-toml.py /path/to/skills/ --apply  # write
 
-  1. Skip files that already contain a top-level `[forge]` table
-     (idempotence: re-running on already-migrated files is a no-op).
-  2. From the `[skill]` block, lift these top-level keys into a new
-     `[forge]` table (preserving order and inline values verbatim):
-
-       source, owner, language, license, stars, updated_at
-
-  3. Rename `[skill.requirements]` → `[forge.requirements]` and
-     `[skill.metadata]` → `[forge.metadata]`, preserving their
-     contents.
-
-  4. Leave `[skill]` keys not in the list above untouched
-     (`name`, `version`, `description`, `author`, `tags`, `prompts`,
-     and any other field declared in `SkillMeta`).
-
-What it does NOT do
--------------------
-- Reformat unrelated whitespace, comments, or table ordering beyond
-  what the migration requires.
-- Migrate hand-authored SKILL.toml files that don't carry SkillForge
-  provenance (those have nothing to move and remain untouched).
-- Touch `SKILL.md` (it doesn't carry the affected schema).
-
-Usage
------
-Dry-run (default) — report what would change but do not write:
-
-    python3 scripts/migrate-skill-toml.py /path/to/skills/
-
-Apply changes in place:
-
-    python3 scripts/migrate-skill-toml.py /path/to/skills/ --apply
-
-Migrate a single file:
-
-    python3 scripts/migrate-skill-toml.py /path/to/skill/SKILL.toml --apply
-
-Exit codes
-----------
-  0 — Success (or dry-run completed). All files either migrated cleanly
-      or were already in the new layout.
-  1 — At least one file could not be parsed / migrated. Per-file
-      errors are printed to stderr.
-  2 — Bad invocation (missing path, etc.).
-
-Dependencies
-------------
-Standard library only (Python 3.8+). No `tomli` / `tomli_w` required.
-The integrator emits a deterministic line-based format, so a textual
-migration is sufficient and avoids depending on a TOML round-trip
-library that would re-format every file.
+Standard-library only. Textual migration; no TOML round-trip.
 """
 from __future__ import annotations
 

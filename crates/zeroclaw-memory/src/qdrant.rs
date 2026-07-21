@@ -12,7 +12,6 @@ use uuid::Uuid;
 use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Qdrant vector database memory backend.
-///
 /// Uses Qdrant's REST API for vector storage and semantic search.
 /// Requires an embedding model_provider for converting text to vectors.
 pub struct QdrantMemory {
@@ -22,7 +21,7 @@ pub struct QdrantMemory {
     collection: String,
     api_key: Option<String>,
     // Behind an `RwLock` so `config/set` can hot-swap the embedder on a
-    // long-lived handle after a provider-profile change (#8359). Reads snapshot
+    // long-lived handle after a provider-profile change Reads snapshot
     // the `Arc` and drop the guard before any `.await`.
     embedder: RwLock<Arc<dyn EmbeddingProvider>>,
     /// Tracks whether collection has been initialized (lazy init for sync factory).
@@ -30,13 +29,6 @@ pub struct QdrantMemory {
 }
 
 impl QdrantMemory {
-    /// Create a new Qdrant memory backend.
-    ///
-    /// # Arguments
-    /// * `url` - Qdrant server URL (e.g., `"http://localhost:6333"`)
-    /// * `collection` - Collection name for storing memories
-    /// * `api_key` - Optional API key for Qdrant Cloud
-    /// * `embedder` - Embedding model_provider for vector conversion
     pub async fn new(
         alias: &str,
         url: &str,
@@ -64,7 +56,6 @@ impl QdrantMemory {
     }
 
     /// Create a Qdrant memory backend with lazy initialization.
-    ///
     /// Collection will be created on first operation. Use this when calling
     /// from a synchronous context (e.g., the memory factory).
     pub fn new_lazy(
@@ -88,7 +79,7 @@ impl QdrantMemory {
         }
     }
 
-    /// Replace the live embedder in place (#8359). Existing `Arc<dyn Memory>`
+    /// Replace the live embedder in place Existing `Arc<dyn Memory>`
     /// holders observe the new embedder on their next embed without the handle
     /// being rebuilt. Shared by the `refresh_embedder` hook and tests.
     pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
@@ -97,7 +88,7 @@ impl QdrantMemory {
 
     /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
     /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
-    /// took effect after a `config/set` provider-profile change (#8359).
+    /// took effect after a `config/set` provider-profile change
     pub fn embedder_dimensions(&self) -> usize {
         self.embedder.read().dimensions()
     }
@@ -134,11 +125,6 @@ impl QdrantMemory {
         req.header("Content-Type", "application/json")
     }
 
-    /// Scroll all points whose payload `agent_id` is on the supplied
-    /// allowlist, optionally filtered by category and session_id.
-    /// Used by `recall_for_agents`'s recent/time-only branch and the
-    /// embedding-empty fallback so the agent_id check happens at the
-    /// query boundary, not after a broader fetch.
     async fn list_for_agents(
         &self,
         allowed_agent_ids: &[&str],
@@ -300,14 +286,6 @@ impl QdrantMemory {
         Ok(())
     }
 
-    /// One-shot, idempotent normalization of `payload.session_id`.
-    ///
-    /// Mirrors the SQLite-backed migration: rewrite rows that were persisted
-    /// before the orchestrator sanitized session keys at the source so the
-    /// new sanitized recall filter still matches them. Iterates the
-    /// collection with a paginated scroll, gathers distinct `session_id`
-    /// values, and issues one `set payload` per (old → new) pair where the
-    /// sanitized form differs from the stored one.
     async fn migrate_session_ids_to_sanitized(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut next_offset: Option<serde_json::Value> = None;
@@ -578,7 +556,7 @@ impl Memory for QdrantMemory {
         // Rebuild from the freshly-resolved settings and swap in place. The
         // Qdrant collection was created for the old vector dimensions; a
         // dimension change still needs a manual reindex/collection rebuild, but
-        // the live handle no longer embeds against a stale endpoint/key (#8359).
+        // the live handle no longer embeds against a stale endpoint/key
         let embedder: Arc<dyn EmbeddingProvider> =
             Arc::from(super::embeddings::create_embedding_provider(
                 model_provider,
@@ -960,11 +938,6 @@ impl Memory for QdrantMemory {
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().to_rfc3339();
 
-        // Attribute un-scoped writes to the synthesized `default`
-        // agent so cross-agent recall's `must agent_id IN (...)` filter
-        // never sees a payload-less point as globally visible. Qdrant
-        // uses alias verbatim as agent_id (no UUID indirection at the
-        // storage layer; see `Memory::ensure_agent_uuid` default impl).
         let resolved_agent_id = agent_id.unwrap_or("default").to_string();
         let payload = MemoryPayload {
             key: key.to_string(),
@@ -975,10 +948,6 @@ impl Memory for QdrantMemory {
             agent_id: Some(resolved_agent_id.clone()),
         };
 
-        // Pre-upsert cleanup must scope to the writing agent so sibling
-        // points under the same key for other agents survive.
-        // Propagate failures so a cleanup error doesn't leave duplicate
-        // (agent_id, key) points after the upsert lands.
         self.delete_points_matching(&[("key", key), ("agent_id", resolved_agent_id.as_str())])
             .await
             .context("qdrant pre-upsert cleanup failed")?;
@@ -1054,13 +1023,6 @@ impl Memory for QdrantMemory {
                 .await;
         }
 
-        // Build a `must` filter that combines the optional session_id
-        // with the agent_id allowlist. The agent_id filter lives in
-        // the search call, not in a post-fetch scroll: legacy points
-        // whose payload lacks `agent_id` are simply not returned (the
-        // V3 store path attributes everything to `default` if no agent
-        // is in scope, so no payload should be agent_id-less after
-        // upgrade).
         let mut must: Vec<serde_json::Value> = Vec::new();
         if let Some(sid) = session_id {
             must.push(serde_json::json!({
@@ -1152,9 +1114,6 @@ impl ::zeroclaw_api::attribution::Attributable for QdrantMemory {
 mod tests {
     use super::*;
 
-    /// Qdrant must also honor `Memory::refresh_embedder` (#8359) — before this
-    /// it inherited the default no-op and kept a stale embedder. Uses the lazy
-    /// constructor so no live Qdrant server is required.
     #[test]
     fn refresh_embedder_swaps_embedder_in_place() {
         let mem = QdrantMemory::new_lazy(

@@ -44,8 +44,6 @@ impl TodoTracker {
         }
     }
 
-    /// Test-only convenience constructor: builds settings from the three
-    /// behavioral flags with default width/max_height.
     #[cfg(test)]
     pub(crate) fn new(location: TodoLocation, enabled: bool, enabled_at_start: bool) -> Self {
         Self::from_settings(TodoTrackerSettings {

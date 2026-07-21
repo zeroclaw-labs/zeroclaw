@@ -7,11 +7,6 @@ pub const GITEA_USER_AGENT: &str = "zeroclaw";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GiteaUser {
-    // Gitea's user payload carries BOTH `login` and `username` (same value);
-    // Forgejo/older builds may send only one. Keep them as separate optional
-    // fields rather than aliasing one onto the other: an `alias` makes serde
-    // treat both keys as the same field and reject a response that has both
-    // with "duplicate field `login`" (real Gitea does exactly that).
     #[serde(default)]
     pub login: String,
     #[serde(default)]

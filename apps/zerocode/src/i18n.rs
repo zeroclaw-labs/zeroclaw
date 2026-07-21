@@ -110,13 +110,6 @@ fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String
     map
 }
 
-/// Disk lookup for a locale's zerocode catalogue. Reads the canonical shared
-/// location written by `zeroclaw locales fetch`:
-/// `<config_dir>/data/ftl/<locale>/zerocode.ftl`, where `<config_dir>` honors
-/// `ZEROCLAW_CONFIG_DIR` and otherwise defaults to `~/.zeroclaw`. This mirrors
-/// the runtime loader's path (zeroclaw-config::ftl_locale_dir) — kept inline
-/// because zerocode carries no `zeroclaw-*` dependency. `ZEROCODE_LOCALE_DIR`
-/// remains an explicit override for testing.
 fn load_ftl_from_disk(locale: &str) -> Option<String> {
     let filename = format!("{locale}/zerocode.ftl");
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -151,12 +144,6 @@ pub(crate) fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".zeroclaw"))
 }
 
-/// Read the persisted locale from the same file the Locale pane writes:
-/// `<config_dir>/zerocode-config.toml` (config_dir honoring `--config-dir`,
-/// then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`). Reading and writing the
-/// exact same path keeps the startup locale in sync with what the pane saved;
-/// the previous candidate list checked `~/.config/zerocode/...` first, which
-/// the writer never touches, so a saved locale was silently ignored.
 fn locale_from_config() -> Option<String> {
     locale_from_config_dir(&config_dir())
 }
@@ -279,6 +266,10 @@ mod tests {
             "zc-zerocode-queue-saved",
             "zc-zerocode-queue-edit-number",
             "zc-zerocode-queue-edit-bool",
+            "zc-zerocode-config-invalid-number",
+            "zc-zerocode-config-positive-required",
+            "zc-zerocode-config-width-order",
+            "zc-zerocode-config-save-mismatch",
             // Help hints
             "zc-zerocode-help-todo-tracker",
             "zc-zerocode-help-message-queue",
@@ -298,6 +289,21 @@ mod tests {
                 "key `{key}` renders as its raw identifier instead of a translation"
             );
         }
+        let save_failed = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-zerocode-config-save-failed",
+            &[("error", "disk unavailable")],
+        )
+        .expect("argument-bearing Config-pane save error key must format");
+        assert!(save_failed.contains("disk unavailable"));
+        assert_ne!(
+            t_args(
+                "zc-zerocode-config-save-failed",
+                &[("error", "disk unavailable")]
+            ),
+            "{zc-zerocode-config-save-failed}"
+        );
     }
 
     #[test]
@@ -313,11 +319,6 @@ mod tests {
         assert_eq!(normalize_locale("fr"), "fr");
     }
 
-    // Regression: the locale read path must match the writer's path. The
-    // Locale pane persists to `<config_dir>/zerocode-config.toml` via
-    // `config::persist_locale`; `locale_from_config_dir` must read that same
-    // file. A prior bug read `~/.config/zerocode/...` first, so a saved
-    // locale was silently ignored on the next launch.
     #[test]
     fn locale_round_trips_through_writer_path() {
         let dir = tempfile::tempdir().unwrap();
