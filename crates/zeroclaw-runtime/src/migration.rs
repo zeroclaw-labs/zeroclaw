@@ -121,7 +121,8 @@ pub async fn migrate_openclaw_memory(
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    zeroclaw_memory::create_memory_for_migration(&config.memory.backend, &config.data_dir)
+    let backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
+    zeroclaw_memory::create_memory_for_migration(&backend, &config.data_dir)
 }
 
 /// Memory handle for the post-import `--reindex` pass, with the configured
@@ -570,7 +571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_reindex_flag_preserves_imported_rows() {
+    async fn migration_reindex_uses_same_dotted_sqlite_backend_as_import() {
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let source_db_dir = source.path().join("memory");
@@ -586,7 +587,8 @@ mod tests {
         )
         .unwrap();
 
-        let config = test_config(target.path());
+        let mut config = test_config(target.path());
+        config.memory.backend = "sqlite.default".to_string();
         migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, true)
             .await
             .unwrap();
