@@ -118,10 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn pkgbuild_features_are_dist_channels() {
+    fn pkgbuild_features_are_lean_dist_channels() {
         let f = spec::resolve_feature_list(&root(), &Selection::Dist)
             .unwrap()
             .join(",");
-        assert!(f.contains("channel-discord") && !f.contains("hardware"));
+        assert!(f.contains("channel-matrix"));
+        assert!(f.contains("whatsapp-web"));
+        assert!(!f.contains("channel-slack"));
     }
 }

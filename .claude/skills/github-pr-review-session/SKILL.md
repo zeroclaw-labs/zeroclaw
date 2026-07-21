@@ -195,7 +195,7 @@ the handoff.
    |---|---|
    | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
    | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
-   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @singlerider; use @JordanTheJet only for hardware, edge-deployment, or project-lead scope → go to step 6 |
+   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @JordanTheJet; add @Audacity88 for runtime/agent/gateway scope → go to step 6 |
    | No scope match + feature, but PR is approved, clean, labels/body are aligned, required checks are green, and the reviewer is preparing merge | Assign the **earliest open milestone** by version order → go to step 5 |
 
    "Earliest open milestone" means the lowest semver among all currently open
@@ -243,9 +243,9 @@ the handoff.
    merge-ready:**
 
    Post a comment on the PR tagging the milestone owners for alignment. Default
-   to @singlerider; use @JordanTheJet only when the unclear
-   placement is primarily about hardware, edge deployments, or project-lead
-   scope. Do this only when the PR is not otherwise ready to merge. If the PR is
+   to @JordanTheJet; add @Audacity88 when the unclear placement is primarily
+   about runtime, agent, or gateway scope. Do this only when the PR is not
+   otherwise ready to merge. If the PR is
    approved, clean, labels/body are aligned, required checks are green, and the
    reviewer is preparing merge, assign the earliest open milestone by version
    order instead, update any tracker if one exists, and continue to the normal
@@ -254,7 +254,7 @@ the handoff.
    Example comment:
    ```bash
    gh pr comment <number> --repo zeroclaw-labs/zeroclaw \
-     --body "@singlerider — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
+     --body "@JordanTheJet — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
    ```
 
    Note this in `tmp/handoff.md` so the next session knows alignment is
@@ -333,7 +333,11 @@ These norms are documented in
 8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
 9. **Never merge.** Never push to contributor branches.
-10. **Never approve over another reviewer's active CHANGES_REQUESTED.**
-   Check the reviews API output before choosing a verdict flag.
+10. **Never approve while another reviewer's substantive concern remains unresolved.**
+   Check the reviews API output and current diff before choosing a verdict flag.
+   A `CHANGES_REQUESTED` state left on an older head is not automatically an
+   unresolved concern. Follow the protocol: verify the concern is resolved,
+   explain that reconciliation in the review body, and remember that your
+   approval does not clear the other review state for merge.
 11. **Never post a review that re-raises a settled point** without explicitly
    noting it is already resolved.

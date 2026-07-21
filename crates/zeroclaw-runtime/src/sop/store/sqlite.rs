@@ -1,18 +1,4 @@
 //! Durable SQLite-backed [`SopRunStore`] (EPIC B).
-//!
-//! WAL-mode SQLite via the workspace `rusqlite` dep (already used by
-//! `zeroclaw-memory`/`zeroclaw-runtime`). One `Arc<Mutex<Connection>>` serializes
-//! access, which makes the CAS-claim admission and revision guards atomic without
-//! explicit transactions. Tables:
-//!
-//! - `sop_runs(run_id PK, revision, terminal, last_progress_at, json)` - upsert-by-revision
-//! - `sop_events(seq PK AUTOINCREMENT, run_id, ts, kind, actor, reason, payload)` - append-only
-//! - `sop_claims(run_id PK, sop_name, lease_expires, json)` - single-winner admission
-//! - `sop_proposals(id PK, status, json)` - procedural-memory namespace
-//!
-//! Selected by `build_run_store()` when `[sop] persist_runs = true` with backend
-//! `"sqlite"`; `build_sop_engine` then injects it and calls `restore_runs()` at
-//! startup. The in-memory backend remains the default when persistence is off.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -79,12 +65,6 @@ fn status_str(s: ProposalStatus) -> &'static str {
     }
 }
 
-/// Revision guard for the durable backend, mirroring the in-memory
-/// `revision_guard`: a strictly-older revision is `StaleRevision`, a divergent
-/// same-revision payload is `RevisionConflict`, and a byte-identical same-revision
-/// retry is accepted. The stored and incoming envelopes are compared as their
-/// serialized JSON. Called while the connection lock is held, so the read + write
-/// it precedes is atomic within the process.
 fn guard_revision(
     run_id: &str,
     stored_rev: u64,
@@ -172,9 +152,10 @@ impl SopRunStore for SqliteRunStore {
     }
 
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
-        let g = self.lock()?;
+        let mut g = self.lock()?;
         let json = serde_json::to_string(terminal)?;
-        let existing: Option<(i64, String)> = g
+        let tx = g.transaction().map_err(sql_err)?;
+        let existing: Option<(i64, String)> = tx
             .query_row(
                 "SELECT revision, json FROM sop_runs WHERE run_id=?1",
                 params![run_id],
@@ -185,7 +166,7 @@ impl SopRunStore for SqliteRunStore {
         if let Some((rev, existing_json)) = existing {
             guard_revision(run_id, rev as u64, &existing_json, terminal.revision, &json)?;
         }
-        g.execute(
+        tx.execute(
             "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
              VALUES (?1, ?2, 1, ?3, ?4)
              ON CONFLICT(run_id) DO UPDATE SET
@@ -201,8 +182,9 @@ impl SopRunStore for SqliteRunStore {
             ],
         )
         .map_err(sql_err)?;
-        g.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id])
+        tx.execute("DELETE FROM sop_claims WHERE run_id=?1", params![run_id])
             .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
@@ -572,11 +554,6 @@ impl SopRunStore for SqliteRunStore {
         }
         if let Some(keep) = policy.keep_secs {
             let cutoff = (Utc::now() - Duration::seconds(keep as i64)).to_rfc3339();
-            // `last_progress_at < cutoff` is false for a NULL timestamp, so a row
-            // with no stamp is never age-evicted. That is safe here: terminal
-            // writes always stamp `last_progress_at` (the engine passes
-            // `now_iso8601()` via `PersistedRun::new`), so terminal rows are never
-            // NULL in practice.
             g.execute(
                 "DELETE FROM sop_events WHERE run_id IN
                    (SELECT run_id FROM sop_runs WHERE terminal=1 AND last_progress_at < ?1)",

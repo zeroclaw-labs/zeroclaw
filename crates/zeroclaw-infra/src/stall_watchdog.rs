@@ -1,12 +1,4 @@
 //! Generic transport stall watchdog for WebSocket-based channels.
-//!
-//! [`StallWatchdog`] detects when a channel transport goes idle beyond a
-//! configurable threshold.  Channels call [`StallWatchdog::touch`] on every
-//! received event; the watchdog fires a caller-supplied callback when the
-//! elapsed silence exceeds `timeout_secs`.
-//!
-//! The timestamp is stored in an [`AtomicU64`] so `touch()` is lock-free and
-//! safe to call from any async context.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,11 +13,6 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// A reusable watchdog that detects stalled (idle) WebSocket transports.
-///
-/// Create one per channel, call [`touch`](Self::touch) on every received
-/// message or event, and [`start`](Self::start) with a callback that triggers
-/// reconnection.
 pub struct StallWatchdog {
     /// Unix timestamp (seconds) of the last received event.
     last_event: Arc<AtomicU64>,
@@ -37,7 +24,6 @@ pub struct StallWatchdog {
 
 impl StallWatchdog {
     /// Create a new watchdog with the given stall threshold.
-    ///
     /// The watchdog is **not** started — call [`start`](Self::start) to begin
     /// monitoring.
     pub fn new(timeout_secs: u64) -> Self {
@@ -49,7 +35,6 @@ impl StallWatchdog {
     }
 
     /// Record that an event was received **right now**.
-    ///
     /// This is lock-free (atomic store) and can be called from any async
     /// context without contention.
     pub fn touch(&self) {
@@ -63,14 +48,6 @@ impl StallWatchdog {
         now_secs().saturating_sub(last) > self.timeout_secs
     }
 
-    /// Start the background polling task.
-    ///
-    /// The task wakes every `timeout_secs / 2` seconds and checks whether the
-    /// transport has stalled.  When a stall is detected `on_stall` is invoked
-    /// (typically to log a warning and break out of the listen loop).
-    ///
-    /// Calling `start` while a task is already running replaces the previous
-    /// task (the old one is aborted).
     pub async fn start(&self, on_stall: impl Fn() + Send + 'static) {
         // Reset timestamp so the freshly-started watchdog doesn't immediately
         // fire.
