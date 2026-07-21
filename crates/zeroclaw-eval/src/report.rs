@@ -26,6 +26,10 @@ pub struct CaseReport {
     pub grades: Vec<GradeResult>,
     /// Set if the run itself errored (e.g. trace exhausted) — counts as a failure.
     pub error: Option<String>,
+    /// Repeated-run statistics when the case ran more than once (live `repeat > 1`).
+    pub repeat: Option<crate::stats::RepeatStats>,
+    /// Optional cluster label from the case, for correlated-family error bars.
+    pub cluster: Option<String>,
 }
 
 impl CaseReport {
@@ -162,6 +166,36 @@ impl SuiteReport {
         s
     }
 
+    /// Suite pass-rate error bar for repeated (live) runs: `pass rate p̄ ±1.96·SEM
+    /// (95% CI)`. Per-case success proportions are collapsed first (one value per
+    /// case), then cluster-averaged, so correlated resamples do not fake precision.
+    /// `None` when no case repeated.
+    pub fn repeat_ci_line(&self) -> Option<String> {
+        let items: Vec<(Option<String>, f64)> = self
+            .cases
+            .iter()
+            .filter_map(|c| {
+                c.repeat
+                    .as_ref()
+                    .map(|r| (c.cluster.clone(), r.proportion()))
+            })
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        let values = crate::stats::cluster_means(&items);
+        let mean = crate::stats::mean(&values);
+        // Student-t multiplier on (n-1) df: the normal z=1.96 understates the
+        // interval for the few-unit suites repeated runs typically produce.
+        let df = values.len().saturating_sub(1);
+        let ci = crate::stats::t95_multiplier(df) * crate::stats::sem(&values);
+        Some(format!(
+            "pass rate {:.0}% +/-{:.0}% (95% CI)",
+            mean * 100.0,
+            ci * 100.0
+        ))
+    }
+
     /// Render a human-readable table. Failing checks are listed beneath their case.
     pub fn render_table(&self) -> String {
         let mut s = String::new();
@@ -196,6 +230,9 @@ impl SuiteReport {
             s.push_str("  \u{2713}\n");
         } else {
             s.push_str(&format!("  ({} failed)\n", self.failed_count()));
+        }
+        if let Some(ci) = self.repeat_ci_line() {
+            s.push_str(&format!("  {ci}\n"));
         }
         s
     }
@@ -240,6 +277,23 @@ impl SuiteReport {
                         map.insert("judge_ref".into(), judge_ref.clone().into());
                     }
                 }
+                if let (Some(r), Some(map)) = (&c.repeat, obj.as_object_mut()) {
+                    map.insert(
+                        "repeat".into(),
+                        serde_json::json!({
+                            "k": r.k,
+                            "passes": r.passes,
+                            "pass_at_k": r.pass_at_k(),
+                            "pass_hat_k": r.pass_hat_k(),
+                            "token_mean": r.token_mean,
+                            "token_stddev": r.token_stddev,
+                            "duration_mean_ms": r.duration_mean,
+                            "duration_stddev_ms": r.duration_stddev,
+                            "check_flips": r.check_flips,
+                            "suspect": r.suspect_note(),
+                        }),
+                    );
+                }
                 obj
             })
             .collect();
@@ -249,6 +303,7 @@ impl SuiteReport {
             "failed": self.failed_count(),
             "total": self.cases.len(),
             "all_passed": self.all_passed(),
+            "repeat_ci": self.repeat_ci_line(),
             "cases": cases,
         });
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
@@ -276,6 +331,8 @@ mod tests {
             record: None,
             grades,
             error: error.map(str::to_string),
+            repeat: None,
+            cluster: None,
         }
     }
 
@@ -537,6 +594,8 @@ mod tests {
                 grade_cat(true, GradeCategory::SideEffect),
             ],
             error: None,
+            repeat: None,
+            cluster: None,
         };
         // score = 3/4 passed.
         assert!((report.score() - 0.75).abs() < f64::EPSILON);
