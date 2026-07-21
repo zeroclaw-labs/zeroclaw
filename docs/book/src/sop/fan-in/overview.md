@@ -17,7 +17,7 @@ Every SOP trigger type, its fields, and its dispatch status, projected directly 
 
 {{#sop-trigger-index}}
 
-Each source has a dedicated guide in the sidebar. Live sources (delivered by a running listener) start runs as events arrive; agent-initiated runs start from inside an agent turn via [`sop_execute`](./manual.md); defined-but-unwired sources validate and match but have no live event source routing into the dispatcher yet.
+Each source has a dedicated guide in the sidebar. Live sources (delivered by a running listener) start runs as events arrive; cron triggers are dispatched by the daemon's periodic SOP maintenance tick; agent-initiated runs start from inside an agent turn via [`sop_execute`](./manual.md); the remaining defined-but-unwired sources (webhook, peripheral, calendar) validate and match but have no live event source routing into the dispatcher yet.
 
 ## Security defaults
 
@@ -37,7 +37,8 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 |---|---|---|
 | SOP never starts from a live source | trigger pattern mismatch or a failing `condition` | Verify the trigger pattern matches the delivered event; check the `condition` against the payload |
 | SOP started but a step did not execute | headless trigger without an active agent loop | Run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
-| Webhook, cron, peripheral, or calendar trigger never fires | event source not wired into the dispatcher | Use a live source ([MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or start the run with [`sop_execute`](./manual.md) |
+| Webhook, peripheral, or calendar trigger never fires | event source not wired into the dispatcher | Use a live source ([MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or start the run with [`sop_execute`](./manual.md) |
+| Cron trigger never fires | maintenance tick not running (no `zeroclaw daemon` or `zeroclaw channel start`; standalone `gateway start` does not run it), `sops_dir` unset, or `maintenance_interval_secs = 0` | Run `zeroclaw daemon` (or `zeroclaw channel start`) with `sop.sops_dir` set and `sop.maintenance_interval_secs` non-zero (default `60`) |
 
 ## See also
 

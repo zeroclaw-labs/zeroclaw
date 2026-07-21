@@ -8,7 +8,12 @@
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
 pub mod allowlist;
+#[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+pub(crate) mod identity_persist;
 pub mod listing;
+pub mod login_events;
+pub mod login_probe;
+pub mod login_relink;
 pub mod orchestrator;
 pub mod paced_channel;
 pub mod util;
