@@ -15,7 +15,7 @@ Composite job with multiple matrix legs:
 - **check**: all features + no-default-features
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh`, plus `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
@@ -218,7 +218,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 
 - Keep `CI Required Gate` deterministic and small. Adding jobs to the gate needs a clear quality argument.
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
-- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned, the same quality gates run locally and in CI.
+- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned. Shared gates must live in `scripts/ci/`; each caller invokes the helper instead of copying its commands. For the standalone firmware protocol gate, the documented local entry point is `./dev/ci.sh firmware-protocol`.
 - Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
 - Run `python3 scripts/ci/release_attestation_contract_test.py` after changing the release attestation, checksum, SBOM, or verification-archive sequence.
 - The `docs-style` gate job runs `bash scripts/ci/docs_quality_gate.sh` (markdown lint + em-dash prose check) and `bash scripts/ci/docs_links_gate.sh` (changed-line link gate). Run both scripts locally before pushing docs changes.
