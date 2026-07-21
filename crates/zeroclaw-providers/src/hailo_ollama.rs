@@ -751,6 +751,48 @@ impl HailoOllamaModelProvider {
             candidates = candidates.split_off(candidates.len() - HAILO_MAX_HISTORY_MESSAGES);
         }
 
+        // `num_ctx` is a local budgeting input for Hailo. Hailo-Ollama does
+        // not understand the native wire option, so reserve the configured
+        // output budget and bound the retained history before serialization.
+        // Four UTF-8 characters per token is an approximate heuristic here;
+        // per-message truncation below remains the final wire-size guard.
+        let history_char_budget = self
+            .tuning
+            .num_ctx
+            .saturating_sub(self.tuning.num_predict.max(0) as u32)
+            .saturating_mul(4) as usize;
+        let original_candidate_count = candidates.len();
+        let mut retained_chars: usize = candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .content
+                    .chars()
+                    .count()
+                    .min(HAILO_MAX_MESSAGE_CHARS)
+            })
+            .sum();
+        while retained_chars > history_char_budget && candidates.len() > 1 {
+            let removed = candidates.remove(0);
+            retained_chars = retained_chars
+                .saturating_sub(removed.content.chars().count().min(HAILO_MAX_MESSAGE_CHARS));
+        }
+        if candidates.len() < original_candidate_count {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "hailo_context_budget_bounded",
+                        "model_provider": self.alias,
+                        "history_messages": original_candidate_count,
+                        "retained_messages": candidates.len(),
+                        "history_char_budget": history_char_budget,
+                    })),
+                "Hailo-Ollama applied local context budget"
+            );
+        }
+
         let first_user = candidates
             .iter()
             .position(|candidate| candidate.kind == MessageKind::User)
@@ -837,10 +879,14 @@ impl HailoOllamaModelProvider {
             stream: false,
             options: Options {
                 temperature: self.tuning.temperature_override.or(temperature),
-                num_ctx: Some(self.tuning.num_ctx),
+                // Hailo-Ollama 0.5.1 does not define or apply num_ctx. The
+                // provider's context budgeting remains local to ZeroClaw; it
+                // must not be represented as an unsupported native option.
+                num_ctx: None,
+                // num_predict is the supported generation-length option.
                 num_predict: Some(self.tuning.num_predict),
             },
-            think: Some(false),
+            think: None,
             tools: None,
         }
     }
@@ -902,7 +948,7 @@ impl HailoOllamaModelProvider {
             );
         }
 
-        serde_json::from_slice(&body).map_err(|error| {
+        let parsed: ApiChatResponse = serde_json::from_slice(&body).map_err(|error| {
             let raw = String::from_utf8_lossy(&body);
             let sanitized = super::sanitize_api_error(&raw);
             ::zeroclaw_log::record!(
@@ -920,7 +966,14 @@ impl HailoOllamaModelProvider {
                 )
             );
             anyhow::Error::msg(format!("Failed to parse Hailo-Ollama response: {error}"))
-        })
+        })?;
+        if parsed.done != Some(true) {
+            anyhow::bail!(
+                "Hailo-Ollama returned an incomplete non-streaming response (done={:?})",
+                parsed.done
+            );
+        }
+        Ok(parsed)
     }
 
     async fn send_request(
@@ -1026,21 +1079,21 @@ impl HailoOllamaModelProvider {
         result
     }
 
-    fn response_text(response: &ApiChatResponse) -> String {
+    fn response_text(response: &ApiChatResponse) -> anyhow::Result<String> {
         let content = Self::strip_think_tags(&response.message.content);
         if !content.trim().is_empty() {
-            return content;
+            return Ok(content);
         }
         if let Some(thinking) = response.message.thinking.as_deref() {
             let thinking = Self::strip_think_tags(thinking);
             if !thinking.trim().is_empty() {
-                return thinking;
+                return Ok(thinking);
             }
         }
-        "Hailo-Ollama returned an empty response. Please try again.".to_string()
+        anyhow::bail!("Hailo-Ollama returned an empty completed response")
     }
 
-    fn response_to_chat_response(response: ApiChatResponse) -> ChatResponse {
+    fn response_to_chat_response(response: ApiChatResponse) -> anyhow::Result<ChatResponse> {
         let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
             Some(TokenUsage {
                 input_tokens: response.prompt_eval_count,
@@ -1050,13 +1103,13 @@ impl HailoOllamaModelProvider {
         } else {
             None
         };
-        let text = Self::response_text(&response);
-        ChatResponse {
+        let text = Self::response_text(&response)?;
+        Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage,
             reasoning_content: None,
-        }
+        })
     }
 
     async fn chat_messages(
@@ -1110,7 +1163,7 @@ impl ModelProvider for HailoOllamaModelProvider {
         }
         messages.push(ChatMessage::user(message));
         let response = self.chat_messages(&messages, model, temperature).await?;
-        Ok(Self::response_text(&response))
+        Self::response_text(&response)
     }
 
     async fn chat_with_history(
@@ -1120,7 +1173,7 @@ impl ModelProvider for HailoOllamaModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let response = self.chat_messages(messages, model, temperature).await?;
-        Ok(Self::response_text(&response))
+        Self::response_text(&response)
     }
 
     async fn chat_with_tools(
@@ -1134,7 +1187,7 @@ impl ModelProvider for HailoOllamaModelProvider {
             anyhow::bail!("Hailo-Ollama does not support native tool calling");
         }
         let response = self.chat_messages(messages, model, temperature).await?;
-        Ok(Self::response_to_chat_response(response))
+        Self::response_to_chat_response(response)
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1147,10 +1200,15 @@ impl ModelProvider for HailoOllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        if request.thinking.is_some() {
+            return Err(anyhow::Error::new(NonRetryableProviderError::new(
+                "Hailo-Ollama does not support call-level thinking",
+            )));
+        }
         let messages =
             self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
         let response = self.chat_messages(&messages, model, temperature).await?;
-        Ok(Self::response_to_chat_response(response))
+        Self::response_to_chat_response(response)
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {

@@ -16,7 +16,7 @@ use zeroclaw_providers::ModelProviderRuntimeOptions;
 use zeroclaw_providers::factory::FamilyProviderFactory;
 use zeroclaw_providers::hailo_ollama::HailoOllamaModelProvider;
 use zeroclaw_providers::ollama::{OllamaModelProvider, OllamaTuning};
-use zeroclaw_providers::traits::{ChatMessage, ModelProvider};
+use zeroclaw_providers::traits::{ChatMessage, ModelProvider, NonRetryableProviderError};
 
 type Capture = Arc<Mutex<Option<Value>>>;
 type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
@@ -74,6 +74,48 @@ async fn capture_chat_headers(
         "done": true,
         "prompt_eval_count": 7,
         "eval_count": 3
+    }))
+}
+
+async fn incomplete_chat() -> Json<Value> {
+    Json(json!({
+        "message": {"role": "assistant", "content": "partial"},
+        "done": false,
+    }))
+}
+
+async fn missing_done_chat() -> Json<Value> {
+    Json(json!({
+        "message": {"role": "assistant", "content": "missing marker"},
+    }))
+}
+
+async fn reasoning_only_chat() -> Json<Value> {
+    Json(json!({
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "thinking": "usable reasoning fallback",
+        },
+        "done": true,
+    }))
+}
+
+async fn content_and_reasoning_chat() -> Json<Value> {
+    Json(json!({
+        "message": {
+            "role": "assistant",
+            "content": "visible answer",
+            "thinking": "internal reasoning",
+        },
+        "done": true,
+    }))
+}
+
+async fn empty_chat() -> Json<Value> {
+    Json(json!({
+        "message": {"role": "assistant", "content": ""},
+        "done": true,
     }))
 }
 
@@ -183,8 +225,8 @@ async fn native_hailo_normalizes_messages_and_reports_honest_capabilities() {
         .expect("request captured");
     assert_eq!(body["model"], "qwen3:1.7b");
     assert_eq!(body["stream"], false);
-    assert_eq!(body["think"], false);
-    assert_eq!(body["options"]["num_ctx"], 2048);
+    assert!(body.get("think").is_none());
+    assert!(body["options"].get("num_ctx").is_none());
     assert_eq!(body["options"]["num_predict"], 64);
     assert_eq!(body["options"]["temperature"], 0.2);
     assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
@@ -234,6 +276,208 @@ async fn native_hailo_preserves_model_ids_ending_in_cloud() {
         .clone()
         .expect("request captured");
     assert_eq!(body["model"], "local-model:cloud");
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_rejects_call_level_thinking_before_http() {
+    let capture: Capture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_chat))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let provider = hailo_provider(&format!("http://{addr}"));
+    let messages = [ChatMessage::user("hello")];
+    let error = provider
+        .chat(
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 1024,
+                }),
+            },
+            "qwen3:1.7b",
+            Some(0.2),
+        )
+        .await
+        .expect_err("native Hailo must reject call-level thinking before HTTP");
+    assert!(error.downcast_ref::<NonRetryableProviderError>().is_some());
+    let error = error.to_string();
+    assert!(error.contains("thinking"), "unexpected error: {error}");
+    assert!(capture.lock().expect("capture lock").is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_rejects_incomplete_non_streaming_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new().route("/api/chat", post(incomplete_chat));
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let error = hailo_provider(&format!("http://{addr}"))
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect_err("incomplete non-streaming Hailo response must fail")
+        .to_string();
+    assert!(error.contains("done"), "unexpected error: {error}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_rejects_response_without_done_marker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new().route("/api/chat", post(missing_done_chat));
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    hailo_provider(&format!("http://{addr}"))
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect_err("response without done marker must fail");
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_accepts_nonempty_reasoning_when_content_is_empty() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new().route("/api/chat", post(reasoning_only_chat));
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let response = hailo_provider(&format!("http://{addr}"))
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("nonempty reasoning is an intentional usable fallback");
+    assert_eq!(response, "usable reasoning fallback");
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_prefers_content_over_reasoning() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new().route("/api/chat", post(content_and_reasoning_chat));
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let response = hailo_provider(&format!("http://{addr}"))
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("content response succeeds");
+    assert_eq!(response, "visible answer");
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_rejects_empty_completed_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new().route("/api/chat", post(empty_chat));
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let error = hailo_provider(&format!("http://{addr}"))
+        .simple_chat("hello", "qwen3:1.7b", Some(0.2))
+        .await
+        .expect_err("empty completed Hailo response must fail")
+        .to_string();
+    assert!(error.contains("empty"), "unexpected error: {error}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_uses_context_window_for_local_history_budget_only() {
+    let capture: Capture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(capture_chat))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let provider = HailoOllamaModelProvider::new(
+        "small_context",
+        Some(&format!("http://{addr}")),
+        5,
+        5,
+        OllamaTuning {
+            num_ctx: 256,
+            num_predict: 64,
+            temperature_override: None,
+        },
+    )
+    .expect("valid fake Hailo URL");
+    let messages = [
+        ChatMessage::user("old ".repeat(300)),
+        ChatMessage::assistant("old answer ".repeat(300)),
+        ChatMessage::user("middle ".repeat(300)),
+        ChatMessage::assistant("middle answer ".repeat(300)),
+        ChatMessage::user("LATEST_CONTEXT_TAIL"),
+    ];
+    provider
+        .chat_with_history(&messages, "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("bounded local history request succeeds");
+
+    let body = capture
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("request captured");
+    let request_messages = body["messages"].as_array().expect("messages array");
+    assert!(request_messages.len() < messages.len());
+    assert!(
+        request_messages
+            .last()
+            .and_then(|message| message["content"].as_str())
+            .is_some_and(|content| content.contains("LATEST_CONTEXT_TAIL"))
+    );
+    assert!(body["options"].get("num_ctx").is_none());
     server.abort();
 }
 
@@ -867,7 +1111,7 @@ async fn independent_hailo_providers_share_normalized_endpoint_gate() {
 }
 
 #[tokio::test]
-async fn typed_hailo_factory_applies_context_tokens_timeout_and_alias() {
+async fn typed_hailo_factory_keeps_context_tokens_off_the_wire_and_applies_timeout_and_alias() {
     let capture: Capture = Arc::new(Mutex::new(None));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -925,7 +1169,7 @@ async fn typed_hailo_factory_applies_context_tokens_timeout_and_alias() {
         .expect("capture lock")
         .clone()
         .expect("request captured");
-    assert_eq!(body["options"]["num_ctx"], 1024);
+    assert!(body["options"].get("num_ctx").is_none());
     assert_eq!(body["options"]["num_predict"], 96);
 
     server.abort();
