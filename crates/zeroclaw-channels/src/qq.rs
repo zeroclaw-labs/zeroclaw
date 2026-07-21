@@ -861,8 +861,8 @@ impl QQChannel {
     ///
     /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
     /// `send_text_markdown` so the body shape (including the optional
-    /// `msg_id` for passive group replies — see PR #9180 / tracker #7872)
-    /// can be asserted directly in tests.
+    /// `msg_id` for passive group replies) can be asserted directly in
+    /// tests.
     fn build_text_markdown_body(content: &str, in_reply_to: Option<&str>) -> serde_json::Value {
         let mut body = json!({
             "markdown": {
@@ -884,8 +884,8 @@ impl QQChannel {
     ///
     /// Pure function — no I/O, no token fetch, no HTTP. Extracted from
     /// `send_media_message` so the body shape (including the optional
-    /// `msg_id` for passive group replies — see PR #9180 / tracker #7872)
-    /// can be asserted directly in tests.
+    /// `msg_id` for passive group replies) can be asserted directly in
+    /// tests.
     fn build_media_message_body(file_info: &str, in_reply_to: Option<&str>) -> serde_json::Value {
         let mut body = json!({
             "msg_type": 7,
@@ -2223,7 +2223,7 @@ allowed_users = ["user1"]
         assert_eq!(body["media"]["file_info"], file_info);
     }
 
-    // --- Regression coverage for #7872: triggering msg_id propagation ---
+    // --- Regression coverage: triggering msg_id propagation ---
     //
     // The tests above (`test_send_media_body_msg_type_7`,
     // `test_send_body_uses_markdown_msg_type`) construct lookalike JSON
