@@ -1193,6 +1193,21 @@ impl Memory for HindsightMemory {
         Ok(entries)
     }
 
+    async fn list_own_daily_history(&self) -> Result<Vec<MemoryEntry>> {
+        // Private-bank + Daily-scoped candidate lookup for the per-turn Daily
+        // dedup gate. Unlike `list` (which merges the shared/system read tiers),
+        // this reads ONLY the agent's PRIVATE bank and keeps only Daily rows, so
+        // a shared/system Daily row can never suppress a private Daily write and
+        // an unrelated category can never crowd the private duplicate out. The
+        // list endpoint has no server-side category filter, so the Daily filter
+        // is applied locally on the decoded category.
+        let entries = self.list_bank(&self.bank).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.category == MemoryCategory::Daily)
+            .collect())
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         // Hindsight has no key-addressed delete: `key` is the memory id the
         // read paths surface (both `id` and `key` on a `MemoryEntry` are set to
@@ -1912,6 +1927,12 @@ mod tests {
         assert_eq!(by_id("v1"), MemoryCategory::Conversation);
         // Untagged rows keep the historical Core fallback.
         assert_eq!(by_id("u1"), MemoryCategory::Core);
+
+        // The whole point of decoding tags: the Daily gate can now find the
+        // Daily candidate instead of every row reading back as Core.
+        let daily = crate::dedup::daily_candidates(hits);
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].id, "d1");
     }
 
     #[tokio::test]
@@ -1934,6 +1955,86 @@ mod tests {
         let items = mem.list(None, None).await.expect("list should succeed");
         assert_eq!(items[0].category, MemoryCategory::Daily);
         assert_eq!(items[1].category, MemoryCategory::Core);
+    }
+
+    /// A HindsightMemory configured with a shared bank, so tests can prove
+    /// `list_own_daily_history` never merges the shared tier the way ordinary
+    /// `list`/`recall` do.
+    fn memory_for_with_shared(base_url: &str, bank: &str, shared_bank: &str) -> HindsightMemory {
+        HindsightMemory {
+            alias: "tester".to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            bank: bank.to_string(),
+            shared_bank: Some(shared_bank.to_string()),
+            system_bank: None,
+            token: "test-token".to_string(),
+            default_top_k: DEFAULT_HINDSIGHT_TOP_K,
+            recall_types: Vec::new(),
+            client: build_client(DEFAULT_HINDSIGHT_TIMEOUT_SECS),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_never_reads_the_shared_bank() {
+        // Regression for the S4 review blocker: a shared/system Daily row must
+        // never suppress a private Daily write. `list_own_daily_history` must
+        // read ONLY the private bank, unlike `list`/`recall` which merge the
+        // shared/system tiers. No mock is mounted for the shared bank's list
+        // endpoint at all, so if the implementation regresses to merging
+        // tiers, this test fails on an unmatched-request panic rather than
+        // silently passing.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-private/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "priv-daily", "text": "private daily row", "tags": ["daily"] }
+                ],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+        // Intentionally NOT mounting a mock for the shared bank's list
+        // endpoint: if `list_own_daily_history` ever queries it, wiremock
+        // returns a 404 and the call fails loudly instead of silently
+        // merging shared rows in.
+
+        let mem = memory_for_with_shared(&server.uri(), "zeroclaw-private", "zeroclaw-shared");
+        let rows = mem
+            .list_own_daily_history()
+            .await
+            .expect("private-only lookup must succeed without touching the shared bank");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "priv-daily");
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_filters_out_non_daily_private_rows() {
+        // Regression for the S4 review blocker: unrelated categories in the
+        // private bank must not crowd out (or masquerade as) the real Daily
+        // candidate set used by the dedup gate.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "core1", "text": "unrelated core fact", "tags": ["core"] },
+                    { "id": "daily1", "text": "daily summary one", "tags": ["daily"] },
+                    { "id": "conv1", "text": "conversation turn", "tags": ["conversation"] },
+                    { "id": "daily2", "text": "daily summary two", "tags": ["daily"] }
+                ],
+                "total": 4
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let rows = mem
+            .list_own_daily_history()
+            .await
+            .expect("list should succeed");
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["daily1", "daily2"], "only Daily rows: {ids:?}");
     }
 
     /// A memory pointed at `base_url` whose client carries a very short
