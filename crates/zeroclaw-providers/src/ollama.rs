@@ -174,62 +174,6 @@ impl OllamaModelProvider {
         }
     }
 
-    fn invalid_hailo_url(reason: &'static str, message: &'static str) -> anyhow::Error {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error_key": "hailo_url_invalid",
-                    "reason": reason,
-                })),
-            "Hailo-Ollama URL validation failed"
-        );
-        anyhow::Error::msg(message)
-    }
-
-    fn normalize_hailo_base_url(raw_url: &str) -> anyhow::Result<String> {
-        let mut url = reqwest::Url::parse(raw_url.trim())
-            .map_err(|_| Self::invalid_hailo_url("parse", "Hailo-Ollama URL is invalid"))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(Self::invalid_hailo_url(
-                "scheme",
-                "Hailo-Ollama URL must use http or https",
-            ));
-        }
-        if url.host_str().is_none() {
-            return Err(Self::invalid_hailo_url(
-                "host",
-                "Hailo-Ollama URL must include a host",
-            ));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(Self::invalid_hailo_url(
-                "credentials",
-                "Hailo-Ollama URL must not contain credentials",
-            ));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(Self::invalid_hailo_url(
-                "query_or_fragment",
-                "Hailo-Ollama URL must not contain a query or fragment",
-            ));
-        }
-
-        let path = url.path().trim_end_matches('/');
-        let base_path = path
-            .strip_suffix("/api/chat")
-            .or_else(|| path.strip_suffix("/api"))
-            .unwrap_or(path)
-            .to_string();
-        url.set_path(if base_path.is_empty() {
-            "/"
-        } else {
-            &base_path
-        });
-        Ok(url.as_str().trim_end_matches('/').to_string())
-    }
-
     pub fn new(alias: &str, base_url: Option<&str>, api_key: Option<&str>) -> Self {
         Self::new_with_reasoning(alias, base_url, api_key, None)
     }
