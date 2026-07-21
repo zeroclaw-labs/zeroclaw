@@ -1,6 +1,8 @@
 //! Grading: non-panicking checks over a [`RunRecord`].
 
-use crate::case::{BudgetExpects, TraceExpects, WorkspaceExpects, validate_workspace_rel_path};
+use crate::case::{
+    BudgetExpects, MemoryExpects, TraceExpects, WorkspaceExpects, validate_workspace_rel_path,
+};
 use crate::record::RunRecord;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +63,7 @@ impl GradeResult {
 /// Context available to graders while the case's workspace still exists.
 pub struct GradeContext<'a> {
     pub workspace: &'a std::path::Path,
+    pub memory: Option<&'a dyn zeroclaw_memory::Memory>,
 }
 
 /// A scorer over a completed run. The trait is async and workspace-aware so
@@ -177,6 +180,178 @@ impl Grader for WorkspaceGrader {
                         format!("cannot read file: {e}"),
                         GradeCategory::SideEffect,
                     )),
+                }
+            }
+        }
+
+        out
+    }
+}
+
+/// Grades end-state memory entries. Every key is validated before the memory
+/// backend is accessed, so a case cannot use grading to escape its namespace.
+pub struct MemoryGrader {
+    pub expects: MemoryExpects,
+}
+
+#[async_trait::async_trait]
+impl Grader for MemoryGrader {
+    fn name(&self) -> &str {
+        "memory"
+    }
+
+    async fn grade(&self, _run: &RunRecord, ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+        let mut out = Vec::new();
+
+        for key in &self.expects.present {
+            let check = format!("memory_present({key:?})");
+            if validate_workspace_rel_path(key).is_err() {
+                out.push(GradeResult::new(
+                    check,
+                    false,
+                    "key escapes workspace",
+                    GradeCategory::SideEffect,
+                ));
+                continue;
+            }
+            let Some(memory) = ctx.memory else {
+                out.push(GradeResult::new(
+                    check,
+                    false,
+                    "no memory backend for this run",
+                    GradeCategory::SideEffect,
+                ));
+                continue;
+            };
+            match memory.get(key).await {
+                Ok(entry) => {
+                    let present = entry.is_some();
+                    out.push(GradeResult::new(
+                        check,
+                        present,
+                        if present { "present" } else { "missing" },
+                        GradeCategory::SideEffect,
+                    ));
+                }
+                Err(error) => out.push(GradeResult::new(
+                    check,
+                    false,
+                    format!("memory backend error: {error}"),
+                    GradeCategory::SideEffect,
+                )),
+            }
+        }
+
+        for key in &self.expects.absent {
+            let check = format!("memory_absent({key:?})");
+            if validate_workspace_rel_path(key).is_err() {
+                out.push(GradeResult::new(
+                    check,
+                    false,
+                    "key escapes workspace",
+                    GradeCategory::SideEffect,
+                ));
+                continue;
+            }
+            let Some(memory) = ctx.memory else {
+                out.push(GradeResult::new(
+                    check,
+                    false,
+                    "no memory backend for this run",
+                    GradeCategory::SideEffect,
+                ));
+                continue;
+            };
+            match memory.get(key).await {
+                Ok(entry) => {
+                    let absent = entry.is_none();
+                    out.push(GradeResult::new(
+                        check,
+                        absent,
+                        if absent {
+                            "absent"
+                        } else {
+                            "unexpectedly present"
+                        },
+                        GradeCategory::SideEffect,
+                    ));
+                }
+                Err(error) => out.push(GradeResult::new(
+                    check,
+                    false,
+                    format!("memory backend error: {error}"),
+                    GradeCategory::SideEffect,
+                )),
+            }
+        }
+
+        for (key, needles) in &self.expects.contains {
+            if validate_workspace_rel_path(key).is_err() {
+                if needles.is_empty() {
+                    out.push(GradeResult::new(
+                        format!("memory_contains({key:?})"),
+                        false,
+                        "key escapes workspace",
+                        GradeCategory::SideEffect,
+                    ));
+                }
+                for needle in needles {
+                    out.push(GradeResult::new(
+                        format!("memory_contains({key:?}, {needle:?})"),
+                        false,
+                        "key escapes workspace",
+                        GradeCategory::SideEffect,
+                    ));
+                }
+                continue;
+            }
+            let Some(memory) = ctx.memory else {
+                for needle in needles {
+                    out.push(GradeResult::new(
+                        format!("memory_contains({key:?}, {needle:?})"),
+                        false,
+                        "no memory backend for this run",
+                        GradeCategory::SideEffect,
+                    ));
+                }
+                continue;
+            };
+            match memory.get(key).await {
+                Ok(entry) => {
+                    for needle in needles {
+                        let check = format!("memory_contains({key:?}, {needle:?})");
+                        match &entry {
+                            Some(entry) => {
+                                let found = entry.content.contains(needle);
+                                out.push(GradeResult::new(
+                                    check,
+                                    found,
+                                    if found {
+                                        "found"
+                                    } else {
+                                        "not found in memory"
+                                    },
+                                    GradeCategory::SideEffect,
+                                ));
+                            }
+                            None => out.push(GradeResult::new(
+                                check,
+                                false,
+                                "memory missing",
+                                GradeCategory::SideEffect,
+                            )),
+                        }
+                    }
+                }
+                Err(error) => {
+                    for needle in needles {
+                        out.push(GradeResult::new(
+                            format!("memory_contains({key:?}, {needle:?})"),
+                            false,
+                            format!("memory backend error: {error}"),
+                            GradeCategory::SideEffect,
+                        ));
+                    }
                 }
             }
         }
@@ -396,14 +571,15 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
 
 /// Build the case's graders and run them while the workspace is alive, returning
 /// every grade concatenated. Always runs [`ExpectationsGrader`], plus a
-/// [`WorkspaceGrader`], [`BudgetGrader`], and [`ResponseJsonGrader`] when the
-/// case declares the matching `expects` fields.
+/// [`WorkspaceGrader`], [`MemoryGrader`], [`BudgetGrader`], and
+/// [`ResponseJsonGrader`] when the case declares the matching `expects` fields.
 pub async fn grade_run(
     trace: &crate::case::LlmTrace,
     record: &RunRecord,
     workspace: &std::path::Path,
+    memory: Option<&dyn zeroclaw_memory::Memory>,
 ) -> Vec<GradeResult> {
-    let ctx = GradeContext { workspace };
+    let ctx = GradeContext { workspace, memory };
     let expects = &trace.expects;
     let mut graders: Vec<Box<dyn Grader>> = vec![Box::new(ExpectationsGrader {
         expects: expects.clone(),
@@ -411,6 +587,11 @@ pub async fn grade_run(
     if let Some(workspace) = &expects.workspace {
         graders.push(Box::new(WorkspaceGrader {
             expects: workspace.clone(),
+        }));
+    }
+    if let Some(memory) = &expects.memory {
+        graders.push(Box::new(MemoryGrader {
+            expects: memory.clone(),
         }));
     }
     if let Some(budget) = &expects.budget {
@@ -435,6 +616,100 @@ mod tests {
     use super::*;
     use crate::case::TraceExpects;
     use crate::record::RunRecord;
+    use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry, SqliteMemory};
+
+    struct PanicGetMemory;
+
+    impl zeroclaw_api::attribution::Attributable for PanicGetMemory {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::InMemory)
+        }
+
+        fn alias(&self) -> &str {
+            "panic-get"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for PanicGetMemory {
+        fn name(&self) -> &str {
+            "panic-get"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            panic!("invalid key reached memory backend: {key}")
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
 
     #[tokio::test]
     async fn grades_run_while_workspace_alive() {
@@ -462,7 +737,13 @@ mod tests {
         let path = tmp.path().to_path_buf();
         let record = run("hi", &[], true);
         let grades = Probe
-            .grade(&record, &GradeContext { workspace: &path })
+            .grade(
+                &record,
+                &GradeContext {
+                    workspace: &path,
+                    memory: None,
+                },
+            )
             .await;
         assert!(grades[0].passed, "workspace must exist during grading");
 
@@ -470,7 +751,13 @@ mod tests {
         // so the assertion above is not vacuously true.
         drop(tmp);
         let after = Probe
-            .grade(&record, &GradeContext { workspace: &path })
+            .grade(
+                &record,
+                &GradeContext {
+                    workspace: &path,
+                    memory: None,
+                },
+            )
             .await;
         assert!(
             !after[0].passed,
@@ -599,6 +886,7 @@ mod tests {
     fn dummy_ctx() -> GradeContext<'static> {
         GradeContext {
             workspace: std::path::Path::new("."),
+            memory: None,
         }
     }
 
@@ -619,6 +907,7 @@ mod tests {
                 &run("", &[], true),
                 &GradeContext {
                     workspace: tmp.path(),
+                    memory: None,
                 },
             )
             .await;
@@ -646,12 +935,135 @@ mod tests {
                 &run("", &[], true),
                 &GradeContext {
                     workspace: tmp.path(),
+                    memory: None,
                 },
             )
             .await;
         assert_eq!(grades.len(), 3);
         assert!(grades.iter().all(|g| !g.passed));
         assert!(grades.iter().all(|g| g.detail == "path escapes workspace"));
+    }
+
+    #[tokio::test]
+    async fn memory_grader_checks_present_absent_and_contains_with_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = SqliteMemory::new("grader-test", tmp.path()).unwrap();
+        memory
+            .store(
+                "project/role",
+                "zeroclaw_operator",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let expects = MemoryExpects {
+            present: vec!["project/role".into(), "missing".into()],
+            absent: vec!["missing".into(), "project/role".into()],
+            contains: BTreeMap::from([
+                (
+                    "project/role".into(),
+                    vec!["zeroclaw".into(), "missing_marker".into()],
+                ),
+                ("missing".into(), vec!["anything".into()]),
+            ]),
+        };
+        let grades = MemoryGrader { expects }
+            .grade(
+                &run("", &[], true),
+                &GradeContext {
+                    workspace: tmp.path(),
+                    memory: Some(&memory),
+                },
+            )
+            .await;
+
+        assert!(find(&grades, r#"memory_present("project/role")"#).passed);
+        assert!(!find(&grades, r#"memory_present("missing")"#).passed);
+        assert!(find(&grades, r#"memory_absent("missing")"#).passed);
+        assert!(!find(&grades, r#"memory_absent("project/role")"#).passed);
+        assert!(find(&grades, r#"memory_contains("project/role", "zeroclaw")"#).passed);
+        assert!(
+            !find(
+                &grades,
+                r#"memory_contains("project/role", "missing_marker")"#
+            )
+            .passed
+        );
+        assert!(!find(&grades, r#"memory_contains("missing", "anything")"#).passed);
+        assert_eq!(grades.len(), 7);
+        assert!(
+            grades
+                .iter()
+                .all(|grade| grade.category == GradeCategory::SideEffect)
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_grader_rejects_invalid_keys_before_backend_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let memory = PanicGetMemory;
+        let expects = MemoryExpects {
+            present: vec!["../escape".into()],
+            absent: vec!["/absolute".into()],
+            contains: BTreeMap::from([
+                ("nested/../../escape".into(), vec!["x".into()]),
+                ("../empty".into(), Vec::new()),
+            ]),
+        };
+        let grades = MemoryGrader { expects }
+            .grade(
+                &run("", &[], true),
+                &GradeContext {
+                    workspace: tmp.path(),
+                    memory: Some(&memory),
+                },
+            )
+            .await;
+
+        assert_eq!(grades.len(), 4);
+        assert!(grades.iter().all(|grade| !grade.passed));
+        assert!(
+            grades
+                .iter()
+                .all(|grade| grade.detail == "key escapes workspace")
+        );
+        assert_eq!(grades[0].check, r#"memory_present("../escape")"#);
+        assert_eq!(grades[1].check, r#"memory_absent("/absolute")"#);
+        assert_eq!(
+            find(&grades, r#"memory_contains("nested/../../escape", "x")"#).detail,
+            "key escapes workspace"
+        );
+        assert_eq!(
+            find(&grades, r#"memory_contains("../empty")"#).detail,
+            "key escapes workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_grader_without_backend_fails_every_declared_check() {
+        let expects = MemoryExpects {
+            present: vec!["present".into()],
+            absent: vec!["absent".into()],
+            contains: BTreeMap::from([("contains".into(), vec!["needle".into()])]),
+        };
+        let grades = MemoryGrader { expects }
+            .grade(&run("", &[], true), &dummy_ctx())
+            .await;
+
+        assert_eq!(grades.len(), 3);
+        assert!(grades.iter().all(|grade| !grade.passed));
+        assert!(
+            grades
+                .iter()
+                .all(|grade| grade.detail == "no memory backend for this run")
+        );
+        assert!(
+            grades
+                .iter()
+                .all(|grade| grade.category == GradeCategory::SideEffect)
+        );
     }
 
     #[tokio::test]

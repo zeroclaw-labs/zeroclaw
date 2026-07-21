@@ -5,11 +5,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig, RiskProfileConfig};
-use zeroclaw_memory::{Memory, create_memory};
+use zeroclaw_memory::{Memory, MemoryCategory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
 use zeroclaw_runtime::approval::ApprovalManager;
 
@@ -56,18 +57,53 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
     Ok(())
 }
 
+/// Seed a case's declared memory entries after validating every key against the
+/// same safe relative-path contract used by workspace fixtures and graders.
+async fn seed_setup_memory(memory: &dyn Memory, setup: &CaseSetup) -> anyhow::Result<()> {
+    for (key, content) in &setup.memory {
+        validate_workspace_rel_path(key)
+            .with_context(|| format!("validating setup memory key {key:?}"))?;
+        memory
+            .store(key, content, MemoryCategory::Core, None)
+            .await
+            .with_context(|| format!("seeding setup memory key {key:?}"))?;
+    }
+    Ok(())
+}
+
 /// Build the live tool registry. With no allowlisted tools, use the Phase 0 echo
 /// registry (a harmless deterministic tool). With an allowlist, use the runtime
-/// default tools filtered to the allowlist by name — the registry filter is the
-/// primary guard; the builder allowlist (set by the caller) is defense in depth.
-fn live_tool_registry(effective: &[String], policy: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
+/// default and memory tools filtered to the allowlist by name — the registry
+/// filter is the primary guard; the builder allowlist (set by the caller) is
+/// defense in depth.
+fn live_tool_registry(
+    effective: &[String],
+    policy: Arc<SecurityPolicy>,
+    memory: Arc<dyn Memory>,
+) -> Vec<Box<dyn Tool>> {
     if effective.is_empty() {
         crate::tools::default_tools()
     } else {
-        let mut tools = zeroclaw_runtime::tools::default_tools(policy);
+        let mut tools = zeroclaw_runtime::tools::default_tools(policy.clone());
+        tools.extend(zeroclaw_runtime::tools::memory_tools(memory, policy));
         tools.retain(|t| effective.iter().any(|name| name == t.name()));
         tools
     }
+}
+
+fn case_memory_config(uses_memory: bool) -> MemoryConfig {
+    let mut config = MemoryConfig {
+        backend: if uses_memory { "sqlite" } else { "none" }.into(),
+        ..MemoryConfig::default()
+    };
+    if uses_memory {
+        // Eval setup is the sole source of initial memory state. Production
+        // startup hydration and hygiene must not reinterpret workspace fixtures
+        // as a second memory-seeding surface.
+        config.auto_hydrate = false;
+        config.hygiene_enabled = false;
+    }
+    config
 }
 
 /// Drive one live case: build a sandboxed agent, run each turn under a wall-clock
@@ -104,7 +140,18 @@ pub async fn run_live_case(
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
-    let tools = live_tool_registry(&effective, policy.clone());
+    let uses_memory = trace.declares_memory()
+        || effective
+            .iter()
+            .any(|name| zeroclaw_runtime::tools::MEMORY_TOOL_NAMES.contains(&name.as_str()));
+    let mem_cfg = case_memory_config(uses_memory);
+    let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
+
+    if let Some(setup) = &trace.setup {
+        seed_setup_memory(memory.as_ref(), setup).await?;
+    }
+
+    let tools = live_tool_registry(&effective, policy.clone(), memory.clone());
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
@@ -113,12 +160,6 @@ pub async fn run_live_case(
     } else {
         Some(effective.clone())
     };
-
-    let mem_cfg = MemoryConfig {
-        backend: "none".into(),
-        ..MemoryConfig::default()
-    };
-    let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
     let provider = (deps.provider)(trace)?;
@@ -130,7 +171,7 @@ pub async fn run_live_case(
     let mut agent = Agent::builder()
         .model_provider(provider)
         .tools(tools)
-        .memory(memory)
+        .memory(memory.clone())
         .observer(observer.clone())
         .tool_dispatcher(dispatcher)
         .workspace_dir(tmp.path().to_path_buf())
@@ -167,7 +208,7 @@ pub async fn run_live_case(
         llm_calls: observer.llm_calls(),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
-    let grades = crate::grader::grade_run(trace, &record, tmp.path()).await;
+    let grades = crate::grader::grade_run(trace, &record, tmp.path(), Some(memory.as_ref())).await;
     Ok(crate::runner::CaseOutcome { record, grades })
 }
 
@@ -178,10 +219,11 @@ mod tests {
     use crate::replay::TraceLlmProvider;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
-        ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities,
+        ChatRequest, ChatResponse, ConversationMessage, ModelProvider, ProviderCapabilities,
     };
 
     /// Build a `RunDeps` for the live path with an injected provider factory.
@@ -216,9 +258,24 @@ mod tests {
     #[test]
     fn empty_allowlist_yields_echo_only_registry() {
         let policy = Arc::new(SecurityPolicy::default());
-        let registry = live_tool_registry(&[], policy);
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+        let registry = live_tool_registry(&[], policy, memory);
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name(), "echo");
+    }
+
+    #[test]
+    fn memory_config_preserves_non_memory_defaults_and_closes_seed_imports() {
+        let defaults = MemoryConfig::default();
+        let non_memory = case_memory_config(false);
+        assert_eq!(non_memory.backend, "none");
+        assert_eq!(non_memory.auto_hydrate, defaults.auto_hydrate);
+        assert_eq!(non_memory.hygiene_enabled, defaults.hygiene_enabled);
+
+        let memory = case_memory_config(true);
+        assert_eq!(memory.backend, "sqlite");
+        assert!(!memory.auto_hydrate);
+        assert!(!memory.hygiene_enabled);
     }
 
     #[test]
@@ -230,7 +287,8 @@ mod tests {
             write_setup_files(
                 tmp.path(),
                 &CaseSetup {
-                    workspace_files: abs
+                    workspace_files: abs,
+                    ..Default::default()
                 }
             )
             .is_err()
@@ -242,7 +300,8 @@ mod tests {
             write_setup_files(
                 tmp.path(),
                 &CaseSetup {
-                    workspace_files: parent
+                    workspace_files: parent,
+                    ..Default::default()
                 }
             )
             .is_err()
@@ -258,11 +317,372 @@ mod tests {
             tmp.path(),
             &CaseSetup {
                 workspace_files: files,
+                ..Default::default()
             },
         )
         .unwrap();
         let written = std::fs::read_to_string(tmp.path().join("sub/dir/file.txt")).unwrap();
         assert_eq!(written, "hello");
+    }
+
+    #[tokio::test]
+    async fn live_seeded_memory_is_readable_through_memory_recall() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "seed-recall",
+                "turns": [{ "user_input": "Use memory_recall to retrieve the project role." }],
+                "tools": ["memory_recall"],
+                "setup": { "memory": { "project/role": "zeroclaw_operator" } },
+                "expects": {
+                    "tools_used": ["memory_recall"],
+                    "all_tools_succeeded": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "tool_calls", "tool_calls": [
+                                { "id": "recall-1", "name": "memory_recall", "arguments": { "query": "zeroclaw_operator" } }
+                            ] } },
+                            { "response": { "type": "text", "content": "done" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            vec!["memory_recall".into()],
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+
+        assert_eq!(outcome.record.tools_called, ["memory_recall"]);
+        assert!(outcome.record.all_tools_succeeded);
+        assert!(outcome.grades.iter().all(|grade| grade.passed));
+        assert!(outcome.record.history.iter().any(|message| {
+            matches!(
+                message,
+                ConversationMessage::ToolResults(results)
+                    if results.iter().any(|result| result.content.contains("zeroclaw_operator"))
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn live_memory_store_satisfies_present_expectation() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "store-memory",
+                "turns": [{ "user_input": "Store the project timezone." }],
+                "tools": ["memory_store"],
+                "expects": {
+                    "tools_used": ["memory_store"],
+                    "all_tools_succeeded": true,
+                    "memory": { "present": ["profile/timezone"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "tool_calls", "tool_calls": [
+                                {
+                                    "id": "store-1",
+                                    "name": "memory_store",
+                                    "arguments": {
+                                        "key": "profile/timezone",
+                                        "content": "America/Los_Angeles"
+                                    }
+                                }
+                            ] } },
+                            { "response": { "type": "text", "content": "stored" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            vec!["memory_store".into()],
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+
+        assert!(outcome.record.all_tools_succeeded);
+        let memory_grade = outcome
+            .grades
+            .iter()
+            .find(|grade| grade.check == r#"memory_present("profile/timezone")"#)
+            .expect("memory grade must be registered");
+        assert!(memory_grade.passed, "memory grade: {memory_grade:?}");
+        assert_eq!(
+            memory_grade.category,
+            crate::grader::GradeCategory::SideEffect
+        );
+    }
+
+    #[tokio::test]
+    async fn live_tool_only_memory_backends_are_effective_and_case_isolated() {
+        let first_trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "tool-only-first",
+                "turns": [{ "user_input": "Store and retrieve the case canary." }],
+                "tools": ["memory_store", "memory_recall"]
+            }"#,
+        )
+        .unwrap();
+        let first_deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "tool_calls", "tool_calls": [
+                                {
+                                    "id": "store-canary",
+                                    "name": "memory_store",
+                                    "arguments": {
+                                        "key": "case/canary",
+                                        "content": "zeroclaw_case_one_canary"
+                                    }
+                                }
+                            ] } },
+                            { "response": { "type": "tool_calls", "tool_calls": [
+                                {
+                                    "id": "recall-canary",
+                                    "name": "memory_recall",
+                                    "arguments": { "query": "zeroclaw_case_one_canary" }
+                                }
+                            ] } },
+                            { "response": { "type": "text", "content": "done" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            vec!["memory_store".into(), "memory_recall".into()],
+            Duration::from_secs(5),
+        );
+
+        let first = run_live_case(&first_trace, &first_deps).await.unwrap();
+        assert_eq!(first.record.tools_called, ["memory_store", "memory_recall"]);
+        assert!(first.record.all_tools_succeeded);
+        assert!(first.record.history.iter().any(|message| {
+            matches!(
+                message,
+                ConversationMessage::ToolResults(results)
+                    if results
+                        .iter()
+                        .any(|result| result.content.contains("zeroclaw_case_one_canary"))
+            )
+        }));
+
+        let second_trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "tool-only-second",
+                "turns": [{ "user_input": "Retrieve the prior case canary." }],
+                "tools": ["memory_recall"]
+            }"#,
+        )
+        .unwrap();
+        let second_deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "tool_calls", "tool_calls": [
+                                {
+                                    "id": "recall-canary",
+                                    "name": "memory_recall",
+                                    "arguments": { "query": "zeroclaw_case_one_canary" }
+                                }
+                            ] } },
+                            { "response": { "type": "text", "content": "done" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            vec!["memory_recall".into()],
+            Duration::from_secs(5),
+        );
+
+        let second = run_live_case(&second_trace, &second_deps).await.unwrap();
+        assert_eq!(second.record.tools_called, ["memory_recall"]);
+        assert!(second.record.all_tools_succeeded);
+        assert!(
+            second
+                .record
+                .history
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::ToolResults(_)))
+        );
+        assert!(second.record.history.iter().all(|message| {
+            !matches!(
+                message,
+                ConversationMessage::ToolResults(results)
+                    if results
+                        .iter()
+                        .any(|result| result.content.contains("zeroclaw_case_one_canary"))
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn live_memory_tools_are_unavailable_when_not_allowlisted() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "blocked-memory-tool",
+                "turns": [{ "user_input": "Try storing memory." }],
+                "tools": ["memory_store"]
+            }"#,
+        )
+        .unwrap();
+        let effective = effective_live_tools(trace.tools.as_deref(), &[]);
+        let policy = Arc::new(SecurityPolicy::default());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+        let registry = live_tool_registry(&effective, policy, memory);
+        assert!(
+            registry
+                .iter()
+                .all(|tool| !zeroclaw_runtime::tools::MEMORY_TOOL_NAMES.contains(&tool.name()))
+        );
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "tool_calls", "tool_calls": [
+                                {
+                                    "id": "store-1",
+                                    "name": "memory_store",
+                                    "arguments": { "key": "blocked", "content": "nope" }
+                                }
+                            ] } },
+                            { "response": { "type": "text", "content": "done" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+
+        assert!(outcome.record.tools_called.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_memory_case_roots_are_isolated() {
+        let canary = tempfile::tempdir().unwrap();
+        let first_case = canary.path().join("case-one");
+        std::fs::create_dir_all(&first_case).unwrap();
+        let config = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let first_memory = create_memory(&config, &first_case, None).unwrap();
+        first_memory
+            .store("case/one", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(first_case.join("memory/brain.db").is_file());
+        assert!(!canary.path().join("memory/brain.db").exists());
+        assert_eq!(first_memory.count().await.unwrap(), 1);
+        drop(first_memory);
+
+        let second_case = canary.path().join("case-two");
+        std::fs::create_dir_all(&second_case).unwrap();
+        let second_memory = create_memory(&config, &second_case, None).unwrap();
+
+        assert!(second_case.join("memory/brain.db").is_file());
+        assert_eq!(second_memory.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_memory_seed_fails_before_provider_invocation() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "invalid-seed",
+                "turns": [{ "user_input": "must not run" }],
+                "setup": { "memory": { "../escape": "blocked" } }
+            }"#,
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let calls = provider_calls.clone();
+        let deps = live_deps(
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "text", "content": "unexpected" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let error = run_live_case(&trace, &deps).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("validating setup memory key"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_snapshot_cannot_hydrate_eval_memory() {
+        let trace: LlmTrace = serde_json::from_str(
+            r####"{
+                "model_name": "snapshot-is-not-a-seed",
+                "turns": [{ "user_input": "Return the scripted response." }],
+                "setup": {
+                    "workspace_files": {
+                        "MEMORY_SNAPSHOT.md": "### 🔑 `snapshot/hidden`\n\nzeroclaw_hidden_fixture\n"
+                    }
+                },
+                "expects": {
+                    "memory": { "absent": ["snapshot/hidden"] }
+                }
+            }"####,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "text", "content": "done" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let grade = outcome
+            .grades
+            .iter()
+            .find(|grade| grade.check == r#"memory_absent("snapshot/hidden")"#)
+            .expect("snapshot absence grade must be registered");
+        assert!(grade.passed, "memory grade: {grade:?}");
     }
 
     #[tokio::test]

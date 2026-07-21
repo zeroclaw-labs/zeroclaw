@@ -13,7 +13,7 @@ harness is configured under `[eval]` and invoked as a CLI subcommand.
 
 | Mode | What it does | Cost | CI |
 |---|---|---|---|
-| `replay` | Replays scripted LLM responses from the fixture through the agent loop. Fully deterministic, no network. | Free | Gated (default) |
+| `replay` | Replays scripted LLM responses from the fixture through the agent loop. Fully deterministic, no network. Cases that declare memory setup or expectations are rejected; use `--mode live` for those cases. | Free | Gated (default) |
 | `live` | Executes cases against a real provider inside a per-case sandbox (see "Live mode"). | Real tokens | Never by default |
 
 ## Suite taxonomy
@@ -51,20 +51,43 @@ runs in CI by default. Enable it by setting `[eval].live_provider` to a dotted
 mode disabled.
 
 A live case omits scripted `steps` (the provider produces the responses) and may
-declare `tools` it needs and a `setup.workspace_files` map to seed the workspace.
+declare `tools` it needs. Its `setup` can seed workspace files with
+`workspace_files` and long-term memory with a `memory` map of key to content. The
+harness stores each seed as an unscoped Core memory entry before the first turn.
+Memory keys follow the same rules as workspace expectation paths: they must be
+non-empty, relative, and cannot contain `..`.
+
+The normal turn-memory policy can automatically recall relevant seeded entries
+into the prompt context. Automatic recall uses the raw user input and the normal
+relevance and context-budget filters, so it is not an exact-key guarantee.
+`memory_recall` remains available as an explicit retrieval surface when a case
+specifically needs or asserts tool-driven recall.
+
 The requested tools are intersected with `[eval].live_allowed_tools`; the default
 (empty) allows no real tools, so a case that needs tools requires the operator to
-opt in explicitly.
+opt in explicitly. This rule also applies to `memory_store`, `memory_recall`,
+`memory_forget`, `memory_export`, and `memory_purge`: a memory tool is available
+only when both the case's `tools` list and the operator's live allowlist name it.
+Declaring `setup.memory` or `expects.memory` does not grant a memory tool. For
+example, a case that asserts tool-driven retrieval needs `memory_recall` in both
+places.
 
 Each live case runs inside a sandbox:
 
 | Control | Behavior |
 |---|---|
 | Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
-| Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`; empty allowlist yields only the harmless echo tool. |
+| Tool registry | Runtime default and memory tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`; empty allowlist yields only the harmless echo tool. |
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
 | Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+
+Cases that declare memory setup or expectations, or that receive an allowlisted
+memory tool, use a fresh SQLite memory backend at `memory/brain.db` under the case
+workspace. The database never uses the operator's configured long-term-memory
+store and disappears with the per-case temporary directory. The `memory/`
+subtree is harness-owned, so workspace expectations should avoid asserting on
+paths inside it; use `expects.memory` for memory state instead.
 
 Because live output is non-deterministic and can embed workspace content, live runs
 belong in the planned `evals/live/` suite, not the gating regression suite.
@@ -78,13 +101,45 @@ signal. The same decision is exposed as the pure function
 
 ## Case format
 
-Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`
-(each with a `user_input` and scripted response `steps`), and declarative
-`expects`. A case is either **positive** (a behavior that must happen) or
-**negative** (a behavior that must NOT happen, e.g. `tools_not_used`,
-`response_not_contains`, `max_tool_calls: 0`). See `evals/README.md` for the
-authoring rules, including the two-experts test and the privacy requirement that
-fixtures use placeholder identities only.
+Each fixture is an `LlmTrace` with a `model_name`, a list of conversation `turns`,
+and declarative `expects`. A replay turn includes `user_input` and scripted
+response `steps`; a live turn includes `user_input` but omits `steps`. Live cases
+can also request `tools` and declare setup maps under `setup.workspace_files` and
+`setup.memory`. Replay rejects a non-empty `setup.memory` map or any
+`expects.memory` block and reports that the case requires `--mode live`.
+
+A case is either **positive** (a behavior that must happen) or **negative** (a
+behavior that must NOT happen, e.g. `tools_not_used`, `response_not_contains`,
+`max_tool_calls: 0`). See `evals/README.md` for the authoring rules, including the
+two-experts test and the privacy requirement that fixtures use placeholder
+identities only.
+
+Example live case with isolated memory setup and checks:
+
+```json
+{
+  "model_name": "recalls-project-status",
+  "id": "gh1234_memory_recall",
+  "tools": ["memory_recall"],
+  "setup": {
+    "memory": { "project/status": "The synthetic project status is green." }
+  },
+  "turns": [{
+    "user_input": "Use memory_recall to retrieve the project status, even if it appears in context."
+  }],
+  "expects": {
+    "response_contains": ["green"],
+    "tools_used": ["memory_recall"],
+    "memory": {
+      "present": ["project/status"],
+      "contains": { "project/status": ["synthetic", "green"] }
+    }
+  }
+}
+```
+
+The operator must also include `memory_recall` in
+`[eval].live_allowed_tools` for this case.
 
 ## Expectations reference
 
@@ -120,6 +175,18 @@ Workspace checks (category `side_effect`), under `workspace`:
 Every workspace path is validated as workspace-relative first; a path that
 escapes the workspace (absolute or containing `..`) is a failed check, never a
 filesystem access.
+
+Memory checks (category `side_effect`), under `memory`:
+
+- `present` / `absent`: exact keys that must / must not exist after the run.
+- `contains`: a map of exact key to substrings that must appear in that entry's
+  content.
+
+Memory checks query the case's isolated memory backend by exact key rather than
+using ranked recall. Each key is validated before the backend is queried; an
+empty, absolute, or `..`-containing key is a failed check, never a memory access.
+Memory expectations are live-mode only; replay rejects their declaration and
+names `--mode live` in the error.
 
 Budget checks (category `budget`), under `budget`, each an inclusive bound:
 `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_duration_ms`,
