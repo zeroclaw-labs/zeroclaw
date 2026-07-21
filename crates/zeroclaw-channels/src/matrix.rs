@@ -3959,8 +3959,7 @@ mod tests {
             assert_eq!(resolved, "recording.mp3");
         }
 
-        // Regression test for the maintainer's blocking review on PR #9153:
-        // a spec-compliant caption+filename-less body must still reach the
+        // A spec-compliant caption+filename-less body must still reach the
         // transcription provider rather than failing on the empty-alias bail
         // OR on filename-derived format rejection.
         #[tokio::test]
