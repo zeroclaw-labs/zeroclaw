@@ -53,10 +53,8 @@ pub fn make_session_backend(
         //
         // Until a given follow-up PR ships, that backend name resolves
         // to a `#[cfg(not(feature = "backend-<name>"))]` arm that
-        // hard-fails at startup. This is the deliberately explicit
-        // shape #6893 / WareWolf-MoonWall / Audacity88 /
-        // singlerider converged on after the SQLite silent-fallback
-        // regression: a known backend whose Cargo feature is not
+        // hard-fails at startup. This is a deliberately explicit
+        // shape: a known backend whose Cargo feature is not
         // compiled into this binary must NOT silently route sessions
         // to SQLite — that would split session history across a fleet.
         //
@@ -82,9 +80,8 @@ pub fn make_session_backend(
             // stay forgiving and route to the default local backend,
             // matching the pre-existing soft-fallback contract. The
             // WARN body inlines the actual offending string so the
-            // operator can spot the typo in their logs (vs. the empty
-            // interpolation the previous implementation emitted — see
-            // the post-mortem in the PR description for #6893).
+            // operator can spot the typo in their logs instead of an
+            // empty-interpolation message that hides the real value.
             let other = other.to_string();
             ::zeroclaw_log::record!(
                 WARN,
@@ -232,10 +229,9 @@ mod tests {
     // accepts as the spelling for an upcoming remote backend) must
     // hard-fail at startup when the matching Cargo feature is not
     // compiled into this binary, instead of silently routing
-    // sessions to the local SQLite/JSONL backend. The `#6893`
-    // review caught a silent SQLite fallback that would have
-    // shredded session history across a fleet once any operator
-    // enabled a remote backend in their config.
+    // sessions to the local SQLite/JSONL backend. A silent SQLite
+    // fallback here would shred session history across a fleet
+    // once any operator enabled a remote backend in their config.
 
     /// Drives `make_session_backend` for a single remote backend name
     /// and asserts the expected fail-fast contract: it returns an
@@ -297,7 +293,7 @@ mod tests {
 
     #[test]
     fn make_session_backend_unknown_value_warn_message_inlines_offending_value() {
-        // Regression guard for #6893 review: a past implementation
+        // Regression guard: an earlier implementation once
         // logged `Unknown session_backend ''; falling back to sqlite`
         // because the warn message was a static string with no
         // interpolation, so the operator could not see their typo in
@@ -339,7 +335,7 @@ mod tests {
         // unknown value (not in the five-remote-name set) is the
         // case the operator has misspelled their config; there is
         // no live connection at risk, so we keep the lenient
-        // fallback that has shipped since before #6893.
+        // fallback this factory has always used for that case.
         let tmp = TempDir::new().unwrap();
         let backend = make_session_backend(tmp.path(), "completely-bogus-typo").unwrap();
         backend.append("k1", &user_msg("hello-fallback")).unwrap();

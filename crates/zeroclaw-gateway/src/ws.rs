@@ -874,7 +874,7 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
 
 /// Sync variant of `session_async::persist_conversation_messages`.
 /// Kept around for the regression test
-/// `persist_conversation_messages_skips_deleted_session` (see #7126)
+/// `persist_conversation_messages_skips_deleted_session`
 /// that asserts the existence-guard / role-filter contract on a
 /// test-only `SessionBackend` mock — moving the test to an async
 /// harness would tie it to tokio's runtime instead of the pure
