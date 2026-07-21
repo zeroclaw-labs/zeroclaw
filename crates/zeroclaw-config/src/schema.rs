@@ -10608,7 +10608,7 @@ pub fn validate_memory_semantics(
         ));
     }
 
-    // #6722: the rerank stage was never landed (PR #4245 closed unmerged).
+    // The proposed rerank stage was never landed, so these knobs remain inert.
     // `DefaultMemoryStrategy::new` logs the same fact at agent start; this
     // config-time copy reaches `config validate` and dashboard callers too.
     if memory.rerank_enabled {
