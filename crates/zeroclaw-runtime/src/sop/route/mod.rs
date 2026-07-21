@@ -103,16 +103,7 @@ fn resolve_target(ctx: &RouteCtx<'_>, target: u32) -> NextStep {
     let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
         return NextStep::Fail(format!("step {target} does not exist"));
     };
-
-    if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
-        return NextStep::Fail(format!("step {target} visit limit reached"));
-    }
-
-    if eligible(step, ctx.run_data) {
-        NextStep::Step(target)
-    } else {
-        NextStep::Wait(target)
-    }
+    resolve_step_decision(ctx, target, step)
 }
 
 /// Resolve the linear successor (`current_step + 1`). Completes when the
@@ -127,15 +118,19 @@ fn resolve_linear(ctx: &RouteCtx<'_>) -> NextStep {
             NextStep::Fail(format!("step {next_step} does not exist"))
         };
     };
+    resolve_step_decision(ctx, next_step, step)
+}
 
-    if !guard::within_visit_bound(ctx.run, next_step, ctx.max_step_visits) {
-        return NextStep::Fail(format!("step {next_step} visit limit reached"));
+/// Apply the visit-bound and dependency checks shared by every target
+/// resolution path, once the candidate step has been looked up.
+fn resolve_step_decision(ctx: &RouteCtx<'_>, target: u32, step: &SopStep) -> NextStep {
+    if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
+        return NextStep::Fail(format!("step {target} visit limit reached"));
     }
-
     if eligible(step, ctx.run_data) {
-        NextStep::Step(next_step)
+        NextStep::Step(target)
     } else {
-        NextStep::Wait(next_step)
+        NextStep::Wait(target)
     }
 }
 
