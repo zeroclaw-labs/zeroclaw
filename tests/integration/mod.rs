@@ -2,8 +2,6 @@ mod agent;
 mod agent_robustness;
 mod backup_cron_scheduling;
 mod channel_matrix;
-#[cfg(feature = "plugins-wasm-cranelift")]
-mod channel_plugin_shadow;
 mod channel_routing;
 mod email_attachments;
 mod hooks;

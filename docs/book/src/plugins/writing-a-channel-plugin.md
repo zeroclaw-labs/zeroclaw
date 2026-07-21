@@ -231,23 +231,10 @@ for wit-bindgen guests.
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
 For a channel: `capabilities` containing `channel`, and almost certainly both
-`config_read` (no platform works without credentials) and `http_client` (the
-outbound `wasi:http` surface is the only network you have; without the
-permission, `send` has no way to reach the platform at all).
-
-For a drop-in replacement of a built-in channel, add `provides` with that
-channel's snake_case config key, for example `provides = "telegram"`. A mirror
-must grant `config_read`; ZeroClaw then supplies each enabled, agent-owned
-`[channels.<type>.<alias>]` section directly to `configure`. Do not add a
-parallel `plugins.entries` config block. Omit `provides` for a novel channel,
-which binds as `plugin.<manifest-name>` and reads its own plugin entry.
-
-Declare how the guest represents inbound sender identities with `sender_match`:
-`exact`, `case_insensitive`, `handle`, or `email`. For example, a guest that
-emits Telegram-style usernames with or without a leading `@` uses
-`sender_match = "handle"`. Omission defaults to `exact` for compatibility. This
-field describes only the emitted string; operators continue to authorize
-identities in `peer_groups`, which the host resolves live for every message.
+`config_read` (no platform works without credentials) and `http_client`. The
+channel adapter implements outbound `wasi:http`, but links it only after that
+grant is validated; without both pieces, `send` has no network path to the
+platform.
 
 ## Build and install
 

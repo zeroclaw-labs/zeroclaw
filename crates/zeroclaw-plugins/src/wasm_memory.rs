@@ -2,16 +2,21 @@
 //! backed by the `memory-plugin` component world. Warm store, called at high
 //! frequency, so the store and bindings live for the adapter's lifetime.
 
+use crate::PluginCapability;
 use crate::component::bindings::memory::MemoryPlugin;
 use crate::component::bindings::memory::exports::zeroclaw::plugin::memory::{
     AgentFilter as WitAgentFilter, ExportFilter as WitExportFilter, MemoryCapabilities,
     MemoryCategory as WitMemoryCategory, MemoryEntry as WitMemoryEntry,
     ProceduralMessage as WitProceduralMessage,
 };
-use crate::component::{PluginState, call_plugin, engine, load_component_with_digest, wt};
+use crate::component::{
+    PluginState, PluginStoreSpec, call_plugin, call_store, engine, load_component, wt,
+};
+use crate::host::AdmittedComponent;
+use crate::instance::PluginInstanceScope;
+use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use wasmtime::Store;
@@ -23,7 +28,7 @@ use zeroclaw_api::memory_traits::{
 
 /// A memory backend backed by a WIT component-model plugin.
 pub struct WasmMemory {
-    alias: String,
+    scope: PluginInstanceScope,
     capabilities: MemoryCapabilities,
     state: Arc<Mutex<(Store<PluginState>, MemoryPlugin)>>,
 }
@@ -33,10 +38,12 @@ impl Attributable for WasmMemory {
         Role::Memory(MemoryKind::Plugin)
     }
     fn alias(&self) -> &str {
-        &self.alias
+        self.scope.id().binding()
     }
 }
 
+/// Build the memory world without HTTP. Memory-network authority will land
+/// only with a component-boundary fixture and the shared egress policy.
 fn linker() -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
@@ -55,39 +62,43 @@ fn linker() -> Result<Linker<PluginState>> {
 
 impl WasmMemory {
     /// Compile and instantiate a memory plugin, caching its capabilities.
+    /// `services` supplies the same required host-service bundle as the other
+    /// worlds, although the current memory WIT does not import config or
+    /// secrets.
     pub async fn from_wasm(
-        alias: impl Into<String>,
-        wasm_path: &Path,
+        scope: PluginInstanceScope,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
-        Self::from_wasm_with_digest(alias, wasm_path, None, limits).await
-    }
-
-    /// Compile and instantiate a memory plugin from the exact bytes bound by
-    /// an optional verified-manifest digest.
-    pub async fn from_wasm_with_digest(
-        alias: impl Into<String>,
-        wasm_path: &Path,
-        expected_sha256: Option<&str>,
-        limits: crate::component::PluginLimits,
-    ) -> Result<Self> {
-        let component = load_component_with_digest(wasm_path, expected_sha256)?;
+        scope.require_capability(PluginCapability::Memory)?;
+        let component = load_component(component)?;
+        let mut store = crate::component::new_store(PluginStoreSpec::new(
+            scope.clone(),
+            services.clone(),
+            limits,
+        ));
         let linker = linker()?;
-        let mut store = crate::component::new_store(&[], limits);
-        let bindings = wt(
-            MemoryPlugin::instantiate_async(&mut store, &component, &linker).await,
-            "failed to instantiate memory plugin",
-        )?;
-        let capabilities = wt(
-            bindings
-                .zeroclaw_plugin_memory()
-                .call_get_memory_capabilities(&mut store)
-                .await,
-            "memory.get-memory-capabilities failed",
-        )?;
+        crate::component::ensure_http_coherent(&store, false)?;
+        let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                MemoryPlugin::instantiate_async(store, &component, &linker).await,
+                "failed to instantiate memory plugin",
+            )
+        });
+        let bindings = bindings?;
+        let capabilities: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_get_memory_capabilities(store)
+                    .await,
+                "memory.get-memory-capabilities failed",
+            )
+        });
         Ok(Self {
-            alias: alias.into(),
-            capabilities,
+            scope,
+            capabilities: capabilities?,
             state: Arc::new(Mutex::new((store, bindings))),
         })
     }
@@ -166,7 +177,7 @@ fn to_wit_procedural(msgs: &[ProceduralMessage]) -> Vec<WitProceduralMessage> {
 #[async_trait]
 impl Memory for WasmMemory {
     fn name(&self) -> &str {
-        &self.alias
+        self.scope.id().package()
     }
 
     async fn store(
@@ -775,5 +786,21 @@ mod tests {
             to_wit_agent_filter(&["a", "b"]),
             WitAgentFilter::Some(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn from_wasm_rejects_a_scope_for_another_capability() {
+        let scope = crate::instance::test_scope(PluginCapability::Tool, "main", []);
+        let component = AdmittedComponent::test_component(b"not-a-component");
+        let result = WasmMemory::from_wasm(
+            scope,
+            &component,
+            &crate::services::test_host_services(),
+            crate::component::test_limits(0),
+        )
+        .await;
+
+        let error = result.err().expect("capability mismatch must fail");
+        assert!(format!("{error:#}").contains("capability"));
     }
 }

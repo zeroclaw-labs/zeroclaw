@@ -1,0 +1,48 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-mediated encrypted durable state scoped to one admitted plugin
+/// package, capability, and binding.
+@unstable(feature = plugins-wit-v0)
+interface state {
+    /// Closed failures returned across the guest boundary.
+    @unstable(feature = plugins-wit-v0)
+    enum state-error {
+        /// The logical key is not portable host-state syntax.
+        invalid-key,
+        /// The admitted instance lacks the required state-read or state-write
+        /// grant.
+        access-denied,
+        /// No authenticated value exists for the key.
+        not-found,
+        /// The expected compare-and-swap revision did not match.
+        conflict,
+        /// The operation would exceed a fixed host quota.
+        quota-exceeded,
+        /// The service is outside an authorized call frame, the host-call
+        /// budget is exhausted, or storage/integrity validation failed closed.
+        unavailable,
+    }
+
+    /// One authenticated plaintext value and its compare-and-swap revision.
+    @unstable(feature = plugins-wit-v0)
+    record state-entry {
+        value: list<u8>,
+        revision: u64,
+    }
+
+    /// Read one value owned by this exact plugin instance.
+    get: func(key: string) -> result<option<state-entry>, state-error>;
+
+    /// Create or replace one value atomically.
+    ///
+    /// `none` requires the key to be absent. `some(revision)` requires an
+    /// exact current revision match. Returns the newly committed revision.
+    put: func(
+        key: string,
+        value: list<u8>,
+        expected-revision: option<u64>,
+    ) -> result<u64, state-error>;
+
+    /// Delete one value only when `expected-revision` matches exactly.
+    delete: func(key: string, expected-revision: u64) -> result<_, state-error>;
+}

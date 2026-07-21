@@ -1,27 +1,16 @@
-# Standalone crate (own [workspace]): built for wasm32-wasip2 as a test fixture,
-# NOT part of the host workspace. Mirrors the published reference-plugin setup.
-#
-# The host E2E tests build this source on demand with the checked-in lockfile.
-# Manual build: rustup target add wasm32-wasip2
-#               cargo build --locked --target wasm32-wasip2
 [package]
-name = "channel-fixture"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-description = "ZeroClaw WIT channel plugin test fixture: a minimal echo channel."
+name = "zeroclaw-channel-plugin-fixture"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [lib]
 crate-type = ["cdylib"]
+doc = false
+doctest = false
+test = false
 
-[dependencies]
-wit-bindgen = "0.46"
-
-[profile.release]
-opt-level = "s"
-lto = true
-strip = true
-codegen-units = 1
-
-[workspace]
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+wit-bindgen = "0.51"

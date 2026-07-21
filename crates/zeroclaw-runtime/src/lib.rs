@@ -28,10 +28,13 @@ pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;
-pub mod plugin_channels;
+pub mod plugin_runtime;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
+pub mod restart;
 pub mod routines;
 pub mod rpc;
 pub mod security;

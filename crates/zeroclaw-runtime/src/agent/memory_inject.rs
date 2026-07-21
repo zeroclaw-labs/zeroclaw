@@ -1,22 +1,5 @@
 //! Unified memory-context injection: ONE policy and ONE renderer for the
 //! memory preamble, applied at the turn engine.
-//!
-//! Replaces the per-path inline renderers (the three `loop_` sites, the
-//! channel orchestrator's budgeted renderer, the agent-direct loader, and
-//! the cron/daemon pre-prompt blocks). The injection decision is keyed on
-//! [`TurnOrigin`] (who initiated the turn), resolved by
-//! [`resolve_inject_policy`]; the pipeline in [`render_memory_context`] is
-//! the uniform superset of the legacy renderers' behavior. Divergences from
-//! any individual legacy path are deliberate and documented on the PR that
-//! wires this module (uniform rigour: a per-path difference is an error
-//! unless documented).
-//!
-//! Pipeline: recall (per session, key-deduped) -> time decay -> relevance
-//! filter -> skip set (autosave keys/content, `*_history` keys, `[IMAGE:`
-//! markers, `<tool_result` blocks, optional Conversation-category
-//! exclusion) -> budget caps (entry count, per-entry chars, total chars)
-//! -> `[Memory context]` wrapper. Exactly one `MemoryRecall` observer
-//! event is emitted per render, covering all recalls.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -98,24 +81,13 @@ pub enum InjectPolicy {
     /// Inject via the uniform pipeline.
     Inject {
         /// Drop `MemoryCategory::Conversation` entries. True for scheduled
-        /// origins (chat history must not leak into autonomous runs, #5456)
+        /// origins (chat history must not leak into autonomous runs,
         /// and for turns without a session scope (without a session filter,
         /// other channels' conversations would bleed in).
         exclude_conversation: bool,
     },
 }
 
-/// Resolve the injection policy from who initiated the turn.
-///
-/// The uniform rule set:
-/// - `SubTurn` never injects: a nested turn must not re-absorb the parent's
-///   memory; the parent states what the child needs in the prompt it writes.
-/// - Scheduled origins (`Cron`, `Daemon`) inject with Conversation entries
-///   excluded (#5456).
-/// - All other origins inject; Conversation entries are excluded when the
-///   turn has no session scope.
-/// - `suppress` covers per-spawn opt-outs (e.g. a cron job configured with
-///   `uses_memory = false`).
 #[must_use]
 pub fn resolve_inject_policy(
     origin: TurnOrigin,
@@ -169,14 +141,6 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     false
 }
 
-/// Render the memory-context preamble for one turn: the uniform pipeline
-/// over one or more session scopes (multi-session recall is key-deduped in
-/// order, mirroring the channel renderer's history-key + sender recall).
-///
-/// Returns the wrapped block followed by a blank line, or an empty string
-/// when nothing qualifies. Recall errors are swallowed (the turn proceeds
-/// without memory); exactly one `MemoryRecall` observer event is emitted
-/// per call, with `success = false` only when every recall failed.
 pub async fn render_memory_context(
     mem: &dyn Memory,
     observer: &dyn Observer,
@@ -311,10 +275,12 @@ mod tests {
     }
 
     /// Recall returns the fixture list for the requested session scope;
-    /// `fail` simulates a backend error.
+    /// `fail` simulates a backend error. `recalls` counts backend recalls
+    /// so decorator-composition tests can observe forwarding.
     struct FixtureMemory {
         by_session: HashMap<Option<String>, Vec<MemoryEntry>>,
         fail: bool,
+        recalls: std::sync::atomic::AtomicUsize,
     }
 
     impl FixtureMemory {
@@ -324,6 +290,7 @@ mod tests {
             Self {
                 by_session,
                 fail: false,
+                recalls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -331,6 +298,7 @@ mod tests {
             Self {
                 by_session: HashMap::new(),
                 fail: true,
+                recalls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -355,6 +323,8 @@ mod tests {
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recalls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail {
                 anyhow::bail!("backend down");
             }
@@ -750,6 +720,7 @@ mod tests {
         let mem = FixtureMemory {
             by_session,
             fail: false,
+            recalls: std::sync::atomic::AtomicUsize::new(0),
         };
         let observer = RecordingObserver::default();
 
@@ -769,5 +740,59 @@ mod tests {
         assert!(context.contains("- only_first: h"));
         assert!(context.contains("- only_sender: s"));
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
+    }
+
+    /// Injection-path smoke for the retrieval decorator: when the turn's
+    /// memory handle is pipeline-wrapped (as `create_memory_for_agent` now
+    /// builds it), each renderer recall reaches the scoped backend and the
+    /// rendered block remains unchanged.
+    #[tokio::test]
+    async fn recall_routes_through_retrieval_pipeline_decorator() {
+        let fixture = std::sync::Arc::new(FixtureMemory::with(vec![entry(
+            "fact",
+            "server is prod-3",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]));
+        let pipeline = zeroclaw_memory::RetrievalPipeline::new(
+            fixture.clone() as std::sync::Arc<dyn Memory>,
+            zeroclaw_memory::RetrievalConfig::default(),
+        );
+        let observer = RecordingObserver::default();
+
+        let first = render_memory_context(
+            &pipeline,
+            &observer,
+            "which server",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+        )
+        .await;
+        let second = render_memory_context(
+            &pipeline,
+            &observer,
+            "which server",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+        )
+        .await;
+
+        assert!(first.contains("- fact: server is prod-3"));
+        assert_eq!(
+            first, second,
+            "direct backend recall must render identically"
+        );
+        assert_eq!(
+            fixture.recalls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each render must reach the backend through the decorator"
+        );
+        assert_eq!(
+            observer.recalls.lock().as_slice(),
+            &[(1, true), (1, true)],
+            "both renders emit a MemoryRecall event"
+        );
     }
 }
