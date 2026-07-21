@@ -786,6 +786,12 @@ impl SopEngine {
                     // by that transition and must NOT be released out from under it.
                     if !holds_exec_claim(status) {
                         self.release_claim_on_park(&run_id);
+                        // The initial park deliberately withheld its route notice while
+                        // the snapshot was not durable. This successful retry is the
+                        // single point that makes the parked gate recoverable, so emit
+                        // the deferred request now. Removing the pending marker first
+                        // prevents later maintenance ticks from sending it again.
+                        self.notify_park_request(&run_id);
                     }
                 }
                 ActivePersistOutcome::CapacityFull | ActivePersistOutcome::Failed => {}
@@ -3748,7 +3754,11 @@ impl SopEngine {
                 // the run waits at the checkpoint - but only AFTER the parked
                 // snapshot is durably persisted (else keep the claim).
                 match self.persist_parked_snapshot_then_release_claim(run_id) {
-                    ParkPersistOutcome::Released => {}
+                    // A policy-gated checkpoint is the same durable approval boundary
+                    // as `WaitingApproval`: send its configured request notice only
+                    // after the parked snapshot is recoverable. If this write failed,
+                    // the maintenance retry owns the eventual single notification.
+                    ParkPersistOutcome::Released => self.notify_park_request(run_id),
                     ParkPersistOutcome::CapacityFull => {
                         let reason = self.pending_pool_capacity_raced_reason(sop);
                         Self::log_pending_capacity_full(run_id, &reason);
@@ -10562,6 +10572,121 @@ mod tests {
         let run = engine.get_run(&run_id).unwrap();
         assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
         assert!(run.waiting_since.is_some());
+    }
+
+    #[test]
+    fn durable_policied_checkpoint_delivers_exactly_one_request_notice() {
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: Some("discord.ops:checkpoint".to_string()),
+                escalation_route: None,
+            },
+        );
+        let mut sop = deterministic_sop("det-routed-checkpoint");
+        sop.steps[1].policy = Some("prod".to_string());
+        let mut engine = engine_with_config_sops(config, vec![sop]).with_approval_broker(
+            std::sync::Arc::new(crate::sop::approval::ApprovalBroker::with_route(adapter)),
+        );
+
+        let first = engine
+            .start_run("det-routed-checkpoint", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        assert!(calls.lock().unwrap().is_empty());
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("step-one"), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "the durable checkpoint sends once");
+        assert_eq!(
+            recorded[0],
+            (
+                crate::sop::approval::ApprovalNoticeKind::Request,
+                "discord.ops:checkpoint".to_string(),
+                run_id,
+                "det-routed-checkpoint".to_string(),
+                2,
+            )
+        );
+    }
+
+    #[test]
+    fn policied_checkpoint_retry_delivers_once_after_persist_succeeds() {
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: Some("discord.ops:checkpoint".to_string()),
+                escalation_route: None,
+            },
+        );
+        let mut sop = deterministic_sop("det-routed-checkpoint-retry");
+        sop.steps[1].policy = Some("prod".to_string());
+        let mut engine = engine_with_config_sops(config, vec![sop])
+            .with_store(store.clone())
+            .with_approval_broker(std::sync::Arc::new(
+                crate::sop::approval::ApprovalBroker::with_route(adapter),
+            ));
+
+        let first = engine
+            .start_run("det-routed-checkpoint-retry", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("step-one"), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Pending { .. }));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "an undurable checkpoint must not send"
+        );
+        assert!(engine.is_park_persist_pending(&run_id));
+
+        store
+            .fail_save
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        engine.run_maintenance_tick();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the successful retry sends exactly once"
+        );
+        engine.run_maintenance_tick();
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "later maintenance ticks must not resend"
+        );
     }
 
     #[test]

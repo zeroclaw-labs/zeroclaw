@@ -839,11 +839,10 @@ impl AgentBuilder {
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
             memory_inject_cfg: self.memory_inject_cfg.unwrap_or_else(|| {
-                crate::agent::memory_inject::MemoryInjectConfig {
-                    min_relevance_score: zeroclaw_config::schema::MemoryConfig::default()
-                        .min_relevance_score,
-                    ..Default::default()
-                }
+                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                    &zeroclaw_config::schema::MemoryConfig::default(),
+                    crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                )
             }),
             config,
             structured_history_cap_resolver: self.structured_history_cap_resolver,
@@ -1638,11 +1637,12 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
-                limit: config.effective_memory_recall_limit(agent_alias),
-                min_relevance_score: config.memory.min_relevance_score,
-                ..Default::default()
-            })
+            .memory_inject_cfg(
+                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                    &config.memory,
+                    config.effective_memory_recall_limit(agent_alias),
+                ),
+            )
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
