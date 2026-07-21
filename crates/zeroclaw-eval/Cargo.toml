@@ -13,6 +13,7 @@ zeroclaw-config.workspace = true
 zeroclaw-memory.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
+chrono.workspace = true
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 regex = "1.10"

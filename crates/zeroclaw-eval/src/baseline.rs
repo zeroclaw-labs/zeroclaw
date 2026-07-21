@@ -18,7 +18,8 @@ pub const BASELINE_SCHEMA: &str = "zeroclaw-eval/baseline/v1";
 /// Whether a suite gates CI. A suite directory named `capability` (or the
 /// `--suite-kind capability` override) is tracked but never gating; everything
 /// else has regression semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SuiteKind {
     Regression,
     Capability,

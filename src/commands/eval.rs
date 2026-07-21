@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
-use zeroclaw_eval::{CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
+use zeroclaw_eval::{
+    CaseReport, HistoryReceipt, HistoryRun, LlmTrace, Mode, RunDeps, SuiteReport,
+    write_history_receipt,
+};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
@@ -20,6 +23,7 @@ pub struct FinalizeOpts {
     pub baseline: Option<PathBuf>,
     pub write_baseline: Option<PathBuf>,
     pub suite_kind: Option<SuiteKind>,
+    pub history_dir: Option<PathBuf>,
 }
 
 /// Handle the post-run flow (dumps, baselines, comparison, printing) and return
@@ -28,6 +32,7 @@ pub async fn finalize(
     config: &Config,
     mode: Mode,
     suite_path: &Path,
+    provider_ref: &str,
     report: SuiteReport,
     opts: FinalizeOpts,
 ) -> Result<i32> {
@@ -58,6 +63,19 @@ pub async fn finalize(
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::write(path, Baseline::from_report(&report).to_json())?;
+        let _ = write_run_history(
+            config,
+            opts.history_dir.as_deref(),
+            &report,
+            HistoryRun {
+                recorded_at: chrono::Utc::now(),
+                suite_dir: suite_path.display().to_string(),
+                suite_kind: kind,
+                mode,
+                provider_ref: provider_ref.to_string(),
+            },
+            None,
+        );
         return Ok(report.exit_code(kind, None));
     }
 
@@ -95,6 +113,20 @@ pub async fn finalize(
         }
     };
 
+    let _ = write_run_history(
+        config,
+        opts.history_dir.as_deref(),
+        &report,
+        HistoryRun {
+            recorded_at: chrono::Utc::now(),
+            suite_dir: suite_path.display().to_string(),
+            suite_kind: kind,
+            mode,
+            provider_ref: provider_ref.to_string(),
+        },
+        comparison.as_ref(),
+    );
+
     if opts.format == OutputFormat::Junit {
         // Cases unverifiable against the baseline render as <skipped/>.
         let skipped: Vec<&str> = comparison
@@ -111,6 +143,81 @@ pub async fn finalize(
     }
 
     Ok(report.exit_code(kind, comparison.as_ref()))
+}
+
+fn resolved_history_dir(override_dir: Option<&Path>, configured_dir: &str) -> Option<PathBuf> {
+    match override_dir {
+        Some(path) if path.as_os_str().is_empty() => None,
+        Some(path) => Some(path.to_path_buf()),
+        None if configured_dir.trim().is_empty() => None,
+        None => Some(PathBuf::from(configured_dir)),
+    }
+}
+
+fn path_is_under_target(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if name == std::ffi::OsStr::new("target")
+        )
+    })
+}
+
+/// Persist one best-effort history receipt after baseline classification. A
+/// history failure is observational only and never changes the eval exit code.
+fn write_run_history(
+    config: &Config,
+    override_dir: Option<&Path>,
+    report: &SuiteReport,
+    run: HistoryRun,
+    comparison: Option<&baseline::BaselineComparison>,
+) -> Option<PathBuf> {
+    write_run_history_with(
+        config,
+        override_dir,
+        report,
+        run,
+        comparison,
+        write_history_receipt,
+    )
+}
+
+fn write_run_history_with(
+    config: &Config,
+    override_dir: Option<&Path>,
+    report: &SuiteReport,
+    run: HistoryRun,
+    comparison: Option<&baseline::BaselineComparison>,
+    writer: impl FnOnce(&Path, &HistoryReceipt) -> Result<PathBuf>,
+) -> Option<PathBuf> {
+    let dir = resolved_history_dir(override_dir, &config.eval.history_dir)?;
+    if path_is_under_target(&dir) {
+        let display = dir.display().to_string();
+        eprintln!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-history-target-warning",
+                &[("dir", display.as_str())],
+            )
+        );
+    }
+
+    match HistoryReceipt::from_report(report, run, comparison)
+        .and_then(|receipt| writer(&dir, &receipt))
+    {
+        Ok(path) => Some(path),
+        Err(error) => {
+            let error = error.to_string();
+            eprintln!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-eval-history-write-warning",
+                    &[("error", error.as_str())],
+                )
+            );
+            None
+        }
+    }
 }
 
 /// Re-run each regressed case once against the same config, returning whether the
@@ -335,10 +442,20 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
 
 /// Run a suite of eval cases and return the aggregated report. The failed-case
 /// auto-dump directory is cleared at run start.
-pub async fn run(config: &Config, suite: PathBuf, mode: Mode) -> Result<SuiteReport> {
+pub struct EvalRun {
+    pub report: SuiteReport,
+    pub provider_ref: String,
+}
+
+pub async fn run(config: &Config, suite: PathBuf, mode: Mode) -> Result<EvalRun> {
     let _ = std::fs::remove_dir_all(AUTO_DUMP_DIR);
     let deps = build_run_deps(config, mode)?;
-    Box::pin(zeroclaw_eval::run_suite(&suite, &deps)).await
+    let provider_ref = deps.provider_ref.clone();
+    let report = Box::pin(zeroclaw_eval::run_suite(&suite, &deps)).await?;
+    Ok(EvalRun {
+        report,
+        provider_ref,
+    })
 }
 
 /// Choose a collision-free path `dir/<stem>.json`, appending `_N` when a file
@@ -620,5 +737,98 @@ mod tests {
             content.contains("boom"),
             "the error string must be captured"
         );
+    }
+
+    #[test]
+    fn history_disabled_by_default_writes_nothing() {
+        let config = Config::default();
+        let report = SuiteReport {
+            cases: vec![case_report("pass", true)],
+        };
+        let writer_called = std::cell::Cell::new(false);
+        let written = write_run_history_with(
+            &config,
+            None,
+            &report,
+            HistoryRun {
+                recorded_at: chrono::Utc::now(),
+                suite_dir: "evals/regression".to_string(),
+                suite_kind: SuiteKind::Regression,
+                mode: Mode::Replay,
+                provider_ref: "scripted".to_string(),
+            },
+            None,
+            |_, _| {
+                writer_called.set(true);
+                anyhow::bail!("disabled history must not invoke its writer")
+            },
+        );
+        assert!(written.is_none());
+        assert!(!writer_called.get());
+        assert!(resolved_history_dir(None, &config.eval.history_dir).is_none());
+    }
+
+    #[tokio::test]
+    async fn history_written_on_write_baseline_early_return() {
+        let config = Config::default();
+        let history_root = tempfile::tempdir().unwrap();
+        let baseline_root = tempfile::tempdir().unwrap();
+        let report = SuiteReport {
+            cases: vec![case_report("pass", true)],
+        };
+        let code = finalize(
+            &config,
+            Mode::Replay,
+            Path::new("evals/regression"),
+            "scripted",
+            report,
+            FinalizeOpts {
+                format: OutputFormat::Json,
+                dump_records: None,
+                baseline: None,
+                write_baseline: Some(baseline_root.path().join("baseline.json")),
+                suite_kind: None,
+                history_dir: Some(history_root.path().to_path_buf()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(baseline_root.path().join("baseline.json").exists());
+        assert_eq!(
+            std::fs::read_dir(history_root.path().join("regression"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn history_write_failure_does_not_change_exit_code() {
+        let config = Config::default();
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = temp.path().join("not-a-directory");
+        std::fs::write(&blocked, "file").unwrap();
+        let report = SuiteReport {
+            cases: vec![case_report("pass", true)],
+        };
+        let code = finalize(
+            &config,
+            Mode::Replay,
+            Path::new("evals/regression"),
+            "scripted",
+            report,
+            FinalizeOpts {
+                format: OutputFormat::Json,
+                dump_records: None,
+                baseline: None,
+                write_baseline: None,
+                suite_kind: None,
+                history_dir: Some(blocked),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
     }
 }

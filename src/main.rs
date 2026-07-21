@@ -516,6 +516,11 @@ enum EvalCommands {
         // i18n-exempt: clap derive help — framework requires a compile-time literal
         #[arg(long)]
         suite_kind: Option<String>,
+
+        /// Append a transcript-free run-history receipt under this directory.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        history_dir: Option<String>,
     },
 }
 
@@ -5216,6 +5221,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 baseline,
                 write_baseline,
                 suite_kind,
+                history_dir,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
@@ -5231,19 +5237,21 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         )
                     }
                 };
-                let report = commands::eval::run(&config, suite_path.clone(), mode).await?;
+                let run = commands::eval::run(&config, suite_path.clone(), mode).await?;
                 let opts = commands::eval::FinalizeOpts {
                     format,
                     dump_records: dump_records.map(std::path::PathBuf::from),
                     baseline: baseline.map(std::path::PathBuf::from),
                     write_baseline: write_baseline.map(std::path::PathBuf::from),
                     suite_kind: kind,
+                    history_dir: history_dir.map(std::path::PathBuf::from),
                 };
                 let code = Box::pin(commands::eval::finalize(
                     &config,
                     mode,
                     &suite_path,
-                    report,
+                    &run.provider_ref,
+                    run.report,
                     opts,
                 ))
                 .await?;

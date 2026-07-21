@@ -257,6 +257,13 @@ pub struct EvalHarnessConfig {
     /// diagnostic.
     #[serde(default)]
     pub judge_gate: bool,
+    /// Directory receiving one append-only run-history receipt per `eval run`
+    /// (schema `zeroclaw-eval/history/v1`): verdicts, scores, per-check results,
+    /// token/duration stats, and comparability keys — never transcripts or
+    /// workspace content. Files accumulate under `<history_dir>/<suite>/`.
+    /// Empty (the default) disables history recording.
+    #[serde(default)]
+    pub history_dir: String,
 }
 
 impl Default for EvalHarnessConfig {
@@ -269,6 +276,7 @@ impl Default for EvalHarnessConfig {
             case_timeout_secs: default_eval_case_timeout_secs(),
             judge_provider: crate::providers::ModelProviderRef::default(),
             judge_gate: false,
+            history_dir: String::new(),
         }
     }
 }

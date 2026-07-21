@@ -207,6 +207,31 @@ workspace file content and model output, so **never commit a dump**;
 privacy placeholder pass as any other fixture (see the privacy contract): no real
 names, transcripts, hostnames, or credentials.
 
+## Run history
+
+Run history is an opt-in, append-only record for longitudinal analysis. Set
+`[eval].history_dir` or pass `--history-dir <dir>` to write one
+`zeroclaw-eval/history/v1` JSON receipt per `eval run`. An empty history directory
+(the default) disables recording. Receipts accumulate under
+`<history_dir>/<suite>/` with a UTC timestamp and short git SHA in each filename;
+collisions receive an `_N` suffix instead of overwriting an earlier run. Avoid
+placing the directory under `target/`, because other tooling may clear that tree.
+
+Each receipt records the UTC time, git SHA and dirty flag when available,
+ZeroClaw version, suite identity and kind, mode, provider reference, pass counts,
+the report's suite-level repeat confidence interval, and transcript-free per-case
+results. Case results include comparability keys, verdict and score, per-check
+booleans, token and duration metrics, repeat statistics, and the baseline
+comparison class when `--baseline` was used.
+
+History receipts never contain `final_response`, conversation `history`, grade
+details, provider error payloads, or workspace content. They are designed for
+retention and private CI artifact upload. This differs deliberately from
+`--dump-records` and `target/eval-last-run/`: those debugging artifacts retain
+full transcripts, are overwritten or managed per run, and must never be
+committed. `/evals/history/` is gitignored as instance/CI data; the canonical
+git-versioned eval artifacts remain `evals/baselines/*.json`.
+
 ## Case format
 
 Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`

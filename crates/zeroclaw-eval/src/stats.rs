@@ -2,6 +2,7 @@
 //! suites. Pure math, no agent I/O.
 
 use crate::Mode;
+use serde::{Deserialize, Serialize};
 
 /// Clamp a requested repeat count to 1..=50 and resolve it for the mode. Returns
 /// the effective count and any warnings (clamping, replay-ignore). Replay is
@@ -157,7 +158,8 @@ pub struct RunSample {
 }
 
 /// Aggregated statistics over k isolated runs of one case.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RepeatStats {
     pub k: u32,
     pub passes: u32,
