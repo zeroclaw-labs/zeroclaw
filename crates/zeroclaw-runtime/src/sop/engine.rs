@@ -2422,6 +2422,7 @@ impl SopEngine {
                 output: reason.clone(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                effective_agent: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -6260,6 +6261,7 @@ mod tests {
                     output: "first".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6285,6 +6287,7 @@ mod tests {
                     output: "second".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6320,6 +6323,7 @@ mod tests {
                     output: "unauthorized".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6413,6 +6417,7 @@ mod tests {
                     output: "unauthorized checkpoint".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6480,6 +6485,7 @@ mod tests {
                     output: "first".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6505,6 +6511,7 @@ mod tests {
                     output: "second".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -8935,6 +8942,7 @@ mod tests {
                 output: "should not advance".into(),
                 started_at: now_iso8601(),
                 completed_at: Some(now_iso8601()),
+                effective_agent: None,
                 tool_calls: Vec::new(),
             },
         );
@@ -8996,6 +9004,7 @@ mod tests {
                 output: "should not advance".into(),
                 started_at: now_iso8601(),
                 completed_at: Some(now_iso8601()),
+                effective_agent: None,
                 tool_calls: Vec::new(),
             },
         );
