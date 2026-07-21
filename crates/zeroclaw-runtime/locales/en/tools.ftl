@@ -84,6 +84,9 @@ tool-file-download-error-read-body = Failed while reading response body: { $err 
 tool-file-download-error-write-body = Failed while writing downloaded bytes: { $err }
 tool-file-download-error-flush = Failed to flush downloaded file: { $err }
 tool-file-download-error-move = Failed to move downloaded file into place: { $err }
+tool-file-download-error-bad-scheme = file_download endpoint URL '{ $url }' must use http:// or https://
+tool-file-download-error-invalid-url = file_download endpoint URL is invalid: { $err }
+tool-file-download-error-private-host = file_download endpoint host '{ $host }' is loopback / private / link-local. To allow this host, add it (or "*") to { $config_key } in config.toml
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
