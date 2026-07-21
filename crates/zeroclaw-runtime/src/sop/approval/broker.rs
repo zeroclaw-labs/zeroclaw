@@ -1738,7 +1738,7 @@ mod tests {
         // rename cannot silently break group/policy resolution.
         let toml = r#"
 [groups.release]
-members = ["http:abc123", "cli:marc"]
+members = ["http:abc123", "cli:zeroclaw_operator"]
 
 [policies.prod]
 required_group = "release"
@@ -1750,7 +1750,10 @@ escalation_route = "discord.oncall:444555666"
         let group = cfg.groups.get("release").expect("release group");
         assert_eq!(
             group.members,
-            vec!["http:abc123".to_string(), "cli:marc".to_string()]
+            vec![
+                "http:abc123".to_string(),
+                "cli:zeroclaw_operator".to_string(),
+            ]
         );
         let policy = cfg.policies.get("prod").expect("prod policy");
         assert_eq!(policy.required_group.as_deref(), Some("release"));

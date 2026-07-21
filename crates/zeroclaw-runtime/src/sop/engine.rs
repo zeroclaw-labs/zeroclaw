@@ -9684,7 +9684,7 @@ type = "manual"
 
     #[test]
     fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
-        // Marc's double-HITL shape: `checkpoint -> capability -> ...`. The
+        // A step-one intake gate can use `checkpoint -> capability -> ...`. The
         // step-1 checkpoint has no prior step result, so its resume must pipe
         // the TRIGGER PAYLOAD forward (mapping identical to `step_input_value`),
         // not Null — otherwise the first work step is starved of the event.

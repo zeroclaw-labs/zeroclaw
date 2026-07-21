@@ -12,7 +12,7 @@
 //! another resolver alongside the config-backed one (a junction of identity
 //! sources); it does not replace channel-provided identities. That resolver is where
 //! canonical-identity LINKING belongs: one person's several channel identities (e.g.
-//! `github:nillth`, `discord:559...`, `email:marc@...`) map to a single canonical
+//! `github:zeroclaw_user`, `discord:559...`, `email:user@example.com`) map to a single canonical
 //! user, so any of them resolves to the same groups. Until then, the config-backed
 //! resolver can grant a group to each channel identity directly.
 

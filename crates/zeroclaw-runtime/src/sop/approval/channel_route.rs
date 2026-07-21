@@ -345,7 +345,7 @@ mod tests {
     fn template_resolves_dotted_paths_and_drops_missing_ones() {
         let ctx = serde_json::json!({
             "repo": "o/r", "number": 7,
-            "author": {"login": "nillth"},
+            "author": {"login": "zeroclaw_user"},
             "title": "It broke"
         });
         assert_eq!(
@@ -353,7 +353,7 @@ mod tests {
                 "Issue {{repo}}#{{number}} by {{author.login}}: {{title}} {{absent.field}}",
                 &ctx
             ),
-            "Issue o/r#7 by nillth: It broke "
+            "Issue o/r#7 by zeroclaw_user: It broke "
         );
         // Unclosed braces pass through untouched rather than panicking.
         assert_eq!(render_template("broken {{oops", &ctx), "broken {{oops");
