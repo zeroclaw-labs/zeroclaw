@@ -76,6 +76,7 @@ pub async fn maybe_run_skill_review(
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: provider,
@@ -127,6 +128,7 @@ pub async fn maybe_run_skill_review(
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias,
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .await
