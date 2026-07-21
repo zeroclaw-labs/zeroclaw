@@ -28,6 +28,10 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.capabilities()
     }
 
+    fn capabilities_for_model(&self, _model: &str) -> super::traits::ProviderCapabilities {
+        self.inner.capabilities_for_model(&self.pinned_model)
+    }
+
     fn default_temperature(&self) -> f64 {
         self.inner.default_temperature()
     }
