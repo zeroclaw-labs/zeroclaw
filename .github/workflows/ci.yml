@@ -146,7 +146,7 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
-      - name: Comment hygiene gate (no issue refs / gravitas / truncation artifacts)
+      - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
@@ -388,7 +388,7 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$'; then
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^Cargo\.(toml|lock)$'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -397,9 +397,6 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         with:
           toolchain: 1.96.1
-      - name: Install plugin fixture target
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.changed.outputs.run == 'true'
         with:
@@ -408,9 +405,6 @@ jobs:
       - name: Check
         if: steps.changed.outputs.run == 'true'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
-      - name: Run plugin component tests
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test tool_plugin_e2e
 
   check-32bit:
     name: Check (32-bit)
@@ -499,11 +493,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check firmware protocol crate
+        run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -693,7 +690,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

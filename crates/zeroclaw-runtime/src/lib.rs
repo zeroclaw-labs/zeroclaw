@@ -28,8 +28,6 @@ pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;
-#[cfg(feature = "plugins-wasm")]
-pub(crate) mod plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;

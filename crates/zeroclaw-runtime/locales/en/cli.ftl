@@ -506,6 +506,8 @@ cli-sop-execution-mode = {"  "}Execution mode: {$value}
 cli-sop-deterministic = {"  "}Deterministic:  {$value}
 cli-sop-cooldown = {"  "}Cooldown:       {$value}s
 cli-sop-max-concurrent = {"  "}Max concurrent: {$value}
+cli-sop-admission-policy = {"  "}Admission:      {$value}
+cli-sop-max-pending-approvals = {"  "}Max pending:    {$value}
 cli-sop-location = {"  "}Location:       {$value}
 cli-sop-triggers = {"  "}Triggers:
 cli-sop-steps = {"  "}Steps:
@@ -662,6 +664,8 @@ cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = unknown runtime preset `{$preset}`
 cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to agent `{$owner}`
 cli-quickstart-error-channel-required = channel type and alias are required
+cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
+cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -784,8 +788,8 @@ cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
@@ -898,6 +902,7 @@ turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ 
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = history message limit exceeded
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).

@@ -11,32 +11,22 @@ install path in `host.rs`.
 
 ### What is signed
 
-The signature covers the **canonical manifest bytes**. The host parses the TOML,
-removes only the exact root `signature` and `publisher_key` entries, preserves
-the rest of the document, and strips trailing empty lines
+The signature covers the **canonical manifest bytes**: the manifest file's
+content with every line whose trimmed form starts with `signature` or
+`publisher_key` followed by `=` removed, and trailing empty lines stripped
 (`canonical_manifest_bytes` in `signature.rs`). This makes the signature
-self-embeddable: sign the manifest without those root fields, then add them;
-verification removes them before checking.
+self-embeddable: you sign the manifest without the signature fields, then add
+them, and verification strips them back out before checking.
 
-Consequences worth knowing:
+Two consequences worth knowing:
 
-- Put the component's SHA-256 in the root `wasm_sha256` field before signing.
-  The signature then binds that digest to the manifest. The host verifies it
-  over the exact bytes it admits and compiles; strict mode rejects executable
-  manifests without it. The registry `sha256` below independently protects the
-  distribution archive in transit.
-- Nested fields with names such as `config_schema.properties.signature`, and
-  similarly prefixed root fields such as `signature_algorithm`, remain signed.
-  Reformatting or reordering retained content invalidates the signature. Sign
-  last, after the manifest is final.
-- Config exposure markers such as
-  `config_schema.properties.api_token.x-secret` are therefore
-  signature-covered policy. Changing a tool or channel property between public
-  config exposure and scoped `secrets.get` access requires rebuilding and
-  re-signing.
-- Packages signed by the former prefix-based canonicalizer need re-signing only
-  if they relied on one of those edge cases or on TOML decoration attached to a
-  removed field. Ordinary manifests keep the same signed content.
+- The `.wasm` component itself is **not** covered by the signature. What the
+  signature attests is the manifest: the name, version, capabilities, and
+  permissions a publisher stands behind. Pair it with a registry `sha256`
+  digest (below) when the artifact integrity matters in transit.
+- Canonicalization is line-based. Reformatting the manifest (reordering
+  lines, changing whitespace within a kept line) invalidates the signature.
+  Sign last, after the manifest is final.
 
 ### Keys and process
 
@@ -49,28 +39,9 @@ recovers the public key from a stored private key. There is no CLI wrapper
 for signing today; publishers drive these functions from a short Rust helper
 in their release pipeline.
 
-The signed manifest then carries two extra **root** fields: `signature` (the
-base64url value) and `publisher_key` (your hex public key). Put both before the
-first table header, including `[config_schema]`; appending them after a table
-header makes them members of that table under TOML rules and the host will see
-an unsigned manifest.
-
-```toml
-name = "my-plugin"
-version = "0.1.0"
-wasm_path = "my-plugin.wasm"
-wasm_sha256 = "<64-hex-character-component-sha256>"
-signature = "<base64url-signature>"
-publisher_key = "<hex-public-key>"
-
-[config_schema]
-type = "object"
-properties = {}
-additionalProperties = false
-```
-
-Operators who want to trust you add that hex key to their
-`plugins.security.trusted_publisher_keys` list:
+The signed manifest then carries two extra fields: `signature` (the base64url
+value) and `publisher_key` (your hex public key). Operators who want to trust
+you add that hex key to their `plugins.security.trusted_publisher_keys` list:
 
 ```bash
 zeroclaw config set plugins.security.signature_mode strict

@@ -243,7 +243,9 @@ where
 }
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
-    let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    let t: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid temperature '{s}': {e}"))?;
     config::schema::validate_temperature(t)
 }
 
@@ -2352,14 +2354,7 @@ async fn run_quickstart_cli(
             } => SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: kind,
                 alias,
-                token: extras
-                    .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
+                fields: extras.into_iter().collect(),
             }),
             ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
         })
@@ -2713,95 +2708,58 @@ fn plugin_host_with_configured_security(
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn installed_plugin_config_entries(
-    host: &zeroclaw::plugins::host::PluginHost,
-    plugin_name: &str,
-) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
-    let manifest = host
-        .manifest(plugin_name)
-        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    if manifest.config_schema.is_none()
-        || !manifest
-            .capabilities
-            .contains(&zeroclaw::plugins::PluginCapability::Tool)
-    {
-        return Ok(Vec::new());
-    }
-
-    // Tool registration currently owns the only package-name runtime binding.
-    // Alias-owned channel bindings must seed their actual instance key when
-    // their production construction path lands; install must not invent one.
-    let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
-        manifest,
-        zeroclaw::plugins::PluginCapability::Tool,
-        std::iter::empty(),
-    )?;
-    Ok(vec![(
-        zeroclaw::plugins::PluginCapability::Tool,
-        scope.id().config_entry_key()?,
-    )])
-}
-
-/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
-/// canonical default instance keys. `config set
-/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
-/// resolution, which only matches entries already present in live config.
-/// Idempotent: existing entries and operator values remain untouched.
-#[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entries(
+async fn seed_plugin_config_entry(
     config: &mut crate::config::schema::Config,
-    entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    plugin_name: &str,
 ) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-
     let whole_config_degraded = config
         .degraded_security
         .iter()
         .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
     if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
-        for (_, instance_key) in entries {
-            eprintln!(
-                "{}",
-                ta(
-                    "cli-plugin-config-entry-seed-skipped",
-                    &[("name", instance_key)],
-                    "warning: skipped seeding the plugin config entry: the \
-                     [plugins] section on disk is malformed. Repair it, add \
-                     `[[plugins.entries]]` with the instance key, then set values \
-                     with `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
-                )
-            );
-        }
-        return Ok(());
-    }
-
-    let mut created = Vec::new();
-    for (_, instance_key) in entries {
-        if config
-            .create_map_key("plugins.entries", instance_key)
-            .map_err(anyhow::Error::msg)?
-        {
-            config.mark_dirty(&format!("plugins.entries.{instance_key}"));
-            created.push(instance_key);
-        }
-    }
-    if created.is_empty() {
-        return Ok(());
-    }
-    Box::pin(config.save_dirty()).await?;
-    for instance_key in created {
-        println!(
+        eprintln!(
             "{}",
             ta(
-                "cli-plugin-config-entry-seeded",
-                &[("name", instance_key)],
-                "Seeded config entry. Set plugin config values with \
-                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                "cli-plugin-config-entry-seed-skipped",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the \
+                 [plugins] section on disk is malformed. Repair it, add \
+                 `[[plugins.entries]]` with the plugin name, then set values \
+                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
             )
         );
+        return Ok(());
     }
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
+            )
+        );
+        return Ok(());
+    }
+    let created = config
+        .create_map_key("plugins.entries", plugin_name)
+        .map_err(anyhow::Error::msg)?;
+    if !created {
+        return Ok(());
+    }
+    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", plugin_name)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+        )
+    );
     Ok(())
 }
 
@@ -3133,6 +3091,33 @@ enum MemoryCommands {
     Reindex,
 }
 
+/// Bootstrap the value of the global `--config-dir` flag before clap renders
+/// localized help. The command comes from [`Cli::command`], so clap remains
+/// responsible for option ownership, external-subcommand payloads, value
+/// parsing, and the option terminator.
+fn probe_config_dir(
+    command: &clap::Command,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<String> {
+    // Help and version normally return display errors before exposing matches.
+    // In this bootstrap view, make them ordinary parse boundaries and retain
+    // the matches clap accumulated before the boundary.
+    let matches = command
+        .clone()
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .disable_version_flag(true)
+        .ignore_errors(true)
+        .try_get_matches_from(args)
+        .ok()?;
+
+    matches
+        .try_get_one::<String>("config_dir")
+        .ok()
+        .flatten()
+        .cloned()
+}
+
 fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
     #[cfg(feature = "agent-runtime")]
     {
@@ -3305,9 +3290,26 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn main() -> Result<()> {
+    let command = Cli::command();
+
+    // Locale detection runs while clap builds localized help, so expose the CLI
+    // override through the bootstrap env before either i18n or Tokio starts.
+    // Empty values remain for clap's canonical parse/validation path below.
+    if let Some(config_dir) = probe_config_dir(&command, std::env::args_os())
+        && !config_dir.trim().is_empty()
+    {
+        // SAFETY: this synchronous bootstrap runs before the Tokio runtime (and
+        // therefore its worker threads) is constructed.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+    }
+
+    async_main(command)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+async fn async_main(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -3323,7 +3325,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let cmd = apply_i18n_to_command(Cli::command());
+    let cmd = apply_i18n_to_command(command);
 
     if std::env::args_os().len() <= 1 {
         return print_no_command_help(cmd);
@@ -3331,12 +3333,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
 
-    if let Some(config_dir) = &cli.config_dir {
-        if config_dir.trim().is_empty() {
-            bail!("--config-dir cannot be empty");
-        }
-        // SAFETY: called early in main before any threads are spawned.
-        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+    if let Some(config_dir) = &cli.config_dir
+        && config_dir.trim().is_empty()
+    {
+        bail!("--config-dir cannot be empty");
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -3647,7 +3647,7 @@ async fn main() -> Result<()> {
             agent,
         } => {
             Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
-            return Ok(());
+            Ok(())
         }
 
         Commands::Agent {
@@ -4096,10 +4096,12 @@ async fn main() -> Result<()> {
                             &current_config.data_dir,
                             None,
                         )?);
+                    let route_adapter = build_sop_route_adapter(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
                         mem,
+                        route_adapter,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -4857,10 +4859,12 @@ async fn main() -> Result<()> {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
                     );
+                    let route_adapter = build_sop_route_adapter(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
                         mem,
+                        route_adapter,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -5116,7 +5120,7 @@ async fn main() -> Result<()> {
         Commands::Locales { locales_command } => {
             let LocalesCommands::Fetch { locale, catalog } = locales_command;
             fetch_locales(&locale, catalog.as_deref()).await?;
-            return Ok(());
+            Ok(())
         }
 
         Commands::Update {
@@ -6119,7 +6123,6 @@ async fn main() -> Result<()> {
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
-                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6128,7 +6131,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6147,7 +6150,6 @@ async fn main() -> Result<()> {
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
-                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6159,7 +6161,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 }
                 Ok(())
             }
@@ -6206,17 +6208,6 @@ async fn main() -> Result<()> {
                                 "Permissions"
                             )
                         );
-                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
-                        {
-                            println!(
-                                "{}",
-                                ta(
-                                    "cli-plugin-config-entry-key",
-                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
-                                    "Config entry key"
-                                )
-                            );
-                        }
                         match &info.wasm_path {
                             Some(path) => println!(
                                 "{}",
@@ -7567,6 +7558,97 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
+/// Build the SOP approval route adapter from the configured channel map, so a SOP
+/// that parks at a policied gate (or later times out) can deliver its approval
+/// request / escalation notice to a real channel (Discord, Slack, ...). Returns
+/// `None` when no channels are configured, in which case `build_sop_engine` falls
+/// back to the log-only no-op adapter (unchanged behavior). MUST be called from
+/// within the tokio runtime: it captures `Handle::current()` so the sync,
+/// under-the-engine-lock `deliver` can fire-and-forget the async channel `send`.
+#[cfg(feature = "agent-runtime")]
+fn build_sop_route_adapter(
+    config: &Config,
+) -> Option<std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter>> {
+    let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
+    // Startup validation: this send-only adapter's channel map omits channels that
+    // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
+    // configured approval route whose channel is absent here, so a `request_route` /
+    // `escalation_route` that would silently fail to deliver at gate time is caught up
+    // front rather than on the first parked gate. This runs BEFORE the empty-map return:
+    // when there are no deliverable channels at all, EVERY configured route is
+    // undeliverable and must still be surfaced.
+    // A route target must be a channel that can actually deliver OUTBOUND; an
+    // inbound-only channel (e.g. AMQP, whose `send` is a no-op) in the map cannot send
+    // an approval notice, so it is not a resolvable route target.
+    let deliverable_keys: std::collections::HashSet<String> = channels
+        .iter()
+        .filter(|(_, ch)| ch.supports_outbound_send())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for issue in zeroclaw_runtime::sop::approval::unresolvable_approval_routes(
+        &config.sop.approval,
+        &deliverable_keys,
+    ) {
+        match issue {
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::Malformed {
+                policy,
+                route_kind,
+                route,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                        })),
+                    "SOP approval route is malformed; use the required channel:recipient format"
+                );
+            }
+            zeroclaw_runtime::sop::approval::ApprovalRouteIssue::UndeliverableChannel {
+                policy,
+                route_kind,
+                route,
+                channel_key,
+            } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "policy": policy,
+                            "route_kind": route_kind,
+                            "route": route,
+                            "channel": channel_key,
+                        })),
+                    "SOP approval route names a channel the route adapter cannot deliver to; \
+                     its approval notices will not be sent (the channel may require runtime SOP \
+                     handles this send-only adapter lacks)"
+                );
+            }
+        }
+    }
+    if channels.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(
+        zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
+            channels,
+            tokio::runtime::Handle::current(),
+        ),
+    ))
+}
+
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
@@ -7675,7 +7757,12 @@ async fn run_sop_maintenance_tick(
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
                     report.cron_started += 1;
                 }
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced { .. } => {
+                    // A2: deferred (backpressure) / coalesced triggers did not start a
+                    // run this tick; the cron schedule re-fires them next pass. The
+                    // precise outcome is logged by process_headless_results below.
                     report.cron_skipped += 1;
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
@@ -7914,6 +8001,102 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn probe_config_dir_extracts_global_flag_in_all_forms() {
+        fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
+            parts
+                .iter()
+                .map(|s| std::ffi::OsString::from(*s))
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+
+        let command = Cli::command();
+
+        // argv[0] is consumed by clap as the binary name.
+        // Space form.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "/x"])),
+            Some("/x".to_string())
+        );
+        // Equals form.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir=/y"])),
+            Some("/y".to_string())
+        );
+        // Global arg: may appear *after* a subcommand.
+        assert_eq!(
+            probe_config_dir(
+                &command,
+                argv(&["zeroclaw", "status", "--config-dir", "/z"])
+            ),
+            Some("/z".to_string())
+        );
+        // Absent.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "status"])),
+            None
+        );
+        // `--` ends option parsing; later values must never redirect config.
+        assert_eq!(
+            probe_config_dir(
+                &command,
+                argv(&[
+                    "zeroclaw",
+                    "config",
+                    "set",
+                    "locale",
+                    "--",
+                    "--config-dir=/ignored",
+                ])
+            ),
+            None
+        );
+        // Present but empty — returned verbatim for clap's validation path.
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", ""])),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn probe_config_dir_follows_clap_token_ownership() {
+        fn argv(parts: &[&str]) -> std::vec::IntoIter<std::ffi::OsString> {
+            parts
+                .iter()
+                .map(|s| std::ffi::OsString::from(*s))
+                .collect::<Vec<_>>()
+                .into_iter()
+        }
+
+        let command = Cli::command();
+        let external_payload = [
+            "zeroclaw",
+            "props",
+            "legacy-command",
+            "--config-dir=/unintended",
+        ];
+
+        // The external subcommand owns every remaining token, including one
+        // that looks like a global option.
+        let cli = Cli::try_parse_from(external_payload)
+            .expect("the deprecated external-subcommand path is valid clap input");
+        assert!(cli.config_dir.is_none());
+        assert_eq!(probe_config_dir(&command, argv(&external_payload)), None);
+
+        // Option-looking and terminating tokens cannot satisfy the spaced
+        // form's required value.
+        assert!(Cli::try_parse_from(["zeroclaw", "--config-dir", "--help"]).is_err());
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--help"])),
+            None
+        );
+        assert_eq!(
+            probe_config_dir(&command, argv(&["zeroclaw", "--config-dir", "--"])),
+            None
+        );
+    }
 
     #[test]
     fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
@@ -9083,6 +9266,8 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));

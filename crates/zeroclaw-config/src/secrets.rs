@@ -23,17 +23,13 @@
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
 
 /// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
+#[cfg(test)]
 const KEY_LEN: usize = 32;
-
-const KEYED_DIGEST_DOMAIN: &[u8] = b"zeroclaw.secret-store.keyed-digest.v1\0";
 
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
@@ -159,7 +155,7 @@ impl SecretStore {
 
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let key_bytes = self.load_existing_key()?;
+        let key_bytes = self.load_or_create_key()?;
         let key = Key::from_slice(&key_bytes);
         let cipher = ChaCha20Poly1305::new(key);
 
@@ -182,7 +178,7 @@ impl SecretStore {
     fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
         let ciphertext = hex_decode(hex_str)
             .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
-        let key = self.load_existing_key()?;
+        let key = self.load_or_create_key()?;
         let plaintext_bytes = xor_cipher(&ciphertext, &key);
         String::from_utf8(plaintext_bytes)
             .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
@@ -203,27 +199,12 @@ impl SecretStore {
         value.starts_with("enc2:")
     }
 
-    /// Compute a domain-separated keyed digest using the existing install key.
-    ///
-    /// This read-only variant never creates `.secret_key`; callers fail closed
-    /// when the key is absent. It is suitable for blind database indexes that
-    /// must not be enumerable without the install secret.
-    pub fn keyed_digest(&self, domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
-        let key = self.load_existing_key()?;
-        keyed_digest_with_key(&key, domain, data)
-    }
-
-    /// Compute a domain-separated keyed digest, creating the install key when
-    /// needed for a write that will persist new encrypted material.
-    pub fn keyed_digest_or_create(&self, domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
-        let key = self.load_or_create_key()?;
-        keyed_digest_with_key(&key, domain, data)
-    }
-
     /// Load the encryption key from disk, or create one if it doesn't exist.
-    fn load_or_create_key(&self) -> Result<Zeroizing<Vec<u8>>> {
+    fn load_or_create_key(&self) -> Result<Vec<u8>> {
         if self.key_path.exists() {
-            self.load_existing_key()
+            let hex_key =
+                fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
+            hex_decode(hex_key.trim()).context("Secret key file is corrupt")
         } else {
             let key = generate_random_key();
             if let Some(parent) = self.key_path.parent() {
@@ -258,7 +239,7 @@ impl SecretStore {
                         "USERNAME environment variable is empty; \
                          cannot restrict key file permissions via icacls"
                     );
-                    return Ok(Zeroizing::new(key));
+                    return Ok(key);
                 };
 
                 // First, ensure the current user owns the file. Without this,
@@ -352,37 +333,9 @@ impl SecretStore {
                 }
             }
 
-            Ok(Zeroizing::new(key))
+            Ok(key)
         }
     }
-
-    /// Read and validate the existing install key without creating a
-    /// replacement. Decrypt/read paths must use this helper so key loss cannot
-    /// silently install a new key that makes recovery harder.
-    fn load_existing_key(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let hex_key = Zeroizing::new(fs::read_to_string(&self.key_path).with_context(|| {
-            format!(
-                "Failed to read existing `.secret_key` at {}",
-                self.key_path.display()
-            )
-        })?);
-        let key = hex_decode(hex_key.trim()).context("Secret key file is corrupt")?;
-        anyhow::ensure!(
-            key.len() == KEY_LEN,
-            "Secret key file is corrupt (expected {KEY_LEN} bytes)"
-        );
-        Ok(Zeroizing::new(key))
-    }
-}
-
-fn keyed_digest_with_key(key: &[u8], domain: &[u8], data: &[u8]) -> Result<[u8; 32]> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
-        .map_err(|_| anyhow::Error::msg("Secret key file is corrupt"))?;
-    mac.update(KEYED_DIGEST_DOMAIN);
-    mac.update(&(domain.len() as u64).to_be_bytes());
-    mac.update(domain);
-    mac.update(data);
-    Ok(mac.finalize().into_bytes().into())
 }
 
 /// XOR cipher with repeating key. Same function for encrypt and decrypt.
@@ -826,54 +779,6 @@ exit 65
         let encrypted = store1.encrypt("secret-for-store1").unwrap();
         let result = store2.decrypt(&encrypted);
         assert!(result.is_err(), "Decrypting with a different key must fail");
-    }
-
-    #[test]
-    fn decrypt_with_missing_key_fails_without_creating_a_replacement() {
-        let source = TempDir::new().unwrap();
-        let missing = TempDir::new().unwrap();
-        let encrypted = SecretStore::new(source.path(), true)
-            .encrypt("preserve-recovery-path")
-            .unwrap();
-        let store = SecretStore::new(missing.path(), true);
-
-        let error = store
-            .decrypt(&encrypted)
-            .expect_err("missing install key must fail closed");
-        assert!(error.to_string().contains(".secret_key"));
-        assert!(
-            !missing.path().join(".secret_key").exists(),
-            "a read failure must not create a wrong replacement key"
-        );
-    }
-
-    #[test]
-    fn keyed_digests_are_stable_domain_separated_and_read_only_by_default() {
-        let tmp = TempDir::new().unwrap();
-        let store = SecretStore::new(tmp.path(), true);
-        assert!(store.keyed_digest(b"owner", b"same").is_err());
-        assert!(!tmp.path().join(".secret_key").exists());
-
-        let first = store.keyed_digest_or_create(b"owner", b"same").unwrap();
-        assert_eq!(store.keyed_digest(b"owner", b"same").unwrap(), first);
-        assert_ne!(store.keyed_digest(b"row", b"same").unwrap(), first);
-        assert_ne!(store.keyed_digest(b"owner", b"other").unwrap(), first);
-        assert_eq!(
-            SecretStore::new(tmp.path(), false)
-                .keyed_digest(b"owner", b"same")
-                .unwrap(),
-            first,
-            "blind-index derivation is independent of config plaintext preference"
-        );
-    }
-
-    #[test]
-    fn corrupt_length_secret_key_is_rejected_without_panicking() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(".secret_key"), "00").unwrap();
-        let store = SecretStore::new(tmp.path(), true);
-        assert!(store.keyed_digest(b"owner", b"value").is_err());
-        assert!(store.encrypt("value").is_err());
     }
 
     #[test]

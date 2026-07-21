@@ -591,23 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn plugin_config_entry_key_formats_in_every_builtin_locale() {
-        let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
-        for (source, locale) in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
-            let value = format_ftl_message(source, locale, "cli-plugin-config-entry-key", &args)
-                .unwrap_or_else(|| panic!("plugin config entry key should format in {locale}"));
-            assert!(value.contains("Tool"));
-            assert!(value.contains("zpi1_fixture"));
-        }
-    }
-
-    #[test]
     fn channel_runtime_committed_cli_catalogs_format_from_fluent() {
         let cases = [
             (
@@ -627,6 +610,23 @@ mod tests {
                 "channel-runtime-model-switched",
                 &[("model", "gpt-test"), ("provider", "openai.default")][..],
                 ["gpt-test", "openai.default"].as_slice(),
+            ),
+            (
+                "channel-runtime-agent-scope-rejected",
+                &[
+                    ("sender", "zeroclaw_user"),
+                    ("agent", "agent-alpha"),
+                    ("model", "gpt-test"),
+                ][..],
+                [
+                    "zeroclaw_user",
+                    "agent-alpha",
+                    "/model --agent",
+                    "/model --user gpt-test",
+                    "admin_for_agent_scope",
+                    "true",
+                ]
+                .as_slice(),
             ),
             ("channel-runtime-request-timeout", &[][..], [].as_slice()),
             (

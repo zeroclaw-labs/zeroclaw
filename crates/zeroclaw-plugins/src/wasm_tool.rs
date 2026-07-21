@@ -2,12 +2,12 @@
 
 use crate::PluginCapability;
 use crate::component::PluginLimits;
-use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::runtime;
-use crate::services::PluginHostServices;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
@@ -16,9 +16,9 @@ pub struct WasmTool {
     name: String,
     description: String,
     parameters_schema: Value,
-    component: AdmittedComponent,
+    wasm_path: PathBuf,
     scope: PluginInstanceScope,
-    services: PluginHostServices,
+    config: HashMap<String, String>,
     limits: PluginLimits,
 }
 
@@ -37,25 +37,23 @@ impl Attributable for WasmTool {
 }
 
 impl WasmTool {
-    /// Build an adapter from already-read metadata and a live host-service bundle.
     pub fn new(
         name: String,
         description: String,
         parameters_schema: Value,
-        component: AdmittedComponent,
+        wasm_path: PathBuf,
         scope: PluginInstanceScope,
-        services: PluginHostServices,
+        config: HashMap<String, String>,
         limits: PluginLimits,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
-        services.resolve_config(&scope)?;
         Ok(Self {
             name,
             description,
             parameters_schema,
-            component,
+            wasm_path,
             scope,
-            services,
+            config,
             limits,
         })
     }
@@ -63,23 +61,19 @@ impl WasmTool {
     /// Create a `WasmTool` by loading its required metadata exports.
     ///
     /// Components that cannot be loaded, instantiated, or queried are rejected
-    /// instead of being registered with synthetic metadata. `services` must
-    /// resolve canonical live config under the supplied instance scope.
+    /// instead of being registered with synthetic metadata.
     pub fn from_wasm(
-        component: AdmittedComponent,
+        wasm_path: PathBuf,
         scope: PluginInstanceScope,
-        services: PluginHostServices,
+        config: HashMap<String, String>,
         limits: PluginLimits,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
-        services.resolve_config(&scope)?;
         let probe = {
-            let component = component.clone();
+            let wasm_path = wasm_path.clone();
             let scope = scope.clone();
-            let services = services.clone();
             block_probe(async move {
-                let mut plugin =
-                    runtime::create_plugin(&component, &scope, &services, limits).await?;
+                let mut plugin = runtime::create_plugin(&wasm_path, &scope, limits).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -89,9 +83,9 @@ impl WasmTool {
             name: meta.name,
             description: meta.description,
             parameters_schema: meta.parameters_schema,
-            component,
+            wasm_path,
             scope,
-            services,
+            config,
             limits,
         })
     }
@@ -134,29 +128,17 @@ impl Tool for WasmTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
-        self.services.resolve_config(&self.scope)?;
-        let mut plugin =
-            runtime::create_plugin(&self.component, &self.scope, &self.services, self.limits)
-                .await?;
-        runtime::call_execute(&mut plugin, &args_json).await
+        let mut plugin = runtime::create_plugin(&self.wasm_path, &self.scope, self.limits).await?;
+        runtime::call_execute(&mut plugin, &args_json, &self.config).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PluginConfigResolver;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
 
     fn tool_scope() -> PluginInstanceScope {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
-    }
-
-    fn component() -> AdmittedComponent {
-        AdmittedComponent::test_component(b"not-a-component")
     }
 
     #[test]
@@ -166,9 +148,9 @@ mod tests {
             "redact".to_string(),
             "does things".to_string(),
             schema.clone(),
-            component(),
+            PathBuf::from("/tmp/plugin.wasm"),
             tool_scope(),
-            crate::services::test_host_services(),
+            HashMap::new(),
             crate::component::test_limits(1_000),
         )
         .expect("tool scope matches adapter");
@@ -188,9 +170,9 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            component(),
+            PathBuf::from("/tmp/plugin.wasm"),
             scope,
-            crate::services::test_host_services(),
+            HashMap::new(),
             crate::component::test_limits(0),
         );
 
@@ -198,85 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_invalid_config() {
-        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
-            Err(crate::error::PluginError::InvalidConfig(
-                "invalid-constructor-config".to_string(),
-            ))
-        }));
-        let result = WasmTool::new(
-            "my_tool".to_string(),
-            "does things".to_string(),
-            serde_json::json!({}),
-            component(),
-            tool_scope(),
-            services,
-            crate::component::test_limits(0),
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn from_wasm_rejects_invalid_component_bytes() {
+    fn from_wasm_rejects_a_missing_component() {
         let result = WasmTool::from_wasm(
-            component(),
+            PathBuf::from("/path/that/must/not/exist.wasm"),
             tool_scope(),
-            crate::services::test_host_services(),
+            HashMap::new(),
             crate::component::test_limits(0),
         );
 
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn from_wasm_validates_config_before_loading_guest_code() {
-        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
-            Err(crate::error::PluginError::InvalidConfig(
-                "invalid-before-load".to_string(),
-            ))
-        }));
-        let error = WasmTool::from_wasm(
-            component(),
-            tool_scope(),
-            services,
-            crate::component::test_limits(0),
-        )
-        .err()
-        .expect("invalid config must reject registration");
-
-        assert!(error.to_string().contains("invalid-before-load"));
-    }
-
-    #[tokio::test]
-    async fn execute_revalidates_live_config_before_loading_guest_code() {
-        let reject = Arc::new(AtomicBool::new(false));
-        let reject_for_resolver = Arc::clone(&reject);
-        let services = crate::services::test_services(PluginConfigResolver::new(move |scope| {
-            if reject_for_resolver.load(Ordering::Relaxed) {
-                return Err(crate::error::PluginError::InvalidConfig(
-                    "invalid-before-execute".to_string(),
-                ));
-            }
-            crate::services::test_host_services().resolve_config(scope)
-        }));
-        let tool = WasmTool::new(
-            "my_tool".to_string(),
-            "does things".to_string(),
-            serde_json::json!({}),
-            component(),
-            tool_scope(),
-            services,
-            crate::component::test_limits(0),
-        )
-        .expect("initial live config must be valid");
-
-        reject.store(true, Ordering::Relaxed);
-        let error = tool
-            .execute(serde_json::json!({}))
-            .await
-            .expect_err("live config must be revalidated before loading guest code");
-
-        assert!(error.to_string().contains("invalid-before-execute"));
     }
 }

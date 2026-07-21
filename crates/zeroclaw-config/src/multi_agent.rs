@@ -11,6 +11,7 @@ crate::define_provider_ref!(AgentAlias, "agents");
 crate::define_provider_ref!(PeerGroupName, "peer_groups");
 crate::define_provider_ref!(PeerUsername, "channels.peers");
 
+/// A cross-agent filesystem grant from a workspace allowlist entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +25,7 @@ pub enum AccessMode {
     ReadWrite,
 }
 
+/// Selects the memory backend used by an agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +50,7 @@ pub enum MemoryBackendKind {
     Lucid,
 }
 
+/// Per-agent workspace and cross-agent access configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent_workspace"]
@@ -57,14 +60,17 @@ pub struct AgentWorkspaceConfig {
     /// `<install>/agents/<alias>/workspace/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// Cross-agent workspace allowlist. An empty map grants no sibling access.
     pub access: BTreeMap<AgentAlias, AccessMode>,
     /// Escape hatch: when `true`, the agent can read or write anywhere
     /// the host filesystem permits. Off by default; flipping this on is
     /// auditable.
     pub unrestricted_filesystem: bool,
+    /// Cross-agent memory allowlist. An empty list grants access only to local memory.
     pub read_memory_from: Vec<AgentAlias>,
 }
 
+/// Per-agent memory backend selection and its persistence contract.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent_memory"]
@@ -75,6 +81,7 @@ pub struct AgentMemoryConfig {
     pub backend: MemoryBackendKind,
 }
 
+/// Preferred output modality for a peer group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +127,7 @@ pub struct PeerGroupConfig {
     pub admin_for_agent_scope: bool,
 }
 
+/// Inbound A2A discovery server configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "a2a_server"]
@@ -138,9 +146,11 @@ pub struct A2aServerConfig {
     /// derives from the gateway port. Advertise-only: nothing binds here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Operator-supplied base URL advertised in agent card endpoints.
     pub public_base_url: String,
 }
 
+/// A2A section wrapper that leaves room for future sibling configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "a2a"]
@@ -151,6 +161,7 @@ pub struct A2aServerSection {
     pub server: A2aServerConfig,
 }
 
+/// Per-agent A2A publication and exposed-skill configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent_a2a"]
