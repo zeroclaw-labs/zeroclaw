@@ -363,10 +363,6 @@ mod tests {
         assert_eq!(resolve_next(&ctx), NextStep::Step(3));
     }
 
-    // Regression: a true top-level `when` plus a non-empty switch with no
-    // matching port must complete, even when an explicit `routing.next` is
-    // also declared. Pre-#8771 and the pre-PR master both return Complete
-    // here; the original patch incorrectly fell through to `next`.
     #[test]
     fn true_guard_unmatched_switch_with_explicit_next_completes() {
         let switch_rules = vec![SwitchRule {
@@ -392,10 +388,6 @@ mod tests {
         assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
-    // Regression: same as above but no explicit `next`; the linear
-    // successor (step 2) exists and would be the natural fallthrough if
-    // the unmatched switch fell through. The unmatched switch must still
-    // complete the run.
     #[test]
     fn true_guard_unmatched_switch_with_linear_successor_completes() {
         let switch_rules = vec![SwitchRule {
@@ -420,9 +412,6 @@ mod tests {
         assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
-    // Regression: same branch as above but with an absent top-level
-    // `when` (None). Absent is the same as true for the routing decision;
-    // it must also complete on an unmatched switch.
     #[test]
     fn absent_guard_unmatched_switch_with_linear_successor_completes() {
         let switch_rules = vec![SwitchRule {
@@ -444,8 +433,6 @@ mod tests {
         assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
-    // Regression: same branch with absent guard and explicit `next` —
-    // still must complete, not fall through to `next`.
     #[test]
     fn absent_guard_unmatched_switch_with_explicit_next_completes() {
         let switch_rules = vec![SwitchRule {
@@ -467,18 +454,11 @@ mod tests {
         assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 
-    // Regression: false top-level `when` + `terminal: true` + an
-    // available linear successor — terminal must win. Lifts the
-    // precedence note out of prose and pins it as executable behavior.
     #[test]
     fn false_guard_terminal_with_available_successor_completes() {
         let mut step1 = step(1);
         step1.routing.when = Some("$.steps.1.enabled == true".to_string());
         step1.routing.terminal = true;
-        // Also wire a non-empty switch with a catch-all so the test would
-        // catch a regression that lets the switch evaluate when guard is
-        // false. With terminal=true and a false guard, the answer must be
-        // Complete regardless.
         step1.routing.switch = vec![SwitchRule {
             name: "catch_all".to_string(),
             when: None,
