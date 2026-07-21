@@ -553,6 +553,7 @@ mod tests {
             output: output.to_string(),
             started_at: now_iso8601(),
             completed_at: Some(now_iso8601()),
+            effective_agent: None,
             tool_calls: Vec::new(),
         }
     }
