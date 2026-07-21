@@ -208,11 +208,11 @@ impl Tool for ClaudeCodeRunnerTool {
         }
         // Pass session metadata via env vars so the hook can correlate events
         use std::fmt::Write;
-        let _ = write!(env_exports, "CLAUDE_CODE_SESSION_ID={} ", &session_id);
+        let _ = write!(env_exports, "CLAUDE_CODE_SESSION_ID={} ", session_id);
         if let Some(ref ch) = slack_channel {
             let _ = write!(env_exports, "CLAUDE_CODE_SLACK_CHANNEL={} ", ch);
         }
-        let _ = write!(env_exports, "CLAUDE_CODE_HOOK_URL={} ", &hook_url);
+        let _ = write!(env_exports, "CLAUDE_CODE_HOOK_URL={} ", hook_url);
 
         // Create tmux session
         let create_result = Command::new("tmux")

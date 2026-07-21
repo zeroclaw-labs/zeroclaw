@@ -420,10 +420,7 @@ impl SopMetricsCollector {
             }
             if let Some(sop_key) = best_key {
                 let suffix = &rest[sop_key.len() + 1..];
-                match state.per_sop.get(sop_key) {
-                    Some(c) => (c, suffix),
-                    None => return None,
-                }
+                (state.per_sop.get(sop_key)?, suffix)
             } else {
                 // No matching SOP name prefix — treat as global metric
                 // (handles case where metric name contains dots but isn't per-SOP)

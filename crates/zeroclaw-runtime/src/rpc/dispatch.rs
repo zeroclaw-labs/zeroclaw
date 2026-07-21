@@ -4561,12 +4561,7 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens: _,
-            output_tokens: _,
-            ..
-        } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
