@@ -32,6 +32,7 @@ zerocode = { path = "apps/zerocode", version = "0.8.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 sys-locale = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 [package]
 name = "zeroclawlabs"
@@ -176,7 +177,7 @@ lru = { version = "0.16", optional = true }
 
 # Memory / persistence (migration.rs, behind agent-runtime)
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono.workspace = true
 chrono-tz = { version = "0.10", optional = true }
 cron = { version = "0.15", optional = true }
 
