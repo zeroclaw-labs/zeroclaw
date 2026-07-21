@@ -2512,6 +2512,32 @@ mod tests {
     }
 
     #[test]
+    fn is_tool_allowed_gates_shared_and_system_memory_writes_by_name() {
+        // The shared/system memory write tiers are gated by tool NAME, the same
+        // mechanism as any native tool. An unconstrained profile has both; a
+        // profile that excludes system keeps shared but loses system; a
+        // non-empty allowlist admits only the listed tier.
+        let unconstrained = SecurityPolicy::default();
+        assert!(unconstrained.is_tool_allowed("shared_memory_store"));
+        assert!(unconstrained.is_tool_allowed("system_memory_store"));
+
+        let shared_not_system = SecurityPolicy {
+            excluded_tools: Some(vec!["system_memory_store".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(shared_not_system.is_tool_allowed("shared_memory_store"));
+        assert!(!shared_not_system.is_tool_allowed("system_memory_store"));
+
+        let only_shared = SecurityPolicy {
+            allowed_tools: Some(vec!["memory_recall".into(), "shared_memory_store".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(only_shared.is_tool_allowed("shared_memory_store"));
+        assert!(!only_shared.is_tool_allowed("system_memory_store"));
+        assert!(!only_shared.is_tool_allowed("memory_store"));
+    }
+
+    #[test]
     fn is_tool_excluded_reflects_denylist_independent_of_allowlist() {
         // No denylist → nothing excluded, regardless of allowlist.
         let none = SecurityPolicy {

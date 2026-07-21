@@ -79,6 +79,7 @@ pub mod report_templates;
 pub mod screenshot;
 pub mod send_via;
 pub mod sessions;
+pub mod shared_memory_store;
 pub mod text_browser;
 pub mod tool_search;
 pub mod weather_tool;
@@ -93,6 +94,8 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_forget",
     "memory_export",
     "memory_purge",
+    "shared_memory_store",
+    "system_memory_store",
 ];
 
 #[cfg(test)]
@@ -120,6 +123,14 @@ mod memory_tool_names_guard {
             )),
             Box::new(memory_export::MemoryExportTool::new(memory.clone())),
             Box::new(memory_purge::MemoryPurgeTool::new(
+                memory.clone(),
+                security.clone(),
+            )),
+            Box::new(shared_memory_store::SharedMemoryStoreTool::new_shared(
+                memory.clone(),
+                security.clone(),
+            )),
+            Box::new(shared_memory_store::SharedMemoryStoreTool::new_system(
                 memory.clone(),
                 security.clone(),
             )),

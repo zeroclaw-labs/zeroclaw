@@ -101,6 +101,21 @@ pub fn find_text_conflicts(
         .collect()
 }
 
+/// Category-agnostic near-duplicate finder used by the per-turn Daily dedup
+/// gate. Unlike [`find_text_conflicts`] this does not restrict to Core and
+/// treats similarity `>= threshold` as a match (so an exact/near-identical
+/// summary is caught even at threshold `1.0`). Callers pre-filter the candidate
+/// set to the category/scope they care about.
+pub fn find_similar(entries: &[MemoryEntry], new_content: &str, threshold: f64) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.superseded_by.is_none() && jaccard_similarity(&e.content, new_content) >= threshold
+        })
+        .map(|e| e.id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

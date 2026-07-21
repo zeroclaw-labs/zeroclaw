@@ -108,6 +108,7 @@ pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+pub use zeroclaw_tools::shared_memory_store::SharedMemoryStoreTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
@@ -622,7 +623,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryRecallTool::with_default_limit(
+            memory.clone(),
+            root_config.effective_memory_recall_tool_limit(agent_alias),
+        )),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
@@ -658,6 +662,27 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
     ];
+
+    // Shared/system memory write tools: registered only when the agent's
+    // backend actually supports the tier (hindsight WITH the relevant bank
+    // configured). Non-hindsight agents, or hindsight agents without a
+    // shared/system bank, never see a tool that could only ever refuse. WHO may
+    // call each tier is then gated per agent by the risk-profile
+    // `allowed_tools`/`excluded_tools` filter, since the tiers are distinct
+    // tool names. Writes here are explicit-only; automatic consolidation still
+    // targets the private bank via `memory.store`.
+    if SharedMemoryStoreTool::is_supported(&memory, false) {
+        tool_arcs.push(Arc::new(SharedMemoryStoreTool::new_shared(
+            memory.clone(),
+            security.clone(),
+        )));
+    }
+    if SharedMemoryStoreTool::is_supported(&memory, true) {
+        tool_arcs.push(Arc::new(SharedMemoryStoreTool::new_system(
+            memory.clone(),
+            security.clone(),
+        )));
+    }
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active

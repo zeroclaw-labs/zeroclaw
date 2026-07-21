@@ -23,6 +23,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs", "sync", "time"] }
+urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 
@@ -33,3 +34,4 @@ memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
 filetime = "0.2"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
