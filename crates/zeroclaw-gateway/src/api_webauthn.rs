@@ -1,5 +1,4 @@
 //! WebAuthn gateway API handlers for hardware key registration and authentication.
-//!
 //! All endpoints require bearer token authentication (PairingGuard) and the
 //! `webauthn` feature flag.
 

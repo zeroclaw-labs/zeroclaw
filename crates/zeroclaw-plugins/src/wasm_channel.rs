@@ -1,11 +1,6 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
-//!
-//! The polling/outbound store is warm and held behind an async mutex. Webhook
-//! parsing uses a disposable configured store per request so host cancellation
-//! cannot poison the warm instance. `listen` runs the inbound bridges.
 
-use crate::PluginPermission;
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
@@ -14,11 +9,15 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
     WebhookRejection as WitWebhookRejection,
 };
-use crate::component::{PluginState, call_plugin, engine, load_component_with_digest, wt};
+use crate::component::{
+    PluginState, PluginStoreSpec, call_channel, call_channel_store, call_store, engine,
+    load_component, wt,
+};
+use crate::endpoint::PluginChannelEndpoint;
+use crate::host::AdmittedComponent;
+use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -33,49 +32,15 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
 
-/// Host-supplied sender authorization for normalized inbound messages.
-///
-/// The runtime builds this resolver over the live canonical configuration. It
-/// is intentionally a closure rather than an allowlist snapshot, so a channel
-/// never owns a second copy of authorization state.
+/// Host-supplied authorization against the live canonical peer policy.
 pub type SenderAuthorizer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-
-/// A channel backed by a WIT component-model plugin.
-pub struct WasmChannel {
-    /// Canonical host-owned routing identity: `plugin.<manifest-name>` for a
-    /// novel plugin or `<provided-channel>.<config-alias>` for a mirror.
-    channel_ref: String,
-    capabilities: ChannelCapabilities,
-    state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
-    /// Verified executable and permission recipe plus an on-demand resolver for
-    /// canonical config/limits. Webhook parsing materializes a disposable store
-    /// from this factory so cancelling one request never poisons the warm channel
-    /// instance used by polling and outbound calls.
-    webhook_factory: ChannelInstanceFactory,
-    inbound: InboundQueue,
-    cached_self_handle: Option<String>,
-    cached_self_addressed_mention: Option<String>,
-    cached_multi_message_delay_ms: u64,
-    poll_healthy: Arc<AtomicBool>,
-    /// Applied at the final host boundary before any inbound transport can
-    /// forward a normalized message to the agent.
-    authorizer: SenderAuthorizer,
-    /// Sink-drain end for host-fed webhooks (set by the orchestrator when this
-    /// channel declares a `webhook-path`). Taken once by `listen`.
-    webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
-}
-
-/// Resolves the current configure payload and execution limits for a channel
-/// component. Production resolvers read the canonical shared `Config` handle on
-/// every call; the tuple is a per-call materialized view and is never cached.
-pub type ChannelRuntimeResolver =
-    Arc<dyn Fn() -> Result<(String, crate::component::PluginLimits)> + Send + Sync>;
 
 #[derive(Clone)]
 struct ChannelInstanceFactory {
+    endpoint: PluginChannelEndpoint,
     component: Arc<Component>,
-    permissions: Arc<[PluginPermission]>,
-    runtime: ChannelRuntimeResolver,
+    services: PluginHostServices,
+    limits: crate::component::PluginLimits,
 }
 
 impl ChannelInstanceFactory {
@@ -83,24 +48,36 @@ impl ChannelInstanceFactory {
         &self,
         inbound: InboundQueue,
     ) -> Result<(Store<PluginState>, ChannelPlugin)> {
-        let (config_json, limits) = (self.runtime)()?;
-        let mut store =
-            crate::component::new_store_with_inbound(self.permissions.as_ref(), inbound, limits);
+        self.services.resolve_config(self.endpoint.scope())?;
+        let mut store = crate::component::new_store(
+            PluginStoreSpec::new(
+                self.endpoint.scope().clone(),
+                self.services.clone(),
+                self.limits,
+            )
+            .with_granted_http()
+            .with_inbound(inbound),
+        );
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
-        let bindings = wt(
-            ChannelPlugin::instantiate_async(&mut store, self.component.as_ref(), &linker).await,
-            "failed to instantiate channel plugin",
-        )?;
-        wt(
-            bindings
-                .zeroclaw_plugin_channel()
-                .call_configure(&mut store, &config_json)
-                .await,
-            "channel.configure trapped",
-        )?
-        .map_err(anyhow::Error::msg)?;
+        let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                ChannelPlugin::instantiate_async(store, self.component.as_ref(), &linker).await,
+                "failed to instantiate channel plugin",
+            )
+        });
+        let bindings = bindings?;
+        let channel = bindings.zeroclaw_plugin_channel();
+        let configure_result: Result<()> =
+            call_channel_store!(store, async |store: &mut Store<PluginState>| {
+                wt(
+                    channel.call_configure(store).await,
+                    "channel.configure trapped",
+                )?
+                .map_err(anyhow::Error::msg)
+            });
+        configure_result?;
         Ok((store, bindings))
     }
 
@@ -110,21 +87,34 @@ impl ChannelInstanceFactory {
         body: &[u8],
     ) -> Result<Result<Vec<WitInboundMessage>, WitWebhookRejection>> {
         let (mut store, bindings) = self.instantiate(InboundQueue::default()).await?;
-        wt(
-            bindings
-                .zeroclaw_plugin_channel()
-                .call_parse_webhook(&mut store, headers, body)
-                .await,
-            "channel.parse-webhook trapped",
-        )
+        call_channel_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_channel()
+                    .call_parse_webhook(store, headers, body)
+                    .await,
+                "channel.parse-webhook trapped",
+            )
+        })
     }
 }
 
-fn fixed_runtime_resolver(
-    config_json: String,
-    limits: crate::component::PluginLimits,
-) -> ChannelRuntimeResolver {
-    Arc::new(move || Ok((config_json.clone(), limits)))
+/// A channel backed by a WIT component-model plugin.
+pub struct WasmChannel {
+    endpoint: PluginChannelEndpoint,
+    capabilities: ChannelCapabilities,
+    state: Mutex<(Store<PluginState>, ChannelPlugin)>,
+    webhook_factory: ChannelInstanceFactory,
+    inbound: InboundQueue,
+    // Static component metadata, fixed for one admitted logical binding.
+    // Changing the external account or these capabilities requires rebuilding
+    // the channel; point-of-use config refresh is only for that same binding.
+    cached_self_handle: Option<String>,
+    cached_self_addressed_mention: Option<String>,
+    cached_multi_message_delay_ms: u64,
+    poll_healthy: AtomicBool,
+    authorizer: SenderAuthorizer,
+    webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -143,32 +133,7 @@ impl Attributable for WasmChannel {
         Role::Channel(ChannelKind::Plugin)
     }
     fn alias(&self) -> &str {
-        split_channel_ref(&self.channel_ref)
-            .1
-            .unwrap_or(&self.channel_ref)
-    }
-}
-
-fn split_channel_ref(channel_ref: &str) -> (&str, Option<&str>) {
-    channel_ref
-        .split_once('.')
-        .map_or((channel_ref, None), |(channel_type, alias)| {
-            (channel_type, Some(alias))
-        })
-}
-
-/// Resolve the JSON config section handed to a channel plugin's `configure`.
-/// Withheld (an empty object) unless the manifest grants `ConfigRead`, so a
-/// plugin without the permission can never be configured with another channel's
-/// secrets. Mirrors the tool-plugin `__config` rule.
-fn resolve_configure_json(
-    config: &HashMap<String, String>,
-    permissions: &[PluginPermission],
-) -> String {
-    if permissions.contains(&PluginPermission::ConfigRead) {
-        serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        "{}".to_string()
+        self.endpoint.alias()
     }
 }
 
@@ -192,90 +157,106 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 }
 
 impl WasmChannel {
-    /// Compile and instantiate one channel plugin from digest-bound bytes.
-    /// `channel_ref` is the host-owned routing identity. `runtime` resolves the
-    /// current permission-filtered config and execution limits whenever a warm
-    /// or disposable instance is configured.
-    async fn instantiate(
-        channel_ref: String,
-        wasm_path: &Path,
-        expected_sha256: Option<&str>,
-        permissions: &[PluginPermission],
-        runtime: ChannelRuntimeResolver,
+    pub async fn from_wasm(
+        endpoint: PluginChannelEndpoint,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
+        limits: crate::component::PluginLimits,
+    ) -> Result<Self> {
+        Self::from_wasm_with_authorizer(endpoint, component, services, limits, Arc::new(|_| false))
+            .await
+    }
+
+    pub async fn from_wasm_with_authorizer(
+        endpoint: PluginChannelEndpoint,
+        component: &AdmittedComponent,
+        services: &PluginHostServices,
+        limits: crate::component::PluginLimits,
         authorizer: SenderAuthorizer,
     ) -> Result<Self> {
         let factory = ChannelInstanceFactory {
-            component: Arc::new(load_component_with_digest(wasm_path, expected_sha256)?),
-            permissions: Arc::from(permissions),
-            runtime,
+            endpoint: endpoint.clone(),
+            component: Arc::new(load_component(component)?),
+            services: services.clone(),
+            limits,
         };
         let inbound = InboundQueue::default();
         let (mut store, bindings) = factory.instantiate(inbound.clone()).await?;
 
         let channel = bindings.zeroclaw_plugin_channel();
 
-        let capabilities = wt(
-            channel.call_get_channel_capabilities(&mut store).await,
-            "channel.get-channel-capabilities failed",
-        )?;
-
-        let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
-            wt(
-                channel.call_self_handle(&mut store).await,
-                "channel.self-handle failed",
-            )?
-        } else {
-            None
-        };
-        let cached_self_addressed_mention =
-            if capabilities.contains(ChannelCapabilities::SELF_ADDRESSED_MENTION) {
+        let static_exports: Result<_> = call_store!(store, async |store: &mut Store<
+            PluginState,
+        >| {
+            let capabilities = wt(
+                channel.call_get_channel_capabilities(&mut *store).await,
+                "channel.get-channel-capabilities failed",
+            )?;
+            let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
                 wt(
-                    channel.call_self_addressed_mention(&mut store).await,
-                    "channel.self-addressed-mention failed",
+                    channel.call_self_handle(&mut *store).await,
+                    "channel.self-handle failed",
                 )?
             } else {
                 None
             };
-        let cached_multi_message_delay_ms =
-            if capabilities.contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS) {
-                wt(
-                    channel.call_multi_message_delay_ms(&mut store).await,
-                    "channel.multi-message-delay-ms failed",
-                )?
-            } else {
-                800
-            };
+            let cached_self_addressed_mention =
+                if capabilities.contains(ChannelCapabilities::SELF_ADDRESSED_MENTION) {
+                    wt(
+                        channel.call_self_addressed_mention(&mut *store).await,
+                        "channel.self-addressed-mention failed",
+                    )?
+                } else {
+                    None
+                };
+            let cached_multi_message_delay_ms =
+                if capabilities.contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS) {
+                    wt(
+                        channel.call_multi_message_delay_ms(store).await,
+                        "channel.multi-message-delay-ms failed",
+                    )?
+                } else {
+                    800
+                };
+            Ok((
+                capabilities,
+                cached_self_handle,
+                cached_self_addressed_mention,
+                cached_multi_message_delay_ms,
+            ))
+        });
+        let (
+            capabilities,
+            cached_self_handle,
+            cached_self_addressed_mention,
+            cached_multi_message_delay_ms,
+        ) = static_exports?;
 
         Ok(Self {
-            channel_ref,
+            endpoint,
             capabilities,
-            state: Arc::new(Mutex::new((store, bindings))),
+            state: Mutex::new((store, bindings)),
             webhook_factory: factory,
             inbound,
             cached_self_handle,
             cached_self_addressed_mention,
             cached_multi_message_delay_ms,
-            poll_healthy: Arc::new(AtomicBool::new(true)),
+            poll_healthy: AtomicBool::new(true),
             authorizer,
             webhook_rx: std::sync::Mutex::new(None),
         })
     }
 
-    /// Whether this plugin advertises `webhook-ingress` (serves inbound via a
-    /// host webhook route rather than self-polling).
     pub fn has_webhook_ingress(&self) -> bool {
         self.capabilities
             .contains(ChannelCapabilities::WEBHOOK_INGRESS)
     }
 
-    /// The URL path segment this channel serves webhooks on, or `None` for a
-    /// poll-only channel. Calls the plugin's `webhook-path` export (only when it
-    /// advertised the capability).
     pub async fn webhook_path(&self) -> Option<String> {
         if !self.has_webhook_ingress() {
             return None;
         }
-        let result: Result<Option<String>> = call_plugin!(
+        let result: Result<Option<String>> = call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -290,202 +271,12 @@ impl WasmChannel {
         result.ok().flatten()
     }
 
-    /// Hand this channel the drain end of its webhook sink, before it is boxed
-    /// into an `Arc<dyn Channel>`; `listen` takes it once.
     pub fn set_webhook_rx(&self, rx: mpsc::Receiver<RawWebhook>) {
         let mut webhook_rx = self
             .webhook_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *webhook_rx = Some(rx);
-    }
-
-    /// Instantiate a novel channel plugin from its `[[plugins.entries]]` config.
-    pub async fn from_wasm(
-        plugin_name: impl Into<String>,
-        wasm_path: &Path,
-        permissions: &[PluginPermission],
-        config: &HashMap<String, String>,
-        limits: crate::component::PluginLimits,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        Self::from_wasm_with_digest(
-            plugin_name,
-            wasm_path,
-            None,
-            permissions,
-            config,
-            limits,
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a novel channel plugin while binding its component to the
-    /// digest carried by the verified manifest.
-    pub async fn from_wasm_with_digest(
-        plugin_name: impl Into<String>,
-        wasm_path: &Path,
-        expected_sha256: Option<&str>,
-        permissions: &[PluginPermission],
-        config: &HashMap<String, String>,
-        limits: crate::component::PluginLimits,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        let plugin_name = plugin_name.into();
-        let config_json = resolve_configure_json(config, permissions);
-        Self::from_wasm_with_runtime_resolver_and_digest(
-            plugin_name,
-            wasm_path,
-            expected_sha256,
-            permissions,
-            fixed_runtime_resolver(config_json, limits),
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a novel channel while resolving config and limits on demand.
-    /// The resolver is called at startup and for each disposable webhook parser.
-    pub async fn from_wasm_with_runtime_resolver(
-        plugin_name: impl Into<String>,
-        wasm_path: &Path,
-        permissions: &[PluginPermission],
-        runtime: ChannelRuntimeResolver,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        Self::from_wasm_with_runtime_resolver_and_digest(
-            plugin_name,
-            wasm_path,
-            None,
-            permissions,
-            runtime,
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a novel channel from a live runtime resolver while binding
-    /// the executable to the digest from its verified manifest.
-    pub async fn from_wasm_with_runtime_resolver_and_digest(
-        plugin_name: impl Into<String>,
-        wasm_path: &Path,
-        expected_sha256: Option<&str>,
-        permissions: &[PluginPermission],
-        runtime: ChannelRuntimeResolver,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        let plugin_name = plugin_name.into();
-        let channel_ref = zeroclaw_api::channel::plugin_channel_ref(&plugin_name);
-        Self::instantiate(
-            channel_ref,
-            wasm_path,
-            expected_sha256,
-            permissions,
-            runtime,
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a mirror from canonical `[channels.<type>.<alias>]` config.
-    pub async fn from_wasm_mirror(
-        channel_type: impl Into<String>,
-        alias: impl Into<String>,
-        wasm_path: &Path,
-        permissions: &[PluginPermission],
-        config_json: &str,
-        limits: crate::component::PluginLimits,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        Self::from_wasm_mirror_with_digest(
-            channel_type,
-            alias,
-            wasm_path,
-            None,
-            permissions,
-            config_json,
-            limits,
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a mirror while binding its component to the digest carried
-    /// by the verified manifest.
-    pub async fn from_wasm_mirror_with_digest(
-        channel_type: impl Into<String>,
-        alias: impl Into<String>,
-        wasm_path: &Path,
-        expected_sha256: Option<&str>,
-        permissions: &[PluginPermission],
-        config_json: &str,
-        limits: crate::component::PluginLimits,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        let channel_type = channel_type.into();
-        let alias = alias.into();
-        let config_json = if permissions.contains(&PluginPermission::ConfigRead) {
-            config_json.to_string()
-        } else {
-            "{}".to_string()
-        };
-        Self::from_wasm_mirror_with_runtime_resolver_and_digest(
-            channel_type,
-            alias,
-            wasm_path,
-            expected_sha256,
-            permissions,
-            fixed_runtime_resolver(config_json, limits),
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a mirrored channel while resolving config and limits on
-    /// demand. The resolver must already enforce `ConfigRead` withholding.
-    pub async fn from_wasm_mirror_with_runtime_resolver(
-        channel_type: impl Into<String>,
-        alias: impl Into<String>,
-        wasm_path: &Path,
-        permissions: &[PluginPermission],
-        runtime: ChannelRuntimeResolver,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        Self::from_wasm_mirror_with_runtime_resolver_and_digest(
-            channel_type,
-            alias,
-            wasm_path,
-            None,
-            permissions,
-            runtime,
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a mirrored channel from a live runtime resolver while
-    /// binding the executable to the digest from its verified manifest.
-    pub async fn from_wasm_mirror_with_runtime_resolver_and_digest(
-        channel_type: impl Into<String>,
-        alias: impl Into<String>,
-        wasm_path: &Path,
-        expected_sha256: Option<&str>,
-        permissions: &[PluginPermission],
-        runtime: ChannelRuntimeResolver,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        let channel_type = channel_type.into();
-        let alias = alias.into();
-        Self::instantiate(
-            format!("{channel_type}.{alias}"),
-            wasm_path,
-            expected_sha256,
-            permissions,
-            runtime,
-            authorizer,
-        )
-        .await
     }
 
     /// Handle to this channel's inbound queue. A host-run listener clones it and
@@ -523,17 +314,16 @@ fn to_wit_send(msg: &SendMessage) -> WitSendMessage {
     }
 }
 
-fn from_wit_inbound(msg: WitInboundMessage, channel_ref: &str) -> ChannelMessage {
-    let (channel_type, alias) = split_channel_ref(channel_ref);
+fn from_wit_inbound(msg: WitInboundMessage, endpoint: &PluginChannelEndpoint) -> ChannelMessage {
     ChannelMessage {
         id: msg.id,
         sender: msg.sender,
         reply_target: msg.reply_target,
         content: msg.content,
-        channel: channel_type.to_string(),
-        // Always stamp the host-owned route. Guest-provided identity cannot
-        // select a different owner or session namespace.
-        channel_alias: alias.map(str::to_string),
+        // Routing identity is issued by the host. Guest-supplied channel and
+        // alias fields cannot select a different owner or session namespace.
+        channel: endpoint.channel_type().to_string(),
+        channel_alias: Some(endpoint.alias().to_string()),
         timestamp: msg.timestamp,
         thread_ts: msg.thread_ts,
         interruption_scope_id: msg.interruption_scope_id,
@@ -543,48 +333,39 @@ fn from_wit_inbound(msg: WitInboundMessage, channel_ref: &str) -> ChannelMessage
     }
 }
 
-/// Return whether a normalized inbound message's sender is currently
-/// authorized by the host, logging a rejected delivery without exposing policy
-/// details to the guest transport.
 fn sender_is_authorized(
     authorizer: &SenderAuthorizer,
-    channel_alias: &str,
-    msg: &ChannelMessage,
+    endpoint: &PluginChannelEndpoint,
+    message: &ChannelMessage,
 ) -> bool {
-    if !authorizer(&msg.sender) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "channel_alias": channel_alias,
-                    "sender": msg.sender.as_str(),
-                })),
-            "ignoring channel-plugin inbound from unauthorized sender"
-        );
-        return false;
+    if authorizer(&message.sender) {
+        return true;
     }
-
-    true
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "channel": endpoint.channel_type(),
+                "channel_alias": endpoint.alias(),
+                "error_key": "plugin_channel_sender_unauthorized",
+            })),
+        "Channel plugin message rejected by live sender policy"
+    );
+    false
 }
 
-/// Forward a normalized inbound message only when its sender is currently
-/// authorized by the host.
-///
-/// Keeping this check at the final host-to-agent boundary makes the same gate
-/// reusable by polling and host-fed transports without trusting a guest to
-/// enforce operator policy.
 async fn forward_if_authorized(
-    tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    tx: &mpsc::Sender<ChannelMessage>,
     authorizer: &SenderAuthorizer,
-    channel_alias: &str,
-    msg: ChannelMessage,
-) -> Result<(), tokio::sync::mpsc::error::SendError<ChannelMessage>> {
-    if !sender_is_authorized(authorizer, channel_alias, &msg) {
-        return Ok(());
+    endpoint: &PluginChannelEndpoint,
+    message: ChannelMessage,
+) -> std::result::Result<(), mpsc::error::SendError<ChannelMessage>> {
+    if sender_is_authorized(authorizer, endpoint, &message) {
+        tx.send(message).await
+    } else {
+        Ok(())
     }
-
-    tx.send(msg).await
 }
 
 fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
@@ -609,12 +390,12 @@ fn from_wit_approval_response(r: WitApprovalResponse) -> ChannelApprovalResponse
 #[async_trait]
 impl Channel for WasmChannel {
     fn name(&self) -> &str {
-        split_channel_ref(&self.channel_ref).0
+        self.endpoint.channel_type()
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let wit_msg = to_wit_send(message);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -630,56 +411,41 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let poll_channel_ref = self.channel_ref.clone();
-        let webhook_channel_ref = poll_channel_ref.clone();
-        let webhook_tx = tx.clone();
+        let poll_tx = tx.clone();
+        let poll_endpoint = self.endpoint.clone();
         let poll_authorizer = Arc::clone(&self.authorizer);
-        let webhook_authorizer = Arc::clone(&self.authorizer);
-        let webhook_rx = self
-            .webhook_rx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-
         let poll_loop = async {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
             const MAX_BACKOFF: Duration = Duration::from_millis(500);
             let mut backoff = INITIAL_BACKOFF;
-
             loop {
-                if tx.is_closed() {
-                    return Ok(());
-                }
-                let polled = {
-                    let mut guard = self.state.lock().await;
-                    let (ref mut store, ref mut bindings) = *guard;
-                    crate::component::refuel(store);
-                    bindings
-                        .zeroclaw_plugin_channel()
-                        .call_poll_message(store)
-                        .await
-                };
+                let polled = call_channel!(
+                    self,
+                    async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                        bindings
+                            .zeroclaw_plugin_channel()
+                            .call_poll_message(store)
+                            .await
+                    }
+                );
                 match polled {
                     Ok(Some(wit_msg)) => {
                         mark_poll_healthy(&self.poll_healthy, true);
                         backoff = INITIAL_BACKOFF;
                         if forward_if_authorized(
-                            &tx,
+                            &poll_tx,
                             &poll_authorizer,
-                            &poll_channel_ref,
-                            from_wit_inbound(wit_msg, &poll_channel_ref),
+                            &poll_endpoint,
+                            from_wit_inbound(wit_msg, &poll_endpoint),
                         )
                         .await
                         .is_err()
                         {
                             return Ok(());
                         }
+                        continue;
                     }
-                    Ok(None) => {
-                        mark_poll_healthy(&self.poll_healthy, true);
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
+                    Ok(None) => mark_poll_healthy(&self.poll_healthy, true),
                     Err(error) => {
                         mark_poll_healthy(&self.poll_healthy, false);
                         ::zeroclaw_log::record!(
@@ -690,23 +456,35 @@ impl Channel for WasmChannel {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "channel_ref": poll_channel_ref,
+                                "channel": poll_endpoint.channel_type(),
+                                "channel_alias": poll_endpoint.alias(),
                                 "error": format!("{error:#}"),
                             })),
                             "channel plugin poll-message trapped; backing off"
                         );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
                     }
                 }
+                tokio::select! {
+                    () = poll_tx.closed() => return Ok(()),
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         };
         tokio::pin!(poll_loop);
 
+        let webhook_rx = self
+            .webhook_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let Some(mut webhook_rx) = webhook_rx else {
             return poll_loop.await;
         };
         let webhook_factory = self.webhook_factory.clone();
+        let webhook_endpoint = self.endpoint.clone();
+        let webhook_authorizer = Arc::clone(&self.authorizer);
+        let webhook_tx = tx;
         let webhook_loop = async move {
             while let Some(RawWebhook {
                 headers,
@@ -725,38 +503,25 @@ impl Channel for WasmChannel {
                     Some(Ok(Ok(messages))) => {
                         let mut delivery_failed = false;
                         for message in messages {
-                            let message = from_wit_inbound(message, &webhook_channel_ref);
+                            let message = from_wit_inbound(message, &webhook_endpoint);
                             if !sender_is_authorized(
                                 &webhook_authorizer,
-                                &webhook_channel_ref,
+                                &webhook_endpoint,
                                 &message,
                             ) {
                                 continue;
                             }
                             let message_id = message.id.trim().to_string();
-                            let reservation =
-                                if message_id.is_empty() {
-                                    None
-                                } else if let Some(idempotency) = idempotency.as_ref() {
-                                    if !idempotency.reserve(&message_id) {
-                                        ::zeroclaw_log::record!(
-                                            INFO,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Note
-                                            )
-                                            .with_attrs(::serde_json::json!({
-                                                "channel_ref": webhook_channel_ref,
-                                                "error_key": "plugin_webhook_duplicate",
-                                            })),
-                                            "duplicate plugin webhook message ignored"
-                                        );
-                                        continue;
-                                    }
-                                    Some((idempotency.clone(), message_id))
-                                } else {
-                                    None
-                                };
+                            let reservation = if message_id.is_empty() {
+                                None
+                            } else if let Some(idempotency) = idempotency.as_ref() {
+                                if !idempotency.reserve(&message_id) {
+                                    continue;
+                                }
+                                Some((idempotency.clone(), message_id))
+                            } else {
+                                None
+                            };
                             let sent = tokio::select! {
                                 biased;
                                 () = cancellation.cancelled() => None,
@@ -800,19 +565,6 @@ impl Channel for WasmChannel {
                         let _ = reply.send(Err(WebhookReject::BadRequest(format!("{error:#}"))));
                     }
                     None => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Inbound
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "channel_ref": webhook_channel_ref,
-                                "error_key": "plugin_webhook_parse_cancelled",
-                            })),
-                            "channel plugin webhook parse cancelled at request deadline"
-                        );
                         let _ = reply.send(Err(WebhookReject::Timeout));
                     }
                 }
@@ -836,7 +588,7 @@ impl Channel for WasmChannel {
         {
             return true;
         }
-        let result: Result<bool> = call_plugin!(
+        let result: Result<bool> = call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -876,7 +628,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let recipient = recipient.to_string();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -896,7 +648,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let recipient = recipient.to_string();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -921,7 +673,7 @@ impl Channel for WasmChannel {
             return Ok(None);
         }
         let wit_msg = to_wit_send(message);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -948,7 +700,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -980,7 +732,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1013,7 +765,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             text.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1036,7 +788,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (recipient, message_id) = (recipient.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1072,7 +824,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             emoji.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1099,7 +851,7 @@ impl Channel for WasmChannel {
             message_id.to_string(),
             emoji.to_string(),
         );
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1119,7 +871,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1142,7 +894,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1170,7 +922,7 @@ impl Channel for WasmChannel {
             return Ok(());
         }
         let (channel_id, message_id) = (channel_id.to_string(), message_id.to_string());
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1198,7 +950,7 @@ impl Channel for WasmChannel {
         }
         let recipient = recipient.to_string();
         let wit_req = to_wit_approval_request(request);
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 let out = wt(
@@ -1229,7 +981,7 @@ impl Channel for WasmChannel {
         let question = question.to_string();
         let choices = choices.to_vec();
         let timeout_secs = timeout.as_secs();
-        call_plugin!(
+        call_channel!(
             self,
             async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
                 wt(
@@ -1253,6 +1005,8 @@ impl Channel for WasmChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PluginCapability;
+    use crate::config::PluginConfigResolver;
 
     #[test]
     fn media_round_trip() {
@@ -1289,53 +1043,69 @@ mod tests {
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
     }
 
-    #[test]
-    fn configure_withholds_section_without_config_read() {
-        let mut config = HashMap::new();
-        config.insert("api_key".to_string(), "secret".to_string());
-        let json = resolve_configure_json(&config, &[PluginPermission::HttpClient]);
-        assert_eq!(json, "{}", "no ConfigRead means an empty config object");
+    #[tokio::test]
+    async fn channel_validates_config_before_loading_guest_code() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-before-load".to_string(),
+            ))
+        }));
+        let component = AdmittedComponent::test_component(b"not-a-component");
+        let result = WasmChannel::from_wasm(
+            endpoint,
+            &component,
+            &services,
+            crate::component::test_limits(0),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("invalid config must reject registration"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("invalid-before-load"));
     }
 
     #[test]
-    fn configure_passes_section_with_config_read() {
-        let mut config = HashMap::new();
-        config.insert("identity".to_string(), "on-call".to_string());
-        let json = resolve_configure_json(&config, &[PluginPermission::ConfigRead]);
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["identity"], "on-call", "granted section round-trips");
-    }
+    fn host_endpoint_overrides_guest_routing_identity() {
+        for (channel_type, alias, guest_alias) in [
+            ("plugin", "acme.chat", Some("guest-selected-alias")),
+            ("telegram", "work", None),
+            ("gmail_push", "main", Some("")),
+        ] {
+            let scope = crate::instance::test_scope(PluginCapability::Channel, alias, []);
+            let endpoint = PluginChannelEndpoint::new(scope, channel_type).unwrap();
+            let message = from_wit_inbound(
+                WitInboundMessage {
+                    id: "evt-1".to_string(),
+                    sender: "sender".to_string(),
+                    reply_target: "room".to_string(),
+                    content: "hello".to_string(),
+                    channel: "guest-selected-type".to_string(),
+                    channel_alias: guest_alias.map(str::to_string),
+                    timestamp: 42,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: Vec::new(),
+                    subject: None,
+                },
+                &endpoint,
+            );
 
-    #[test]
-    fn inbound_route_is_stamped_from_verified_manifest_name() {
-        let message = from_wit_inbound(
-            WitInboundMessage {
-                id: "evt-1".to_string(),
-                sender: "sender".to_string(),
-                reply_target: "room".to_string(),
-                content: "hello".to_string(),
-                channel: "guest-controlled".to_string(),
-                channel_alias: Some("other-owner".to_string()),
-                timestamp: 0,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: Vec::new(),
-                subject: None,
-            },
-            "plugin.weather-alerts",
-        );
-
-        assert_eq!(message.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
-        assert_eq!(message.channel_alias.as_deref(), Some("weather-alerts"));
+            assert_eq!(message.channel, channel_type);
+            assert_eq!(message.channel_alias.as_deref(), Some(alias));
+            assert_ne!(message.channel, endpoint.instance_id().package());
+            assert_eq!(message.content, "hello");
+            assert!(message.internal_sop_event.is_none());
+            assert!(!message.passive_context);
+            assert!(!message.explicitly_addressed);
+        }
     }
 
     #[test]
     fn host_enqueued_inbound_reaches_the_drain_handle() {
-        // The inbound contract is host-fed: a listener the orchestrator owns
-        // (vendor tunnel, webhook) enqueues through the handle from
-        // `WasmChannel::inbound()`, and the plugin drains the same queue. Prove
-        // the producer side here so the transport is not just asserted at the
-        // queue type but at the handle a host listener actually holds.
         let queue = crate::component::InboundQueue::default();
         let listener_handle = queue.clone();
         assert_eq!(queue.pending(), 0, "starts empty");
@@ -1364,34 +1134,5 @@ mod tests {
         assert_eq!(drained.id, "evt-1");
         assert_eq!(drained.content, "inbound sms");
         assert_eq!(queue.pending(), 0, "draining empties the shared queue");
-    }
-
-    #[test]
-    fn from_wit_inbound_host_stamps_canonical_route() {
-        let make = || WitInboundMessage {
-            id: "1".into(),
-            sender: "u".into(),
-            reply_target: "u".into(),
-            content: "hi".into(),
-            channel: "plugin-ignored".into(),
-            channel_alias: Some("plugin-supplied".into()),
-            timestamp: 0,
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: Vec::new(),
-            subject: None,
-        };
-
-        // A mirror stamps the host-owned alias, overriding whatever the plugin
-        // put in `channel_alias`, so routing/session keys never trust the plugin.
-        let stamped = from_wit_inbound(make(), "telegram.main");
-        assert_eq!(stamped.channel, "telegram");
-        assert_eq!(stamped.channel_alias.as_deref(), Some("main"));
-
-        // Novel plugins use the same host-owned route grammar and never trust
-        // the guest's channel or alias fields.
-        let novel = from_wit_inbound(make(), "plugin.echo.channel");
-        assert_eq!(novel.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
-        assert_eq!(novel.channel_alias.as_deref(), Some("echo.channel"));
     }
 }

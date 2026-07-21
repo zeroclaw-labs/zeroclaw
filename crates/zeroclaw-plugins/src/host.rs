@@ -3,10 +3,12 @@
 use super::error::PluginError;
 use super::signature::{self, SignatureMode};
 use super::{PluginCapability, PluginInfo, PluginManifest};
+use crate::config::validate_manifest_config;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Subdirectory inside a skill-capable plugin that holds individual skills.
 const SKILLS_SUBDIR: &str = "skills";
@@ -22,6 +24,33 @@ pub struct PluginHost {
 struct LoadedPlugin {
     manifest: PluginManifest,
     plugin_dir: PathBuf,
+    component: Option<AdmittedComponent>,
+}
+
+/// Exact executable bytes that passed package confinement and digest policy.
+///
+/// Adapters consume this artifact instead of reopening a manifest path, so the
+/// component they compile is the same file generation the host admitted.
+#[derive(Clone)]
+pub struct AdmittedComponent {
+    bytes: Arc<[u8]>,
+}
+
+impl AdmittedComponent {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::from(bytes),
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    pub(crate) fn test_component(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::new(bytes.into())
+    }
 }
 
 impl PluginHost {
@@ -73,11 +102,6 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Parse the signature mode string from config into a `SignatureMode`.
-    /// Parse a `[plugins.security] signature_mode` config string into a
-    /// [`SignatureMode`]. Returns `None` for any unrecognized value so the
-    /// caller can surface the misconfiguration under its attribution span
-    /// instead of silently degrading to the weakest posture. Case-insensitive.
     pub fn parse_signature_mode(mode: &str) -> Option<SignatureMode> {
         match mode.to_lowercase().as_str() {
             "strict" => Some(SignatureMode::Strict),
@@ -87,11 +111,6 @@ impl PluginHost {
         }
     }
 
-    /// Resolve a `[plugins.security] signature_mode` config string into a
-    /// [`SignatureMode`], failing safe to [`SignatureMode::Strict`] on any
-    /// unrecognized value. The misconfiguration WARN is emitted under a
-    /// plugin-role attribution span so the record carries role context even
-    /// from context-free config call sites.
     #[must_use]
     pub fn resolve_signature_mode(mode: &str) -> SignatureMode {
         Self::parse_signature_mode(mode).unwrap_or_else(|| {
@@ -132,7 +151,7 @@ impl PluginHost {
             if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 let manifest_path = path.join("manifest.toml");
                 if manifest_path.exists()
-                    && let Ok((manifest_toml, manifest)) = read_manifest(&manifest_path)
+                    && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
                 {
                     if path.file_name().and_then(|name| name.to_str())
                         != Some(manifest.name.as_str())
@@ -151,19 +170,23 @@ impl PluginHost {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to signature verification failure");
                         continue;
                     }
-
-                    if let Some(relative) = manifest.wasm_path.as_deref()
-                        && let Err(e) = resolve_confined_wasm_path(&path, relative)
-                    {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to unsafe wasm_path");
+                    if let Err(e) = validate_manifest_config(&manifest) {
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid config schema");
                         continue;
                     }
-
+                    let component = match admit_component(&path, &manifest) {
+                        Ok(component) => component,
+                        Err(e) => {
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to executable artifact admission failure");
+                            continue;
+                        }
+                    };
                     self.loaded.insert(
                         manifest.name.clone(),
                         LoadedPlugin {
                             manifest,
-                            plugin_dir: path.clone(),
+                            plugin_dir: path,
+                            component,
                         },
                     );
                 }
@@ -171,6 +194,12 @@ impl PluginHost {
         }
 
         Ok(())
+    }
+
+    fn load_manifest(&self, path: &Path) -> Result<(PluginManifest, String), PluginError> {
+        let content = std::fs::read_to_string(path)?;
+        let manifest: PluginManifest = toml::from_str(&content)?;
+        Ok((manifest, content))
     }
 
     /// Verify a plugin's signature against configured policy.
@@ -207,6 +236,12 @@ impl PluginHost {
         self.loaded.get(name).map(plugin_info_from_loaded)
     }
 
+    /// Return the admitted manifest that owns a plugin's runtime contract.
+    #[must_use]
+    pub fn manifest(&self, name: &str) -> Option<&PluginManifest> {
+        self.loaded.get(name).map(|plugin| &plugin.manifest)
+    }
+
     /// Install a plugin from a directory path. Returns the installed
     /// plugin's manifest name so callers can key follow-up work (config
     /// seeding, messaging) off the canonical name rather than the source path.
@@ -225,7 +260,7 @@ impl PluginHost {
             )));
         }
 
-        let (manifest_toml, manifest) = read_manifest(&manifest_path)?;
+        let (manifest, manifest_toml) = self.load_manifest(&manifest_path)?;
         let source_dir = manifest_path
             .parent()
             .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
@@ -236,41 +271,25 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
-        // Parse and verify the same manifest bytes that will be installed.
+        // Parse, verify, and persist the same manifest generation.
         self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        validate_manifest_config(&manifest)?;
+        let component = admit_component(source_dir, &manifest)?;
 
-        // Open the confined source once. Digest verification and the installed
-        // file both derive from these exact bytes.
-        let wasm_payload = manifest
-            .wasm_path
-            .as_deref()
-            .map(|relative| {
-                let source = resolve_confined_wasm_path(source_dir, relative)?;
-                let bytes = read_stable_file(&source)?;
-                if let Some(expected) = manifest.wasm_sha256.as_deref() {
-                    signature::verify_payload_digest(&bytes, expected)?;
-                }
-                Ok::<_, PluginError>((relative, bytes))
-            })
-            .transpose()?;
-
-        // Copy plugin to plugins directory
         let dest_dir = self.plugins_dir.join(&manifest.name);
         if dest_dir.exists() {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
         std::fs::create_dir_all(&dest_dir)?;
 
-        // Preserve the exact bytes that passed signature verification.
+        // Persist the exact manifest and payload generations admitted above.
         std::fs::write(dest_dir.join("manifest.toml"), manifest_toml.as_bytes())?;
-
-        // Copy the exact payload bytes that passed confinement and digest checks.
-        if let Some((rel, bytes)) = wasm_payload {
+        if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component.as_ref()) {
             let dest = dest_dir.join(rel);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&dest, bytes)?;
+            std::fs::write(&dest, component.bytes())?;
             resolve_confined_wasm_path(&dest_dir, rel)?;
         }
 
@@ -289,6 +308,7 @@ impl PluginHost {
             LoadedPlugin {
                 manifest,
                 plugin_dir: dest_dir,
+                component,
             },
         );
 
@@ -297,13 +317,13 @@ impl PluginHost {
 
     /// Remove a plugin by name.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
-        validate_plugin_name(name)?;
-        let plugin = self
-            .loaded
-            .remove(name)
-            .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
-        if plugin.plugin_dir.exists() {
-            std::fs::remove_dir_all(plugin.plugin_dir)?;
+        if self.loaded.remove(name).is_none() {
+            return Err(PluginError::NotFound(name.to_string()));
+        }
+
+        let plugin_dir = self.plugins_dir.join(name);
+        if plugin_dir.exists() {
+            std::fs::remove_dir_all(plugin_dir)?;
         }
 
         Ok(())
@@ -318,15 +338,10 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get tool-capable plugins with their resolved WASM file paths.
-    /// Returns `(manifest, resolved_wasm_path)` tuples for building `WasmTool`s.
-    /// Tool plugins without a `wasm_path` are skipped.
-    pub fn tool_plugin_details(&self) -> Vec<(&PluginManifest, PathBuf)> {
-        self.loaded
-            .values()
-            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Tool))
-            .filter_map(|p| executable_path(p).map(|path| (&p.manifest, path)))
-            .collect()
+    /// Get tool-capable plugins with the exact executable bytes admitted for
+    /// them. Plugins without an executable artifact are skipped.
+    pub fn tool_plugin_details(&self) -> Vec<(&PluginManifest, &AdmittedComponent)> {
+        self.executable_plugin_details(PluginCapability::Tool)
     }
 
     /// Get channel-capable plugins.
@@ -338,16 +353,23 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get channel-capable plugins with their resolved WASM file paths.
-    /// Returns `(manifest, resolved_wasm_path)` tuples for building
-    /// `WasmChannel`s, mirroring [`Self::tool_plugin_details`]. Channel plugins
-    /// without a `wasm_path` are skipped, so a manifest that declares the
-    /// capability but ships no component is never registered as a live channel.
-    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, PathBuf)> {
+    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &AdmittedComponent)> {
+        self.executable_plugin_details(PluginCapability::Channel)
+    }
+
+    fn executable_plugin_details(
+        &self,
+        capability: PluginCapability,
+    ) -> Vec<(&PluginManifest, &AdmittedComponent)> {
         self.loaded
             .values()
-            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Channel))
-            .filter_map(|p| executable_path(p).map(|path| (&p.manifest, path)))
+            .filter(|plugin| plugin.manifest.capabilities.contains(&capability))
+            .filter_map(|plugin| {
+                plugin
+                    .component
+                    .as_ref()
+                    .map(|component| (&plugin.manifest, component))
+            })
             .collect()
     }
 
@@ -360,12 +382,6 @@ impl PluginHost {
             .collect()
     }
 
-    /// Get skill-capable plugins paired with the absolute path to their `skills/`
-    /// directory. Plugins without an existing `skills/` subdirectory are skipped.
-    ///
-    /// Callers (typically the runtime skill loader) should pass each `skills_dir`
-    /// to `load_skills_from_directory` and then re-namespace the resulting skill
-    /// names as `plugin:<plugin>/<skill>` to avoid collisions with user skills.
     pub fn skill_plugin_details(&self) -> Vec<(&PluginManifest, PathBuf)> {
         self.loaded
             .values()
@@ -388,12 +404,16 @@ impl PluginHost {
 }
 
 fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
-    let wasm_path = executable_path(p);
-    let loaded = match &wasm_path {
-        Some(path) => path.is_file(),
+    let loaded = match &p.component {
+        Some(_) => true,
         // Skill-only plugins are "loaded" if their skills/ subtree exists.
         None => p.plugin_dir.join(SKILLS_SUBDIR).is_dir(),
     };
+    let wasm_path = p
+        .manifest
+        .wasm_path
+        .as_deref()
+        .map(|relative| p.plugin_dir.join(relative));
     PluginInfo {
         name: p.manifest.name.clone(),
         version: p.manifest.version.clone(),
@@ -405,49 +425,83 @@ fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
     }
 }
 
-fn executable_path(plugin: &LoadedPlugin) -> Option<PathBuf> {
-    plugin
-        .manifest
+fn admit_component(
+    plugin_dir: &Path,
+    manifest: &PluginManifest,
+) -> Result<Option<AdmittedComponent>, PluginError> {
+    manifest
         .wasm_path
         .as_deref()
-        .and_then(|relative| resolve_confined_wasm_path(&plugin.plugin_dir, relative).ok())
+        .map(|relative| {
+            let path = resolve_confined_wasm_path(plugin_dir, relative)?;
+            let bytes = read_stable_file(&path)?;
+            if let Some(expected) = manifest.wasm_sha256.as_deref() {
+                signature::verify_payload_digest(&bytes, expected)?;
+            }
+            Ok(AdmittedComponent::new(bytes))
+        })
+        .transpose()
 }
 
-/// Read and parse one manifest buffer so policy checks and installation cannot
-/// observe different file generations.
-fn read_manifest(path: &Path) -> Result<(String, PluginManifest), PluginError> {
-    let manifest_toml = std::fs::read_to_string(path)?;
-    let manifest = toml::from_str(&manifest_toml)?;
-    Ok((manifest_toml, manifest))
-}
-
-fn validate_plugin_name(name: &str) -> Result<(), PluginError> {
-    let mut chars = name.chars();
-    if !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+/// Resolve a manifest's executable path without allowing traversal or symlink
+/// indirection outside the package. Every existing component is checked before
+/// canonicalization so an in-package symlink is rejected as well.
+fn resolve_confined_wasm_path(plugin_dir: &Path, relative: &str) -> Result<PathBuf, PluginError> {
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
     {
         return Err(PluginError::InvalidManifest(format!(
-            "plugin name must be a portable path component using ASCII letters, digits, '-', '_', or '.' (got {name:?})"
+            "wasm_path must be a confined relative path (got {})",
+            relative.display()
         )));
     }
-    Ok(())
-}
 
-fn validate_provided_channel_type(channel_type: &str) -> Result<(), PluginError> {
-    let mut chars = channel_type.chars();
-    if !chars.next().is_some_and(|ch| ch.is_ascii_lowercase())
-        || !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-    {
+    let root = std::fs::canonicalize(plugin_dir)?;
+    let mut candidate = root.clone();
+    for component in relative.components() {
+        if let Component::Normal(segment) = component {
+            candidate.push(segment);
+            let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    PluginError::NotFound(format!("WASM file not found: {}", candidate.display()))
+                } else {
+                    PluginError::Io(error)
+                }
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "wasm_path contains a symlink: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+
+    if !std::fs::metadata(&candidate)?.is_file() {
         return Err(PluginError::InvalidManifest(format!(
-            "provides must name a snake_case built-in channel type (got {channel_type:?})"
+            "WASM payload is not a regular file: {}",
+            candidate.display()
         )));
     }
-    Ok(())
+    let resolved = std::fs::canonicalize(&candidate)?;
+    if !resolved.starts_with(&root) || resolved != candidate {
+        return Err(PluginError::InvalidManifest(format!(
+            "wasm_path escapes plugin directory: {}",
+            relative.display()
+        )));
+    }
+    Ok(resolved)
 }
 
-/// Read the same file object whose canonical path was checked. The caller then
-/// hashes, compiles, or writes this returned buffer without reopening the
-/// attacker-controlled source path.
+/// Open the canonical payload once and confirm that the opened file object is
+/// still the object named by that path before returning its bytes.
 pub(crate) fn read_stable_file(path: &Path) -> Result<Vec<u8>, PluginError> {
     let file_name = path.file_name().ok_or_else(|| {
         PluginError::InvalidManifest(format!(
@@ -491,23 +545,13 @@ fn validate_manifest_shape(
     manifest: &PluginManifest,
     plugin_dir: &Path,
 ) -> Result<(), PluginError> {
-    validate_plugin_name(&manifest.name)?;
+    crate::instance::validate_package_name(&manifest.name).map_err(PluginError::InvalidManifest)?;
 
     if manifest.capabilities.is_empty() {
         return Err(PluginError::InvalidManifest(format!(
             "plugin '{}' declares no capabilities",
             manifest.name
         )));
-    }
-
-    if let Some(channel_type) = manifest.provides.as_deref() {
-        if !manifest.capabilities.contains(&PluginCapability::Channel) {
-            return Err(PluginError::InvalidManifest(format!(
-                "plugin '{}' declares `provides` without the channel capability",
-                manifest.name
-            )));
-        }
-        validate_provided_channel_type(channel_type)?;
     }
 
     let is_skill_only =
@@ -536,44 +580,6 @@ fn validate_manifest_shape(
     }
 
     Ok(())
-}
-
-/// Resolve a manifest's WASM path without allowing it to leave the plugin
-/// directory lexically or through an existing symlink.
-fn resolve_confined_wasm_path(plugin_dir: &Path, relative: &str) -> Result<PathBuf, PluginError> {
-    let relative = Path::new(relative);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(PluginError::InvalidManifest(format!(
-            "wasm_path must be a confined relative path (got {})",
-            relative.display()
-        )));
-    }
-
-    let candidate = plugin_dir.join(relative);
-    if !candidate.is_file() {
-        return Err(PluginError::NotFound(format!(
-            "WASM file not found: {}",
-            candidate.display()
-        )));
-    }
-
-    let root = std::fs::canonicalize(plugin_dir)?;
-    let resolved = std::fs::canonicalize(&candidate)?;
-    if !resolved.starts_with(&root) {
-        return Err(PluginError::InvalidManifest(format!(
-            "wasm_path escapes plugin directory: {}",
-            relative.display()
-        )));
-    }
-    Ok(resolved)
 }
 
 /// Validate a skill bundle: `<plugin_dir>/skills/` must exist, contain at least
@@ -687,14 +693,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// Move every plugin (a subdirectory containing a `manifest.toml`) from `from`
-/// into `to`, returning the number moved.
-///
-/// Uses `rename`, falling back to a recursive copy + remove when the source and
-/// destination live on different filesystems. An existing `to/<name>` is never
-/// overwritten — that plugin is skipped. A missing or empty `from` is a no-op.
-/// Used by `zeroclaw plugin migrate` to relocate plugins stranded in legacy
-/// install directories into the configured one.
 pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError> {
     let Ok(entries) = std::fs::read_dir(from) else {
         return Ok(0);
@@ -763,6 +761,38 @@ permissions = []
     }
 
     #[test]
+    fn discovery_rejects_config_permission_without_a_schema() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("invalid-config");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"invalid-config\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"config_read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn install_rejects_invalid_config_schema_before_copying_files() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"invalid-config\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"config_read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").unwrap();
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        assert!(host.install(source.path().to_str().unwrap()).is_err());
+        assert!(!plugins.path().join("invalid-config").exists());
+    }
+
+    #[test]
     fn from_plugins_dir_scans_the_path_directly() {
         // Plugin lives directly under the given dir (no extra `plugins/` level).
         let dir = tempdir().unwrap();
@@ -817,20 +847,17 @@ capabilities = ["tool"]
 
     #[test]
     fn install_then_discover_round_trip_uses_same_dir() {
-        // Regression for the install/discovery path divergence (issue #6254):
+        // Regression for the install/discovery path divergence
         // a plugin installed into a resolved plugins dir must be discoverable
         // by a fresh host pointed at the *same* dir.
         let src = tempdir().unwrap();
-        std::fs::write(
-            src.path().join("manifest.toml"),
-            r#"
+        let manifest = r#"
 name = "roundtrip"
 version = "0.1.0"
 wasm_path = "plugin.wasm"
 capabilities = ["tool"]
-"#,
-        )
-        .unwrap();
+"#;
+        std::fs::write(src.path().join("manifest.toml"), manifest).unwrap();
         std::fs::write(src.path().join("plugin.wasm"), b"\0asm").unwrap();
 
         let plugins_dir = tempdir().unwrap();
@@ -838,6 +865,11 @@ capabilities = ["tool"]
         installer
             .install(src.path().to_str().unwrap())
             .expect("install should succeed");
+        assert_eq!(
+            std::fs::read_to_string(plugins_dir.path().join("roundtrip/manifest.toml")).unwrap(),
+            manifest,
+            "installation must persist the exact parsed and verified manifest bytes"
+        );
 
         // Fresh host over the same dir — mirrors the CLI install vs. runtime
         // discovery split, both now resolving via `from_plugins_dir`.
@@ -1060,43 +1092,37 @@ capabilities = ["tool"]
     }
 
     #[test]
-    fn provides_requires_channel_capability_and_snake_case_type() {
-        for manifest_toml in [
-            r#"name = "tool-mirror"
-version = "0.1.0"
-wasm_path = "plugin.wasm"
-capabilities = ["tool"]
-provides = "telegram"
-"#,
-            r#"name = "empty-mirror"
-version = "0.1.0"
-wasm_path = "plugin.wasm"
-capabilities = ["channel"]
-provides = ""
-"#,
-            r#"name = "kebab-mirror"
-version = "0.1.0"
-wasm_path = "plugin.wasm"
-capabilities = ["channel"]
-provides = "gmail-push"
-"#,
-        ] {
-            let manifest: PluginManifest = toml::from_str(manifest_toml).unwrap();
-            let plugin_dir = tempdir().unwrap();
-            assert!(validate_manifest_shape(&manifest, plugin_dir.path()).is_err());
-        }
-
-        let manifest: PluginManifest = toml::from_str(
-            r#"name = "talk-mirror"
-version = "0.1.0"
-wasm_path = "plugin.wasm"
-capabilities = ["channel"]
-provides = "nextcloud_talk"
-"#,
+    fn manifest_name_must_be_a_canonical_package_slug() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("unsafe-name");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"../escape\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
         )
         .unwrap();
-        let plugin_dir = tempdir().unwrap();
-        validate_manifest_shape(&manifest, plugin_dir.path()).unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn discovery_rejects_package_directory_name_mismatches() {
+        let dir = tempdir().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        for directory in ["first", "second"] {
+            let plugin_dir = plugins_dir.join(directory);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                "name = \"shared\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+            )
+            .unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        }
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.get_plugin("shared").is_none());
     }
 
     #[test]
@@ -1177,6 +1203,23 @@ provides = "nextcloud_talk"
         std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
     }
 
+    fn signed_tool_manifest(name: &str, payload: &[u8], include_digest: bool) -> (String, String) {
+        let digest = if include_digest {
+            format!("wasm_sha256 = \"{}\"\n", signature::sha256_hex(payload))
+        } else {
+            String::new()
+        };
+        let unsigned = format!(
+            "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\n{digest}capabilities = [\"tool\"]\n"
+        );
+        let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
+        let signed = format!(
+            "{unsigned}publisher_key = \"{publisher_key}\"\nsignature = \"{}\"\n",
+            signature::sign_manifest(&unsigned, &private_key).unwrap()
+        );
+        (signed, publisher_key)
+    }
+
     fn write_channel_plugin(plugins_dir: &Path, name: &str, with_wasm: bool) {
         let plugin_dir = plugins_dir.join(name);
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -1212,7 +1255,7 @@ provides = "nextcloud_talk"
             "a channel manifest with no wasm_path is not registrable as a live channel"
         );
         assert_eq!(details[0].0.name, "with-wasm");
-        assert!(details[0].1.ends_with("plugin.wasm"));
+        assert_eq!(details[0].1.bytes(), b"\0asm");
     }
 
     #[test]
@@ -1234,208 +1277,59 @@ provides = "nextcloud_talk"
     }
 
     #[test]
-    fn discovery_rejects_absolute_and_parent_wasm_paths() {
-        for (name, wasm_path) in [
-            ("absolute", "/tmp/plugin.wasm"),
-            ("parent", "../plugin.wasm"),
-        ] {
-            let dir = tempdir().unwrap();
-            let plugin_dir = dir.path().join("plugins").join(name);
-            std::fs::create_dir_all(&plugin_dir).unwrap();
-            std::fs::write(
-                plugin_dir.join("manifest.toml"),
-                format!(
-                    "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"{wasm_path}\"\ncapabilities = [\"tool\"]\n"
-                ),
-            )
-            .unwrap();
-
-            let host = PluginHost::new(dir.path()).unwrap();
-            assert!(
-                host.list_plugins().is_empty(),
-                "unsafe wasm_path must not be discovered: {wasm_path}"
-            );
-        }
-    }
-
-    #[test]
-    fn discovery_and_install_reject_nonportable_plugin_names() {
-        let root = tempdir().unwrap();
-        let discovered = root.path().join("plugins").join("candidate");
-        std::fs::create_dir_all(&discovered).unwrap();
-        std::fs::write(discovered.join("plugin.wasm"), b"component").unwrap();
-        std::fs::write(
-            discovered.join("manifest.toml"),
-            "name = \"../escape\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
-        )
-        .unwrap();
-        let host = PluginHost::from_plugins_dir(&root.path().join("plugins")).unwrap();
-        assert!(host.list_plugins().is_empty());
-
-        let source = root.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(source.join("plugin.wasm"), b"component").unwrap();
-        std::fs::write(
-            source.join("manifest.toml"),
-            "name = \"../victim\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
-        )
-        .unwrap();
-        let victim = root.path().join("victim");
-        std::fs::create_dir_all(&victim).unwrap();
-        std::fs::write(victim.join("sentinel"), b"keep").unwrap();
-
-        let mut installer = PluginHost::from_plugins_dir(&root.path().join("installed")).unwrap();
-        assert!(installer.install(source.to_str().unwrap()).is_err());
-        assert_eq!(std::fs::read(victim.join("sentinel")).unwrap(), b"keep");
-    }
-
-    #[test]
-    fn strict_install_uses_one_signed_manifest_and_payload_generation() {
-        let source = tempdir().unwrap();
-        let payload = b"signed component bytes";
-        std::fs::write(source.path().join("plugin.wasm"), payload).unwrap();
+    fn strict_discovery_verifies_the_config_schema_as_signed_content() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("signed-schema");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
         let unsigned = format!(
-            "# preserved comment\nname = \"signed-install\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
-            signature::sha256_hex(payload)
+            r#"name = "signed-schema"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+wasm_sha256 = "{}"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+required = ["retries"]
+additionalProperties = false
+
+[config_schema.properties.retries]
+type = "integer"
+minimum = 1
+"#,
+            signature::sha256_hex(b"\0asm")
         );
         let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
-        let signed = format!(
-            "{unsigned}publisher_key = \"{publisher_key}\"\nsignature = \"{}\"\n",
-            signature::sign_manifest(&unsigned, &private_key).unwrap()
+        let signed_value = signature::sign_manifest(&unsigned, &private_key).unwrap();
+        let signed = unsigned.replacen(
+            "wasm_path = \"plugin.wasm\"",
+            &format!(
+                "signature = \"{signed_value}\"\npublisher_key = \"{publisher_key}\"\nwasm_path = \"plugin.wasm\""
+            ),
+            1,
         );
-        std::fs::write(source.path().join("manifest.toml"), &signed).unwrap();
+        std::fs::write(plugin_dir.join("manifest.toml"), &signed).unwrap();
 
-        let installed = tempdir().unwrap();
-        let mut host = PluginHost::from_plugins_dir_with_security(
-            installed.path(),
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
             SignatureMode::Strict,
             vec![publisher_key.clone()],
         )
         .unwrap();
-        host.install(source.path().to_str().unwrap()).unwrap();
-        let installed_dir = installed.path().join("signed-install");
-        assert_eq!(
-            std::fs::read_to_string(installed_dir.join("manifest.toml")).unwrap(),
-            signed
-        );
-        assert_eq!(
-            std::fs::read(installed_dir.join("plugin.wasm")).unwrap(),
-            payload
-        );
-
-        let tampered_source = tempdir().unwrap();
-        std::fs::write(tampered_source.path().join("manifest.toml"), &signed).unwrap();
-        std::fs::write(
-            tampered_source.path().join("plugin.wasm"),
-            b"tampered component bytes",
-        )
-        .unwrap();
-        let second_install = tempdir().unwrap();
-        let mut second_host = PluginHost::from_plugins_dir_with_security(
-            second_install.path(),
-            SignatureMode::Strict,
-            vec![publisher_key],
-        )
-        .unwrap();
-        assert!(matches!(
-            second_host.install(tampered_source.path().to_str().unwrap()),
-            Err(PluginError::PayloadDigestMismatch { .. })
-        ));
-        assert!(!second_install.path().join("signed-install").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stable_payload_read_rejects_a_post_confinement_symlink_swap() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempdir().unwrap();
-        let payload = root.path().join("plugin.wasm");
-        std::fs::write(&payload, b"inside").unwrap();
-        let confined = std::fs::canonicalize(&payload).unwrap();
-        let outside = root.path().join("outside.wasm");
-        std::fs::write(&outside, b"outside").unwrap();
-        std::fs::remove_file(&payload).unwrap();
-        symlink(&outside, &payload).unwrap();
-
-        assert!(matches!(
-            read_stable_file(&confined),
-            Err(PluginError::InvalidManifest(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn discovery_rejects_wasm_symlink_outside_plugin_directory() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempdir().unwrap();
-        let outside = dir.path().join("outside.wasm");
-        std::fs::write(&outside, b"outside").unwrap();
-        let plugin_dir = dir.path().join("plugins").join("escape");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        symlink(&outside, plugin_dir.join("plugin.wasm")).unwrap();
-        std::fs::write(
-            plugin_dir.join("manifest.toml"),
-            "name = \"escape\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
-        )
-        .unwrap();
-
-        let host = PluginHost::new(dir.path()).unwrap();
-        assert!(host.list_plugins().is_empty());
-    }
-
-    #[test]
-    fn strict_signed_plugin_requires_payload_digest() {
-        let dir = tempdir().unwrap();
-        let plugin_dir = dir.path().join("signed-no-digest");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        std::fs::write(plugin_dir.join("plugin.wasm"), b"component").unwrap();
-        let unsigned = "name = \"signed-no-digest\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n";
-        let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
-        let signed = format!(
-            "{unsigned}publisher_key = \"{publisher_key}\"\nsignature = \"{}\"\n",
-            signature::sign_manifest(unsigned, &private_key).unwrap()
-        );
-        std::fs::write(plugin_dir.join("manifest.toml"), signed).unwrap();
-
-        let host = PluginHost::from_plugins_dir_with_security(
-            dir.path(),
-            SignatureMode::Strict,
-            vec![publisher_key],
-        )
-        .unwrap();
-        assert!(
-            host.list_plugins().is_empty(),
-            "a valid manifest signature without a signed payload digest is insufficient"
-        );
-    }
-
-    #[test]
-    fn strict_signed_plugin_accepts_signed_payload_digest() {
-        let dir = tempdir().unwrap();
-        let plugin_dir = dir.path().join("signed-digest");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        let payload = b"component";
-        std::fs::write(plugin_dir.join("plugin.wasm"), payload).unwrap();
-        let unsigned = format!(
-            "name = \"signed-digest\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
-            signature::sha256_hex(payload)
-        );
-        let (private_key, publisher_key) = signature::generate_signing_key().unwrap();
-        let signed = format!(
-            "{unsigned}publisher_key = \"{publisher_key}\"\nsignature = \"{}\"\n",
-            signature::sign_manifest(&unsigned, &private_key).unwrap()
-        );
-        std::fs::write(plugin_dir.join("manifest.toml"), signed).unwrap();
-
-        let host = PluginHost::from_plugins_dir_with_security(
-            dir.path(),
-            SignatureMode::Strict,
-            vec![publisher_key],
-        )
-        .unwrap();
         assert_eq!(host.list_plugins().len(), 1);
+
+        let tampered = signed.replace("minimum = 1", "minimum = 2");
+        std::fs::write(plugin_dir.join("manifest.toml"), tampered).unwrap();
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Strict,
+            vec![publisher_key],
+        )
+        .unwrap();
+        assert!(host.list_plugins().is_empty());
     }
 
     #[test]
@@ -1474,6 +1368,202 @@ provides = "nextcloud_talk"
             1,
             "permissive mode must load an unsigned plugin (untrusted and invalid signatures also load with a warning in permissive mode, covered in signature.rs)"
         );
+    }
+
+    #[test]
+    fn install_rejects_absolute_and_parent_wasm_paths() {
+        let source = tempdir().unwrap();
+        let outside_root = tempdir().unwrap();
+        let outside = outside_root.path().join("outside-plugin.wasm");
+        std::fs::write(&outside, b"outside").unwrap();
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        for wasm_path in [
+            "../outside-plugin.wasm".to_string(),
+            outside.display().to_string(),
+        ] {
+            std::fs::write(
+                source.path().join("manifest.toml"),
+                format!(
+                    "name = \"unsafe-path\"\nversion = \"0.1.0\"\nwasm_path = \"{wasm_path}\"\ncapabilities = [\"tool\"]\n"
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                host.install(source.path().to_str().unwrap()),
+                Err(PluginError::InvalidManifest(_))
+            ));
+            assert!(!plugins.path().join("unsafe-path").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_payload_and_package_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let plugins = root.path().join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let outside = root.path().join("outside.wasm");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let payload_link = plugins.join("payload-link");
+        std::fs::create_dir_all(&payload_link).unwrap();
+        std::fs::write(
+            payload_link.join("manifest.toml"),
+            "name = \"payload-link\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        symlink(&outside, payload_link.join("plugin.wasm")).unwrap();
+
+        let package_target = root.path().join("package-target");
+        std::fs::create_dir_all(&package_target).unwrap();
+        std::fs::write(
+            package_target.join("manifest.toml"),
+            "name = \"package-link\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(package_target.join("plugin.wasm"), b"component").unwrap();
+        symlink(&package_target, plugins.join("package-link")).unwrap();
+
+        let host = PluginHost::new(root.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_payload_read_rejects_a_post_confinement_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let payload = root.path().join("plugin.wasm");
+        std::fs::write(&payload, b"inside").unwrap();
+        let confined = std::fs::canonicalize(&payload).unwrap();
+        let outside = root.path().join("outside.wasm");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(&payload).unwrap();
+        symlink(&outside, &payload).unwrap();
+
+        assert!(matches!(
+            read_stable_file(&confined),
+            Err(PluginError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn declared_payload_digest_is_enforced_in_non_strict_modes() {
+        let payload = b"actual component";
+        for mode in [SignatureMode::Disabled, SignatureMode::Permissive] {
+            let root = tempdir().unwrap();
+            let plugin_dir = root.path().join("digest-mismatch");
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), payload).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    "name = \"digest-mismatch\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
+                    signature::sha256_hex(b"different component")
+                ),
+            )
+            .unwrap();
+
+            let host =
+                PluginHost::from_plugins_dir_with_security(root.path(), mode, Vec::new()).unwrap();
+            assert!(host.list_plugins().is_empty());
+        }
+    }
+
+    #[test]
+    fn strict_mode_requires_and_accepts_a_signed_payload_digest() {
+        let payload = b"signed component";
+        for (name, include_digest, expected_count) in
+            [("no-digest", false, 0), ("with-digest", true, 1)]
+        {
+            let root = tempdir().unwrap();
+            let plugin_dir = root.path().join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), payload).unwrap();
+            let (manifest, publisher_key) = signed_tool_manifest(name, payload, include_digest);
+            std::fs::write(plugin_dir.join("manifest.toml"), manifest).unwrap();
+
+            let host = PluginHost::from_plugins_dir_with_security(
+                root.path(),
+                SignatureMode::Strict,
+                vec![publisher_key],
+            )
+            .unwrap();
+            assert_eq!(host.list_plugins().len(), expected_count);
+        }
+    }
+
+    #[test]
+    fn admitted_component_retains_the_exact_verified_bytes() {
+        let root = tempdir().unwrap();
+        let plugin_dir = root.path().join("exact-bytes");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let admitted_bytes = b"first component generation";
+        std::fs::write(plugin_dir.join("plugin.wasm"), admitted_bytes).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"exact-bytes\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
+                signature::sha256_hex(admitted_bytes)
+            ),
+        )
+        .unwrap();
+
+        let host = PluginHost::from_plugins_dir(root.path()).unwrap();
+        let component = host.tool_plugin_details()[0].1.clone();
+        std::fs::write(
+            plugin_dir.join("plugin.wasm"),
+            b"second component generation",
+        )
+        .unwrap();
+
+        assert_eq!(component.bytes(), admitted_bytes);
+    }
+
+    #[test]
+    fn strict_install_persists_the_exact_signed_generations() {
+        let payload = b"signed install component";
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), payload).unwrap();
+        let (manifest, publisher_key) = signed_tool_manifest("signed-install", payload, true);
+        std::fs::write(source.path().join("manifest.toml"), &manifest).unwrap();
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            vec![publisher_key],
+        )
+        .unwrap();
+
+        host.install(source.path().to_str().unwrap()).unwrap();
+        let installed = plugins.path().join("signed-install");
+        assert_eq!(
+            std::fs::read_to_string(installed.join("manifest.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read(installed.join("plugin.wasm")).unwrap(),
+            payload
+        );
+        assert_eq!(host.tool_plugin_details()[0].1.bytes(), payload);
+    }
+
+    #[test]
+    fn digest_without_an_executable_path_is_invalid() {
+        let manifest: PluginManifest = toml::from_str(
+            "name = \"digest-only\"\nversion = \"0.1.0\"\nwasm_sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\ncapabilities = [\"skill\"]\n",
+        )
+        .unwrap();
+        let root = tempdir().unwrap();
+        assert!(matches!(
+            validate_manifest_shape(&manifest, root.path()),
+            Err(PluginError::InvalidManifest(_))
+        ));
     }
 
     #[test]

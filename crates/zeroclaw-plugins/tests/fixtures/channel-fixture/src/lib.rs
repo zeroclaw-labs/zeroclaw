@@ -1,16 +1,4 @@
-//! Minimal ZeroClaw WIT channel plugin used as an integration-test fixture.
-//!
-//! It reports one canned inbound message the first time `poll-message` is
-//! called, accepts `send` (dropping the bytes), advertises `health-check` +
-//! `self-handle`, and stubs every capability-gated method with its documented
-//! default. Its `configure` export emits a unique host log so integration tests
-//! can prove whether startup exports ran. It exists solely to prove the host's
-//! channel-plugin runtime path end-to-end (`WasmChannel::from_wasm` → configure
-//! → capabilities → send → poll). No network, no filesystem, no config
-//! needed.
-//!
-//! The host E2E tests build this source on demand with the checked-in lockfile.
-//! Manual build: `cargo build --locked --target wasm32-wasip2`.
+//! Minimal channel component used by the plugin-host scoped-secret tests.
 
 #[cfg(target_family = "wasm")]
 mod component {
@@ -20,104 +8,138 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::cell::{Cell, RefCell};
-
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
         SendMessage, WebhookRejection,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
-    use zeroclaw::plugin::logging::{
-        log_record, LogLevel, PluginAction, PluginEvent, PluginOutcome,
-    };
+    use zeroclaw::plugin::config::{ConfigError, get as config_get};
+    use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
+    use zeroclaw::plugin::state::{StateError, get as state_get, put as state_put};
 
-    const PLUGIN_NAME: &str = "echo-channel";
-    const PLUGIN_VERSION: &str = "0.1.0";
-    const CONFIGURE_MARKER: &str = "channel-fixture configure export invoked";
-    const POLL_MARKER: &str = "channel-fixture poll-message export invoked";
+    struct FixtureChannel;
 
-    struct EchoChannel;
-
-    // Deliver one inbound message, then `none`, so a host poll loop terminates.
-    // The message echoes the JSON this plugin received from `configure`, so a
-    // host test can assert exactly what config (plaintext, typed) reached it.
-    thread_local! {
-        static DELIVERED: Cell<bool> = const { Cell::new(false) };
-        static CONFIG: RefCell<String> = RefCell::new(String::new());
+    fn current_public_config() -> Result<serde_json::Value, String> {
+        let config = config_get().map_err(|_| "expected point-of-use public config".to_string())?;
+        serde_json::from_str(&config).map_err(|_| "expected public config object".to_string())
     }
 
-    impl PluginInfo for EchoChannel {
+    impl PluginInfo for FixtureChannel {
         fn plugin_name() -> String {
-            PLUGIN_NAME.to_string()
+            "channel-fixture".to_string()
         }
+
         fn plugin_version() -> String {
-            PLUGIN_VERSION.to_string()
+            "0.0.0".to_string()
         }
     }
 
-    impl Channel for EchoChannel {
+    impl Channel for FixtureChannel {
         fn name() -> String {
-            PLUGIN_NAME.to_string()
+            "channel-fixture".to_string()
         }
 
-        fn configure(config: String) -> Result<(), String> {
-            log_record(
-                LogLevel::Info,
-                &PluginEvent {
-                    function_name: "channel_fixture::configure".to_string(),
-                    action: PluginAction::Start,
-                    outcome: Some(PluginOutcome::Success),
-                    duration_ms: None,
-                    attrs: None,
-                    message: CONFIGURE_MARKER.to_string(),
-                },
-            );
-            CONFIG.with(|c| *c.borrow_mut() = config);
+        fn configure() -> Result<(), String> {
+            let config = current_public_config()?;
+            let public = config
+                .as_object()
+                .ok_or_else(|| "expected public config object".to_string())?;
+            if public
+                .get("retry_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(5)
+            {
+                return Err("expected typed retry_count config".to_string());
+            }
+            if public
+                .get("credential_epoch")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("expected credential_epoch config".to_string());
+            }
+            if public.len() != 2 {
+                return Err("expected only public config".to_string());
+            }
+            if !matches!(secret_get("retry_count"), Err(SecretError::NotFound)) {
+                return Err("public property was exposed as a secret".to_string());
+            }
+            let token = secret_get("api_token")
+                .map_err(|_| "expected scoped api_token secret".to_string())?;
+            if token.is_empty() {
+                return Err("expected non-empty api_token secret".to_string());
+            }
+            let current = state_get("channel-session")
+                .map_err(|_| "expected scoped channel state".to_string())?;
+            let expected = current.as_ref().map(|entry| entry.revision);
+            let revision = state_put("channel-session", token.as_bytes(), expected)
+                .map_err(|_| "expected scoped channel state write".to_string())?;
+            if revision != expected.unwrap_or(0) + 1 {
+                return Err("unexpected channel state revision".to_string());
+            }
+
             Ok(())
         }
 
-        fn send(_message: SendMessage) -> Result<(), String> {
+        fn send(message: SendMessage) -> Result<(), String> {
+            let config = current_public_config()?;
+            let epoch = config
+                .get("credential_epoch")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "expected credential_epoch config".to_string())?;
+            if !matches!(secret_get("retry_count"), Err(SecretError::NotFound)) {
+                return Err("public property was exposed as a secret".to_string());
+            }
+            let token = secret_get("api_token")
+                .map_err(|_| "expected api_token during channel operation".to_string())?;
+            let state = state_get("channel-session")
+                .map_err(|_| "expected channel state during operation".to_string())?
+                .ok_or_else(|| "expected configured channel state".to_string())?;
+            if state.value != token.as_bytes() {
+                let next_revision =
+                    state_put("channel-session", token.as_bytes(), Some(state.revision))
+                        .map_err(|_| "expected CAS update after credential rotation".to_string())?;
+                if next_revision != state.revision + 1 {
+                    return Err("unexpected rotated channel state revision".to_string());
+                }
+            }
+            if message.content != format!("{epoch}:{token}") {
+                return Err("message did not use one current config revision".to_string());
+            }
+
             Ok(())
         }
 
         fn poll_message() -> Option<InboundMessage> {
-            log_record(
-                LogLevel::Info,
-                &PluginEvent {
-                    function_name: "channel_fixture::poll_message".to_string(),
-                    action: PluginAction::Inbound,
-                    outcome: Some(PluginOutcome::Success),
-                    duration_ms: None,
-                    attrs: None,
-                    message: POLL_MARKER.to_string(),
-                },
-            );
-            let already = DELIVERED.with(|d| d.replace(true));
-            if already {
-                return None;
-            }
-            // Echo the config this plugin received, so the host test can assert
-            // the exact (plaintext, typed) JSON that reached `configure`.
-            let content = CONFIG.with(|c| c.borrow().clone());
+            let message = zeroclaw::plugin::inbound::inbound_poll()?;
             Some(InboundMessage {
-                id: "fixture-1".to_string(),
-                sender: "tester".to_string(),
-                reply_target: "tester".to_string(),
-                content,
-                channel: PLUGIN_NAME.to_string(),
-                channel_alias: None,
-                timestamp: 0,
-                thread_ts: None,
-                interruption_scope_id: None,
+                id: message.id,
+                sender: message.sender,
+                reply_target: message.reply_target,
+                content: message.content,
+                // Deliberately untrusted: the host must replace both values
+                // with its admitted logical endpoint.
+                channel: "guest-channel".to_string(),
+                channel_alias: Some("guest-alias".to_string()),
+                timestamp: message.timestamp,
+                thread_ts: message.thread_ts,
+                interruption_scope_id: message.interruption_scope_id,
                 attachments: Vec::new(),
-                subject: None,
+                subject: message.subject,
             })
         }
 
         fn get_channel_capabilities() -> ChannelCapabilities {
-            ChannelCapabilities::HEALTH_CHECK
-                | ChannelCapabilities::SELF_HANDLE
-                | ChannelCapabilities::WEBHOOK_INGRESS
+            if matches!(config_get(), Err(ConfigError::Unavailable))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable))
+            {
+                ChannelCapabilities::HEALTH_CHECK
+                    | ChannelCapabilities::SELF_HANDLE
+                    | ChannelCapabilities::WEBHOOK_INGRESS
+            } else {
+                ChannelCapabilities::empty()
+            }
         }
 
         fn health_check() -> bool {
@@ -125,7 +147,10 @@ mod component {
         }
 
         fn self_handle() -> Option<String> {
-            Some("@echo".to_string())
+            (matches!(config_get(), Err(ConfigError::Unavailable))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable)))
+            .then(|| "@fixture".to_string())
         }
 
         fn self_addressed_mention() -> Option<String> {
@@ -152,19 +177,31 @@ mod component {
             Ok(None)
         }
 
-        fn update_draft(_r: String, _m: String, _t: String) -> Result<(), String> {
+        fn update_draft(
+            _recipient: String,
+            _message_id: String,
+            _text: String,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn update_draft_progress(_r: String, _m: String, _t: String) -> Result<(), String> {
+        fn update_draft_progress(
+            _recipient: String,
+            _message_id: String,
+            _text: String,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn finalize_draft(_r: String, _m: String, _t: String) -> Result<(), String> {
+        fn finalize_draft(
+            _recipient: String,
+            _message_id: String,
+            _final_text: String,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn cancel_draft(_r: String, _m: String) -> Result<(), String> {
+        fn cancel_draft(_recipient: String, _message_id: String) -> Result<(), String> {
             Ok(())
         }
 
@@ -176,23 +213,35 @@ mod component {
             800
         }
 
-        fn add_reaction(_c: String, _m: String, _e: String) -> Result<(), String> {
+        fn add_reaction(
+            _channel: String,
+            _message_id: String,
+            _emoji: String,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn remove_reaction(_c: String, _m: String, _e: String) -> Result<(), String> {
+        fn remove_reaction(
+            _channel: String,
+            _message_id: String,
+            _emoji: String,
+        ) -> Result<(), String> {
             Ok(())
         }
 
-        fn pin_message(_c: String, _m: String) -> Result<(), String> {
+        fn pin_message(_channel: String, _message_id: String) -> Result<(), String> {
             Ok(())
         }
 
-        fn unpin_message(_c: String, _m: String) -> Result<(), String> {
+        fn unpin_message(_channel: String, _message_id: String) -> Result<(), String> {
             Ok(())
         }
 
-        fn redact_message(_c: String, _m: String, _reason: Option<String>) -> Result<(), String> {
+        fn redact_message(
+            _channel: String,
+            _message_id: String,
+            _reason: Option<String>,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -223,35 +272,30 @@ mod component {
             headers: Vec<(String, String)>,
             body: Vec<u8>,
         ) -> Result<Vec<InboundMessage>, WebhookRejection> {
-            // Auth: the caller must present this fixture's configured secret in
-            // `x-fixture-secret`; otherwise reject (the host replies 401 and
-            // enqueues nothing). Stands in for a real platform HMAC check.
-            let secret = CONFIG.with(|c| c.borrow().clone());
+            let secret = secret_get("api_token").map_err(|_| {
+                WebhookRejection::Unauthorized("webhook credential unavailable".to_string())
+            })?;
             let presented = headers
                 .iter()
-                .find(|(k, _)| k == "x-fixture-secret")
-                .map(|(_, v)| v.as_str());
+                .find(|(name, _)| name == "x-fixture-secret")
+                .map(|(_, value)| value.as_str());
             if presented != Some(secret.as_str()) {
                 return Err(WebhookRejection::Unauthorized(
-                    "bad signature".to_string(),
+                    "bad fixture signature".to_string(),
                 ));
             }
             if body == b"stall-parse" {
-                // WASI clocks suspend through an async host call. The host E2E
-                // cancels this invocation at the request deadline and then
-                // proves the same warm channel store can process another call.
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
-            let content = String::from_utf8(body).map_err(|_| {
-                WebhookRejection::BadRequest("non-utf8 body".to_string())
-            })?;
+            let content = String::from_utf8(body)
+                .map_err(|_| WebhookRejection::BadRequest("non-utf8 body".to_string()))?;
             Ok(vec![InboundMessage {
                 id: "webhook-1".to_string(),
                 sender: "webhook".to_string(),
                 reply_target: "webhook".to_string(),
                 content,
-                channel: PLUGIN_NAME.to_string(),
-                channel_alias: None,
+                channel: "guest-channel".to_string(),
+                channel_alias: Some("guest-alias".to_string()),
                 timestamp: 0,
                 thread_ts: None,
                 interruption_scope_id: None,
@@ -261,5 +305,5 @@ mod component {
         }
     }
 
-    export!(EchoChannel);
+    export!(FixtureChannel);
 }

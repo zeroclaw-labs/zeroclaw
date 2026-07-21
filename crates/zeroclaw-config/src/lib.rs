@@ -7,7 +7,6 @@
 #![allow(clippy::useless_format)]
 
 pub mod alias_refs;
-pub mod allowlist;
 pub mod api_error;
 pub mod autonomy;
 pub mod comment_writer;

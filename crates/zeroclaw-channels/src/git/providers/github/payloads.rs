@@ -1,10 +1,4 @@
 //! GitHub REST payloads and provider-local constants.
-//!
-//! Deserialized verbatim from api.github.com. Layer: provider data. These
-//! shapes are GitHub-specific and never leak into the generic `git` core —
-//! `mapping` turns them into [`crate::git::events::GitEvent`]s, and `api`
-//! deserializes them. Zero business logic beyond the small accessors that
-//! parse forge-encoded fields (issue/PR numbers from URLs, token freshness).
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -56,11 +50,6 @@ pub struct GhIssue {
     pub body: Option<String>,
     pub user: GhUser,
     pub created_at: DateTime<Utc>,
-    /// Last-modified time. GitHub's issues `since` filter keys on this, so
-    /// the Issues stream cursor advances on it (see `fetch_issues`).
-    /// Optional only so older/hand-built fixtures without the field fall
-    /// back to `created_at` via [`GhIssue::updated_at`]; real payloads
-    /// always carry it.
     #[serde(default, rename = "updated_at")]
     pub updated_at_raw: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -212,12 +201,6 @@ pub struct GhPull {
     pub html_url: String,
 }
 
-/// One entry of the repository Events API feed
-/// (`/repos/{owner}/{repo}/events` — the Tier C backbone transport).
-/// `payload` stays untyped here: its shape depends on `kind`, and one
-/// malformed entry must not fail deserialization of the whole feed.
-/// Identity and timestamps come from the embedded objects, not the feed
-/// entry, so they de-duplicate against the targeted endpoints.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GhRepoEvent {
     /// `IssueCommentEvent`, `IssuesEvent`, `PullRequestEvent`, ….

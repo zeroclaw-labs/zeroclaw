@@ -13,7 +13,6 @@ Composite job with multiple matrix legs:
 - **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check**: all features + no-default-features
-- **plugin backends**: compile each WASM backend and run the real channel component E2E with Cranelift
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
@@ -165,6 +164,8 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
 | `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml` | Report-only container vulnerability scanning |
 | `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml` | Upload Trivy SARIF reports to the Security tab |
+| `github/codeql-action/init` (`v3`) | `ci-code-analysis.yml` | Initialize CodeQL Rust analysis |
+| `github/codeql-action/analyze` (`v3`) | `ci-code-analysis.yml` | Upload CodeQL SARIF to the Security tab |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
@@ -180,6 +181,8 @@ anchore/sbom-action@*
 slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
 aquasecurity/trivy-action@*
 github/codeql-action/upload-sarif@*
+github/codeql-action/init@*
+github/codeql-action/analyze@*
 ```
 
 Export the current effective policy:
