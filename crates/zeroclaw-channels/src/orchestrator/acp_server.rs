@@ -1419,14 +1419,29 @@ impl AcpServer {
             }
         };
 
-        let prompt = Self::materialize_prompt(
+        // Reserve the session turn BEFORE materializing attachments. Materializing
+        // `resource.blob` parts writes files into uploads/; two concurrent prompts for
+        // the same session must not both perform that side effect before one is
+        // rejected with SESSION_BUSY. Reserve first, then do the work.
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        self.register_cancel_token(&session_id, cancel_token.clone())?;
+
+        let prompt = match Self::materialize_prompt(
             params,
             if workspace_dir.is_empty() {
                 None
             } else {
                 Some(Path::new(&workspace_dir))
             },
-        )?;
+        ) {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                // Release the reservation we just took so a bad attachment doesn't
+                // wedge the session for subsequent prompts.
+                self.remove_cancel_token(&session_id);
+                return Err(e);
+            }
+        };
 
         let session_id_s = session_id.clone();
         let agent_alias_s = agent_alias.clone();
@@ -1449,8 +1464,7 @@ impl AcpServer {
             "ACP session/prompt turn starting"
         );
 
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        self.register_cancel_token(&session_id, cancel_token.clone())?;
+        // Turn already reserved (and `cancel_token` created) before materialization.
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
         let config = self.config_snapshot();
@@ -4487,6 +4501,64 @@ mod tests {
             .await
             .expect("cancel should still target the original active token");
         assert!(active_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_concurrent_blob_without_writing_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        // Simulate an in-flight turn already holding the session reservation.
+        let active_token = tokio_util::sync::CancellationToken::new();
+        server
+            .register_cancel_token(&session_id, active_token.clone())
+            .expect("simulated active turn should register token");
+
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"concurrent blob bytes",
+        );
+        let err = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id.clone(),
+                    "prompt": [{
+                        "type": "resource",
+                        "resource": { "uri": "file:///race.bin", "blob": b64 }
+                    }]
+                }),
+                &serde_json::json!(3),
+            )
+            .await
+            .expect_err("concurrent prompt must be rejected before its blob is materialized");
+
+        assert_eq!(err.code, SESSION_BUSY);
+
+        // The turn must be reserved BEFORE any side effect: a rejected prompt must
+        // not have written its attachment into the workspace.
+        let uploads = cwd.path().join("uploads");
+        let wrote_any = std::fs::read_dir(&uploads)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .any(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            })
+            .unwrap_or(false);
+        assert!(
+            !wrote_any,
+            "blob was materialized before the turn was admitted (SESSION_BUSY)"
+        );
     }
 
     #[tokio::test]
