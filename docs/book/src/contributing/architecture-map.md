@@ -6,10 +6,11 @@ This page is only a map. The linked files remain the source of truth.
 
 ## Start Here
 
-1. Read the repo-root `AGENTS.md` first. It contains the current risk tiers, protected files, anti-patterns, localization rules, and agent-specific workflow contracts.
-2. Read [How to contribute](./how-to.md) for the PR mechanics, validation expectations, and review process.
+1. Read the repo-root `AGENTS.md` first. It contains the compact, always-loaded safety and contribution contract.
+2. Read [How to contribute](./how-to.md) for PR mechanics, validation expectations, and the review process.
 3. Use the tables below to choose the architecture and foundation documents that match the change.
-4. If the change crosses subsystem, config, security, workflow, governance, or release boundaries, check the [RFC process](./rfcs.md) before implementing.
+4. Consult [Coding agent guidelines](./agent-guidelines.md) when an AI coding task needs detailed source-of-truth examples, risk and stability policy, skill discovery, or protected operational documents.
+5. If the change crosses subsystem, config, security, workflow, governance, or release boundaries, check the [RFC process](./rfcs.md) before implementing.
 
 ## Common Change Paths
 
@@ -47,7 +48,7 @@ This page is only a map. The linked files remain the source of truth.
 
 Coding agents should use the same public docs as humans, plus the repository-local agent contracts.
 
-- Follow the repo-root `AGENTS.md` and the matching in-repo skill listed there when one applies.
+- Follow the repo-root `AGENTS.md`. Inspect `.claude/skills/*/SKILL.md` and use the matching in-repo skill when one applies; the skill file is authoritative.
 - Treat foundation documents as decision context. They explain why a review may ask for a split, an RFC, stronger validation, or a different owner.
 - Keep private workflow mechanics out of public PR bodies, issue comments, and reviews. Public text should cite concrete behavior, source paths, commands, validation evidence, linked issues, and user-visible risk.
 - If a generated or skill-authored draft conflicts with source code, current `AGENTS.md`, or a ratified foundation document, stop and reconcile before posting or implementing.
