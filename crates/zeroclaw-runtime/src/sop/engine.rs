@@ -316,7 +316,8 @@ impl SopEngine {
         Arc::clone(&self.approval_broker)
     }
 
-    /// Resolve a gate THROUGH the broker (membership + quorum), then the chokepoint.
+    /// Resolve a gate or deterministic checkpoint THROUGH the broker (membership +
+    /// quorum), then its single transition owner.
     /// This is the entry point out-of-band surfaces (gateway / CLI / tools) should
     /// call so a `[sop.approval]` policy is enforced; with no policy it is exactly
     /// `resolve_gate`. The broker is cloned out first so it does not borrow `self`
@@ -328,6 +329,19 @@ impl SopEngine {
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
+        if let Some(step) = self.active_runs.get(run_id).and_then(|run| {
+            (run.status == SopRunStatus::PausedCheckpoint).then_some(run.current_step)
+        }) {
+            if let Some(outcome) =
+                broker.authorize_checkpoint(self, run_id, step, &decision, &principal)?
+            {
+                return Ok(outcome);
+            }
+            let action = self.decide_checkpoint_with_principal(run_id, decision, principal)?;
+            return Ok(super::approval::BrokerOutcome::Resolved(
+                super::approval::ResolveOutcome::Resumed(Box::new(action)),
+            ));
+        }
         broker.resolve(self, run_id, decision, principal)
     }
     /// Reconstruct in-flight runs from the store at startup (durable backends).
@@ -2675,6 +2689,216 @@ impl SopEngine {
         }
     }
 
+    /// Apply a broker-authorized checkpoint decision and persist the resulting run
+    /// state together with the approver audit row. The run store is the durable
+    /// source of truth for both surfaces, so a failed combined write leaves the
+    /// checkpoint parked with no false resolution event.
+    fn decide_checkpoint_with_principal(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<SopRunAction> {
+        let prior_run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        if prior_run.status != SopRunStatus::PausedCheckpoint {
+            bail!(
+                "Run {run_id} is not paused at a checkpoint (status: {})",
+                prior_run.status
+            );
+        }
+        if self.is_park_persist_pending(run_id) {
+            bail!(
+                "Run {run_id} cannot resolve: its parked checkpoint snapshot is not yet durably persisted (retrying)"
+            );
+        }
+
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let current_step = self.resolve_sop_step(&sop, prior_run.current_step)?;
+        let piped = prior_run
+            .step_results
+            .last()
+            .map(step_result_value)
+            .unwrap_or(serde_json::Value::Null);
+        let (status, recorded_output, routed_output, started_at, completed_at) = match &decision {
+            super::approval::ApprovalDecision::Approve => (
+                SopStepStatus::Completed,
+                piped.to_string(),
+                piped,
+                prior_run.started_at.clone(),
+                Some(now_iso8601()),
+            ),
+            super::approval::ApprovalDecision::Deny { reason } => {
+                if let super::step_contract::StepFailure::Goto { step } = &current_step.on_failure {
+                    self.resolve_sop_step(&sop, *step)?;
+                }
+                let detail = reason
+                    .clone()
+                    .unwrap_or_else(|| "checkpoint denied by operator".to_string());
+                let now = now_iso8601();
+                (
+                    SopStepStatus::Failed,
+                    detail.clone(),
+                    serde_json::Value::String(detail),
+                    now.clone(),
+                    Some(now),
+                )
+            }
+        };
+
+        let retries_consumed = prior_run
+            .step_results
+            .iter()
+            .filter(|result| {
+                result.step_number == current_step.number && result.status == SopStepStatus::Failed
+            })
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let denial_terminates = matches!(decision, super::approval::ApprovalDecision::Deny { .. })
+            && matches!(
+                route::failure::route_failure(
+                    &current_step.on_failure,
+                    retries_consumed,
+                    self.config.max_step_retries,
+                ),
+                NextStep::Fail(_)
+            );
+        if denial_terminates {
+            self.reacquire_claim_uncapped(run_id)?;
+            if let Err(e) = self
+                .store
+                .mark_claim_retained_after_terminal_rollback(run_id)
+            {
+                self.release_claim_on_park(run_id);
+                return Err(anyhow::Error::msg(format!(
+                    "failed to persist terminal-rollback claim marker for run {run_id}: {e}"
+                )));
+            }
+        } else {
+            self.reacquire_claim_on_resume(run_id)?;
+        }
+
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+            run.step_results.push(SopStepResult {
+                step_number: current_step.number,
+                status,
+                output: recorded_output,
+                started_at,
+                completed_at,
+                effective_agent: None,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        let mut routed_status = status;
+        if status == SopStepStatus::Completed {
+            if let Err(reason) = self.validate_step_output(&current_step, &routed_output) {
+                routed_status = SopStepStatus::Failed;
+                let full_reason = format!(
+                    "Step {} output schema validation failed: {reason}",
+                    current_step.number
+                );
+                if let Some(recorded) = self
+                    .active_runs
+                    .get_mut(run_id)
+                    .and_then(|run| run.step_results.last_mut())
+                {
+                    recorded.status = SopStepStatus::Failed;
+                    recorded.output = full_reason;
+                }
+            } else if let Some(run) = self.active_runs.get_mut(run_id) {
+                run.llm_calls_saved += 1;
+            }
+        }
+
+        let route = match self.route_decision_after_recorded_step(
+            run_id,
+            &sop,
+            &current_step,
+            routed_status,
+        ) {
+            Ok(route) => route,
+            Err(e) => {
+                self.active_runs.insert(run_id.to_string(), prior_run);
+                if !denial_terminates {
+                    self.release_claim_on_park(run_id);
+                }
+                return Err(e);
+            }
+        };
+        let event = super::approval::GateLedgerEntry {
+            run_id: run_id.to_string(),
+            step: current_step.number,
+            kind: super::approval::GateEventKind::Resolved,
+            decision: Some(decision),
+            principal,
+            ts: now_iso8601(),
+        }
+        .into_event_record();
+
+        match route {
+            NextStep::Complete => {
+                let saved = self
+                    .active_runs
+                    .get(run_id)
+                    .map(|run| run.llm_calls_saved)
+                    .unwrap_or(0);
+                match self.finish_run_with_gate_event(run_id, SopRunStatus::Completed, None, &event)
+                {
+                    Ok(action) => {
+                        self.deterministic_savings.total_llm_calls_saved += saved;
+                        self.deterministic_savings.total_runs += 1;
+                        Ok(action)
+                    }
+                    Err(e) => {
+                        self.active_runs.insert(run_id.to_string(), prior_run);
+                        if !denial_terminates {
+                            self.release_claim_on_park(run_id);
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            NextStep::Fail(reason) => match self.finish_run_with_gate_event(
+                run_id,
+                SopRunStatus::Failed,
+                Some(reason),
+                &event,
+            ) {
+                Ok(action) => Ok(action),
+                Err(e) => {
+                    self.active_runs.insert(run_id.to_string(), prior_run);
+                    if !denial_terminates {
+                        self.release_claim_on_park(run_id);
+                    }
+                    Err(e)
+                }
+            },
+            next => {
+                if let Err(e) = self.persist_active_with_gate_event(run_id, &event) {
+                    self.active_runs.insert(run_id.to_string(), prior_run);
+                    self.release_claim_on_park(run_id);
+                    return Err(e);
+                }
+                self.apply_route_decision(
+                    run_id,
+                    &sop,
+                    current_step.number,
+                    next,
+                    true,
+                    Some(retry_input_value(&prior_run, current_step.number)),
+                    Some(routed_output),
+                )
+            }
+        }
+    }
+
     /// Failure path for a denied checkpoint: record the checkpoint step `Failed`
     /// and route through its `on_failure` policy via the shared deterministic
     /// record-and-route chokepoint. `Goto` reaches the authored failure step;
@@ -3944,29 +4168,47 @@ impl SopEngine {
         &self.config.approval
     }
 
-    /// The name of the approval policy that applies to the run's currently-waiting
-    /// step, if that step names one. Shared by the broker (membership/quorum) and
-    /// the approval query surfaces so the "which policy applies now" lookup lives in
-    /// exactly one place.
-    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
-        let run = self.get_run(run_id)?;
-        let sop = self.get_sop(&run.sop_name)?;
+    /// Fallible lookup for the approval policy that applies to the run's current
+    /// parked step. `Ok(None)` means the step is intentionally unpoliced; `Err`
+    /// means the live run/SOP/step state is unavailable and callers must fail
+    /// closed rather than treating it as unpoliced.
+    pub(crate) fn current_step_policy_lookup(&self, run_id: &str) -> Result<Option<String>> {
+        let run = self
+            .get_run(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let sop = self.get_sop(&run.sop_name).ok_or_else(|| {
+            anyhow::Error::msg(format!("SOP '{}' no longer loaded", run.sop_name))
+        })?;
         // Match the step by its `number`, NOT by vec position: routed / non-contiguous
         // step numbers mean position != number, and a positional lookup would read the
         // wrong step's policy (silently unpolicing a policied gate, or vice versa).
-        let name = sop
+        let step = sop
             .steps
             .iter()
-            .find(|s| s.number == run.current_step)?
-            .policy
-            .as_deref()?
-            .trim();
+            .find(|s| s.number == run.current_step)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "SOP '{}' no longer contains step {}",
+                    run.sop_name, run.current_step
+                ))
+            })?;
+        let Some(name) = step.policy.as_deref() else {
+            return Ok(None);
+        };
+        let name = name.trim();
         // An empty/whitespace name means "no policy", same as the Markdown parser's
         // `policy:` bullet (mod.rs). Without this, a TOML `policy = ""` step would
         // deserialize as `Some("")` and the broker would treat it as a NAMED-but-absent
         // policy (fail closed, gate stuck waiting forever) instead of unpoliced -
         // diverging from the equivalent Markdown SOP, which normalizes to `None`.
-        (!name.is_empty()).then(|| name.to_string())
+        Ok((!name.is_empty()).then(|| name.to_string()))
+    }
+
+    /// The name of the approval policy that applies to the run's current step, if
+    /// that step names one. Read surfaces collapse unavailable live state to
+    /// `None`; the broker uses the fallible lookup above to fail closed.
+    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
+        self.current_step_policy_lookup(run_id).ok().flatten()
     }
 
     /// Classify a run's approval gate for `resolve_gate` (idempotency + typed
@@ -6145,13 +6387,13 @@ mod tests {
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let engine = engine_with_sops(vec![]).with_store(store);
 
-        // Same subject "alice" over HTTP then WS: collapses to gateway:alice.
+        // Same subject "ZeroClawOperator" over HTTP then WS: collapses to gateway:ZeroClawOperator.
         engine
             .record_gate_vote(
                 "run-1",
                 1,
                 "p",
-                &ApprovalPrincipal::http(Some("alice".into())),
+                &ApprovalPrincipal::http(Some("ZeroClawOperator".into())),
             )
             .unwrap();
         engine
@@ -6159,7 +6401,7 @@ mod tests {
                 "run-1",
                 1,
                 "p",
-                &ApprovalPrincipal::ws("c".into(), Some("alice".into())),
+                &ApprovalPrincipal::ws("c".into(), Some("ZeroClawOperator".into())),
             )
             .unwrap();
         // A repeat over HTTP: still the same canonical voter.
@@ -6168,12 +6410,17 @@ mod tests {
                 "run-1",
                 1,
                 "p",
-                &ApprovalPrincipal::http(Some("alice".into())),
+                &ApprovalPrincipal::http(Some("ZeroClawOperator".into())),
             )
             .unwrap();
-        // A CLI actor is a genuinely distinct source (cli:bob).
+        // A CLI actor is a genuinely distinct source (cli:ZeroClawMaintainer).
         engine
-            .record_gate_vote("run-1", 1, "p", &ApprovalPrincipal::cli(Some("bob".into())))
+            .record_gate_vote(
+                "run-1",
+                1,
+                "p",
+                &ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
+            )
             .unwrap();
         // A vote on step 2 is a separate tally.
         engine
@@ -6199,7 +6446,7 @@ mod tests {
         assert_eq!(
             distinct(1),
             2,
-            "gateway:alice (http+ws collapsed) + cli:bob = 2 distinct step-1 voters"
+            "gateway:ZeroClawOperator (http+ws collapsed) + cli:ZeroClawMaintainer = 2 distinct step-1 voters"
         );
         assert_eq!(
             distinct(2),
@@ -6217,10 +6464,14 @@ mod tests {
         use crate::sop::approval::ApprovalPrincipal;
         let store = std::sync::Arc::new(InMemoryRunStore::new());
         let engine = engine_with_sops(vec![]).with_store(store);
-        let alice = ApprovalPrincipal::cli(Some("alice".into()));
+        let zero_claw_operator = ApprovalPrincipal::cli(Some("ZeroClawOperator".into()));
 
-        engine.record_gate_vote("run-1", 1, "prod", &alice).unwrap();
-        engine.record_gate_vote("run-1", 1, "prod", &alice).unwrap();
+        engine
+            .record_gate_vote("run-1", 1, "prod", &zero_claw_operator)
+            .unwrap();
+        engine
+            .record_gate_vote("run-1", 1, "prod", &zero_claw_operator)
+            .unwrap();
         assert_eq!(
             engine.gate_votes_for_step("run-1", 1).unwrap().len(),
             1,
@@ -6228,7 +6479,7 @@ mod tests {
         );
 
         engine
-            .record_gate_vote("run-1", 1, "prod2", &alice)
+            .record_gate_vote("run-1", 1, "prod2", &zero_claw_operator)
             .unwrap();
         assert_eq!(
             engine.gate_votes_for_step("run-1", 1).unwrap().len(),
@@ -9049,7 +9300,7 @@ mod tests {
         let res = engine.resolve_gate(
             &run_id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         );
         assert!(
             res.is_err(),

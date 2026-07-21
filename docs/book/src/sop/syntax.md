@@ -91,10 +91,17 @@ escalation_route = "oncall"
 `[sop.approval.groups.*]` members are approval identities, not account names.
 Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
 `agent:<alias>`) to grant approval rights on one transport only, or bare
-(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+(`ZeroClawOperator`) to grant any source carrying that identity. HTTP and WebSocket
 approval surfaces use the paired-token subject; the current CLI approval path
 (`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
 membership yet.
+
+The paired-token subject is the lowercase SHA-256 hex digest of the bearer
+token. After pairing, copy the digest from the canonical
+`gateway.paired_tokens` entry, or compute it from the bearer token without
+putting that secret in shell history. Rotating a paired token creates a new
+subject, so update every approval-group membership that references the old
+digest as part of the same rotation.
 
 ## 3. `SOP.md` Step Format
 

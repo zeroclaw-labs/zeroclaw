@@ -21777,9 +21777,9 @@ pub enum ApprovalTimeoutAction {
 pub struct SopApprovalConfig {
     /// Named approver groups: `group name -> members`. A member is matched against
     /// the transport-derived (channel-authenticated) `ApprovalPrincipal` identity.
-    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:alice`,
+    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:ZeroClawOperator`,
     /// `ws:<subject>`, `agent:<alias>`) to grant rights on one transport only, or a
-    /// bare identity (`alice`) to grant from any source. A future auth system adds a
+    /// bare identity (`ZeroClawOperator`) to grant from any source. A future auth system adds a
     /// second resolver alongside this one; it does not replace channel identities.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     #[nested]
