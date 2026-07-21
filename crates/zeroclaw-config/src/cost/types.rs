@@ -20,6 +20,11 @@ pub struct TokenUsage {
     pub cost_usd: f64,
     #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
     pub pricing_available: bool,
+    /// Whether the provider supplied a non-empty usage observation. `false`
+    /// records an attributable call whose token usage is unknown rather than
+    /// incorrectly representing it as a zero-token call.
+    #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
+    pub usage_available: bool,
     /// Timestamp of the request
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
@@ -109,6 +114,23 @@ impl TokenUsage {
             total_tokens,
             cost_usd,
             pricing_available: true,
+            usage_available: true,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// Construct an attributable observation for a provider response that did
+    /// not include usable token counts.
+    pub fn unavailable(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+            pricing_available: false,
+            usage_available: false,
             timestamp: chrono::Utc::now(),
         }
     }

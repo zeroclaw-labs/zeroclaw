@@ -28,18 +28,25 @@ impl ResolvedModelAccess<'_> {
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
-        crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        crate::agent::turn::provider_call::enforce_tool_loop_budget().await?;
         let resp = ProviderDispatch::from_ref(self.model_provider)
             .chat(request, self.model, self.temperature)
             .await?;
         // Record spend immediately after the call (before any caller-side output
         // validation) so a downstream failure still counts the provider usage.
-        crate::agent::cost::record_tool_loop_cost_usage_optional(
+        if let Err(error) = crate::agent::cost::record_tool_loop_cost_usage_optional(
             self.provider_name,
             self.model,
             resp.usage.as_ref(),
         )
-        .await?;
+        .await
+        {
+            if let Some(task_id) = crate::agent::cost::current_exact_goal_task_id() {
+                let _ =
+                    crate::control_plane::pause_goal_for_accounting_failure(&task_id, &error).await;
+            }
+            return Err(error);
+        }
         Ok(resp)
     }
 }
