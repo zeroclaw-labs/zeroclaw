@@ -174,10 +174,22 @@ pub(crate) async fn interpret_chat_response(
     // Non-goal unpriced calls remain observable as `Some(0.0)`; a
     // goal-attributed call instead returns an accounting error before its
     // response can advance the tool loop.
-    let call_cost_usd =
-        record_tool_loop_cost_usage_optional(ctx.provider_name, ctx.model, resp.usage.as_ref())
-            .await?
-            .map(|(_total_tokens, cost_usd)| cost_usd);
+    let call_cost_usd = match record_tool_loop_cost_usage_optional(
+        ctx.provider_name,
+        ctx.model,
+        resp.usage.as_ref(),
+    )
+    .await
+    {
+        Ok(usage) => usage.map(|(_total_tokens, cost_usd)| cost_usd),
+        Err(error) => {
+            if let Some(task_id) = crate::agent::cost::current_exact_goal_task_id() {
+                let _ =
+                    crate::control_plane::pause_goal_for_accounting_failure(&task_id, &error).await;
+            }
+            return Err(error);
+        }
+    };
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).

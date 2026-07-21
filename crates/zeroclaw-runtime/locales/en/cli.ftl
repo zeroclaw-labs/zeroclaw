@@ -986,6 +986,7 @@ channel-runtime-fallback-footer =
 goal-budget-limit-unlimited = unlimited
 goal-budget-cost-value = ${$amount}
 goal-budget-summary = Budget: tokens {$tokens_used}/{$token_limit}; cost {$cost_used}/{$cost_limit}.
+goal-budget-summary-cost-unavailable = Budget: tokens {$tokens_used}/{$token_limit}; cost unavailable.
 goal-budget-summary-unavailable = Budget: usage unavailable; limits tokens {$token_limit}, cost {$cost_limit}.
 goal-command-started =
     🎯 Goal `{$task_id}` started.
@@ -1099,6 +1100,7 @@ goal-command-error-missing-budget = Goal budget requires `--tokens=N|unlimited`,
 goal-command-error-invalid-budget-flag = Invalid goal budget flag `{$flag}`; use `--tokens=N|unlimited` or `--cost=N|unlimited`.
 goal-command-error-invalid-token-budget = Invalid goal token budget `{$value}`; use a positive integer or `unlimited`.
 goal-command-error-invalid-cost-budget = Invalid goal cost budget `{$value}`; use a positive number or `unlimited`.
+goal-command-error-cost-tracking-required = A finite goal cost budget requires enabled cost tracking and a writable cost ledger.
 goal-command-error-unexpected-arguments = Unexpected goal arguments `{$args}`.
 goal-command-error-unknown-action = Unknown goal action `{$action}`; use start, objective, status, budget, pause, resume, cancel, or help.
 goal-command-error-extension-missing = Goal extension missing for task `{$task_id}`.
@@ -1229,4 +1231,3 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
-
