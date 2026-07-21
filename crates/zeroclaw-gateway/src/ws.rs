@@ -1100,7 +1100,7 @@ async fn process_chat_message(
                     // owner. Route changes, browser sleep, and transient
                     // network loss therefore detach the client without firing
                     // the turn's cancellation token. Disable this select arm
-                    // after detach so a closed stream cannot recreate #6514's
+                    // after detach so a closed stream cannot recreate the
                     // immediately-ready hot loop; `event_rx` remains active and
                     // is drained until the agent finishes naturally.
                     let text = match client_msg {
@@ -2021,8 +2021,8 @@ mod tests {
         );
     }
 
-    // Regression for #6514 and #8559. The mid-turn `client_msg` arm in
-    // `forward_fut` must classify stream-end / close / error frames as a
+    // Regression coverage for detached viewers. The mid-turn `client_msg` arm
+    // in `forward_fut` must classify stream-end / close / error frames as a
     // detach. The production arm then disables itself while continuing to
     // drain turn events; a bare `continue` would hot-loop, while cancellation
     // would incorrectly stop work merely because its viewer disappeared.
