@@ -1738,6 +1738,7 @@ impl SopEngine {
             revision: 0,
             revision_base: 0,
         };
+        let first_input = step_input_value(&run, 1);
         self.active_runs.insert(run_id.clone(), run);
 
         if deterministic {
@@ -1749,7 +1750,7 @@ impl SopEngine {
                     run_id, sop.name
                 )
             );
-            match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
+            match self.dispatch_deterministic_step(&run_id, &sop, 1, first_input) {
                 Ok(action) => Ok(action),
                 Err(e) => Err(self.rollback_failed_start(&run_id, &claim, e)),
             }
@@ -4885,6 +4886,7 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
+        self.remove_deterministic_state_file(&run);
         self.finished_runs.push(run);
 
         let max = self.config.max_finished_runs;
@@ -13501,11 +13503,12 @@ type = "manual"
     }
 
     #[test]
-    fn resolve_via_broker_denies_checkpoint_and_cancels() {
-        // Deny of a parked checkpoint through the chokepoint cancels the run (the
-        // approval-gate deny semantics), records the reason, and audits the
-        // resolution. Previously a checkpoint could not be denied out-of-band at
-        // all (the surfaces returned not_waiting).
+    fn resolve_via_broker_denies_checkpoint_through_failure_route() {
+        // Deny of a parked checkpoint through the chokepoint follows the authored
+        // failure route, records the reason, and audits the resolution. With the
+        // default failure route, the run terminates as Failed. Previously a
+        // checkpoint could not be denied out-of-band at all (the surfaces returned
+        // not_waiting).
         let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deny")]);
         let first = engine.start_run("cp-deny", manual_event()).unwrap();
         let run_id = extract_run_id(&first).to_string();
@@ -13527,15 +13530,15 @@ type = "manual"
             matches!(
                 outcome,
                 super::super::approval::BrokerOutcome::Resolved(
-                    super::super::approval::ResolveOutcome::Denied
+                    super::super::approval::ResolveOutcome::Resumed(_)
                 )
             ),
-            "expected Resolved(Denied), got {outcome:?}"
+            "expected Resolved(Resumed), got {outcome:?}"
         );
         let run = engine
             .last_finished_run("cp-deny")
             .expect("denied run reached the finished list");
-        assert_eq!(run.status, SopRunStatus::Cancelled);
+        assert_eq!(run.status, SopRunStatus::Failed);
         let events = engine.run_events(&run_id).unwrap_or_default();
         assert!(
             events.iter().any(|ev| ev.kind == "gate_resolved"),
@@ -13817,7 +13820,7 @@ type = "manual"
             .expect("the gate is still resolvable after a failed revise");
         assert_eq!(
             engine.last_finished_run("cp-revise-fail").unwrap().status,
-            SopRunStatus::Cancelled
+            SopRunStatus::Failed
         );
     }
 
@@ -14057,7 +14060,7 @@ type = "manual"
             .unwrap();
         assert!(
             !state_file.exists(),
-            "a cancelled run must remove its park snapshot"
+            "a terminally denied run must remove its park snapshot"
         );
 
         // Approved run: snapshot gone after completion too.
