@@ -222,7 +222,19 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 }
 
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(mut job) = with_read_connection(config, |conn| {
+    let mut job = get_job_raw(config, job_id)?;
+    resolve_declarative_shell_output_format(config, &mut job);
+    Ok(job)
+}
+
+/// Raw DB row for a job, with no config overlay applied. `shell_output_format`
+/// on the returned job is exactly what's stored in the `cron_jobs` column —
+/// for a declarative job that is a stale/default value, not the canonical
+/// one from `config.cron`. Used by [`update_job`] so unrelated patches don't
+/// re-persist a config-resolved snapshot into a column declarative jobs
+/// don't own; every other caller should use [`get_job`] instead.
+fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
+    let Some(job) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -240,8 +252,6 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     else {
         anyhow::bail!("Cron job '{job_id}' not found")
     };
-
-    resolve_declarative_shell_output_format(config, &mut job);
     Ok(job)
 }
 
@@ -366,7 +376,10 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut jobs = Vec::new();
         for row in rows {
             match row {
-                Ok(job) => jobs.push(job),
+                Ok(mut job) => {
+                    resolve_declarative_shell_output_format(config, &mut job);
+                    jobs.push(job);
+                }
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -401,7 +414,10 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut jobs = Vec::new();
         for row in rows {
             match row {
-                Ok(job) => jobs.push(job),
+                Ok(mut job) => {
+                    resolve_declarative_shell_output_format(config, &mut job);
+                    jobs.push(job);
+                }
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -421,7 +437,11 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
-    let mut job = get_job(config, job_id)?;
+    // Start from the raw DB row, not the config-resolved `get_job()` view:
+    // for a declarative job, `shell_output_format` isn't DB-owned, so an
+    // unrelated patch (e.g. toggling `enabled`) must not re-persist the
+    // resolved config value into the column and recreate a second owner.
+    let mut job = get_job_raw(config, job_id)?;
     let mut schedule_changed = false;
 
     if let Some(schedule) = patch.schedule {
@@ -467,7 +487,12 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.uses_memory = uses_memory;
     }
     if let Some(shell_output_format) = patch.shell_output_format {
-        job.shell_output_format = shell_output_format;
+        // Declarative jobs read this from `config.cron`, not the DB column
+        // (the API rejects this patch for them already; this is
+        // defense-in-depth for any other caller of `update_job`).
+        if job.source != "declarative" {
+            job.shell_output_format = shell_output_format;
+        }
     }
 
     if schedule_changed {
@@ -2926,6 +2951,91 @@ schedule = { kind = "every", every_ms = 300000 }
             listed.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Raw,
             "list_jobs must return raw format resolved from config for a declarative raw shell job"
+        );
+    }
+
+    /// Regression: an unrelated `update_job()` patch on a declarative job
+    /// must not persist a config-resolved snapshot of `shell_output_format`
+    /// into the DB column. After the update, a later config change must
+    /// still be reflected by `get_job()`, `due_jobs()`, and
+    /// `all_overdue_jobs()` — none of them may keep serving a value the
+    /// unrelated update happened to freeze at update time.
+    #[test]
+    fn update_job_unrelated_patch_does_not_snapshot_declarative_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["raw-decl"]);
+
+        let mut decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("raw-decl".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo raw-decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
+        config.cron.insert("raw-decl".to_string(), decl.clone());
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Unrelated patch: only toggles `uses_memory`, never touches
+        // `shell_output_format`. Must not freeze the currently-resolved
+        // `Raw` value into the DB column.
+        update_job(
+            &config,
+            "raw-decl",
+            CronJobPatch {
+                uses_memory: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        // Config changes after the update — if the update had snapshotted
+        // `Raw` into the DB column, every read path below would still
+        // report `Raw` instead of following this change.
+        decl.shell_output_format = zeroclaw_config::schema::CronShellOutputFormat::Wrapped;
+        config.cron.insert("raw-decl".to_string(), decl);
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        let job = get_job(&config, "raw-decl").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "get_job must follow the current config value, not a value snapshotted by an unrelated update"
+        );
+        assert!(
+            !job.uses_memory,
+            "the unrelated patch must still have taken effect"
+        );
+
+        let due = due_jobs(&config, far_future).unwrap();
+        let due_job = due.iter().find(|j| j.id == "raw-decl").expect("job is due");
+        assert_eq!(
+            due_job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "due_jobs must follow the current config value, not a stored snapshot"
+        );
+
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        let overdue_job = overdue
+            .iter()
+            .find(|j| j.id == "raw-decl")
+            .expect("job is overdue");
+        assert_eq!(
+            overdue_job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "all_overdue_jobs must follow the current config value, not a stored snapshot"
         );
     }
 }

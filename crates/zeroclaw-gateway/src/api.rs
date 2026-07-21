@@ -462,6 +462,12 @@ pub async fn handle_api_cron_add(
         matches!(job_type.as_deref(), Some("agent")) || (job_type.is_none() && prompt.is_some());
 
     let result = if is_agent {
+        if shell_output_format.is_some() {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
         let prompt = match prompt.as_deref() {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
@@ -4098,7 +4104,7 @@ pub(crate) mod tests {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
-            "echo hello",
+            "echo hello-raw-patch-run",
             None,
             true,
         )
@@ -4108,6 +4114,10 @@ pub(crate) mod tests {
             zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
             "imperative jobs default to wrapped"
         );
+        // Imperative jobs get UUID ids; the scheduler resolves owning agent
+        // by reverse-lookup against `agent.cron_jobs`, same as
+        // `cron_api_run_executes_shell_job_and_records_run`.
+        link_job_to_test_agent(&state, &job.id);
 
         let response = handle_api_cron_patch(
             State(state.clone()),
@@ -4134,6 +4144,26 @@ pub(crate) mod tests {
             updated.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Raw,
             "get_job must reflect the patched format for an imperative job"
+        );
+
+        // The regression this PATCH must actually prove: the persisted
+        // value is what execution reads, not just what get_job() reports.
+        // A job created wrapped, then PATCHed to raw, must run raw.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["success"], true);
+        let output = run_json["output"].as_str().unwrap_or_default();
+        assert!(
+            output.contains("hello-raw-patch-run"),
+            "expected bare stdout in output, got: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "a PATCH-to-raw job must run raw (bare stdout), not the wrapped status envelope; got: {output}"
         );
     }
 
@@ -4269,6 +4299,57 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 .contains("agent job"),
             "error should explain the field does not apply to agent jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_add_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format must be rejected at creation for agent jobs, matching the PATCH contract, \
+             instead of silently discarded"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "a rejected create must not persist a job"
         );
     }
 
