@@ -19,6 +19,25 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 
+[features]
+# ── Multi-database session backend series (PR 1 of N) ─────────────
+#
+# Each backend has its own Cargo feature on this crate. The
+# follow-up PR for that backend flips its feature to a real
+# dependency (`dep:postgres`, `dep:mysql`, …) and replaces the
+# matching `#[cfg(not(feature = "backend-<name>"))]` fail-fast arm
+# in `make_session_backend` with a real ctor. Until that PR lands,
+# enabling the feature is a no-op — the dispatcher's fail-fast arm
+# is the only thing the feature gates today, and the ctor it
+# eventually wraps does not exist yet, so we keep them as empty
+# optional features here to stay cargo-clean and avoid
+# `unexpected_cfgs` lint warnings.
+backend-postgres = []
+backend-mysql = []
+backend-mariadb = []
+backend-oracle = []
+backend-db2 = []
+
 [dev-dependencies]
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
