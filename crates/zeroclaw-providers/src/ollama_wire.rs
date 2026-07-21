@@ -57,6 +57,8 @@ pub(super) struct Options {
 pub(super) struct ApiChatResponse {
     pub(super) message: ResponseMessage,
     #[serde(default)]
+    pub(super) done: Option<bool>,
+    #[serde(default)]
     pub(super) prompt_eval_count: Option<u64>,
     #[serde(default)]
     pub(super) eval_count: Option<u64>,

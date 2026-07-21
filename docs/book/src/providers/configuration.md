@@ -141,8 +141,9 @@ work after `queue_timeout_secs`.
 
 Hailo-Ollama rejects transport options it cannot honor rather than silently
 ignoring them. In particular, `extra_headers`, `tls_ca_cert_path`, `think=true`,
-`provider_extra`, `api_path`, `wire_api`, and `chat_template_kwargs` are not
-supported. Set `native_tools = false` (or leave it unset).
+call-level native `thinking`, `provider_extra`, `api_path`, `wire_api`, and
+`chat_template_kwargs` are not supported. Set `native_tools = false` (or leave
+it unset).
 
 If an accepted request reaches its HTTP timeout or ends with another post-connect
 transport failure, ZeroClaw quarantines that endpoint for the rest of the process
@@ -150,10 +151,16 @@ because Hailo may still be generating after the client disconnects. Confirm the
 backend is idle (restart it if necessary), then restart ZeroClaw to clear the
 quarantine. A connection-establishment failure does not quarantine the endpoint.
 
-For native-backend compatibility, ZeroClaw sends non-streaming requests with
-thinking disabled, folds system instructions into plain user prose, keeps at
-most 12 recent messages, and bounds each normalized message to 2,000 Unicode
-characters. Native tool calling, streaming, and vision are not advertised.
+For native-backend compatibility, ZeroClaw omits unsupported `think` and
+`num_ctx` wire fields rather than claiming to control them. `context_window`
+controls ZeroClaw's best-effort local history budgeting; it is deliberately not
+sent to Hailo-Ollama. Call-level native thinking requests are rejected before
+any backend request. Responses must be a completed non-streaming response
+(`done=true`), and an empty completed response is treated as an error. A low
+`context_window` actively trims older history before the 12-message cap is
+applied. System instructions are folded into plain user prose, at most 12 recent
+messages are kept, and each normalized message is bounded to 2,000 Unicode characters.
+Native tool calling, streaming, and vision are not advertised.
 Prompt-guided tool calls and results remain available as plain text history when
 the complete injected tool protocol fits in the bounded first message; ZeroClaw
 rejects an oversized protocol instead of sending truncated tool instructions.
