@@ -189,7 +189,7 @@ fn run_test_case(
 /// On Windows the command is passed via `raw_arg` (not `.args`), so `cmd.exe`
 /// receives the `/C "<command>"` form verbatim under its own quoting rules —
 /// std's MSVC-style escaping mangles commands containing quotes — and
-/// `CREATE_NO_WINDOW` keeps a console from flashing (#7083 quoting contract).
+/// `CREATE_NO_WINDOW` keeps a console from flashing while preserving that contract.
 #[cfg(windows)]
 fn build_test_runner(
     command: &str,

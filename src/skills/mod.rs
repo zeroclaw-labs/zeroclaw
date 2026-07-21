@@ -2130,7 +2130,7 @@ mod install_location_tests {
         );
     }
 
-    /// End-to-end #8334 (requested in review): drive the *real* `skills install`
+    /// End-to-end install-to-load coverage: drive the *real* `skills install`
     /// command handler with a local skill source, then assert the runtime loader
     /// the agent boot/loop uses actually returns it — covering the full
     /// install → read path, not just the resolved destination.
