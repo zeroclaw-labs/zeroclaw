@@ -32,6 +32,7 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 ### Runtime & Memory
 - Unified memory-context injection is now keyed on `TurnOrigin` ingress provenance, and a durable memory store seam adds supersede/dedup/budget/policy-gate handling with embedding-identity persistence and automatic vector migration on change (#8619, #8570, #8623).
 - Live eval cases can now seed isolated per-case SQLite memory and grade exact-key memory side effects, with memory tools gated by both case and operator allowlists (#9226).
+- Live eval fails closed when a case effectively requests `shell`, preventing a fallback to application-only path checks when no portable OS sandbox is guaranteed.
 - Metered provider seams (`ResolvedModelAccess::run_model_query`) now cover the model-query path and the max-iteration graceful summary (#8806, #8821).
 - Process RAM/CPU sampling landed on macOS, Windows, and FreeBSD via `sysinfo`, and a model-context-window bar was added to the ZeroCode TUI, gateway agent chat, and interactive CLI (#8802, #7946).
 - Goal task storage foundation and a configurable native runtime shell were added (#8685, #8311).

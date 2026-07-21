@@ -305,6 +305,15 @@ impl Grader for MemoryGrader {
                 }
                 continue;
             }
+            if needles.is_empty() {
+                out.push(GradeResult::new(
+                    format!("memory_contains({key:?})"),
+                    false,
+                    "contains requires at least one substring",
+                    GradeCategory::SideEffect,
+                ));
+                continue;
+            }
             let Some(memory) = ctx.memory else {
                 for needle in needles {
                     out.push(GradeResult::new(
@@ -1064,6 +1073,37 @@ mod tests {
                 .iter()
                 .all(|grade| grade.category == GradeCategory::SideEffect)
         );
+    }
+
+    #[tokio::test]
+    async fn memory_grader_rejects_empty_contains_lists_without_backend_access() {
+        let expects = MemoryExpects {
+            contains: BTreeMap::from([("profile/role".into(), Vec::new())]),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let with_backend = MemoryGrader {
+            expects: expects.clone(),
+        }
+        .grade(
+            &run("", &[], true),
+            &GradeContext {
+                workspace: tmp.path(),
+                memory: Some(&PanicGetMemory),
+            },
+        )
+        .await;
+        let without_backend = MemoryGrader { expects }
+            .grade(&run("", &[], true), &dummy_ctx())
+            .await;
+
+        for grades in [&with_backend, &without_backend] {
+            assert_eq!(grades.len(), 1);
+            assert_eq!(grades[0].check, r#"memory_contains("profile/role")"#);
+            assert!(!grades[0].passed);
+            assert_eq!(grades[0].detail, "contains requires at least one substring");
+            assert_eq!(grades[0].category, GradeCategory::SideEffect);
+        }
     }
 
     #[tokio::test]
