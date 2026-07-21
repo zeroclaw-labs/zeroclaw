@@ -75,6 +75,141 @@ fn action_label(action: &SopRunAction) -> &'static str {
     }
 }
 
+/// Post-start bookkeeping shared by the single-SOP loop and the AMQP batch path:
+/// drive a headless deterministic run to a terminal state (its slot would otherwise
+/// never free), snapshot the run for audit under the lock, and build the `Started`
+/// result. `action` is the first action returned by activation.
+fn record_started_run(
+    eng: &mut SopEngine,
+    sop_name: &str,
+    action: SopRunAction,
+    started_runs: &mut Vec<SopRun>,
+) -> DispatchResult {
+    let run_id = extract_run_id_from_action(&action).to_string();
+
+    // Headless deterministic runs have no agent loop to execute steps. Left as-is,
+    // the run sits in active_runs as Running forever and its max_concurrent slot
+    // never frees, so every later event from the same SOP is skipped. Drive it to a
+    // terminal state here so the slot frees and the SOP can fire again.
+    let is_deterministic = eng
+        .get_sop(sop_name)
+        .is_some_and(|s| s.execution_mode == SopExecutionMode::Deterministic);
+    let action = if is_deterministic {
+        match eng.drive_headless_deterministic(&run_id, action) {
+            Ok(terminal) => terminal,
+            Err(e) => SopRunAction::Failed {
+                run_id: run_id.clone(),
+                sop_name: sop_name.to_string(),
+                reason: e.to_string(),
+            },
+        }
+    } else {
+        action
+    };
+
+    // Snapshot the run for audit (must be done under lock). get_run resolves both
+    // active and finished runs, so a terminal headless deterministic run is captured.
+    if let Some(run) = eng.get_run(&run_id).cloned() {
+        started_runs.push(run);
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "SOP dispatch: started '{}' run {run_id} (action: {})",
+            sop_name,
+            action_label(&action)
+        )
+    );
+    DispatchResult::Started {
+        run_id,
+        sop_name: sop_name.to_string(),
+        action: Box::new(action),
+    }
+}
+
+/// Re-classify a failed start. A start can fail because the shared CAS exec slot was
+/// claimed by ANOTHER engine between the admission pre-check and the claim (both
+/// passed `evaluate_admission` while the slot was free; only one wins). Re-consult
+/// `evaluate_admission` so a capacity loss under a non-drop policy becomes `Deferred`
+/// (a durable AMQP caller then redelivers) rather than `Skipped` (acked-and-lost). A
+/// genuine error (SOP gone, etc.) still maps to `Skipped`.
+fn reclassify_failed_start(eng: &SopEngine, sop_name: &str, err: &anyhow::Error) -> DispatchResult {
+    let result = match eng.evaluate_admission(sop_name) {
+        SopAdmission::Defer { reason } => DispatchResult::Deferred {
+            sop_name: sop_name.to_string(),
+            reason,
+        },
+        SopAdmission::Coalesce { existing_run_id } => DispatchResult::Coalesced {
+            sop_name: sop_name.to_string(),
+            existing_run_id,
+        },
+        SopAdmission::Admit | SopAdmission::Drop { .. } => DispatchResult::Skipped {
+            sop_name: sop_name.to_string(),
+            reason: err.to_string(),
+        },
+    };
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "error": format!("{}", err), "sop_name": sop_name,
+            })
+        ),
+        &format!("SOP dispatch: start failed for '{sop_name}', reclassified")
+    );
+    result
+}
+
+/// Apply the bounded per-message idempotency window before admission. A confirmed
+/// redelivery coalesces when the same SOP already started for the delivery key. A
+/// fresh delivery never coalesces; it only marks a reused key ambiguous so the safe
+/// failure direction remains a duplicate run rather than an acknowledged lost trigger.
+fn coalesce_confirmed_redelivery(
+    eng: &mut SopEngine,
+    sop_name: &str,
+    dedup: Option<(&str, bool)>,
+) -> Option<DispatchResult> {
+    match dedup {
+        Some((key, true)) => {
+            let existing_run_id = eng.dispatch_dedup_lookup(sop_name, key)?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "sop_name": sop_name,
+                        "existing_run_id": existing_run_id,
+                    })),
+                &format!(
+                    "SOP dispatch: coalesced redelivered '{sop_name}' into run \
+                     {existing_run_id} (per-message idempotency)"
+                )
+            );
+            Some(DispatchResult::Coalesced {
+                sop_name: sop_name.to_string(),
+                existing_run_id,
+            })
+        }
+        Some((key, false)) => {
+            eng.note_fresh_dispatch_key(sop_name, key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Remember a successfully started run for later confirmed-redelivery coalescing.
+fn remember_dispatch_start(
+    eng: &mut SopEngine,
+    sop_name: &str,
+    dedup: Option<(&str, bool)>,
+    result: &DispatchResult,
+) {
+    if let (Some((key, _)), DispatchResult::Started { run_id, .. }) = (dedup, result) {
+        eng.record_dispatch_dedup(sop_name, key, run_id);
+    }
+}
+
 // ── Core dispatch ───────────────────────────────────────────────
 
 pub async fn dispatch_sop_event(
@@ -228,18 +363,125 @@ async fn dispatch_sop_event_filtered(
             }
         };
 
+        // Keep message-id idempotency orthogonal to admission. This pre-pass removes
+        // only SOPs already known to have started for a confirmed redelivery; every
+        // remaining SOP still follows the same single-run or atomic AMQP-batch path.
+        let mut candidate_names = Vec::with_capacity(matched_names.len());
         for sop_name in &matched_names {
-            // A2 per-message idempotency. On a CONFIRMED broker redelivery, if this SOP
-            // already started for this delivery key, COALESCE into the existing run
-            // instead of starting it again. A FRESH delivery never coalesces; instead, if
-            // its key is already in the window a distinct delivery is REUSING a message-id,
-            // so mark that key ambiguous (before admission, so it holds even if this
-            // delivery then defers) - after which neither it nor a later redelivery
-            // coalesces. The safe direction is always a duplicate run, never ACKing a
-            // distinct trigger away.
-            match dedup {
-                Some((key, true)) => {
-                    if let Some(existing_run_id) = eng.dispatch_dedup_lookup(sop_name, key) {
+            if let Some(result) = coalesce_confirmed_redelivery(&mut eng, sop_name, dedup) {
+                results.push(result);
+            } else {
+                candidate_names.push(sop_name.clone());
+            }
+        }
+        if candidate_names.is_empty() {
+            return results;
+        }
+
+        // AMQP is the only durable (manual-ack) transport, so a multi-match delivery is
+        // handled ALL-OR-NOTHING for the SOPs that can actually run: either every
+        // ADMISSIBLE sibling starts (and the delivery acks), or none does and the whole
+        // delivery is requeued. Two rules keep that honest:
+        //   * Redelivery only helps a RETRYABLE outcome. A `Defer` (backpressure) may
+        //     become admissible later; a terminal `Drop`/`Coalesce` never will. So a
+        //     terminal sibling must NOT force the delivery to requeue - that would NACK
+        //     forever waiting for something that can't change (the 2a bug).
+        //   * A partial start must never ack-and-lose an unstarted sibling. Activation
+        //     runs no irreversible side effect (deterministic execution and the LLM agent
+        //     loop both run LATER), so the batch is activated ATOMICALLY: activate every
+        //     reserved sibling first, and if any activation fails, roll the rest back and
+        //     defer the whole set for requeue - no sibling is ever Started while another
+        //     is dropped (the 2b bug).
+        if event.source == SopTriggerSource::Amqp && matched_names.len() > 1 {
+            let admissions: Vec<(&String, SopAdmission)> = candidate_names
+                .iter()
+                .map(|sop_name| (sop_name, eng.evaluate_admission(sop_name)))
+                .collect();
+
+            // A RETRYABLE `Defer` on any sibling means the batch cannot start atomically
+            // now, but could on a later delivery: defer the WHOLE delivery for requeue.
+            // (Terminal siblings are surfaced too, but the presence of a Deferred is what
+            // requeues.) Only when NO sibling is retryably deferred do we start the
+            // admissible subset and let terminal siblings settle without an endless NACK.
+            let has_retryable_defer = admissions
+                .iter()
+                .any(|(_, admission)| matches!(admission, SopAdmission::Defer { .. }));
+            if has_retryable_defer {
+                for (sop_name, admission) in admissions {
+                    match admission {
+                        SopAdmission::Admit | SopAdmission::Defer { .. } => {
+                            let reason = match admission {
+                                SopAdmission::Defer { reason } => reason,
+                                _ => "AMQP delivery deferred because another matched SOP is backpressured".to_string(),
+                            };
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!(
+                                    "SOP dispatch: deferred '{sop_name}' (amqp batch backpressure): {reason}"
+                                )
+                            );
+                            results.push(DispatchResult::Deferred {
+                                sop_name: sop_name.clone(),
+                                reason,
+                            });
+                        }
+                        SopAdmission::Coalesce { existing_run_id } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "existing_run_id": existing_run_id
+                                })),
+                                &format!(
+                                    "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
+                                )
+                            );
+                            results.push(DispatchResult::Coalesced {
+                                sop_name: sop_name.clone(),
+                                existing_run_id,
+                            });
+                        }
+                        SopAdmission::Drop { reason } => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                            );
+                            results.push(DispatchResult::Skipped {
+                                sop_name: sop_name.clone(),
+                                reason,
+                            });
+                        }
+                    }
+                }
+                return results;
+            }
+
+            // No retryable sibling. The only non-`Admit` outcomes (if any) are TERMINAL
+            // (`Drop`/`Coalesce`) and will never become admissible - record them now, and
+            // collect the admissible subset to start. Redelivering the batch for a
+            // terminal sibling would re-drop it and, with no Started sibling, NACK forever.
+            let mut admit_names: Vec<String> = Vec::new();
+            for (sop_name, admission) in admissions {
+                match admission {
+                    SopAdmission::Admit => admit_names.push(sop_name.clone()),
+                    SopAdmission::Coalesce { existing_run_id } => {
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -250,8 +492,215 @@ async fn dispatch_sop_event_filtered(
                                 "sop_name": sop_name, "existing_run_id": existing_run_id
                             })),
                             &format!(
-                                "SOP dispatch: coalesced redelivered '{sop_name}' into run \
-                                 {existing_run_id} (per-message idempotency)"
+                                "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
+                            )
+                        );
+                        results.push(DispatchResult::Coalesced {
+                            sop_name: sop_name.clone(),
+                            existing_run_id,
+                        });
+                    }
+                    SopAdmission::Drop { reason } => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                            &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                        );
+                        results.push(DispatchResult::Skipped {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        });
+                    }
+                    // `has_retryable_defer` was false, so no `Defer` remains here.
+                    SopAdmission::Defer { .. } => unreachable!(
+                        "a retryable Defer would have returned via the has_retryable_defer branch"
+                    ),
+                }
+            }
+
+            // Structural over-capacity guard. If the admissible fan-out is LARGER than the
+            // global concurrency budget, an all-or-nothing batch can NEVER be satisfied: from
+            // idle every sibling is `Admit`, the reservation loop fills the global cap and the
+            // next reservation always fails, so deferring the batch NACK-requeues it and the
+            // redelivery reproduces the identical state - a permanent livelock, not transient
+            // backpressure. Redelivery cannot help, so drop the whole delivery with a loud
+            // health error (Skipped keeps `results_need_redelivery` false, so the broker acks
+            // instead of NACK-looping) and tell the operator to raise `max_concurrent_total` or
+            // reduce the matched fan-out. Starting only the subset that fits is NOT an option:
+            // a mixed Started+Deferred set would either ack-and-lose the deferred siblings or
+            // replay the started ones on redelivery (the 2b double-execution hazard).
+            let global_cap = eng.config().max_concurrent_total;
+            if admit_names.len() > global_cap {
+                let reason = format!(
+                    "matched AMQP fan-out ({}) exceeds max_concurrent_total ({}); an all-or-nothing delivery this large can never be satisfied and is dropped to avoid a NACK-requeue livelock - raise max_concurrent_total or reduce the matched SOP fan-out",
+                    admit_names.len(),
+                    global_cap
+                );
+                crate::health::mark_component_error("sop_dispatch", reason.clone());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "admissible_fan_out": admit_names.len(),
+                            "max_concurrent_total": global_cap,
+                        })),
+                    &format!("SOP dispatch: {reason}")
+                );
+                for sop_name in &admit_names {
+                    results.push(DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+                return results;
+            }
+
+            // Reserve every ADMISSIBLE sibling's exec slot through the authoritative store
+            // CAS BEFORE activating any of them — a reservation holds a real claim but
+            // creates no run and runs no step, so no SOP side effect occurs yet. A sibling
+            // engine that grabs a slot mid-batch makes one reservation fail; we then release
+            // the reservations already held and defer the admissible set for requeue, rather
+            // than leaving a partial start. (An empty admissible set — every sibling terminal
+            // — reserves nothing and simply acks the recorded terminals.) RESIDUAL: a sibling
+            // can still claim a slot between our consecutive reservation CAS calls, but that
+            // only causes an extra (safe) requeue, never a partial start.
+            let mut reservations = Vec::new();
+            let mut shortfall: Option<(String, String)> = None;
+            for sop_name in &admit_names {
+                match eng.reserve_run_slot(sop_name) {
+                    Ok(reservation) => reservations.push(reservation),
+                    Err(e) => {
+                        shortfall = Some((sop_name.clone(), e.to_string()));
+                        break;
+                    }
+                }
+            }
+            if let Some((blocked, reason)) = shortfall {
+                for reservation in reservations {
+                    eng.release_reservation(reservation);
+                }
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "blocked_sop": blocked.as_str(), "reason": reason.as_str()
+                        })),
+                    &format!(
+                        "SOP dispatch: AMQP batch not fully admissible ('{blocked}'); deferring admissible set for requeue"
+                    )
+                );
+                for sop_name in &admit_names {
+                    results.push(DispatchResult::Deferred {
+                        sop_name: sop_name.clone(),
+                        reason: format!(
+                            "AMQP delivery deferred: matched SOP '{blocked}' had no execution slot for the whole batch ({reason})"
+                        ),
+                    });
+                }
+                return results;
+            }
+            // Every admissible slot is reserved, so no sibling can take them now. ACTIVATE
+            // the whole reserved set ATOMICALLY: activation inserts an in-memory run and
+            // produces its first action but runs NO irreversible side effect (deterministic
+            // execution and the LLM agent loop both run LATER, in `record_started_run` / the
+            // driver). So we activate every reservation FIRST; if any activation fails, roll
+            // the already-activated siblings back (remove their runs + release their claims),
+            // release the reservations not yet activated, and defer the whole set for requeue
+            // — never leaving one sibling Started while another is dropped. Only once EVERY
+            // sibling has activated do we `record_started_run` (which drives headless
+            // deterministic runs to terminal); a failure there is that run's own terminal
+            // outcome (Started-then-Failed), not a lost trigger.
+            let mut activated: Vec<(String, SopRunAction)> = Vec::new();
+            let mut activation_failure: Option<(String, String)> = None;
+            let mut remaining = reservations.into_iter();
+            for reservation in remaining.by_ref() {
+                let sop_name = reservation.sop_name().to_string();
+                match eng.activate_reserved_run(reservation, event.clone()) {
+                    Ok(action) => activated.push((sop_name, action)),
+                    Err(e) => {
+                        activation_failure = Some((sop_name, e.to_string()));
+                        break;
+                    }
+                }
+            }
+            if let Some((failed_sop, reason)) = activation_failure {
+                for (_sop_name, action) in &activated {
+                    eng.rollback_activated_run(extract_run_id_from_action(action));
+                }
+                for reservation in remaining {
+                    eng.release_reservation(reservation);
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "failed_sop": failed_sop.as_str(), "reason": reason.as_str()
+                        })),
+                    &format!(
+                        "SOP dispatch: AMQP batch activation of '{failed_sop}' failed; rolled the batch back and deferred the whole delivery for requeue"
+                    )
+                );
+                for sop_name in &admit_names {
+                    results.push(DispatchResult::Deferred {
+                        sop_name: sop_name.clone(),
+                        reason: format!(
+                            "AMQP delivery deferred: activation of matched SOP '{failed_sop}' failed for the whole batch ({reason})"
+                        ),
+                    });
+                }
+                return results;
+            }
+            for (sop_name, action) in activated {
+                let result = record_started_run(&mut eng, &sop_name, action, &mut started_runs);
+                remember_dispatch_start(&mut eng, &sop_name, dedup, &result);
+                results.push(result);
+            }
+        } else {
+            for sop_name in &candidate_names {
+                // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
+                // the authoritative CAS start; the other outcomes are surfaced (logged +
+                // carried on a DispatchResult) so a non-admitted trigger is never lost.
+                match eng.evaluate_admission(sop_name) {
+                    SopAdmission::Defer { reason } => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                            &format!(
+                                "SOP dispatch: deferred '{sop_name}' (backpressure): {reason}"
+                            )
+                        );
+                        results.push(DispatchResult::Deferred {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        });
+                        continue;
+                    }
+                    SopAdmission::Coalesce { existing_run_id } => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "existing_run_id": existing_run_id
+                            })),
+                            &format!(
+                                "SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}"
                             )
                         );
                         results.push(DispatchResult::Coalesced {
@@ -260,142 +709,36 @@ async fn dispatch_sop_event_filtered(
                         });
                         continue;
                     }
-                }
-                Some((key, false)) => eng.note_fresh_dispatch_key(sop_name, key),
-                None => {}
-            }
-            // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
-            // the authoritative CAS start; the other outcomes are surfaced (logged +
-            // carried on a DispatchResult) so a non-admitted trigger is never lost.
-            match eng.evaluate_admission(sop_name) {
-                SopAdmission::Defer { reason } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    SopAdmission::Drop { reason } => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_attrs(::serde_json::json!({
                                 "sop_name": sop_name, "reason": reason
                             })),
-                        &format!("SOP dispatch: deferred '{sop_name}' (backpressure): {reason}")
-                    );
-                    results.push(DispatchResult::Deferred {
-                        sop_name: sop_name.clone(),
-                        reason,
-                    });
-                    continue;
-                }
-                SopAdmission::Coalesce { existing_run_id } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "sop_name": sop_name, "existing_run_id": existing_run_id
-                            })),
-                        &format!("SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}")
-                    );
-                    results.push(DispatchResult::Coalesced {
-                        sop_name: sop_name.clone(),
-                        existing_run_id,
-                    });
-                    continue;
-                }
-                SopAdmission::Drop { reason } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "sop_name": sop_name, "reason": reason
-                            })),
-                        &format!("SOP dispatch: dropped '{sop_name}': {reason}")
-                    );
-                    results.push(DispatchResult::Skipped {
-                        sop_name: sop_name.clone(),
-                        reason,
-                    });
-                    continue;
-                }
-                SopAdmission::Admit => {}
-            }
-            match eng.start_run(sop_name, event.clone()) {
-                Ok(action) => {
-                    // Extract run_id from the action (authoritative source)
-                    let run_id = extract_run_id_from_action(&action).to_string();
-
-                    let is_deterministic = eng
-                        .get_sop(sop_name)
-                        .is_some_and(|s| s.execution_mode == SopExecutionMode::Deterministic);
-                    let action = if is_deterministic {
-                        match eng.drive_headless_deterministic(&run_id, action) {
-                            Ok(terminal) => terminal,
-                            Err(e) => SopRunAction::Failed {
-                                run_id: run_id.clone(),
-                                sop_name: sop_name.clone(),
-                                reason: e.to_string(),
-                            },
-                        }
-                    } else {
-                        action
-                    };
-
-                    // Snapshot the run for audit (must be done under lock).
-                    // get_run resolves both active and finished runs, so a
-                    // terminal headless deterministic run is captured here.
-                    if let Some(run) = eng.get_run(&run_id).cloned() {
-                        started_runs.push(run);
-                    }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "SOP dispatch: started '{}' run {run_id} (action: {})",
-                            sop_name,
-                            action_label(&action)
-                        )
-                    );
-                    // A2 per-message idempotency: remember this SOP started for this
-                    // delivery key (regardless of the redelivery flag) so a later broker
-                    // redelivery of THIS message coalesces instead of duplicating.
-                    if let Some((key, _)) = dedup {
-                        eng.record_dispatch_dedup(sop_name, key, &run_id);
-                    }
-                    results.push(DispatchResult::Started {
-                        run_id,
-                        sop_name: sop_name.clone(),
-                        action: Box::new(action),
-                    });
-                }
-                Err(e) => {
-                    // start_run can fail because the shared CAS exec slot was claimed
-                    // by ANOTHER engine between our dispatch pre-check and the claim
-                    // (both passed evaluate_admission while the slot was free; only one
-                    // wins try_claim_run). Re-classify via evaluate_admission so a
-                    // capacity loss under a non-drop policy becomes Deferred (a durable
-                    // AMQP caller then redelivers) instead of Skipped (acked-and-lost).
-                    // A genuine error (SOP gone, etc.) still maps to Skipped.
-                    let result = match eng.evaluate_admission(sop_name) {
-                        SopAdmission::Defer { reason } => DispatchResult::Deferred {
+                            &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                        );
+                        results.push(DispatchResult::Skipped {
                             sop_name: sop_name.clone(),
                             reason,
-                        },
-                        SopAdmission::Coalesce { existing_run_id } => DispatchResult::Coalesced {
-                            sop_name: sop_name.clone(),
-                            existing_run_id,
-                        },
-                        SopAdmission::Admit | SopAdmission::Drop { .. } => {
-                            DispatchResult::Skipped {
-                                sop_name: sop_name.clone(),
-                                reason: e.to_string(),
-                            }
-                        }
-                    };
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "error": format!("{}", e), "sop_name": sop_name,
-                            })),
-                        &format!("SOP dispatch: start failed for '{sop_name}', reclassified")
-                    );
-                    results.push(result);
+                        });
+                        continue;
+                    }
+                    SopAdmission::Admit => {}
+                }
+                match eng.start_run(sop_name, event.clone()) {
+                    Ok(action) => {
+                        let result =
+                            record_started_run(&mut eng, sop_name, action, &mut started_runs);
+                        remember_dispatch_start(&mut eng, sop_name, dedup, &result);
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        results.push(reclassify_failed_start(&eng, sop_name, &e));
+                    }
                 }
             }
         }
@@ -538,17 +881,27 @@ pub fn process_headless_results(results: &[DispatchResult]) {
     }
 }
 
-/// True if any dispatch result was `Deferred` - a trigger backpressured because an
-/// exec slot or the pending-approval pool was full. A durable transport (e.g. AMQP
-/// with `durable_ack`) MUST NOT ack such a delivery: acking would drop the
-/// backpressured trigger. The transport should instead redeliver it (nack/requeue)
-/// so it is retried once capacity frees. `Started` (ran), `Coalesced` (absorbed into
-/// an in-flight run), `Skipped`/`Drop` (deliberately dropped), and `NoMatch` were all
-/// handled and should be acked.
+/// True when at least one matched SOP is backpressured and no SOP has already
+/// started from this delivery. A durable transport (e.g. AMQP with `durable_ack`)
+/// can safely nack/requeue only when redelivery cannot replay a started SOP's
+/// side effects.
+///
+/// For an AMQP multi-match the dispatch path reserves the whole batch before
+/// starting any SOP, so a backpressured batch is `Deferred`-all (redeliver) and a
+/// startable batch is `Started`-all — it does NOT normally produce a mixed
+/// `Started`+`Deferred` set. If a mixed set ever arises (a start reclassified after
+/// activation), this returns false: the started sibling must not be replayed by a
+/// requeue. Cleanly requeueing such a partial delivery would need per-message-id
+/// idempotency so the started sibling is not double-run, which is tracked
+/// separately and out of scope here.
 pub fn results_need_redelivery(results: &[DispatchResult]) -> bool {
-    results
-        .iter()
-        .any(|r| matches!(r, DispatchResult::Deferred { .. }))
+    !results.is_empty()
+        && results
+            .iter()
+            .any(|r| matches!(r, DispatchResult::Deferred { .. }))
+        && !results
+            .iter()
+            .any(|r| matches!(r, DispatchResult::Started { .. }))
 }
 
 /// Headless fan-in chokepoint for untrusted external events (channel
@@ -1414,12 +1767,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amqp_sibling_defer_redelivery_coalesces_the_started_not_the_deferred() {
-        // The EXACT scenario the fix targets: one AMQP delivery matches TWO SOPs. SOP A
-        // admits and STARTS; sibling SOP B is at capacity and DEFERS, so
-        // `results_need_redelivery` requeues the WHOLE delivery. On the broker's
-        // redelivery (same message_id), SOP A must COALESCE (not start again) while only
-        // the deferred sibling B is retried - proving the requeue no longer duplicates A.
+    async fn amqp_atomic_batch_redelivery_coalesces_every_started_sibling() {
+        // An ACK can be lost after an atomic multi-match batch starts. A confirmed
+        // broker redelivery with the same message-id must coalesce every sibling into
+        // its original run instead of replaying the whole batch.
         let mut sop_a = test_sop(
             "sop-a",
             vec![SopTrigger::Amqp {
@@ -1428,31 +1779,15 @@ mod tests {
             }],
         );
         sop_a.max_concurrent = 4;
-        let mut sop_b = test_sop(
+        let sop_b = test_sop(
             "sop-b",
             vec![SopTrigger::Amqp {
                 routing_key: "orders.new".into(),
                 condition: None,
             }],
         );
-        sop_b.max_concurrent = 1;
         let engine = test_engine(vec![sop_a, sop_b]);
         let audit = test_audit();
-
-        // Fill SOP B's single exec slot so the delivery makes B defer.
-        engine
-            .lock()
-            .unwrap()
-            .start_run(
-                "sop-b",
-                SopEvent {
-                    source: SopTriggerSource::Amqp,
-                    topic: Some("orders.new".into()),
-                    payload: None,
-                    timestamp: now_iso8601(),
-                },
-            )
-            .unwrap();
 
         let key = "amqp:m1";
         let first = dispatch_untrusted_fan_in(
@@ -1464,24 +1799,16 @@ mod tests {
             Some((key.to_string(), false)),
         )
         .await;
-        assert!(
-            first.iter().any(
-                |r| matches!(r, DispatchResult::Started { sop_name, .. } if sop_name == "sop-a")
-            ),
-            "SOP A admits and starts: {first:?}"
-        );
-        assert!(
-            first.iter().any(
-                |r| matches!(r, DispatchResult::Deferred { sop_name, .. } if sop_name == "sop-b")
-            ),
-            "sibling SOP B is at capacity and defers: {first:?}"
-        );
-        assert!(
-            results_need_redelivery(&first),
-            "a deferred sibling requeues the whole delivery"
+        assert_eq!(
+            first
+                .iter()
+                .filter(|r| matches!(r, DispatchResult::Started { .. }))
+                .count(),
+            2,
+            "the fresh delivery starts the complete atomic batch: {first:?}"
         );
 
-        // Broker REDELIVERS the SAME message (same message_id, redelivered = true).
+        // Broker redelivers the same message after the ACK was lost.
         let second = dispatch_untrusted_fan_in(
             &engine,
             &audit,
@@ -1491,28 +1818,18 @@ mod tests {
             Some((key.to_string(), true)),
         )
         .await;
-        assert!(
-            second.iter().any(
-                |r| matches!(r, DispatchResult::Coalesced { sop_name, .. } if sop_name == "sop-a")
-            ),
-            "on redelivery SOP A coalesces (does not restart): {second:?}"
-        );
-        assert!(
-            second.iter().any(
-                |r| matches!(r, DispatchResult::Deferred { sop_name, .. } if sop_name == "sop-b")
-            ),
-            "the deferred sibling B is retried on redelivery: {second:?}"
+        assert_eq!(
+            second
+                .iter()
+                .filter(|r| matches!(r, DispatchResult::Coalesced { .. }))
+                .count(),
+            2,
+            "the redelivery coalesces both already-started siblings: {second:?}"
         );
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .active_runs()
-                .values()
-                .filter(|r| r.sop_name == "sop-a")
-                .count(),
-            1,
-            "SOP A ran exactly once despite the redelivery"
+            engine.lock().unwrap().active_runs().len(),
+            2,
+            "each sibling ran exactly once despite the redelivery"
         );
     }
 
@@ -1969,6 +2286,25 @@ mod tests {
             !results_need_redelivery(&handled),
             "Skipped/Coalesced/NoMatch were all handled and must be acked"
         );
+
+        let mixed = vec![
+            DispatchResult::Started {
+                run_id: "run-1".into(),
+                sop_name: "started".into(),
+                action: Box::new(SopRunAction::Completed {
+                    run_id: "run-1".into(),
+                    sop_name: "started".into(),
+                }),
+            },
+            DispatchResult::Deferred {
+                sop_name: "deferred".into(),
+                reason: "slots full".into(),
+            },
+        ];
+        assert!(
+            !results_need_redelivery(&mixed),
+            "a delivery with any already-started SOP must be acked to avoid replaying side effects"
+        );
     }
 
     #[tokio::test]
@@ -2009,6 +2345,344 @@ mod tests {
         assert!(
             results_need_redelivery(&second),
             "a deferred trigger must be redelivered, not acked"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_defers_all_before_starting_when_one_sop_is_backpressured() {
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let mut blocked = test_sop("blocked-amqp", vec![amqp_trigger()]);
+        blocked.max_concurrent = 1;
+        let free = test_sop("free-amqp", vec![amqp_trigger()]);
+        let engine = test_engine(vec![blocked, free]);
+        let audit = test_audit();
+
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.start_run(
+                "blocked-amqp",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("anitya.update".into()),
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .expect("first blocked-amqp run fills its only slot");
+        }
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 2, "both matching SOPs return a result");
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Deferred { sop_name, .. } if sop_name == "blocked-amqp")),
+            "the full SOP must report backpressure: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Deferred { sop_name, .. } if sop_name == "free-amqp")),
+            "the free sibling must be deferred instead of started under AMQP all-or-none: {results:?}"
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Started { .. })),
+            "AMQP all-or-none must not start a sibling when any matched SOP defers: {results:?}"
+        );
+        assert!(
+            results_need_redelivery(&results),
+            "no SOP started, so the broker delivery is safe to requeue"
+        );
+
+        let eng = engine.lock().unwrap();
+        assert_eq!(
+            eng.active_runs()
+                .values()
+                .filter(|run| run.sop_name == "blocked-amqp")
+                .count(),
+            1,
+            "the pre-existing blocked run remains the only blocked-amqp run"
+        );
+        assert_eq!(
+            eng.active_runs()
+                .values()
+                .filter(|run| run.sop_name == "free-amqp")
+                .count(),
+            0,
+            "free-amqp must not start until the broker redelivers the full batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_drops_over_capacity_batch_instead_of_livelocking() {
+        // A batch whose admissible fan-out is LARGER than max_concurrent_total (here 2 matched
+        // SOPs, global cap 1) can never fit all-or-nothing: from idle both Admit, but only one
+        // slot exists, so the batch can never start as a whole. Deferring it would NACK-requeue
+        // forever (the redelivery reproduces the identical idle state). It must be DROPPED
+        // (Skipped) with a loud error so the delivery acks - not livelocked.
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let first = test_sop("first-amqp", vec![amqp_trigger()]);
+        let second = test_sop("second-amqp", vec![amqp_trigger()]);
+        let engine = test_engine_with_config(
+            vec![first, second],
+            SopConfig {
+                max_concurrent_total: 1,
+                ..SopConfig::default()
+            },
+        );
+        let audit = test_audit();
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 2, "both matching SOPs return a result");
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, DispatchResult::Skipped { .. })),
+            "a structurally-over-capacity batch is dropped (Skipped), not deferred: {results:?}"
+        );
+        assert!(
+            !results_need_redelivery(&results),
+            "a permanently-unsatisfiable batch must ACK, never NACK-requeue-livelock: {results:?}"
+        );
+        assert!(
+            engine.lock().unwrap().active_runs().is_empty(),
+            "no matched SOP may start when the whole AMQP batch can never fit"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_starts_admissible_sibling_when_another_is_terminal_drop() {
+        // 2a: a matched SOP with a TERMINAL `Drop` outcome must NOT force the whole delivery
+        // to requeue forever (a `Drop` can never become admissible on retry). The admissible
+        // sibling starts; the dropped sibling is `Skipped`; no `Deferred` remains, so the
+        // delivery acks instead of NACKing endlessly.
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let mut dropper = test_sop("drop-amqp", vec![amqp_trigger()]);
+        dropper.admission_policy = crate::sop::types::SopAdmissionPolicy::Drop;
+        dropper.max_concurrent = 1;
+        let admit = test_sop("admit-amqp", vec![amqp_trigger()]);
+        let engine = test_engine(vec![dropper, admit]);
+        let audit = test_audit();
+
+        // Fill drop-amqp's only slot so its next admission is a terminal Drop.
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.start_run(
+                "drop-amqp",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("anitya.update".into()),
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .expect("first drop-amqp run fills its only slot");
+        }
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+            None,
+        )
+        .await;
+
+        assert!(
+            results.iter().any(|r| matches!(r, DispatchResult::Started { sop_name, .. } if sop_name == "admit-amqp")),
+            "the admissible sibling must start even though a sibling drops: {results:?}"
+        );
+        assert!(
+            results.iter().any(
+                |r| matches!(r, DispatchResult::Skipped { sop_name, .. } if sop_name == "drop-amqp")
+            ),
+            "the terminal Drop sibling is skipped, not deferred: {results:?}"
+        );
+        assert!(
+            !results_need_redelivery(&results),
+            "a terminal Drop sibling must NOT force an endless requeue - the delivery acks: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_rolls_back_and_defers_when_a_sibling_activation_fails() {
+        // 2b: activation is atomic. If a later sibling fails to activate after an earlier one
+        // already activated, the batch rolls the earlier one back and defers the WHOLE
+        // delivery for requeue - never leaving one sibling Started while another is dropped.
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let good = test_sop("good-amqp", vec![amqp_trigger()]);
+        // `broken-amqp` has no step numbered 1, so activating it (which dispatches step 1)
+        // fails - modelling a post-reservation activation error mid-batch.
+        let mut broken = test_sop("broken-amqp", vec![amqp_trigger()]);
+        broken.steps[0].number = 2;
+        let engine = test_engine(vec![good, broken]);
+        let audit = test_audit();
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "both matched SOPs return a result: {results:?}"
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Started { .. })),
+            "atomic activation must not leave any sibling Started when one fails: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, DispatchResult::Deferred { .. })),
+            "the whole batch defers for requeue: {results:?}"
+        );
+        assert!(
+            results_need_redelivery(&results),
+            "no sibling started, so the delivery is safe to requeue"
+        );
+        assert!(
+            engine.lock().unwrap().active_runs().is_empty(),
+            "the rolled-back sibling leaves no live run (no partial start leaked): {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn amqp_multi_match_defers_all_when_a_sibling_engine_holds_the_last_slot() {
+        // Cross-engine capacity: two engines share the store CAS. A sibling engine holds
+        // one of two global exec slots. An AMQP delivery matches SOPs A and B (each
+        // admissible on its own), but the whole batch needs both remaining slots. The
+        // batch RESERVATION must observe the sibling's claim through the shared store and
+        // defer ALL — it must never partially start A while B cannot fit (which would ack
+        // the delivery and permanently drop B's trigger).
+        use crate::sop::store::{InMemoryRunStore, SopRunStore};
+        let amqp_trigger = || SopTrigger::Amqp {
+            routing_key: "anitya.update".into(),
+            condition: None,
+        };
+        let store: Arc<dyn SopRunStore> = Arc::new(InMemoryRunStore::new());
+
+        // Sibling engine (shares the store) fills one of the two global exec slots.
+        let mut filler = test_sop("filler-amqp", vec![amqp_trigger()]);
+        filler.max_concurrent = 1;
+        let mut sibling = SopEngine::new(SopConfig {
+            max_concurrent_total: 2,
+            ..SopConfig::default()
+        })
+        .with_store(store.clone());
+        sibling.set_sops_for_test(vec![filler]);
+        sibling
+            .start_run(
+                "filler-amqp",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("anitya.update".into()),
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .expect("the sibling engine fills one global slot");
+        assert_eq!(
+            store.claim_counts("filler-amqp").unwrap().1,
+            1,
+            "the sibling engine holds one global exec slot in the shared store"
+        );
+
+        // Primary engine: A and B both match the delivery; each is admissible alone, but
+        // the batch needs 2 free slots and only 1 remains (the sibling holds the other).
+        let mut a = test_sop("a-amqp", vec![amqp_trigger()]);
+        a.max_concurrent = 1;
+        let mut b = test_sop("b-amqp", vec![amqp_trigger()]);
+        b.max_concurrent = 1;
+        let mut primary = SopEngine::new(SopConfig {
+            max_concurrent_total: 2,
+            ..SopConfig::default()
+        })
+        .with_store(store.clone());
+        primary.set_sops_for_test(vec![a, b]);
+        let engine = Arc::new(Mutex::new(primary));
+        let audit = test_audit();
+
+        let results = dispatch_untrusted_fan_in(
+            &engine,
+            &audit,
+            SopTriggerSource::Amqp,
+            Some("anitya.update"),
+            Some(r#"{"name":"curl"}"#),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "both matching SOPs return a result: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, DispatchResult::Deferred { .. })),
+            "a sibling engine holding the last slot must defer the WHOLE batch: {results:?}"
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|r| matches!(r, DispatchResult::Started { .. })),
+            "no matched SOP may partially start when the batch cannot fully reserve across engines: {results:?}"
+        );
+        assert!(
+            results_need_redelivery(&results),
+            "no SOP started, so the delivery is safe to requeue"
+        );
+        assert!(
+            engine.lock().unwrap().active_runs().is_empty(),
+            "the primary engine started nothing"
+        );
+        assert_eq!(
+            store.claim_counts("a-amqp").unwrap().1,
+            1,
+            "the reserved-then-released batch leaves only the sibling's slot held"
         );
     }
 

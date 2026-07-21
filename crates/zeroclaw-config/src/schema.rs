@@ -900,6 +900,17 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+    /// Override the provider's vision (image input) capability.
+    /// `None` (default) uses the provider family's built-in default. Several
+    /// families (llama.cpp, the generic OpenAI-compatible endpoint, etc.)
+    /// assume vision-capable because they can serve multimodal models. Set
+    /// `vision = false` for a text-only model served by such a family (e.g. a
+    /// text LLM behind llama.cpp) so image messages are routed to a configured
+    /// `[multimodal] vision_model_provider` instead of being sent to a model
+    /// that rejects them. `Some(true)` forces vision on.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
     /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
     /// in the request body (llama.cpp-specific). Use this to pass model-family
     /// template variables that control behaviour not exposed by other fields.
@@ -10473,12 +10484,31 @@ pub struct MemoryConfig {
     /// call today, so those names have no effect (kept for forward compat).
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
-    /// Enable LLM reranking when candidate count exceeds threshold.
+    /// Candidate pool multiplier over the final recall limit before blend/rerank trimming.
+    /// Values must be in 1..=20; runtime also enforces a bounded candidate pool.
+    #[serde(default = "default_candidate_multiplier")]
+    pub candidate_multiplier: usize,
+    /// Enable the recall rerank stage: blend retrieval score with importance
+    /// and recency, collapse near-duplicate entries, then trim back to the
+    /// recall limit. The advanced strategy below runs when the candidate
+    /// count reaches `rerank_threshold`.
     #[serde(default)]
     pub rerank_enabled: bool,
-    /// Minimum candidate count to trigger reranking.
+    /// Minimum candidate count to trigger the advanced rerank strategy.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
+    /// Advanced rerank strategy. Valid: "none", "mmr".
+    #[serde(default = "default_rerank_strategy")]
+    pub rerank_strategy: String,
+    /// MMR relevance-vs-diversity weight, where 1.0 means relevance-only.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f64,
+    /// Importance weight used by the recall blend.
+    #[serde(default = "default_importance_weight")]
+    pub importance_weight: f64,
+    /// Recency weight used by the recall blend.
+    #[serde(default = "default_recency_weight")]
+    pub recency_weight: f64,
     /// Reserved (0.0-1.0): the FTS score above which recall would skip the
     /// vector stage. Inert until the backend exposes distinct FTS and vector
     /// operations; recall is a single hybrid call today, so this has no effect.
@@ -10567,7 +10597,7 @@ pub struct MemoryTypesConfig {
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.policy"]
 pub struct MemoryPolicyConfig {
@@ -10583,6 +10613,53 @@ pub struct MemoryPolicyConfig {
     /// Namespaces that are read-only (writes are rejected).
     #[serde(default)]
     pub read_only_namespaces: Vec<String>,
+    /// Content scan mode for durable memory writes: "off", "on", or "strict".
+    #[serde(default = "default_memory_threat_scan")]
+    pub threat_scan: String,
+    /// Re-scan stored entries at recall/read time and withhold flagged entries.
+    #[serde(default = "default_true")]
+    pub threat_scan_load_time: bool,
+    /// Behavior when a write-time content scan matches: "reject" or
+    /// "block-on-read".
+    #[serde(default = "default_memory_threat_scan_on_hit")]
+    pub threat_scan_on_hit: String,
+    /// Redact configured secret/PII categories before persistence.
+    #[serde(default)]
+    pub redact_on_write: bool,
+    /// Redaction categories applied when `redact_on_write` is true.
+    #[serde(default = "default_memory_redact_categories")]
+    pub redact_categories: Vec<String>,
+}
+
+impl Default for MemoryPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_entries_per_namespace: 0,
+            max_entries_per_category: 0,
+            retention_days_by_category: std::collections::HashMap::new(),
+            read_only_namespaces: Vec::new(),
+            threat_scan: default_memory_threat_scan(),
+            threat_scan_load_time: true,
+            threat_scan_on_hit: default_memory_threat_scan_on_hit(),
+            redact_on_write: false,
+            redact_categories: default_memory_redact_categories(),
+        }
+    }
+}
+
+fn default_memory_threat_scan() -> String {
+    "on".into()
+}
+
+fn default_memory_threat_scan_on_hit() -> String {
+    "reject".into()
+}
+
+fn default_memory_redact_categories() -> Vec<String> {
+    ["secret", "api_key", "private_key", "email", "phone"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 fn default_retrieval_stages() -> Vec<String> {
@@ -10594,8 +10671,49 @@ fn default_retrieval_stages() -> Vec<String> {
 fn default_rerank_threshold() -> usize {
     5
 }
+
+/// Largest allowed multiplier for the bounded query-time rerank candidate pool.
+pub const MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER: usize = 20;
+
+fn default_candidate_multiplier() -> usize {
+    4
+}
+fn default_rerank_strategy() -> String {
+    "none".into()
+}
+fn default_mmr_lambda() -> f64 {
+    0.7
+}
+fn default_importance_weight() -> f64 {
+    0.2
+}
+fn default_recency_weight() -> f64 {
+    0.1
+}
 fn default_fts_early_return_score() -> f64 {
     0.85
+}
+
+fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
+    if !(1..=MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER).contains(&memory.candidate_multiplier) {
+        anyhow::bail!(
+            "memory.candidate_multiplier must be in 1..={MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER} (got {})",
+            memory.candidate_multiplier
+        );
+    }
+
+    for (path, value) in [
+        ("memory.min_relevance_score", memory.min_relevance_score),
+        ("memory.mmr_lambda", memory.mmr_lambda),
+        ("memory.importance_weight", memory.importance_weight),
+        ("memory.recency_weight", memory.recency_weight),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            anyhow::bail!("{path} must be a finite number in 0.0..=1.0 (got {value})");
+        }
+    }
+
+    Ok(())
 }
 fn default_namespace() -> String {
     "default".into()
@@ -10611,6 +10729,65 @@ fn default_dedup_jaccard_threshold() -> f64 {
 }
 fn default_pin_min_importance() -> f64 {
     1.01
+}
+
+/// Surface `[memory]` knobs that the schema accepts but that have no runtime
+/// consumer yet, so an operator who sets them learns they currently have no
+/// effect instead of debugging missing behavior (same class of check as the
+/// `wire_api_not_supported_for_family` warning).
+///
+/// A PR that wires a consumer for one of these knobs must drop its check
+/// here in the same change; this list mirrors what is inert on the current
+/// tree, not what is planned.
+///
+/// Called from `Config::collect_warnings`, so each warning reaches both the
+/// CLI (via `validate()`'s tracing emission) and the gateway dashboard.
+pub fn validate_memory_semantics(
+    memory: &MemoryConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    let mut inert: Vec<(&'static str, &'static str)> = Vec::new();
+
+    // The staged retrieval pipeline (`RetrievalPipeline`) exists but is not
+    // wired into the production recall path, so its tuning knobs are inert.
+    if memory.retrieval_stages != default_retrieval_stages() {
+        inert.push((
+            "memory.retrieval_stages",
+            "the staged retrieval pipeline is not wired into the recall path yet",
+        ));
+    }
+    if (memory.fts_early_return_score - default_fts_early_return_score()).abs() > f64::EPSILON {
+        inert.push((
+            "memory.fts_early_return_score",
+            "the staged retrieval pipeline is not wired into the recall path yet",
+        ));
+    }
+
+    // The proposed rerank stage was never landed, so these knobs remain inert.
+    // `DefaultMemoryStrategy::new` logs the same fact at agent start; this
+    // config-time copy reaches `config validate` and dashboard callers too.
+    if memory.rerank_enabled {
+        inert.push((
+            "memory.rerank_enabled",
+            "the rerank stage is not yet implemented",
+        ));
+    }
+    if memory.rerank_threshold != default_rerank_threshold() {
+        inert.push((
+            "memory.rerank_threshold",
+            "the rerank stage is not yet implemented",
+        ));
+    }
+
+    inert
+        .into_iter()
+        .map(|(path, reason)| {
+            crate::validation_warnings::ValidationWarning::new(
+                "memory_config_knob_inert",
+                format!("{path} is set but {reason}; this setting currently has no effect"),
+                path,
+            )
+        })
+        .collect()
 }
 
 /// Write-time duplicate handling policy for memory entries.
@@ -10733,8 +10910,13 @@ impl Default for MemoryConfig {
             snapshot_on_hygiene: false,
             auto_hydrate: true,
             retrieval_stages: default_retrieval_stages(),
+            candidate_multiplier: default_candidate_multiplier(),
             rerank_enabled: false,
             rerank_threshold: default_rerank_threshold(),
+            rerank_strategy: default_rerank_strategy(),
+            mmr_lambda: default_mmr_lambda(),
+            importance_weight: default_importance_weight(),
+            recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
@@ -18381,6 +18563,7 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        warnings.extend(validate_memory_semantics(&self.memory));
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -18780,6 +18963,8 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        validate_memory_rerank_config(&self.memory)?;
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -21659,9 +21844,9 @@ pub enum ApprovalTimeoutAction {
 pub struct SopApprovalConfig {
     /// Named approver groups: `group name -> members`. A member is matched against
     /// the transport-derived (channel-authenticated) `ApprovalPrincipal` identity.
-    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:alice`,
+    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:ZeroClawOperator`,
     /// `ws:<subject>`, `agent:<alias>`) to grant rights on one transport only, or a
-    /// bare identity (`alice`) to grant from any source. A future auth system adds a
+    /// bare identity (`ZeroClawOperator`) to grant from any source. A future auth system adds a
     /// second resolver alongside this one; it does not replace channel identities.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     #[nested]
@@ -21884,6 +22069,74 @@ max_height = 8
         .expect("legacy filter_builtins key must not break deserialization");
         assert!(matches!(group.mode, super::ToolFilterGroupMode::Always));
         assert_eq!(group.tools, vec!["filesystem__*".to_string()]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_config_rerank_stage_defaults() {
+        // An empty [memory] block resolves the rerank-stage keys to their
+        // inert defaults (stage off, "none" strategy).
+        let cfg: super::MemoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.rerank_enabled);
+        assert_eq!(cfg.candidate_multiplier, 4);
+        assert_eq!(cfg.rerank_threshold, 5);
+        assert_eq!(cfg.rerank_strategy, "none");
+        assert!((cfg.mmr_lambda - 0.7).abs() < f64::EPSILON);
+        assert!((cfg.importance_weight - 0.2).abs() < f64::EPSILON);
+        assert!((cfg.recency_weight - 0.1).abs() < f64::EPSILON);
+
+        // The Default impl agrees with the serde defaults.
+        let def = super::MemoryConfig::default();
+        assert_eq!(def.candidate_multiplier, cfg.candidate_multiplier);
+        assert_eq!(def.rerank_strategy, cfg.rerank_strategy);
+        assert!((def.mmr_lambda - cfg.mmr_lambda).abs() < f64::EPSILON);
+        assert!((def.importance_weight - cfg.importance_weight).abs() < f64::EPSILON);
+        assert!((def.recency_weight - cfg.recency_weight).abs() < f64::EPSILON);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_rejects_invalid_memory_rerank_values() {
+        // A NaN in any of the blend/floor floats must be rejected outright: it
+        // survives `clamp` and would silently drop valid memories downstream.
+        let reject_nan = |field: &str| {
+            let mut config = super::Config::default();
+            match field {
+                "memory.min_relevance_score" => config.memory.min_relevance_score = f64::NAN,
+                "memory.mmr_lambda" => config.memory.mmr_lambda = f64::NAN,
+                "memory.importance_weight" => config.memory.importance_weight = f64::NAN,
+                "memory.recency_weight" => config.memory.recency_weight = f64::NAN,
+                other => panic!("unhandled field {other}"),
+            }
+            let err = config
+                .validate()
+                .expect_err("non-finite value must fail validation");
+            assert!(
+                err.to_string().contains(field),
+                "expected {field}, got {err}"
+            );
+        };
+        reject_nan("memory.min_relevance_score");
+        reject_nan("memory.mmr_lambda");
+        reject_nan("memory.importance_weight");
+        reject_nan("memory.recency_weight");
+
+        for multiplier in [0, super::MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER + 1] {
+            let mut config = super::Config::default();
+            config.memory.candidate_multiplier = multiplier;
+            let err = config
+                .validate()
+                .expect_err("out-of-range multiplier must fail validation");
+            assert!(
+                err.to_string().contains("memory.candidate_multiplier"),
+                "unexpected error: {err}"
+            );
+        }
+
+        let mut config = super::Config::default();
+        config.memory.mmr_lambda = 1.1;
+        let err = config
+            .validate()
+            .expect_err("out-of-range MMR lambda must fail validation");
+        assert!(err.to_string().contains("memory.mmr_lambda"));
     }
 
     #[::core::prelude::v1::test]
@@ -34055,6 +34308,76 @@ allowed_users = []
         config.memory.backend = "markdown.default".to_string();
 
         assert!(warnings_with_code(&config, SEMANTIC_MEMORY_WARNING).is_empty());
+    }
+
+    const INERT_MEMORY_KNOB_WARNING: &str = "memory_config_knob_inert";
+
+    fn inert_knob_paths(config: &Config) -> Vec<String> {
+        warnings_with_code(config, INERT_MEMORY_KNOB_WARNING)
+            .into_iter()
+            .map(|warning| warning.path)
+            .collect()
+    }
+
+    #[test]
+    async fn validate_memory_semantics_silent_at_defaults() {
+        let config = Config::default();
+
+        assert!(inert_knob_paths(&config).is_empty());
+    }
+
+    #[test]
+    async fn validate_memory_semantics_warns_for_non_default_retrieval_stages() {
+        let mut config = Config::default();
+        config.memory.retrieval_stages = vec!["fts".into()];
+
+        assert_eq!(inert_knob_paths(&config), vec!["memory.retrieval_stages"]);
+    }
+
+    #[test]
+    async fn validate_memory_semantics_warns_for_non_default_fts_early_return_score() {
+        let mut config = Config::default();
+        config.memory.fts_early_return_score = 0.5;
+
+        assert_eq!(
+            inert_knob_paths(&config),
+            vec!["memory.fts_early_return_score"]
+        );
+    }
+
+    #[test]
+    async fn validate_memory_semantics_warns_for_rerank_enabled() {
+        let mut config = Config::default();
+        config.memory.rerank_enabled = true;
+
+        let warnings = warnings_with_code(&config, INERT_MEMORY_KNOB_WARNING);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, "memory.rerank_enabled");
+        assert!(
+            warnings[0].message.contains("currently has no effect"),
+            "warning should state the knob has no effect: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn validate_memory_semantics_warns_for_non_default_rerank_threshold() {
+        let mut config = Config::default();
+        config.memory.rerank_threshold = 10;
+
+        assert_eq!(inert_knob_paths(&config), vec!["memory.rerank_threshold"]);
+    }
+
+    #[test]
+    async fn validate_memory_semantics_reports_each_set_knob() {
+        let mut config = Config::default();
+        config.memory.rerank_enabled = true;
+        config.memory.rerank_threshold = 10;
+
+        assert_eq!(
+            inert_knob_paths(&config),
+            vec!["memory.rerank_enabled", "memory.rerank_threshold"]
+        );
     }
 
     #[test]
