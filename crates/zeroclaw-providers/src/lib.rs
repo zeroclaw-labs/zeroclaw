@@ -1336,11 +1336,12 @@ fn push_pinned_entries(
     out.push(ReliableModelProviderEntry::new(
         family,
         cooldown_key.clone(),
-        Box::new(crate::model_pin::ModelPinnedProvider::new(
-            alias,
-            primary_model,
-            Box::new(std::sync::Arc::clone(&built)),
-        )),
+        Box::new(
+            crate::model_pin::ModelPinnedProvider::builder(alias)
+                .pinned_model(primary_model)
+                .inner(Box::new(std::sync::Arc::clone(&built)))
+                .build(),
+        ),
     ));
     for model in extra_models {
         if model.trim().is_empty() || model == primary_model {
@@ -1349,11 +1350,12 @@ fn push_pinned_entries(
         out.push(ReliableModelProviderEntry::new(
             family,
             cooldown_key.clone(),
-            Box::new(crate::model_pin::ModelPinnedProvider::new(
-                alias,
-                model,
-                Box::new(std::sync::Arc::clone(&built)),
-            )),
+            Box::new(
+                crate::model_pin::ModelPinnedProvider::builder(alias)
+                    .pinned_model(model)
+                    .inner(Box::new(std::sync::Arc::clone(&built)))
+                    .build(),
+            ),
         ));
     }
 }
@@ -3755,7 +3757,9 @@ mod tests {
         assert_eq!(tuning.num_predict, 4096);
         assert_eq!(tuning.temperature_override, Some(0.5));
 
-        let provider = ollama::OllamaModelProvider::new("test", None, None).with_tuning(tuning);
+        let provider = ollama::OllamaModelProvider::builder("test")
+            .tuning(tuning)
+            .build();
         assert_eq!(provider.tuning(), tuning);
     }
 
