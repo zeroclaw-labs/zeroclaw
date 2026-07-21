@@ -754,6 +754,13 @@ pub struct SopStepResult {
     pub output: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// The agent whose policy/tools/provider actually executed this step —
+    /// the acting authority the audit record must name. For a step that
+    /// delegated to a different agent this is the step agent, not the turn's
+    /// outer agent; `None` for deterministic/checkpoint steps, drivers with
+    /// no resolved alias, and legacy records persisted before capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent: Option<String>,
     /// Ordered tool invocations made while executing this step. Empty
     /// for checkpoint steps and legacy records persisted before capture.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -867,7 +874,28 @@ pub struct DeterministicSavings {
 pub enum SopRunAction {
     /// Inject this step into the agent for execution. `step.agent` is the
     /// resolved effective agent (step override then parent), not the raw
-    /// persisted override; consumers must not re-resolve it.
+    /// persisted override; consumers must not re-resolve it. Consumers MUST run
+    /// the step AS that effective agent: when it names a different agent than
+    /// the one running the turn, the step's COMPLETE per-agent execution
+    /// contract must be re-assembled for that agent, never inherited from the
+    /// parent turn — its gated tool registry, security policy, MCP scope,
+    /// provider binding (incl. the agent's own temperature), resolved runtime
+    /// controls (iteration/result/context limits, parsing/parallelism, dedup
+    /// exemptions, tool filter groups), and an approval manager built from the
+    /// step agent's risk profile under the parent surface's interactivity mode
+    /// (a live operator approval route survives delegation). The step runs on
+    /// an EXPLICIT child transcript (the step agent's own system prompt plus
+    /// the step context); the parent turn's conversation is never sent to the
+    /// step agent's provider, and only the step's final output flows back.
+    /// Records emitted while the step runs stamp the step agent as the acting
+    /// identity, with the delegating agent preserved as parent correlation.
+    /// A driver path that carries the re-assembly handle (the live runtime and
+    /// channel-orchestrator turn paths) re-assembles the step agent; a path
+    /// that does NOT carry it (e.g. a bounded delegate sub-loop) MUST fail the
+    /// cross-agent step CLOSED rather than run it with the parent's context.
+    /// Either way the invariant holds: a cross-agent step never executes with
+    /// a broader scope than its own agent — it is re-assembled or it is
+    /// refused.
     ExecuteStep {
         run_id: String,
         step: SopStep,
@@ -1366,6 +1394,7 @@ path = "/sop/test"
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "Step 1 done".into(),

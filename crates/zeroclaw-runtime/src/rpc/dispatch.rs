@@ -4131,13 +4131,72 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
+        let mut resumed_action = None;
         {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-            guard
-                .decide_checkpoint(&req.run_id, decision)
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
+            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            match guard
+                .resolve_via_broker(&req.run_id, decision, principal)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
+            {
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) => {
+                    resumed_action = Some(*action);
+                }
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved,
+                )
+                | BrokerOutcome::PendingQuorum { .. } => {}
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
+                )
+                | BrokerOutcome::NotWaiting => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)
+                | BrokerOutcome::NotAuthorized { .. } => {
+                    return Err(rpc_err(
+                        AUTH_REQUIRED,
+                        crate::i18n::get_required_cli_string("sop-rpc-decision-unauthorized"),
+                    ));
+                }
+                BrokerOutcome::PolicyMissing { name } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-missing",
+                            &[("name", name.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::PolicyUnavailable { reason } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-unavailable",
+                            &[("reason", reason.as_str())],
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(action) = resumed_action {
+            let config = self.ctx.config.read().clone();
+            crate::sop::spawn_headless_run_driver(
+                config,
+                Arc::clone(&engine),
+                self.ctx.sop_audit.clone(),
+                action,
+            );
         }
 
         let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
@@ -5406,6 +5465,158 @@ mod tests {
             .handle_sops_runs(&serde_json::json!({ "sop": "some-sop" }))
             .expect_err("missing engine must error");
         assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    fn make_checkpoint_rpc_dispatcher(
+        quorum: u32,
+        members: &[&str],
+        tui_id: &str,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{
+            ApprovalGroupConfig, ApprovalPolicyConfig, Config, SopApprovalConfig,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let sops_dir = temp.path().join("sops");
+        let sop = Sop {
+            name: "rpc-checkpoint".into(),
+            description: "checkpoint RPC authorization test".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "authorize".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some("prod".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "continue".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).unwrap();
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: members.iter().map(|member| (*member).to_string()).collect(),
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".into()),
+                quorum,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let mut config = Config::default();
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        config.sop.approval = SopApprovalConfig { groups, policies };
+
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone())
+            .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "rpc-checkpoint",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected checkpoint wait, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
+        (dispatcher, engine, run_id, temp)
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+        use crate::sop::types::SopRunStatus;
+
+        let (unauthorized, engine, run_id, _temp) =
+            make_checkpoint_rpc_dispatcher(1, &["cli:ZeroClawOperator"], "ZeroClawAgent");
+        let error = unauthorized
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("unauthorized RPC principal must be rejected");
+        assert_eq!(error.code, AUTH_REQUIRED);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
+            2,
+            &["cli:ZeroClawOperator", "cli:ZeroClawMaintainer"],
+            "ZeroClawOperator",
+        );
+        pending
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
+            .await
+            .expect("an authorized first vote returns the still-parked overlay");
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
     }
 
     #[test]

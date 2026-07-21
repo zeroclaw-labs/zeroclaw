@@ -32,6 +32,12 @@ pub enum ResolveOutcome {
     /// `approval_mode` forbids this principal from clearing the gate (an agent under
     /// `OutOfBandRequired`, or a non-agent under `AgentTool`). The gate stays open.
     RejectedSelfApproval,
+    /// Approved, but every execution slot is full: re-admitting the run would exceed
+    /// the SOP's `max_concurrent` or the global `max_concurrent_total`. The gate is
+    /// left `WaitingApproval` (untouched, re-resolvable, no ledger row, no claim);
+    /// a later resolve or the timeout tick's retry resumes it once a slot frees. This
+    /// is routine backpressure, not a rejection - the caps are enforced on resume.
+    DeferredAtCapacity,
 }
 
 impl ResolveOutcome {
@@ -48,6 +54,7 @@ impl ResolveOutcome {
             ResolveOutcome::AlreadyResolved => "already_resolved",
             ResolveOutcome::NotWaiting => "not_waiting",
             ResolveOutcome::RejectedSelfApproval => "rejected_self_approval",
+            ResolveOutcome::DeferredAtCapacity => "deferred_at_capacity",
         }
     }
 }

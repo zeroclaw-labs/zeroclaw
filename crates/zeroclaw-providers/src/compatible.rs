@@ -99,7 +99,7 @@ pub enum AuthStyle {
 /// `tool_calls[].function.arguments` is not well-formed JSON. Smaller /
 /// reasoning models sometimes emit a malformed arguments string; when that
 /// happens the whole turn fails with HTTP 400 and the user receives the
-/// generic fallback instead of the agent's response. #8675.
+/// generic fallback instead of the agent's response.
 ///
 /// Contract:
 /// - empty / whitespace-only → `"{}"` (every upstream accepts this)
@@ -1370,8 +1370,7 @@ impl StreamToolCallAccumulator {
         let name = self.name?;
         // Route through the shared `sanitize_tool_arguments` helper so the
         // normalization contract (empty/whitespace → "{}", invalid JSON →
-        // WARN + "{}", valid JSON → passthrough) has a single source of
-        // truth. #8675.
+        // WARN + "{}", valid JSON → passthrough) has a single source of truth.
         let normalized_arguments = sanitize_tool_arguments(&name, &self.arguments);
 
         Some(ProviderToolCall {
@@ -3426,7 +3425,7 @@ mod tests {
         assert_eq!(sanitize_tool_arguments("f", r#"{"path":"/tmp"#), "{}");
         // Trailing junk
         assert_eq!(sanitize_tool_arguments("f", r#"{"x":1}garbage"#), "{}");
-        // Truncated (the actual observed failure case from #8675)
+        // Truncated (the observed failure case from the field)
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
     }
 
@@ -5878,6 +5877,31 @@ mod tests {
             Some("Let me think about this...")
         );
         assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_round_trips_tool_call_extra_content() {
+        let extra_content = serde_json::json!({
+            "google": {
+                "thought_signature": "sig_1"
+            }
+        });
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}",
+                "extra_content": extra_content.clone()
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+
+        assert_eq!(tool_calls[0].extra_content.as_ref(), Some(&extra_content));
     }
 
     #[test]

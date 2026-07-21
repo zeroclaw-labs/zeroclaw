@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
@@ -21,6 +21,17 @@ import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
+
+// Open chat links in a new tab so navigation never replaces the live chat
+// page. In-page anchors (e.g. GFM footnote refs) keep default navigation.
+const markdownComponents: Components = {
+  a: ({ node: _node, href, ...props }) =>
+    href?.startsWith('#') ? (
+      <a {...props} href={href} />
+    ) : (
+      <a {...props} href={href} target="_blank" rel="noopener noreferrer" />
+    ),
+};
 
 /** Format token count with commas (e.g., 12345 -> "12,345"). */
 function fmtTokens(n: number): string {
@@ -738,7 +749,7 @@ const MessageItem = memo(function MessageItem({
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
           ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent}</ReactMarkdown></div>
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{cleanContent}</ReactMarkdown></div>
           ) : (
             <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}
