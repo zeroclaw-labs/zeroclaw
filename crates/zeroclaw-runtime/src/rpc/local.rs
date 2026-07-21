@@ -1,10 +1,4 @@
 //! Local IPC transport for the RPC layer.
-//!
-//! On Unix this binds a `SOCK_STREAM` AF_UNIX socket at
-//! `<config.data_dir>/daemon.sock`; on Windows it creates a per-user named
-//! pipe whose name is derived from the data_dir so each `--data-dir` gets
-//! its own endpoint. `$ZEROCLAW_SOCKET` overrides the endpoint path on
-//! both platforms.
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
@@ -36,11 +30,6 @@ const EMFILE: i32 = 24; // too many open files (this process)
 #[cfg(unix)]
 const ENFILE: i32 = 23; // too many open files (system-wide)
 
-/// Returns `true` when an error from a stream listener's `accept()` is
-/// transient and the listener itself remains usable, so the serve loop
-/// should log and keep running rather than terminating the daemon. Covers
-/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
-/// per-connection hiccups.
 fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     if matches!(
         e.kind(),
@@ -55,13 +44,6 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     false
 }
 
-/// Resolve the local-IPC endpoint path.
-///
-/// Returns `$ZEROCLAW_SOCKET` when set, otherwise a per-`data_dir`
-/// platform-native endpoint:
-/// - Unix: `<data_dir>/daemon.sock` (filesystem path)
-/// - Windows: `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from
-///   `data_dir` so each data directory gets its own pipe
 pub fn socket_path(config: &Config) -> PathBuf {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         return PathBuf::from(p);
@@ -137,7 +119,6 @@ impl RpcTransport for LocalTransport {
 // ── Listener ─────────────────────────────────────────────────────
 
 /// Run the local IPC RPC listener as a daemon subsystem.
-///
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
 pub async fn run_local_listener(
@@ -182,7 +163,7 @@ pub async fn run_local_listener(
                             // Transient (e.g. EMFILE under fd pressure):
                             // the listener is still valid. Back off briefly
                             // to avoid hot-spinning, then keep serving
-                            // rather than killing the daemon (#7042).
+                            // rather than killing the daemon
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -770,7 +751,7 @@ mod accept_error_tests {
     #[cfg(unix)]
     #[test]
     fn fd_exhaustion_accept_errors_are_recoverable() {
-        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        // EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
     }

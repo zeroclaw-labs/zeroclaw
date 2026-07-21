@@ -1,8 +1,4 @@
 //! The append-only approval ledger entry, mapped onto EPIC B's `SopEventRecord`.
-//!
-//! Replaces the old last-write-wins `sop_approval_{run}_{step}` overwrite: every
-//! gate event becomes an immutable, monotonic-seq row via the store's
-//! `append_event`, carrying WHO resolved it (the principal) and WHY.
 
 use serde::{Deserialize, Serialize};
 

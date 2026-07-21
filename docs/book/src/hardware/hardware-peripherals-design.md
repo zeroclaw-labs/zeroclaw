@@ -265,7 +265,7 @@ tracking phase status here (which drifts as work lands), the layers are:
 - [STM32 Nucleo-F401RE](https://www.st.com/en/evaluation-tools/nucleo-f401re.html)
 - [tonic](https://github.com/hyperium/tonic): gRPC for Rust
 - [probe-rs](https://probe.rs/): ARM debug probe, flash, memory access
-- [nusb](https://github.com/nic-hartley/nusb): USB device enumeration (VID/PID)
+- [nusb](https://github.com/kevinmehall/nusb): USB device enumeration (VID/PID)
 
 ## 14. Raw Prompt Summary
 

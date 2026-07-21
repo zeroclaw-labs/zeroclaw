@@ -1,13 +1,4 @@
 //! End-to-end migration tests for the V1 → V2 → V3 chain.
-//!
-//! Sole input: `fixtures/v1.toml` at the crate root, embedded via
-//! `include_str!` so it lives only in the test/cli binary. No fixture
-//! files for V2 or V3 — V2/V3 shape is asserted via typed deserialization
-//! (`Config`) and `toml::Value` navigation on the migration output.
-//!
-//! One test per transform listed in the plan's Step 0 ground truth. Each
-//! test asserts the destination value present in V3 output; if the migration
-//! step that performs the transform is broken, the test fails.
 
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::migration::{
@@ -32,14 +23,6 @@ fn v3_value() -> toml::Value {
     toml::from_str(&migrated).expect("migrate_file output parses as TOML")
 }
 
-/// Run a V2-shape TOML literal through `V2Config::migrate()` directly. Used by
-/// V2→V3-only transform tests where threading data through a V1 fixture would
-/// fake a starting state that no real user ever wrote.
-///
-/// Gate: the V3 output must round-trip as `Config` (no `unknown field`, no
-/// type mismatches). This closes the V2-fixture-round-trip gate from the
-/// migration plan in one place: every test that calls `migrate_v2` proves
-/// its V2 input also produces a V3-loadable config.
 fn migrate_v2(input: &str) -> toml::Value {
     let v2: V2Config = toml::from_str(input).expect("V2 input parses as V2Config");
     let value = v2.migrate().expect("V2 → V3 migration succeeds");
@@ -372,13 +355,6 @@ group_id = "fold-test-group"
         "non-\"dm\" group_id must not set dm_only=true"
     );
 }
-
-// ─────────────────────────────────────────────────────────────
-// T7 — channel `enabled` semantics. V3 keeps the V2 boolean on the
-// channel config; the runtime gates registration on `cfg.enabled` and
-// the migration ports the value through verbatim so an operator's
-// "configured but parked" channel survives migration.
-// ─────────────────────────────────────────────────────────────
 
 #[test]
 fn t7_enabled_false_channel_preserved() {
@@ -972,12 +948,6 @@ fn agent_synthesized_into_runtime_profiles_default() {
     assert_eq!(profile.tool_dispatcher.as_deref(), Some("auto"));
 }
 
-// ─────────────────────────────────────────────────────────────
-// cost.prices drop (per #5947 — composite V2 keys can't be remapped
-// onto V3 alias-keyed paths without heuristics; operators paste
-// manually under the right block).
-// ─────────────────────────────────────────────────────────────
-
 #[test]
 fn cost_prices_dropped_not_folded() {
     let cfg = v3_config();
@@ -1201,14 +1171,6 @@ fn malformed_schema_version_returns_clean_error() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────
-// discord_history bot_token conflict — per #5947, when the legacy
-// [channels.discord-history].bot_token differs from
-// [channels.discord].bot_token, the migration drops the history
-// token (the discord token wins) and emits a WARN naming the source.
-// Two-bot deployments must reconfigure manually.
-// ─────────────────────────────────────────────────────────────
-
 #[test]
 fn discord_history_bot_token_conflict_drops_history_token() {
     // Both blocks present with different bot_tokens; discord wins.
@@ -1242,14 +1204,6 @@ channel_ids = ["aaaa"]
         "the discord_history fold still flips archive=true on the merged block"
     );
 }
-
-// ─────────────────────────────────────────────────────────────
-// Feishu rename — V3 collapses Feishu and Lark to one channel type.
-// V2 [channels.feishu] becomes V3 [channels.lark.feishu] (alias name
-// is "feishu", not "default") so two-bot deployments with both
-// [channels.lark] AND [channels.feishu] survive as two distinct V3
-// aliases without losing data.
-// ─────────────────────────────────────────────────────────────
 
 #[test]
 fn feishu_only_block_folds_into_lark_feishu_alias() {
@@ -1356,16 +1310,6 @@ encrypt_key = "feishu_encrypt"
     );
 }
 
-// ─────────────────────────────────────────────────────────────
-// V1/V2 colon-URL provider strings — `(custom|anthropic-custom):<url>`.
-// Pre-fix the migration used the raw colon-URL string as the V3 outer
-// provider key, then synthesized `model_provider = "<type>:<url>.<alias>"`.
-// V3's `split_once('.')` resolution then tokenized at the first URL dot
-// (e.g. inside `api.z.ai`), making the reference unresolvable. The fix
-// splits the URL into `uri` on the alias entry and uses only the
-// prefix as the V3 type key, keeping `<type>.<alias>` parseable.
-// ─────────────────────────────────────────────────────────────
-
 #[test]
 fn anthropic_custom_colon_url_default_provider_folds_under_anthropic() {
     // Phase 8 migration sweep: V2 `anthropic-custom:URL` form folds under
@@ -1464,12 +1408,6 @@ api_key = "sk-zai-agent"
     );
 }
 
-// ─────────────────────────────────────────────────────────────
-// signal "dm" sentinel — separate test because the V1 fixture above
-// uses a non-"dm" value to exercise the array fold path. This test
-// inlines a minimal V1 input to exercise the sentinel branch.
-// ─────────────────────────────────────────────────────────────
-
 #[test]
 fn t6_signal_dm_sentinel_sets_dm_only() {
     let raw = r#"
@@ -1497,12 +1435,6 @@ group_id = "dm"
         "the \"dm\" sentinel must NOT also land in group_ids[]"
     );
 }
-
-// ─────────────────────────────────────────────────────────────
-// model_routes / embedding_routes — V2 spelled the routing target
-// as `provider`, V3 as `model_provider`. The runtime serde alias was
-// removed; the rename has to happen at migration time.
-// ─────────────────────────────────────────────────────────────
 
 #[test]
 fn v2_model_routes_provider_field_renamed_to_model_provider() {
@@ -1721,11 +1653,6 @@ agents = ["researcher"]
     assert!(group.get("external_peers").is_none());
 }
 
-/// Per-channel-type peer-auth field name regression. The V2 field
-/// name varied per platform (allowed_users, allowed_contacts,
-/// allowed_from, allowed_numbers, allowed_senders, allowed_pubkeys);
-/// every one of them folds into `external_peers` on a synthesized
-/// peer group and the original channel field is REMOVED.
 #[test]
 fn v2_every_inbound_peer_field_folds_and_is_stripped() {
     let v3 = migrate_v2(
@@ -1876,25 +1803,8 @@ allowed_rooms = ["!ops:matrix.org"]
     assert_eq!(rooms, vec!["!ops:matrix.org"]);
 }
 
-// ─────────────────────────────────────────────────────────────
-// V3_CHANNEL_TYPES coverage — every typed nested channel slot on
-// `ChannelsConfig` must appear in the migration walker's alias-wrap
-// list. Missing entries silently slip through the "unmodeled keys
-// passthrough" branch and surface as type errors at V3 deserialize
-// time (a V2 `[channels.foo] enabled = false` block remains flat,
-// then deserialize tries to read it as `HashMap<String, FooConfig>`
-// and panics with `invalid type: boolean false, expected struct
-// FooConfig`). The user report this regression test came from is
-// at the bottom of the next test.
-// ─────────────────────────────────────────────────────────────
-
 #[test]
 fn v2_channels_voice_duplex_block_alias_wraps() {
-    // Reproduces a user-reported migration error:
-    //   invalid type: boolean `false`, expected struct VoiceDuplexConfig
-    //   in `channels.voice_duplex.enabled`
-    // Cause: voice_duplex was missing from V3_CHANNEL_TYPES and went
-    // through the unmodeled-keys passthrough, leaving the V2 block flat.
     let raw = r#"
 default_provider = "openai"
 default_model = "gpt-4o-mini"
@@ -2031,10 +1941,6 @@ funnel = true
 
 #[test]
 fn v3_channel_types_covers_every_typed_channel_slot() {
-    // Drift gate: every `#[nested] HashMap<String, T>` field under
-    // ChannelsConfig must appear in V3_CHANNEL_TYPES (or be intentionally
-    // folded into a sibling type — today only `feishu` qualifies, since
-    // V2 `[channels.feishu]` is migrated to `[channels.lark.feishu]`).
     use std::collections::HashSet;
     use zeroclaw_config::schema::Config;
     use zeroclaw_config::schema::v2::V3_CHANNEL_TYPES;
@@ -2046,12 +1952,6 @@ fn v3_channel_types_covers_every_typed_channel_slot() {
     // step that runs before the alias-wrap loop.
     let folded_into_sibling: HashSet<&str> = ["feishu"].into_iter().collect();
 
-    // map_key_sections paths come from the per-struct `#[prefix = ...]`
-    // attribute, which historically uses kebab-case for multi-word slots
-    // (`channels.gmail-push`). The migration walker compares against the
-    // TOML key, which is the snake-case field name (`channels.gmail_push`).
-    // Normalize before comparing so the two never silently disagree on
-    // separator choice.
     let typed_channel_slots: Vec<String> = Config::map_key_sections()
         .into_iter()
         .filter_map(|s| {
@@ -2165,28 +2065,6 @@ enabled = false
     );
 }
 
-// ─────────────────────────────────────────────────────────────
-// `zeroclaw config generate <version>` end-to-end regression
-// guards.
-//
-// These tests run the same `generate()` function the CLI invokes,
-// then push the output through the typed migration chain and the
-// V3 schema validator. A break in any of the following surfaces
-// fails one of these tests:
-//
-// - V1Config / V2Config typed lens drifts away from real V1/V2 TOML
-// - V2→V3 migration starts dropping or mistyping a section
-// - A new required V3 schema field lands without a default and
-//   without a corresponding migration synthesis step
-// - V3 `Config::validate()` grows a new check that the V1 fixture
-//   doesn't satisfy
-// - `encrypt_secret_strings` stops covering a known secret key name
-//
-// Lower bounds (section counts, presence of named sections) are
-// preferred over exact equality so adding new sections or aliases
-// doesn't break the suite — only removals / regressions do.
-// ─────────────────────────────────────────────────────────────
-
 #[test]
 fn generate_every_version_migrates_and_validates() {
     for target in 1..=CURRENT_SCHEMA_VERSION {
@@ -2195,13 +2073,6 @@ fn generate_every_version_migrates_and_validates() {
         let cfg = migrate_to_current(&raw).unwrap_or_else(|e| {
             panic!("generate({target}) output failed to migrate to current schema: {e:#}")
         });
-        // Validation rejects dangling references and structural mismatches.
-        // A green load here means the typed chain plus the V3 validator
-        // accept the generated config end-to-end. We tolerate `Err` only
-        // when validate() surfaces a known-by-design fixture artifact
-        // (the V1 fixture intentionally has an empty
-        // `[model_providers.claude-code]` block, which Config::validate
-        // does NOT reject — it just warns at load time).
         cfg.validate()
             .unwrap_or_else(|e| panic!("generate({target}) output fails Config::validate: {e:#}"));
     }
@@ -2468,20 +2339,6 @@ fn find_first_string_at_key(value: &toml::Value, key: &str) -> Option<String> {
 
 #[test]
 fn encryption_covers_every_schema_secret_field() {
-    // The encrypt walker derives its key-name allowlist from the typed
-    // schema via Config::prop_fields().filter(is_secret). This test
-    // proves end-to-end coverage by:
-    //
-    //   1. Generating a comprehensive V3 config from the V1 fixture.
-    //   2. Encrypting it via the walker.
-    //   3. Asserting that every prop_fields() entry with is_secret =
-    //      true whose dotted path is present in the generated config
-    //      carries `enc2:` ciphertext at that path (or is empty).
-    //
-    // Adding a new `#[secret]` field to the schema automatically
-    // joins the allowlist — no SECRET_KEY_NAMES const to maintain —
-    // and this test verifies the resulting output gets encrypted.
-
     let tmp = tempfile::tempdir().expect("tempdir");
     let raw = generate(
         CURRENT_SCHEMA_VERSION,
@@ -2538,19 +2395,6 @@ fn encryption_covers_every_schema_secret_field() {
 
 #[test]
 fn encryption_covers_compound_map_secret_field() {
-    // Map-shaped `#[secret]` fields (e.g. `mcp.servers[*].headers:
-    // HashMap<String, String>`) don't surface through `prop_fields()`
-    // — the derive intentionally skips non-Vec compound types. The
-    // raw-TOML encrypt walker must therefore source its allowlist
-    // from `secret_field_terminals()` (compile-time enumeration of
-    // every `#[secret]` field at every depth), so map-shaped values
-    // get the same encrypt-on-save coverage as scalar ones.
-    //
-    // This regression encodes that: a TOML config containing an MCP
-    // headers table with bearer credentials must have every value
-    // encrypted by the raw walker, while keys stay plaintext and
-    // sibling non-secret strings (`url`, `name`) stay plaintext too.
-
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = SecretStore::new(tmp.path(), true);
 
@@ -2605,8 +2449,6 @@ X-Tenant = "tenant-42"
     );
     assert_eq!(store.decrypt(tenant).expect("decrypt tenant"), "tenant-42",);
 
-    // Sibling non-secret strings remain plaintext — the walker only
-    // descends through allowlisted keys, not every string in the tree.
     assert_eq!(
         server.get("url").and_then(toml::Value::as_str),
         Some("https://mcp.example.invalid/sse"),
@@ -2641,11 +2483,6 @@ api_key = "op://zeroclaw/provider/openai-api-key"
 
 #[test]
 fn identity_lifts_into_agents_default_during_v2_to_v3() {
-    // V2 had a top-level [identity] block. V3 demoted identity to
-    // per-agent (`[agents.<alias>.identity]`); the V2->V3 typed
-    // migration must lift the top-level block into the synthesized
-    // default agent and remove the top-level key so the V3
-    // deserializer doesn't see an unknown field.
     let v3 = migrate_v2(
         r#"
 schema_version = 2
@@ -2683,11 +2520,6 @@ api_key = "sk-test"
 
 #[test]
 fn identity_lift_does_not_clobber_operator_per_agent_block() {
-    // If the operator already wrote a per-agent identity block in
-    // their V2 input (forward-looking), the V2->V3 lift must not
-    // overwrite it. Top-level [identity] is still removed (V3 has no
-    // slot for it) but each per-agent block keeps its operator-set
-    // value.
     let v3 = migrate_v2(
         r#"
 schema_version = 2
@@ -2734,11 +2566,6 @@ fn lookup_dotted<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Val
 
 #[test]
 fn get_prop_resolves_model_field_for_typed_provider_alias() {
-    // Reproduce: the dashboard's model-row click handler calls
-    // getProp(`providers.models.<type>.<alias>.model`). If that path
-    // doesn't resolve (or returns the wrong shape), the model→type
-    // map stays empty and the click can't route to the provider's
-    // Costs tab. Pinned with the user's exact config shape.
     use zeroclaw_config::schema::Config;
     let raw = r#"
 schema_version = 3
@@ -2792,11 +2619,6 @@ model = "claude-opus-4-7"
 
 #[test]
 fn typed_family_root_is_not_a_map_keyed_section() {
-    // Regression: ModelProviders is a typed struct (anthropic, openai, …
-    // HashMap fields), not a single HashMap, so the typed-family root
-    // doesn't resolve as a map-keyed section. Any frontend code that
-    // walks providers.<category> must route through map_key_sections /
-    // GET /api/config/templates instead.
     use zeroclaw_config::schema::Config;
     let raw = r#"
 schema_version = 3
@@ -2839,14 +2661,6 @@ fn map_key_sections_exposes_typed_family_slots() {
         );
     }
 }
-
-// ─────────────────────────────────────────────────────────────
-// Runtime-acceptance gate: every alias reference on every agent
-// in a migrated V2 config resolves to a real config entry. Closes
-// the migration-plan item "post-migration runtime accepts the
-// migrated config, loads agents, and resolves all alias references"
-// at the config layer (no live provider / channel / memory I/O).
-// ─────────────────────────────────────────────────────────────
 
 #[test]
 fn migrated_v2_agent_alias_references_all_resolve() {

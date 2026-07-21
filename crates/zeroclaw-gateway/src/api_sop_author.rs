@@ -230,20 +230,6 @@ pub async fn handle_sop_run(
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
             }
-            // A2: absorbed into an already-in-flight run — report that run.
-            zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced {
-                existing_run_id, ..
-            } => {
-                return Json(serde_json::json!({ "run_id": existing_run_id })).into_response();
-            }
-            // A2: backpressured; this authoring surface has no retry loop.
-            zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({ "error": reason })),
-                )
-                    .into_response();
-            }
             zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { reason, .. } => {
                 return (
                     StatusCode::CONFLICT,
@@ -257,6 +243,18 @@ pub async fn handle_sop_run(
                     Json(serde_json::json!({ "error": reason })),
                 )
                     .into_response();
+            }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced {
+                existing_run_id, ..
+            } => {
+                return Json(serde_json::json!({ "run_id": existing_run_id })).into_response();
             }
             zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {}
         }

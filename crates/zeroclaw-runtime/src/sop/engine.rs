@@ -62,6 +62,16 @@ pub struct SopEngine {
     /// `resolve_gate` chokepoint. Defaults to a pass-through (no policies) so
     /// behavior is unchanged until a `[sop.approval]` policy is configured.
     approval_broker: Arc<super::approval::ApprovalBroker>,
+    /// Bounded per-message dispatch idempotency window for at-least-once
+    /// transports. The key is scoped by SOP name and maps to the run already
+    /// started for that delivery.
+    dispatch_dedup: std::collections::VecDeque<(String, String)>,
+}
+
+const DISPATCH_DEDUP_CAP: usize = 512;
+
+fn dispatch_dedup_composite(sop_name: &str, dedup_key: &str) -> String {
+    format!("{sop_name}\u{0}{dedup_key}")
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -103,6 +113,7 @@ impl SopEngine {
             capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
             claims_pending_persist: std::collections::HashSet::new(),
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
+            dispatch_dedup: std::collections::VecDeque::new(),
         }
     }
 
@@ -1051,32 +1062,6 @@ impl SopEngine {
         self.evaluate_admission_with_reserved(sop_name, 0, 0)
     }
 
-    /// Evaluate a group of matched SOPs as one delivery unit. Each `Admit` reserves
-    /// one simulated exec slot before evaluating later siblings, so all-or-nothing
-    /// transports can detect a batch that would exceed per-SOP or global capacity
-    /// before starting any run.
-    pub(crate) fn evaluate_admission_batch_all_or_nothing(
-        &self,
-        sop_names: &[String],
-    ) -> Vec<(String, SopAdmission)> {
-        let mut reserved_by_sop: HashMap<String, usize> = HashMap::new();
-        let mut reserved_total = 0usize;
-        let mut out = Vec::with_capacity(sop_names.len());
-
-        for sop_name in sop_names {
-            let reserved_for_sop = *reserved_by_sop.get(sop_name).unwrap_or(&0);
-            let admission =
-                self.evaluate_admission_with_reserved(sop_name, reserved_for_sop, reserved_total);
-            if matches!(admission, SopAdmission::Admit) {
-                *reserved_by_sop.entry(sop_name.clone()).or_default() += 1;
-                reserved_total += 1;
-            }
-            out.push((sop_name.clone(), admission));
-        }
-
-        out
-    }
-
     fn evaluate_admission_with_reserved(
         &self,
         sop_name: &str,
@@ -1152,6 +1137,57 @@ impl SopEngine {
                         reason: format!("SOP '{sop_name}' execution slots full (drop policy)"),
                     }
                 }
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_dedup_lookup(&self, sop_name: &str, dedup_key: &str) -> Option<String> {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        self.dispatch_dedup
+            .iter()
+            .find(|(key, _)| *key == composite)
+            .and_then(|(_, run_id)| (!run_id.is_empty()).then(|| run_id.clone()))
+    }
+
+    pub(crate) fn note_fresh_dispatch_key(&mut self, sop_name: &str, dedup_key: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(key, _)| *key == composite)
+        {
+            entry.1.clear();
+        }
+    }
+
+    pub(crate) fn record_dispatch_dedup(&mut self, sop_name: &str, dedup_key: &str, run_id: &str) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        if let Some(entry) = self
+            .dispatch_dedup
+            .iter_mut()
+            .find(|(key, _)| *key == composite)
+        {
+            if entry.1 != run_id {
+                entry.1.clear();
+            }
+            return;
+        }
+
+        self.dispatch_dedup
+            .push_back((composite, run_id.to_string()));
+        while self.dispatch_dedup.len() > DISPATCH_DEDUP_CAP {
+            if let Some((_, evicted_run)) = self.dispatch_dedup.pop_front()
+                && self.active_runs.contains_key(&evicted_run)
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_run_id": evicted_run,
+                            "cap": DISPATCH_DEDUP_CAP,
+                        })),
+                    "SOP dispatch dedup window evicted a still-active run"
+                );
             }
         }
     }
@@ -6755,7 +6791,7 @@ mod tests {
         );
     }
 
-    // ── Advance step gate guard (#8678) ─────────────────
+    // ── Advance step gate guard ──────────────────────────
     //
     // A driver calling `sop_advance` while a run is parked at an external
     // gate (WaitingApproval or PausedCheckpoint) used to be allowed to

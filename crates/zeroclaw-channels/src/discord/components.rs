@@ -2,10 +2,6 @@
 //! `DiscordOutgoing.components`: their data shapes, ergonomic builders, and
 //! serialization to Discord's component JSON. A message carries up to 5 action
 //! rows; each row holds up to 5 buttons, or exactly one select menu. Every
-//! interactive (non-link) component routes through a [`CustomId`] so the inbound
-//! dispatch (EPIC B Phase 2) can recognize and route the click. Modal text
-//! inputs are added with modal handling (Phase 3) — a message action row never
-//! holds them.
 
 use serde_json::{Value, json};
 

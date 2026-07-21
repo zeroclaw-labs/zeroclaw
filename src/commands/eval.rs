@@ -1,9 +1,4 @@
 //! `zeroclaw eval` — run the agent evaluation harness.
-//!
-//! Phase 0 supports deterministic replay: each `*.json` trace fixture in the suite
-//! directory is replayed through the real agent loop and graded against its
-//! declarative expectations. The command exits non-zero if any case fails, so it
-//! can gate CI.
 
 use anyhow::Result;
 use std::path::PathBuf;

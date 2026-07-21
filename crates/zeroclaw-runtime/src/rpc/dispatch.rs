@@ -1,8 +1,4 @@
 //! JSON-RPC 2.0 method dispatch. Transport-agnostic.
-//!
-//! **No string-literal matching.** Every wire method name is registered
-//! exactly once in [`Method::ALL`]. The compiler enforces that every
-//! variant has a handler via exhaustive `match`.
 
 use super::context::RpcContext;
 use super::transport::RpcTransport;
@@ -35,12 +31,6 @@ mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
 }
-
-// ── Method registry ──────────────────────────────────────────────
-//
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -345,11 +335,6 @@ fn personality_template_context(
             .map(str::to_string)
             .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
             .unwrap_or_else(|| "ZeroClaw".to_string()),
-        // Existing config editors pass an agent alias, but Quickstart
-        // also asks for templates before the new agent exists. Treat an
-        // explicit agent request as a full per-agent template render so
-        // MEMORY.md is available during first-run setup; keep the no-agent
-        // fallback memoryless for generic/default callers.
         include_memory: configured_agent_exists || agent_requested,
         ..Default::default()
     }
@@ -366,10 +351,51 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     }
 }
 
+/// Extract the agent alias from an `agents.<alias>.model_provider` prop path.
+/// A live change to an agent's bound provider must rebuild that agent's live
+/// session boxes the same way a `providers.models.*` edit does, so any
+/// `config/set agents.<alias>.model_provider` caller (the config pane and other
+/// RPC/config-set clients) gets a live refresh.
+fn agent_alias_from_model_provider_prop(prop: &str) -> Option<String> {
+    let rest = prop.strip_prefix("agents.")?;
+    let (alias, field) = rest.split_once('.')?;
+    if alias.is_empty() || field != "model_provider" {
+        None
+    } else {
+        Some(alias.to_string())
+    }
+}
+
+/// Session-selection predicate for an agent-scoped `model_provider` refresh
+/// (`config/set agents.<alias>.model_provider`). Only sessions bound to the
+/// edited agent are eligible, and a session that carries its own
+/// `model_provider` override is excluded so unrelated agents and overridden
+/// sessions are never rebuilt.
+fn agent_scoped_refresh_selects(
+    edited_agent: &str,
+    session_agent: &str,
+    overrides: &SessionOverrides,
+) -> bool {
+    session_agent == edited_agent && overrides.model_provider.is_none()
+}
+
+/// Session-selection predicate for a provider-scoped refresh
+/// (`providers.models.*` edit). A session is eligible when its own
+/// `model_provider` override matches the edited provider, or when it has no
+/// override and thus inherits the agent's provider (final provider match is
+/// resolved separately against config).
+fn provider_scoped_refresh_selects(target_ref: &str, overrides: &SessionOverrides) -> bool {
+    overrides
+        .model_provider
+        .as_deref()
+        .map(|r| r == target_ref)
+        .unwrap_or(true)
+}
+
 /// Whether memory embeddings resolve from the given `<type>.<alias>` provider
 /// profile — either the base `[memory].embedding_provider` reference or any
 /// `[[embedding_routes]]` entry. Gates the memory-embedder refresh on a
-/// `config/set` provider-profile change (#8359).
+/// `config/set` provider-profile change
 fn memory_embeddings_use_provider(
     config: &zeroclaw_config::schema::Config,
     model_provider_ref: &str,
@@ -414,15 +440,6 @@ async fn move_renamed_agent_workspace(
     }
 }
 
-/// Whether a TUI session should eagerly initialize the agent's MCP servers when
-/// the agent is built for `session/new`.
-///
-/// ACP (Code) sessions skip MCP initialization so `session/new` returns
-/// promptly: user-configured MCP servers are external processes/services that
-/// can block startup while they connect or time out. Chat sessions initialize
-/// MCP so the Zerocode TUI exposes the same MCP tools — and, under deferred
-/// loading, the `tool_search` built-in — that the gateway already exposes for
-/// the same agent (#8193).
 fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
     !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
 }
@@ -437,18 +454,6 @@ pub struct RpcDispatcher {
     tui_id: Option<String>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
-    /// Client-side elicitation capabilities advertised during `initialize`
-    /// (parsed from `params.clientCapabilities.elicitation`). Connection-
-    /// scoped: ACP `initialize` happens once per connection, before any
-    /// `session/new`. The dispatcher is the canonical owner for the
-    /// lifetime of the TUI connection; the per-session `RpcApprovalChannel`
-    /// receives a `Copy` of this value at session-creation time so it can
-    /// route `request_choice` / `request_multi_choice` over
-    /// `elicitation/create` when supported.
-    ///
-    /// Mirrors the equivalent slot on `AcpServer.client_elicitation_caps`
-    /// — Zerocode's Code tab is a superset of ACP, so both surfaces speak
-    /// the same elicitation RFD.
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
 }
 
@@ -469,9 +474,6 @@ impl RpcDispatcher {
         self.tui_id.as_deref()
     }
 
-    /// Test-only: stamp the caller's tui_id without going through the
-    /// `initialize` handshake, so ownership-gated handlers can be exercised
-    /// directly. Never called from prod.
     #[cfg(test)]
     pub fn set_tui_id_for_test(&mut self, tui_id: Option<String>) {
         self.tui_id = tui_id;
@@ -488,6 +490,14 @@ impl RpcDispatcher {
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+        }
+    }
+
+    async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
+        if let Some(event) = event
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+        {
+            let _ = self.rpc.send_raw(notification).await;
         }
     }
 
@@ -775,11 +785,6 @@ impl RpcDispatcher {
             ));
         }
 
-        // Cache the parsed elicitation capabilities for the lifetime of this
-        // connection. The per-session `RpcApprovalChannel` reads them at
-        // construction time so it can route `request_choice` /
-        // `request_multi_choice` over `elicitation/create` when the client
-        // advertises support. Mirrors the equivalent slot on `AcpServer`.
         let elicitation = req
             .client_capabilities
             .as_ref()
@@ -900,9 +905,6 @@ impl RpcDispatcher {
 
     // ── Session handlers ─────────────────────────────────────────
 
-    /// Test-only: call `handle_session_new` directly, bypassing the
-    /// authentication gate in the `run` loop.  This lets integration tests
-    /// drive the full agent-creation path without spinning up a transport.
     #[cfg(test)]
     pub async fn handle_session_new_for_test(&self, params: &Value) -> RpcResult {
         self.handle_session_new(params).await
@@ -998,19 +1000,14 @@ impl RpcDispatcher {
             .chat_mode
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        // ACP (Code) sessions never get the long-term-memory tools or backend.
-        // The exclusion is derived from `chat_mode` on the server rather than
-        // trusted from the wire `exclude_memory` flag, so a client that omits
-        // or falsifies the flag cannot smuggle memory access into a Code
-        // session. A non-ACP caller may still opt in explicitly.
         let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             || req.exclude_memory == Some(true);
         // Chat sessions initialize MCP so the TUI sees the same MCP tools the
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
-        // `session/new` prompt (#8193).
+        // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
             initialize_mcp,
@@ -1148,10 +1145,12 @@ impl RpcDispatcher {
                             ));
                         }
                         message_count = data.messages.len();
-                        self.ctx
+                        let seed_event = self
+                            .ctx
                             .sessions
-                            .seed_conversation_history(&session_id, data.messages)
+                            .seed_conversation_history_with_event(&session_id, data.messages)
                             .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
                         // Restore the durable TodoWrite plan into the fresh
                         // in-memory session and re-emit it so the resuming /
                         // reconnecting client's tracker repopulates without a
@@ -1223,7 +1222,12 @@ impl RpcDispatcher {
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
-                        self.ctx.sessions.seed_history(&session_id, &stored).await;
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_history_with_event(&session_id, &stored)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
                         message_count = stored.len();
                     }
                 }
@@ -1454,22 +1458,16 @@ impl RpcDispatcher {
             }
         };
 
-        let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
             .as_deref()
             .and_then(|id| self.ctx.tui_registry.get_env(id));
-        // Reaped ACP sessions always rehydrate as `ChatMode::Acp` (see the
-        // insert below), so the recovered agent must enforce the same
-        // server-side memory-tool exclusion as a fresh `session/new` ACP
-        // session — otherwise session recovery silently restores the
-        // long-term-memory backend and tools the ACP invariant forbids.
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
             false,
@@ -1505,10 +1503,12 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
-        self.ctx
+        let seed_event = self
+            .ctx
             .sessions
-            .seed_conversation_history(sid, data.messages)
+            .seed_conversation_history_with_event(sid, data.messages)
             .await;
+        self.forward_seed_event(sid, seed_event).await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -1531,17 +1531,6 @@ impl RpcDispatcher {
         let req: SessionPromptParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        // Reject blank turns at the RPC boundary. A turn must carry SOMETHING
-        // — either prose or an attachment — for the agent to act on. Letting
-        // an empty `{prompt: "", attachments: []}` through would push a user
-        // message that contains only the runtime's timestamp prefix into the
-        // model context; Claude in particular then narrates the trailing
-        // `<<HUMAN_CONVERSATION_START>>` template sentinel instead of
-        // responding, and that bleeds into the visible transcript. The
-        // duplicate guard inside `Agent::turn_streamed` is the load-bearing
-        // one (any code path that reaches the agent is covered); this one
-        // gives RPC callers a clean error code instead of a generic agent
-        // failure surfaced after queue acquisition.
         if req.prompt.trim().is_empty() && req.attachments.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
@@ -1551,38 +1540,26 @@ impl RpcDispatcher {
 
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None => {
-                // The in-memory session was reaped (orphan grace or idle TTL)
-                // between the TUI's last touch and this prompt landing. Recover
-                // to a WORKING session: rehydrate the agent + history from the
-                // durable ACP store and continue the turn. The user's prompt
-                // just lands — no dead end, no "start a new session". Only if
-                // the durable row is genuinely gone do we fail, and then we
-                // emit an attributed TurnComplete so the TUI leaves `working`.
-                match self.rehydrate_reaped_session(sid).await {
-                    Some(a) => a,
-                    None => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail,
-                            )
+            None => match self.rehydrate_reaped_session(sid).await {
+                Some(a) => a,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({ "session_id": sid })),
-                            "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
-                        );
-                        self.emit_turn_complete(
-                            sid,
-                            crate::rpc::types::TurnCompletionOutcome::Failed,
-                            "turn cancelled by daemon: session_not_found".to_string(),
-                        )
-                        .await;
-                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
+                        "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
+                    );
+                    self.emit_turn_complete(
+                        sid,
+                        crate::rpc::types::TurnCompletionOutcome::Failed,
+                        "turn cancelled by daemon: session_not_found".to_string(),
+                    )
+                    .await;
+                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                 }
-            }
+            },
         };
 
         // Process inline attachments: upload each, append markers to prompt.
@@ -1590,12 +1567,6 @@ impl RpcDispatcher {
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
-            // Uploads go to the AGENT's workspace dir, not the session cwd.
-            // The session cwd is often the user's project/git working tree
-            // (e.g. when the TUI is launched from inside a repo), and we
-            // don't want to splatter binary blobs into their source tree.
-            // The per-agent workspace (`<config_dir>/agents/<alias>/workspace`)
-            // is the canonical home for agent-owned files.
             let agent_alias = self
                 .ctx
                 .sessions
@@ -1610,11 +1581,6 @@ impl RpcDispatcher {
                 .to_string_lossy()
                 .to_string();
             let is_wss = self.peer_label.starts_with("wss:");
-            // Only insert a newline separator if there's existing text.
-            // An attachment-only turn must not start with a leading "\n"
-            // because that produces a user message whose only non-marker
-            // content is whitespace — same failure mode the top-of-fn
-            // guard prevents, just at one layer down.
             if !prompt.is_empty() {
                 prompt.push('\n');
             }
@@ -1654,12 +1620,6 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        let pre_history_len = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            self.ctx.sessions.history_len(sid).await.unwrap_or(0)
-        } else {
-            0
-        };
-
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1702,7 +1662,7 @@ impl RpcDispatcher {
         // Cost-tracking context for this turn. Built from the daemon-scoped
         // tracker + the live pricing map and stamped with the agent alias so
         // `execute_turn` can persist token usage and attribute spend. `None`
-        // when cost tracking is disabled (no tracker wired). See #5221.
+        // when cost tracking is disabled (no tracker wired).
         let cost_context = self.ctx.cost_tracker.as_ref().map(|tracker| {
             let cfg_guard = self.ctx.config.read();
             let pricing = crate::agent::cost::build_model_provider_pricing(&cfg_guard);
@@ -1745,11 +1705,6 @@ impl RpcDispatcher {
                             tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
                                 .await;
                     }
-                    // Store-then-emit: persist a TodoWrite plan (both the
-                    // in-memory live cache and, for ACP sessions, the durable
-                    // store) before its notification goes out, so a racing
-                    // reconnect — or a later resume — reads a consistent list.
-                    // No-op for every other event.
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
@@ -1840,40 +1795,15 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && matches!(
-                        outcome,
-                        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. })
-                    )
-                    && let Some(new_msgs) = self
-                        .ctx
-                        .sessions
-                        .history_slice_from(sid, pre_history_len)
-                        .await
-                    && !new_msgs.is_empty()
+                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
                 {
-                    let store = store.clone();
-                    let sid_owned = sid.to_string();
-                    let persisted = tokio::task::spawn_blocking(move || {
-                        store.append_turn(&sid_owned, &new_msgs)
-                    })
-                    .await;
-                    let error = match persisted {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(join) => Some(join.to_string()),
-                    };
-                    if let Some(detail) = error {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                            "Failed to persist ACP turn"
-                        );
-                    }
+                        "Failed to persist ACP turn"
+                    );
                 }
             }
             crate::rpc::types::ChatMode::Chat => {
@@ -2285,35 +2215,6 @@ impl RpcDispatcher {
             }
         }
 
-        // Fallback: ACP sessions live in a dedicated store (`acp-sessions.db`)
-        // and are keyed by their raw UUID — they will never be found in the
-        // unified `session_backend` above. Without this branch the Code
-        // (ACP) pane in the TUI resumes a persisted session and renders a
-        // blank transcript even though the picker (which reads from the ACP
-        // store) reports a non-zero `message_count`. See issue #7799.
-        //
-        // Flatten `ConversationMessage` → `ChatMessage` for the
-        // `{ role, content }` wire schema:
-        //   * `Chat(...)`               → pass through.
-        //   * `AssistantToolCalls { text: Some(t), .. }`
-        //                               → assistant `ChatMessage` carrying
-        //                                 just the visible narration `t`.
-        //                                 The agent's duplicate-narration
-        //                                 guard means this text is stored
-        //                                 ONLY on the `AssistantToolCalls`
-        //                                 entry — there is no paired
-        //                                 `Chat(assistant)` row — so dropping
-        //                                 it would lose visible turns from
-        //                                 the replayed transcript on resume.
-        //   * `AssistantToolCalls { text: None | Some("") , .. }`
-        //                               → drop: nothing to render and the
-        //                                 wire shape can't carry tool-call
-        //                                 metadata.
-        //   * `ToolResults(_)`          → drop: the wire shape can't carry
-        //                                 tool results and the TUI's
-        //                                 `load_history` ignores them.
-        // Surfacing tool-call metadata and tool results in replay is a
-        // separate wire-schema change.
         if raw.is_empty()
             && let Some(store) = self.ctx.acp_session_store.as_ref()
         {
@@ -2351,12 +2252,6 @@ impl RpcDispatcher {
             }
         }
 
-        // Page-window the load. `before_index` is a 0-based index pointing
-        // at the first message NOT to return — the page contains the N
-        // messages immediately preceding it. With `before_index = None`
-        // (the default) the page contains the most recent `limit`
-        // messages. `limit = None` returns everything for backward
-        // compatibility with callers that pre-date this change.
         let total = raw.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
@@ -2761,18 +2656,15 @@ impl RpcDispatcher {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
         }
+        if let Some(agent_alias) = agent_alias_from_model_provider_prop(&req.prop) {
+            self.schedule_live_sessions_refresh_for_agent(agent_alias);
+        }
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
         })
     }
 
-    /// Hot-swap the long-lived RPC memory handle's embedder when a `config/set`
-    /// provider-profile change touches the profile memory embeddings resolve
-    /// from. Without this, the install-wide memory handle keeps its
-    /// construction-time endpoint/key until a daemon restart (#8359). Mirrors
-    /// the live-session refresh's "only when the changed provider is in use"
-    /// gate; a no-op for backends that don't hot-swap their embedder.
     fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
         let resolved = {
             let config = self.ctx.config.read();
@@ -2798,11 +2690,6 @@ impl RpcDispatcher {
                 resolved.dimensions,
             );
         }
-        // 2. Live per-agent session memory handles. Each active agent holds its
-        //    own backend instance (built by `create_memory_for_agent`) that
-        //    resolves embeddings from the same global `[memory]` config, so the
-        //    same resolved settings apply — otherwise an in-flight session keeps
-        //    embedding against the stale endpoint/key until it is rebuilt.
         self.schedule_live_agent_memory_refresh(resolved);
     }
 
@@ -2836,10 +2723,51 @@ impl RpcDispatcher {
         });
     }
 
+    /// Rebuild the live agent box for every session bound to `agent_alias`,
+    /// resolving the agent's currently-configured `model_provider` from config.
+    /// Fired when `agents.<alias>.model_provider` changes via `config/set` so a
+    /// provider switch takes effect on the running session without a restart —
+    /// the same refresh a `providers.models.*` edit triggers. Only sessions
+    /// bound to the edited agent are rebuilt; sessions belonging to other
+    /// agents, and sessions that carry their own `model_provider` override, are
+    /// left untouched even when they resolve to the same provider.
+    fn schedule_live_sessions_refresh_for_agent(&self, agent_alias: String) {
+        let ctx = Arc::clone(&self.ctx);
+        zeroclaw_spawn::spawn!(async move {
+            let provider_ref = {
+                let config = ctx.config.read();
+                config
+                    .agent(&agent_alias)
+                    .map(|agent| agent.model_provider.to_string())
+            };
+            let Some(provider_ref) = provider_ref else {
+                return;
+            };
+            Self::refresh_live_sessions_matching(ctx, &provider_ref, |session_agent, overrides| {
+                agent_scoped_refresh_selects(&agent_alias, session_agent, overrides)
+            })
+            .await;
+        });
+    }
+
     async fn refresh_live_sessions_for_model_provider(
         ctx: Arc<RpcContext>,
         model_provider_ref: &str,
     ) {
+        let target_ref = model_provider_ref.to_string();
+        Self::refresh_live_sessions_matching(ctx, model_provider_ref, move |_agent, overrides| {
+            provider_scoped_refresh_selects(&target_ref, overrides)
+        })
+        .await;
+    }
+
+    async fn refresh_live_sessions_matching<F>(
+        ctx: Arc<RpcContext>,
+        model_provider_ref: &str,
+        select: F,
+    ) where
+        F: Fn(&str, &SessionOverrides) -> bool,
+    {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
             let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
@@ -2848,7 +2776,10 @@ impl RpcDispatcher {
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            let uses_provider = {
+            if !select(&agent_alias, &overrides) {
+                continue;
+            }
+            let resolves_provider = {
                 let config = ctx.config.read();
                 let effective_ref = overrides.model_provider.as_deref().or_else(|| {
                     config
@@ -2857,7 +2788,7 @@ impl RpcDispatcher {
                 });
                 effective_ref == Some(model_provider_ref)
             };
-            if !uses_provider {
+            if !resolves_provider {
                 continue;
             }
 
@@ -3374,13 +3305,6 @@ impl RpcDispatcher {
         to_result(summary)
     }
 
-    /// Optional organization-level cost snapshot, read from
-    /// `<data_dir>/org_cost.json` if present. Vendor-neutral and
-    /// presence-gated: an integrator's `sync` can write this file from an
-    /// upstream billing source so the dashboard can show org + personal
-    /// billed totals; a vanilla build never writes it, so this returns `null`
-    /// and the dashboard simply omits the organization row. The file is
-    /// returned verbatim (the daemon does not interpret its shape).
     fn handle_cost_org(&self) -> RpcResult {
         let path = self.ctx.config.read().data_dir.join("org_cost.json");
         match std::fs::read_to_string(&path) {
@@ -3678,13 +3602,6 @@ impl RpcDispatcher {
             roots.insert(s.as_str().to_string());
         }
 
-        // Drop bare parents when a dotted child exists AND the parent
-        // carries no direct scalar fields of its own. `providers`
-        // vanishes once `providers.models` is present because
-        // `ProvidersConfig` is a pure wrapper — every scalar lives
-        // under a sub-section. But `mcp` keeps `enabled` and
-        // `deferred_loading` directly, so the parent stays visible
-        // alongside `mcp.servers` and `mcp.bundles`.
         let direct_scalar_parents: std::collections::HashSet<String> = config
             .prop_fields()
             .iter()
@@ -3842,7 +3759,21 @@ impl RpcDispatcher {
                     biased;
                     _ = rpc.closed() => break,
                     event = rx.recv() => match event {
-                        Ok(event) => {
+                        Ok(mut event) => {
+                            // Pairing secrets (QR payloads, one-shot pair codes)
+                            // ride the shared broadcast bus stamped with the
+                            // ephemeral marker. `logs/subscribe` is NOT the
+                            // bearer-authenticated SSE surface those credentials
+                            // are scoped to — a fresh remote RPC client can
+                            // `initialize` and subscribe over WSS without the
+                            // gateway bearer check — so fail closed: withhold
+                            // marked frames entirely and strip the internal
+                            // marker from everything else (public shape
+                            // unchanged). See `zeroclaw_gateway::sse`.
+                            if zeroclaw_log::frame_carries_ephemeral_credentials(&event) {
+                                continue;
+                            }
+                            zeroclaw_log::strip_ephemeral_broadcast_marker(&mut event);
                             let notification =
                                 JsonRpcNotification::new(notification::LOGS_EVENT, event);
                             if let Ok(json) = serde_json::to_string(&notification)
@@ -4001,14 +3932,6 @@ impl RpcDispatcher {
             let _ = self.rpc.send_raw(json).await;
         }
     }
-
-    // ── Quickstart ───────────────────────────────────────────────
-    //
-    // RPC mirror of the HTTP `/api/quickstart/*` routes in
-    // `zeroclaw-gateway`. All business logic lives in
-    // `zeroclaw_runtime::quickstart`; these handlers are call-the-runtime
-    // plumbing only — they MUST stay byte-equivalent to the HTTP routes
-    // so the drift test holds.
 
     fn handle_quickstart_state(&self) -> RpcResult {
         let cfg = self.ctx.config.read().clone();
@@ -4531,12 +4454,6 @@ fn to_result<T: Serialize>(val: T) -> RpcResult {
     serde_json::to_value(val).map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))
 }
 
-/// Cap on the `content` field of memory entries returned via
-/// `memory/list` and `memory/search`. List rows are previews; the
-/// full content is only required when the user opens the detail
-/// pane, which fetches it via `memory/get`. Keeping the preview cap
-/// here means both wire bytes and client RAM stay bounded across
-/// large memory backends.
 const MEMORY_PREVIEW_CONTENT_BYTES: usize = 200;
 
 /// Truncate each entry's `content` to the preview budget. Operates
@@ -4568,6 +4485,31 @@ fn truncate_memory_previews(
 /// so the meter freezes at the default even when the profile is set higher.
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
     cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
+/// Persist the exact turn delta captured before structured history trimming.
+/// Empty and failed turns intentionally remain no-ops.
+async fn persist_acp_turn(
+    store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: &str,
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<String> {
+    let messages = match outcome {
+        Ok(TurnOutcome::Completed { messages, .. })
+        | Ok(TurnOutcome::Cancelled { messages, .. })
+            if !messages.is_empty() =>
+        {
+            messages.clone()
+        }
+        _ => return None,
+    };
+    let store = Arc::clone(store);
+    let session_id = session_id.to_string();
+    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join) => Some(join.to_string()),
+    }
 }
 
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
@@ -4609,11 +4551,6 @@ async fn persist_plan_if_any(
     }
 }
 
-/// Build the `session/update` `plan` notification used to repopulate a
-/// resuming/reconnecting client's tracker from stored state. Returns
-/// `None` when the plan is empty (nothing to show). Reuses the same
-/// `TurnEvent::Plan` → notification mapping as the live path so the wire
-/// shape can never drift between live and replay.
 fn plan_replay_notification(
     session_id: &str,
     entries: &[zeroclaw_api::plan::PlanEntry],
@@ -4680,18 +4617,11 @@ fn notification_for_turn_event(
             cached_input_tokens: _,
             output_tokens: _,
             ..
-        } => {
-            // `input_tokens` per TokenUsage contract is the *total* prompt
-            // size (uncached + cached). `cached_input_tokens` is a subset
-            // and must NOT be added — doing so double-counts cache reads
-            // and inflates the displayed context size (was showing ~2× the
-            // real value on Anthropic / OpenAI sessions with prompt cache).
-            SessionUpdateEvent::ContextUsage {
-                session_id: session_id.to_string(),
-                input_tokens: *input_tokens,
-                max_context_tokens,
-            }
-        }
+        } => SessionUpdateEvent::ContextUsage {
+            session_id: session_id.to_string(),
+            input_tokens: *input_tokens,
+            max_context_tokens,
+        },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),
@@ -4739,11 +4669,98 @@ mod tests {
     }
 
     #[test]
+    fn agent_alias_from_model_provider_prop_matches_only_the_bound_provider_field() {
+        // The config pane and other `config/set agents.<alias>.model_provider`
+        // callers write this path; it must map back to the alias so the live
+        // session refresh fires. The zerocode picker takes the `session/configure`
+        // path instead and is not a caller here.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("agents.fred.model_provider"),
+            Some("fred".to_string())
+        );
+        // Any other agent field must not trigger a provider rebuild.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("agents.fred.risk_profile"),
+            None
+        );
+        // A provider-profile edit is handled by the other refresh path, not this one.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("providers.models.anthropic.default.model"),
+            None
+        );
+        // Empty alias is rejected.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("agents..model_provider"),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_scoped_refresh_selects_only_edited_agent_without_override() {
+        use crate::rpc::session::SessionOverrides;
+        let no_override = SessionOverrides::default();
+        let with_override = SessionOverrides {
+            model_provider: Some("anthropic.other".to_string()),
+            ..Default::default()
+        };
+
+        // A session bound to the edited agent with no override is rebuilt.
+        assert!(agent_scoped_refresh_selects("fred", "fred", &no_override));
+        // A session belonging to a different agent is never rebuilt, even
+        // when it resolves to the same provider.
+        assert!(!agent_scoped_refresh_selects("fred", "wilma", &no_override));
+        // The edited agent's own session is left untouched when it carries a
+        // `model_provider` override.
+        assert!(!agent_scoped_refresh_selects(
+            "fred",
+            "fred",
+            &with_override
+        ));
+        // A different agent with an override is likewise excluded.
+        assert!(!agent_scoped_refresh_selects(
+            "fred",
+            "wilma",
+            &with_override
+        ));
+    }
+
+    #[test]
+    fn provider_scoped_refresh_selects_inheritors_and_matching_overrides() {
+        use crate::rpc::session::SessionOverrides;
+        let no_override = SessionOverrides::default();
+        let matching_override = SessionOverrides {
+            model_provider: Some("anthropic.default".to_string()),
+            ..Default::default()
+        };
+        let other_override = SessionOverrides {
+            model_provider: Some("openai.default".to_string()),
+            ..Default::default()
+        };
+
+        // No override: inherits the agent provider, so it is a candidate
+        // (final config match is resolved by the caller).
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &no_override
+        ));
+        // Override that names the edited provider is a candidate.
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &matching_override
+        ));
+        // Override that names a different provider is excluded.
+        assert!(!provider_scoped_refresh_selects(
+            "anthropic.default",
+            &other_override
+        ));
+    }
+
+    #[test]
     fn session_initializes_mcp_for_chat_but_not_acp() {
         use crate::rpc::types::ChatMode;
         // Chat sessions must initialize MCP so the Zerocode TUI sees the same
         // MCP tools (and the deferred-loading `tool_search`) the gateway
-        // already exposes for the agent (#8193).
+        // already exposes for the agent
         assert!(
             session_should_initialize_mcp(&ChatMode::Chat),
             "Chat sessions must eagerly initialize MCP"
@@ -4756,19 +4773,10 @@ mod tests {
         );
     }
 
-    // ── #8193: behavioral `session/new` MCP coverage ─────────────────────────
-    //
-    // These drive the real `handle_session_new` path against a mock MCP server
-    // (HTTP transport, so the harness stays cross-platform — no stdio scripts)
-    // and assert on the resulting agent's tool list. They guard the call-site
-    // wiring, not just the `session_should_initialize_mcp` seam: reverting the
-    // `session/new` argument back to a hard-coded `false` makes the two Chat
-    // tests fail.
-
     /// Spin up a wiremock server that speaks the minimum MCP HTTP handshake
     /// (`initialize` → `notifications/initialized` → `tools/list`) and advertises
     /// a single tool. The dotted `tool_name` exercises spec-valid names that
-    /// must survive `<server>__<tool>` prefixing (#8193).
+    /// must survive `<server>__<tool>` prefixing
     async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4879,12 +4887,6 @@ mod tests {
         );
     }
 
-    /// `excluded_tools` ALWAYS subtracts (documented contract:
-    /// docs/book/src/tools/mcp.md, tools/overview.md), including the deferred-MCP
-    /// `tool_search` meta-tool, which is registered AFTER the built-in policy filter.
-    /// Routing `from_config` through `ScopedToolRegistry::assemble` enforces this via
-    /// the final denylist sweep, so an operator who excludes `tool_search` disables
-    /// deferred-MCP discovery even though bundles are granted and deferred loading is on.
     #[tokio::test]
     async fn chat_session_new_excluded_tool_search_is_dropped_in_deferred_mcp_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4940,13 +4942,6 @@ mod tests {
         );
     }
 
-    /// Regression for #8193. Registering `tool_search` is not enough: the TUI
-    /// Chat `session/new` agent must also *advertise* the deferred MCP tools in
-    /// its system prompt so the model knows they exist and to call
-    /// `tool_search`. Before the fix, `agent.rs` pushed `tool_search` but never
-    /// built the deferred-tools section, so the agent reported it had no MCP
-    /// tools / no `tool_search`. This asserts the section (and the concrete
-    /// dotted `<server>__<tool>` stub) reaches the system prompt.
     #[tokio::test]
     async fn chat_session_new_advertises_deferred_mcp_section_in_system_prompt() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4988,15 +4983,6 @@ mod tests {
         );
     }
 
-    /// Regression guard for #8193, at the agent layer and *behavioral*.
-    /// `chat_session_new_exposes_tool_search_in_deferred_mcp_mode` proves
-    /// `tool_search` is registered; `chat_session_new_advertises_deferred_mcp_
-    /// section_in_system_prompt` proves it is advertised in the prompt. Neither
-    /// proves that *invoking* `tool_search` returns the granted deferred MCP
-    /// tool — a future regression could register a mis-scoped or empty search
-    /// instance that lists yet resolves nothing ("present but empty"). This
-    /// drives the real `session/new` deferred path, invokes `tool_search`, and
-    /// asserts the granted `<server>__<tool>` stub actually comes back.
     #[tokio::test]
     async fn chat_session_new_tool_search_returns_granted_mcp_tool_in_deferred_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5074,16 +5060,6 @@ mod tests {
         );
     }
 
-    /// Regression test for #7733. An agent whose `mcp_bundles` is empty
-    /// must receive ZERO MCP tools at session/new time, even when the
-    /// global `[mcp.servers]` list is non-empty and another agent (here
-    /// `test-agent`) has been granted that same server through a bundle.
-    /// In deferred mode the visible signal is the absence of
-    /// `tool_search`.
-    ///
-    /// If a future change reverts any production call site from
-    /// `config.mcp_servers_for_agent(agent_alias)` back to
-    /// `&config.mcp.servers`, this test fails.
     #[tokio::test]
     async fn chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_deferred() {
         use zeroclaw_config::schema::AliasedAgentConfig;
@@ -5145,10 +5121,6 @@ mod tests {
         );
     }
 
-    /// Eager-mode counterpart to
-    /// `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_deferred`.
-    /// In eager mode the visible signal is the absence of any prefixed
-    /// `<server>__<tool>` name (here: `remote__domains.list`).
     #[tokio::test]
     async fn chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_eager() {
         use zeroclaw_config::schema::AliasedAgentConfig;
@@ -5242,6 +5214,77 @@ mod tests {
         );
     }
 
+    /// Blocking regression: a fresh remote RPC client that reaches
+    /// `logs/subscribe` (an unauthenticated surface — a new WSS client can
+    /// `initialize` and subscribe without the gateway bearer) must never
+    /// receive a pairing credential off the shared broadcast bus, while
+    /// ordinary log frames still forward with the internal marker stripped.
+    #[tokio::test]
+    async fn logs_subscribe_fails_closed_on_pairing_credentials() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let config = zeroclaw_config::schema::Config::default();
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx.clone());
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
+
+        assert!(
+            d.handle_logs_subscribe().await.is_ok(),
+            "a fresh client should be able to subscribe"
+        );
+
+        // Marker-stamped credential frame (as `record_event` stamps a QR login
+        // event) followed by an ordinary lifecycle frame.
+        let credential = serde_json::json!({
+            "source": "observability",
+            "attributes": { "login": { "state": "qr", "qr_payload": "SECRET-QR-PAYLOAD" } },
+            zeroclaw_log::EPHEMERAL_BROADCAST_MARKER: true,
+        });
+        let plain = serde_json::json!({
+            "source": "observability",
+            "type": "tool_call",
+            "tool": "SENTINEL-LIVE",
+        });
+        event_tx.send(credential).expect("send credential frame");
+        event_tx.send(plain).expect("send plain frame");
+
+        // Collect forwarded notifications until the sentinel arrives or the
+        // budget elapses.
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, writer_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let hit = msg.contains("SENTINEL-LIVE");
+                    seen.push_str(&msg);
+                    if hit {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            seen.contains("SENTINEL-LIVE"),
+            "an ordinary lifecycle frame must still forward over logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains("SECRET-QR-PAYLOAD"),
+            "a remote RPC client must never obtain a pairing credential via logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
+            "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
+        );
+    }
+
     fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -5305,7 +5348,7 @@ mod tests {
 
     // cost/org: null only for a genuinely-absent snapshot; any other read failure
     // (unreadable file, a directory at the path, bad JSON) surfaces as an error so a
-    // broken deployment is not mistaken for a vanilla one. (Audacity88/JordanTheJet, #8482.)
+    // broken deployment is not mistaken for a vanilla one. (Audacity88/JordanTheJet,)
     #[test]
     fn cost_org_absent_returns_null() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5335,7 +5378,7 @@ mod tests {
         assert!(d.handle_cost_org().is_err());
     }
 
-    // #8590: the `sops/trigger-sources` RPC response must carry the full
+    // The `sops/trigger-sources` RPC response must carry the full
     // ordered `SopTriggerSource` walk so authoring surfaces (web + zerocode)
     // render the picker from the backend list instead of reconstructing it.
     // Any new trigger source variant appears here automatically; a surface that
@@ -6597,12 +6640,6 @@ mod tests {
 
     #[test]
     fn usage_event_does_not_double_count_cached_subset() {
-        // Per TokenUsage contract, cached_input_tokens is a *subset* of
-        // input_tokens. The ACP ContextUsage notification must report
-        // input_tokens as-is — the cached subset is already included.
-        //
-        // Realistic OpenAI-shape: prompt_tokens = 25_000 (already total),
-        // cached_tokens = 15_000 (subset). Context size = 25_000, NOT 40_000.
         let event = TurnEvent::Usage {
             input_tokens: Some(25_000),
             cached_input_tokens: Some(15_000),
@@ -6664,11 +6701,6 @@ mod tests {
         assert_eq!(val["server_version"], "0.1.0");
     }
 
-    /// Cover the `initialize` parsing path that caches the TUI's
-    /// `clientCapabilities.elicitation` block so the per-session
-    /// `RpcApprovalChannel` can route `request_choice` over
-    /// `elicitation/create`. Source-of-truth check: the dispatcher
-    /// is the canonical owner; the test reads the field directly.
     #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =
@@ -6708,18 +6740,6 @@ mod tests {
         assert!(dispatcher.client_elicitation_caps.form);
         assert!(!dispatcher.client_elicitation_caps.url);
     }
-
-    // -----------------------------------------------------------------------
-    // ACP session/new — memory-tool exclusion
-    // -----------------------------------------------------------------------
-    //
-    // These tests verify that `session/new` with `exclude_memory: true` strips
-    // all five memory tools from the agent, while `exclude_memory: false` leaves
-    // at least one memory tool present.
-    //
-    // They live here (not in `tests/`) because they depend on `#[cfg(test)]`
-    // helpers: `RpcContext::minimal`, `RpcDispatcher::handle_session_new_for_test`,
-    // and `Agent::tool_names`.
 
     use zeroclaw_tools::MEMORY_TOOL_NAMES as MEMORY_TOOLS;
 
@@ -7074,6 +7094,93 @@ mod tests {
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
+    #[tokio::test]
+    async fn seed_trim_event_is_forwarded_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 1,
+            reason: "message cap".into(),
+        };
+
+        dispatcher
+            .forward_seed_event("restored-session", Some(event))
+            .await;
+
+        let raw = rx
+            .try_recv()
+            .expect("restored history trim must notify the active client");
+        let notification: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], "restored-session");
+        assert_eq!(notification["params"]["dropped_messages"], 4);
+        assert!(
+            rx.try_recv().is_err(),
+            "one seed trim must emit exactly one notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_appends_complete_pretrim_delta_at_cap() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "trim-at-cap";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let existing = (0..50)
+            .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
+            .collect::<Vec<_>>();
+        store.append_turn(sid, &existing).unwrap();
+
+        let new_messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("new-user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new-assistant")),
+        ];
+        let outcome = Ok(TurnOutcome::Completed {
+            text: "new-assistant".into(),
+            messages: new_messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(restored.messages.len(), 52);
+        assert_eq!(
+            serde_json::to_value(&restored.messages[50..]).unwrap(),
+            serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_skips_empty_and_failed_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "no-turn-delta";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let empty = Ok(TurnOutcome::Cancelled {
+            partial_text: String::new(),
+            messages: Vec::new(),
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+
+        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
     fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         use zeroclaw_config::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
         use zeroclaw_config::schema::{AliasedAgentConfig, DelegateTargetConfig};
@@ -7279,8 +7386,6 @@ mod tests {
         );
     }
 
-    /// chat_mode=acp creates a row in acp-sessions.db, sessions.db stays empty
-    /// for that session_id.
     #[tokio::test]
     async fn acp_session_new_writes_to_acp_store_only() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7313,12 +7418,6 @@ mod tests {
         );
     }
 
-    /// Regression for #7799: `session/messages` must fall back to the dedicated
-    /// ACP session store when the requested session is an ACP session whose
-    /// messages live there (and NOT in the unified `session_backend`). Without
-    /// this, the Code (ACP) pane resumes a saved session and renders a blank
-    /// transcript even though the picker (which reads `session/list-acp`)
-    /// reports a non-zero `message_count`.
     #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
@@ -7331,14 +7430,6 @@ mod tests {
         let (dispatcher, _sessions, chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
 
-        // Seed an ACP session directly in the dedicated store, exactly the way
-        // a real Code pane would after a turn: a user message, an assistant
-        // turn that narrates while issuing a tool call (the agent stores the
-        // narration ONLY on the `AssistantToolCalls` row — the
-        // duplicate-narration guard suppresses a paired `Chat(assistant)`
-        // row), the tool result, a second tool-call round with no narration,
-        // and a final plain assistant reply. Nothing is written to the
-        // unified `session_backend`, mirroring the production split.
         let sid = "acp-resume-7799";
         acp_store
             .create_session(sid, "test-agent", "/tmp/ws")
@@ -7406,17 +7497,6 @@ mod tests {
         let parsed: SessionMessagesResult =
             from_value(result).expect("SessionMessagesResult shape");
 
-        // Expected replayed transcript (after flattening for the
-        // `{ role, content }` wire shape):
-        //   0: user      "hello from prior turn"
-        //   1: assistant "let me check the logs"   (narration recovered
-        //                                            from AssistantToolCalls.text;
-        //                                            losing this is the
-        //                                            regression #7903 review
-        //                                            was raised against)
-        //   2: assistant "ack from prior turn"
-        // The text-less AssistantToolCalls and both ToolResults rows are
-        // dropped because the current wire schema can't carry them.
         assert_eq!(parsed.session_id, sid);
         assert_eq!(
             parsed.total, 3,
@@ -7441,10 +7521,6 @@ mod tests {
         assert_eq!(parsed.messages[2].content, "ack from prior turn");
     }
 
-    /// A reaped ACP session (gone from memory, durable row intact) must
-    /// rehydrate to a WORKING session — the agent comes back in memory and the
-    /// next turn continues on the same conversation. This is the recovery path:
-    /// the alternative ("start a new session") is the irrecoverable freeze.
     #[tokio::test]
     async fn reaped_acp_session_rehydrates_to_working_instead_of_failing() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7497,10 +7573,6 @@ mod tests {
         );
     }
 
-    /// Resuming an ACP session with no caller cwd must recover the original
-    /// working directory from the persisted store, not fall back to the agent
-    /// workspace dir. Regression: a reconnect showed the wrong cwd because the
-    /// resume path defaulted the cwd instead of reading the retained session's.
     #[tokio::test]
     async fn acp_resume_recovers_persisted_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7546,11 +7618,6 @@ mod tests {
         );
     }
 
-    /// The ACP memory-tool invariant must survive session recovery: a reaped
-    /// ACP session that rehydrates must come back with NONE of the long-term
-    /// memory tools, exactly like a fresh `session/new` ACP session. Without
-    /// the server-side exclusion on the rehydrate path, recovery would silently
-    /// restore the memory backend and tools the ACP boundary forbids.
     #[tokio::test]
     async fn reaped_acp_session_rehydrates_without_memory_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7587,9 +7654,6 @@ mod tests {
         }
     }
 
-    /// A deliberately killed ACP session must not be treated like a merely
-    /// reaped session. The durable transcript remains available, but the next
-    /// prompt must not silently resurrect the killed live session.
     #[tokio::test]
     async fn killed_acp_session_does_not_rehydrate_from_durable_store() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7777,12 +7841,6 @@ mod tests {
         dispatcher
     }
 
-    /// Mint a config with `providers.models.anthropic.default` so we can
-    /// poke its `#[secret]` `api-key` field through `config/set`.
-    ///
-    /// IMPORTANT: pins `config_path` and `data_dir` into the supplied tempdir
-    /// so that `flush_config()` → `save_dirty()` never falls through to
-    /// `default_config_and_data_dirs()` and clobbers `~/.zeroclaw/config.toml`.
     fn make_secret_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         let mut cfg = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
@@ -7818,11 +7876,6 @@ mod tests {
         );
     }
 
-    /// End-to-end (#8359): a `config/set` on the provider profile memory
-    /// embeddings resolve from must refresh the long-lived RPC memory handle's
-    /// embedder in place — no daemon restart, no rebuilt handle. Drives the real
-    /// `handle_config_set` path and observes the live handle flip from the Noop
-    /// embedder (dims 0) to the resolved provider's embedder (dims 1536).
     #[tokio::test]
     async fn config_set_refreshes_memory_embedder_on_provider_change() {
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -7871,11 +7924,6 @@ mod tests {
         );
     }
 
-    /// End-to-end (#8359), proving the *endpoint and key* — not just dimensions
-    /// — reach the embed path: point the memory embedding provider at mock A,
-    /// then `config/set` its `uri` + `api_key` to mock B, and assert the next
-    /// embed HTTP request lands on mock B with the new bearer token. A refresh
-    /// that ignored the new uri/key would keep hitting mock A and fail this.
     #[tokio::test]
     async fn config_set_routes_memory_embeds_to_new_endpoint_and_key() {
         use wiremock::matchers::{method, path};
@@ -7971,12 +8019,6 @@ mod tests {
         );
     }
 
-    /// A live chat session holds its own per-agent memory backend, separate
-    /// from `ctx.memory`. Drives the FULL `handle_config_set` path (parse →
-    /// gate → resolve → spawn) with a registered session whose agent memory is
-    /// `AgentScopedMemory(SQLite)`, and waits for the spawned refresh to reach
-    /// it — otherwise an in-flight session keeps embedding against the stale
-    /// endpoint/key (#8359).
     #[tokio::test]
     async fn config_set_refreshes_live_agent_session_memory() {
         use zeroclaw_api::memory_traits::Memory;
@@ -8163,27 +8205,6 @@ mod tests {
         assert_eq!(stored.as_deref(), Some("claude-sonnet-4-5"));
     }
 
-    /// End-to-end disk-roundtrip regression for the
-    /// `[[mcp.servers]]` per-field editor (see commit `d06ed25` and the
-    /// in-config-crate regression test
-    /// `save_dirty_persists_mcp_server_field_via_natural_key`).
-    ///
-    /// The shipped natural-key arm successfully mutates the in-memory
-    /// `Config` — so the dashboard / TUI showed the new value — but
-    /// the incremental `save_dirty` writer walked array-of-tables
-    /// nodes as if they were plain tables and silently dropped every
-    /// dirty path that targeted a `mcp.servers.<alias>.<field>` shape.
-    /// Net effect: `handle_config_set` returned `Ok({set: true})`, the
-    /// UI updated, and the on-disk `config.toml` kept its stale value
-    /// until the next process restart wiped the in-memory change.
-    ///
-    /// This test reproduces the full RPC surface — `handle_config_set`
-    /// → `set_prop_persistent` → `flush_config` → `save_dirty` — and
-    /// asserts that the on-disk file actually contains the new value
-    /// once the await returns. The original test surface
-    /// (`config_set_non_secret_field_still_uses_set_prop` above) only
-    /// asserts on in-memory state, which is exactly what let this bug
-    /// ship.
     #[tokio::test]
     async fn config_set_persists_mcp_server_field_to_disk() {
         use zeroclaw_config::schema::{McpServerConfig, McpTransport};
@@ -8265,11 +8286,6 @@ mod tests {
             "natural-key `name` must survive the incremental save; got:\n{written}"
         );
 
-        // Final paranoia: reparse the on-disk file from scratch and
-        // confirm `Config` loads with the new command. If the writer
-        // produces a syntactically-valid but semantically-wrong shape
-        // (e.g. an inline `mcp.servers.fs = { ... }` instead of a
-        // `[[mcp.servers]]` table), this catches it.
         let reparsed: zeroclaw_config::schema::Config = toml::from_str(&written).unwrap();
         let entry = reparsed
             .mcp
@@ -8386,6 +8402,100 @@ mod tests {
             temperature_for_session(dispatcher, session_id).await,
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn config_set_agent_model_provider_refreshes_bound_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+        other.temperature = Some(0.2);
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "session must start on the currently-bound provider's model"
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.test-agent.model_provider",
+                "value": "openai.other-provider"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set agents.<alias>.model_provider must succeed: {res:?}"
+        );
+
+        wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    #[tokio::test]
+    async fn existing_session_uses_reloaded_structured_history_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .max_history_messages = Some(2);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old assistant"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new assistant"),
+        ]);
+
+        assert!(
+            matches!(event, Some(TurnEvent::HistoryTrimmed { .. })),
+            "an existing session must observe the reloaded runtime-profile cap"
+        );
+        assert!(!agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat) if chat.content == "old user"
+        )));
+        assert!(agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "new assistant"
+        )));
     }
 
     #[tokio::test]
@@ -8690,11 +8800,6 @@ mod tests {
         token
     }
 
-    /// Variant of `make_two_dispatchers_sharing_context` that returns the
-    /// writer-channel receivers so a test can assert which notifications
-    /// the dispatcher emitted. The notifications carry the load-bearing
-    /// `session/update TurnComplete` events that flip the TUI out of its
-    /// `working` state — silently dropping one is the production freeze.
     fn make_dispatcher_with_capture(
         config: zeroclaw_config::schema::Config,
     ) -> (
@@ -8711,13 +8816,6 @@ mod tests {
         (dispatcher, rx, sessions)
     }
 
-    /// RED guard: a `session/prompt` for a session that no longer exists
-    /// (e.g. evicted by the reaper while the TUI thought the session was
-    /// still live) MUST emit a `session/update TurnComplete::Failed`
-    /// notification so the TUI can exit `working` state. Silently dropping
-    /// the request — the production behaviour — leaves the TUI parked
-    /// forever with no `TurnComplete` ever arriving. This is the second
-    /// half of the freeze: a reaped session + a fresh prompt = hang.
     #[tokio::test]
     async fn session_prompt_on_missing_session_emits_turn_complete_failed() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8757,9 +8855,6 @@ mod tests {
         );
     }
 
-    /// Cross-TUI cancel from a distinct dispatcher (separate connection,
-    /// separate `tui_id`) targeting a session owned by another TUI. The
-    /// fixed daemon must refuse and leave the owner's token un-fired.
     #[tokio::test]
     async fn session_cancel_from_distinct_non_owner_dispatcher_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8795,9 +8890,6 @@ mod tests {
         );
     }
 
-    /// Cancel from a dispatcher that never completed the `initialize`
-    /// handshake (no `tui_id`) must be refused. An unauthenticated caller
-    /// has no provable ownership claim over any session.
     #[tokio::test]
     async fn session_cancel_from_anonymous_dispatcher_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8826,9 +8918,6 @@ mod tests {
         );
     }
 
-    /// Regression guard: the legitimate owner must still be able to cancel
-    /// its own session via its OWN dispatcher. A fix that over-rejects and
-    /// breaks the user-pressed-Esc path is unacceptable.
     #[tokio::test]
     async fn session_cancel_from_owner_dispatcher_still_works() {
         let tmp = tempfile::TempDir::new().unwrap();
