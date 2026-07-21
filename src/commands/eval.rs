@@ -8,6 +8,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
 use zeroclaw_eval::{CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 /// Where failed-case records are auto-dumped on every run.
 pub const AUTO_DUMP_DIR: &str = "target/eval-last-run";
@@ -39,7 +40,13 @@ pub async fn finalize(
         Path::new(AUTO_DUMP_DIR),
     )?;
     if wrote_auto && opts.format == OutputFormat::Table {
-        println!("  failed-case records: {AUTO_DUMP_DIR}/");
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-failed-case-records",
+                &[("dir", AUTO_DUMP_DIR)],
+            )
+        );
     }
 
     // --write-baseline: persist the run and exit with its normal code.
@@ -62,7 +69,13 @@ pub async fn finalize(
                 let flaky = baseline::downgrade_flaky_regressions(&mut cmp, mode, &rerun_passed);
                 if opts.format == OutputFormat::Table {
                     for id in &flaky {
-                        println!("  flaky (unconfirmed regression): {id}");
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-eval-flaky-unconfirmed-regression",
+                                &[("id", id)],
+                            )
+                        );
                     }
                 }
             }
@@ -136,21 +149,41 @@ fn print_comparison(
     report: &SuiteReport,
     baseline: &Baseline,
 ) {
-    println!("\n  baseline comparison:");
+    println!();
+    println!(
+        "{}",
+        get_required_cli_string("cli-eval-baseline-comparison")
+    );
     for (id, c) in &comparison.per_case {
         let line = match c {
-            CaseComparison::New => "new".to_string(),
-            CaseComparison::Removed => "removed (warn) - in baseline, absent now".to_string(),
-            CaseComparison::Unverifiable => "changed - refresh baseline".to_string(),
-            CaseComparison::Improvement => "improvement".to_string(),
-            CaseComparison::FlakyUnconfirmed => "flaky (unconfirmed regression)".to_string(),
+            CaseComparison::New => get_required_cli_string("cli-eval-comparison-new"),
+            CaseComparison::Removed => get_required_cli_string("cli-eval-comparison-removed"),
+            CaseComparison::Unverifiable => {
+                get_required_cli_string("cli-eval-comparison-unverifiable")
+            }
+            CaseComparison::Improvement => {
+                get_required_cli_string("cli-eval-comparison-improvement")
+            }
+            CaseComparison::FlakyUnconfirmed => {
+                get_required_cli_string("cli-eval-comparison-flaky-unconfirmed")
+            }
             CaseComparison::Regression { categories } => {
                 let cats: Vec<&str> = categories.iter().map(|c| c.as_str()).collect();
-                format!("REGRESSION ({})", cats.join(", "))
+                let categories = cats.join(", ");
+                get_required_cli_string_with_args(
+                    "cli-eval-comparison-regression",
+                    &[("categories", categories.as_str())],
+                )
             }
             CaseComparison::Unchanged { token_delta_pct } => match token_delta_pct {
-                Some(pct) => format!("unchanged (tokens {pct:+.0}%)"),
-                None => "unchanged".to_string(),
+                Some(pct) => {
+                    let pct = format!("{pct:+.0}");
+                    get_required_cli_string_with_args(
+                        "cli-eval-comparison-unchanged-tokens",
+                        &[("pct", pct.as_str())],
+                    )
+                }
+                None => get_required_cli_string("cli-eval-comparison-unchanged"),
             },
         };
         println!("    {id}: {line}");
