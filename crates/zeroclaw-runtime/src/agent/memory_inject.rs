@@ -1068,6 +1068,15 @@ mod tests {
         - stale: quarterly report workflow uses legacy tool\n\
         - alpha_dup: deploy target is prod-cluster-3 for staging\n\
         [/Memory context]\n\n";
+    // Conversation exclusion is an eligibility boundary, so it runs before
+    // duplicate collapse and MMR. Once the ineligible rows are removed, this
+    // fixture is below the advanced-strategy threshold and keeps blend order.
+    const GOLDEN_RERANK_NO_CONVERSATION: &str = "[Memory context]\n\
+        - alpha: deploy target is prod-cluster-3\n\
+        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - beta: team standup moved to 0930\n\
+        - stale: quarterly report workflow uses legacy tool\n\
+        [/Memory context]\n\n";
 
     #[tokio::test]
     async fn injection_goldens_across_origin_budget_and_flags() {
@@ -1171,7 +1180,7 @@ mod tests {
                 true,
                 false,
                 rerank_on,
-                GOLDEN_RERANK,
+                GOLDEN_RERANK_NO_CONVERSATION,
             ),
         ];
 
@@ -1525,5 +1534,82 @@ mod tests {
             "ineligible row dropped"
         );
         assert!(context.contains("- fact_e: epsilon elderberry"));
+    }
+
+    /// Composed score-domain regression: current SQLite recall owns BM25
+    /// calibration, while this module owns the blend and relevance floor.
+    /// Exercise the stock no-embedding backend through the real renderer so
+    /// those two layers cannot silently drift back onto incompatible scales.
+    #[tokio::test]
+    async fn noop_sqlite_bm25_recall_stays_ranked_through_rerank_injection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory = zeroclaw_memory::SqliteMemory::new("rerank-bm25", tmp.path()).unwrap();
+        assert_eq!(
+            memory.embedder_dimensions(),
+            0,
+            "the regression must exercise the BM25-only recall path"
+        );
+
+        memory
+            .store(
+                "best_match",
+                "orbital vault orbital vault passphrase",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        memory
+            .store(
+                "supporting_match",
+                "orbital vault maintenance schedule",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recalled = memory
+            .recall("orbital vault", 20, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 2);
+        assert!(
+            recalled.iter().all(|entry| {
+                entry
+                    .score
+                    .is_some_and(|score| (0.0..=1.0).contains(&score))
+            }),
+            "the recall boundary must normalize every BM25 score"
+        );
+        assert!(
+            recalled[0].score > recalled[1].score,
+            "term-frequency relevance must remain distinguishable"
+        );
+
+        let config = zeroclaw_config::schema::MemoryConfig {
+            rerank_enabled: true,
+            rerank_strategy: "none".into(),
+            min_relevance_score: 0.4,
+            ..Default::default()
+        };
+        let inject = MemoryInjectConfig::from_memory_config(&config, 5);
+        let context = render_memory_context(
+            &memory,
+            &RecordingObserver::default(),
+            "orbital vault",
+            &[],
+            &inject,
+            false,
+        )
+        .await;
+
+        let best = context
+            .find("- best_match: ")
+            .expect("the relevance leader survives the configured floor");
+        let supporting = context
+            .find("- supporting_match: ")
+            .expect("the weaker relevant entry survives the configured floor");
+        assert!(best < supporting, "BM25 relevance order survives blending");
     }
 }

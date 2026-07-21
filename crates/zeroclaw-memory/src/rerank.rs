@@ -68,11 +68,11 @@ impl RerankConfig {
     }
 }
 
-/// Run blend, duplicate collapse, optional advanced rerank, threshold, and
-/// trim. `is_eligible` is the caller's render-eligibility predicate; it is
-/// applied after ranking but before the final trim so ineligible rows do not
-/// consume final-selection slots while the over-fetched pool still does the
-/// ranking work.
+/// Run blend, eligibility filtering, duplicate collapse, optional advanced
+/// rerank, threshold, and trim. `is_eligible` is the caller's render-eligibility
+/// predicate; it is applied before duplicate collapse so an ineligible row
+/// cannot shadow an eligible fact with the same content, and before the final
+/// trim so it cannot consume a selection slot.
 pub fn run(
     mut pool: Vec<MemoryEntry>,
     config: &RerankConfig,
@@ -104,6 +104,10 @@ pub fn run(
         ));
     }
 
+    // Apply the renderer's scope and hygiene boundary before duplicate
+    // collapse. Otherwise a higher-scoring Conversation/autosave row can
+    // discard an eligible fact with the same content, then be removed itself.
+    pool.retain(|entry| is_eligible(entry));
     let mut candidates = collapse_exact_and_near_duplicates(pool, DEFAULT_NEAR_DUPLICATE_THRESHOLD);
     sort_by_score(&mut candidates);
 
@@ -119,10 +123,6 @@ pub fn run(
             .score
             .is_none_or(|score| score >= config.min_relevance_score)
     });
-    // Drop render-ineligible entries (Conversation, autosave/history keys,
-    // media markers, orphan tool-result blocks) before the final trim so the
-    // over-fetched candidates below the cutoff can fill the freed slots.
-    candidates.retain(|entry| is_eligible(entry));
     candidates.truncate(final_limit);
     candidates
 }
@@ -529,6 +529,30 @@ mod tests {
         assert_eq!(results.len(), 2, "eligible candidate fills the freed slot");
         assert_eq!(results[0].key, "keep_a");
         assert_eq!(results[1].key, "keep_b");
+    }
+
+    /// An ineligible row with duplicate content must not shadow an eligible
+    /// fact during collapse and then disappear at the render boundary.
+    #[test]
+    fn ineligible_duplicate_cannot_collapse_eligible_fact() {
+        let mut cfg = config(RerankStrategy::None);
+        cfg.final_limit = 1;
+        let results = run(
+            vec![
+                entry(
+                    "skip_autosave",
+                    "the release train leaves Friday",
+                    0.99,
+                    0.0,
+                ),
+                entry("curated_fact", "the release train leaves Friday", 0.8, 0.0),
+            ],
+            &cfg,
+            |entry| entry.key != "skip_autosave",
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "curated_fact");
     }
 
     /// Diversity-only endpoint: every candidate ties on the first MMR pass, so
