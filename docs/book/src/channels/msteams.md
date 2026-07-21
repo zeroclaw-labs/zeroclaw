@@ -119,7 +119,10 @@ Set `stream_mode = "partial"` for progressive responses:
   in-progress bubble shows status lines ("thinking", tool activity) and
   accumulating response text, then is replaced by the final message. Status
   history disappears once the final message lands — this matches the
-  built-in Copilot experience.
+  built-in Copilot experience. The stream opens lazily on the first real
+  status line or content chunk, so the bubble never flashes a `...`
+  placeholder; answers that finish before any intermediate update arrive as
+  a single plain message.
 - **Group chats and team channels** don't support native streaming. They show
   the normal typing indicator, then receive one final reply. This avoids a
   notification for an initial placeholder (such as `...`) while the completed
