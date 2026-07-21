@@ -5410,7 +5410,15 @@ async fn process_channel_message_body(
                 }),
                 ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
+                // Live channel-daemon SOP path: re-assemble a nested step's
+                // agent when it delegates to a different agent, so the step runs
+                // with that agent's own gated tools/policy/MCP scope rather than
+                // this turn's.
+                sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+                    config: ctx.prompt_config.as_ref(),
+                }),
             });
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
@@ -19055,6 +19063,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         observer.record_event(
             &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
                 tool: "file_write".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
@@ -19084,6 +19093,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         observer.record_event(
             &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
                 tool: "file_read".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
@@ -19124,6 +19134,7 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         let mk_event = || zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "file_read".to_string(),
             tool_call_id: None,
             arguments: Some(r#"{"path":"/a"}"#.to_string()),

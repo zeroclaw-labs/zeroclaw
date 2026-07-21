@@ -10390,6 +10390,12 @@ pub struct MemoryConfig {
     /// Run the periodic hygiene pass that archives stale daily/session files and enforces retention windows. Leave on unless you want to manage cleanup yourself.
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
+    /// Also extract atomic durable facts from each consolidated turn and store
+    /// them as individual Core memories. Default off; the flip is sequenced in
+    /// a later phase. SQLite-only: enabling this requires the sqlite memory
+    /// backend globally and on every agent (validated at config load).
+    #[serde(default)]
+    pub consolidation_extract_facts: bool,
     /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
@@ -10470,7 +10476,12 @@ pub struct MemoryConfig {
     pub auto_hydrate: bool,
 
     // ── Retrieval Pipeline ─────────────────────────────────────
-    /// Retrieval stages to execute in order. Valid: "cache", "fts", "vector".
+    /// Retrieval stages for per-agent recall. Only `"cache"` is active: it
+    /// enables an in-process, per-handle hot cache over recall results and is
+    /// omitted from the default so recall stays coherent across handles.
+    /// `"fts"` and `"vector"` are reserved for when the backend exposes
+    /// distinct FTS and vector operations; recall is a single hybrid backend
+    /// call today, so those names have no effect (kept for forward compat).
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
     /// Enable LLM reranking when candidate count exceeds threshold.
@@ -10479,7 +10490,9 @@ pub struct MemoryConfig {
     /// Minimum candidate count to trigger reranking.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
-    /// FTS score above which to early-return without vector search (0.0–1.0).
+    /// Reserved (0.0-1.0): the FTS score above which recall would skip the
+    /// vector stage. Inert until the backend exposes distinct FTS and vector
+    /// operations; recall is a single hybrid call today, so this has no effect.
     #[serde(default = "default_fts_early_return_score")]
     pub fts_early_return_score: f64,
 
@@ -10538,10 +10551,30 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub policy: MemoryPolicyConfig,
+
+    /// Typed memory configuration (`[memory.types]` section).
+    #[serde(default)]
+    #[nested]
+    pub types: MemoryTypesConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
     // config via `Config::resolve_active_storage`.
+}
+
+/// Typed memory configuration (`[memory.types]` section).
+///
+/// Behaviour-neutral by default: `enabled` gates MemoryKind assignment on new
+/// consolidation writes and defaults off; the flip is sequenced in a later
+/// phase. SQLite-only: enabling requires the sqlite memory backend globally
+/// and on every agent (validated at config load).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.types"]
+pub struct MemoryTypesConfig {
+    /// Assign a first-class MemoryKind to new consolidation writes.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -10564,7 +10597,10 @@ pub struct MemoryPolicyConfig {
 }
 
 fn default_retrieval_stages() -> Vec<String> {
-    vec!["cache".into(), "fts".into(), "vector".into()]
+    // No "cache": the hot cache is opt-in so activating the retrieval decorator
+    // does not change default per-agent recall. "fts"/"vector" are reserved and
+    // inert (recall is a single hybrid backend call today).
+    vec!["fts".into(), "vector".into()]
 }
 fn default_rerank_threshold() -> usize {
     5
@@ -10683,6 +10719,7 @@ impl Default for MemoryConfig {
             backend: "sqlite".into(),
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
+            consolidation_extract_facts: false,
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
@@ -10725,6 +10762,7 @@ impl Default for MemoryConfig {
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
+            types: MemoryTypesConfig::default(),
         }
     }
 }
@@ -18874,6 +18912,48 @@ impl Config {
                 "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
+        // Typed-memory producers are a SQLite-only slice: the enabled write
+        // path stores through `store_with_options_and_agent`, and only the
+        // SQLite backend persists the full typed StoreOptions surface. Any
+        // other backend would hit the trait default's explicit failure deep
+        // inside spawned background consolidation, so reject the
+        // configuration at load instead.
+        if self.memory.types.enabled || self.memory.consolidation_extract_facts {
+            let flag_path = if self.memory.types.enabled {
+                "memory.types.enabled"
+            } else {
+                "memory.consolidation_extract_facts"
+            };
+            // Mirror the runtime's backend classification
+            // (`backend_kind_from_dotted`): trim, take the prefix before the
+            // first dot, compare case-insensitively.
+            let backend_kind = self
+                .memory
+                .backend
+                .trim()
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if backend_kind != "sqlite" {
+                validation_bail!(
+                    InvalidFormat,
+                    flag_path,
+                    "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
+                    self.memory.backend
+                );
+            }
+            for (alias, agent) in &self.agents {
+                if agent.memory.backend != crate::multi_agent::MemoryBackendKind::Sqlite {
+                    let agent_backend = agent.memory.backend;
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.memory.backend"),
+                        "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
+                    );
+                }
+            }
+        }
         for (alias, agent) in &self.agents {
             if agent.precheck.timeout_secs == 0 {
                 validation_bail!(
@@ -23557,6 +23637,50 @@ default_temperature = 0.7
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);
         assert_eq!(m.search_mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    async fn memory_types_and_extract_facts_default_off() {
+        let m = MemoryConfig::default();
+        assert!(!m.consolidation_extract_facts);
+        assert!(!m.types.enabled);
+    }
+
+    #[test]
+    async fn memory_config_without_types_keys_deserializes_off() {
+        // Back-compat: configs written before [memory.types] and
+        // consolidation_extract_facts existed must still parse, with both off.
+        let toml_str = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+"#;
+        let parsed = parse_test_config(toml_str);
+        assert!(!parsed.memory.consolidation_extract_facts);
+        assert!(!parsed.memory.types.enabled);
+    }
+
+    #[test]
+    async fn memory_types_keys_parse_when_set() {
+        let toml_str = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+consolidation_extract_facts = true
+
+[memory.types]
+enabled = true
+"#;
+        let parsed = parse_test_config(toml_str);
+        assert!(parsed.memory.consolidation_extract_facts);
+        assert!(parsed.memory.types.enabled);
     }
 
     #[test]
@@ -33282,6 +33406,88 @@ allowed_users = []
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_typed_memory_flags_on_non_sqlite_global_backend() {
+        let mut config = multi_agent_test_config();
+        config.memory.types.enabled = true;
+        config.memory.backend = "postgres.work".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("typed memory on a non-sqlite global backend must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory.types.enabled") && msg.contains("SQLite-only"),
+            "expected SQLite-only explanation naming the flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_typed_memory_flags_on_non_sqlite_agent_backend() {
+        let mut config = multi_agent_test_config();
+        config.memory.consolidation_extract_facts = true;
+
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let err = config
+            .validate()
+            .expect_err("typed memory with a non-sqlite agent backend must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory.consolidation_extract_facts")
+                && msg.contains("agents.beta.memory.backend")
+                && msg.contains("Markdown"),
+            "expected SQLite-only explanation naming the agent, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_typed_memory_flags_on_sqlite() {
+        let mut config = multi_agent_test_config();
+        config.memory.types.enabled = true;
+        config.memory.consolidation_extract_facts = true;
+        config.memory.backend = "sqlite".to_string();
+
+        config
+            .validate()
+            .expect("typed memory on sqlite everywhere must pass validation");
+    }
+
+    #[test]
+    async fn validate_accepts_typed_memory_flags_on_mixed_case_sqlite() {
+        // The runtime classifies backends case-insensitively
+        // (`backend_kind_from_dotted` lowercases), so the SQLite-only gate
+        // must accept every spelling the runtime resolves to sqlite.
+        let mut config = multi_agent_test_config();
+        config.memory.types.enabled = true;
+        config.memory.backend = " SQLite.default ".to_string();
+
+        config
+            .validate()
+            .expect("mixed-case sqlite spellings the runtime accepts must pass the typed gate");
+    }
+
+    #[test]
+    async fn validate_allows_non_sqlite_backend_when_typed_memory_flags_off() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "postgres.work".to_string();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Postgres;
+
+        config
+            .validate()
+            .expect("flags-off configs keep every backend choice valid");
     }
 
     #[test]

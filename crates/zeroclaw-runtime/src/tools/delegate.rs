@@ -2620,6 +2620,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
@@ -2680,6 +2681,7 @@ impl DelegateTool {
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
