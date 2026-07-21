@@ -15684,14 +15684,15 @@ Let me check the result."#;
             .expect("Windows Ctrl+C helper process should start");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut timed_out = false;
         let status = loop {
             if let Some(status) = child.try_wait().expect("query helper process status") {
                 break status;
             }
             if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("Windows Ctrl+C helper process timed out");
+                timed_out = true;
+                child.kill().expect("terminate timed-out helper process");
+                break child.wait().expect("reap timed-out helper process");
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
@@ -15711,6 +15712,10 @@ Let me check the result."#;
             .read_to_string(&mut stderr)
             .expect("read helper stderr");
 
+        assert!(
+            !timed_out,
+            "Windows Ctrl+C helper process timed out\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert_eq!(
             status.code(),
             Some(0),
@@ -15722,12 +15727,23 @@ Let me check the result."#;
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "subprocess helper for the Windows Ctrl+C exit-code regression"]
     async fn interactive_signal_lifecycle_windows_child_helper() {
-        use windows::Win32::System::Console::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
+        use windows::Win32::System::Console::{
+            CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        };
+
+        // GitHub's test process can carry Windows' inheritable "ignore Ctrl+C"
+        // attribute. Clear it before Tokio installs the same listener used by
+        // the REPL; otherwise GenerateConsoleCtrlEvent succeeds but Windows
+        // deliberately skips every handler in this isolated helper.
+        unsafe { SetConsoleCtrlHandler(None, false) }
+            .expect("enable Ctrl+C handling in helper process");
+        eprintln!("Windows Ctrl+C helper: handling enabled");
 
         let phase = Arc::new(parking_lot::Mutex::new(InteractivePhase::Idle));
         let (mut notice_rx, signal_task) =
             spawn_interactive_signal_task(Arc::clone(&phase)).expect("install Ctrl+C listener");
         let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        eprintln!("Windows Ctrl+C helper: listener installed");
 
         let signal_thread = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -15735,11 +15751,13 @@ Let me check the result."#;
             // Group id 0 broadcasts CTRL_C_EVENT only within that console.
             unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) }
                 .expect("generate CTRL_C_EVENT in helper console");
+            eprintln!("Windows Ctrl+C helper: event generated");
         });
 
         let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
             .await
             .expect("idle wait should receive Ctrl+C");
+        eprintln!("Windows Ctrl+C helper: event received");
         assert!(request_rx.recv().await.is_some());
         assert!(matches!(event, InteractiveIdleEvent::Interrupt));
         assert!(matches!(*phase.lock(), InteractivePhase::Stopping));
