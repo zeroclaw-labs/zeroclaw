@@ -118,9 +118,13 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
         />
         <RowFact
           icon={Brain}
-          value={agent.memoryCount}
+          value={agent.memoryCount === null ? t('agentcard.memory_unavailable') : agent.memoryCount}
           label={agent.memoryCount === 1 ? t('agentcard.memory') : t('agentcard.memories')}
-          title={t('agentcard.stored_memories')}
+          title={
+            agent.memoryCount === null
+              ? t('agentcard.memory_unavailable_title')
+              : t('agentcard.stored_memories')
+          }
         />
         <RowFact
           icon={DollarSign}

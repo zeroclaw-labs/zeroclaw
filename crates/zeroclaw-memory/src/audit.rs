@@ -384,6 +384,14 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.count().await
     }
 
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        self.inner.count_own().await
+    }
+
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        self.inner.count_by_agent_id(agent_id).await
+    }
+
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }

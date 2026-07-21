@@ -1586,6 +1586,27 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        let conn = self.conn.clone();
+        let agent_id = agent_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let conn = conn.lock();
+            // Native COUNT, not the capped `list()` + filter the trait default
+            // uses: `list()` caps at 1,000 rows before agent filtering, so an
+            // agent with more rows than that (or whose rows sort outside the
+            // capped slice) would be undercounted or read 0.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id = ?1",
+                params![agent_id],
+                |row| row.get(0),
+            )?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(count as u64)
+        })
+        .await?
+    }
+
     async fn health_check(&self) -> bool {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())

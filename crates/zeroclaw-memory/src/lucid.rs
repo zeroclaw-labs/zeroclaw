@@ -479,6 +479,11 @@ impl Memory for LucidMemory {
         self.local.count().await
     }
 
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        // Attribution lives only on the local SQLite mirror (see rename_agent).
+        self.local.count_by_agent_id(agent_id).await
+    }
+
     async fn health_check(&self) -> bool {
         self.local.health_check().await
     }

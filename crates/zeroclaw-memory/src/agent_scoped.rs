@@ -304,7 +304,9 @@ impl Memory for AgentScopedMemory {
 
     async fn count(&self) -> Result<usize> {
         // Scope to the bound + allowlisted agents so a wrapper-using
-        // caller does not see the install-wide row total.
+        // caller does not see the install-wide row total. This is
+        // VISIBILITY-scoped (includes allowlisted peers) for the recall/list
+        // use case; own-footprint callers must use `count_own` instead.
         let entries = self.inner.list(None, None).await?;
         Ok(entries
             .into_iter()
@@ -314,6 +316,12 @@ impl Memory for AgentScopedMemory {
                     .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
             })
             .count())
+    }
+
+    async fn count_own(&self) -> Result<u64> {
+        // Narrower than `count()`: only the bound agent's own rows, via the
+        // backend's native uncapped count, never allowlisted peers.
+        self.inner.count_by_agent_id(&self.agent_id).await
     }
 
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
@@ -803,6 +811,113 @@ mod tests {
         assert!(
             !hits.iter().any(|e| e.key == "rogue-key"),
             "caller allowlist must be intersected, not unioned"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_own_excludes_allowlisted_peer_rows() {
+        // `count_own` is the bound agent's own footprint, NOT the
+        // visibility-scoped `count()` (which includes allowlisted peers).
+        // Alpha allowlists beta for READ access, but beta's rows must not be
+        // counted as part of alpha's own footprint.
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "alpha-row",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(alpha_uuid),
+            )
+            .await
+            .unwrap();
+        for i in 0..3 {
+            inner
+                .store_with_agent(
+                    &format!("beta-row-{i}"),
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, vec![beta_uuid.clone()]);
+
+        // Sanity: visibility-scoped `count()` includes the allowlisted peer.
+        assert_eq!(
+            wrapper.count().await.unwrap(),
+            4,
+            "count() is visibility-scoped and includes the allowlisted peer's rows"
+        );
+        // `count_own` must exclude them.
+        assert_eq!(
+            wrapper.count_own().await.unwrap(),
+            1,
+            "count_own must report only the bound agent's own row, never allowlisted peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_own_is_correct_above_the_list_row_cap() {
+        // SQLite's `list()` caps at 1,000 rows before agent filtering, so the
+        // trait's default `count_by_agent_id` (list + filter) would undercount
+        // an agent with more rows than that, or one whose rows sort outside
+        // the capped slice. `count_own` must use the native uncapped COUNT
+        // query instead.
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "noise"]).await;
+        let alpha_uuid = &uuids[0];
+        let noise_uuid = &uuids[1];
+
+        // Seed 1,005 "noise" rows attributed to a different agent so they sort
+        // ahead of alpha's rows in `list()`'s `ORDER BY updated_at DESC`
+        // (inserted first => older `updated_at` => NOT ahead; insert noise
+        // AFTER alpha's rows so noise is newer and pushes alpha's single row
+        // past the 1,000-row cap).
+        inner
+            .store_with_agent(
+                "alpha-only-row",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(alpha_uuid),
+            )
+            .await
+            .unwrap();
+        for i in 0..1005 {
+            inner
+                .store_with_agent(
+                    &format!("noise-{i}"),
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(noise_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, Vec::<String>::new());
+
+        assert_eq!(
+            wrapper.count_own().await.unwrap(),
+            1,
+            "count_own must find the agent's row via a native COUNT, not a capped list+filter"
         );
     }
 }

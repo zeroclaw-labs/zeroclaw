@@ -461,6 +461,56 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 
+    /// Count THIS agent's own footprint: rows it owns, never rows it merely
+    /// has read visibility into via `workspace.read_memory_from`.
+    ///
+    /// This is deliberately NOT the same as `count()` on a wrapper that
+    /// composes multiple agents' read visibility into one handle (e.g. an
+    /// agent-scoped decorator around a shared SQL/Qdrant backend), which is
+    /// visibility-scoped (includes allowlisted peers) for the recall/list
+    /// use case. Own-count is a distinct, narrower metric for dashboards:
+    /// "how many rows does this agent actually own", independent of who
+    /// else it can currently see.
+    ///
+    /// Default: delegates to [`Self::count`] — correct for every backend
+    /// whose bare handle already represents exactly one agent's storage
+    /// (SQLite/Postgres/Qdrant's raw backend, Hindsight's private bank,
+    /// Markdown's per-agent dir, the `none` stub). Only a wrapper composing
+    /// MULTIPLE agents' visibility into one handle needs to override this to
+    /// a narrower, natively-scoped count instead of inheriting the
+    /// wrapper's merged `count()`.
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        let n = self.count().await?;
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
+    }
+
+    /// Count memory rows natively attributed to a specific `agent_id`,
+    /// without visibility merging (no allowlisted-peer inclusion) and
+    /// without the `list()` read cap (1,000 rows on SQLite/Qdrant) that
+    /// backs the default filter-based implementation below.
+    ///
+    /// This is the backend-native seam an agent-scoped wrapper composing
+    /// multiple agents' visibility into one handle uses to implement
+    /// [`Self::count_own`] correctly: such a wrapper's own `count()` is
+    /// visibility-scoped and cannot serve as an own-footprint count. Only
+    /// backends actually wrapped that way (SQLite, PostgreSQL, Qdrant) need
+    /// an efficient override; single-agent backends (Hindsight, Markdown,
+    /// `none`) are never wrapped that way and keep the default.
+    ///
+    /// Default: composes [`Self::list`] and filters by `agent_id` —
+    /// functionally correct but inherits `list`'s row cap on backends that
+    /// have one, so it undercounts a single agent with more rows than that
+    /// cap. Backends wrapped by a multi-agent visibility decorator MUST
+    /// override this with a native, uncapped `COUNT` query.
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        let entries = self.list(None, None).await?;
+        let n = entries
+            .into_iter()
+            .filter(|e| e.agent_id.as_deref() == Some(agent_id))
+            .count();
+        Ok(u64::try_from(n).unwrap_or(u64::MAX))
+    }
+
     /// Health check
     async fn health_check(&self) -> bool;
 

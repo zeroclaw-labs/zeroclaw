@@ -377,7 +377,14 @@ export default function AgentDrawer({
                 {t('agent.stat.memories')}
               </div>
               <div className="mt-0.5 text-sm text-pc-text">
-                {agent.memoryCount === 0 ? (
+                {agent.memoryCount === null ? (
+                  <span
+                    className="text-status-warning"
+                    title={t('agent.stat.memories_unavailable_title')}
+                  >
+                    {t('agent.stat.unavailable')}
+                  </span>
+                ) : agent.memoryCount === 0 ? (
                   <span className="text-pc-text-muted">{t('agent.stat.none')}</span>
                 ) : (
                   <Link

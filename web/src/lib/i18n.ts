@@ -1479,6 +1479,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.stat.memories': 'Memories',
     'agent.stat.this_month': 'This month',
     'agent.stat.none': 'none',
+    'agent.stat.unavailable': 'unavailable',
+    'agent.stat.memories_unavailable_title': 'Memory backend unavailable or timed out — count could not be verified. This is distinct from a genuinely empty store.',
     'agent.no_sessions_yet': 'no sessions yet',
     'agent.just_now': 'just now',
     'agent.cost_untracked_title': 'Per-agent tracking disabled in [cost].track_per_agent',
@@ -1501,6 +1503,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agentcard.memory': 'memory',
     'agentcard.memories': 'memories',
     'agentcard.stored_memories': 'Stored memories',
+    'agentcard.memory_unavailable': 'n/a',
+    'agentcard.memory_unavailable_title': 'Memory backend unavailable or timed out — count could not be verified. This is distinct from a genuinely empty store.',
     'agentcard.this_month': 'this month',
 
     // Tools
