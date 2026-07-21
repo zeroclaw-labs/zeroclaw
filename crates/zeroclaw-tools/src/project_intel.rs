@@ -1,18 +1,13 @@
 //! Project delivery intelligence tool.
-//!
-//! Provides read-only analysis and generation for project management:
-//! status reports, risk detection, client communication drafting,
-//! sprint summaries, and effort estimation.
 
 use super::report_templates;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Project intelligence tool for consulting project management.
-///
 /// All actions are read-only analysis/generation; nothing is modified externally.
 pub struct ProjectIntelTool {
     default_language: String,
@@ -115,7 +110,7 @@ impl ProjectIntelTool {
         let rendered = tpl.render(&vars);
         Ok(ToolResult {
             success: true,
-            output: rendered,
+            output: rendered.into(),
             error: None,
         })
     }
@@ -222,7 +217,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output: tpl.render(&vars),
+            output: tpl.render(&vars).into(),
             error: None,
         })
     }
@@ -299,7 +294,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output: body,
+            output: body.into(),
             error: None,
         })
     }
@@ -340,7 +335,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output: tpl.render(&vars),
+            output: tpl.render(&vars).into(),
             error: None,
         })
     }
@@ -351,7 +346,7 @@ impl ProjectIntelTool {
         if tasks.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("No task descriptions provided".into()),
             });
         }
@@ -373,7 +368,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -564,7 +559,7 @@ impl Tool for ProjectIntelTool {
             "effort_estimate" => self.execute_effort_estimate(&args),
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{other}'. Valid actions: status_report, risk_scan, draft_update, sprint_summary, effort_estimate"
                 )),

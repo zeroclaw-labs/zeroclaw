@@ -1,13 +1,4 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
-//!
-//! Modelled directly on `zeroclaw_infra::acp_session_store::AcpSessionStore`
-//! (`parking_lot::Mutex<Connection>` + WAL pragmas + `CREATE TABLE IF NOT EXISTS`),
-//! so the supervision plane reuses the proven durability pattern rather than
-//! inventing a new one. One `tasks` table indexes every supervised unit of work;
-//! the producers' flat-JSON payloads stay where they are — this is the *index*.
-//!
-//! All methods are sync SQLite calls behind a `parking_lot::Mutex`; no `.await` is
-//! held across the lock, so the `#[async_trait]` futures stay `Send`.
 
 use std::path::Path;
 
@@ -18,7 +9,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::authority::is_authoritative;
 use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
-/// The durable task registry. `tasks.db` lives beside the other workspace DBs.
+mod goal;
+
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
 }
@@ -45,7 +39,8 @@ impl SqliteTaskStore {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA foreign_keys = ON;",
         )
         .context("set control-plane PRAGMAs")?;
         conn.execute_batch(
@@ -69,9 +64,12 @@ impl SqliteTaskStore {
                  error           TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);",
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
+                ON tasks(agent, kind, started_at DESC);",
         )
-        .context("create control-plane schema")?;
+        .context("create control-plane base schema")?;
+        migrate_schema(&conn).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -99,6 +97,46 @@ impl SqliteTaskStore {
             .context("delete tasks by agent")?;
         Ok(n as u64)
     }
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read control-plane schema version")?;
+    goal::migrate_schema(conn, version)?;
+    if version > CONTROL_PLANE_SCHEMA_VERSION {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "db_version": version,
+                    "known_version": CONTROL_PLANE_SCHEMA_VERSION,
+                })
+            ),
+            "control-plane DB was created by a newer schema version"
+        );
+    }
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("inspect {table} columns"))?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("query {table} columns"))?;
+    let exists = rows.any(|name| matches!(name, Ok(name) if name == column));
+    if !exists {
+        conn.execute_batch(alter_sql)
+            .with_context(|| format!("add {table}.{column}"))?;
+    }
+    Ok(())
 }
 
 // ── serde<->TEXT helpers (reuse the snake_case derive, no hand-kept string tables) ──
@@ -170,51 +208,101 @@ where
     for r in rows {
         match r {
             Ok(rec) => out.push(rec),
-            Err(e) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
-                "control-plane: skipping unreadable task row"
-            ),
+            Err(e) => log_unreadable_task_row(e),
         }
     }
     out
+}
+
+fn log_unreadable_task_row(error: rusqlite::Error) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+        "control-plane: skipping unreadable task row"
+    );
+}
+
+fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
+    // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
+    // must be a true no-op, never clobber an already-recorded output/error/terminal
+    // status back to NULL/running (review finding— the documented idempotency).
+    conn.execute(
+        "INSERT INTO tasks
+            (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
+             parent_id, originator_route, delivered, idem_key, principal_id,
+             started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            rec.id,
+            kind_to_db(rec.kind),
+            rec.agent,
+            status_to_db(rec.status),
+            rec.owner_pid as i64,
+            rec.owner_boot_id,
+            rec.heartbeat_at,
+            rec.depth as i64,
+            rec.parent_id,
+            rec.originator_route,
+            rec.delivered as i64,
+            rec.idem_key,
+            rec.principal_id,
+            rec.started_at,
+            rec.finished_at,
+        ],
+    )
+    .context("insert task record")?;
+    Ok(())
+}
+
+fn update_task_status_record(
+    conn: &Connection,
+    id: &str,
+    status: TaskStatus,
+    output: Option<String>,
+    error: Option<String>,
+) -> Result<usize> {
+    let finished_at = status
+        .is_terminal()
+        .then(|| chrono::Utc::now().to_rfc3339());
+    conn.execute(
+        "UPDATE tasks
+            SET status = ?1,
+                output = COALESCE(?2, output),
+                error  = COALESCE(?3, error),
+                finished_at = COALESCE(?4, finished_at)
+          WHERE id = ?5
+            AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+        params![status_to_db(status), output, error, finished_at, id],
+    )
+    .context("update task status")
+}
+
+fn claim_task_owner_record(
+    conn: &Connection,
+    id: &str,
+    owner_pid: u32,
+    owner_boot_id: &str,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE tasks
+            SET owner_pid = ?1,
+                owner_boot_id = ?2,
+                heartbeat_at = NULL
+          WHERE id = ?3
+            AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+        params![owner_pid as i64, owner_boot_id, id],
+    )
+    .context("claim task owner")
 }
 
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
         let conn = self.conn.lock();
-        // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
-        // must be a true no-op, never clobber an already-recorded output/error/terminal
-        // status back to NULL/running (review finding #11 — the documented idempotency).
-        conn.execute(
-            "INSERT INTO tasks
-                (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-                 parent_id, originator_route, delivered, idem_key, principal_id,
-                 started_at, finished_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                rec.id,
-                kind_to_db(rec.kind),
-                rec.agent,
-                status_to_db(rec.status),
-                rec.owner_pid as i64,
-                rec.owner_boot_id,
-                rec.heartbeat_at,
-                rec.depth as i64,
-                rec.parent_id,
-                rec.originator_route,
-                rec.delivered as i64,
-                rec.idem_key,
-                rec.principal_id,
-                rec.started_at,
-                rec.finished_at,
-            ],
-        )
-        .context("insert task record")?;
+        insert_task_record(&conn, rec)?;
         Ok(())
     }
 
@@ -239,26 +327,14 @@ impl TaskRegistry for SqliteTaskStore {
         output: Option<String>,
         error: Option<String>,
     ) -> Result<()> {
-        let finished_at = status
-            .is_terminal()
-            .then(|| chrono::Utc::now().to_rfc3339());
         let conn = self.conn.lock();
-        // Terminal-state guard: once a task has reached ANY terminal state this is a
-        // no-op. Closes the reaper-sweep TOCTOU where a task that legitimately Completed
-        // between the reaper's snapshot and its update could be clobbered back to
-        // TimedOut (and its real finished_at lost). Mirrors reconcile_lost's
-        // `AND status='running'` discipline (review finding #2).
-        conn.execute(
-            "UPDATE tasks
-                SET status = ?1,
-                    output = COALESCE(?2, output),
-                    error  = COALESCE(?3, error),
-                    finished_at = COALESCE(?4, finished_at)
-              WHERE id = ?5
-                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
-            params![status_to_db(status), output, error, finished_at, id],
-        )
-        .context("update task status")?;
+        update_task_status_record(&conn, id, status, output, error)?;
+        Ok(())
+    }
+
+    async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
         Ok(())
     }
 
@@ -422,5 +498,18 @@ mod tests {
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_none());
         s.heartbeat("a", "boot-1").await.unwrap(); // owner: stamps
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn claim_owner_updates_canonical_owner_fields_for_resumed_task() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("a", "main", 1, "boot-old")).await.unwrap();
+
+        s.claim_owner("a", 42, "boot-new").await.unwrap();
+
+        let got = s.get("a").await.unwrap().unwrap();
+        assert_eq!(got.owner_pid, 42);
+        assert_eq!(got.owner_boot_id, "boot-new");
+        assert!(got.heartbeat_at.is_none());
     }
 }

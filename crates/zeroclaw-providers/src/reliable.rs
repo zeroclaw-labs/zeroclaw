@@ -12,12 +12,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-// ── ModelProvider Fallback Notification ──────────────────────────────────────
-// When ReliableModelProvider uses a fallback (different model_provider or model than
-// requested), it records the details here so channel code can notify the user.
-// Uses tokio::task_local to avoid cross-request leakage between concurrent
-// users (the old global static had a race window).
-
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
 pub struct ProviderFallbackInfo {
@@ -69,18 +63,6 @@ fn record_provider_fallback(
     });
 }
 
-// ── Error Classification ─────────────────────────────────────────────────
-// Errors are split into retryable (transient server/network failures) and
-// non-retryable (permanent client errors). This distinction drives whether
-// the retry loop continues, falls back to the next model_provider, or aborts
-// immediately — avoiding wasted latency on errors that cannot self-heal.
-
-/// Return a short user-facing string for transient provider errors, or `None`
-/// for errors that warrant showing the technical detail to the user.
-///
-/// Callers should use this instead of forwarding raw error strings so that
-/// transient overloads and rate-limits produce a brief, friendly reply rather
-/// than a multi-line technical dump.
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     let msg = err.to_string();
     // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
@@ -197,11 +179,6 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| msg_lower.contains(hint))
 }
 
-/// Check if an error is a tool schema validation failure (e.g. Groq returning
-/// "tool call validation failed: attempted to call tool '...' which was not in request").
-/// These errors should NOT be classified as non-retryable because the model_provider's
-/// built-in fallback logic (`compatible.rs::is_native_tool_schema_unsupported`)
-/// can recover by switching to prompt-guided tool instructions.
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
@@ -243,12 +220,6 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
-/// Check if a 429 is a business/quota-plan error that retries cannot fix.
-///
-/// Examples:
-/// - plan does not include requested model
-/// - insufficient balance / package not active
-/// - known model_provider business codes (e.g. Z.AI: 1311, 1113)
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     if !is_rate_limited(err) {
         return false;
@@ -626,15 +597,6 @@ fn push_failure(
     failures.push(failure);
 }
 
-/// True when a syntactically-successful response carries no usable content:
-/// no text, no tool calls, and no reasoning. Such "empty completions" (a 2xx
-/// with a null/blank message, a 0-token sample, a content-filter soft block, or
-/// a truncated stream) are never a legitimate final answer — they are almost
-/// always a transient provider hiccup — so callers re-roll them like a
-/// retryable error instead of surfacing a blank turn.
-///
-/// Prompt-guided tool calls embed the call in `text`, so a response carrying
-/// `<tool_call>…` is non-empty here and is never misclassified.
 fn is_empty_completion(resp: &ChatResponse) -> bool {
     resp.text_or_empty().trim().is_empty()
         && resp.tool_calls.is_empty()
@@ -643,16 +605,6 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
             .as_deref()
             .is_none_or(|r| r.trim().is_empty())
 }
-
-// ── Resilient ModelProvider Wrapper ────────────────────────────────────────────
-// Two-level strategy: model_provider chain → retry loop.
-//   Outer loop: iterate registered model_providers in priority order. The production
-//               caller always wires a single primary; tests construct multi-
-//               element chains directly to exercise failover semantics.
-//   Inner loop: retry the same (model_provider, model) pair with exponential backoff,
-//               rotating API keys on rate-limit errors.
-// Loop invariant: `failures` accumulates every failed attempt so the final
-// error message gives operators a complete diagnostic trail.
 
 pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
@@ -690,7 +642,6 @@ pub struct ReliableModelProvider {
     /// Per-model failover chains. Test-only: model_name → [alt1, alt2, ...].
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Transient provider cooldowns after retryable rate limits.
-    ///
     /// Source of truth: live provider 429 / Retry-After evidence observed by
     /// this wrapper. It is intentionally in-memory and per wrapper instance.
     rate_limit_cooldowns: Mutex<HashMap<String, Instant>>,
@@ -736,8 +687,6 @@ impl ReliableModelProvider {
         self
     }
 
-    /// Test-only hook: install per-model failover chains. Production builds
-    /// never call this — the schema has no surface for it.
     #[cfg(test)]
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
@@ -1977,12 +1926,6 @@ impl ModelProvider for ReliableModelProvider {
 
 impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        // Delegate to the primary (first) inner provider so the on-disk
-        // model_provider_type reflects the concrete provider
-        // (`anthropic`, `openai`, …) rather than the wrapper kind.
-        // If the wrapper somehow held zero providers we fall back to
-        // the parent `System` role — log emissions in that degenerate
-        // state are not user-facing.
         match self.model_providers.first() {
             Some(entry) => ::zeroclaw_api::attribution::Attributable::role(&*entry.provider),
             None => ::zeroclaw_api::attribution::Role::System,
@@ -3551,8 +3494,6 @@ mod tests {
 
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
 
-    /// Gap 2: `chat()` returns an aggregated error when all model_providers fail,
-    /// matching behavior of `returns_aggregated_error_when_all_providers_fail`.
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
         let model_provider = ReliableModelProvider::new(
@@ -3661,8 +3602,6 @@ mod tests {
 
     // Arc<NativeModelAwareMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    /// Gap 3: `chat()` tries fallback models on failure,
-    /// matching behavior of `model_failover_tries_fallback_model`.
     #[tokio::test]
     async fn chat_tries_model_failover_on_failure() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3705,8 +3644,6 @@ mod tests {
         assert_eq!(seen[1], "claude-sonnet");
     }
 
-    /// Gap 4: `chat()` skips retries on non-retryable errors (401, 403, etc.),
-    /// matching behavior of `skips_retries_on_non_retryable_error`.
     #[tokio::test]
     async fn chat_skips_non_retryable_errors() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
@@ -4083,16 +4020,16 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "run shell".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" }
                 }
             }),
-        }];
+        )];
         let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &messages,
@@ -4131,11 +4068,11 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "run shell".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell",
+            serde_json::json!({"type": "object"}),
+        )];
         let mut stream = model_provider.stream_chat(
             ChatRequest {
                 messages: &messages,
@@ -4431,7 +4368,7 @@ mod tests {
         .await;
     }
 
-    // Regression for #6589: ReliableModelProvider::supports_vision() must reflect the
+    // ReliableModelProvider::supports_vision() must reflect the
     // primary (first) provider, not .any() across the fallback chain. This mirrors
     // supports_native_tools() which already uses .first().
     #[test]

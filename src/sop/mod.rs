@@ -144,6 +144,20 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                     &[("value", &sop.max_concurrent.to_string())]
                 )
             );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-admission-policy",
+                    &[("value", &sop.admission_policy.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-max-pending-approvals",
+                    &[("value", &sop.max_pending_approvals.to_string())]
+                )
+            );
             if let Some(loc) = &sop.location {
                 println!(
                     "{}",
@@ -199,6 +213,29 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             "This command talks to the running daemon over the gateway; \
              it is not handled by the local SOP CLI."
         ),
+        crate::SopCommands::Graph { name, format } => {
+            let sop = sops
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| anyhow::Error::msg(format!("SOP not found: {name}")))?;
+            let graph = SopGraph::from_sop(sop);
+            let fmt = match format {
+                crate::SopGraphFormat::Outline => TextGraphFormat::Outline,
+                crate::SopGraphFormat::Adjacency => TextGraphFormat::Adjacency,
+                crate::SopGraphFormat::Json => TextGraphFormat::Json,
+            };
+            print!("{}", render_graph_text(&graph, &fmt));
+            Ok(())
+        }
+        crate::SopCommands::Delete { name } => {
+            let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
+            delete_sop(&dir, &name)?;
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-sop-deleted", &[("name", &name)])
+            );
+            Ok(())
+        }
     }
 }
 
@@ -409,6 +446,9 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -441,6 +481,9 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         };
 
         let warnings = validate_sop(&sop);

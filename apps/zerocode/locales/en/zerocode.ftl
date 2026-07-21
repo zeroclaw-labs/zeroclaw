@@ -5,8 +5,10 @@ zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
+zc-pane-sop = SOPs
 
 zc-app-help-cycle-mode = Cycle mode
+zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
 
@@ -88,7 +90,6 @@ zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
 zc-input-placeholder-chat = Type to chat
 
-zc-input-help-slash-commands = Slash commands
 zc-input-help-completions-navigate = Navigate completions
 zc-input-help-completions-accept = Accept
 zc-input-help-completions-dismiss = Dismiss
@@ -103,6 +104,7 @@ zc-input-clipboard-error = Clipboard error: { $error }
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.
+zc-turn-no-output = Turn completed with no output.
 zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
 zc-queue-title = Queue ({ $count })
 zc-queue-empty-list = No queued messages.
@@ -171,6 +173,15 @@ zc-dashboard-memory-not-configured = Memory is not configured yet. Use Quickstar
 zc-dashboard-search-action-apply = apply
 zc-dashboard-search-action-cancel = cancel
 zc-dashboard-search-prefix = search:
+zc-dashboard-agent-rename-action-apply = rename
+zc-dashboard-agent-rename-action-cancel = cancel
+zc-dashboard-agent-rename-hint = rename
+zc-dashboard-agent-rename-prefix = rename:
+zc-dashboard-agent-rename-empty = Agent name cannot be empty
+zc-dashboard-agent-rename-unchanged = Agent name unchanged
+zc-dashboard-agent-rename-success = Renamed { $from } to { $to }
+zc-dashboard-agent-rename-success-warnings = Renamed { $from } to { $to } with warnings: { $warnings }
+zc-dashboard-agent-rename-failed = Rename failed: { $error }
 
 zc-dashboard-label-connected = Connected
 zc-dashboard-label-server = Server
@@ -248,7 +259,20 @@ zc-dashboard-section-by-agent = By Agent
 zc-dashboard-section-command = Command
 zc-dashboard-section-prompt = Prompt
 zc-dashboard-section-last-output = Last Output
-
+zc-dashboard-section-manual-run = Manual Run
+zc-dashboard-section-recent-runs = Recent Runs
+zc-dashboard-actions = Actions
+zc-dashboard-cron-action-hint = { $run } run now · { $refresh } refresh
+zc-dashboard-loading-runs = Loading runs…
+zc-dashboard-runs-error = Failed to load runs
+zc-dashboard-no-runs = No runs recorded yet
+zc-dashboard-run-succeeded = Run succeeded
+zc-dashboard-run-failed = Run failed
+zc-dashboard-run-running = Run started: { $id }
+zc-dashboard-run-already-running = Run already in progress: { $id }
+zc-dashboard-run-pending-status = running
+zc-dashboard-run-pending-window = starting now
+zc-dashboard-run-pending-output = Manual trigger in progress…
 
 zc-dashboard-yes = yes
 zc-dashboard-no = no
@@ -266,6 +290,11 @@ zc-quickstart-selector-agent = Agent
 zc-quickstart-selector-submit = Submit
 
 zc-quickstart-reuse-alias-help = Reuse this alias instead of creating a new one.
+zc-quickstart-existing-providers-heading = Existing providers
+zc-quickstart-existing-providers-show-more = [+ Show { $count } more existing providers]
+zc-quickstart-existing-providers-show-fewer = [- Show fewer existing providers]
+zc-quickstart-new-provider-heading = Create new provider
+zc-quickstart-provider-alias-exists = Alias `{ $alias }` already exists. Pick another alias or use the existing provider.
 
 zc-quickstart-risk-locked-down = Locked Down
 zc-quickstart-risk-locked-down-desc = Tight defaults. Workspace-only fs, approval on med/high risk.
@@ -276,6 +305,8 @@ zc-quickstart-risk-yolo-desc = Full autonomy. No approval gates. Use on disposab
 
 zc-quickstart-runtime-tight = Tight
 zc-quickstart-runtime-tight-desc = Low ceilings on iterations and tokens.
+zc-quickstart-runtime-local-small = Local Small
+zc-quickstart-runtime-local-small-desc = Compact limits for smaller local models with structured tool calls.
 zc-quickstart-runtime-balanced = Balanced
 zc-quickstart-runtime-balanced-desc = Sensible ceilings. Recommended.
 zc-quickstart-runtime-unbounded = Unbounded
@@ -316,6 +347,11 @@ zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
 zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
 zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
+zc-quickstart-missing-model-provider = Choose a model provider before creating.
+zc-quickstart-missing-risk-profile = Choose a risk profile before creating.
+zc-quickstart-missing-runtime-profile = Choose a runtime profile before creating.
+zc-quickstart-missing-memory = Choose a memory backend before creating.
+zc-quickstart-missing-agent = Name the agent before creating.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel
@@ -334,7 +370,10 @@ zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
+zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-switch-error = Failed to switch session: { $error }
+zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 
@@ -382,6 +421,8 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
+zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
 zc-elicit-help-cancel = Cancel
@@ -396,6 +437,8 @@ zc-chat-approval-action-edit = Edit
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
+zc-chat-copy-message = [Copy]
+zc-chat-copy-message-copied = [Copied]
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

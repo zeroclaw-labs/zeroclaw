@@ -4,12 +4,34 @@
 //! that goes to disk + the `serde_json::Value` clone that goes to the
 //! broadcast hook). Rolling rotation streams through `BufReader::lines`
 //! into a temp file rather than slurping the whole file into a `String`.
+//!
+//! ## Hot-path write concurrency model
+//!
+//! Disk persistence runs on a dedicated `std::thread` named
+//! `zeroclaw-log-writer` so `record_event` does not block on file I/O
+//! or fsync. The async runtime emits an event by serializing it once
+//! and `try_send`-ing onto a bounded `std::sync::mpsc::sync_channel`;
+//! when the channel is full (worker is slow or disk is stalled) the
+//! event is dropped with a `tracing::warn!` so a single slow disk
+//! cannot wedge an agent turn. The worker re-opens the active file
+//! per write (matching the prior single-threaded semantics — required
+//! because rolling trim and size-based rotation rename the file out
+//! from under an open handle), runs the rotation hooks inline, and
+//! calls `sync_all` on a periodic cadence (every
+//! `SYNC_EVERY_N_WRITES` writes or `SYNC_INTERVAL` of wall-clock
+//! time, whichever comes first). This trades per-event durability
+//! (the prior behaviour was `sync_data` after every write) for bounded
+//! write latency: a process crash may lose up to one sync interval of
+//! pending writes.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
@@ -19,12 +41,76 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use serde_json::Value;
 
+/// Top-level marker stamped onto a broadcast frame when it carries
+/// `ephemeral_attributes` (short-lived pairing secrets deep-merged into the
+/// live copy). Broadcast consumers use it to withhold the frame from any
+/// stream that is not bearer-authenticated — the frame's secrets must fail
+/// closed rather than ride an unauthenticated `/api/events` subscriber. It is
+/// stamped only on the broadcast copy (never the persisted value, which drops
+/// `ephemeral_attributes` via `serde(skip)`) and is stripped by the SSE layer
+/// before delivery, so the public event shape is unchanged.
+pub const EPHEMERAL_BROADCAST_MARKER: &str = "_ephemeral_credentials";
+
+/// Capacity of the bounded mpsc between `record_event` and the worker.
+/// Sized for high-throughput agent turns (each turn can emit 20-100 events)
+/// while keeping the queue's RSS footprint bounded. When the queue is full
+/// the producer drops the event with a `tracing::warn!` rather than
+/// blocking the async task.
+const QUEUE_CAPACITY: usize = 1024;
+
+/// Worker calls `sync_all` after every N successful writes (in addition
+/// to the wall-clock cadence below). Tuned so a steady-state event stream
+/// of 1000 events/sec still gets ~10 fsyncs/sec.
+const SYNC_EVERY_N_WRITES: u64 = 100;
+
+/// Worker calls `sync_all` at least this often in wall-clock time even if
+/// `SYNC_EVERY_N_WRITES` has not been reached. Bounds the data-loss window
+/// under a slow trickle of events.
+const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum time the worker blocks on `recv_timeout` between idle ticks.
+/// Kept short so shutdown is prompt and the periodic sync interval is
+/// honoured even when no events are flowing.
+const IDLE_TICK: Duration = Duration::from_millis(50);
+
+/// Upper bound on how long re-init waits for a previous worker thread to
+/// observe channel disconnect and exit. Sized well above `IDLE_TICK` so a
+/// healthy worker always exits before the deadline; a stuck worker is
+/// logged and abandoned rather than blocking config reload forever.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
+
+/// A unit of work sent from the async runtime to the disk-persistence
+/// worker. The `Value` payload is unavoidable because we serialize once
+/// on the producer side to keep the queue small.
+enum WriterJob {
+    /// Serialize-and-write a single event to the log file.
+    Write(Value),
+    /// Block until the worker has drained all previously-queued jobs and
+    /// completed a `sync_all`. Acks via a rendezvous channel.
+    Flush(SyncSender<()>),
+}
+
+/// Set when the worker thread has exited (panic or normal). Used by
+/// `flush_for_test` to short-circuit on a dead worker rather than block.
+type WorkerDead = Arc<AtomicBool>;
+
+/// Per-worker state (no `tx` — the worker is the consumer, not a producer).
+/// The `policy` and `worker_dead` fields are shared with the producer-facing
+/// [`WriterState`].
+struct WorkerState {
+    policy: ResolvedPolicy,
+    worker_dead: WorkerDead,
+}
+
+/// Producer-facing state. The `tx` sender is NOT shared with the worker
+/// so the channel's [`Disconnected`](std::sync::mpsc::TrySendError::Disconnected)
+/// exit path can fire once the last producer drops their sender.
 struct WriterState {
     policy: ResolvedPolicy,
-    write_lock: Mutex<()>,
+    tx: SyncSender<WriterJob>,
+    worker_dead: WorkerDead,
 }
 
 static WRITER: OnceLock<parking_lot::RwLock<Option<Arc<WriterState>>>> = OnceLock::new();
@@ -37,9 +123,6 @@ fn current_state() -> Option<Arc<WriterState>> {
     slot().read().clone()
 }
 
-/// Initialize (or disable) the persistence writer from config. Idempotent.
-/// When enabled, runs a streaming in-place migration of any schema-1 rows
-/// in the existing file before resuming appends.
 pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
@@ -55,11 +138,204 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
         );
     }
 
+    // Tear down any previous writer before installing the new one. Taking
+    // the slot first stops new producers from cloning the old Arc; dropping
+    // the Arc drops its SyncSender and disconnects the old worker.
+    shutdown_current_writer();
+
+    let (tx, rx) = sync_channel::<WriterJob>(QUEUE_CAPACITY);
+    let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
+
+    if policy.storage.is_enabled() {
+        let worker_state = Arc::new(WorkerState {
+            policy: policy.clone(),
+            worker_dead: Arc::clone(&worker_dead),
+        });
+        spawn_worker(rx, worker_state);
+    } else {
+        // No worker will ever run for a disabled policy; mark dead so
+        // flush_for_test / re-init waiters do not spin on a false flag.
+        worker_dead.store(true, Ordering::Release);
+        drop(rx);
+    }
+
     let state = Arc::new(WriterState {
         policy,
-        write_lock: Mutex::new(()),
+        tx,
+        worker_dead,
     });
     *slot().write() = Some(state);
+}
+
+/// Remove the currently installed writer (if any) and wait for its worker
+/// thread to exit. Best-effort: if another thread still holds an
+/// `Arc<WriterState>` clone the channel stays open until that clone drops,
+/// and we only wait up to [`SHUTDOWN_WAIT`] before proceeding.
+fn shutdown_current_writer() {
+    let previous = slot().write().take();
+    let Some(prev) = previous else {
+        return;
+    };
+    let dead = Arc::clone(&prev.worker_dead);
+    // Dropping `prev` drops the last slot-owned SyncSender. Any in-flight
+    // `record_event` that already cloned the Arc may keep the channel open
+    // briefly; the wait below covers the common case.
+    drop(prev);
+
+    let start = Instant::now();
+    while !dead.load(Ordering::Acquire) && start.elapsed() < SHUTDOWN_WAIT {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if !dead.load(Ordering::Acquire) {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            "log: previous writer worker did not exit within {:?}; continuing with re-init",
+            SHUTDOWN_WAIT
+        );
+    }
+}
+
+/// Spawn the disk-persistence worker thread. The worker owns the active
+/// log file handle and processes `WriterJob`s until either the channel
+/// closes (all senders dropped) or the process exits. On normal exit the
+/// worker performs a final `sync_all` so any pending writes are durable.
+fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
+    let dead = Arc::clone(&state.worker_dead);
+    let builder = thread::Builder::new().name("zeroclaw-log-writer".into());
+    if let Err(err) = builder.spawn(move || worker_main(rx, state)) {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            error = %err,
+            "log: failed to spawn zeroclaw-log-writer thread; persistence disabled"
+        );
+        dead.store(true, Ordering::Release);
+    }
+}
+
+fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
+    let mut writes_since_sync: u64 = 0;
+    let mut last_sync = Instant::now();
+
+    loop {
+        let job = match rx.recv_timeout(IDLE_TICK) {
+            Ok(job) => Some(job),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        if let Some(job) = job {
+            match job {
+                WriterJob::Write(value) => {
+                    if let Err(err) = write_one(&state, &value) {
+                        tracing::warn!(
+                            target: "zeroclaw_log_internal",
+                            error = ?err,
+                            path = %state.policy.path.display(),
+                            "log: worker write failed"
+                        );
+                    } else {
+                        writes_since_sync += 1;
+                    }
+                }
+                WriterJob::Flush(ack) => {
+                    if let Err(err) = sync_active_file(&state) {
+                        tracing::warn!(
+                            target: "zeroclaw_log_internal",
+                            error = ?err,
+                            "log: worker flush sync_all failed"
+                        );
+                    }
+                    writes_since_sync = 0;
+                    last_sync = Instant::now();
+                    let _ = ack.send(());
+                }
+            }
+        }
+
+        if writes_since_sync > 0
+            && (writes_since_sync >= SYNC_EVERY_N_WRITES || last_sync.elapsed() >= SYNC_INTERVAL)
+        {
+            if let Err(err) = sync_active_file(&state) {
+                tracing::warn!(
+                    target: "zeroclaw_log_internal",
+                    error = ?err,
+                    "log: worker periodic sync_all failed"
+                );
+            }
+            writes_since_sync = 0;
+            last_sync = Instant::now();
+        }
+    }
+
+    // Channel closed (all senders dropped). Final sync so any pending
+    // writes that the worker pulled off the queue land on disk before
+    // we exit.
+    let _ = sync_active_file(&state);
+    state.worker_dead.store(true, Ordering::Release);
+}
+
+/// Serialize + write one event. Opens the active file fresh, runs the
+/// rotation hooks inline (so they can rename the file out from under
+/// the next write), and drops the handle on return. No `sync_data` —
+/// durability is the worker's periodic `sync_all`.
+fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
+    // Date-boundary rotation runs *before* the append so a new day's
+    // first event lands in a fresh file. Idempotent when no rotation
+    // is needed.
+    if state.policy.storage == StoragePolicy::Rotating {
+        maybe_rotate_for_date(state)?;
+    }
+    let mut file = open_active_file(state)?;
+    {
+        let mut writer = BufWriter::new(&mut file);
+        write_jsonl_line(&mut writer, value)?;
+        writer.flush()?;
+    }
+    match state.policy.storage {
+        StoragePolicy::Rolling => trim_to_last_entries(state)?,
+        StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
+        StoragePolicy::None | StoragePolicy::Full => {}
+    }
+    Ok(())
+}
+
+/// Open the active file just long enough to call `sync_all`. Used for
+/// Flush and the periodic sync cadence. Returns Ok(()) when the file
+/// does not exist yet (no writes have happened this run).
+fn sync_active_file(state: &Arc<WorkerState>) -> Result<()> {
+    let file = match open_active_file(state) {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    file.sync_all().context("sync_all log file")?;
+    Ok(())
+}
+
+/// Open (or create) the active log file in append mode with the
+/// 0o600 Unix permission bit. Called once at worker startup and again
+/// after any operation that may have renamed the file out from under
+/// us (rotation, rolling trim).
+fn open_active_file(state: &Arc<WorkerState>) -> Result<File> {
+    if let Some(parent) = state.policy.path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating log directory {}", parent.display()))?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&state.policy.path)
+        .with_context(|| format!("opening log file {}", state.policy.path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&state.policy.path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
 }
 
 /// Public accessor for the canonical log file path. Used by the gateway's
@@ -68,18 +344,21 @@ pub fn runtime_trace_path() -> Option<PathBuf> {
     current_state().map(|s| s.policy.path.clone())
 }
 
-/// Synchronously wait for all pending log writes to land on disk.
-///
-/// **Currently a no-op** — `record_event` is still synchronous, so any
-/// `record!` call has already hit disk + fsync by the time the macro returns.
-/// A follow-up PR will move disk persistence to a background worker; this
-/// function will then become a real round-trip signal so test code can
-/// keep asserting on the file's contents immediately after `record_event`.
-///
-/// Callers must be in the `zeroclaw-log` crate's own test module (or any
-/// other test code that re-exports this function). Not part of the
-/// production runtime API.
 pub fn flush_for_test() -> Result<()> {
+    let Some(state) = current_state() else {
+        return Ok(());
+    };
+    if state.worker_dead.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !state.policy.storage.is_enabled() {
+        return Ok(());
+    }
+    let (ack_tx, ack_rx) = sync_channel(0);
+    if state.tx.send(WriterJob::Flush(ack_tx)).is_err() {
+        return Ok(());
+    }
+    let _ = ack_rx.recv();
     Ok(())
 }
 
@@ -97,13 +376,22 @@ pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> 
 }
 
 /// Emit one event. Always fans out to the broadcast hook + tracing event.
-/// If persistence is enabled, also appends a JSON line to disk.
+/// If persistence is enabled, hands the serialized value to the disk
+/// worker via a bounded `try_send`. The hot path performs no file I/O.
+///
+/// The broadcast copy carries `ephemeral_attributes` deep-merged into
+/// `attributes` (live SSE consumers may render short-lived pairing
+/// credentials); the persisted copy never does — `LogEvent` marks the
+/// field `serde(skip)`, so the serialized value below is credential-free
+/// by construction.
 ///
 /// This is the function the `record!` macro expands into. Direct callers
 /// (the schema migration tool, tests) can invoke it too, but production
 /// code should go through the macro so the `tracing::event!` carries the
 /// correct `file:line` source info.
 pub fn record_event(event: LogEvent) {
+    // `serde(skip)` on `ephemeral_attributes` keeps this value — the one
+    // that reaches disk — free of broadcast-only secrets.
     let value = match serde_json::to_value(&event) {
         Ok(v) => v,
         Err(err) => {
@@ -119,7 +407,17 @@ pub fn record_event(event: LogEvent) {
     observer_bridge::forward(&event);
 
     if let Some(hook) = current_broadcast_hook() {
-        let _ = hook.send(value.clone());
+        let mut broadcast_value = value.clone();
+        if !event.ephemeral_attributes.is_null() {
+            merge_ephemeral_into_attributes(&mut broadcast_value, &event.ephemeral_attributes);
+            // Mark the frame so a broadcast consumer that cannot authenticate
+            // its subscribers (an unauthenticated `/api/events` stream) fails
+            // closed on the pairing secret instead of fanning it out.
+            if let Value::Object(map) = &mut broadcast_value {
+                map.insert(EPHEMERAL_BROADCAST_MARKER.to_string(), Value::Bool(true));
+            }
+        }
+        let _ = hook.send(broadcast_value);
     }
 
     let Some(state) = current_state() else {
@@ -129,13 +427,77 @@ pub fn record_event(event: LogEvent) {
         return;
     }
 
-    if let Err(err) = append_line(&state, &value) {
-        tracing::warn!(
-            target: "zeroclaw_log_internal",
-            error = ?err,
-            path = %state.policy.path.display(),
-            "log: append failed",
-        );
+    let job = WriterJob::Write(value);
+    match state.tx.try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(dropped)) => {
+            let _ = dropped;
+            tracing::warn!(
+                target: "zeroclaw_log_internal",
+                path = %state.policy.path.display(),
+                queue_capacity = QUEUE_CAPACITY,
+                "log: writer queue full; dropping event"
+            );
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            state.worker_dead.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// True when a broadcast frame was stamped with [`EPHEMERAL_BROADCAST_MARKER`]
+/// by [`record_event`] — i.e. it carries broadcast-only pairing secrets (QR
+/// payloads, pair codes) deep-merged into `attributes`.
+///
+/// Every consumer of the shared broadcast bus (the gateway SSE stream, the RPC
+/// `logs/subscribe` forwarder) uses this to fail closed on the credential
+/// unless it can prove its subscriber is authenticated.
+pub fn frame_carries_ephemeral_credentials(value: &Value) -> bool {
+    value
+        .get(EPHEMERAL_BROADCAST_MARKER)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Strip the internal [`EPHEMERAL_BROADCAST_MARKER`] from a broadcast frame
+/// before it is delivered to a consumer, so the public event shape is
+/// unchanged. Returns whether the marker was present.
+pub fn strip_ephemeral_broadcast_marker(value: &mut Value) -> bool {
+    value
+        .as_object_mut()
+        .and_then(|obj| obj.remove(EPHEMERAL_BROADCAST_MARKER))
+        .is_some()
+}
+
+/// Deep-merge the event's `ephemeral_attributes` into the broadcast
+/// value's `attributes` object. Ephemeral keys win on conflict (they are
+/// the fresher, call-site-provided data). Only object-into-object merges
+/// recurse; any other shape replaces wholesale.
+fn merge_ephemeral_into_attributes(broadcast_value: &mut Value, ephemeral: &Value) {
+    let Some(root) = broadcast_value.as_object_mut() else {
+        return;
+    };
+    let attributes = root
+        .entry("attributes".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    deep_merge(attributes, ephemeral);
+}
+
+fn deep_merge(target: &mut Value, incoming: &Value) {
+    match (target, incoming) {
+        (Value::Object(target_map), Value::Object(incoming_map)) => {
+            for (key, incoming_child) in incoming_map {
+                match target_map.get_mut(key) {
+                    Some(target_child) => deep_merge(target_child, incoming_child),
+                    None => {
+                        target_map.insert(key.clone(), incoming_child.clone());
+                    }
+                }
+            }
+        }
+        (target_slot, incoming_value) => {
+            *target_slot = incoming_value.clone();
+        }
     }
 }
 
@@ -154,61 +516,10 @@ fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<
     Ok(())
 }
 
-fn append_line(state: &Arc<WriterState>, value: &Value) -> Result<()> {
-    let _guard = state.write_lock.lock();
-
-    if let Some(parent) = state.policy.path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating log directory {}", parent.display()))?;
-    }
-
-    // Date-boundary rotation runs *before* the append so a new day's first
-    // event lands in a fresh file and the archived file holds exactly the prior
-    // day(s). Size rotation runs *after* the append (below), since it depends on
-    // the post-append file size.
-    if state.policy.storage == StoragePolicy::Rotating {
-        maybe_rotate_for_date(state)?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let file = options
-        .open(&state.policy.path)
-        .with_context(|| format!("opening log file {}", state.policy.path.display()))?;
-    let mut writer = BufWriter::new(file);
-    write_jsonl_line(&mut writer, value)?;
-    writer.flush().context("flushing log line")?;
-    let file = writer
-        .into_inner()
-        .context("taking log file out of buf writer")?;
-    file.sync_data().context("fsync log line")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&state.policy.path, fs::Permissions::from_mode(0o600));
-    }
-
-    match state.policy.storage {
-        StoragePolicy::Rolling => trim_to_last_entries(state)?,
-        StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
-        StoragePolicy::None | StoragePolicy::Full => {}
-    }
-
-    Ok(())
-}
-
 /// Rolling trim. Streams the file line-by-line into a temp file, keeping
 /// the last `max_entries` lines, then atomically renames. Never loads the
 /// whole file into memory.
-fn trim_to_last_entries(state: &Arc<WriterState>) -> Result<()> {
+fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     // Count lines first (cheap pass).
     let total = count_nonempty_lines(&state.policy.path)?;
     if total <= state.policy.max_entries {
@@ -289,16 +600,10 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
     Ok(n)
 }
 
-// ── Archive rotation (StoragePolicy::Rotating) ───────────────────────
-//
-// Unlike rolling trim (which discards old entries from the active file),
-// rotation renames the active file to a timestamped archive and prunes old
-// archives by count/age, preserving rotated events for later diagnostics.
-
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
 /// or it was last written today.
-fn maybe_rotate_for_date(state: &Arc<WriterState>) -> Result<()> {
+fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
     if !state.policy.rotate_daily {
         return Ok(());
     }
@@ -325,7 +630,7 @@ fn maybe_rotate_for_date(state: &Arc<WriterState>) -> Result<()> {
 /// Rotate the active file when a just-completed append left it at or above the
 /// configured byte budget. No-op when size rotation is disabled (`max_bytes`
 /// `== 0`) or the file is under budget.
-fn maybe_rotate_for_size(state: &Arc<WriterState>) -> Result<()> {
+fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
     let max = state.policy.max_bytes;
     if max == 0 {
         return Ok(());
@@ -348,12 +653,7 @@ fn maybe_rotate_for_size(state: &Arc<WriterState>) -> Result<()> {
     Ok(())
 }
 
-/// Rename the active file to a deterministic, lexically sortable archive name
-/// stamped with `when` (the time of the file's last event), then prune old
-/// archives. Archive names keep the active file's extension so an operator's
-/// `*.jsonl` tooling still matches them, e.g.
-/// `runtime-trace.jsonl` → `runtime-trace.20260624-031500.jsonl`.
-fn rotate_active(state: &Arc<WriterState>, when: DateTime<Utc>) -> Result<()> {
+fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     let path = &state.policy.path;
     let archive = archive_path(path, when)?;
     fs::rename(path, &archive)
@@ -365,7 +665,7 @@ fn rotate_active(state: &Arc<WriterState>, when: DateTime<Utc>) -> Result<()> {
         let _ = fs::set_permissions(&archive, fs::Permissions::from_mode(0o600));
     }
 
-    run_retention(state);
+    run_retention(&state.policy);
     Ok(())
 }
 
@@ -380,8 +680,9 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
     let (base, ext) = split_base_ext(file_name);
     let stamp = when.format("%Y%m%d-%H%M%S").to_string();
 
-    // Callers hold the writer `write_lock` across the existence check and the
-    // subsequent `fs::rename`, so the check-then-rename has no in-process race.
+    // The existence check and subsequent `fs::rename` are called from
+    // the single-threaded worker, so the check-then-rename has no
+    // in-process race.
     let mut candidate = dir.join(format!("{base}.{stamp}{ext}"));
     let mut n = 1u32;
     while candidate.exists() {
@@ -411,12 +712,6 @@ fn is_stamp(s: &str) -> bool {
         && b[9..].iter().all(u8::is_ascii_digit)
 }
 
-/// True when `core` is *exactly* the infix [`archive_path`] places between the
-/// base prefix and the extension: a `YYYYMMDD-HHMMSS` stamp, optionally followed
-/// by `.<digits>` (the same-second collision counter). The match is exact, not a
-/// prefix test, so a foreign sibling that merely *starts* with a stamp (e.g.
-/// `<stamp>.backup` or `<stamp>.notes`) is never treated as an archive and can
-/// never be pruned by retention.
 fn is_archive_core(core: &str) -> bool {
     match core.split_once('.') {
         // `<stamp>.<counter>` — counter must be a non-empty run of digits.
@@ -428,9 +723,6 @@ fn is_archive_core(core: &str) -> bool {
     }
 }
 
-/// List rotated archive files sitting next to the active file: siblings that
-/// share the active file's base and extension but are not the active file
-/// itself. Returns `(path, mtime)` pairs.
 fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
     let dir = active.parent().unwrap_or_else(|| Path::new("."));
     let active_name = active
@@ -459,12 +751,6 @@ fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
         let Some(suffix) = name.strip_prefix(&prefix) else {
             continue;
         };
-        // Archives keep the active file's extension, so strip it (and reject any
-        // same-stem sibling carrying a different one). What remains must be the
-        // *exact* shape `archive_path` generates — `<stamp>` or `<stamp>.<n>` —
-        // so retention never prunes a foreign or crash-orphaned sibling that
-        // merely starts with a stamp (e.g. `<stamp>.backup.jsonl`), even for an
-        // extension-less log path.
         let core = if ext.is_empty() {
             suffix
         } else {
@@ -489,14 +775,14 @@ fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
 /// Prune rotated archives by age then by count. Best-effort: a removal failure
 /// is logged but never fails the enclosing append, since retention is
 /// housekeeping rather than part of the durability contract.
-fn run_retention(state: &Arc<WriterState>) {
-    let max_files = state.policy.retention_max_files;
-    let max_age_days = state.policy.retention_max_age_days;
+fn run_retention(policy: &ResolvedPolicy) {
+    let max_files = policy.retention_max_files;
+    let max_age_days = policy.retention_max_age_days;
     if max_files == 0 && max_age_days == 0 {
         return;
     }
 
-    let mut archives = match list_archives(&state.policy.path) {
+    let mut archives = match list_archives(&policy.path) {
         Ok(a) => a,
         Err(err) => {
             tracing::warn!(
@@ -544,12 +830,6 @@ fn remove_archive(path: &Path) {
     }
 }
 
-/// Shared test-time mutex for tests that mutate the global writer state.
-/// Re-exported `pub(crate)` so `macro::tests` etc. can serialize against
-/// the same lock as `writer::tests`. Always compiled (not gated behind
-/// `#[cfg(test)]`) so peer crates can borrow it via the
-/// `__private_test_writer_lock` helper in `lib.rs`. A `parking_lot::Mutex`
-/// static costs nothing at runtime when untouched.
 pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
@@ -578,6 +858,7 @@ mod tests {
             record_event(ev);
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -587,6 +868,106 @@ mod tests {
             let v: Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
+    }
+
+    #[test]
+    fn ephemeral_attributes_reach_broadcast_but_never_disk() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        ev.message = Some("qr ready".to_string());
+        ev.attributes = serde_json::json!({
+            "login": { "state": "qr", "channel": "wechat.assistant" }
+        });
+        ev.ephemeral_attributes = serde_json::json!({
+            "login": { "qr_payload": "SECRET-QR-PAYLOAD" }
+        });
+        record_event(ev);
+
+        // Broadcast copy: ephemeral fields deep-merged into attributes.
+        let broadcast = rx.try_recv().expect("broadcast copy delivered");
+        assert_eq!(
+            broadcast["attributes"]["login"]["qr_payload"],
+            "SECRET-QR-PAYLOAD"
+        );
+        assert_eq!(broadcast["attributes"]["login"]["state"], "qr");
+
+        // Persisted copy: the credential never lands on disk.
+        flush_for_test().unwrap();
+        let path = runtime_trace_path().unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("SECRET-QR-PAYLOAD"),
+            "persisted JSONL must not contain ephemeral credentials: {contents}"
+        );
+        assert!(
+            contents.contains("\"state\":\"qr\""),
+            "persisted JSONL keeps the lifecycle state: {contents}"
+        );
+        let line: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert!(line["attributes"]["login"].get("qr_payload").is_none());
+        assert!(line.get("ephemeral_attributes").is_none());
+        // The broadcast-only fail-closed marker also never reaches disk.
+        assert!(line.get(EPHEMERAL_BROADCAST_MARKER).is_none());
+
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    /// A frame carrying `ephemeral_attributes` is stamped with the
+    /// fail-closed marker on the broadcast copy so an SSE layer that cannot
+    /// authenticate its subscribers can withhold the pairing secret. A frame
+    /// with no ephemeral attributes is never stamped.
+    #[test]
+    fn broadcast_frame_marks_ephemeral_credentials_for_fail_closed_delivery() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        let mut with_secret = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        with_secret.attributes = serde_json::json!({ "login": { "state": "qr" } });
+        with_secret.ephemeral_attributes =
+            serde_json::json!({ "login": { "qr_payload": "SECRET-QR-PAYLOAD" } });
+        record_event(with_secret);
+        let framed = rx.try_recv().expect("broadcast copy delivered");
+        assert_eq!(
+            framed[EPHEMERAL_BROADCAST_MARKER], true,
+            "credential-bearing frame must be marked for fail-closed delivery: {framed}"
+        );
+
+        let mut no_secret = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        no_secret.attributes = serde_json::json!({ "login": { "state": "connected" } });
+        record_event(no_secret);
+        let plain = rx.try_recv().expect("broadcast copy delivered");
+        assert!(
+            plain.get(EPHEMERAL_BROADCAST_MARKER).is_none(),
+            "credential-free frame must not be marked: {plain}"
+        );
+
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn deep_merge_prefers_ephemeral_on_conflict_and_recurses() {
+        let mut target = serde_json::json!({
+            "login": { "state": "qr", "attempt": 1 },
+            "other": "kept"
+        });
+        let incoming = serde_json::json!({
+            "login": { "qr_payload": "p", "attempt": 2 }
+        });
+        deep_merge(&mut target, &incoming);
+        assert_eq!(target["login"]["state"], "qr");
+        assert_eq!(target["login"]["qr_payload"], "p");
+        assert_eq!(target["login"]["attempt"], 2);
+        assert_eq!(target["other"], "kept");
     }
 
     #[test]
@@ -606,6 +987,106 @@ mod tests {
         assert!(
             !path.exists(),
             "no file should exist when storage is disabled"
+        );
+    }
+
+    #[test]
+    fn reinit_applies_changed_rotation_policy() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_rotating(tmp.path(), 0, false, 0, 0);
+
+        emit("before-reload");
+        flush_for_test().unwrap();
+
+        let path = runtime_trace_path().unwrap();
+        assert!(
+            list_archives(&path).unwrap().is_empty(),
+            "size rotation should be disabled before re-init"
+        );
+        assert_eq!(total_events(&path), 1);
+
+        install_rotating(tmp.path(), 1, false, 1, 0);
+        emit("after-reload");
+        flush_for_test().unwrap();
+
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "re-init should apply the new byte budget and rotate on the next append"
+        );
+        assert_eq!(
+            total_events(&path),
+            2,
+            "re-init must preserve already-written events while applying the new policy"
+        );
+    }
+
+    #[test]
+    fn reinit_can_disable_persistence_without_restart() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        emit("persisted-before-disable");
+        flush_for_test().unwrap();
+
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(count_lines(&path), 1);
+
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+
+        emit("not-persisted-after-disable");
+        // Disabled policy has no worker; flush is a no-op. Prior writes were
+        // drained by the shutdown path inside init_from_config.
+        flush_for_test().unwrap();
+
+        assert_eq!(
+            count_lines(&path),
+            1,
+            "disabled persistence after re-init should stop appending without deleting existing logs"
+        );
+    }
+
+    #[test]
+    fn reinit_shuts_down_previous_worker_before_installing_new() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        let first = current_state().expect("writer installed");
+        let first_dead = Arc::clone(&first.worker_dead);
+        assert!(
+            !first_dead.load(Ordering::Acquire),
+            "fresh worker should be alive"
+        );
+        // Drop our Arc clone so shutdown can close the channel. Holding it
+        // would keep the SyncSender alive and prevent the worker from exiting.
+        drop(first);
+
+        // Re-init with a different policy must tear down the first worker
+        // (channel disconnect → worker_dead) before installing the second.
+        install_rotating(tmp.path(), 0, false, 0, 0);
+
+        assert!(
+            first_dead.load(Ordering::Acquire),
+            "previous worker must exit during re-init so it cannot race the new policy"
+        );
+        let second = current_state().expect("replacement writer installed");
+        assert!(
+            !second.worker_dead.load(Ordering::Acquire),
+            "replacement worker should be alive"
+        );
+        // The replacement must not share the previous worker_dead flag —
+        // that would mean the old Arc was reused rather than replaced.
+        assert!(
+            !Arc::ptr_eq(&first_dead, &second.worker_dead),
+            "re-init must install a fresh WriterState, not mutate the old one"
         );
     }
 
@@ -633,6 +1114,13 @@ mod tests {
         let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
         ev.message = Some(msg.to_string());
         record_event(ev);
+        // JSONL fsync runs off the async hot path, so `record_event` returns
+        // before the line is on disk. Tests that assert on the log file
+        // immediately after emitting must flush first (the explicit idiom used
+        // throughout this module); folding it into `emit` keeps every
+        // emit-then-read test correct — notably the `reinit_*` tests, which
+        // read the file right after emitting.
+        flush_for_test().unwrap();
     }
 
     fn set_mtime(path: &Path, when: SystemTime) {
@@ -670,6 +1158,7 @@ mod tests {
             emit(&format!("event-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         let archives = list_archives(&path).unwrap();
         assert!(
@@ -699,6 +1188,7 @@ mod tests {
         // Today's first event must archive the stale file and start fresh.
         emit("today");
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         assert_eq!(
             archives.len(),
@@ -724,6 +1214,7 @@ mod tests {
             emit(&format!("e-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         assert!(
             list_archives(&path).unwrap().is_empty(),
@@ -748,6 +1239,7 @@ mod tests {
             emit(&format!("f-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         assert_eq!(total_events(&path), 6, "full keeps every event");
         assert!(list_archives(&path).unwrap().is_empty());
@@ -771,7 +1263,7 @@ mod tests {
             archives.push(p);
         }
 
-        run_retention(&current_state().unwrap());
+        run_retention(&current_state().unwrap().policy);
 
         assert!(
             !archives[0].exists() && !archives[1].exists(),
@@ -799,7 +1291,7 @@ mod tests {
         set_mtime(&old, SystemTime::now() - Duration::from_secs(3 * 86_400));
         set_mtime(&recent, SystemTime::now() - Duration::from_secs(3_600));
 
-        run_retention(&current_state().unwrap());
+        run_retention(&current_state().unwrap().policy);
 
         assert!(!old.exists(), "archive older than the age cap is pruned");
         assert!(recent.exists(), "recent archive is kept");
@@ -845,8 +1337,6 @@ mod tests {
         assert!(is_archive_core("20260624-031500")); // <stamp>
         assert!(is_archive_core("20260624-031500.1")); // <stamp>.<counter>
         assert!(is_archive_core("20260624-031500.42"));
-        // Foreign siblings that merely *start* with a stamp must be rejected, so
-        // they are never pruned (this is the boundary the review flagged).
         assert!(!is_archive_core("20260624-031500.backup"));
         assert!(!is_archive_core("20260624-031500.notes"));
         assert!(!is_archive_core("20260624-031500.1.2")); // counter is not multi-segment
@@ -873,6 +1363,7 @@ mod tests {
             emit(&format!("event-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         // Retention ran as a side effect of the real append path, capping the
         // archive set even though many more rotations occurred.
@@ -900,6 +1391,7 @@ mod tests {
             emit(&format!("burst-{i}"));
         }
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         // Daily rotation archives the stale file; size rotation adds more.
         assert!(
@@ -944,9 +1436,6 @@ mod tests {
         init_from_config(&cfg, tmp.path());
         let path = runtime_trace_path().unwrap();
 
-        // Two foreign siblings that share the base prefix must never be pruned:
-        // one with no stamp, and one that *starts* with a valid stamp but is not
-        // a shape `archive_path` generates (the boundary the review flagged).
         let foreign_plain = tmp.path().join("trace.notes");
         let foreign_stamped = tmp.path().join("trace.20260101-000000.notes");
         fs::write(&foreign_plain, "keep me\n").unwrap();
@@ -956,6 +1445,7 @@ mod tests {
             emit(&format!("e-{i}"));
         }
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         assert_eq!(
             archives.len(),
@@ -1003,6 +1493,7 @@ mod tests {
             emit(&format!("e-{i}"));
         }
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         assert!(
             archives.iter().all(|(p, _)| p != &foreign),

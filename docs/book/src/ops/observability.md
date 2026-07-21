@@ -124,9 +124,20 @@ redeploy.
 
 ## On-disk format
 
-JSONL: one event per line, UTF-8, `0o600` permissions on Unix. Every
-line is `sync_data`'d after write, the line is durable before the
-emitting code returns.
+JSONL: one event per line, UTF-8, `0o600` permissions on Unix. The
+hot path is non-blocking: `record_event` hands the serialized event
+to a dedicated background thread (`zeroclaw-log-writer`) via a bounded
+channel and returns immediately. The worker calls `sync_all` on a
+periodic cadence: every 100 writes or every 1 second of wall-clock
+time, whichever fires first, plus a final `sync_all` when the channel
+closes on normal shutdown. This trades per-event durability (the prior
+synchronous behaviour) for bounded write latency: a process crash may
+lose up to one sync interval of pending writes. If the worker falls
+behind, `record_event` drops the event with a `tracing::warn!` rather
+than blocking the async runtime. Workers are per-process singletons;
+disabling and re-enabling persistence via `init_from_config` drops the
+old worker (channel close triggers its final sync and thread exit) and
+spawns a fresh one.
 
 Line shape mirrors `zeroclaw_log::event::LogEvent`. Top-level keys:
 

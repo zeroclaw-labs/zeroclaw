@@ -24,17 +24,17 @@
 //!     "properties": {
 //!         "name": {
 //!             "type": "string",
-//!             "minLength": 1,  // Gemini rejects this
-//!             "pattern": "^[a-z]+$"  // Gemini rejects this
+//!             "minLength": 1, // Gemini rejects this
+//!             "pattern": "^[a-z]+$" // Gemini rejects this
 //!         },
 //!         "age": {
-//!             "$ref": "#/$defs/Age"  // Needs resolution
+//!             "$ref": "#/$defs/Age" // Needs resolution
 //!         }
 //!     },
 //!     "$defs": {
 //!         "Age": {
 //!             "type": "integer",
-//!             "minimum": 0  // Gemini rejects this
+//!             "minimum": 0 // Gemini rejects this
 //!         }
 //!     }
 //! });
@@ -43,16 +43,17 @@
 //!
 //! // Result:
 //! // {
-//! //   "type": "object",
-//! //   "properties": {
-//! //     "name": { "type": "string" },
-//! //     "age": { "type": "integer" }
-//! //   }
+//! // "type": "object",
+//! // "properties": {
+//! // "name": { "type": "string" },
+//! // "age": { "type": "integer" }
+//! // }
 //! // }
 //! ```
 //!
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Keywords that Gemini rejects for tool schemas.
 pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
@@ -133,6 +134,51 @@ impl SchemaCleanr {
     /// Clean schema for OpenAI compatibility (most permissive).
     pub fn clean_for_openai(schema: Value) -> Value {
         Self::clean(schema, CleaningStrategy::OpenAI)
+    }
+
+    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas:
+    /// returns the same `Arc` when the pre-scan proves cleaning is a
+    /// no-op, deep-copying the tree only when a rewrite is actually needed.
+    pub fn clean_shared(schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
+        if Self::needs_cleaning(schema, strategy) {
+            Arc::new(Self::clean((**schema).clone(), strategy))
+        } else {
+            Arc::clone(schema)
+        }
+    }
+
+    /// Conservative read-only pre-scan: `true` when [`Self::clean`] with
+    /// `strategy` could change `schema`.
+    ///
+    /// False positives are allowed (a flagged schema may clean to an equal
+    /// value); false negatives are not — `!needs_cleaning(s)` must imply
+    /// `clean(s) == s`. The triggers mirror every rewrite path in
+    /// `clean_object`: strategy-specific keyword removal, plus the
+    /// strategy-independent rewrites (`$ref` resolution, `const` → `enum`,
+    /// `anyOf`/`oneOf` simplification and sibling-`type` skipping, and
+    /// null-stripping in `type` arrays).
+    pub fn needs_cleaning(schema: &Value, strategy: CleaningStrategy) -> bool {
+        match schema {
+            Value::Object(obj) => {
+                let unsupported = strategy.unsupported_keywords();
+                for (key, value) in obj {
+                    if unsupported.contains(&key.as_str()) {
+                        return true;
+                    }
+                    match key.as_str() {
+                        "$ref" | "const" | "anyOf" | "oneOf" => return true,
+                        "type" if value.is_array() => return true,
+                        _ => {}
+                    }
+                    if Self::needs_cleaning(value, strategy) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Value::Array(arr) => arr.iter().any(|v| Self::needs_cleaning(v, strategy)),
+            _ => false,
+        }
     }
 
     /// Clean schema with specified strategy.
@@ -541,6 +587,104 @@ impl SchemaCleanr {
 mod tests {
     use super::*;
 
+    /// `!needs_cleaning(s)` must imply `clean(s) == s` — the safety contract
+    /// that lets `clean_shared` skip the deep copy.
+    #[test]
+    fn test_needs_cleaning_false_implies_clean_is_identity() {
+        let clean_schemas = [
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path" },
+                    "recursive": { "type": "boolean", "default": false },
+                    "depth": { "type": "integer" }
+                },
+                "required": ["path"]
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "items": { "type": "array", "items": { "type": "string" } },
+                    "mode": { "type": "string", "enum": ["fast", "slow"] }
+                }
+            }),
+            json!({ "type": "object", "properties": {} }),
+        ];
+        for strategy in [
+            CleaningStrategy::Gemini,
+            CleaningStrategy::Anthropic,
+            CleaningStrategy::OpenAI,
+            CleaningStrategy::Conservative,
+        ] {
+            for schema in &clean_schemas {
+                assert!(
+                    !SchemaCleanr::needs_cleaning(schema, strategy),
+                    "expected no cleaning needed for {schema} under {strategy:?}"
+                );
+                assert_eq!(
+                    SchemaCleanr::clean(schema.clone(), strategy),
+                    *schema,
+                    "clean must be identity when needs_cleaning is false ({strategy:?})"
+                );
+            }
+        }
+    }
+
+    /// Every rewrite path in the cleaner must be flagged by the pre-scan.
+    #[test]
+    fn test_needs_cleaning_flags_every_rewrite_trigger() {
+        let dirty = [
+            // $ref resolution happens for every strategy.
+            json!({ "$ref": "#/$defs/Age", "$defs": { "Age": { "type": "integer" } } }),
+            // const → enum conversion.
+            json!({ "const": "fixed" }),
+            // anyOf/oneOf simplification and sibling-type skipping.
+            json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] }),
+            json!({ "oneOf": [{ "type": "string" }, { "type": "number" }] }),
+            // type-array null stripping.
+            json!({ "type": ["string", "null"] }),
+            // Nested trigger below the top level.
+            json!({
+                "type": "object",
+                "properties": { "role": { "const": "admin" } }
+            }),
+        ];
+        for schema in &dirty {
+            assert!(
+                SchemaCleanr::needs_cleaning(schema, CleaningStrategy::OpenAI),
+                "expected cleaning flagged even for the most permissive strategy: {schema}"
+            );
+        }
+        // Strategy-specific keyword removal.
+        let has_min_length = json!({ "type": "string", "minLength": 1 });
+        assert!(SchemaCleanr::needs_cleaning(
+            &has_min_length,
+            CleaningStrategy::Gemini
+        ));
+        assert!(!SchemaCleanr::needs_cleaning(
+            &has_min_length,
+            CleaningStrategy::Anthropic
+        ));
+    }
+
+    #[test]
+    fn test_clean_shared_returns_same_arc_when_clean() {
+        let schema = Arc::new(json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        }));
+        let shared = SchemaCleanr::clean_shared(&schema, CleaningStrategy::Anthropic);
+        assert!(
+            Arc::ptr_eq(&schema, &shared),
+            "clean schema must be shared, not copied"
+        );
+
+        let dirty = Arc::new(json!({ "type": "string", "const": "x" }));
+        let cleaned = SchemaCleanr::clean_shared(&dirty, CleaningStrategy::Anthropic);
+        assert!(!Arc::ptr_eq(&dirty, &cleaned));
+        assert_eq!(cleaned["enum"], json!(["x"]));
+    }
+
     #[test]
     fn test_remove_unsupported_keywords() {
         let schema = json!({
@@ -581,6 +725,27 @@ mod tests {
 
         assert_eq!(cleaned["properties"]["age"]["type"], "integer");
         assert!(cleaned["properties"]["age"].get("minimum").is_none()); // Stripped by Gemini strategy
+        assert!(cleaned.get("$defs").is_none());
+    }
+
+    #[test]
+    fn test_resolve_ref_decodes_json_pointer_escapes() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "slash": { "$ref": "#/$defs/Foo~1Bar" },
+                "tilde": { "$ref": "#/$defs/Tilde~0Name" }
+            },
+            "$defs": {
+                "Foo/Bar": { "type": "string" },
+                "Tilde~Name": { "type": "integer" }
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_anthropic(schema);
+
+        assert_eq!(cleaned["properties"]["slash"]["type"], "string");
+        assert_eq!(cleaned["properties"]["tilde"]["type"], "integer");
         assert!(cleaned.get("$defs").is_none());
     }
 

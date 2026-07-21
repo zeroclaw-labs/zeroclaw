@@ -1,12 +1,5 @@
 //! `GitChannel` — the provider-agnostic composition root implementing the
 //! `Channel` trait over a [`GitProvider`].
-//!
-//! Layer: channel composition root. Owns everything forge-neutral — the
-//! poll loop, dedup, per-stream cursor advance, routing, dispatch, draft
-//! throttle, comment chunking, mention gating, and allowlist — and drives
-//! a single boxed provider for all forge IO. Selecting and constructing
-//! the provider from config is the only forge-aware step, isolated to
-//! [`build_provider`]; everything else here is identical for any forge.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,7 +14,9 @@ use super::events::{self, EventFilter, GitEvent};
 use super::poll::{PollState, PollStream};
 use super::router::{self, RouteAction, TransportPlan};
 use super::traits::{GitProvider, ReactionTarget, SelfIdentity};
-use super::types::{COMMENT_MAX_CHARS, GitChannelError, IssueRef, RepoRef};
+use super::types::{
+    COMMENT_MAX_CHARS, ForgeMethod, ForgeRequest, GitChannelError, IssueRef, RepoRef,
+};
 
 /// The channel key under `[channels.git.<alias>]` — also stamped on every
 /// `ChannelMessage` as its `channel`.
@@ -35,6 +30,52 @@ const MIN_POLL_INTERVAL_SECS: u64 = 15;
 /// abuse limits punish rapid content mutation.
 const DRAFT_EDIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Resolve the GitHub App private key PEM, preferring the inline `private_key`
+/// and falling back to reading `private_key_path` from disk. Backward-compatible
+/// with configs that predate the inline field.
+fn resolve_github_private_key(cfg: &GitConfig) -> anyhow::Result<Option<String>> {
+    if cfg.private_key.is_some() {
+        return Ok(cfg.private_key.clone());
+    }
+    let Some(path) = cfg
+        .private_key_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(pem) => {
+            warn_on_loose_permissions(path);
+            Ok(Some(pem))
+        }
+        Err(e) => anyhow::bail!("git channel: reading private_key_path `{path}` failed: {e}"),
+    }
+}
+
+/// The private key is a long-lived credential: group/other access on the
+/// key file is operator error worth surfacing, but not worth refusing to
+/// start over.
+#[cfg(unix)]
+fn warn_on_loose_permissions(path: &str) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.mode() & 0o077 != 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"path": path})),
+            "GitHub App private key is readable by group/other; chmod 600 recommended"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_on_loose_permissions(_path: &str) {}
+
 /// Build the configured forge provider, or a clear error for an unknown
 /// `provider` value. The only forge-aware seam in the channel.
 fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
@@ -44,7 +85,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             {
                 Ok(Box::new(super::providers::github::GithubProvider::new(
                     cfg.app_id,
-                    cfg.private_key_path.clone(),
+                    resolve_github_private_key(cfg)?,
                     cfg.installation_id,
                     cfg.proxy_url.clone(),
                 )))
@@ -133,7 +174,6 @@ impl GitChannel {
         })
     }
 
-    /// Construct with an explicit provider (mock-server tests).
     #[cfg(test)]
     fn with_provider(
         cfg: GitConfig,
@@ -231,11 +271,6 @@ impl GitChannel {
         streams
     }
 
-    /// Poll one repo's active streams through the provider, dedup and
-    /// order the normalized events, and dispatch them in event-time
-    /// order. Returns `Ok(false)` when the orchestrator hung up; provider
-    /// errors are returned for the caller to log and continue (rate
-    /// limiting is handled specially there).
     async fn poll_repo(
         &self,
         repo: &RepoRef,
@@ -246,12 +281,6 @@ impl GitChannel {
     ) -> Result<bool, GitChannelError> {
         let repo_key = repo.to_string();
         let mut batch: Vec<GitEvent> = Vec::new();
-        // Cursor advances and the fresh feed ETag are STAGED here, not
-        // committed to `state`, until the whole batch has been dispatched.
-        // A fetch error on a later stream (or the rate-limit backoff that
-        // re-enters this function) must not advance a cursor or mark an
-        // event seen for events that were never delivered — otherwise the
-        // next tick skips them permanently.
         let mut advances: Vec<(PollStream, DateTime<Utc>)> = Vec::new();
         let mut fresh_etag: Option<String> = None;
         // Dedup across streams within this tick, since the shared seen-set
@@ -311,11 +340,6 @@ impl GitChannel {
         Ok(true)
     }
 
-    /// Route one typed event through the per-event table and deliver it.
-    /// Returns `false` when the orchestrator hung up.
-    ///
-    /// SOP-routed events are emitted as channel-carried SOP envelopes;
-    /// the orchestrator consumes them before normal chat processing.
     async fn dispatch_event(
         &self,
         event: GitEvent,
@@ -602,6 +626,30 @@ impl Channel for GitChannel {
         self.provider.add_reaction(&target, emoji).await?;
         Ok(())
     }
+
+    async fn forge_request(
+        &self,
+        request: zeroclaw_api::channel::ForgeApiRequest,
+    ) -> anyhow::Result<zeroclaw_api::channel::ForgeApiResponse> {
+        let Some(method) = ForgeMethod::parse(&request.method) else {
+            anyhow::bail!(
+                "invalid forge HTTP method `{}` (expected GET/POST/PATCH/PUT/DELETE)",
+                request.method
+            );
+        };
+        let resp = self
+            .provider
+            .forge_request(ForgeRequest {
+                method,
+                path: request.path,
+                body: request.body,
+            })
+            .await?;
+        Ok(zeroclaw_api::channel::ForgeApiResponse {
+            status: resp.status,
+            body: resp.body,
+        })
+    }
 }
 
 /// Split text into comment-sized chunks at paragraph (preferred) or word
@@ -652,6 +700,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_key_prefers_inline_then_path() {
+        let inline = GitConfig {
+            private_key: Some("INLINE-PEM".to_string()),
+            private_key_path: Some("/does/not/matter".to_string()),
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            resolve_github_private_key(&inline).unwrap().as_deref(),
+            Some("INLINE-PEM")
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("git_key_{}.pem", std::process::id()));
+        std::fs::write(&path, "PATH-PEM").unwrap();
+        let from_path = GitConfig {
+            private_key: None,
+            private_key_path: Some(path.to_string_lossy().into_owned()),
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            resolve_github_private_key(&from_path).unwrap().as_deref(),
+            Some("PATH-PEM")
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let neither = GitConfig::default();
+        assert!(resolve_github_private_key(&neither).unwrap().is_none());
+
+        let missing = GitConfig {
+            private_key: None,
+            private_key_path: Some("/no/such/key.pem".to_string()),
+            ..GitConfig::default()
+        };
+        assert!(resolve_github_private_key(&missing).is_err());
+    }
+
+    #[test]
     fn unknown_provider_is_a_clear_error() {
         let cfg = GitConfig {
             provider: "bitbucket".to_string(),
@@ -669,12 +754,6 @@ mod tests {
         assert!(msg.contains("supported: github, gitea, forgejo"));
     }
 
-    // Regression (fail closed): a gitea/forgejo config without api_base_url
-    // must error at construction - synchronously, before any provider or
-    // HTTP client exists, so no request (carrying the access token) can be
-    // sent anywhere. The old code silently fell back to
-    // https://gitea.com/api/v1 and attached the configured token to every
-    // request against it.
     #[cfg(feature = "provider-gitea")]
     #[test]
     fn gitea_forgejo_without_api_base_url_fails_closed() {
@@ -754,30 +833,17 @@ mod tests {
         }
     }
 
-    // ── Mock-server integration tests (wiremock) ───────────────────
-    //
-    // These exercise the GitHub provider THROUGH the generic `GitChannel`:
-    // the same GitHub REST mocks, the same assertions as the original
-    // channel-github suite, now flowing provider → generic poll/dedup/
-    // dispatch.
     #[cfg(feature = "provider-github")]
     mod github_integration {
         use super::*;
         use crate::git::providers::github::api_test_support::with_base;
         use crate::git::providers::github::{GithubProvider, TEST_KEY_PEM};
 
-        fn write_test_key() -> tempfile::NamedTempFile {
-            use std::io::Write;
-            let mut f = tempfile::NamedTempFile::new().unwrap();
-            f.write_all(TEST_KEY_PEM.as_bytes()).unwrap();
-            f
-        }
-
-        fn base_cfg(key_file: &tempfile::NamedTempFile) -> GitConfig {
+        fn base_cfg() -> GitConfig {
             GitConfig {
                 enabled: true,
                 app_id: 1,
-                private_key_path: key_file.path().to_string_lossy().into_owned(),
+                private_key: Some(TEST_KEY_PEM.to_string()),
                 installation_id: Some(77),
                 repos: vec!["octo/repo".into()],
                 ..GitConfig::default()
@@ -788,7 +854,7 @@ mod tests {
         fn mock_channel(cfg: GitConfig, server_uri: String) -> GitChannel {
             let provider = GithubProvider::new(
                 cfg.app_id,
-                cfg.private_key_path.clone(),
+                cfg.private_key.clone(),
                 cfg.installation_id,
                 None,
             )
@@ -875,8 +941,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
 
             let filter = test_filter();
             let plan = default_plan();
@@ -939,8 +1004,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let key = write_test_key();
-            let mut cfg = base_cfg(&key);
+            let mut cfg = base_cfg();
             cfg.events.insert(
                 "pull_request.opened".to_string(),
                 zeroclaw_config::schema::GitEventRoute {
@@ -1025,10 +1089,9 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
             let cfg = GitConfig {
                 events_backbone: true,
-                ..base_cfg(&key)
+                ..base_cfg()
             };
             let ch = mock_channel(cfg, server.uri());
 
@@ -1102,8 +1165,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let mut cfg = base_cfg(&key);
+            let mut cfg = base_cfg();
             cfg.events.insert(
                 "workflow_run.failed".to_string(),
                 zeroclaw_config::schema::GitEventRoute {
@@ -1158,8 +1220,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
@@ -1199,8 +1260,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let draft_id = ch
                 .send_draft(&SendMessage::new("thinking…", "octo/repo#5"))
                 .await
@@ -1233,8 +1293,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
@@ -1253,13 +1312,6 @@ mod tests {
             }
         }
 
-        /// Regression: a fetch error on a later stream must not drop events
-        /// already fetched from an earlier one. Before the staged-commit
-        /// fix, `poll_repo` advanced the Issues cursor and marked the issue
-        /// seen the moment the Issues stream returned, so a Comments-stream
-        /// error (the same shape as the rate-limit backoff that re-enters
-        /// this function) permanently lost the already-fetched issue: the
-        /// next tick's cursor had moved past it and the dedup set held it.
         #[tokio::test]
         async fn later_stream_error_does_not_drop_earlier_events() {
             use wiremock::matchers::{method, path};
@@ -1288,8 +1340,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let floor = now - chrono::Duration::hours(1);
@@ -1329,13 +1380,6 @@ mod tests {
             assert!(rx2.recv().await.is_none());
         }
 
-        /// Regression: the Issues stream follows `Link: rel="next"`
-        /// pagination, so items beyond the first 100-item page are still
-        /// delivered. Before this, one unpaginated page let a busy repo's
-        /// older `updated`-matching items saturate the page and starve
-        /// newer ones, livelocking a cursor that advances on the newest
-        /// returned item. Here page one links to page two and both issues
-        /// are forwarded.
         #[tokio::test]
         async fn issues_stream_follows_link_pagination() {
             use wiremock::matchers::{method, path};
@@ -1378,8 +1422,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(now - chrono::Duration::hours(1));
