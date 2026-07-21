@@ -740,12 +740,16 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if matches!(
+    if !matches!(
         root_config.effective_skills_prompt_mode(agent_alias),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
     ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+        // Global `full` is deprecated and inert, so skills render compactly and
+        // `read_skill` loads instructions on demand. A per-agent runtime profile
+        // that explicitly pins `full` still inlines skills eagerly and
+        // therefore skips `read_skill`. ReadSkillTool holds full config to
+        // support all skill sources: workspace skills, open-skills, agent-bound
+        // bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -2564,7 +2568,9 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
+    fn all_tools_registers_read_skill_even_with_deprecated_full() {
+        // `prompt_injection_mode = full` is deprecated and inert: skills always
+        // render compactly, so `read_skill` must be registered regardless.
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2600,7 +2606,7 @@ mod tests {
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"read_skill"));
+        assert!(names.contains(&"read_skill"));
     }
 
     fn registry_names(tmp: &TempDir, is_subagent_caller: bool) -> Vec<String> {
@@ -2729,7 +2735,8 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         // Global is Compact; a runtime profile pins this agent to Full and the
-        // agent selects it via `runtime_profile`.
+        // agent selects it via `runtime_profile`. The Full pin inlines skills
+        // eagerly, so read_skill must be omitted.
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
         cfg.runtime_profiles.insert(

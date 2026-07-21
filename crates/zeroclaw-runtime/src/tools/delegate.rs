@@ -2374,7 +2374,7 @@ impl DelegateTool {
             model_name,
             tools: prompt_tools,
             skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
@@ -5488,6 +5488,48 @@ mod tests {
         assert!(!prompt.contains("ISO 8601:"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_honors_resolved_full_skill_mode() {
+        let mut config = AliasedAgentConfig::default();
+        config.resolved.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let workspace = std::env::temp_dir();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run <smoke> & release checks.".into()],
+            slash_options: Vec::new(),
+            location: None,
+        }];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf());
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                Some(&skills),
+            )
+            .unwrap();
+
+        assert!(prompt.contains("<instructions>"));
+        assert!(
+            prompt.contains("<instruction>Run &lt;smoke&gt; &amp; release checks.</instruction>")
+        );
+        assert!(!prompt.contains("read_skill"));
+        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]

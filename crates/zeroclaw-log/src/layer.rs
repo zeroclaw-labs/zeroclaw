@@ -701,6 +701,64 @@ mod e2e_tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
+    async fn scope_span_entered_sync_binds_skill_bundle() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        {
+            let _scope = zeroclaw_log::scope_span!(skill_bundle: "skills").entered();
+            zeroclaw_log::record!(
+                INFO,
+                Event::new(module_path!(), Action::Note).with_outcome(EventOutcome::Success),
+                "scope-span sync skill_bundle test"
+            );
+        }
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("scope-span sync skill_bundle test"))
+                        .unwrap_or(false)
+                    {
+                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                        assert_eq!(
+                            zc.get("skill_bundle").and_then(|v| v.as_str()),
+                            Some("skills"),
+                            "expected skill_bundle attribution, got: {zc:?}"
+                        );
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found,
+            "did not find the test event with scope_span skill_bundle attribution",
+        );
+
+        crate::clear_broadcast_hook();
+    }
+
+    /// A `Role::System` span carries a queryable alias. Config load and
+    /// migration attribution must land `system_alias` in `LogEvent.zeroclaw`,
+    /// not merely set `zc_role = system` with the alias dropped.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
     async fn system_role_span_populates_system_alias() {
         let _subscriber_guard = TEST_LOCK.lock();
         let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();

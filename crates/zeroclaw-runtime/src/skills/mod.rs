@@ -1595,12 +1595,12 @@ fn display_skill_location(path: &Path) -> String {
     }
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the "Available Skills" system prompt section (compact summaries).
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     skills_to_prompt_with_mode(
         skills,
         workspace_dir,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
     )
 }
 
@@ -1618,10 +1618,14 @@ fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
     }
 }
 
-/// Build the "Available Skills" system prompt section with configurable verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
     workspace_dir: &Path,
+    // A per-agent runtime profile can pin `Full` to inline skill instructions
+    // eagerly. Global `full` is deprecated and inert: it resolves to
+    // `Compact` before reaching here, so an agent gets full inlining only when
+    // its runtime profile explicitly pins `Full`, otherwise skills render as
+    // compact summaries whose instructions load on demand via `read_skill`.
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
@@ -1630,44 +1634,39 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
+    let is_full = matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    );
+
+    let mut prompt = if is_full {
+        String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
-        ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
+        )
+    } else {
+        String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
-        ),
+        )
     };
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, !is_full);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
+        // Full mode inlines instructions eagerly. Compact mode skips them
+        // (loaded on demand via `read_skill`) and inlines only tool metadata so
+        // the LLM knows which skill tools exist.
+        if is_full && !skill.prompts.is_empty() {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
@@ -4090,6 +4089,75 @@ mod prompt_callable_name_tests {
         assert!(
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+
+    /// Pins the restored `Full` prompt-rendering branch: a runtime-profile
+    /// `Full` pin must inline skill instructions eagerly, must NOT emit the compact
+    /// "load on demand via read_skill" language, and must keep XML-escaping the
+    /// instruction text. Fails if `skills_to_prompt_with_mode` ever reverts to
+    /// ignoring its `mode` parameter — the prompt-half counterpart to
+    /// `all_tools_omits_read_skill_for_full_agent_override_over_global_compact`.
+    #[test]
+    fn full_mode_prompt_inlines_escaped_instructions_and_omits_read_skill() {
+        let skill = Skill {
+            name: "probe".to_string(),
+            description: "test skill".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["Handle <tags> & \"quotes\" carefully".to_string()],
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let full = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        // Full inlines instructions eagerly, XML-escaped — never raw.
+        assert!(
+            full.contains("<instructions>"),
+            "full mode must inline an <instructions> block:\n{full}",
+        );
+        assert!(
+            full.contains(
+                "<instruction>Handle &lt;tags&gt; &amp; &quot;quotes&quot; carefully</instruction>"
+            ),
+            "full mode must XML-escape inlined instruction text:\n{full}",
+        );
+        assert!(
+            !full.contains("Handle <tags> & \"quotes\""),
+            "raw, unescaped instruction text must never reach the prompt:\n{full}",
+        );
+        // Full must not fall back to the compact on-demand language.
+        assert!(
+            !full.contains("read_skill"),
+            "full mode must not emit the compact read_skill language:\n{full}",
+        );
+        assert!(
+            !full.contains("loaded on demand"),
+            "full mode must not emit the compact load-on-demand language:\n{full}",
+        );
+
+        // Counterpart: the same skill under Compact omits inlined instructions
+        // and advertises `read_skill` for on-demand loading.
+        let compact = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        );
+        assert!(
+            !compact.contains("<instructions>"),
+            "compact mode must not inline instructions:\n{compact}",
+        );
+        assert!(
+            compact.contains("read_skill"),
+            "compact mode must advertise `read_skill`:\n{compact}",
         );
     }
 
