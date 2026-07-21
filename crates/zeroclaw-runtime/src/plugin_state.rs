@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -473,9 +474,22 @@ impl Drop for StateEnvelope {
 }
 
 fn open_database(path: &Path) -> Result<Connection, PluginStateError> {
+    // Different agent/plugin registries can lazily open this install-owned
+    // database at the same time. Serialize first-open PRAGMAs and schema setup
+    // so concurrent stores do not race `journal_mode` or DDL before SQLite's
+    // busy timeout is active.
+    static DATABASE_OPEN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _open_guard = DATABASE_OPEN_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
     let parent = path.parent().ok_or(PluginStateError::Unavailable)?;
     std::fs::create_dir_all(parent).map_err(|_| PluginStateError::Unavailable)?;
     let connection = Connection::open(path).map_err(|_| PluginStateError::Unavailable)?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|_| PluginStateError::Unavailable)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -486,7 +500,6 @@ fn open_database(path: &Path) -> Result<Connection, PluginStateError> {
         .execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
-             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS plugin_state (
                  owner BLOB NOT NULL,
                  locator BLOB PRIMARY KEY NOT NULL,
@@ -686,6 +699,43 @@ mod tests {
         let value = restarted.get(&primary, &state_key).await.unwrap().unwrap();
         assert_eq!(value.value(), plaintext);
         assert_eq!(value.revision(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_writes_share_the_install_key_and_database() {
+        let root = TempDir::new().unwrap();
+        let first = store(&root);
+        let second = store(&root);
+        let instance_scope = scope("concurrent");
+        let first_key = key("first");
+        let second_key = key("second");
+
+        let (first_revision, second_revision) = tokio::join!(
+            first.put(&instance_scope, &first_key, b"one", None),
+            second.put(&instance_scope, &second_key, b"two", None),
+        );
+        assert_eq!(first_revision, Ok(1));
+        assert_eq!(second_revision, Ok(1));
+
+        let reopened = store(&root);
+        assert_eq!(
+            reopened
+                .get(&instance_scope, &first_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value(),
+            b"one"
+        );
+        assert_eq!(
+            reopened
+                .get(&instance_scope, &second_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .value(),
+            b"two"
+        );
     }
 
     #[tokio::test]
