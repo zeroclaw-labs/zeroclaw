@@ -555,8 +555,8 @@ impl CompatFamilySpec for AnyscaleModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
 }
 impl CompatFamilySpec for NebiusModelProviderConfig {
-    const DISPLAY: &'static str = "Nebius AI Studio";
-    const DEFAULT_URL: &'static str = "https://api.studio.nebius.ai/v1";
+    const DISPLAY: &'static str = "Nebius Token Factory";
+    const DEFAULT_URL: &'static str = "https://api.tokenfactory.nebius.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nebius");
 }

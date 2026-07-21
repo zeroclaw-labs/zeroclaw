@@ -32,8 +32,10 @@ const MAX_INPUT_ROWS: u16 = 5;
 const SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
+    "/browse",
     "/clear-queue",
     "/detach",
+    "/help",
     "/model",
     "/model-provider",
     "/new",
@@ -73,6 +75,10 @@ pub(crate) enum InputBarAction {
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
     ToggleThinking,
+    /// User typed `/browse` — parent should enter transcript browse mode.
+    EnterBrowseMode,
+    /// User typed `/help` — parent should open the app-level Help overlay.
+    OpenHelp,
     /// User chose a model directly (`/model <name>`) — parent applies it via
     /// `session/configure`.
     SetModel(String),
@@ -109,6 +115,8 @@ enum SlashCommand<'a> {
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
     RestartSession,
+    EnterBrowseMode,
+    OpenHelp,
     NotACommand,
 }
 
@@ -134,6 +142,10 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::RestartSession
     } else if trimmed == "/toggle-thinking" {
         SlashCommand::ToggleThinking
+    } else if trimmed == "/browse" {
+        SlashCommand::EnterBrowseMode
+    } else if trimmed == "/help" {
+        SlashCommand::OpenHelp
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
         let name = name.trim();
         if name.is_empty() {
@@ -1307,6 +1319,8 @@ impl InputBarState {
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+                SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
+                SlashCommand::OpenHelp => InputBarAction::OpenHelp,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -1688,15 +1702,7 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>()).with_child(
-            HelpNode::titled(
-                crate::i18n::t("zc-input-help-slash-commands"),
-                SLASH_COMMANDS
-                    .iter()
-                    .map(|cmd| E::key(*cmd, String::new()))
-                    .collect(),
-            ),
-        )
+        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>())
     }
 }
 
@@ -1991,6 +1997,14 @@ mod tests {
             SlashCommand::ToggleThinking
         ));
         assert!(matches!(
+            parse_slash_command("/browse"),
+            SlashCommand::EnterBrowseMode
+        ));
+        assert!(matches!(
+            parse_slash_command("/help"),
+            SlashCommand::OpenHelp
+        ));
+        assert!(matches!(
             parse_slash_command("hello"),
             SlashCommand::NotACommand
         ));
@@ -2161,24 +2175,22 @@ mod tests {
     }
 
     #[test]
-    fn help_context_lists_slash_commands_from_canonical_source() {
+    fn help_context_keeps_slash_commands_out_of_general_help() {
         use crate::widgets::HelpContext;
         let bar = InputBarState::new();
         let node = bar.help_context();
-        let title = crate::i18n::t("zc-input-help-slash-commands");
-        let section = node
-            .children
+        let listed = node
+            .entries
             .iter()
-            .find(|c| c.title.as_deref() == Some(title.as_str()))
-            .expect("slash-commands section present");
-        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
-        for cmd in SLASH_COMMANDS {
+            .chain(node.children.iter().flat_map(|child| child.entries.iter()))
+            .map(|entry| entry.key_str())
+            .collect::<Vec<_>>();
+        for command in SLASH_COMMANDS {
             assert!(
-                listed.iter().any(|k| k == cmd),
-                "slash command {cmd} must appear in the help section"
+                !listed.iter().any(|key| key == command),
+                "{command} stays in autocomplete, not the general Help modal"
             );
         }
-        assert_eq!(listed.len(), SLASH_COMMANDS.len());
     }
 
     #[test]
@@ -2189,6 +2201,23 @@ mod tests {
             bar.handle_enter(),
             InputBarAction::OpenModelProviderPicker
         ));
+    }
+
+    #[test]
+    fn browse_command_returns_enter_browse_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/browse");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::EnterBrowseMode
+        ));
+    }
+
+    #[test]
+    fn help_command_returns_open_help_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/help");
+        assert!(matches!(bar.handle_enter(), InputBarAction::OpenHelp));
     }
 
     #[test]
