@@ -42,6 +42,10 @@ zeroclaw eval run --suite evals/regression --format json
 loading is non-recursive: only direct `*.json` children of the suite directory
 are cases.
 
+`--format` selects `table` (default), `json`, or `junit`. JUnit XML maps each
+case to a `<testcase>`: a failing case becomes a `<failure>`, a run error an
+`<error>`, and a case that is unverifiable against a baseline a `<skipped/>`.
+
 ## Live mode
 
 Live mode (`--mode live`) runs each case against a real configured provider, so it

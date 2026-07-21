@@ -3,6 +3,7 @@
 pub mod baseline;
 pub mod case;
 pub mod grader;
+pub mod junit;
 pub mod live;
 pub mod observer;
 pub mod record;

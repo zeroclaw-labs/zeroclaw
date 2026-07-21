@@ -92,6 +92,21 @@ pub async fn finalize(
         }
     };
 
+    if opts.format == OutputFormat::Junit {
+        // Cases unverifiable against the baseline render as <skipped/>.
+        let skipped: Vec<&str> = comparison
+            .as_ref()
+            .map(|cmp| {
+                cmp.per_case
+                    .iter()
+                    .filter(|(_, c)| matches!(c, CaseComparison::Unverifiable))
+                    .map(|(id, _)| id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        print!("{}", zeroclaw_eval::junit::render_junit(&report, &skipped));
+    }
+
     Ok(report.exit_code(kind, comparison.as_ref()))
 }
 
@@ -352,13 +367,18 @@ pub enum OutputFormat {
     Table,
     /// Machine-readable JSON, for CI artifacts.
     Json,
+    /// JUnit XML, for CI test reporters.
+    Junit,
 }
 
-/// Render a suite report in the requested format.
+/// Render a suite report in the requested format. JUnit is emitted separately in
+/// `finalize` (it needs the baseline comparison for `<skipped/>`), so it is a
+/// no-op here.
 pub fn print_report(report: &SuiteReport, format: OutputFormat) {
     match format {
         OutputFormat::Json => println!("{}", report.to_json()),
         OutputFormat::Table => println!("{}", report.render_table()),
+        OutputFormat::Junit => {}
     }
 }
 
