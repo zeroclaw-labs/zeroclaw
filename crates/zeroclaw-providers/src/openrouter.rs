@@ -1806,12 +1806,11 @@ mod tests {
 
     #[test]
     fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
-        // Regression for #8675: a malformed arguments string in the assistant
-        // history must be normalized to "{}" so the outbound chat-completions
-        // request doesn't 400 on strict upstreams. This test pins that the
-        // openrouter call site of `sanitize_tool_arguments` is wired in; the
-        // helper contract itself is covered in
-        // `compatible::tests::sanitize_tool_arguments_*`.
+        // A malformed arguments string in the assistant history must be
+        // normalized to "{}" so the outbound chat-completions request doesn't
+        // 400 on strict upstreams. This test pins that the openrouter call site
+        // of `sanitize_tool_arguments` is wired in; the helper contract itself
+        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
