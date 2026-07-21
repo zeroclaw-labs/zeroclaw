@@ -102,6 +102,26 @@ Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never
 gate. To refresh a baseline after an intentional behavior change, re-run with
 `--write-baseline` and commit the updated file.
 
+## Repeated runs (pass@k, pass^k, variance)
+
+A live case can set `repeat: k` (clamped to 1..=50) to run k fully isolated times
+(fresh workspace, agent, and provider each run). Replay is deterministic, so
+`repeat > 1` runs once with a warning.
+
+Per case the report gives `passes/k`, `pass@k` (passes > 0), `pass^k` (all k
+passed), per-check flip counts, and the mean and sample standard deviation of
+total tokens and duration. A live case counts as PASSED for gating and baselines
+iff `pass^k` (the consistency standard).
+
+At the suite level, each case's success proportion `p_i = passes_i / k_i` is
+collapsed first (one value per case), so correlated resamples do not fake
+precision; the report prints `pass rate p̄ +/-t·SEM (95% CI)`, using the Student-t
+multiplier on n-1 degrees of freedom (the normal z=1.96 understates the interval
+for the few-unit suites repeated runs typically produce). An optional
+per-case `cluster` label averages correlated case families together before the
+error bar; omitting it asserts independence. A case with `0/k` passes at `k >= 5`
+is flagged low-signal, and at `k >= 20` as a suspect (broken) task.
+
 ## Exit-code contract
 
 The process exit code is the CI gate, and it is suite-kind aware:

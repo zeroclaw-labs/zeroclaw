@@ -412,4 +412,56 @@ mod tests {
             "the out-of-workspace file_write must not report success"
         );
     }
+
+    #[tokio::test]
+    async fn repeated_runs_are_isolated() {
+        // Run 1 writes marker.txt into its temp workspace; run 2 asserts the file
+        // is absent. A fresh workspace per run means run 2 cannot see run 1's file.
+        let write_case: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "iso-write", "turns": [{ "user_input": "write" }],
+                 "tools": ["file_write"],
+                 "expects": { "workspace": { "file_exists": ["marker.txt"] } } }"#,
+        )
+        .unwrap();
+        let write_deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[
+                {"response":{"type":"tool_calls","tool_calls":[{"id":"1","name":"file_write","arguments":{"path":"marker.txt","content":"hi"}}]}},
+                {"response":{"type":"text","content":"done"}}
+            ]}]}"#,
+                ))
+            },
+            vec!["file_write".to_string()],
+            Duration::from_secs(5),
+        );
+        let out1 = run_live_case(&write_case, &write_deps).await.unwrap();
+        assert!(
+            out1.grades.iter().all(|g| g.passed),
+            "run 1 must write marker.txt into its own workspace: {:?}",
+            out1.grades
+        );
+
+        // Run 2: a fresh case that does nothing and asserts marker.txt is absent.
+        let absent_case: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "iso-absent", "turns": [{ "user_input": "noop" }],
+                 "expects": { "workspace": { "file_absent": ["marker.txt"] } } }"#,
+        )
+        .unwrap();
+        let noop_deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"noop"}}]}]}"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+        let out2 = run_live_case(&absent_case, &noop_deps).await.unwrap();
+        assert!(
+            out2.grades.iter().all(|g| g.passed),
+            "run 2's fresh workspace must not contain run 1's marker.txt: {:?}",
+            out2.grades
+        );
+    }
 }

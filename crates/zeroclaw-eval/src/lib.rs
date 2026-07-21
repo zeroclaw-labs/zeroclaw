@@ -9,6 +9,7 @@ pub mod record;
 pub mod replay;
 pub mod report;
 pub mod runner;
+pub mod stats;
 pub mod tools;
 
 pub use case::{CaseSetup, LlmTrace, TraceExpects};

@@ -24,6 +24,20 @@ pub struct LlmTrace {
     /// Tool names this case requests. Live mode only; ignored in replay.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
+    /// Number of isolated live runs for this case (clamped to 1..=50). In replay
+    /// `repeat > 1` runs once (deterministic). A live case counts as PASSED for
+    /// gating/baselines iff every run passes (pass^k).
+    #[serde(default = "default_repeat")]
+    pub repeat: u32,
+    /// Optional cluster label. Correlated case families sharing a label are
+    /// averaged together before the suite error bar, so resamples of one family do
+    /// not fake precision. Omitting it asserts independence.
+    #[serde(default)]
+    pub cluster: Option<String>,
+}
+
+fn default_repeat() -> u32 {
+    1
 }
 
 /// Pre-run environment preparation for a case.

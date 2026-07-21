@@ -94,13 +94,15 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
             .unwrap_or("<unknown>")
             .to_string();
 
-        let report = match run_case(&trace, deps).await {
-            Ok(outcome) => CaseReport {
+        let report = match run_case_repeated(&trace, deps).await {
+            Ok((outcome, repeat)) => CaseReport {
                 name,
                 source,
                 record: Some(outcome.record),
                 grades: outcome.grades,
                 error: None,
+                repeat,
+                cluster: trace.cluster.clone(),
             },
             Err(e) => CaseReport {
                 name,
@@ -108,12 +110,54 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
                 record: None,
                 grades: vec![],
                 error: Some(e.to_string()),
+                repeat: None,
+                cluster: trace.cluster.clone(),
             },
         };
         cases.push(report);
     }
 
     Ok(SuiteReport { cases })
+}
+
+/// Run a case, repeating it for live suites with `repeat > 1`. Each repeat is a
+/// fully isolated run (fresh temp workspace, agent, and provider). Returns a
+/// representative outcome (a failing run when any exists, so its grades explain
+/// the failure; otherwise the first run) plus aggregated [`RepeatStats`]. The
+/// representative's grades make the case pass iff every run passed (pass^k).
+pub async fn run_case_repeated(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+) -> anyhow::Result<(CaseOutcome, Option<crate::stats::RepeatStats>)> {
+    let (k, warnings) = crate::stats::effective_repeat(deps.mode, trace.repeat);
+    for w in &warnings {
+        eprintln!("  {} (repeat): {w}", trace.display_id());
+    }
+    if k <= 1 {
+        return Ok((run_case(trace, deps).await?, None));
+    }
+    let mut outcomes = Vec::with_capacity(k as usize);
+    for _ in 0..k {
+        outcomes.push(run_case(trace, deps).await?);
+    }
+    let all_pass = |o: &CaseOutcome| o.grades.iter().all(|g| g.passed);
+    let samples: Vec<crate::stats::RunSample> = outcomes
+        .iter()
+        .map(|o| crate::stats::RunSample {
+            passed: all_pass(o),
+            total_tokens: o.record.input_tokens + o.record.output_tokens,
+            duration_ms: o.record.duration_ms,
+            checks: o
+                .grades
+                .iter()
+                .map(|g| (g.check.clone(), g.passed))
+                .collect(),
+        })
+        .collect();
+    let stats = crate::stats::RepeatStats::from_runs(k, &samples);
+    let rep_idx = outcomes.iter().position(|o| !all_pass(o)).unwrap_or(0);
+    let representative = outcomes.swap_remove(rep_idx);
+    Ok((representative, Some(stats)))
 }
 
 /// Run a single trace through a freshly built, isolated agent, grade it while its
