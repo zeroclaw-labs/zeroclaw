@@ -110,6 +110,13 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
     };
     let broker = engine.approval_broker();
     if let Some(route) = broker.escalation_route(engine.approval_config(), &policy_name) {
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %run_id,
+            sop_name = %sop_name,
+        );
+        let _guard = span.enter();
         broker.deliver_escalation(&route, run_id, &sop_name, step);
     }
 }

@@ -360,7 +360,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         )
         .unwrap();
         assert!(out.is_resumed(), "first approve resumes");
@@ -437,7 +437,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         )
         .unwrap();
         let events = e.run_events(&id).unwrap();
@@ -445,7 +445,7 @@ mod tests {
             .iter()
             .find(|ev| ev.kind == "gate_resolved")
             .expect("a gate_resolved ledger row");
-        assert_eq!(resolved.actor.as_deref(), Some("alice"));
+        assert_eq!(resolved.actor.as_deref(), Some("ZeroClawOperator"));
         assert_eq!(resolved.payload["source"], "cli");
     }
 
@@ -472,7 +472,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         )
         .unwrap();
         assert_eq!(
@@ -529,7 +529,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         );
         assert!(
             res.is_err(),
@@ -565,7 +565,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         );
         assert!(
             res.is_err(),
