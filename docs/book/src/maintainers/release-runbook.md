@@ -425,6 +425,16 @@ If you need to raise the floor to drop support for an older version:
 
 ## If something goes wrong
 
+**The run dies instantly with `startup_failure` (zero jobs created):** Treat
+this as a symptom, not an allowlist diagnosis. Check the run summary and
+repository Actions policy. If GitHub reports a selected-actions rejection and
+the release workflow recently added or changed `uses:` refs, compare those refs
+with [Allowed actions](./ci-and-actions.md#allowed-actions). Add only the
+rejected pattern in Settings → Actions → General, wait a few minutes for the
+setting to propagate, then dispatch a fresh run. If GitHub does not report a
+policy rejection, investigate the workflow definition or other repository
+policy instead.
+
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 

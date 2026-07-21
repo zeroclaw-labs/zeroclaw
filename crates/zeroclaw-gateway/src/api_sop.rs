@@ -116,6 +116,11 @@ fn outcome_response(outcome: &ResolveOutcome) -> (StatusCode, &'static str) {
         ResolveOutcome::AlreadyResolved => (StatusCode::OK, "already_resolved"),
         ResolveOutcome::NotWaiting => (StatusCode::NOT_FOUND, "not_waiting"),
         ResolveOutcome::RejectedSelfApproval => (StatusCode::FORBIDDEN, "rejected_self_approval"),
+        // Approved, but re-admitting would exceed the concurrency caps: temporary
+        // backpressure, retry once a slot frees (the gate stays waiting).
+        ResolveOutcome::DeferredAtCapacity => {
+            (StatusCode::SERVICE_UNAVAILABLE, "deferred_at_capacity")
+        }
     }
 }
 
@@ -243,6 +248,10 @@ fn broker_outcome_response(outcome: &BrokerOutcome) -> (StatusCode, String) {
         BrokerOutcome::PolicyMissing { name } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("policy_missing ('{name}')"),
+        ),
+        BrokerOutcome::PolicyUnavailable { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("policy_unavailable ({reason})"),
         ),
     }
 }

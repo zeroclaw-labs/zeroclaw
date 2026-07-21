@@ -322,6 +322,7 @@ impl Observer for OtelObserver {
                 messages_count,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
@@ -341,6 +342,10 @@ impl Observer for OtelObserver {
                                 "gen_ai.agent.name",
                                 agent_alias.clone().unwrap_or_default(),
                             ),
+                            KeyValue::new(
+                                "zeroclaw.parent_agent_alias",
+                                parent_agent_alias.clone().unwrap_or_default(),
+                            ),
                             KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                         ]),
                     &parent_cx,
@@ -353,6 +358,7 @@ impl Observer for OtelObserver {
                 arguments,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let mut span_attrs = vec![
@@ -360,6 +366,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("tool.name", tool.clone()),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(id) = tool_call_id {
@@ -562,6 +572,7 @@ impl Observer for OtelObserver {
                 output_tokens,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
                 messages,
             } => {
@@ -575,6 +586,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 self.llm_calls.add(1, &attrs);
@@ -589,6 +604,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(input) = input_tokens {
@@ -735,6 +754,7 @@ impl Observer for OtelObserver {
                 result,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let secs = duration.as_secs_f64();
@@ -752,6 +772,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(id) = tool_call_id {
@@ -1283,6 +1307,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
@@ -1291,6 +1316,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(250),
@@ -1324,6 +1350,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             arguments: None,
@@ -1332,6 +1359,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -1343,6 +1371,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "file_read".into(),
             tool_call_id: None,
             duration: Duration::from_millis(5),
@@ -1450,6 +1479,7 @@ mod tests {
     fn tool_call_with_id_args_and_result_does_not_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("toolu_01ABC".into()),
             arguments: Some(r#"{"command":"ls -la /tmp"}"#.into()),
@@ -1458,6 +1488,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("toolu_01ABC".into()),
             duration: Duration::from_millis(42),
@@ -1471,6 +1502,7 @@ mod tests {
         // Failure case — the issue author specifically wants to see *why*
         // a tool call failed, so the result field is the error text.
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("toolu_02DEF".into()),
             duration: Duration::from_millis(3),
@@ -1499,6 +1531,7 @@ mod tests {
     fn otel_records_llm_failure_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "missing-model".into(),
             duration: Duration::from_millis(0),
@@ -1551,6 +1584,7 @@ mod tests {
         );
 
         obs.record_event(&ObserverEvent::LlmRequest {
+            parent_agent_alias: None,
             model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             messages_count: 2,
@@ -1559,6 +1593,7 @@ mod tests {
             turn_id: Some("turn-1".into()),
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             duration: Duration::from_millis(25),
@@ -1572,6 +1607,7 @@ mod tests {
             messages: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("call-1".into()),
             arguments: Some(r#"{"command":"date"}"#.into()),
@@ -1580,6 +1616,7 @@ mod tests {
             turn_id: Some("turn-1".into()),
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("call-1".into()),
             duration: Duration::from_millis(5),
@@ -1657,6 +1694,7 @@ mod tests {
         )
         .expect("creation should succeed");
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(100),
@@ -1670,6 +1708,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(50),

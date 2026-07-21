@@ -135,61 +135,56 @@ fn factory_unknown_provider_rejected() {
 #[test]
 fn compatible_provider_bearer_auth_style() {
     // Construction with Bearer auth should succeed
-    let _provider = OpenAiCompatibleModelProvider::new(
-        "test",
-        "TestProvider",
-        "https://api.test.com",
-        Some("sk-test-key-12345"),
-        AuthStyle::Bearer,
-    );
+    let _provider = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("TestProvider")
+        .base_url("https://api.test.com")
+        .credential(Some("sk-test-key-12345"))
+        .auth_style(AuthStyle::Bearer)
+        .build();
 }
 
 #[test]
 fn compatible_provider_xapikey_auth_style() {
     // Construction with XApiKey auth should succeed
-    let _provider = OpenAiCompatibleModelProvider::new(
-        "test",
-        "TestProvider",
-        "https://api.test.com",
-        Some("sk-test-key-12345"),
-        AuthStyle::XApiKey,
-    );
+    let _provider = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("TestProvider")
+        .base_url("https://api.test.com")
+        .credential(Some("sk-test-key-12345"))
+        .auth_style(AuthStyle::XApiKey)
+        .build();
 }
 
 #[test]
 fn compatible_provider_custom_auth_header() {
     // Construction with Custom auth should succeed
-    let _provider = OpenAiCompatibleModelProvider::new(
-        "test",
-        "TestProvider",
-        "https://api.test.com",
-        Some("sk-test-key-12345"),
-        AuthStyle::Custom("X-Custom-Auth".into()),
-    );
+    let _provider = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("TestProvider")
+        .base_url("https://api.test.com")
+        .credential(Some("sk-test-key-12345"))
+        .auth_style(AuthStyle::Custom("X-Custom-Auth".into()))
+        .build();
 }
 
 #[test]
 fn compatible_provider_no_credential() {
     // Construction without credential should succeed (for local model_providers)
-    let _provider = OpenAiCompatibleModelProvider::new(
-        "test",
-        "TestLocal",
-        "http://localhost:11434",
-        None,
-        AuthStyle::Bearer,
-    );
+    let _provider = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("TestLocal")
+        .base_url("http://localhost:11434")
+        .credential(None)
+        .auth_style(AuthStyle::Bearer)
+        .build();
 }
 
 #[test]
 fn compatible_provider_base_url_trailing_slash_normalized() {
     // Construction with trailing slash URL should succeed
-    let _provider = OpenAiCompatibleModelProvider::new(
-        "test",
-        "TestProvider",
-        "https://api.test.com/v1/",
-        Some("key"),
-        AuthStyle::Bearer,
-    );
+    let _provider = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("TestProvider")
+        .base_url("https://api.test.com/v1/")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::Bearer)
+        .build();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

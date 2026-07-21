@@ -839,11 +839,10 @@ impl AgentBuilder {
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
             memory_inject_cfg: self.memory_inject_cfg.unwrap_or_else(|| {
-                crate::agent::memory_inject::MemoryInjectConfig {
-                    min_relevance_score: zeroclaw_config::schema::MemoryConfig::default()
-                        .min_relevance_score,
-                    ..Default::default()
-                }
+                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                    &zeroclaw_config::schema::MemoryConfig::default(),
+                    crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                )
             }),
             config,
             structured_history_cap_resolver: self.structured_history_cap_resolver,
@@ -902,6 +901,19 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// The full `Config` the agent was constructed from, when available. Sourced
+    /// from `provider_switch_config` - the single canonical config snapshot the
+    /// agent already carries for provider-alias resolution. `None` only on
+    /// configless (test-builder) agents; every production construction path
+    /// (`from_config` / `from_config_with_tui_env`) populates it. Used by the
+    /// vision route to resolve the configured `vision_model_provider`'s
+    /// alias-specific options (the `vision` override, endpoint URI, credentials).
+    fn full_config(&self) -> Option<&zeroclaw_config::schema::Config> {
+        self.provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.config.as_deref())
     }
 
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
@@ -1625,11 +1637,12 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
-                limit: config.effective_memory_recall_limit(agent_alias),
-                min_relevance_score: config.memory.min_relevance_score,
-                ..Default::default()
-            })
+            .memory_inject_cfg(
+                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                    &config.memory,
+                    config.effective_memory_recall_limit(agent_alias),
+                ),
+            )
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
@@ -2159,10 +2172,12 @@ impl Agent {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
+                    self.full_config(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
                     &self.model_provider_name,
+                    &effective_model,
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -2171,7 +2186,8 @@ impl Agent {
                     }
                 };
             let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_deref()
+                .as_ref()
+                .map(|resolved| resolved.provider.as_ref())
                 .unwrap_or(self.model_provider.as_ref());
             tool_dispatcher_for_provider(&self.config, active_provider)
         };
@@ -2245,6 +2261,12 @@ impl Agent {
                                 silent: false,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 model_switch_callback: None,
@@ -2292,7 +2314,18 @@ impl Agent {
                         }),
                         ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
                         turn_id: &turn_id,
+                        // Live-daemon SOP path: re-assemble a nested step's agent
+                        // when it delegates elsewhere. Config survives only via
+                        // `provider_switch_config`; with `None` (test builder) a
+                        // cross-agent step FAILS CLOSED rather than inheriting
+                        // this turn's context.
+                        sop_reassembly: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|c| c.config.as_deref())
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
                     }),
                 ),
             )
@@ -2442,10 +2475,12 @@ impl Agent {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
+                    self.full_config(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
                     &self.model_provider_name,
+                    &effective_model,
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -2459,7 +2494,8 @@ impl Agent {
                     }
                 };
             let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_deref()
+                .as_ref()
+                .map(|resolved| resolved.provider.as_ref())
                 .unwrap_or(self.model_provider.as_ref());
             tool_dispatcher_for_provider(&self.config, active_provider)
         };
@@ -2589,6 +2625,12 @@ impl Agent {
                                     silent: true,
                                     approval: self.approval_manager.as_deref(),
                                     multimodal_config: &self.multimodal_config,
+                                    // Inlined `full_config()` (per-field borrow) so it coexists with
+                                    // the `&mut self.image_cache` in this same ToolLoop expression.
+                                    config: self
+                                        .provider_switch_config
+                                        .as_ref()
+                                        .and_then(|c| c.config.as_deref()),
                                     hooks: self.hook_runner.as_deref(),
                                     activated_tools: self.activated_tools.as_ref(),
                                     model_switch_callback: Some(
@@ -2644,7 +2686,18 @@ impl Agent {
                             }),
                             ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),
+                            parent_agent_alias: None,
                             turn_id: &turn_id,
+                            // Live-daemon SOP path: re-assemble a nested step's
+                            // agent when it delegates elsewhere. Config survives
+                            // only via `provider_switch_config`; with `None`
+                            // (test builder) a cross-agent step FAILS CLOSED
+                            // rather than inheriting this turn's context.
+                            sop_reassembly: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|c| c.config.as_deref())
+                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
                         }),
                     ),
                 )
