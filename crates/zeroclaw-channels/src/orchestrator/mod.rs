@@ -4018,6 +4018,12 @@ async fn handle_runtime_command_if_needed(
         }
     };
 
+    let response = redact_channel_outbound_leaks(
+        &response,
+        &defaults_snapshot.config.security.leak_detection,
+        outbound_content_format_for_channel(&msg.channel),
+    );
+
     if let Err(err) = channel
         .send(&{
             let mut sm = SendMessage::new(response, &msg.reply_target)
