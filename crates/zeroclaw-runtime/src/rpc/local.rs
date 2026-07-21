@@ -123,7 +123,7 @@ impl RpcTransport for LocalTransport {
 /// The daemon uses it for `--ephemeral` shutdown logic.
 ///
 /// `ready_tx` is the daemon foreground startup echo's readiness signal
-/// (#9000): `true` is sent once, immediately after the IPC endpoint is
+/// `true` is sent once, immediately after the IPC endpoint is
 /// bound and secured, so the echo cannot announce readiness before the
 /// socket accepts connections. Callers without an echo pass `None`.
 pub async fn run_local_listener(
@@ -146,7 +146,7 @@ pub async fn run_local_listener(
 
     // Announce endpoint availability the moment the socket is bound and
     // secured: the daemon's foreground startup echo gates its "started"
-    // banner on this signal (#9000). A send failure only means no receiver
+    // banner on this signal. A send failure only means no receiver
     // is listening — not an error worth failing startup over.
     if let Some(tx) = &ready_tx {
         let _ = tx.send(true);

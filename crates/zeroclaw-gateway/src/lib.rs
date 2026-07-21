@@ -566,7 +566,7 @@ pub async fn run_gateway(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     // Readiness signal owned by the daemon's foreground startup echo
-    // (#9000): the actual bound address is sent once, immediately after the
+    // The actual bound address is sent once, immediately after the
     // listener binds, so the echo cannot announce readiness before the
     // endpoint is available. Standalone gateway passes `None`.
     ready_tx: Option<tokio::sync::watch::Sender<Option<std::net::SocketAddr>>>,
@@ -624,7 +624,7 @@ pub async fn run_gateway(
 
     // Announce endpoint availability before anything else: the daemon's
     // foreground startup echo gates its "started" banner on this signal, so
-    // it must fire the moment the listener is bound (#9000). A send failure
+    // it must fire the moment the listener is bound. A send failure
     // only means no receiver is listening (standalone gateway) — not an
     // error worth failing startup over.
     if let Some(tx) = &ready_tx {

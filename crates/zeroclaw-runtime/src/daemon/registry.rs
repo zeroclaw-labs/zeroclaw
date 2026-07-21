@@ -47,7 +47,7 @@ pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFutur
 ///
 /// The optional readiness sender reports endpoint readiness to the daemon's
 /// foreground startup echo the moment the transport's listener binds
-/// (#9000). Transports without an echo consumer receive `None`.
+/// Transports without an echo consumer receive `None`.
 pub type RpcStarter = Box<
     dyn Fn(
             Arc<RpcContext>,

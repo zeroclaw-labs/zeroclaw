@@ -249,7 +249,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
-/// Foreground-echo gate for `daemon::run` (issue #9000): true only when
+/// Foreground-echo gate for `daemon::run`: true only when
 /// stderr is an interactive terminal AND this process owns that terminal's
 /// foreground process group. A shell background job (`zeroclaw daemon ... &`)
 /// inherits the TTY descriptor, so `is_terminal()` alone would wrongly print
@@ -4276,7 +4276,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
-                    // Foreground echo (issue #9000): only true when this
+                    // Foreground echo: only true when this
                     // daemon is the user's interactive foreground process
                     // (no `--verbose`, stderr is a real tty, and on unix
                     // this process owns the tty's foreground process
@@ -4284,7 +4284,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     // descriptor but is not the foreground owner).
                     // Background / systemd-supervised callers stay silent
                     // so we don't pollute the journal with the seven
-                    // pre-#7934 informational lines.
+                    // informational lines.
                     !cli.verbose && stderr_is_interactive_foreground(),
                 ))
                 .await;
@@ -8240,7 +8240,7 @@ mod tests {
         assert!(stderr_foreground_decision(123, 123));
         // Interactive background job (`zeroclaw daemon ... &`): inherits
         // the tty descriptor but the foreground group belongs to the shell
-        // or another job — must stay silent (#9000 round-2 premise).
+        // or another job — must stay silent.
         assert!(!stderr_foreground_decision(123, 456));
         // No controlling terminal / tcgetpgrp error: -1 must never pass.
         assert!(!stderr_foreground_decision(-1, 123));

@@ -544,7 +544,7 @@ mod tests {
         }
     }
 
-    /// Locale-key coverage for the daemon foreground startup echo (#9000):
+    /// Locale-key coverage for the daemon foreground startup echo:
     /// every banner key must exist and format in all five catalogues, and
     /// the machine-facing arguments (gateway URL, socket path, timeout
     /// seconds) must survive translation.

@@ -299,7 +299,7 @@ pub async fn run(
     ephemeral: bool,
     // `true` when the daemon was launched as an interactive foreground
     // process — i.e. the operator is sitting at the terminal. When `true`,
-    // `echo_daemon_started_to_terminal` reprints the seven pre-#7934
+    // `echo_daemon_started_to_terminal` reprints the seven informational
     // informational lines so the operator can see the gateway URL, IPC
     // socket, components, and stop signal without needing `--verbose`.
     // Auto-spawned / systemd-managed callers MUST pass `false` to keep
@@ -345,7 +345,7 @@ pub async fn run(
     let channels_cancel = tokio_util::sync::CancellationToken::new();
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
-    // Readiness signals for the foreground startup echo (#9000): the echo
+    // Readiness signals for the foreground startup echo: the echo
     // may only print "started" after every endpoint it announces has
     // reported its bind. The senders are wired into the supervised gateway
     // and socket starters below (foreground runs only); the receivers are
@@ -372,7 +372,7 @@ pub async fn run(
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         // Foreground runs hand the starter a readiness sender so the echo
-        // learns the actual bound address (#9000); service runs get `None`
+        // learns the actual bound address; service runs get `None`
         // and carry no extra wiring.
         let gateway_ready = foreground.then(|| gateway_ready_tx.clone());
         if foreground {
@@ -610,7 +610,7 @@ pub async fn run(
         let socket_start = std::sync::Arc::new(socket_start);
         let socket_cancel = channels_cancel.clone();
         let count = socket_client_count.clone();
-        // Same readiness contract as the gateway starter (#9000).
+        // Same readiness contract as the gateway starter.
         let socket_ready = foreground.then(|| socket_ready_tx.clone());
         if foreground {
             socket_echo_rx = Some(socket_ready_rx);
@@ -650,7 +650,7 @@ pub async fn run(
                 let cancel = wss_cancel.clone();
                 let count = count.clone();
                 // The startup banner announces only the gateway and local
-                // socket endpoints; WSS has no echo consumer (#9000).
+                // socket endpoints; WSS has no echo consumer.
                 async move { start(ctx, cancel, count, None).await }
             },
         ));
@@ -733,7 +733,7 @@ pub async fn run(
 
     record_daemon_started(&config, &host, port);
     if foreground {
-        // Gate the banner on real endpoint readiness (#9000): the ready
+        // Gate the banner on real endpoint readiness: the ready
         // message must not precede endpoint availability, and a slow or
         // retrying bind must surface as "starting", never as "started".
         let readiness =
@@ -814,7 +814,7 @@ fn record_daemon_started(config: &Config, host: &str, port: u16) {
     );
 }
 
-/// Bounded wait for the endpoints the foreground banner announces (#9000).
+/// Bounded wait for the endpoints the foreground banner announces.
 /// Local binds normally complete in well under a second; 15s bounds the
 /// wait so a supervisor retry loop cannot stall the echo — or block the
 /// daemon's shutdown-signal handling behind it — indefinitely.
@@ -868,23 +868,23 @@ async fn await_startup_readiness(
     }
 }
 
-/// Foreground echo for the seven pre-#7934 informational lines that the
-/// structured `record_daemon_started` event hid behind the `--verbose`
-/// display gate. Kept as a separate helper so the structured call path
-/// (always emit) and the terminal-echo path (foreground only) stay
-/// independently testable. Accepts any `io::Write` so the in-process
-/// tests can pass an in-memory buffer without pulling in `libc` or
-/// touching global stderr state. `run()` passes `std::io::stderr().lock()`
-/// — the only call site for production output. Restores the operator-facing
-/// feedback lost in the #7934 "route stdout diagnostics through logs"
-/// sweep (issue #9000).
+/// Foreground echo for the daemon startup banner.
 ///
-/// Round-2: the banner's content is gated on [`StartupReadiness`]. Only
-/// the `Ready` arm prints endpoint addresses — using the gateway's actual
-/// bound address reported through the readiness signal — so the "started"
-/// claim can never precede endpoint availability. The `Starting` arm
-/// announces no endpoints. Every line renders through the Fluent `cli-*`
-/// catalogue (`locales/*/cli.ftl`), the repository's source of truth for
+/// Kept as a separate helper so the structured call path (always emit)
+/// and the terminal-echo path (foreground only) stay independently
+/// testable. Accepts any `io::Write` so the in-process tests can pass
+/// an in-memory buffer without pulling in `libc` or touching global stderr
+/// state. `run()` passes `std::io::stderr().lock()` — the only call site
+/// for production output. Restores the operator-facing feedback that the
+/// structured `record_daemon_started` event hid behind the `--verbose`
+/// display gate.
+///
+/// The banner's content is gated on [`StartupReadiness`]. Only the `Ready`
+/// arm prints endpoint addresses — using the gateway's actual bound address
+/// reported through the readiness signal — so the "started" claim can
+/// never precede endpoint availability. The `Starting` arm announces no
+/// endpoints. Every line renders through the Fluent `cli-*` catalogue
+/// (`locales/*/cli.ftl`), the repository's source of truth for
 /// operator-facing CLI/daemon output.
 fn echo_daemon_started_to_terminal<W: std::io::Write>(
     config: &Config,
@@ -2427,7 +2427,7 @@ mod tests {
         );
     }
 
-    // ── Foreground terminal-echo (issue #9000) ──────────────────────────────
+    // ── Foreground terminal-echo ─────────────────────────────────────────
     //
     // The helper writes via `eprintln!`-equivalent into a `io::Write` so
     // the in-process tests can pass an in-memory buffer without pulling
@@ -2467,7 +2467,7 @@ mod tests {
 
         // Assert the canonical English Fluent rendering of every line —
         // expectations come from the catalogue, not a second handwritten
-        // message surface (#9000 round-2).
+        // message surface.
         let en = crate::i18n::get_english_cli_string_with_args;
         assert!(
             captured.contains(en("cli-daemon-started-title", &[]).as_str()),
@@ -2601,7 +2601,7 @@ mod tests {
             "starting state must say starting, got: {captured:?}"
         );
         // Endpoint availability is not confirmed: the starting banner must
-        // not announce the gateway/socket endpoints as ready (#9000).
+        // not announce the gateway/socket endpoints as ready.
         assert!(
             !captured.contains(
                 en(
@@ -3337,7 +3337,7 @@ mod tests {
         );
     }
 
-    /// Round-2 wiring regression (#9000): a foreground `run()` must hand the
+    /// Wiring regression: a foreground `run()` must hand the
     /// gateway starter a readiness sender, and the starter's ready mark is
     /// what unblocks the startup echo. The stub reports its "bind" and then
     /// triggers reload so the daemon returns; the test proves the daemon
