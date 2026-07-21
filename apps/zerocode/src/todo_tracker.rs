@@ -207,7 +207,7 @@ impl TodoTracker {
     }
 
     pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        use ratatui::style::Style;
+        use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::Paragraph;
 
@@ -239,7 +239,11 @@ impl TodoTracker {
             // tracks the active palette (and per-agent overrides) live:
             // completed → dim, in-progress → bold accent, pending → body.
             let (glyph, style, label): (&str, Style, &str) = match e.status {
-                PlanStatus::Completed => ("✔", theme::dim_style(), e.content.as_str()),
+                PlanStatus::Completed => (
+                    "✔",
+                    theme::dim_style().add_modifier(Modifier::DIM),
+                    e.content.as_str(),
+                ),
                 PlanStatus::InProgress => (
                     "▶",
                     theme::accent_style(),
@@ -550,6 +554,37 @@ mod tests {
             buf.content().iter().all(|c| c.fg != Color::Reset),
             "no cell should use the terminal default foreground"
         );
+    }
+
+    #[test]
+    fn terminal_theme_distinguishes_completed_from_pending() {
+        use ratatui::style::{Color, Modifier};
+
+        let theme = crate::theme::theme_by_name("terminal").expect("terminal registered");
+        let _guard = crate::theme::set_active_for_test(theme);
+
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![
+            entry("Completed", PlanStatus::Completed),
+            entry("Pending", PlanStatus::Pending),
+        ]);
+        let buf = render_to_buffer(&t, 30, 7);
+        let completed = buf
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "✔")
+            .expect("completed row rendered");
+        let pending = buf
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "○")
+            .expect("pending row rendered");
+
+        assert_eq!(completed.fg, Color::Reset);
+        assert_eq!(pending.fg, Color::Reset);
+        assert!(completed.modifier.contains(Modifier::DIM));
+        assert!(!pending.modifier.contains(Modifier::DIM));
+        assert_ne!(completed.modifier, pending.modifier);
     }
 
     #[test]
