@@ -1,0 +1,13 @@
+{
+  "model_name": "gh8787-excluded-tool-not-called",
+  "turns": [
+    { "user_input": "Just tell me one fact about the moon.", "steps": [
+      { "response": { "type": "text", "content": "The moon has no atmosphere.", "input_tokens": 18, "output_tokens": 8 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["moon"],
+    "tools_not_used": ["shell", "file_write", "echo"],
+    "max_tool_calls": 0
+  }
+}
