@@ -69,18 +69,59 @@ pub fn materialize_resource_blob(
         format!("{}.{ext}", &hex[..16])
     };
 
-    let upload_dir = workspace_dir.join("uploads");
+    // Resolve the workspace to a symlink-free base so containment checks below are
+    // meaningful. The blob producer (MCP server / ACP client) controls the bytes and
+    // therefore the content-hash filename, so it can pre-plant a symlink at the
+    // destination; every write path here must be no-follow and stay inside `ws_root`.
+    let ws_root = std::fs::canonicalize(workspace_dir)
+        .map_err(|e| EmbeddedResourceError(format!("Cannot resolve workspace dir: {e}")))?;
+
+    let upload_dir = ws_root.join("uploads");
+    // A symlinked `uploads/` would redirect every write outside the workspace.
+    if let Ok(meta) = std::fs::symlink_metadata(&upload_dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(EmbeddedResourceError(
+            "uploads path is a symlink; refusing to materialize blob".into(),
+        ));
+    }
     std::fs::create_dir_all(&upload_dir)
         .map_err(|e| EmbeddedResourceError(format!("Cannot create upload dir: {e}")))?;
-    let dest = upload_dir.join(&storage_name);
+    // The real uploads dir must live inside the workspace (guards a symlink planted
+    // on an intermediate component).
+    let upload_real = std::fs::canonicalize(&upload_dir)
+        .map_err(|e| EmbeddedResourceError(format!("Cannot resolve upload dir: {e}")))?;
+    if !upload_real.starts_with(&ws_root) {
+        return Err(EmbeddedResourceError(
+            "upload dir resolves outside the workspace; refusing to materialize blob".into(),
+        ));
+    }
 
-    let needs_write = match std::fs::metadata(&dest) {
-        Ok(meta) => meta.len() != bytes.len() as u64,
-        Err(_) => true,
+    let dest = upload_real.join(&storage_name);
+    // Never follow a symlink sitting at the destination. Drop it; the atomic rename
+    // below installs a fresh regular file in its place.
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::remove_file(&dest).map_err(|e| {
+                EmbeddedResourceError(format!("Cannot clear symlink at upload dest: {e}"))
+            })?;
+        }
+        _ => {}
+    }
+
+    // Content-addressed dedup, but verify content rather than trusting a length match:
+    // an attacker-substituted file of equal length must not be handed back.
+    let needs_write = match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_file() && meta.len() == bytes.len() as u64 => {
+            match std::fs::read(&dest) {
+                Ok(existing) => existing != bytes,
+                Err(_) => true,
+            }
+        }
+        _ => true,
     };
     if needs_write {
-        std::fs::write(&dest, &bytes)
-            .map_err(|e| EmbeddedResourceError(format!("Cannot write upload: {e}")))?;
+        write_blob_atomic(&upload_real, &dest, &hex, &bytes)?;
     }
 
     let abs_path = std::fs::canonicalize(&dest).unwrap_or(dest);
@@ -97,6 +138,49 @@ pub fn materialize_resource_blob(
         mime_type: mime,
         filename,
     })
+}
+
+/// Write `bytes` to `dest` atomically without ever following a symlink at `dest`.
+///
+/// Writes to a uniquely-named temp file in the same directory (via `create_new`, so
+/// a pre-planted symlink at the temp path is refused rather than followed), then
+/// renames it over `dest`. `rename` replaces a symlink at `dest` without following it,
+/// and the rename is atomic on the same filesystem.
+fn write_blob_atomic(
+    dir: &Path,
+    dest: &Path,
+    hex: &str,
+    bytes: &[u8],
+) -> Result<(), EmbeddedResourceError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".tmp-{}-{seq}-{}", std::process::id(), &hex[..16]));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| EmbeddedResourceError(format!("Cannot create upload temp file: {e}")))?;
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| EmbeddedResourceError(format!("Cannot write upload: {e}")));
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EmbeddedResourceError(format!(
+            "Cannot install upload file: {e}"
+        )));
+    }
+    Ok(())
 }
 
 fn filename_from_uri(uri: Option<&str>) -> String {
@@ -218,5 +302,75 @@ mod tests {
         let err =
             materialize_resource_blob(dir.path(), Some("file:///big.bin"), None, &b64).unwrap_err();
         assert!(err.to_string().contains("MB") || err.to_string().contains("limit"));
+    }
+
+    // Security: a pre-planted symlink at the destination must never be followed.
+    // The MCP/ACP producer can predict the content-hash filename, so it can plant a
+    // symlink pointing outside the workspace before the blob is written. Writing
+    // through it would clobber an arbitrary file.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_at_dest_is_not_followed_on_write() {
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, b"TOPSECRET").unwrap();
+
+        // Different length than the legit blob so the length-dedup gate would
+        // (in the vulnerable code) decide to write — through the symlink.
+        let bytes = b"legit blob payload";
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+
+        // First call creates the real destination and tells us its path.
+        let first =
+            materialize_resource_blob(ws.path(), Some("file:///a.bin"), None, &b64).unwrap();
+        let dest = first.abs_path.clone();
+
+        // Attacker replaces it with a symlink to the outside secret.
+        std::fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&secret, &dest).unwrap();
+
+        // Second call with the same bytes resolves to the same dest (now a symlink).
+        let _ = materialize_resource_blob(ws.path(), Some("file:///a.bin"), None, &b64);
+
+        // The outside secret must be untouched, and the resolved path must stay
+        // inside the workspace.
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"TOPSECRET",
+            "write followed the symlink and clobbered a file outside the workspace"
+        );
+        let out = materialize_resource_blob(ws.path(), Some("file:///a.bin"), None, &b64).unwrap();
+        assert!(
+            out.abs_path.starts_with(ws.path().canonicalize().unwrap()),
+            "resolved dest escaped the workspace: {:?}",
+            out.abs_path
+        );
+    }
+
+    // Security: an existing file with the same length but different content must not
+    // be trusted. The length-only dedup gate would skip the write and hand the model
+    // a marker pointing at substituted content.
+    #[test]
+    fn same_length_substituted_content_is_not_trusted() {
+        let ws = tempdir().unwrap();
+        let bytes = b"authentic-content";
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+
+        let first =
+            materialize_resource_blob(ws.path(), Some("file:///a.bin"), None, &b64).unwrap();
+        let dest = first.abs_path.clone();
+
+        // Overwrite with different content of identical length.
+        let forged = b"forged!!!!content";
+        assert_eq!(forged.len(), bytes.len());
+        std::fs::write(&dest, forged).unwrap();
+
+        let out = materialize_resource_blob(ws.path(), Some("file:///a.bin"), None, &b64).unwrap();
+        assert_eq!(
+            std::fs::read(&out.abs_path).unwrap(),
+            bytes,
+            "length-only dedup handed back substituted content"
+        );
     }
 }
