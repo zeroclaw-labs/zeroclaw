@@ -897,7 +897,11 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        let mut saw_stop_reason = false;
+        // The provider's completion signal is the source of truth for whether
+        // buffered stream state may be published. `message_stop` is the
+        // canonical signal; Anthropic also sends `stop_reason` immediately
+        // before it, which lets us accept EOF after the response is complete.
+        let mut completion_signal: Option<&'static str> = None;
 
         loop {
             let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
@@ -1068,7 +1072,7 @@ impl AnthropicModelProvider {
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
                     if stop_reason != "none" {
-                        saw_stop_reason = true;
+                        completion_signal = Some("stop_reason");
                     }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
@@ -1100,58 +1104,8 @@ impl AnthropicModelProvider {
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                         "stream: message_stop"
                     );
-                    if let Some(id) = tool_id.take() {
-                        let name = tool_name.take().unwrap_or_default();
-                        let input = std::mem::take(&mut tool_input_json);
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"tool_name": &name})),
-                            "stream: tool_use block still open at message_stop: flushing before Final so the call is not swallowed"
-                        );
-                        let _ = tx
-                            .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
-                                id,
-                                name,
-                                arguments: input,
-                                extra_content: None,
-                            })))
-                            .await;
-                    }
-                    if input_tokens.is_some()
-                        || output_tokens.is_some()
-                        || cached_input_tokens.is_some()
-                        || cache_creation_input_tokens.is_some()
-                    {
-                        // Normalize to TokenUsage contract: `input_tokens` is
-                        // the *total* prompt size. Anthropic reports three
-                        // DISJOINT buckets per
-                        // https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
-                        //   total = cache_read + cache_creation + input_tokens
-                        // where `input_tokens` from the API is "tokens after
-                        // the last cache breakpoint", not the total.
-                        let uncached = input_tokens.unwrap_or(0);
-                        let cache_read = cached_input_tokens.unwrap_or(0);
-                        let cache_create = cache_creation_input_tokens.unwrap_or(0);
-                        let normalized_input = Some(
-                            uncached
-                                .saturating_add(cache_read)
-                                .saturating_add(cache_create),
-                        );
-                        let _ = tx
-                            .send(Ok(StreamEvent::Usage(TokenUsage {
-                                input_tokens: normalized_input,
-                                output_tokens,
-                                cached_input_tokens,
-                            })))
-                            .await;
-                    }
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
-                    return;
+                    completion_signal = Some("message_stop");
+                    break;
                 }
                 "error" => {
                     let msg = event
@@ -1168,6 +1122,14 @@ impl AnthropicModelProvider {
             }
         }
 
+        let Some(completion_signal) = completion_signal else {
+            crate::stream_guard::finish_sse_stream(tx, false, "message_stop").await;
+            return;
+        };
+
+        // Both message_stop and accepted EOF-after-stop_reason finalize here.
+        // Keeping ToolCall -> Usage -> Final in one place prevents the two
+        // completion paths from drifting apart.
         if let Some(id) = tool_id.take() {
             let name = tool_name.take().unwrap_or_default();
             let input = std::mem::take(&mut tool_input_json);
@@ -1175,8 +1137,11 @@ impl AnthropicModelProvider {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"tool_name": &name, "saw_stop_reason": saw_stop_reason})),
-                "stream: tool_use block still open at stream end: flushing before finish"
+                    .with_attrs(::serde_json::json!({
+                        "tool_name": &name,
+                        "completion_signal": completion_signal,
+                    })),
+                "stream: tool_use block still open at completion: flushing before Final so the call is not swallowed"
             );
             let _ = tx
                 .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
@@ -1188,7 +1153,35 @@ impl AnthropicModelProvider {
                 .await;
         }
 
-        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
+        if input_tokens.is_some()
+            || output_tokens.is_some()
+            || cached_input_tokens.is_some()
+            || cache_creation_input_tokens.is_some()
+        {
+            // Normalize to TokenUsage contract: `input_tokens` is the *total*
+            // prompt size. Anthropic reports three DISJOINT buckets per
+            // https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching:
+            //   total = cache_read + cache_creation + input_tokens
+            // where `input_tokens` from the API is "tokens after the last
+            // cache breakpoint", not the total.
+            let uncached = input_tokens.unwrap_or(0);
+            let cache_read = cached_input_tokens.unwrap_or(0);
+            let cache_create = cache_creation_input_tokens.unwrap_or(0);
+            let normalized_input = Some(
+                uncached
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_create),
+            );
+            let _ = tx
+                .send(Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: normalized_input,
+                    output_tokens,
+                    cached_input_tokens,
+                })))
+                .await;
+        }
+
+        crate::stream_guard::finish_sse_stream(tx, true, completion_signal).await;
     }
 }
 
@@ -2030,35 +2023,33 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
 
-        let mut tool_call = None;
-        let mut tool_pos = None;
-        let mut final_pos = None;
-        let mut idx = 0;
+        let mut events = Vec::new();
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
-            match ev {
-                Ok(StreamEvent::ToolCall(tc)) => {
-                    tool_pos = Some(idx);
-                    tool_call = Some(tc);
-                }
-                Ok(StreamEvent::Final) => final_pos = Some(idx),
-                _ => {}
-            }
-            idx += 1;
+            events.push(ev);
         }
 
-        let tc = tool_call.expect("tool_use open at message_stop must be flushed as a ToolCall");
-        assert_eq!(tc.name, "shell");
-        assert_eq!(tc.arguments, "{\"command\":\"ls\"}");
-        assert!(
-            tool_pos < final_pos,
-            "ToolCall must be emitted before Final, got tool={tool_pos:?} final={final_pos:?}"
-        );
+        match events.as_slice() {
+            [
+                Ok(StreamEvent::ToolCall(tc)),
+                Ok(StreamEvent::Usage(usage)),
+                Ok(StreamEvent::Final),
+            ] => {
+                assert_eq!(tc.name, "shell");
+                assert_eq!(tc.arguments, "{\"command\":\"ls\"}");
+                assert_eq!(usage.input_tokens, Some(10));
+                assert_eq!(usage.output_tokens, Some(9));
+                assert_eq!(usage.cached_input_tokens, None);
+            }
+            other => panic!(
+                "open tool at message_stop must finalize as ToolCall -> Usage -> Final, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
-    async fn tool_use_open_at_eof_after_stop_reason_is_flushed() {
+    async fn tool_use_open_at_eof_after_stop_reason_uses_canonical_finalizer() {
         use std::io::Cursor;
 
         let bytes = b"event: message_start\n\
@@ -2073,19 +2064,61 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usa
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
 
-        let mut tool_call = None;
+        let mut events = Vec::new();
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
-            if let Ok(StreamEvent::ToolCall(tc)) = ev {
-                tool_call = Some(tc);
-            }
+            events.push(ev);
         }
 
-        let tc = tool_call
-            .expect("tool_use open at EOF after stop_reason must be flushed as a ToolCall");
-        assert_eq!(tc.name, "file_read");
-        assert_eq!(tc.arguments, "{\"path\":\"a\"}");
+        match events.as_slice() {
+            [
+                Ok(StreamEvent::ToolCall(tc)),
+                Ok(StreamEvent::Usage(usage)),
+                Ok(StreamEvent::Final),
+            ] => {
+                assert_eq!(tc.name, "file_read");
+                assert_eq!(tc.arguments, "{\"path\":\"a\"}");
+                assert_eq!(usage.input_tokens, Some(10));
+                assert_eq!(usage.output_tokens, Some(9));
+                assert_eq!(usage.cached_input_tokens, None);
+            }
+            other => panic!(
+                "open tool at accepted EOF must finalize as ToolCall -> Usage -> Final, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_use_open_at_bare_eof_fails_closed_without_tool_or_final() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_z\",\"name\":\"file_read\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"part\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            events.push(ev);
+        }
+
+        match events.as_slice() {
+            [Err(StreamError::Http(message))] => {
+                assert!(message.contains("truncated"), "got: {message}");
+                assert!(message.contains("message_stop"), "got: {message}");
+            }
+            other => panic!(
+                "bare EOF with an open tool must emit only the truncation error, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
