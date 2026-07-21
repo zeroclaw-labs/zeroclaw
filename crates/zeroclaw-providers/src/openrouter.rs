@@ -51,11 +51,6 @@ enum MessageContent {
     Parts(Vec<MessagePart>),
 }
 
-/// Marker placed on a content block to opt it into OpenRouter prompt caching.
-///
-/// Currently only `{"type": "ephemeral"}` is defined. OpenRouter forwards this
-/// field to upstream providers that support prompt caching (Anthropic,
-/// DeepSeek, Qwen). Providers without caching ignore the marker.
 #[derive(Debug, Serialize)]
 struct CacheControl {
     #[serde(rename = "type")]
@@ -138,7 +133,7 @@ struct NativeToolFunctionSpec {
     name: String,
     description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
-    /// transparently, never deep-cloned per request (#8642).
+    /// transparently, never deep-cloned per request
     parameters: Arc<serde_json::Value>,
 }
 
@@ -263,13 +258,19 @@ impl OpenRouterModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content")
@@ -350,13 +351,6 @@ impl OpenRouterModelProvider {
 
     fn to_message_content(role: &str, content: &str) -> MessageContent {
         if role == "system" {
-            // Serialize system messages as a single-text-part array so we can
-            // attach `cache_control: {"type": "ephemeral"}`. OpenRouter forwards
-            // this marker to upstream providers that support prompt caching
-            // (Anthropic, DeepSeek, Qwen); providers without caching ignore
-            // the field. The wire shape is identical to a plain-string system
-            // message for ignoring providers, so this is safe across the
-            // provider fleet.
             return MessageContent::Parts(vec![MessagePart::Text {
                 text: content.to_string(),
                 cache_control: Some(CacheControl {
@@ -559,11 +553,6 @@ impl ModelProvider for OpenRouterModelProvider {
     }
 
     async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        // OpenRouter's public `/models` payload carries a `pricing` object per
-        // model. The default trait impl would discard it (delegates to
-        // `list_models` → `pricing: None`); override to surface pricing so the
-        // cost-rates editor can prefill rates for the first-class `openrouter`
-        // slot, matching the OpenAI-compatible vendor-fallback path.
         crate::openrouter_catalog::list_all_models_with_pricing().await
     }
 
@@ -888,13 +877,6 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         });
 
-        // Bind the task's lifetime to the returned stream so dropping the
-        // stream cancels the in-flight HTTP request. Without this guard the
-        // spawned task keeps reading the response body to completion after
-        // the consumer is gone, holding a connection-pool slot and
-        // consuming OpenRouter quota for a request the caller no longer
-        // wants. `AbortHandle::abort` is a no-op if the task has already
-        // finished, so the happy path is unaffected.
         let guard = AbortOnDrop::new(handle.abort_handle());
 
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
@@ -1823,6 +1805,66 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // A malformed arguments string in the assistant history must be
+        // normalized to "{}" so the outbound chat-completions request doesn't
+        // 400 on strict upstreams. This test pins that the openrouter call site
+        // of `sanitize_tool_arguments` is wired in; the helper contract itself
+        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON object must round-trip byte-for-byte
+        // so the openrouter call site cannot accidentally re-encode or strip
+        // good payloads.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_rejects_non_object_tool_arguments() {
+        // Strict providers (Cohere, OpenRouter auto-exacto) require a JSON
+        // object for tool-call arguments. Null, arrays, strings, numbers, and
+        // booleans are valid JSON but must not reach the upstream.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        for tc in tool_calls {
+            assert_eq!(
+                tc.function.arguments, "{}",
+                "non-object arg for {} must normalize to empty object",
+                tc.function.name
+            );
+        }
+    }
+
+    #[test]
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
@@ -1918,14 +1960,6 @@ mod tests {
         assert_eq!(result[1].function.name, "another-valid");
     }
 
-    /// Regression: skill tools used to be registered with a `.` separator
-    /// (`{skill}.{tool}`), e.g. `openrouter-spend.check_openrouter_spend`.
-    /// That format silently failed `is_valid_openai_tool_name` and got
-    /// dropped from the function-call spec list sent to OpenAI-compatible
-    /// providers, while still appearing in the system prompt — leaving the
-    /// LLM hallucinating "unknown tool" errors. Skill tools now use the
-    /// `__` separator (matching the MCP `<server>__<tool>` convention),
-    /// which passes the validator and survives `convert_tools`.
     #[test]
     fn convert_tools_preserves_skill_namespaced_names_with_double_underscore() {
         use zeroclaw_api::tool::ToolSpec;
@@ -2088,12 +2122,6 @@ mod tests {
         assert_eq!(prov["allow_fallbacks"], false);
     }
 
-    /// Regression for #5822.
-    ///
-    /// `AbortOnDrop` must cancel the bound tokio task when it is dropped.
-    /// This guards the `stream_chat` invariant that a dropped stream stops
-    /// the in-flight SSE-forwarding task instead of letting it run to
-    /// completion.
     #[tokio::test]
     async fn abort_on_drop_cancels_long_running_task() {
         use std::sync::Arc;

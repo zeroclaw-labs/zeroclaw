@@ -9,7 +9,7 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 | Skill | Use it when |
 |---|---|
 | `github-pr-review-session` | Reviewing a specific PR or working through the review queue: drafts the review body, cross-checks against source, posts via `gh` under the active account holder's identity |
-| `github-issue-triage` | Running a backlog sweep, closing stale/duplicate issues, applying labels, enforcing the RFC stale policy |
+| `github-issue-triage` | Running a backlog sweep, closing stale/duplicate issues, applying labels, enforcing the canonical [issue stale policy](./labels.md#issue-stale-policy) |
 | `github-issue` | Filing a structured issue (bug report or feature request) |
 | `github-pr` | Opening or updating a PR with a fully-populated template body |
 | `squash-merge` | Landing an approved PR into `master` with preserved commit history and the purple **Merged** badge |
@@ -54,7 +54,7 @@ The `github-issue-triage` skill runs autonomous backlog sweeps within defined au
 
 - **Triage**: process issues with no triage labels: classify, apply labels, link to open PRs, flag thin bug reports, redirect security issues
 - **Sweep**: full backlog pass in priority order (fixed-by-merged-PR → duplicates → `r:support` → stale candidates)
-- **Stale**: RFC stale-policy enforcement (`status:stale` then close per the policy window and exclusion rules)
+- **Stale**: apply the canonical [issue stale policy](./labels.md#issue-stale-policy) (`status:stale`, response window, exclusions, and re-engagement)
 - **Won't-fix**: close issues that violate a named core engineering constraint, citing the constraint and its `AGENTS.md`/RFC reference
 - **Single**: handle one issue by number or URL
 

@@ -1,14 +1,4 @@
 //! Browser delegation tool.
-//!
-//! Delegates browser-based tasks to a browser-capable CLI subprocess (e.g.
-//! Claude Code with `claude-in-chrome` MCP tools) for interacting with
-//! corporate web applications (Teams, Outlook, Jira, Confluence) that lack
-//! direct API access.
-//!
-//! The tool spawns the configured CLI binary in non-interactive mode, passing
-//! a structured prompt that instructs it to use browser automation. A
-//! persistent Chrome profile can be configured so SSO sessions survive across
-//! invocations.
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -32,7 +22,6 @@ impl BrowserDelegateTool {
     }
 
     /// Build the CLI command for a browser task.
-    ///
     /// Constructs a `tokio::process::Command` with the configured CLI binary,
     /// `--print` flag for non-interactive mode, and optional Chrome profile env.
     fn build_command(&self, task: &str, url: Option<&str>) -> tokio::process::Command {
@@ -67,7 +56,6 @@ impl BrowserDelegateTool {
     }
 
     /// Extract URLs from free-form text and validate each against domain policy.
-    ///
     /// Prevents policy bypass by embedding blocked URLs in the `task` text,
     /// which is forwarded verbatim to the browser CLI subprocess.
     fn validate_task_urls(&self, task: &str) -> anyhow::Result<()> {
@@ -79,7 +67,6 @@ impl BrowserDelegateTool {
     }
 
     /// Validate URL against allowed/blocked domain lists and scheme restrictions.
-    ///
     /// Only `http` and `https` schemes are permitted. Blocked domains take
     /// precedence over allowed domains when both lists contain the same entry.
     fn validate_url(&self, url: &str) -> anyhow::Result<()> {

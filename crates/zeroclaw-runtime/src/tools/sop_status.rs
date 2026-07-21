@@ -270,6 +270,8 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -383,6 +385,7 @@ mod tests {
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "done".into(),
@@ -421,6 +424,7 @@ mod tests {
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Failed,
                 output: "fail".into(),
