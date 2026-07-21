@@ -339,7 +339,7 @@ When an AI coding assistant reads a repository, it sees the code as it is now. I
 
 ### 7.1 The Pattern
 
-The root `AGENTS.md` is the project's strongest existing contribution to AI-assisted development. It tells AI coding assistants the commands to run, the architecture to respect, the risk tiers to apply, and the anti-patterns to avoid. It works because it is specific, opinionated, and short.
+The root `AGENTS.md` is the project's compact, always-loaded contract for AI-assisted development. It owns project-wide safety, privacy, authorization, contribution, and validation policy. The architecture and contribution map routes non-trivial tasks to their relevant sources, while the coding agent guidelines hold optional detail such as examples, current stability assignments, skill discovery, and protected operational documents. This layered contract stays specific and opinionated without loading every detail into every session.
 
 As the workspace decomposes into crates (per the microkernel architecture RFC), each crate should have its own `AGENTS.md`. This is the mechanism by which architectural boundaries become enforceable at the AI-assistance layer, not just at compile time through crate dependencies, but at the reasoning layer before any code is written.
 
@@ -443,7 +443,9 @@ Implementations are registered by the binary crate, not by the kernel.
 
 ### 7.4 The AGENTS.md Hierarchy
 
-The root `AGENTS.md` sets project-wide policy. Crate-level `AGENTS.md` files narrow that policy for their specific scope. When an AI tool reads a file in `crates/zeroclaw-api/`, it should read both the root `AGENTS.md` (project policy) and `crates/zeroclaw-api/AGENTS.md` (crate policy). Crate policy is more specific and takes precedence where they conflict.
+The root `AGENTS.md` sets the compact project-wide policy. The [architecture and contribution map](../contributing/architecture-map.md) routes tasks to maintained architecture, foundation, testing, security, and maintainer sources. [Coding agent guidelines](../contributing/agent-guidelines.md) provide detailed project-wide examples and registries that are useful on demand but are not part of the always-loaded bootstrap.
+
+Crate-level `AGENTS.md` files narrow that policy for their specific scope. When an AI tool reads a file in `crates/zeroclaw-api/`, it should read the root contract, follow the architecture map for the task, and read `crates/zeroclaw-api/AGENTS.md` when present. Crate policy is more specific and takes precedence within its scope, but it cannot weaken project-wide safety, privacy, or authorization requirements.
 
 ---
 

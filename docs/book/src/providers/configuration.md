@@ -20,6 +20,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -65,6 +66,33 @@ When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama
 {{#env-var container}}
 
 The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
+
+## Per-model vision capability
+
+Use `vision` when a provider family can serve both multimodal and text-only
+models. The value belongs to the provider alias, so routing and fallback paths
+resolve it together with that alias's endpoint, credentials, and model:
+
+```toml
+[providers.models.openai.vision]
+model = "gpt-4o"
+wire_api = "responses"
+vision = true
+
+[providers.models.llamacpp.text]
+model = "qwen3-4b"
+vision = false
+```
+
+Leaving `vision` unset preserves the provider family's built-in default. For
+OpenAI Responses aliases, set `vision = true` for models that accept image
+input; this opt-in keeps text-only Responses models from receiving image
+payloads accidentally.
+
+When `[multimodal] vision_model_provider` names a dotted provider alias, its
+`model` is used automatically. An explicit `[multimodal] vision_model` takes
+precedence over the alias model; if neither is set, the primary turn model is
+used for backward compatibility.
 
 ## Per-family knobs: worked examples
 

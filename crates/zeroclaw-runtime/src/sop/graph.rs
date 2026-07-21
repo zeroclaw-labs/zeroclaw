@@ -757,6 +757,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -1060,6 +1062,7 @@ mod tests {
 
     fn result(step: u32, status: SopStepStatus) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: step,
             status,
             output: String::new(),

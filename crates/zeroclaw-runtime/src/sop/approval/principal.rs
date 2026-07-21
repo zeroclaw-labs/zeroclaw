@@ -97,6 +97,31 @@ impl ApprovalPrincipal {
             .unwrap_or_else(|| self.source_label().to_string())
     }
 
+    /// The voter SOURCE for quorum distinctness. HTTP and WS collapse to a single
+    /// `gateway` source because they authenticate via the SAME PairingGuard token -
+    /// the derived subject (token hash) is identical whichever transport carries it,
+    /// so one credential presented over HTTP and over WS is ONE voter, not two, and
+    /// cannot inflate a quorum. Agent/CLI keep distinct sources (a CLI OS-user is a
+    /// genuinely different actor from a paired gateway device).
+    fn voter_source(&self) -> &'static str {
+        match self.source {
+            ApprovalSource::Http | ApprovalSource::Ws => "gateway",
+            _ => self.source_label(),
+        }
+    }
+
+    /// Quorum-distinctness key. Qualified by the *voter source* (see
+    /// [`Self::voter_source`]) so a different identity on a different source stays
+    /// distinct, while the same paired credential over HTTP+WS counts once. An
+    /// identity-less principal keys to its source alone, so anonymous votes from one
+    /// source count once and cannot inflate a quorum.
+    pub fn voter_key(&self) -> String {
+        match &self.identity {
+            Some(id) => format!("{}:{}", self.voter_source(), id),
+            None => self.voter_source().to_string(),
+        }
+    }
+
     /// Stable wire label for the source (for ledger payloads / logs).
     pub fn source_label(&self) -> &'static str {
         match self.source {
@@ -142,6 +167,31 @@ mod tests {
         );
         assert_eq!(ApprovalPrincipal::cli(None).actor_label(), "cli");
         assert_eq!(ApprovalPrincipal::system().actor_label(), "system");
+    }
+
+    #[test]
+    fn voter_key_collapses_gateway_transports_but_keeps_sources_distinct() {
+        // HTTP and WS share the paired credential -> one canonical gateway voter.
+        assert_eq!(
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            ApprovalPrincipal::ws("conn".into(), Some("sub".into())).voter_key(),
+            "the same subject over HTTP and WS is one voter"
+        );
+        assert_eq!(
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            "gateway:sub"
+        );
+        // A CLI actor with the same name is a genuinely distinct voter.
+        assert_ne!(
+            ApprovalPrincipal::cli(Some("sub".into())).voter_key(),
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            "a CLI actor is distinct from a gateway subject"
+        );
+        // Different subjects on the gateway stay distinct.
+        assert_ne!(
+            ApprovalPrincipal::http(Some("a".into())).voter_key(),
+            ApprovalPrincipal::http(Some("b".into())).voter_key()
+        );
     }
 
     #[test]
