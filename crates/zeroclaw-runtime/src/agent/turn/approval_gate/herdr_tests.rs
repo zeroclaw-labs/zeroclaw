@@ -119,10 +119,9 @@ macro_rules! assert_state_sequence {
 async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
     clear_broadcast_hook();
     let spy = HerdrSpy::new();
-    let (reporter, calls) = make_spy_reporter(spy);
-    let herdr = Arc::new(HerdrObserver::new_with_reporter(reporter));
+    let (client, calls) = make_spy_reporter(spy);
+    let herdr = Arc::new(HerdrObserver::new(client, None));
     let _guard = set_scoped_broadcast_hook(herdr.clone());
-    crate::integrations::herdr::update_session_id("test-session-1");
 
     let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
     let channel = Arc::new(TestChannel::new(
@@ -146,10 +145,9 @@ async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
 async fn approval_gate_herdr_deny_transitions_blocked_to_idle() {
     clear_broadcast_hook();
     let spy = HerdrSpy::new();
-    let (reporter, calls) = make_spy_reporter(spy);
-    let herdr = Arc::new(HerdrObserver::new_with_reporter(reporter));
+    let (client, calls) = make_spy_reporter(spy);
+    let herdr = Arc::new(HerdrObserver::new(client, None));
     let _guard = set_scoped_broadcast_hook(herdr.clone());
-    crate::integrations::herdr::update_session_id("test-session-2");
 
     let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
     let channel = Arc::new(TestChannel::new(

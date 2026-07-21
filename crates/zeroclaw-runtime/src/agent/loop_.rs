@@ -1125,8 +1125,11 @@ pub async fn run(
         // guard then drops, removing the hook and releasing the I/O thread.
         // Daemon/cron/subagent callers pass `interactive = false`; the Herdr
         // integration is CLI-interactive-only and must not mutate pane state
-        // from those paths.
-        let _herdr_guard = crate::integrations::herdr::try_install_hook(interactive, agent_alias);
+        // from those paths. The `turn_id` filter ensures nested non-interactive
+        // subagent runs cannot mutate the parent's pane state even though they
+        // share the same process.
+        let _herdr_guard =
+            crate::integrations::herdr::try_install_hook(interactive, agent_alias, Some(&turn_id));
         // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
         // exporter's background interval fires. Hold a FlushGuard for the rest of
         // this body so every return path — including `?` errors — pushes buffered
@@ -1599,9 +1602,10 @@ pub async fn run(
             }
         });
 
-        // herdr session_id: use memory_session_id if present, else fallback to pane:{alias}.
-        // This ensures herdr can map the pane to a session even without explicit file path.
-        crate::integrations::herdr::set_session_id(agent_alias, memory_session_id.as_deref());
+        // Herdr session_id reporting is deferred until Herdr accepts the
+        // ("herdr:zeroclaw", "zeroclaw") (source, agent) pair contract (see
+        // discussion #811). `memory_session_id` is still used below for
+        // internal memory operations and local correlation.
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =

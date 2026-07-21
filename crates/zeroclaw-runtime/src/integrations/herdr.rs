@@ -11,17 +11,18 @@
 //! fire-and-forget; flush synchronously waits for pending writes at shutdown.
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
-
-use parking_lot::RwLock;
 
 use zeroclaw_api::observability_traits::ObserverMetric;
 
@@ -35,6 +36,9 @@ use crate::observability::{
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Maximum time to wait for a UDS write before giving up.
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
+/// Maximum time to wait for the writer task to drain all pending messages
+/// at shutdown. Bounds the total teardown latency.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Connect to a Unix domain socket with a timeout using tokio.
 #[cfg(unix)]
@@ -77,7 +81,11 @@ const AGENT: &str = "zeroclaw";
 /// and subagent callers pass `interactive = false` and must not mutate the
 /// pane's process-wide Herdr state, since their lifecycle and flush
 /// assumptions differ from the CLI one-shot / REPL path.
-pub fn try_install_hook(interactive: bool, agent_alias: &str) -> Option<BroadcastHookGuard> {
+pub fn try_install_hook(
+    interactive: bool,
+    agent_alias: &str,
+    owning_turn_id: Option<&str>,
+) -> Option<BroadcastHookGuard> {
     if !interactive {
         return None;
     }
@@ -86,7 +94,7 @@ pub fn try_install_hook(interactive: bool, agent_alias: &str) -> Option<Broadcas
     }
     let socket_path = std::env::var("HERDR_SOCKET_PATH").ok()?;
     let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
-    install_hook_from_env(socket_path, pane_id, agent_alias)
+    install_hook_from_env(socket_path, pane_id, agent_alias, owning_turn_id)
 }
 
 /// Install the hook from already-resolved env values. Factored out of
@@ -97,11 +105,12 @@ fn install_hook_from_env(
     socket_path: String,
     pane_id: String,
     agent_alias: &str,
+    owning_turn_id: Option<&str>,
 ) -> Option<BroadcastHookGuard> {
     // UDS is Unix-only; silently skip on other platforms.
     #[cfg(not(unix))]
     {
-        let _ = (socket_path, pane_id, agent_alias);
+        let _ = (socket_path, pane_id, agent_alias, owning_turn_id);
         return None;
     }
 
@@ -126,11 +135,10 @@ fn install_hook_from_env(
     let _ = client.send("pane.release_agent", &serde_json::Map::new());
     // Report initial idle state so herdr shows the agent immediately, even
     // before any user message triggers a state transition.
-    client.report_state("idle", None);
+    client.report_state("idle");
     // Startup messages are best-effort; the first ObserverEvent will re-emit
     // idle if the daemon was unavailable.
-    let reporter = DebouncedReporter::new(client);
-    let observer = Arc::new(HerdrObserver::new(reporter));
+    let observer = Arc::new(HerdrObserver::new(client, owning_turn_id));
     Some(set_scoped_broadcast_hook(observer))
 }
 
@@ -139,38 +147,106 @@ fn install_hook_from_env(
 #[cfg(test)]
 type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
 
+/// Maximum number of pending messages in the writer queue. Bounded to prevent
+/// unbounded accumulation when the Herdr daemon is slow or unavailable.
+/// Capacity 64: 64 * 700ms (max connect+write) = ~45s theoretical max drain,
+/// but shutdown timeout caps actual wait at 2s.
+const WRITER_QUEUE_CAPACITY: usize = 64;
+
+/// Drop guard that signals the drain-done channel during a panic unwind, so
+/// the sync `shutdown_drain()` never waits the full 2s timeout for a task
+/// that already crashed.
+#[cfg(unix)]
+struct DrainOnPanic(Option<std_mpsc::SyncSender<()>>);
+
+#[cfg(unix)]
+impl Drop for DrainOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(tx) = self.0.take()
+        {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// Client that sends JSON-RPC notifications to the herdr daemon via tokio UDS.
 /// The `send()` method serializes and fires off an async write — it never
-/// blocks the caller. Call `flush()` to wait until pending writes complete
+/// blocks the caller. Call `shutdown_drain()` to wait until pending writes complete
 /// (used at startup and shutdown for guaranteed delivery).
 pub(crate) struct HerdrClient {
     pane_id: String,
     #[cfg(test)]
     spy: Option<SpyFn>,
     #[cfg(unix)]
-    writer: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    writer: Mutex<Option<mpsc::Sender<String>>>,
+    #[cfg(unix)]
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Sync channel signaled by the writer task when it has finished draining.
+    /// Allows the sync `flush()` path to wait without `block_in_place`.
+    #[cfg(unix)]
+    drain_done_rx: Mutex<Option<std_mpsc::Receiver<()>>>,
 }
 
 impl HerdrClient {
     pub(crate) fn new(socket_path: String, pane_id: String) -> Self {
         #[cfg(unix)]
         {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (tx, mut rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+            // Sync channel for the writer task to signal drain completion to
+            // the sync `flush()` path. Buffered(1) so the writer task can send
+            // without blocking even if the receiver isn't waiting yet.
+            let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
+            // Clone so the panic guard can signal drain completion even if
+            // the writer task panics mid-write.
+            let drain_tx_for_panic = drain_done_tx.clone();
             let socket_path = socket_path.clone();
-            zeroclaw_spawn::spawn!(async move {
-                while let Some(payload) = rx.recv().await {
-                    let mut stream = match connect_with_timeout(&socket_path).await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let _ = send_on_stream(&mut stream, &payload).await;
+            let _writer_handle = zeroclaw_spawn::spawn!(async move {
+                let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => {
+                            // Shutdown signal received, drain remaining messages
+                            while let Some(payload) = rx.recv().await {
+                                let mut stream = match connect_with_timeout(&socket_path).await {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                let _ = send_on_stream(&mut stream, &payload).await;
+                            }
+                            // Signal drain completion to the sync flush path.
+                            let _ = drain_done_tx.send(());
+                            break;
+                        }
+                        maybe_payload = rx.recv() => {
+                            match maybe_payload {
+                                Some(payload) => {
+                                    let mut stream = match connect_with_timeout(&socket_path).await {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
+                                    let _ = send_on_stream(&mut stream, &payload).await;
+                                }
+                                None => {
+                                    // Channel closed without shutdown signal;
+                                    // signal drain done and exit.
+                                    let _ = drain_done_tx.send(());
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             });
             Self {
                 pane_id,
                 #[cfg(test)]
                 spy: None,
-                writer: Some(tx),
+                writer: Mutex::new(Some(tx)),
+                shutdown_tx: Mutex::new(Some(shutdown_tx)),
+                drain_done_rx: Mutex::new(Some(drain_done_rx)),
             }
         }
         #[cfg(not(unix))]
@@ -180,8 +256,6 @@ impl HerdrClient {
                 pane_id,
                 #[cfg(test)]
                 spy: None,
-                #[cfg(unix)]
-                writer: None,
             }
         }
     }
@@ -195,7 +269,41 @@ impl HerdrClient {
             pane_id,
             spy: Some(Arc::new(spy)),
             #[cfg(unix)]
-            writer: None,
+            writer: Mutex::new(None),
+            #[cfg(unix)]
+            shutdown_tx: Mutex::new(None),
+            #[cfg(unix)]
+            drain_done_rx: Mutex::new(None),
+        }
+    }
+
+    /// Wait for the writer task to drain all pending messages and exit.
+    /// Uses a sync channel so this can be called from a sync context without
+    /// `block_in_place`. The timeout bounds the total drain time.
+    pub(crate) fn shutdown_drain(&self, timeout_dur: Duration) {
+        #[cfg(unix)]
+        {
+            // Close the sender so no new messages can be queued
+            self.writer.lock().take();
+
+            // Signal the writer task to enter drain mode
+            if let Some(shutdown_tx) = self.shutdown_tx.lock().take() {
+                let _ = shutdown_tx.send(());
+            }
+
+            // Wait for drain completion via the sync channel with a timeout.
+            if let Some(rx) = self.drain_done_rx.lock().take() {
+                let deadline = Instant::now() + timeout_dur;
+                if let Some(rem) = deadline.checked_duration_since(Instant::now())
+                    && !rem.is_zero()
+                {
+                    let _ = rx.recv_timeout(rem);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = timeout_dur;
         }
     }
 
@@ -249,27 +357,26 @@ impl HerdrClient {
 
         let payload_str = serde_json::to_string(&payload)?;
 
-        // Fire-and-forget: push to writer task. The channel is unbounded, so
-        // send is O(1) even if the writer task is stuck connecting to a stale
-        // socket. Messages may accumulate if the daemon is slow/unavailable;
-        // they are drained when the writer task reconnects or dropped on Drop.
+        // Fire-and-forget: push to writer task via bounded channel. Use
+        // `try_send` so the caller never blocks on a slow/unavailable peer.
+        // On queue full, drop the new message — `transit_to` already suppresses
+        // redundant state transitions, so this is a rare
+        // backpressure case that loses a stale lifecycle snapshot.
         #[cfg(unix)]
-        if let Some(tx) = &self.writer {
-            let _ = tx.send(payload_str);
+        if let Some(tx) = self.writer.lock().as_ref() {
+            match tx.try_send(payload_str) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
 
         Ok(())
     }
 
-    fn report_state(&self, state: &str, session_id: Option<&str>) {
+    fn report_state(&self, state: &str) {
         let mut params = serde_json::Map::new();
         params.insert("state".into(), serde_json::Value::String(state.into()));
-        if let Some(sid) = session_id {
-            params.insert(
-                "agent_session_id".into(),
-                serde_json::Value::String(sid.into()),
-            );
-        }
         let _ = self.send("pane.report_agent", &params);
     }
 
@@ -287,7 +394,7 @@ impl HerdrClient {
     }
 }
 
-// ── DebouncedReporter ────────────────────────────────────────────────────────
+// ── HerdrState ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HerdrState {
@@ -297,145 +404,104 @@ pub(crate) enum HerdrState {
     Released,
 }
 
-/// Debounces status changes so the herdr socket is only contacted on actual
-/// state transitions, not on every ObserverEvent.
-pub(crate) struct DebouncedReporter {
-    pub(crate) client: HerdrClient,
-    state: HerdrState,
-}
-
-impl DebouncedReporter {
-    pub(crate) fn new(client: HerdrClient) -> Self {
-        Self {
-            client,
-            state: HerdrState::Idle,
-        }
-    }
-
-    fn transit_to(&mut self, target: HerdrState, session_id: Option<&str>) {
-        if self.state == target {
-            return;
-        }
-        self.state = target;
-        if target == HerdrState::Released {
-            self.client.report_state("idle", None);
-            self.client.report_released();
-        } else {
-            let label = match target {
-                HerdrState::Working => "working",
-                HerdrState::Idle => "idle",
-                HerdrState::Blocked => "blocked",
-                HerdrState::Released => unreachable!(),
-            };
-            self.client.report_state(label, session_id);
-        }
-    }
-
-    /// Flush at shutdown: if not yet Released, emit idle + release_agent.
-    /// The writer task drains pending messages naturally when the sender drops.
-    pub(crate) fn flush(&mut self) {
-        if self.state != HerdrState::Released {
-            self.state = HerdrState::Released;
-            self.client.report_state("idle", None);
-            self.client.report_released();
-        }
-    }
-}
-
-// ── Session ID slot (process-wide) ──────────────────────────────────────────
-//
-// This is NOT a duplicate of canonical state. The source of truth for the
-// session id is `memory_session_id` resolved in `agent::loop_::run()` from the
-// session state file. This slot is a cross-thread resolver: a single writer
-// (`update_session_id`, called from the agent loop) populates it, and the
-// `HerdrObserver::record_event` path reads it from whichever thread the
-// `TeeObserver` broadcast fan-out happens to land on. The previous
-// `thread_local!` was unsound for that use case because tokio can migrate the
-// observer's task to a different worker thread, where the slot would read
-// `None`. The pattern mirrors `BROADCAST_HOOK` in `observability/mod.rs`.
-
-static SESSION_ID_SLOT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
-
-fn session_id_slot() -> &'static RwLock<Option<String>> {
-    SESSION_ID_SLOT.get_or_init(|| RwLock::new(None))
-}
-
-pub fn update_session_id(sid: &str) {
-    session_id_slot().write().replace(sid.to_owned());
-}
-
-/// Set the herdr session ID. If `memory_session_id` is present, use it directly.
-/// Otherwise, fall back to `pane:{agent_alias}` for herdr session mapping.
-pub fn set_session_id(agent_alias: &str, memory_session_id: Option<&str>) {
-    let sid = memory_session_id.map(|s| s.to_owned()).or_else(|| {
-        Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
-            "pane:{agent_alias}"
-        )))
-    });
-    if let Some(sid) = sid {
-        update_session_id(&sid);
-    }
-}
-
-fn current_session_id() -> Option<String> {
-    session_id_slot().read().clone()
-}
-
 // ── HerdrObserver ────────────────────────────────────────────────────────────
 
 /// Observer that reports agent lifecycle to the herdr daemon.
 ///
 /// State machine: `Idle` → activity event → `Working` → `AgentEnd` → `Idle`.
+///
+/// Events are filtered by `owning_turn_id`: only events whose `turn_id`
+/// matches the owning interactive run are forwarded to herdr. This isolates
+/// nested non-interactive runs (subagents) from the parent's pane state.
+/// Child agents pass `interactive = false` to `try_install_hook`, which
+/// returns `None` and installs no hook; even if they did install one, the
+/// `owning_turn_id` filter would prevent their events from reaching the
+/// parent's observer.
 pub struct HerdrObserver {
-    reporter: Mutex<DebouncedReporter>,
+    state: Mutex<HerdrState>,
+    client: HerdrClient,
+    /// Owning turn identity for event filtering.
+    owning_turn_id: Option<String>,
 }
 
 impl HerdrObserver {
-    pub(crate) fn new(reporter: DebouncedReporter) -> Self {
+    pub(crate) fn new(client: HerdrClient, owning_turn_id: Option<&str>) -> Self {
         Self {
-            reporter: Mutex::new(reporter),
+            state: Mutex::new(HerdrState::Idle),
+            client,
+            owning_turn_id: owning_turn_id.map(|s| s.to_owned()),
         }
     }
+}
 
-    /// Test-only constructor that accepts a pre-built reporter.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn new_with_reporter(reporter: DebouncedReporter) -> Self {
-        Self::new(reporter)
+impl HerdrObserver {
+    fn transit_to(&self, state: &mut HerdrState, target: HerdrState) {
+        if *state == target {
+            return;
+        }
+        *state = target;
+        match target {
+            HerdrState::Released => {
+                self.client.report_state("idle");
+                self.client.report_released();
+            }
+            HerdrState::Working => self.client.report_state("working"),
+            HerdrState::Idle => self.client.report_state("idle"),
+            HerdrState::Blocked => self.client.report_state("blocked"),
+        }
     }
 }
 
 impl Observer for HerdrObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        let sid = current_session_id();
-        let mut reporter = self.reporter.lock().expect("herdr observer poisoned");
+        // Filter by owning turn_id: only events from the owning interactive
+        // run are forwarded. This prevents child agents (subagents) from
+        // mutating the parent's herdr pane state.
+        if let Some(owning) = self.owning_turn_id.as_deref() {
+            let event_turn: Option<&str> = match event {
+                ObserverEvent::AgentStart { turn_id, .. }
+                | ObserverEvent::LlmRequest { turn_id, .. }
+                | ObserverEvent::LlmResponse { turn_id, .. }
+                | ObserverEvent::AgentEnd { turn_id, .. }
+                | ObserverEvent::ToolCallStart { turn_id, .. }
+                | ObserverEvent::ToolCall { turn_id, .. }
+                | ObserverEvent::HistoryTrimmed { turn_id, .. }
+                | ObserverEvent::AuthorizationRequested { turn_id, .. }
+                | ObserverEvent::AuthorizationResponded { turn_id, .. } => turn_id.as_deref(),
+                _ => None,
+            };
+            if event_turn.is_some_and(|t| t != owning) {
+                return;
+            }
+        }
+        let mut state = self.state.lock();
         match event {
             ObserverEvent::AgentStart { .. } => {
-                reporter.transit_to(HerdrState::Idle, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Idle);
             }
             ObserverEvent::LlmRequest { .. } | ObserverEvent::ToolCallStart { .. } => {
-                reporter.transit_to(HerdrState::Working, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Working);
             }
             ObserverEvent::LlmResponse { .. } => {
-                reporter.transit_to(HerdrState::Working, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Working);
             }
             ObserverEvent::ToolCall { .. } => {
-                reporter.transit_to(HerdrState::Working, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Working);
             }
             ObserverEvent::TurnComplete => {
-                reporter.transit_to(HerdrState::Idle, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Idle);
             }
             ObserverEvent::AgentEnd { .. } => {
-                reporter.transit_to(HerdrState::Released, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Released);
             }
             ObserverEvent::AuthorizationRequested { .. } => {
-                reporter.transit_to(HerdrState::Blocked, sid.as_deref());
+                self.transit_to(&mut state, HerdrState::Blocked);
             }
             ObserverEvent::AuthorizationResponded { granted, .. } => {
                 if *granted {
-                    reporter.transit_to(HerdrState::Working, sid.as_deref());
+                    self.transit_to(&mut state, HerdrState::Working);
                 } else {
-                    reporter.transit_to(HerdrState::Idle, sid.as_deref());
+                    self.transit_to(&mut state, HerdrState::Idle);
                 }
             }
             _ => {}
@@ -445,10 +511,15 @@ impl Observer for HerdrObserver {
     fn record_metric(&self, _metric: &ObserverMetric) {}
 
     fn flush(&self) {
-        self.reporter
-            .lock()
-            .expect("herdr observer poisoned")
-            .flush();
+        {
+            let mut state = self.state.lock();
+            if *state != HerdrState::Released {
+                *state = HerdrState::Released;
+                self.client.report_state("idle");
+                self.client.report_released();
+            }
+        }
+        self.client.shutdown_drain(SHUTDOWN_TIMEOUT);
     }
 
     fn name(&self) -> &str {
@@ -463,7 +534,10 @@ impl Observer for HerdrObserver {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use parking_lot::Mutex;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::UnixListener;
 
     /// A spy that captures all `pane.report_agent` / `pane.release_agent`
     /// calls instead of sending them over UDS.
@@ -488,11 +562,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Build a `DebouncedReporter` with a `HerdrClient` that uses the spy
-    /// instead of connecting to a real UDS socket.
-    pub(crate) fn make_spy_reporter(
-        spy: HerdrSpy,
-    ) -> (DebouncedReporter, Arc<Mutex<Vec<HerdrSpyCall>>>) {
+    /// Build a `HerdrClient` with the spy instead of connecting to a real UDS socket.
+    pub(crate) fn make_spy_reporter(spy: HerdrSpy) -> (HerdrClient, Arc<Mutex<Vec<HerdrSpyCall>>>) {
         let calls = spy.into_inner();
         let calls_clone = calls.clone();
         let client = HerdrClient::new_with_spy(
@@ -505,8 +576,7 @@ pub(crate) mod tests {
                 });
             },
         );
-        let reporter = DebouncedReporter::new(client);
-        (reporter, calls)
+        (client, calls)
     }
 
     #[tokio::test]
@@ -539,6 +609,7 @@ pub(crate) mod tests {
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-pane".into(),
             "test-agent",
+            None,
         );
         let elapsed = start.elapsed();
 
@@ -564,7 +635,7 @@ pub(crate) mod tests {
         // vars were set by some other process. The gate short-circuits before
         // any env read.
         assert!(
-            try_install_hook(false, "test-agent").is_none(),
+            try_install_hook(false, "test-agent", None).is_none(),
             "try_install_hook(false) must return None without consulting env vars"
         );
     }
@@ -578,34 +649,38 @@ pub(crate) mod tests {
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-🦀".into(),
             "test-agent",
+            None,
         );
     }
 
-    /// `DebouncedReporter::flush()` must emit the idle + release_agent
+    /// `HerdrObserver::flush()` must emit the idle + release_agent
     /// notifications exactly once and transition to `Released`, matching the
     /// AgentEnd / run-teardown drain contract.
     #[tokio::test]
-    async fn debounced_reporter_flush_drains_release_messages() {
+    async fn herdr_observer_flush_drains_release_messages() {
         let spy = HerdrSpy::new();
-        let (mut reporter, calls) = make_spy_reporter(spy);
+        let (client, calls) = make_spy_reporter(spy);
+        let observer = HerdrObserver::new(client, None);
 
         // Simulate the agent reaching Working state first so flush has
         // something to release from.
-        reporter.transit_to(HerdrState::Working, Some("test-session"));
+        observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
         calls.lock().clear();
 
-        reporter.flush();
+        observer.flush();
 
         let captured: Vec<HerdrSpyCall> = calls.lock().clone();
         let methods: Vec<&str> = captured.iter().map(|c| c.method.as_str()).collect();
 
         // The flush must emit exactly two messages: an idle state report
         // followed by a release_agent notification.
-        assert!(
-            reporter.state == HerdrState::Released,
-            "flush must transition state to Released, got {:?}",
-            reporter.state,
-        );
         assert_eq!(
             captured.len(),
             2,
@@ -628,51 +703,14 @@ pub(crate) mod tests {
             methods
         );
 
-        // Double-flush is a no-op — the reporter is already Released.
+        // Double-flush is a no-op — the observer is already Released.
         let count_after_first = calls.lock().len();
-        reporter.flush();
+        observer.flush();
         assert_eq!(
             calls.lock().len(),
             count_after_first,
             "second flush must not emit duplicate release messages"
         );
-    }
-
-    /// `current_session_id()` must return the value set by `update_session_id()`
-    /// regardless of which thread reads it. The previous `thread_local!` slot
-    /// was unsound because tokio can migrate the observer's task to a different
-    /// worker thread.
-    #[test]
-    fn session_id_is_visible_across_threads() {
-        // Guard: clear any session_id set by a previous test.
-        session_id_slot().write().take();
-
-        // Write the session ID on the current thread.
-        update_session_id("cross-thread-session-1");
-
-        // Spawn a distinct OS thread and read the session ID.
-        let t = std::thread::spawn(|| {
-            let sid = current_session_id();
-            assert_eq!(
-                sid.as_deref(),
-                Some("cross-thread-session-1"),
-                "session_id written on one thread must be visible on another thread"
-            );
-            sid
-        });
-        let result = t.join().expect("cross-thread session_id thread panicked");
-        assert_eq!(result.as_deref(), Some("cross-thread-session-1"));
-
-        // Update the session ID and verify the new value is visible on a fresh thread.
-        update_session_id("cross-thread-session-2");
-        let t2 = std::thread::spawn(current_session_id);
-        let result2 = t2
-            .join()
-            .expect("cross-thread session_id thread 2 panicked");
-        assert_eq!(result2.as_deref(), Some("cross-thread-session-2"));
-
-        // Clean up so other tests don't observe stale state.
-        session_id_slot().write().take();
     }
 
     /// `next_seq()` must return monotonically increasing values starting from
@@ -708,6 +746,201 @@ pub(crate) mod tests {
             "seq {} should be seeded from wall clock (now ~{})",
             seq1,
             now_micros
+        );
+    }
+
+    /// Shutdown drain test: verify ordered receipt of `idle` then
+    /// `pane.release_agent` before shutdown completes. Uses a real
+    /// `UnixListener` to receive messages and confirm ordering.
+    #[tokio::test]
+    async fn herdr_shutdown_drain_ordered_receipt() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("herdr-test.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        // Bind a listener before starting the client
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Create client and send messages
+        let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
+        client.report_state("idle");
+        client.report_released();
+
+        // Flush (drains the writer task)
+        client.shutdown_drain(SHUTDOWN_TIMEOUT);
+
+        // Now accept and read messages from the listener
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && received.len() < 2 {
+            match tokio::time::timeout(Duration::from_millis(50), listener.accept()).await {
+                Ok(Ok((stream, _))) => {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_ok() {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                            if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
+                                received.push(method.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Verify ordered receipt: idle then release_agent
+        assert_eq!(
+            received.len(),
+            2,
+            "expected 2 messages, got {}: {:?}",
+            received.len(),
+            received
+        );
+        assert_eq!(received[0], "pane.report_agent");
+        assert_eq!(received[1], "pane.release_agent");
+    }
+
+    /// Shutdown drain bounded wait test: slow/unavailable peer must not
+    /// block shutdown longer than the timeout. Simulates a slow listener
+    /// that accepts but never reads, verifying the 2s timeout is honored.
+    #[tokio::test]
+    async fn herdr_shutdown_drain_bounded_wait() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("herdr-test-slow.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        // Bind a listener that accepts but never reads (slow peer)
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Create client and send a message
+        let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
+        client.report_state("idle");
+        client.report_released();
+
+        // Flush should complete within timeout even with slow peer
+        let start = Instant::now();
+        client.shutdown_drain(SHUTDOWN_TIMEOUT);
+        let elapsed = start.elapsed();
+
+        // Must complete within SHUTDOWN_TIMEOUT (2s) + some slack
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown drain must be bounded, took {:?}",
+            elapsed
+        );
+
+        // Clean up: drop listener to unblock any pending accept
+        drop(listener);
+    }
+
+    /// Nested run isolation test: parent interactive run + child subagent
+    /// (interactive=false). Verifies child events don't reach parent's
+    /// herdr hook, parent session unchanged, child AgentEnd doesn't
+    /// release parent's pane.
+    #[tokio::test]
+    async fn herdr_nested_run_isolation() {
+        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
+        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+
+        clear_broadcast_hook();
+
+        // Parent installs hook with owning turn_id
+        let parent_turn_id = "parent-turn-123";
+        let spy_parent = HerdrSpy::new();
+        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
+        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
+        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
+
+        // Simulate parent activity
+        let parent_start = ObserverEvent::AgentStart {
+            model_provider: "test".into(),
+            model: "test".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        let parent_llm = ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        let parent_end = ObserverEvent::AgentEnd {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+
+        // Parent events should be processed
+        parent_observer.record_event(&parent_start);
+        parent_observer.record_event(&parent_llm);
+        parent_observer.record_event(&parent_end);
+
+        // Child (subagent) events with different turn_id should be filtered out
+        let child_turn_id = "child-turn-456";
+        let child_start = ObserverEvent::AgentStart {
+            model_provider: "test".into(),
+            model: "test".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(child_turn_id.to_string()),
+        };
+        let child_llm = ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(child_turn_id.to_string()),
+        };
+        let child_end = ObserverEvent::AgentEnd {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(child_turn_id.to_string()),
+        };
+
+        // Child events should NOT be processed by parent observer
+        parent_observer.record_event(&child_start);
+        parent_observer.record_event(&child_llm);
+        parent_observer.record_event(&child_end);
+
+        // Verify only parent events were captured (6 events: start, llm, end for parent)
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+
+        // Parent: LlmRequest→Working, AgentEnd→Idle+Release (initial Idle is implicit)
+        assert_eq!(
+            state_methods,
+            vec!["working", "idle"],
+            "child events should be filtered out, got {:?}",
+            state_methods
+        );
+
+        // Verify no release_agent from child (child's AgentEnd would have emitted it)
+        let release_count = captured
+            .iter()
+            .filter(|c| c.method == "pane.release_agent")
+            .count();
+        assert_eq!(
+            release_count, 1,
+            "only parent AgentEnd should emit release_agent"
         );
     }
 }
