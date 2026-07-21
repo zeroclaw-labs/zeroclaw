@@ -22,12 +22,11 @@ pub fn apply_timeout_action(
         // Audit-first: don't re-surface unless the escalation row is durably
         // recorded; on a store failure skip this run (it retries next tick).
         ApprovalTimeoutAction::Escalate => {
-            let entry = system_entry(engine, run_id, GateEventKind::Escalated);
-            if let Err(e) = engine.record_gate_event(entry) {
+            let event = system_entry(engine, run_id, GateEventKind::Escalated).into_event_record();
+            if let Err(e) = engine.restamp_waiting_with_gate_event(run_id, &event) {
                 log_audit_skip(run_id, "escalate", &e);
                 return None;
             }
-            engine.restamp_waiting(run_id);
             // EPIC G (Phase 10): if this step's approval policy names a distinct
             // second route, deliver an escalation notice to it (best-effort; the gate
             // stays open regardless). With no policy/route this is a no-op, so the
@@ -38,15 +37,12 @@ pub fn apply_timeout_action(
         // Fail-safe terminal: cancel the run. Audit-first: do not cancel unless
         // the timeout row is durably recorded; on a store failure skip (retries).
         ApprovalTimeoutAction::Cancel => {
-            let entry = system_entry(engine, run_id, GateEventKind::TimedOut);
-            if let Err(e) = engine.record_gate_event(entry) {
-                log_audit_skip(run_id, "cancel", &e);
-                return None;
-            }
-            match engine.finish_run(
+            let event = system_entry(engine, run_id, GateEventKind::TimedOut).into_event_record();
+            match engine.finish_run_with_gate_event(
                 run_id,
                 SopRunStatus::Cancelled,
                 Some("approval timeout (fail-closed cancel)".to_string()),
+                &event,
             ) {
                 Ok(action) => Some(action),
                 Err(e) => {
@@ -114,6 +110,13 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
     };
     let broker = engine.approval_broker();
     if let Some(route) = broker.escalation_route(engine.approval_config(), &policy_name) {
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %run_id,
+            sop_name = %sop_name,
+        );
+        let _guard = span.enter();
         broker.deliver_escalation(&route, run_id, &sop_name, step);
     }
 }

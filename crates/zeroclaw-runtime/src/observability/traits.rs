@@ -62,6 +62,7 @@ mod tests {
     #[test]
     fn observer_event_and_metric_are_cloneable() {
         let event = ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
