@@ -1,5 +1,4 @@
 //! Standard node capability definitions for device nodes.
-//!
 //! These define the expected schemas that camera, screen, location, and
 //! notification nodes should advertise when they connect via WebSocket.
 

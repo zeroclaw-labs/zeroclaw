@@ -48,7 +48,6 @@ struct TestCase {
 }
 
 /// Parse a single TEST.sh line into a `TestCase`.
-///
 /// Expected format: `command | expected_exit_code | expected_output_pattern`
 fn parse_test_line(line: &str) -> Option<TestCase> {
     let trimmed = line.trim();
@@ -88,11 +87,6 @@ fn parse_test_line(line: &str) -> Option<TestCase> {
     })
 }
 
-/// Check whether `output` matches `pattern`.
-///
-/// If the pattern looks like a regex (contains regex metacharacters beyond a
-/// simple `/` path), we attempt a regex match. Otherwise we fall back to a
-/// simple substring check.
 fn pattern_matches(output: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true;
@@ -441,7 +435,7 @@ mod tests {
 
     #[test]
     fn truncate_output_does_not_panic_on_multibyte_boundary() {
-        // Regression for #7828: `max` landing inside a multi-byte UTF-8 char
+        // `max` landing inside a multi-byte UTF-8 char
         // must not panic. "🦀" is 4 bytes; max=2 is mid-char.
         let out = truncate_output("🦀🦀🦀", 2);
         assert!(

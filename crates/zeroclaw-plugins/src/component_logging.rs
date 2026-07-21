@@ -4,8 +4,27 @@ use zeroclaw_log::{Action, Event, EventOutcome, record};
 
 use crate::component::PluginState;
 use crate::component::bindings;
+use crate::instance::PluginInstanceId;
+
+fn plugin_log_attrs(
+    instance: &PluginInstanceId,
+    fn_name: String,
+    raw_attrs: Option<String>,
+) -> serde_json::Value {
+    let mut attrs = serde_json::json!({
+        "plugin": instance.package(),
+        "plugin_capability": instance.capability(),
+        "plugin_binding": instance.binding(),
+        "plugin_fn": fn_name,
+    });
+    if let Some(raw) = raw_attrs {
+        attrs["raw"] = serde_json::Value::String(raw);
+    }
+    attrs
+}
 
 fn do_log_record(
+    instance: &PluginInstanceId,
     level_idx: u8,
     fn_name: String,
     action: Action,
@@ -18,11 +37,7 @@ fn do_log_record(
     if let Some(ms) = duration_ms {
         ev = ev.with_duration(ms);
     }
-    let attrs = match raw_attrs {
-        Some(raw) => serde_json::json!({ "plugin_fn": fn_name, "raw": raw }),
-        None => serde_json::json!({ "plugin_fn": fn_name }),
-    };
-    ev = ev.with_attrs(attrs);
+    ev = ev.with_attrs(plugin_log_attrs(instance, fn_name, raw_attrs));
     match level_idx {
         0 => record!(TRACE, ev, msg),
         1 => record!(DEBUG, ev, msg),
@@ -97,6 +112,7 @@ macro_rules! impl_host {
                     LogLevel::Error => 4,
                 };
                 do_log_record(
+                    self.scope().id(),
                     level_idx,
                     event.function_name,
                     action,
@@ -136,5 +152,23 @@ impl bindings::channel::zeroclaw::plugin::inbound::Host for PluginState {
 
     async fn inbound_pending(&mut self) -> u32 {
         self.inbound().pending()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PluginCapability;
+
+    #[test]
+    fn host_log_attributes_are_issued_from_the_instance_identity() {
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "support", []);
+        let attrs = plugin_log_attrs(scope.id(), "poll".to_string(), Some("guest".to_string()));
+
+        assert_eq!(attrs["plugin"], "fixture");
+        assert_eq!(attrs["plugin_capability"], "channel");
+        assert_eq!(attrs["plugin_binding"], "support");
+        assert_eq!(attrs["plugin_fn"], "poll");
+        assert_eq!(attrs["raw"], "guest");
     }
 }
