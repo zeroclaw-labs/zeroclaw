@@ -4,71 +4,49 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
 use zeroclaw_api::model_provider::{
-    ChatRequest, ChatResponse, ModelProvider, TokenUsage, ToolCall,
+    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 
 use crate::case::{LlmTrace, TraceResponse};
 
-/// One FIFO queue of scripted steps per conversation turn, plus a cursor marking
-/// the turn currently being replayed.
-struct ReplayState {
-    turns: Vec<VecDeque<TraceResponse>>,
-    current: usize,
-}
-
+/// Replays a trace's scripted steps in FIFO order across the whole conversation.
+///
+/// The provider is opaque to the runner (it is injected as a boxed `ModelProvider`
+/// through `RunDeps`), so turn boundaries are not enforced externally; the trace's
+/// steps are flattened into a single queue and consumed in order. Requesting more
+/// responses than the trace scripts is an error (exhaustion guard).
 pub struct TraceLlmProvider {
-    state: Arc<Mutex<ReplayState>>,
+    steps: Mutex<VecDeque<TraceResponse>>,
     trace_name: String,
 }
 
 impl TraceLlmProvider {
-    /// Build a replay provider from a trace, keeping each turn's steps in its own queue.
-    pub fn from_trace(trace: &LlmTrace) -> Self {
-        let turns = trace
-            .turns
-            .iter()
-            .map(|turn| turn.steps.iter().map(|s| s.response.clone()).collect())
-            .collect();
-        Self {
-            state: Arc::new(Mutex::new(ReplayState { turns, current: 0 })),
+    /// Build a replay provider from a trace, flattening every turn's scripted steps
+    /// into one FIFO queue. Fails if any turn has no scripted steps: replay requires
+    /// every LLM round-trip to be scripted, so an empty turn is an authoring error
+    /// rather than a live case.
+    pub fn try_from_trace(trace: &LlmTrace) -> anyhow::Result<Self> {
+        let mut steps = VecDeque::new();
+        for (turn_index, turn) in trace.turns.iter().enumerate() {
+            let turn_steps = turn.steps.as_deref().unwrap_or_default();
+            if turn_steps.is_empty() {
+                anyhow::bail!(
+                    "replay case '{}' turn {} has no scripted steps",
+                    trace.model_name,
+                    turn_index
+                );
+            }
+            for step in turn_steps {
+                steps.push_back(step.response.clone());
+            }
+        }
+        Ok(Self {
+            steps: Mutex::new(steps),
             trace_name: trace.model_name.clone(),
-        }
-    }
-
-    /// A handle the runner uses to advance turn boundaries while it drives the agent.
-    pub fn handle(&self) -> ReplayHandle {
-        ReplayHandle {
-            state: Arc::clone(&self.state),
-            trace_name: self.trace_name.clone(),
-        }
-    }
-}
-
-/// Runner-side handle for advancing the replay cursor between conversation turns.
-/// Shares the provider's queues (the same `Arc` the agent holds), so the runner can
-/// assert per-turn consumption without owning the boxed provider.
-pub struct ReplayHandle {
-    state: Arc<Mutex<ReplayState>>,
-    trace_name: String,
-}
-
-impl ReplayHandle {
-    /// Assert the just-finished turn consumed all of its scripted steps, then advance
-    /// the cursor to the next turn. Errors if any steps were left unconsumed.
-    pub fn finish_turn(&self, turn_index: usize) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap();
-        let leftover = state.turns.get(state.current).map_or(0, |q| q.len());
-        if leftover > 0 {
-            anyhow::bail!(
-                "TraceLlmProvider({}): turn {turn_index} scripted {leftover} step(s) the agent never requested — the trace over-specifies this turn's LLM round-trips",
-                self.trace_name
-            );
-        }
-        state.current += 1;
-        Ok(())
+        })
     }
 }
 
@@ -84,6 +62,16 @@ impl Attributable for TraceLlmProvider {
 
 #[async_trait]
 impl ModelProvider for TraceLlmProvider {
+    /// Truthful capabilities so the provider stays correct if ever routed through
+    /// dispatcher resolution (`tool_dispatcher_for_provider`): the scripted tool
+    /// calls are native tool calls.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            ..ProviderCapabilities::default()
+        }
+    }
+
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -91,8 +79,25 @@ impl ModelProvider for TraceLlmProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        // Not exercised by the agent loop (which uses `chat`); kept for trait completeness.
-        Ok(String::new())
+        // Not used by the agent loop (which uses `chat`); used to script the judge
+        // in tests: pop the next step, which must be a Text step, and return it.
+        let step = {
+            let mut steps = self.steps.lock().unwrap();
+            steps.pop_front()
+        };
+        match step {
+            Some(TraceResponse::Text { content, .. }) => Ok(content),
+            Some(TraceResponse::ToolCalls { .. }) => {
+                anyhow::bail!(
+                    "TraceLlmProvider({}): chat_with_system got a tool_calls step; scripted judge responses must be text",
+                    self.trace_name
+                )
+            }
+            None => anyhow::bail!(
+                "TraceLlmProvider({}): chat_with_system requested more responses than scripted",
+                self.trace_name
+            ),
+        }
     }
 
     async fn chat(
@@ -102,12 +107,11 @@ impl ModelProvider for TraceLlmProvider {
         _temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let step = {
-            let mut state = self.state.lock().unwrap();
-            let current = state.current;
-            match state.turns.get_mut(current).and_then(|q| q.pop_front()) {
+            let mut steps = self.steps.lock().unwrap();
+            match steps.pop_front() {
                 Some(step) => step,
                 None => anyhow::bail!(
-                    "TraceLlmProvider({}): turn {current} requested more LLM responses than the trace provides for that turn",
+                    "TraceLlmProvider({}): the agent requested more LLM responses than the trace provides",
                     self.trace_name
                 ),
             }

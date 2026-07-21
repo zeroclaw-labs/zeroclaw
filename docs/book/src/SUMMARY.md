@@ -121,6 +121,7 @@
   - [Cost tracking](./ops/cost-tracking.md)
   - [Troubleshooting](./ops/troubleshooting.md)
   - [Network deployment](./ops/network-deployment.md)
+  - [Eval harness](./ops/eval-harness.md)
 - [Hardware & Boards](./hardware/index.md)
   - [Hardware subsystem](./hardware/subsystem.md)
   - [Adding boards & tools](./hardware/adding-boards-and-tools.md)
