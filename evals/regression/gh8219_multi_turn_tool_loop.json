@@ -1,0 +1,19 @@
+{
+  "model_name": "gh8219-multi-turn-tool-loop",
+  "turns": [
+    { "user_input": "Echo the word alpha for me.", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "c1", "name": "echo", "arguments": {"message": "alpha"} }], "input_tokens": 20, "output_tokens": 8 } },
+      { "response": { "type": "text", "content": "Echoed: alpha", "input_tokens": 30, "output_tokens": 6 } }
+    ]},
+    { "user_input": "Now echo the word beta.", "steps": [
+      { "response": { "type": "tool_calls", "tool_calls": [{ "id": "c2", "name": "echo", "arguments": {"message": "beta"} }], "input_tokens": 40, "output_tokens": 8 } },
+      { "response": { "type": "text", "content": "Echoed: beta", "input_tokens": 50, "output_tokens": 6 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["beta"],
+    "tools_used": ["echo"],
+    "max_tool_calls": 2,
+    "all_tools_succeeded": true
+  }
+}

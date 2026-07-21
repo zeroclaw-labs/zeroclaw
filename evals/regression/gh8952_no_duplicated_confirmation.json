@@ -1,0 +1,13 @@
+{
+  "model_name": "gh8952-no-duplicated-confirmation",
+  "turns": [
+    { "user_input": "Briefly confirm you received the task.", "steps": [
+      { "response": { "type": "text", "content": "Got it.", "input_tokens": 14, "output_tokens": 3 } }
+    ]}
+  ],
+  "expects": {
+    "response_matches": ["^Got it\\.$"],
+    "response_not_contains": ["Got it. Got it"],
+    "max_tool_calls": 0
+  }
+}

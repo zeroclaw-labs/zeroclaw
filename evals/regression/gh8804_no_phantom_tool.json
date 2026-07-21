@@ -1,0 +1,13 @@
+{
+  "model_name": "gh8804-no-phantom-tool",
+  "turns": [
+    { "user_input": "What is 2 plus 2?", "steps": [
+      { "response": { "type": "text", "content": "2 plus 2 is 4.", "input_tokens": 15, "output_tokens": 7 } }
+    ]}
+  ],
+  "expects": {
+    "response_contains": ["4"],
+    "tools_not_used": ["search", "web", "http_request"],
+    "max_tool_calls": 0
+  }
+}
