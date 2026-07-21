@@ -90,12 +90,12 @@ mod tests {
             step: 2,
             kind: GateEventKind::Resolved,
             decision: Some(ApprovalDecision::Approve),
-            principal: ApprovalPrincipal::cli(Some("alice".into())),
+            principal: ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
             ts: "2026-01-01T00:00:00Z".into(),
         };
         let rec = entry.into_event_record();
         assert_eq!(rec.kind, "gate_resolved");
-        assert_eq!(rec.actor.as_deref(), Some("alice"));
+        assert_eq!(rec.actor.as_deref(), Some("ZeroClawOperator"));
         assert_eq!(rec.payload["source"], "cli");
         assert_eq!(rec.payload["decision"], "approve");
         assert_eq!(rec.payload["step"], 2);

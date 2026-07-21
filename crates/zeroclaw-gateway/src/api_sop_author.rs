@@ -418,7 +418,10 @@ pub async fn handle_sop_decide(
         };
         let status = guard.get_run(&run_id).map(|r| r.status);
         match status {
-            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
+            Some(
+                zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval
+                | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint,
+            ) => {
                 use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
                 // Route through the broker (membership + quorum), not `resolve_gate`
                 // directly, otherwise this authoring surface would
@@ -452,6 +455,16 @@ pub async fn handle_sop_decide(
                         )
                             .into_response();
                     }
+                    Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "outcome": "deferred_at_capacity",
+                                "run_id": run_id,
+                            })),
+                        )
+                            .into_response();
+                    }
                     Ok(BrokerOutcome::NotAuthorized { required_group }) => {
                         return (
                             StatusCode::FORBIDDEN,
@@ -468,6 +481,16 @@ pub async fn handle_sop_decide(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": format!("approval policy '{name}' is not configured (gate left waiting)")
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Ok(BrokerOutcome::PolicyUnavailable { reason }) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "policy_unavailable",
+                                "reason": reason,
                             })),
                         )
                             .into_response();
@@ -493,18 +516,17 @@ pub async fn handle_sop_decide(
                     }
                 }
             }
-            _ => match guard.decide_checkpoint(&run_id, decision) {
-                Ok(action) => {
-                    resumed_action = Some(action);
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    )
-                        .into_response();
-                }
-            },
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Run {run_id} is not waiting for approval or paused at a checkpoint"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
 
