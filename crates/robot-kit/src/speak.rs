@@ -1,5 +1,4 @@
 //! Speak Tool - Text-to-speech via Piper
-//!
 //! Converts text to speech using Piper TTS (fast, offline, runs on Pi).
 //! Plays audio through the speaker.
 

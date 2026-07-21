@@ -65,13 +65,11 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: ubuntu-latest
             target: arm-unknown-linux-gnueabihf
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
           - os: ubuntu-latest
@@ -134,12 +132,9 @@ jobs:
             export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
-          FEATURES="channel-matrix,channel-lark"
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            cargo build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
-          else
-            cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
-          fi
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
+          echo "Resolved features: $FEATURES"
+          cargo build --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
           if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
             cargo build --release --locked -p zerocode --target ${{ matrix.target }}
           fi

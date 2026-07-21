@@ -21,6 +21,11 @@ const ACP_WS_PROTOCOL: &str = "zeroclaw.acp.v1";
 #[derive(Debug, Deserialize)]
 pub struct AcpQuery {
     token: Option<String>,
+    /// Connection-scoped default agent alias. Used when `session/new` omits
+    /// `agentAlias`, so spec-vanilla one-agent-per-endpoint ACP clients can
+    /// address each configured agent via its own URL. Validated exactly like
+    /// an explicit `agentAlias` at `session/new`; ignored by session restore.
+    agent: Option<String>,
 }
 
 pub async fn handle_ws_acp(
@@ -50,11 +55,11 @@ pub async fn handle_ws_acp(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, params.agent))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
     let (input_tx, input_rx) = mpsc::channel::<String>(256);
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
@@ -79,15 +84,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let canvas_store = state.canvas_store.clone();
     let server = if let Some(store) = store {
         Arc::new(
-            AcpServer::new_with_writer_and_store(config, acp_config, output_tx, store)
-                .with_canvas_store(canvas_store)
-                .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone()),
+            AcpServer::new_with_live_config_and_writer_and_store(
+                Arc::clone(&state.config),
+                acp_config,
+                output_tx,
+                store,
+            )
+            .with_canvas_store(canvas_store)
+            .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
+            .with_connection_default_agent(default_agent),
         )
     } else {
         Arc::new(
-            AcpServer::new_with_writer(config, acp_config, output_tx)
-                .with_canvas_store(canvas_store)
-                .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone()),
+            AcpServer::new_with_live_config_and_writer(
+                Arc::clone(&state.config),
+                acp_config,
+                output_tx,
+            )
+            .with_canvas_store(canvas_store)
+            .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
+            .with_connection_default_agent(default_agent),
         )
     };
 
