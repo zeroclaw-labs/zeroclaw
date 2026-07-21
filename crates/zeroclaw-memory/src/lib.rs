@@ -17,6 +17,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+pub mod hindsight;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -48,6 +49,7 @@ pub use backend::{
 };
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
+pub use hindsight::HindsightMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -153,6 +155,18 @@ where
         ),
         MemoryBackendKind::None => {
             wrap_audit(NoneMemory::new("none"), workspace_dir, audit_enabled)
+        }
+        MemoryBackendKind::Hindsight => {
+            // The install-wide/builder entry point has no agent alias; the
+            // per-agent factory (`create_memory_for_agent`) is the primary
+            // path and builds hindsight with the real alias. Here we honor an
+            // explicit ZC_HINDSIGHT_BANK or fall back to a generic alias so CLI
+            // `zeroclaw memory` and migration paths still resolve a bank.
+            wrap_audit(
+                hindsight::HindsightMemory::from_env("zeroclaw")?,
+                workspace_dir,
+                audit_enabled,
+            )
         }
         MemoryBackendKind::Unknown => {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
@@ -796,7 +810,42 @@ pub async fn create_memory_for_agent(
         .agents
         .get(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+
     let backend_kind = agent_cfg.memory.backend;
+
+    // Hindsight external backend: a first-class per-agent `MemoryBackendKind`.
+    // Each agent gets its own server-namespaced bank (derived from
+    // `[memory.hindsight] bank_template` or an explicit per-agent `bank_id`),
+    // so the bank is the private per-agent scope; no local agent_id column or
+    // AgentScopedMemory wrapper is needed. Endpoint/top-k come from the typed
+    // `[memory.hindsight]` section and the token is resolved from the env var
+    // it names. This branch precedes the storage-backed paths because hindsight
+    // has no `[storage.*]` instance to resolve.
+    //
+    // Selected when the per-agent backend is Hindsight, or when the install-wide
+    // `[memory] backend = "hindsight"` string selects it for all agents
+    // (backwards-compatible with the pre-enum install-wide selection).
+    let install_wide_hindsight = config
+        .memory
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("hindsight");
+    if matches!(backend_kind, ConfigBackend::Hindsight) || install_wide_hindsight {
+        let backend = hindsight::HindsightMemory::from_config(
+            &config.memory.hindsight,
+            agent_alias,
+            &agent_cfg.memory.bank_id,
+        )?;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "🧠 Hindsight memory backend configured (bank: {})",
+                backend.bank()
+            )
+        );
+        return Ok(Arc::new(backend));
+    }
 
     // Markdown branch: the wrapper composes per-agent dirs, not a
     // shared backend. Skip the inner-backend factory entirely.
@@ -1188,6 +1237,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    ..Default::default()
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1241,6 +1291,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    ..Default::default()
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1278,6 +1329,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::None,
+                    ..Default::default()
                 },
                 ..AliasedAgentConfig::default()
             },

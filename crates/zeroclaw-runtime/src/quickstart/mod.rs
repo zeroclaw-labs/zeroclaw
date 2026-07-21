@@ -567,6 +567,10 @@ fn memory_kind_keys() -> Vec<String> {
         // belongs in the quickstart picker.
         match k {
             M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::Lucid | M::None => (),
+            // Hindsight is omitted from the quickstart picker (like Qdrant):
+            // it needs an external endpoint + bearer token, so it is opt-in via
+            // `[memory.hindsight]` rather than a one-click onboarding choice.
+            M::Hindsight => (),
         }
         serde_json::to_value(k)
             .ok()

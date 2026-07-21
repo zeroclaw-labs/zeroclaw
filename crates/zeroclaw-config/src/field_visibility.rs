@@ -14,6 +14,9 @@ pub fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
     if backend != "postgres" {
         out.push("postgres.");
     }
+    if backend != "hindsight" {
+        out.push("hindsight.");
+    }
     out
 }
 
@@ -24,7 +27,21 @@ pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
         } else {
             cfg.memory.backend.as_str()
         };
-        return memory_backend_excludes(backend)
+        let mut excludes = memory_backend_excludes(backend);
+        // The `[memory.hindsight]` section is shared install-wide, but the
+        // backend can also be selected per agent (`agents.<alias>.memory
+        // .backend = "hindsight"`) while the install-wide `memory.backend`
+        // stays something else. Reveal the hindsight settings whenever any
+        // agent uses the hindsight backend, so it stays editable in the
+        // dashboard for the multi-agent case.
+        let any_agent_hindsight = cfg
+            .agents
+            .values()
+            .any(|a| a.memory.backend == crate::multi_agent::MemoryBackendKind::Hindsight);
+        if any_agent_hindsight {
+            excludes.retain(|leaf| *leaf != "hindsight.");
+        }
+        return excludes
             .into_iter()
             .map(|leaf| format!("memory.{leaf}"))
             .collect();
@@ -106,7 +123,40 @@ mod tests {
         assert!(ex.contains(&"sqlite-open-timeout-secs"));
         assert!(ex.contains(&"conversation-retention-days"));
         assert!(ex.contains(&"qdrant."));
+        assert!(ex.contains(&"hindsight."));
         assert!(!ex.contains(&"postgres."));
+    }
+
+    #[test]
+    fn hindsight_backend_reveals_only_hindsight_subsection() {
+        // hindsight active → keep hindsight subsection, hide the SQL/vector ones
+        let ex = memory_backend_excludes("hindsight");
+        assert!(!ex.contains(&"hindsight."));
+        assert!(ex.contains(&"qdrant."));
+        assert!(ex.contains(&"postgres."));
+        assert!(ex.contains(&"sqlite-open-timeout-secs"));
+    }
+
+    #[test]
+    fn per_agent_hindsight_reveals_section_even_when_install_wide_is_sqlite() {
+        use crate::multi_agent::MemoryBackendKind;
+        let mut cfg = Config::default();
+        cfg.memory.backend = "sqlite".into();
+        // Install-wide sqlite hides the hindsight subsection...
+        assert!(
+            excluded_paths(&cfg, "memory")
+                .iter()
+                .any(|p| p == "memory.hindsight.")
+        );
+        // ...but a single hindsight agent reveals it.
+        let mut agent = crate::schema::AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::Hindsight;
+        cfg.agents.insert("scout".to_string(), agent);
+        assert!(
+            !excluded_paths(&cfg, "memory")
+                .iter()
+                .any(|p| p == "memory.hindsight.")
+        );
     }
 
     #[test]
