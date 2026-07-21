@@ -443,6 +443,20 @@ impl Memory for RetrievalPipeline {
         self.memory.count().await
     }
 
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        // Pure pass-through: this decorator only adds an optional read-side hot
+        // cache and never caches counts, so it has no own policy to apply.
+        // Forwarding preserves the inner backend's native own-footprint count
+        // (visibility-correct, uncapped) instead of the trait defaults.
+        self.memory.count_own().await
+    }
+
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        // Pure pass-through: see `count_own`. Reaches the backend's native
+        // uncapped COUNT rather than the list+filter default.
+        self.memory.count_by_agent_id(agent_id).await
+    }
+
     async fn health_check(&self) -> bool {
         self.memory.health_check().await
     }

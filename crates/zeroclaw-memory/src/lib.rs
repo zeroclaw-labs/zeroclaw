@@ -3112,6 +3112,104 @@ store_timeout_ms = 40000
         );
     }
 
+    /// Dashboard own-count is correct through the COMPLETE production
+    /// decorator chain the factory builds, not just a hand-wrapped
+    /// `AgentScopedMemory`. The chain here is
+    /// `RetrievalPipeline -> AgentScopedMemory -> ScannedMemory -> SqliteMemory`,
+    /// which is exactly the handle the gateway dashboard receives and calls
+    /// `count_own()` on. This pins BOTH regressions the transparent decorators
+    /// would otherwise reintroduce:
+    ///   (a) an allowlisted PEER's rows are EXCLUDED from the agent's own count
+    ///       (the outer `count()` is visibility-scoped and DOES include them),
+    ///       so if `ScannedMemory`/`RetrievalPipeline` fell back to the
+    ///       visibility-scoped default the peer rows would leak in; and
+    ///   (b) an own count ABOVE the 1,000-row `list()` cap is NOT truncated,
+    ///       proving the native uncapped `count_by_agent_id` COUNT is reached
+    ///       through every wrapper instead of the list+filter trait default.
+    #[tokio::test]
+    async fn create_memory_for_agent_own_count_survives_full_decorator_chain() {
+        let tmp = TempDir::new().unwrap();
+        let mut agents = std::collections::HashMap::new();
+        // `alpha` allowlists `beta` for cross-agent READ visibility. Both are
+        // on the default SQLite backend (a native `count_by_agent_id`
+        // override), sharing one `brain.db` under `data_dir`.
+        let mut alpha = zeroclaw_config::schema::AliasedAgentConfig::default();
+        alpha.workspace.read_memory_from = vec!["beta".into()];
+        agents.insert("alpha".to_string(), alpha);
+        agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        // The OUTER handles the dashboard actually receives.
+        let alpha_handle = create_memory_for_agent(&config, "alpha", None)
+            .await
+            .unwrap();
+        let beta_handle = create_memory_for_agent(&config, "beta", None)
+            .await
+            .unwrap();
+
+        // Seed a few allowlisted-peer rows with a distinctive marker so we can
+        // prove they ARE within alpha's read visibility (making their exclusion
+        // from the own count a real, observable property, not a vacuous one).
+        let peer_rows = 3u64;
+        for i in 0..peer_rows {
+            beta_handle
+                .store(
+                    &format!("beta-{i}"),
+                    "peervisiblemarker",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Seed alpha with MORE own rows than the SQLite `list()` cap (1,000),
+        // so a list+filter default would truncate the own count at the cap.
+        let alpha_own_rows = 1005u64;
+        for i in 0..alpha_own_rows {
+            alpha_handle
+                .store(&format!("alpha-{i}"), "v", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        // The allowlisted peer's rows ARE reachable through alpha's OUTER
+        // handle (recall is visibility-scoped and includes the allowlist), so
+        // any visibility-based own-count fallback would wrongly fold them in.
+        let peer_visible = alpha_handle
+            .recall("peervisiblemarker", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_visible.len(),
+            peer_rows as usize,
+            "the allowlisted peer's rows must be visible through alpha's outer handle"
+        );
+
+        // (a) peers excluded AND (b) above the 1,000-row cap not truncated:
+        // both hold only if the native uncapped, own-scoped `count_by_agent_id`
+        // path is reached through `RetrievalPipeline` and `ScannedMemory`. A
+        // missing forward at either layer falls back to the trait default
+        // (`count_own` -> visibility-scoped `count()`), which is itself list-
+        // capped at 1,000 — so it can report neither 1005 nor anything above
+        // the cap, and this exact-value assertion fails.
+        assert_eq!(
+            alpha_handle.count_own().await.unwrap(),
+            alpha_own_rows,
+            "count_own through the full chain must exclude the {peer_rows} allowlisted \
+             peer rows (not {}) and not truncate at the 1,000-row list cap",
+            alpha_own_rows + peer_rows
+        );
+    }
+
     /// Opting the hot cache in via `retrieval_stages = ["cache"]` keeps a
     /// handle coherent with its own writes (a mutation invalidates the cache).
     #[tokio::test]

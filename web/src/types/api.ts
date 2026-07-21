@@ -12,13 +12,26 @@ export interface StatusResponse {
   daemon_started_at?: string;
   gateway_port: number;
   locale: string;
+  /** Backend name resolved from the SAME handle that produced
+   *  `memory_count`/`memory_status`, so the label and count can never
+   *  disagree (e.g. under install-wide Hindsight fallback with a default
+   *  per-agent enum). */
   memory_backend: string;
-  /** Live entry count of the resolved memory backend. When the request is
-   *  scoped with `?agent=<alias>` this reflects THAT agent's own backend
-   *  (its per-alias hindsight bank, its agent-scoped SQL rows, …); without an
-   *  agent it is the install-wide store. For hindsight it counts the private
-   *  per-agent bank only, not the read-merged shared/system tiers. */
-  memory_count: number;
+  /** Live OWN-footprint entry count of the resolved memory backend — never
+   *  visibility-scoped (excludes rows only visible via
+   *  `workspace.read_memory_from`). When the request is scoped with
+   *  `?agent=<alias>` this reflects THAT agent's own backend (its per-alias
+   *  hindsight bank, its agent-scoped SQL rows, …); without an agent it is
+   *  the install-wide store. For hindsight it counts the private per-agent
+   *  bank only, not the read-merged shared/system tiers.
+   *  `null` when `memory_status !== "ok"` — an unavailable/failed backend is
+   *  NOT the same as a genuinely empty store (0); render it distinctly. */
+  memory_count: number | null;
+  /** `"ok"` when `memory_count` reflects a real (possibly zero) live count.
+   *  `"unavailable"` when the backend handle failed to build, the count
+   *  errored, or the count exceeded the short status-specific deadline —
+   *  render this distinctly from a `memory_count` of 0. */
+  memory_status: "ok" | "unavailable";
   paired: boolean;
   channels: Record<string, boolean>;
   health: HealthSnapshot;

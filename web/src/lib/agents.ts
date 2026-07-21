@@ -21,12 +21,15 @@ export interface AgentSummary {
   sessionCount: number;
   lastActivity: string | null;
   monthCostUsd: number | null;
-  /** Live entry count from this agent's OWN memory backend, fetched via
-   *  `/api/status?agent=<alias>` (which dispatches to the active per-agent
-   *  backend). For hindsight this is the private per-agent bank; for SQL it is
-   *  the agent-scoped rows. Not derived from install-wide `agent_alias`
-   *  bucketing, which read 0 for hindsight (its rows carry no `agent_alias`). */
-  memoryCount: number;
+  /** Live OWN-footprint entry count from this agent's OWN memory backend,
+   *  fetched via `/api/status?agent=<alias>` (which dispatches to the active
+   *  per-agent backend). For hindsight this is the private per-agent bank;
+   *  for SQL it is the agent's own rows (never allowlisted peers). Not
+   *  derived from install-wide `agent_alias` bucketing, which read 0 for
+   *  hindsight (its rows carry no `agent_alias`).
+   *  `null` when the backend could not be queried (unavailable/timed out) —
+   *  distinct from a genuinely empty store (`0`). Render these differently. */
+  memoryCount: number | null;
 }
 
 export interface AgentPickerSummary {
@@ -104,10 +107,13 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         listProps(`agents.${alias}`),
         // Per-agent status dispatches to that agent's OWN memory backend, so
         // the count is correct for hindsight (per-agent bank), SQL (scoped
-        // rows), markdown (its dir), etc. Falls back to 0 on error.
+        // rows), markdown (its dir), etc. `null` here means the backend
+        // couldn't be queried (unavailable/timed out) — kept distinct from a
+        // genuine 0 rather than collapsed to it, both on a request failure
+        // and on `memory_status !== "ok"` in a successful response.
         getStatus(alias)
-          .then((s) => s.memory_count ?? 0)
-          .catch(() => 0),
+          .then((s) => (s.memory_status === 'ok' ? (s.memory_count ?? 0) : null))
+          .catch(() => null),
       ]);
       // Configurable-macro paths are kebab-case (snake field names
       // converted via snake_to_kebab in zeroclaw-macros).

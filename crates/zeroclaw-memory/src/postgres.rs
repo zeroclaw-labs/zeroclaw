@@ -679,6 +679,22 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn count_by_agent_id(&self, agent_id: &str) -> Result<u64> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let agent_id = agent_id.to_string();
+
+        run_on_os_thread(move || -> Result<u64> {
+            let mut client = client.lock();
+            // Native COUNT keyed on the row's `agent_id`, not the capped
+            // `list()` + filter the trait default uses.
+            let stmt = format!("SELECT COUNT(*) FROM {qualified_table} WHERE agent_id = $1");
+            let count: i64 = client.query_one(&stmt, &[&agent_id])?.get(0);
+            u64::try_from(count).context("PostgreSQL returned a negative agent memory count")
+        })
+        .await
+    }
+
     async fn health_check(&self) -> bool {
         let client = self.client.get().clone();
         run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))

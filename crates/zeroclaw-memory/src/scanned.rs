@@ -434,6 +434,20 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.count().await
     }
 
+    async fn count_own(&self) -> anyhow::Result<u64> {
+        // Pure pass-through: content scanning is a write-boundary policy, not a
+        // counting policy. Own-count carries no content to scan or redact, so
+        // this decorator must forward it unchanged to preserve the inner
+        // backend's native, visibility-correct own-footprint count.
+        self.inner.count_own().await
+    }
+
+    async fn count_by_agent_id(&self, agent_id: &str) -> anyhow::Result<u64> {
+        // Pure pass-through: see `count_own`. Forwarding reaches the backend's
+        // native uncapped COUNT instead of the trait's list+filter default.
+        self.inner.count_by_agent_id(agent_id).await
+    }
+
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }
