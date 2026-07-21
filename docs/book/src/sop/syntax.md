@@ -91,10 +91,17 @@ escalation_route = "oncall"
 `[sop.approval.groups.*]` members are approval identities, not account names.
 Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
 `agent:<alias>`) to grant approval rights on one transport only, or bare
-(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+(`ZeroClawOperator`) to grant any source carrying that identity. HTTP and WebSocket
 approval surfaces use the paired-token subject; the current CLI approval path
 (`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
 membership yet.
+
+The paired-token subject is the lowercase SHA-256 hex digest of the bearer
+token. After pairing, copy the digest from the canonical
+`gateway.paired_tokens` entry, or compute it from the bearer token without
+putting that secret in shell history. Rotating a paired token creates a new
+subject, so update every approval-group membership that references the old
+digest as part of the same rotation.
 
 ## 3. `SOP.md` Step Format
 
@@ -190,10 +197,15 @@ Both routes are `channel:recipient`: `channel` is a configured channel's map key
 (`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
 channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
 and never blocks or clears the gate - the approval itself still comes back through
-the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
-approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
-(where channels are configured); leave them unset (or empty) to notify only the
-originating surface, which is the default.
+an authenticated approve/deny surface whose principal can satisfy the policy's
+group and quorum requirements. Routes fire only in the daemon (where channels are
+configured); leave them unset (or empty) to notify only the originating surface,
+which is the default.
+
+Route delivery has no durable retry queue. A daemon exit before the asynchronous
+send completes, or a channel send failure, can lose the notice without changing
+the parked gate. Operators can inspect pending runs with `zeroclaw sop pending`
+and contact an eligible approver through an authenticated approval surface.
 
 ### Step Contract Enforcement
 

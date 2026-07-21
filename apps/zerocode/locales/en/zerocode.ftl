@@ -8,6 +8,7 @@ zc-pane-quickstart = Quickstart
 zc-pane-sop = SOPs
 
 zc-app-help-cycle-mode = Cycle mode
+zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
 
@@ -89,7 +90,6 @@ zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
 zc-input-placeholder-chat = Type to chat
 
-zc-input-help-slash-commands = Slash commands
 zc-input-help-completions-navigate = Navigate completions
 zc-input-help-completions-accept = Accept
 zc-input-help-completions-dismiss = Dismiss
@@ -437,6 +437,8 @@ zc-chat-approval-action-edit = Edit
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
+zc-chat-copy-message = [Copy]
+zc-chat-copy-message-copied = [Copied]
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
