@@ -1,0 +1,100 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-mediated TCP, direct TLS, and mandatory in-place STARTTLS.
+///
+/// The guest never receives an ambient socket. The host authorizes and resolves
+/// the destination through the shared egress service, dials only the pinned
+/// address set, and retains that authorization for the lifetime of the
+/// connection resource.
+interface sockets {
+    /// Transport state requested when opening a connection.
+    enum connect-mode {
+        /// Permanently plaintext application traffic. Host policy must grant an
+        /// explicit plaintext exception for the destination.
+        plaintext,
+        /// TLS is authenticated before `connect` returns.
+        direct-tls,
+        /// Protocol negotiation begins in plaintext and must be upgraded in
+        /// place before application traffic is accepted.
+        start-tls,
+    }
+
+    /// One outbound connection request.
+    record connect-request {
+        host: string,
+        port: u16,
+        mode: connect-mode,
+        /// Optional host-configured TLS profile. Profiles are invalid for
+        /// `plaintext`; an absent profile uses the host's system trust roots.
+        tls-profile: option<string>,
+    }
+
+    /// Stable, typed failure categories. Details remain in host diagnostics;
+    /// guests never need to parse error strings.
+    enum socket-error {
+        access-denied,
+        invalid-request,
+        resolution-failed,
+        connection-limit,
+        connect-failed,
+        tls-configuration-failed,
+        tls-handshake-failed,
+        invalid-state,
+        closed,
+        backpressure,
+        chunk-too-large,
+        host-unavailable,
+    }
+
+    /// Why a connection reached a terminal state.
+    enum close-reason {
+        peer-closed,
+        io-error,
+        host-closed,
+        tls-upgrade-failed,
+    }
+
+    /// One non-blocking receive result.
+    variant receive-event {
+        /// Raw TCP bytes. Chunk boundaries are arbitrary.
+        data(list<u8>),
+        /// The connection is live but no bytes are buffered.
+        idle,
+        /// The actor has terminated. Dropping or closing the resource releases
+        /// its retained shared-egress lease.
+        closed(close-reason),
+    }
+
+    /// One host-owned connection and its single stream-owning actor.
+    resource connection {
+        /// Queue application bytes. STARTTLS connections reject this until the
+        /// TLS handshake has succeeded.
+        send: func(bytes: list<u8>) -> result<_, socket-error>;
+
+        /// Drain application bytes without blocking. Plaintext negotiation
+        /// bytes can never cross this operation.
+        receive: func() -> result<receive-event, socket-error>;
+
+        /// Queue pre-upgrade protocol negotiation bytes. This is legal only
+        /// while a STARTTLS connection remains in its negotiation phase.
+        send-negotiation: func(bytes: list<u8>) -> result<_, socket-error>;
+
+        /// Drain pre-upgrade protocol negotiation bytes without blocking. This
+        /// is legal only before the STARTTLS handshake begins.
+        receive-negotiation: func() -> result<receive-event, socket-error>;
+
+        /// Number of buffered byte chunks waiting to be drained.
+        pending: func() -> result<u32, socket-error>;
+
+        /// Permanently commit a STARTTLS connection to an in-place TLS
+        /// handshake. Failure closes the stream; there is no plaintext retry.
+        upgrade-tls: func() -> result<_, socket-error>;
+    }
+
+    /// Authorize, resolve, and connect. Direct TLS is complete before success;
+    /// STARTTLS returns a negotiation-only resource.
+    connect: func(request: connect-request) -> result<own<connection>, socket-error>;
+
+    /// Consume and close a connection resource immediately.
+    close: func(connection: own<connection>);
+}

@@ -31,6 +31,7 @@ move it). The current layout is:
 │   │   ├── runtime-trace.jsonl # persisted logs
 │   │   └── costs.jsonl         # cost ledger
 │   ├── devices.db              # paired-device metadata
+│   ├── plugin-state.db          # encrypted exact-instance plugin state
 │   └── memory/                 # shared instance memory stores
 ├── shared/                     # shared resources, such as skill bundles
 └── agents/<alias>/workspace/   # per-agent filesystem sandbox and identity
@@ -46,6 +47,7 @@ new runtime state should be described in terms of `<install>/data/`,
 | --- | --- | --- | --- | --- | --- |
 | Config values | `zeroclaw-config::Config` loaded from `config.toml` | `<install>/config.toml` | daemon `Arc<RwLock<Config>>` plus per-subsystem resolved views | `/admin/reload` re-reads config and re-instantiates daemon subsystems; direct config writes use schema validation and dirty-path checks | Do not cache config-derived facts in long-lived structs unless the cache is explicitly rebuilt on reload. |
 | Encrypted secrets | Config secret fields plus `.secret_key` | `<install>/config.toml`, `<install>/.secret_key` | secret-store helpers in `zeroclaw-config` | Reload observes changed config; losing `.secret_key` makes encrypted config secrets unrecoverable | Never copy decrypted values into logs, docs, PR bodies, or runtime metadata. |
+| Plugin durable state | Authenticated state envelopes keyed by the host-issued plugin instance identity and portable logical key | `data/plugin-state.db`, encrypted by `<install>/.secret_key` | runtime `PluginStateStore` injected through `PluginHostServices` | SQLite WAL and compare-and-swap revisions serialize writes; tool/channel service frames recheck effective grants | The DB exposes only keyed blind indexes and `enc2:` ciphertext. Back it up with `.secret_key`; a missing or replaced key fails closed. |
 | Agent filesystem identity | Per-agent workspace files | `<install>/agents/<alias>/workspace/` | effective `SecurityPolicy` and agent prompt construction | Created lazily when the agent starts; workspace access is evaluated from config | This is the filesystem sandbox, not the config source of truth for providers/channels/tools. |
 | Shared skill bundles | Configured skill bundle entries and resolved bundle dirs | `<install>/shared/skills/<bundle>/` by default | skill loading / prompt enrichment | Reload and new agent starts observe config and filesystem changes | Bundle aliases and directory resolution come from config; the files are the bundle content. |
 | Conversation memory | `zeroclaw-memory` backend selected per agent | SQLite/Postgres/Lucid/Qdrant/Markdown backend locations; SQLite shared store lives under `data/memory/` | `Arc<dyn Memory>` wrapped in agent-scoping adapters | Backend choice is locked once an agent has written data; same-backend cross-agent recall is opt-in | Memory rows are agent-scoped. Do not replace memory ownership with copied prompt/session caches. |
@@ -89,6 +91,7 @@ At minimum, include:
 - `data/state/costs.jsonl` if cost history matters
 - `data/state/runtime-trace.jsonl` if logs are needed for incident review
 - `data/devices.db` for paired-device metadata
+- `data/plugin-state.db` together with `.secret_key` for plugin-owned durable state
 
 Do not run two daemons against the same install root. Several stores use SQLite
 with a single-writer model, and the process-local caches assume one daemon owns
@@ -108,4 +111,5 @@ the instance.
 - Cost ledger: `crates/zeroclaw-config/src/cost/tracker.rs`
 - Pairing guard: `crates/zeroclaw-config/src/pairing.rs`
 - Device registry: `crates/zeroclaw-gateway/src/api_pairing.rs`
+- Plugin durable state: `crates/zeroclaw-runtime/src/plugin_state.rs`
 - Reload endpoint: `crates/zeroclaw-gateway/src/lib.rs`

@@ -3,14 +3,16 @@
 
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
-use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
-use crate::instance::{PluginGrantSet, PluginInstanceScope};
+use crate::component::{
+    PluginState, PluginStoreSpec, call_plugin, call_store, call_tool_execute, engine,
+    load_component, wt,
+};
+use crate::host::AdmittedComponent;
+use crate::instance::PluginInstanceScope;
+use crate::services::PluginHostServices;
 use crate::{PluginCapability, PluginPermission};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use wasmtime::Store;
 use wasmtime::component::Linker;
@@ -29,11 +31,19 @@ pub struct Plugin {
     state: Arc<Mutex<(Store<PluginState>, ToolPlugin)>>,
 }
 
-fn base_linker() -> Result<Linker<PluginState>> {
+/// Build exactly the optional imports authorized by this store's admitted
+/// scope. Linkers are materialized once per plugin load so adding another
+/// optional interface cannot create a combinatorial cache of variants.
+fn build_linker(state: &PluginState) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
+    if state.http_enabled() {
+        crate::component::add_wasi_http(&mut linker)?;
+    }
     let mut options = crate::component::bindings::tool::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_sockets(state.permission_enabled(PluginPermission::SocketClient));
+    options.plugins_wit_v0_websocket(state.permission_enabled(PluginPermission::WebSocketClient));
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -45,52 +55,32 @@ fn base_linker() -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
-/// Cached linker for plugins without `HttpClient`: base WASI plus the tool
-/// world, no network.
-fn tool_linker() -> &'static Linker<PluginState> {
-    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| base_linker().expect("tool linker"))
-}
-
-/// Cached linker for `HttpClient` plugins: the base surface plus `wasi:http`.
-/// Built only once, on first use by an HTTP-granted plugin.
-fn tool_linker_http() -> &'static Linker<PluginState> {
-    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| {
-        let mut linker = base_linker().expect("tool linker");
-        crate::component::add_wasi_http(&mut linker).expect("tool http linker");
-        linker
-    })
-}
-
 /// Compile and instantiate a tool plugin under one host-issued scope.
 ///
-/// The scope decides whether the store carries an outbound-HTTP context and
-/// whether the linker exposes `wasi:http`; deriving both from the same scope
-/// prevents authority from drifting between instantiation and execution.
+/// The scope decides whether the store/linker expose outbound HTTP, WebSocket,
+/// and socket imports. Deriving them from the same admission prevents authority
+/// from drifting between instantiation and execution. The required service
+/// bundle resolves canonical live config for that same scope.
 pub async fn create_plugin(
-    wasm_path: &Path,
+    component: &AdmittedComponent,
     scope: &PluginInstanceScope,
+    services: &PluginHostServices,
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
     scope.require_capability(PluginCapability::Tool)?;
-    let component = load_component(wasm_path)?;
+    let component = load_component(component)?;
     let mut store = crate::component::new_store(
-        PluginStoreSpec::new(scope.clone(), limits).with_granted_http(),
+        PluginStoreSpec::new(scope.clone(), services.clone(), limits).with_granted_http(),
     );
-    let http = store.data().http_enabled();
-    let linker = if http {
-        tool_linker_http()
-    } else {
-        tool_linker()
-    };
-    crate::component::ensure_http_coherent(&store, http)?;
-    let bindings = wt(
-        ToolPlugin::instantiate_async(&mut store, &component, linker).await,
-        "failed to instantiate tool plugin",
-    )?;
+    let linker = build_linker(store.data())?;
+    let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+        wt(
+            ToolPlugin::instantiate_async(store, &component, &linker).await,
+            "failed to instantiate tool plugin",
+        )
+    });
     Ok(Plugin {
-        state: Arc::new(Mutex::new((store, bindings))),
+        state: Arc::new(Mutex::new((store, bindings?))),
     })
 }
 
@@ -120,19 +110,13 @@ pub async fn call_tool_metadata(plugin: &mut Plugin) -> Result<ToolMetadata> {
     )
 }
 
-/// Invoke the exported tool's `execute`, injecting the plugin's resolved config.
-pub async fn call_execute(
-    plugin: &mut Plugin,
-    args_json: &[u8],
-    config: &HashMap<String, String>,
-) -> Result<ToolResult> {
-    call_plugin!(
+/// Invoke the exported tool's `execute`, injecting its non-secret resolved config.
+pub async fn call_execute(plugin: &mut Plugin, args_json: &[u8]) -> Result<ToolResult> {
+    call_tool_execute!(
         plugin,
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            let input = inject_config(
-                args_json,
-                effective_config(config, store.data().scope().grants()),
-            )?;
+            let config = store.data_mut().public_config()?;
+            let input = inject_config(args_json, &config)?;
             let result = wt(
                 bindings
                     .zeroclaw_plugin_tool()
@@ -154,35 +138,19 @@ fn into_tool_result(result: WitToolResult) -> ToolResult {
     }
 }
 
-/// Merge the plugin's resolved config under the reserved `__config` key,
+/// Merge the plugin's public resolved config under the reserved `__config` key,
 /// stripping any caller-supplied `__config` so the section cannot be spoofed.
-fn inject_config(args_json: &[u8], config: &HashMap<String, String>) -> Result<String> {
+fn inject_config(args_json: &[u8], config: &serde_json::Value) -> Result<String> {
     let mut args: serde_json::Value =
         serde_json::from_slice(args_json).context("plugin args are not valid JSON")?;
     let obj = args
         .as_object_mut()
         .context("plugin args must be a JSON object")?;
     obj.remove("__config");
-    if !config.is_empty() {
-        obj.insert(
-            "__config".to_string(),
-            serde_json::to_value(config).context("failed to serialize plugin config")?,
-        );
+    if config.as_object().is_some_and(|config| !config.is_empty()) {
+        obj.insert("__config".to_string(), config.clone());
     }
     serde_json::to_string(&args).context("failed to serialize plugin input")
-}
-
-/// The configured section only when the admitted scope grants `ConfigRead`, else empty.
-fn effective_config<'a>(
-    config: &'a HashMap<String, String>,
-    grants: &PluginGrantSet,
-) -> &'a HashMap<String, String> {
-    static EMPTY: OnceLock<HashMap<String, String>> = OnceLock::new();
-    if grants.allows(PluginPermission::ConfigRead) {
-        config
-    } else {
-        EMPTY.get_or_init(HashMap::new)
-    }
 }
 
 #[cfg(test)]
@@ -190,32 +158,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inject_config_adds_config_key() {
-        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
+    fn inject_config_adds_public_config_key() {
+        let config = serde_json::json!({"region": "west"});
         let out = inject_config(br#"{"prompt":"a sunset"}"#, &config).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["prompt"], "a sunset");
-        assert_eq!(v["__config"]["api_key"], "secret");
+        assert_eq!(v["__config"]["region"], "west");
     }
 
     #[test]
     fn inject_config_empty_leaves_args_untouched() {
-        let out = inject_config(br#"{"prompt":"x"}"#, &HashMap::new()).unwrap();
+        let out = inject_config(br#"{"prompt":"x"}"#, &serde_json::json!({})).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("__config").is_none());
     }
 
     #[test]
     fn inject_config_rejects_non_object_args() {
-        let config = HashMap::from([("k".to_string(), "v".to_string())]);
+        let config = serde_json::json!({"k": "v"});
         assert!(inject_config(br#"[1,2,3]"#, &config).is_err());
     }
 
     #[test]
     fn inject_config_strips_caller_supplied_config_when_section_empty() {
         let out = inject_config(
-            br#"{"prompt":"x","__config":{"api_key":"forged"}}"#,
-            &HashMap::new(),
+            br#"{"prompt":"x","__config":{"region":"forged"}}"#,
+            &serde_json::json!({}),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -225,46 +193,35 @@ mod tests {
 
     #[test]
     fn inject_config_overrides_caller_supplied_config_when_section_present() {
-        let config = HashMap::from([("api_key".to_string(), "real".to_string())]);
-        let out = inject_config(
-            br#"{"prompt":"x","__config":{"api_key":"forged"}}"#,
-            &config,
-        )
-        .unwrap();
+        let config = serde_json::json!({"region": "real"});
+        let out =
+            inject_config(br#"{"prompt":"x","__config":{"region":"forged"}}"#, &config).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["__config"]["api_key"], "real");
+        assert_eq!(v["__config"]["region"], "real");
     }
 
     #[test]
-    fn effective_config_withholds_section_without_config_read() {
-        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
-        let scope = crate::instance::test_scope(
-            PluginCapability::Tool,
-            "main",
-            [PluginPermission::HttpClient],
-        );
-        let resolved = effective_config(&config, scope.grants());
-        assert!(resolved.is_empty());
-    }
+    fn inject_config_preserves_typed_values() {
+        let config = serde_json::json!({
+            "enabled": true,
+            "limit": 5,
+            "labels": ["one", "two"],
+            "nested": {"ratio": 1.5}
+        });
+        let out = inject_config(br#"{"prompt":"x"}"#, &config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
 
-    #[test]
-    fn effective_config_passes_section_with_config_read() {
-        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
-        let scope = crate::instance::test_scope(
-            PluginCapability::Tool,
-            "main",
-            [PluginPermission::ConfigRead],
-        );
-        let resolved = effective_config(&config, scope.grants());
-        assert_eq!(resolved.get("api_key").map(String::as_str), Some("secret"));
+        assert_eq!(value["__config"], config);
     }
 
     #[tokio::test]
     async fn create_plugin_rejects_a_scope_for_another_capability() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let component = AdmittedComponent::test_component(b"not-a-component");
         let result = create_plugin(
-            Path::new("/path/that/must/not-be-read.wasm"),
+            &component,
             &scope,
+            &crate::services::test_host_services(),
             crate::component::test_limits(0),
         )
         .await;
