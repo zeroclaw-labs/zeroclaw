@@ -541,6 +541,8 @@ mod cost_usd_regression_tests {
                         .and_then(|v| v.as_str())
                         .map(|s| s == "llm_response")
                         .unwrap_or(false)
+                        && value.get("trace_id").and_then(|v| v.as_str())
+                            == Some("turn-cost-regression")
                     {
                         found_cost = Some(
                             value

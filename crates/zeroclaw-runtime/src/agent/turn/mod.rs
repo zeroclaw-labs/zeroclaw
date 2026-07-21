@@ -42,6 +42,7 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
+pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -175,7 +176,13 @@ async fn enforce_reported_budget(
     }
 }
 
-pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+    let model_switch_state = p
+        .exec
+        .model_switch_callback
+        .clone()
+        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
+    p.exec.model_switch_callback = Some(Arc::clone(&model_switch_state));
     let ToolLoop {
         exec,
         history,
@@ -895,6 +902,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        model_switch_callback: model_switch_callback.as_ref(),
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -912,6 +920,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        model_switch_callback: model_switch_callback.as_ref(),
                     };
                     execute_tools_sequential(
                         &executable_calls,
