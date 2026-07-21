@@ -26,7 +26,9 @@ use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -222,6 +224,15 @@ impl SecretStore {
 
     /// Load the encryption key from disk, or create one if it doesn't exist.
     fn load_or_create_key(&self) -> Result<Zeroizing<Vec<u8>>> {
+        // Several runtime-owned plugin state handles can reach the same install
+        // concurrently. Serialize the one-time create path so two first writes
+        // cannot derive indexes from different keys and overwrite `.secret_key`.
+        static KEY_CREATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _creation_guard = KEY_CREATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
         if self.key_path.exists() {
             self.load_existing_key()
         } else {
@@ -229,7 +240,29 @@ impl SecretStore {
             if let Some(parent) = self.key_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&self.key_path, hex_encode(&key))
+            let encoded_key = Zeroizing::new(hex_encode(&key));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut key_file = match options.open(&self.key_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A different process won the create race. Never overwrite
+                    // its canonical key; a partial concurrent write fails
+                    // closed and can be retried after that writer completes.
+                    return self.load_existing_key();
+                }
+                Err(error) => {
+                    return Err(error).context("Failed to create secret key file");
+                }
+            };
+            key_file
+                .write_all(encoded_key.as_bytes())
+                .and_then(|()| key_file.sync_all())
                 .context("Failed to write secret key file")?;
 
             // Set restrictive permissions
@@ -570,6 +603,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::ffi::OsString;
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -864,6 +898,39 @@ exit 65
                 .unwrap(),
             first,
             "blind-index derivation is independent of config plaintext preference"
+        );
+    }
+
+    #[test]
+    fn concurrent_first_writes_share_one_install_key_generation() {
+        const WRITERS: usize = 16;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let handles = (0..WRITERS)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let store = SecretStore::new(&root, true);
+                    barrier.wait();
+                    store.keyed_digest_or_create(b"plugin-state-owner", b"same-instance")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let digests = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("key writer must not panic"))
+            .collect::<Result<Vec<_>>>()
+            .expect("concurrent writers must share the canonical install key");
+        assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            hex_decode(fs::read_to_string(root.join(".secret_key")).unwrap().trim())
+                .unwrap()
+                .len(),
+            KEY_LEN
         );
     }
 

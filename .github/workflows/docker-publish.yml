@@ -14,6 +14,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      release_ref:
+        description: "Immutable release tag to build (vX.Y.Z)"
+        required: true
+        type: string
   workflow_dispatch:
 
 concurrency:
@@ -37,6 +43,8 @@ jobs:
       include: ${{ steps.read.outputs.include }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - name: Read generated docker-tags.toml into a build matrix
         id: read
         run: |
@@ -61,6 +69,8 @@ jobs:
         include: ${{ fromJSON(needs.matrix.outputs.include) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
 
       - name: Log in to GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
