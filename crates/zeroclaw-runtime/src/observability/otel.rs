@@ -48,6 +48,7 @@ pub struct OtelObserver {
     memory_recall_count: Counter<u64>,
     memory_recall_duration: Histogram<f64>,
     memory_store_count: Counter<u64>,
+    memory_audit_count: Counter<u64>,
     rag_retrieve_count: Counter<u64>,
     rag_retrieve_duration: Histogram<f64>,
 
@@ -206,6 +207,11 @@ impl OtelObserver {
             .with_description("Total memory.store calls from the runtime boundary")
             .build();
 
+        let memory_audit_count = meter
+            .u64_counter("zeroclaw.memory.audit.count")
+            .with_description("Total memory audit trail actions")
+            .build();
+
         let rag_retrieve_count = meter
             .u64_counter("zeroclaw.rag.retrieve.count")
             .with_description("Total rag.retrieve calls from the runtime boundary")
@@ -237,6 +243,7 @@ impl OtelObserver {
             memory_recall_count,
             memory_recall_duration,
             memory_store_count,
+            memory_audit_count,
             rag_retrieve_count,
             rag_retrieve_duration,
             active_agent_spans: Mutex::new(HashMap::new()),
@@ -505,6 +512,45 @@ impl Observer for OtelObserver {
                     KeyValue::new("success", success.to_string()),
                 ];
                 self.memory_store_count.add(1, &metric_attrs);
+            }
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                let secs = duration.as_secs_f64();
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+                let span_attrs = vec![
+                    KeyValue::new("memory.action", action.clone()),
+                    KeyValue::new("memory.backend", backend.clone()),
+                    KeyValue::new("memory.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("db.system", backend.clone()),
+                    KeyValue::new("db.operation", action.clone()),
+                ];
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("memory.audit")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+
+                let metric_attrs = [
+                    KeyValue::new("action", action.clone()),
+                    KeyValue::new("backend", backend.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.memory_audit_count.add(1, &metric_attrs);
             }
             ObserverEvent::LlmResponse {
                 model_provider,
@@ -1384,6 +1430,18 @@ mod tests {
             category: "fact".into(),
             backend: "qdrant".into(),
             duration: Duration::from_millis(3),
+            success: false,
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(5),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "purge".into(),
+            backend: "qdrant".into(),
+            duration: Duration::from_millis(2),
             success: false,
         });
     }

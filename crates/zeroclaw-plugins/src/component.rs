@@ -11,6 +11,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
+use crate::instance::PluginInstanceScope;
 
 #[derive(Clone, Default)]
 pub struct InboundQueue {
@@ -70,6 +71,59 @@ pub struct PluginLimits {
     pub max_instances: usize,
 }
 
+#[cfg(test)]
+pub(crate) fn test_limits(call_fuel: u64) -> PluginLimits {
+    PluginLimits {
+        call_fuel,
+        max_memory_bytes: 1024 * 1024,
+        max_table_elements: 100,
+        max_instances: 10,
+    }
+}
+
+/// Complete host-side inputs for constructing one scoped plugin store.
+///
+/// The immutable instance scope supplies identity and effective grants. Limits
+/// remain a per-store materialized view of canonical host configuration, while
+/// the inbound queue is a process-local resource owned by this store.
+pub(crate) struct PluginStoreSpec {
+    scope: PluginInstanceScope,
+    limits: PluginLimits,
+    inbound: InboundQueue,
+    http: bool,
+}
+
+impl PluginStoreSpec {
+    /// Create a store specification with no host-fed inbound messages.
+    #[must_use]
+    pub(crate) fn new(scope: PluginInstanceScope, limits: PluginLimits) -> Self {
+        Self {
+            scope,
+            limits,
+            inbound: InboundQueue::default(),
+            http: false,
+        }
+    }
+
+    /// Attach HTTP only when this scope was granted `HttpClient`.
+    ///
+    /// Adapters opt into the surface explicitly. This prevents adding a grant
+    /// to a scope from silently widening an adapter that has not implemented
+    /// and tested the corresponding component boundary.
+    #[must_use]
+    pub(crate) fn with_granted_http(mut self) -> Self {
+        self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
+    }
+
+    /// Attach the queue shared with a host-owned inbound listener.
+    #[must_use]
+    pub(crate) fn with_inbound(mut self, inbound: InboundQueue) -> Self {
+        self.inbound = inbound;
+        self
+    }
+}
+
 pub mod bindings {
     pub mod tool {
         wasmtime::component::bindgen!({
@@ -98,6 +152,7 @@ pub mod bindings {
 }
 
 pub struct PluginState {
+    scope: PluginInstanceScope,
     wasi: WasiCtx,
     table: ResourceTable,
     http: Option<WasiHttpCtx>,
@@ -107,42 +162,42 @@ pub struct PluginState {
 }
 
 impl PluginState {
-    pub fn new(permissions: &[PluginPermission], limits: PluginLimits) -> Self {
-        Self::with_inbound(permissions, InboundQueue::default(), limits)
-    }
-
-    /// Build store state with a caller-supplied inbound queue. A channel plugin
-    /// whose host listener feeds it inbound traffic shares the listener's queue
-    /// handle here, so `inbound-poll` drains what the listener enqueued.
-    pub fn with_inbound(
-        permissions: &[PluginPermission],
-        inbound: InboundQueue,
-        limits: PluginLimits,
-    ) -> Self {
-        let http = permissions
-            .contains(&PluginPermission::HttpClient)
-            .then(WasiHttpCtx::new);
+    /// Build store state from one typed, host-issued specification.
+    /// `HttpClient` is the only grant that can widen the host surface here, and
+    /// only after the adapter calls [`PluginStoreSpec::with_granted_http`]. That
+    /// opt-in attaches a `WasiHttpCtx` so the gated `wasi:http` import can be
+    /// linked. Other grants are consumed by adapters or host services where
+    /// implemented and do not widen ambient WASI.
+    pub(crate) fn new(spec: PluginStoreSpec) -> Self {
+        let http = spec.http.then(WasiHttpCtx::new);
         Self {
+            scope: spec.scope,
             wasi: WasiCtx::builder().build(),
             table: ResourceTable::new(),
             http,
-            inbound,
+            inbound: spec.inbound,
             limits: StoreLimitsBuilder::new()
-                .memory_size(limits.max_memory_bytes)
-                .table_elements(limits.max_table_elements)
-                .instances(limits.max_instances)
+                .memory_size(spec.limits.max_memory_bytes)
+                .table_elements(spec.limits.max_table_elements)
+                .instances(spec.limits.max_instances)
                 .build(),
-            fuel_per_call: limits.call_fuel,
+            fuel_per_call: spec.limits.call_fuel,
         }
     }
 
+    /// Immutable host-owned identity and authority for this store.
+    #[must_use]
+    pub(crate) fn scope(&self) -> &PluginInstanceScope {
+        &self.scope
+    }
+
     /// Whether this state was built with outbound HTTP attached.
-    pub fn http_enabled(&self) -> bool {
+    pub(crate) fn http_enabled(&self) -> bool {
         self.http.is_some()
     }
 
     /// The inbound queue this plugin drains. Host code holds a clone to enqueue.
-    pub fn inbound(&self) -> &InboundQueue {
+    pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
     }
 }
@@ -209,22 +264,13 @@ pub fn engine() -> &'static Engine {
     })
 }
 
-pub fn new_store(permissions: &[PluginPermission], limits: PluginLimits) -> Store<PluginState> {
-    new_store_with_inbound(permissions, InboundQueue::default(), limits)
-}
-
-/// Like [`new_store`], but the resulting state shares `inbound` so a host
-/// listener can enqueue traffic the plugin drains. The limiter and per-call
-/// fuel are wired identically to [`new_store`].
-pub fn new_store_with_inbound(
-    permissions: &[PluginPermission],
-    inbound: InboundQueue,
-    limits: PluginLimits,
-) -> Store<PluginState> {
-    let state = PluginState::with_inbound(permissions, inbound, limits);
+/// Build a Wasmtime store whose imports are derived from one admitted scope.
+pub(crate) fn new_store(spec: PluginStoreSpec) -> Store<PluginState> {
+    let call_fuel = spec.limits.call_fuel;
+    let state = PluginState::new(spec);
     let mut store = Store::new(engine(), state);
     store.limiter(|state| &mut state.limits);
-    set_call_fuel(&mut store, limits.call_fuel);
+    set_call_fuel(&mut store, call_fuel);
     store
 }
 
@@ -280,19 +326,22 @@ pub(crate) use call_plugin;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PluginCapability;
 
-    fn limits(call_fuel: u64) -> PluginLimits {
-        PluginLimits {
-            call_fuel,
-            max_memory_bytes: 256 * 1024 * 1024,
-            max_table_elements: 100_000,
-            max_instances: 64,
-        }
+    fn scope(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        crate::instance::test_scope(PluginCapability::Tool, binding, grants)
+    }
+
+    fn spec(grants: impl IntoIterator<Item = PluginPermission>, call_fuel: u64) -> PluginStoreSpec {
+        PluginStoreSpec::new(scope("main", grants), test_limits(call_fuel)).with_granted_http()
     }
 
     #[test]
     fn http_absent_without_permission() {
-        let state = PluginState::new(&[], limits(0));
+        let state = PluginState::new(spec([], 0));
         assert!(
             !state.http_enabled(),
             "no HttpClient permission means no outbound HTTP context"
@@ -301,14 +350,14 @@ mod tests {
 
     #[test]
     fn http_absent_for_unrelated_permissions() {
-        let state = PluginState::new(
-            &[
+        let state = PluginState::new(spec(
+            [
                 PluginPermission::ConfigRead,
                 PluginPermission::MemoryRead,
                 PluginPermission::FileRead,
             ],
-            limits(0),
-        );
+            0,
+        ));
         assert!(
             !state.http_enabled(),
             "only HttpClient attaches the HTTP context"
@@ -317,7 +366,7 @@ mod tests {
 
     #[test]
     fn http_present_with_permission() {
-        let state = PluginState::new(&[PluginPermission::HttpClient], limits(0));
+        let state = PluginState::new(spec([PluginPermission::HttpClient], 0));
         assert!(
             state.http_enabled(),
             "HttpClient attaches the outbound HTTP context"
@@ -325,13 +374,24 @@ mod tests {
     }
 
     #[test]
+    fn grant_does_not_enable_http_without_adapter_opt_in() {
+        let granted_scope = scope("main", [PluginPermission::HttpClient]);
+        let state = PluginState::new(PluginStoreSpec::new(granted_scope, test_limits(0)));
+
+        assert!(
+            !state.http_enabled(),
+            "an adapter must explicitly opt into its tested HTTP boundary"
+        );
+    }
+
+    #[test]
     fn http_coherence_accepts_matching_store_and_linker() {
-        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        let granted = new_store(spec([PluginPermission::HttpClient], 0));
         assert!(
             ensure_http_coherent(&granted, true).is_ok(),
             "granted store paired with an http linker is coherent"
         );
-        let plain = new_store(&[], limits(0));
+        let plain = new_store(spec([], 0));
         assert!(
             ensure_http_coherent(&plain, false).is_ok(),
             "ungranted store paired with a plain linker is coherent"
@@ -343,12 +403,12 @@ mod tests {
         // A registration path that links wasi:http against a store with no
         // HttpClient context (or the reverse) is refused at instantiate time
         // with a named error, not a WasiHttpView::http panic on first call.
-        let granted = new_store(&[PluginPermission::HttpClient], limits(0));
+        let granted = new_store(spec([PluginPermission::HttpClient], 0));
         assert!(
             ensure_http_coherent(&granted, false).is_err(),
             "granted store with a plain linker cannot back its own permission"
         );
-        let plain = new_store(&[], limits(0));
+        let plain = new_store(spec([], 0));
         assert!(
             ensure_http_coherent(&plain, true).is_err(),
             "plain store with an http linker would panic on first outbound call"
@@ -440,7 +500,7 @@ mod tests {
     #[test]
     fn plugin_state_exposes_its_inbound_queue() {
         let q = InboundQueue::default();
-        let state = PluginState::with_inbound(&[], q.clone(), limits(0));
+        let state = PluginState::new(spec([], 0).with_inbound(q.clone()));
         q.enqueue(sample_inbound("y"));
         assert_eq!(
             state.inbound().pending(),
@@ -451,7 +511,7 @@ mod tests {
 
     #[test]
     fn engine_enables_fuel_metering() {
-        let mut store = Store::new(engine(), PluginState::new(&[], limits(0)));
+        let mut store = Store::new(engine(), PluginState::new(spec([], 0)));
         store
             .set_fuel(123)
             .expect("fuel must be enabled on the shared plugin engine");
@@ -460,13 +520,13 @@ mod tests {
 
     #[test]
     fn new_store_seeds_configured_budget() {
-        let store = new_store(&[], limits(777));
+        let store = new_store(spec([], 777));
         assert_eq!(store.get_fuel().expect("get_fuel"), 777);
     }
 
     #[test]
     fn zero_budget_traps_before_any_work() {
-        let store = new_store(&[], limits(0));
+        let store = new_store(spec([], 0));
         assert_eq!(
             store.get_fuel().expect("get_fuel"),
             0,
@@ -476,7 +536,7 @@ mod tests {
 
     #[test]
     fn refuel_restores_per_call_budget_on_a_warm_store() {
-        let mut store = new_store(&[], limits(500));
+        let mut store = new_store(spec([], 500));
         store.set_fuel(3).expect("set_fuel");
         assert_eq!(store.get_fuel().expect("get_fuel"), 3);
         refuel(&mut store);
@@ -484,6 +544,24 @@ mod tests {
             store.get_fuel().expect("get_fuel"),
             500,
             "refuel must reset a drained warm store to the configured per-call budget"
+        );
+    }
+
+    #[test]
+    fn stores_share_only_their_issued_instance_scope() {
+        let primary = scope("primary", []);
+        let primary_store = new_store(PluginStoreSpec::new(primary.clone(), test_limits(0)));
+        let second_primary_store = new_store(PluginStoreSpec::new(primary, test_limits(0)));
+        let backup_store = new_store(PluginStoreSpec::new(scope("backup", []), test_limits(0)));
+
+        assert!(std::ptr::eq(
+            primary_store.data().scope().id(),
+            second_primary_store.data().scope().id()
+        ));
+        assert_ne!(
+            primary_store.data().scope().id(),
+            backup_store.data().scope().id(),
+            "separate bindings must not share a host-service namespace"
         );
     }
 }
