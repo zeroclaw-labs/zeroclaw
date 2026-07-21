@@ -328,7 +328,7 @@ async fn handle_clear(
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(
         classify_memory_backend(&backend),
-        MemoryBackendKind::Markdown | MemoryBackendKind::Qdrant
+        MemoryBackendKind::Markdown | MemoryBackendKind::Qdrant | MemoryBackendKind::Hindsight
     ) {
         bail!(unsupported_clear_backend_message(&backend));
     }
