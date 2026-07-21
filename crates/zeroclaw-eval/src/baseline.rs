@@ -191,7 +191,11 @@ fn current_key(rec: &crate::record::RunRecord) -> ComparabilityKey<'_> {
 /// The distinct categories of the current case's failing grades.
 fn flipped_categories(case: &CaseReport) -> Vec<GradeCategory> {
     let mut out: Vec<GradeCategory> = Vec::new();
-    for g in case.grades.iter().filter(|g| !g.passed) {
+    for g in case
+        .grades
+        .iter()
+        .filter(|grade| !grade.passed && !grade.diagnostic)
+    {
         if !out.contains(&g.category) {
             out.push(g.category);
         }
@@ -392,6 +396,37 @@ mod tests {
             other => panic!("expected tool regression, got {other:?}"),
         }
         assert_eq!(cmp.confirmed_regressions(), 1);
+    }
+
+    #[test]
+    fn regression_categories_exclude_diagnostic_failures() {
+        let pass = SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("response", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let baseline = baseline_of(&pass);
+        let mut diagnostic = grade("judge:quality", false, GradeCategory::Judge);
+        diagnostic.diagnostic = true;
+        let current = SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![
+                    grade("response", false, GradeCategory::Response),
+                    diagnostic,
+                ],
+                10,
+            )],
+        };
+        let comparison = compare(&current, &baseline);
+        assert_eq!(
+            comparison.per_case["a"],
+            CaseComparison::Regression {
+                categories: vec![GradeCategory::Response]
+            }
+        );
     }
 
     #[test]

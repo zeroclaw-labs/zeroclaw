@@ -1,6 +1,7 @@
 //! Pass/fail aggregation and rendering.
 
-use crate::grader::GradeResult;
+use crate::grader::{GradeResult, grades_pass};
+use serde::{Deserialize, Serialize};
 
 /// A case's comparison id: the record's `case_id` when present, else its name.
 /// The single canonical case-identity derivation (baseline skip-matching and the
@@ -36,7 +37,7 @@ impl CaseReport {
     /// A case passes when it ran without error and every non-diagnostic check
     /// passed. Diagnostic grades (e.g. an uncalibrated judge dimension) never gate.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed || g.diagnostic)
+        self.error.is_none() && grades_pass(&self.grades)
     }
 
     fn checks_passed(&self) -> usize {
@@ -76,6 +77,19 @@ impl CaseReport {
             .collect();
         serde_json::Value::Object(map)
     }
+}
+
+/// Numeric suite-level repeated-run summary. This is the canonical source for
+/// both human rendering and machine-readable JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RepeatCi {
+    /// Mean pass proportion after correlated cases are collapsed by cluster.
+    pub pass_rate: f64,
+    /// Two-sided 95% confidence-interval half-width. Absent when fewer than two
+    /// independent units make an interval unidentifiable.
+    pub ci_half_width: Option<f64>,
+    /// Number of independent units after cluster collapsing.
+    pub independent_units: usize,
 }
 
 /// Aggregated results for a whole suite.
@@ -166,34 +180,53 @@ impl SuiteReport {
         s
     }
 
-    /// Suite pass-rate error bar for repeated (live) runs: `pass rate p̄ ±1.96·SEM
-    /// (95% CI)`. Per-case success proportions are collapsed first (one value per
-    /// case), then cluster-averaged, so correlated resamples do not fake precision.
-    /// `None` when no case repeated.
-    pub fn repeat_ci_line(&self) -> Option<String> {
+    /// Suite pass-rate summary for repeated (live) runs. When any case repeated,
+    /// all cases contribute their success proportion: repeated cases contribute
+    /// `passes/k`, while one-shot cases contribute 1 or 0. Correlated cases are
+    /// cluster-averaged before the SEM so they do not fake precision.
+    pub fn repeat_ci(&self) -> Option<RepeatCi> {
+        if !self.cases.iter().any(|case| case.repeat.is_some()) {
+            return None;
+        }
         let items: Vec<(Option<String>, f64)> = self
             .cases
             .iter()
-            .filter_map(|c| {
-                c.repeat
-                    .as_ref()
-                    .map(|r| (c.cluster.clone(), r.proportion()))
+            .map(|case| {
+                let proportion = case.repeat.as_ref().map_or_else(
+                    || if case.passed() { 1.0 } else { 0.0 },
+                    |repeat| repeat.proportion(),
+                );
+                (case.cluster.clone(), proportion)
             })
             .collect();
-        if items.is_empty() {
-            return None;
-        }
         let values = crate::stats::cluster_means(&items);
-        let mean = crate::stats::mean(&values);
-        // Student-t multiplier on (n-1) df: the normal z=1.96 understates the
-        // interval for the few-unit suites repeated runs typically produce.
-        let df = values.len().saturating_sub(1);
-        let ci = crate::stats::t95_multiplier(df) * crate::stats::sem(&values);
-        Some(format!(
-            "pass rate {:.0}% +/-{:.0}% (95% CI)",
-            mean * 100.0,
-            ci * 100.0
-        ))
+        let independent_units = values.len();
+        let ci_half_width = (independent_units >= 2).then(|| {
+            // Student-t multiplier on (n-1) df: the normal z=1.96 understates the
+            // interval for the few-unit suites repeated runs typically produce.
+            crate::stats::t95_multiplier(independent_units - 1) * crate::stats::sem(&values)
+        });
+        Some(RepeatCi {
+            pass_rate: crate::stats::mean(&values),
+            ci_half_width,
+            independent_units,
+        })
+    }
+
+    /// Render the canonical numeric repeated-run summary for the table output.
+    pub fn repeat_ci_line(&self) -> Option<String> {
+        let ci = self.repeat_ci()?;
+        Some(match ci.ci_half_width {
+            Some(half_width) => format!(
+                "pass rate {:.0}% +/-{:.0}% (95% CI)",
+                ci.pass_rate * 100.0,
+                half_width * 100.0
+            ),
+            None => format!(
+                "pass rate {:.0}% (95% CI unavailable: fewer than 2 independent units)",
+                ci.pass_rate * 100.0
+            ),
+        })
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -303,7 +336,7 @@ impl SuiteReport {
             "failed": self.failed_count(),
             "total": self.cases.len(),
             "all_passed": self.all_passed(),
-            "repeat_ci": self.repeat_ci_line(),
+            "repeat_ci": self.repeat_ci(),
             "cases": cases,
         });
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
@@ -607,5 +640,81 @@ mod tests {
         assert_eq!(totals["side_effect"]["total"].as_u64(), Some(1));
         // Categories with no grades do not appear.
         assert!(totals.get("budget").is_none());
+    }
+
+    fn repeat_stats(k: u32, passes: u32) -> crate::stats::RepeatStats {
+        crate::stats::RepeatStats {
+            k,
+            passes,
+            token_mean: 0.0,
+            token_stddev: 0.0,
+            duration_mean: 0.0,
+            duration_stddev: 0.0,
+            check_flips: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn repeat_ci_single_unit_is_explicitly_unavailable() {
+        let mut repeated = case("only", vec![grade("c", true, "")], None);
+        repeated.repeat = Some(repeat_stats(2, 2));
+        let suite = SuiteReport {
+            cases: vec![repeated],
+        };
+        let ci = suite.repeat_ci().expect("repeat summary");
+        assert_eq!(ci.pass_rate, 1.0);
+        assert_eq!(ci.independent_units, 1);
+        assert_eq!(ci.ci_half_width, None);
+        let line = suite.repeat_ci_line().expect("repeat summary line");
+        assert!(line.contains("CI unavailable"));
+        assert!(!line.contains("NaN"));
+    }
+
+    #[test]
+    fn repeat_ci_includes_one_shot_cases_in_mixed_suite() {
+        let mut repeated = case("repeat-pass", vec![grade("c", true, "")], None);
+        repeated.repeat = Some(repeat_stats(2, 2));
+        let mut cases = vec![repeated];
+        for index in 0..9 {
+            cases.push(case(
+                &format!("one-shot-fail-{index}"),
+                vec![grade("c", false, "")],
+                None,
+            ));
+        }
+        let ci = SuiteReport { cases }.repeat_ci().expect("repeat summary");
+        assert!((ci.pass_rate - 0.1).abs() < f64::EPSILON);
+        assert_eq!(ci.independent_units, 10);
+        assert!(ci.ci_half_width.is_some());
+    }
+
+    #[test]
+    fn repeat_ci_single_cluster_does_not_produce_nan() {
+        let mut first = case("first", vec![grade("c", true, "")], None);
+        first.repeat = Some(repeat_stats(2, 2));
+        first.cluster = Some("family".to_string());
+        let mut second = case("second", vec![grade("c", false, "")], None);
+        second.cluster = Some("family".to_string());
+        let suite = SuiteReport {
+            cases: vec![first, second],
+        };
+        let ci = suite.repeat_ci().expect("repeat summary");
+        assert_eq!(ci.independent_units, 1);
+        assert_eq!(ci.ci_half_width, None);
+        assert!((ci.pass_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn repeat_ci_json_is_numeric_not_preformatted_text() {
+        let mut first = case("first", vec![grade("c", true, "")], None);
+        first.repeat = Some(repeat_stats(2, 2));
+        let second = case("second", vec![grade("c", false, "")], None);
+        let report = SuiteReport {
+            cases: vec![first, second],
+        };
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["repeat_ci"]["pass_rate"].as_f64(), Some(0.5));
+        assert_eq!(json["repeat_ci"]["independent_units"].as_u64(), Some(2));
+        assert!(json["repeat_ci"]["ci_half_width"].is_number());
     }
 }

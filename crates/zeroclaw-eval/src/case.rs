@@ -135,6 +135,31 @@ pub struct TraceExpects {
     pub judge: Vec<JudgeRubric>,
 }
 
+impl TraceExpects {
+    /// Whether the case declares at least one deterministic tool, workspace, or
+    /// budget check. Judge-only cases are forbidden because an LLM opinion must
+    /// never be the sole CI decision-maker.
+    pub fn has_deterministic_check(&self) -> bool {
+        let has_tool_check = !self.tools_used.is_empty()
+            || !self.tools_not_used.is_empty()
+            || self.max_tool_calls.is_some()
+            || self.all_tools_succeeded.is_some();
+        let has_workspace_check = self.workspace.as_ref().is_some_and(|workspace| {
+            !workspace.file_exists.is_empty()
+                || !workspace.file_absent.is_empty()
+                || !workspace.file_contains.is_empty()
+        });
+        let has_budget_check = self.budget.as_ref().is_some_and(|budget| {
+            budget.max_input_tokens.is_some()
+                || budget.max_output_tokens.is_some()
+                || budget.max_total_tokens.is_some()
+                || budget.max_duration_ms.is_some()
+                || budget.max_llm_calls.is_some()
+        });
+        has_tool_check || has_workspace_check || has_budget_check
+    }
+}
+
 fn default_judge_threshold() -> f64 {
     0.7
 }
@@ -197,6 +222,17 @@ impl LlmTrace {
     /// otherwise `model_name`.
     pub fn display_id(&self) -> &str {
         self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
+    /// Validate cross-field authoring rules before any provider call runs.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.expects.judge.is_empty() && !self.expects.has_deterministic_check() {
+            anyhow::bail!(
+                "eval case '{}' declares judge rubrics without a deterministic tool, workspace, or budget check",
+                self.display_id()
+            );
+        }
+        Ok(())
     }
 
     /// Load a trace from a JSON file.
@@ -309,6 +345,25 @@ mod tests {
         assert!(t.turns.is_empty());
         assert!(t.expects.response_contains.is_empty());
         assert!(t.expects.max_tool_calls.is_none());
+    }
+
+    #[test]
+    fn judge_only_case_fails_validation() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"judge-only","turns":[],"expects":{"judge":[{"name":"quality","rubric":"grade it"}]}}"#,
+        )
+        .unwrap();
+        let error = trace.validate().unwrap_err();
+        assert!(error.to_string().contains("without a deterministic"));
+    }
+
+    #[test]
+    fn judge_case_with_tool_check_passes_validation() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"judge-plus-tool","turns":[],"expects":{"max_tool_calls":0,"judge":[{"name":"quality","rubric":"grade it"}]}}"#,
+        )
+        .unwrap();
+        assert!(trace.validate().is_ok());
     }
 
     #[test]

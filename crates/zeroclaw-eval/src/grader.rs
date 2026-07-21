@@ -69,6 +69,15 @@ impl GradeResult {
     }
 }
 
+/// Canonical pass/fail predicate for a completed set of grades.
+///
+/// Diagnostic grades remain visible in reports but never gate a case. Keep all
+/// execution, baseline, and output-format decisions routed through this helper
+/// so an ungated judge result cannot accidentally become a hard failure.
+pub fn grades_pass(grades: &[GradeResult]) -> bool {
+    grades.iter().all(|grade| grade.passed || grade.diagnostic)
+}
+
 /// Context available to graders while the case's workspace still exists.
 pub struct GradeContext<'a> {
     pub workspace: &'a std::path::Path,
@@ -684,6 +693,18 @@ mod tests {
     fn empty_expectations_produce_no_results() {
         let out = evaluate_expects(&TraceExpects::default(), &run("hi", &[], true));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_failure_does_not_gate_grade_set() {
+        let grades = vec![GradeResult {
+            check: "judge:quality".to_string(),
+            passed: false,
+            detail: "below threshold".to_string(),
+            category: GradeCategory::Judge,
+            diagnostic: true,
+        }];
+        assert!(grades_pass(&grades));
     }
 
     #[test]

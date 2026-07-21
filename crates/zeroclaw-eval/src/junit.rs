@@ -63,19 +63,22 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
         ));
         if is_skipped(case) {
             xml.push_str("<skipped/>");
-        } else if let Some(err) = &case.error {
-            xml.push_str(&format!(
-                "<error message=\"{}\">{}</error>",
-                escape(err),
-                escape(err)
-            ));
+        } else if case.error.is_some() {
+            // Run errors can contain provider payloads. JUnit is commonly retained
+            // or uploaded by CI, so keep the artifact transcript/PII-safe.
+            xml.push_str("<error message=\"run error\"/>");
         } else {
-            let failing: Vec<&crate::grader::GradeResult> =
-                case.grades.iter().filter(|g| !g.passed).collect();
+            let failing: Vec<&crate::grader::GradeResult> = case
+                .grades
+                .iter()
+                .filter(|grade| !grade.passed && !grade.diagnostic)
+                .collect();
             if let Some(first) = failing.first() {
+                // Grade details may embed the model's final response. Preserve safe
+                // check/category metadata without copying response content into CI.
                 let body: String = failing
                     .iter()
-                    .map(|g| format!("{}: {}", g.check, g.detail))
+                    .map(|grade| format!("{} ({})", grade.check, grade.category.as_str()))
                     .collect::<Vec<_>>()
                     .join("\n");
                 xml.push_str(&format!(
@@ -130,8 +133,9 @@ mod tests {
         let xml = render_junit(&report, &[]);
         // The case name is escaped in the attribute.
         assert!(xml.contains("name=\"weird &lt;&quot;&amp;&apos;&gt; name\""));
-        // The failure body escapes and drops the control char (bell), keeps newline.
-        assert!(xml.contains("check&lt;x&gt;: line1\nline2bell"));
+        // The safe failure body escapes the check and omits response-derived detail.
+        assert!(xml.contains("check&lt;x&gt; (response)"));
+        assert!(!xml.contains("line1"));
         assert!(!xml.contains('\u{0007}'));
     }
 
@@ -151,6 +155,40 @@ mod tests {
         assert!(xml.contains("errors=\"1\"")); // only "err"
         assert!(xml.contains("skipped=\"1\"")); // only "changed"
         assert!(xml.contains("<skipped/>"));
-        assert!(xml.contains("<error message=\"boom\">boom</error>"));
+        assert!(xml.contains("<error message=\"run error\"/>"));
+        assert!(!xml.contains("boom"));
+    }
+
+    #[test]
+    fn diagnostic_failure_is_not_a_junit_failure() {
+        let mut diagnostic = grade("judge:quality", false, "below threshold");
+        diagnostic.category = GradeCategory::Judge;
+        diagnostic.diagnostic = true;
+        let report = SuiteReport {
+            cases: vec![case("diagnostic", vec![diagnostic], None)],
+        };
+        let xml = render_junit(&report, &[]);
+        assert!(xml.contains("failures=\"0\""));
+        assert!(!xml.contains("<failure"));
+    }
+
+    #[test]
+    fn junit_omits_response_and_error_details() {
+        const RESPONSE_SENTINEL: &str = "PRIVATE_MODEL_RESPONSE_7f6d";
+        const ERROR_SENTINEL: &str = "PRIVATE_PROVIDER_ERROR_3a91";
+        let report = SuiteReport {
+            cases: vec![
+                case(
+                    "failed",
+                    vec![grade("response_contains", false, RESPONSE_SENTINEL)],
+                    None,
+                ),
+                case("errored", vec![], Some(ERROR_SENTINEL)),
+            ],
+        };
+        let xml = render_junit(&report, &[]);
+        assert!(!xml.contains(RESPONSE_SENTINEL));
+        assert!(!xml.contains(ERROR_SENTINEL));
+        assert!(xml.contains("response_contains (response)"));
     }
 }

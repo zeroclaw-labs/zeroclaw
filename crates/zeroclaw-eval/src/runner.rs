@@ -27,6 +27,13 @@ pub struct CaseOutcome {
     pub grades: Vec<GradeResult>,
 }
 
+impl CaseOutcome {
+    /// Whether this outcome passes the canonical grade gate.
+    pub fn passed(&self) -> bool {
+        crate::grader::grades_pass(&self.grades)
+    }
+}
+
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
 pub type ProviderFactory =
@@ -143,11 +150,10 @@ pub async fn run_case_repeated(
     for _ in 0..k {
         outcomes.push(run_case(trace, deps).await?);
     }
-    let all_pass = |o: &CaseOutcome| o.grades.iter().all(|g| g.passed);
     let samples: Vec<crate::stats::RunSample> = outcomes
         .iter()
         .map(|o| crate::stats::RunSample {
-            passed: all_pass(o),
+            passed: o.passed(),
             total_tokens: o.record.input_tokens + o.record.output_tokens,
             duration_ms: o.record.duration_ms,
             checks: o
@@ -158,7 +164,10 @@ pub async fn run_case_repeated(
         })
         .collect();
     let stats = crate::stats::RepeatStats::from_runs(k, &samples);
-    let rep_idx = outcomes.iter().position(|o| !all_pass(o)).unwrap_or(0);
+    let rep_idx = outcomes
+        .iter()
+        .position(|outcome| !outcome.passed())
+        .unwrap_or(0);
     let representative = outcomes.swap_remove(rep_idx);
     Ok((representative, Some(stats)))
 }
@@ -166,6 +175,7 @@ pub async fn run_case_repeated(
 /// Run a single trace through a freshly built, isolated agent, grade it while its
 /// workspace is still alive, and return the outcome. Dispatches on `deps.mode`.
 pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
+    trace.validate()?;
     match deps.mode {
         Mode::Replay => run_replay_case(trace, deps).await,
         Mode::Live => crate::live::run_live_case(trace, deps).await,
@@ -330,6 +340,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn judge_only_case_is_rejected_before_execution() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "judge-only",
+                "turns": [{ "user_input": "hi", "steps": [
+                    { "response": { "type": "text", "content": "done" } }
+                ] }],
+                "expects": { "judge": [{ "name": "quality", "rubric": "grade it" }] }
+            }"#,
+        )
+        .unwrap();
+        let error = run_case(&trace, &RunDeps::replay()).await.unwrap_err();
+        assert!(error.to_string().contains("without a deterministic"));
+    }
+
+    #[tokio::test]
     async fn judge_tokens_excluded_from_case_budget() {
         let trace: LlmTrace = serde_json::from_str(
             r#"{
@@ -337,7 +363,10 @@ mod tests {
                 "turns": [{ "user_input": "hi", "steps": [
                     { "response": { "type": "text", "content": "done", "input_tokens": 20, "output_tokens": 5 } }
                 ] }],
-                "expects": { "judge": [{ "name": "h", "rubric": "grade it" }] }
+                "expects": {
+                    "max_tool_calls": 0,
+                    "judge": [{ "name": "h", "rubric": "grade it" }]
+                }
             }"#,
         )
         .unwrap();

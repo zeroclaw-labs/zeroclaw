@@ -51,6 +51,9 @@ pub async fn finalize(
 
     // --write-baseline: persist the run and exit with its normal code.
     if let Some(path) = &opts.write_baseline {
+        if opts.format == OutputFormat::Junit {
+            print!("{}", zeroclaw_eval::junit::render_junit(&report, &[]));
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -134,7 +137,7 @@ async fn rerun_live_regressions(
         if regressed.contains(&id) {
             let passed = matches!(
                 Box::pin(zeroclaw_eval::run_case(trace, &deps)).await,
-                Ok(outcome) if outcome.grades.iter().all(|g| g.passed)
+                Ok(outcome) if outcome.passed()
             );
             out.insert(id.to_string(), passed);
         }
@@ -219,9 +222,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 .as_ref()
                 .is_some_and(|j| j.judge_ref.split(':').next() == Some(provider_ref.as_str()))
             {
-                println!(
-                    "  warning: judge and live provider are the same provider reference (self-judging bias)"
-                );
+                eprintln!("{}", get_required_cli_string("cli-eval-self-judge-warning"));
             }
             let cfg = config.clone();
             RunDeps {
@@ -242,25 +243,65 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
     Ok(deps)
 }
 
-/// Sanitize a judge ref into a calibration filename stem: `/`, `.`, and `:` all
-/// become `_` so the model-inclusive `judge_ref` is a safe single-segment name.
+/// Sanitize a judge ref into a calibration filename stem. The documented `/`,
+/// `.`, and `:` separators become `_`; all other characters outside the small
+/// portable filename set do too, so the result stays one path segment on every
+/// supported platform.
 fn calibration_stem(judge_ref: &str) -> String {
     judge_ref
         .chars()
-        .map(|c| {
-            if c == '/' || c == '.' || c == ':' {
-                '_'
-            } else {
-                c
-            }
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => c,
+            _ => '_',
         })
         .collect()
 }
 
+const CALIBRATION_SCHEMA: &str = "zeroclaw-eval/calibration/v1";
+const MIN_CALIBRATION_RECORDS: u64 = 50;
+
+#[derive(serde::Deserialize)]
+struct JudgeCalibration {
+    schema: String,
+    judge_ref: String,
+    labeled_records: u64,
+    agreement: f64,
+    labeler: String,
+    date: String,
+}
+
+/// Validate the calibration contract before it is allowed to change a judge
+/// grade from diagnostic to gating. Exact `judge_ref` matching also closes the
+/// collision risk in the prompt-prescribed sanitized filename convention.
+fn validate_calibration(path: &Path, expected_judge_ref: &str) -> std::result::Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let calibration: JudgeCalibration =
+        serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    if calibration.schema != CALIBRATION_SCHEMA {
+        return Err("wrong schema".to_string());
+    }
+    if calibration.judge_ref != expected_judge_ref {
+        return Err("judge reference mismatch".to_string());
+    }
+    if calibration.labeled_records < MIN_CALIBRATION_RECORDS {
+        return Err("too few labeled records".to_string());
+    }
+    if !calibration.agreement.is_finite() || !(0.0..=1.0).contains(&calibration.agreement) {
+        return Err("agreement is outside 0.0..=1.0".to_string());
+    }
+    if calibration.labeler.trim().is_empty() {
+        return Err("labeler is required".to_string());
+    }
+    if chrono::NaiveDate::parse_from_str(&calibration.date, "%Y-%m-%d").is_err() {
+        return Err("date must use YYYY-MM-DD".to_string());
+    }
+    Ok(())
+}
+
 /// Build judge deps from config, or `None` when `[eval].judge_provider` is empty.
-/// Judge grades gate only when `judge_gate` is set AND a calibration file exists
-/// for the judge (keyed by the model-inclusive `judge_ref`, matching the
-/// comparability key); otherwise they stay diagnostic (a missing file warns).
+/// Judge grades gate only when `judge_gate` is set AND a valid calibration file
+/// exists for the judge (keyed by the model-inclusive `judge_ref`, matching the
+/// comparability key); otherwise they stay diagnostic and a warning is emitted.
 fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
     let judge_provider = config.eval.judge_provider.as_str().trim().to_string();
     if judge_provider.is_empty() {
@@ -269,22 +310,26 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
     let (provider, _provider_type, model) =
         build_session_model_provider(config, &judge_provider, None)?;
     let judge_ref = format!("{judge_provider}:{model}");
-    let calibration = std::path::Path::new(&format!(
+    let calibration_path = PathBuf::from(format!(
         "evals/calibration/{}.json",
         calibration_stem(&judge_ref)
-    ))
-    .exists();
-    let gates = config.eval.judge_gate && calibration;
-    if config.eval.judge_gate && !calibration {
-        println!(
-            "  warning: [eval].judge_gate is set but no calibration file for {judge_ref}; judge grades stay diagnostic"
+    ));
+    let calibration_valid =
+        config.eval.judge_gate && validate_calibration(&calibration_path, &judge_ref).is_ok();
+    if config.eval.judge_gate && !calibration_valid {
+        eprintln!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-calibration-warning",
+                &[("judge_ref", judge_ref.as_str())],
+            )
         );
     }
     Ok(Some(zeroclaw_eval::grader::JudgeDeps {
         provider: std::sync::Arc::from(provider),
         model,
         judge_ref,
-        gates,
+        gates: calibration_valid,
     }))
 }
 
@@ -442,6 +487,75 @@ mod tests {
             calibration_stem("anthropic.sonnet:model-a"),
             calibration_stem("anthropic.sonnet:model-b")
         );
+        assert_eq!(
+            calibration_stem(r"provider.alias:model\..\calibration"),
+            "provider_alias_model____calibration"
+        );
+    }
+
+    fn write_calibration(
+        dir: &tempfile::TempDir,
+        judge_ref: &str,
+        labeled_records: u64,
+        agreement: f64,
+    ) -> PathBuf {
+        let path = dir.path().join("calibration.json");
+        let value = serde_json::json!({
+            "schema": CALIBRATION_SCHEMA,
+            "judge_ref": judge_ref,
+            "labeled_records": labeled_records,
+            "agreement": agreement,
+            "labeler": "human-reviewer",
+            "date": "2026-07-21",
+        });
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn valid_calibration_satisfies_gating_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_calibration(&dir, "anthropic.judge:model-a", 50, 0.9);
+        assert!(validate_calibration(&path, "anthropic.judge:model-a").is_ok());
+    }
+
+    #[test]
+    fn invalid_calibration_never_enables_gating() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let undersized = write_calibration(&dir, "anthropic.judge:model-a", 49, 0.9);
+        assert!(validate_calibration(&undersized, "anthropic.judge:model-a").is_err());
+
+        let wrong_judge = write_calibration(&dir, "anthropic.judge:model-b", 50, 0.9);
+        assert!(validate_calibration(&wrong_judge, "anthropic.judge:model-a").is_err());
+
+        let bad_agreement = write_calibration(&dir, "anthropic.judge:model-a", 50, 1.1);
+        assert!(validate_calibration(&bad_agreement, "anthropic.judge:model-a").is_err());
+
+        let invalid_date = serde_json::json!({
+            "schema": CALIBRATION_SCHEMA,
+            "judge_ref": "anthropic.judge:model-a",
+            "labeled_records": 50,
+            "agreement": 0.9,
+            "labeler": "human-reviewer",
+            "date": "not-a-date",
+        });
+        std::fs::write(&bad_agreement, serde_json::to_vec(&invalid_date).unwrap()).unwrap();
+        assert!(validate_calibration(&bad_agreement, "anthropic.judge:model-a").is_err());
+
+        std::fs::write(&bad_agreement, "not json").unwrap();
+        assert!(validate_calibration(&bad_agreement, "anthropic.judge:model-a").is_err());
+    }
+
+    #[test]
+    fn calibration_content_check_neutralizes_filename_collision() {
+        assert_eq!(
+            calibration_stem("provider.alias:model/a"),
+            calibration_stem("provider.alias:model.a")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_calibration(&dir, "provider.alias:model/a", 50, 0.9);
+        assert!(validate_calibration(&path, "provider.alias:model.a").is_err());
     }
 
     #[test]

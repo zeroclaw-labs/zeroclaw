@@ -252,8 +252,9 @@ pub struct EvalHarnessConfig {
     /// than the one under test (self-judging is biased).
     #[serde(default)]
     pub judge_provider: crate::providers::ModelProviderRef,
-    /// When true AND a calibration file exists for the judge, judge failures
-    /// affect the exit code. Default false: judge grades are diagnostic.
+    /// When true AND a valid calibration file exists for the exact judge model,
+    /// judge failures affect the exit code. Default false: judge grades are
+    /// diagnostic.
     #[serde(default)]
     pub judge_gate: bool,
 }

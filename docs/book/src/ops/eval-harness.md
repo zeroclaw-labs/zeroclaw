@@ -45,6 +45,9 @@ are cases.
 `--format` selects `table` (default), `json`, or `junit`. JUnit XML maps each
 case to a `<testcase>`: a failing case becomes a `<failure>`, a run error an
 `<error>`, and a case that is unverifiable against a baseline a `<skipped/>`.
+Because CI systems commonly retain or publish JUnit artifacts, failure elements
+carry check/category identifiers but never grade details, model responses, or
+provider error payloads.
 
 ## Live mode
 
@@ -87,7 +90,7 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface)`:
+tool_surface, judge_ref)`:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
   compared or gated.
@@ -122,12 +125,13 @@ verdict, malformed output, or a transport error is reported as
 `UNKNOWN (diagnostic)` and never fails a build.
 
 **Judge grades are diagnostic by default:** they are stripped from the pass/fail
-gate unless `[eval].judge_gate` is true AND a calibration file exists at
+gate unless `[eval].judge_gate` is true AND a valid calibration file exists at
 `evals/calibration/<judge_ref>.json`, where `judge_ref` is the model-inclusive
 `<type>.<alias>:<model>` with `/`, `.`, and `:` replaced by `_` (so calibration
 is model-specific, matching the comparability key). When
-`judge_gate` is set but no calibration file exists, the harness warns and stays
-diagnostic. Judge token usage is never added to the case's own token totals (the
+`judge_gate` is set but the file is missing, malformed, names a different judge,
+has fewer than 50 labeled records, or reports agreement outside 0.0 to 1.0, the
+harness warns and stays diagnostic. Judge token usage is never added to the case's own token totals (the
 judge runs outside the agent), and the judge reference joins the baseline
 comparability key, so swapping judges makes cases unverifiable rather than
 silently compared.
@@ -148,17 +152,22 @@ A live case can set `repeat: k` (clamped to 1..=50) to run k fully isolated time
 
 Per case the report gives `passes/k`, `pass@k` (passes > 0), `pass^k` (all k
 passed), per-check flip counts, and the mean and sample standard deviation of
-total tokens and duration. A live case counts as PASSED for gating and baselines
-iff `pass^k` (the consistency standard).
+total tokens and duration. Diagnostic judge grades remain visible but do not
+turn a run into a failure. A live case counts as PASSED for gating and baselines
+iff every run passes its non-diagnostic checks (`pass^k`, the consistency
+standard).
 
-At the suite level, each case's success proportion `p_i = passes_i / k_i` is
-collapsed first (one value per case), so correlated resamples do not fake
-precision; the report prints `pass rate p̄ +/-t·SEM (95% CI)`, using the Student-t
-multiplier on n-1 degrees of freedom (the normal z=1.96 understates the interval
-for the few-unit suites repeated runs typically produce). An optional
-per-case `cluster` label averages correlated case families together before the
-error bar; omitting it asserts independence. A case with `0/k` passes at `k >= 5`
-is flagged low-signal, and at `k >= 20` as a suspect (broken) task.
+At the suite level, when any case repeats, every case contributes its success
+proportion `p_i = passes_i / k_i` (a one-shot case therefore contributes 1 or
+0). These values are collapsed first (one value per case), so correlated
+resamples do not fake precision; the report prints `pass rate p̄ +/-t·SEM (95%
+CI)`, using the Student-t multiplier on n-1 degrees of freedom (the normal
+z=1.96 understates the interval for the few-unit suites repeated runs typically
+produce). An optional per-case `cluster` label averages correlated case families
+together before the error bar; omitting it asserts independence. With fewer than
+two independent units, the pass rate is reported but the CI is explicitly
+unavailable instead of emitting a numeric interval. A case with `0/k` passes at
+`k >= 5` is flagged low-signal, and at `k >= 20` as a suspect (broken) task.
 
 ## Exit-code contract
 
