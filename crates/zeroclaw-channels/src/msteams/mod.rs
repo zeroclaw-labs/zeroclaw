@@ -9,8 +9,11 @@
 //!
 //! Streaming (`stream_mode = "partial"`) drives Teams' native streaming
 //! protocol in personal chats — the gray in-progress bubble fed by
-//! `streaminfo` typing activities, replaced by the final message — and
-//! falls back to message edits in group chats and team channels.
+//! `streaminfo` typing activities, replaced by the final message. The
+//! stream opens lazily on the first real status line or content chunk
+//! (mirroring OpenClaw's `HttpStream`), so no placeholder frame is ever
+//! posted. Group chats and team channels don't open drafts at all: they
+//! show the ordinary typing indicator and receive one final reply.
 //!
 //! Design: `docs/msteams-channel-design.md`.
 
@@ -72,6 +75,18 @@ struct SendContext {
     token: String,
 }
 
+/// Per-draft native-streaming state. Source of truth created here: the
+/// streaminfo sequence counter and the Teams-assigned `streamId` exist
+/// nowhere else and are dropped on finalize/cancel.
+struct DraftStream {
+    /// Teams `streamId` — the Connector-assigned id of the first
+    /// activity. `None` while the draft is lazily pending (no activity
+    /// has been POSTed yet).
+    stream_id: Option<String>,
+    /// Next `streamSequence` (starts at 1, monotonic per stream).
+    next_sequence: u64,
+}
+
 /// A `typing`/`message` activity carrying a Teams `streaminfo` entity
 /// (the native streaming protocol; design §4).
 fn streaming_activity_body(
@@ -112,12 +127,14 @@ pub struct MsTeamsChannel {
     bot_identity: Arc<OnceLock<BotIdentity>>,
     listener_ready: Arc<AtomicBool>,
     connector: tokio::sync::RwLock<Option<ConnectorHandle>>,
-    /// Per-draft Teams streaming state: `streamId` -> next
-    /// `streamSequence`. Source of truth created here — the streaminfo
-    /// protocol counter is assigned locally and exists nowhere else.
-    /// Entries are removed on finalize/cancel. Drafts without an entry
-    /// use the group-chat message-edit fallback.
-    draft_streams: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Per-draft Teams streaming state, keyed by the locally assigned
+    /// draft handle returned from `send_draft`. Source of truth created
+    /// here — the handle, streaminfo sequence counter, and (once the
+    /// stream opens) the Teams `streamId` exist nowhere else. Entries
+    /// are removed on finalize/cancel.
+    draft_streams: parking_lot::Mutex<HashMap<String, DraftStream>>,
+    /// Monotonic source for locally assigned draft handles.
+    draft_counter: AtomicU64,
     /// Last draft-update instant per recipient, enforcing the
     /// `draft_update_interval_ms` floor (Teams rate-limits streaming
     /// updates to roughly one per second).
@@ -144,6 +161,7 @@ impl MsTeamsChannel {
             listener_ready: Arc::new(AtomicBool::new(false)),
             connector: tokio::sync::RwLock::new(None),
             draft_streams: parking_lot::Mutex::new(HashMap::new()),
+            draft_counter: AtomicU64::new(0),
             last_draft_update: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             token_url_override: None,
@@ -336,21 +354,58 @@ impl MsTeamsChannel {
             .insert(recipient.to_string(), Instant::now());
     }
 
-    /// Consume the next `streamSequence` for a native-streaming draft.
-    /// `None` means this draft uses the message-edit fallback.
-    fn next_stream_sequence(&self, stream_id: &str) -> Option<u64> {
-        let mut streams = self.draft_streams.lock();
-        streams.get_mut(stream_id).map(|next| {
-            let sequence = *next;
-            *next += 1;
-            sequence
-        })
+    /// Drop all local state for a draft (finalized or cancelled),
+    /// returning the Teams `streamId` if the stream ever opened.
+    fn clear_draft_state(&self, recipient: &str, draft_id: &str) -> Option<String> {
+        let removed = self.draft_streams.lock().remove(draft_id);
+        self.last_draft_update.lock().remove(recipient);
+        removed.and_then(|draft| draft.stream_id)
     }
 
-    /// Drop all local state for a draft (finalized or cancelled).
-    fn clear_draft_state(&self, recipient: &str, stream_id: &str) {
-        self.draft_streams.lock().remove(stream_id);
-        self.last_draft_update.lock().remove(recipient);
+    /// POST one streaminfo activity for a draft, opening the Teams
+    /// stream on the first call. The first activity carries real
+    /// content — never a placeholder — mirroring OpenClaw's lazy
+    /// `HttpStream`, so the gray bubble's first visible frame is actual
+    /// status or response text. The sequence counter (and, on open, the
+    /// Teams-assigned `streamId`) is committed only after the request
+    /// succeeds, so a failed open retries as sequence 1.
+    async fn push_stream_activity(
+        &self,
+        recipient: &str,
+        draft_id: &str,
+        text: &str,
+        stream_type: &str,
+    ) -> Result<()> {
+        let Some((sequence, stream_id)) = self
+            .draft_streams
+            .lock()
+            .get(draft_id)
+            .map(|draft| (draft.next_sequence, draft.stream_id.clone()))
+        else {
+            return Ok(());
+        };
+        let (_, ctx) = self.send_context(recipient).await?;
+        let body = streaming_activity_body(
+            "typing",
+            text,
+            stream_type,
+            Some(sequence),
+            stream_id.as_deref(),
+        );
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
+        let response_id = Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
+
+        if let Some(draft) = self.draft_streams.lock().get_mut(draft_id) {
+            if draft.stream_id.is_none() {
+                draft.stream_id = Some(
+                    response_id
+                        .context("Teams streaming draft opened but no streamId was returned")?,
+                );
+            }
+            draft.next_sequence = sequence + 1;
+        }
+        self.mark_draft_update(recipient);
+        Ok(())
     }
 
     /// Build the inbound activity router. Split from `listen()` so tests
@@ -672,122 +727,106 @@ impl Channel for MsTeamsChannel {
         self.stream_mode() == StreamMode::MultiMessage
     }
 
-    /// Open a native streaming draft in a personal chat. Team channels and
-    /// group chats use the ordinary typing indicator and deliver one final
-    /// reply, since editing a placeholder causes Teams to notify only the
-    /// placeholder rather than the completed answer.
+    /// Register a lazy streaming draft for a personal chat. No activity
+    /// is POSTed here — the placeholder text the orchestrator passes is
+    /// deliberately dropped, and the Teams stream opens on the first
+    /// real update instead, so the gray bubble never flashes "..." (and
+    /// fast answers skip the stream entirely). Team channels and group
+    /// chats don't open drafts: they use the ordinary typing indicator
+    /// and deliver one final reply.
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         if self.stream_mode() != StreamMode::Partial {
             return Ok(None);
         }
-        let (_, ctx) = self.send_context(&message.recipient).await?;
-        if !ctx.reference.is_personal() {
+        // Personal-chat check straight from the in-memory conversation
+        // store; no token acquisition or network traffic happens until
+        // the stream actually opens.
+        let (base_id, _) = activity::split_conversation_id(&message.recipient);
+        if !self
+            .conversations
+            .get(base_id)
+            .is_some_and(|reference| reference.is_personal())
+        {
             return Ok(None);
         }
-        let text = if message.content.is_empty() {
-            "..."
-        } else {
-            message.content.as_str()
-        };
-        let conversation_id = Self::conversation_id_for_thread(&ctx, message.thread_ts.as_deref());
-        let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
-
-        let body = streaming_activity_body("typing", text, "informative", Some(1), None);
-        let draft_id = Self::activity_request(&ctx, reqwest::Method::POST, url, &body)
-            .await?
-            .context("Teams streaming draft opened but no streamId was returned")?;
-        self.draft_streams.lock().insert(draft_id.clone(), 2);
-        self.mark_draft_update(&message.recipient);
+        let draft_id = format!(
+            "draft-{}",
+            self.draft_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        self.draft_streams.lock().insert(
+            draft_id.clone(),
+            DraftStream {
+                stream_id: None,
+                next_sequence: 1,
+            },
+        );
         Ok(Some(draft_id))
     }
 
-    /// Stream accumulated content into the draft. Non-fatal failures are
-    /// logged and swallowed — the finalize pass carries the full text.
+    /// Stream accumulated content into the draft, opening the Teams
+    /// stream on the first call. Non-fatal failures are logged and
+    /// swallowed — the finalize pass carries the full text.
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let Some(cfg) = self.config() else {
             return Ok(());
         };
+        if text.trim().is_empty() {
+            return Ok(());
+        }
         if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
             return Ok(());
         }
-        let (_, ctx) = self.send_context(recipient).await?;
-
-        let outcome = match self.next_stream_sequence(message_id) {
-            Some(sequence) => {
-                let body = streaming_activity_body(
-                    "typing",
-                    text,
-                    "streaming",
-                    Some(sequence),
-                    Some(message_id),
-                );
-                let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-                Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await
-            }
-            None => {
-                let body = serde_json::json!({ "type": "message", "text": text });
-                let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(message_id))?;
-                Self::activity_request(&ctx, reqwest::Method::PUT, url, &body).await
-            }
-        };
-        match outcome {
-            Ok(_) => self.mark_draft_update(recipient),
-            Err(err) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
-                    "Teams draft update failed"
-                );
-            }
+        if let Err(err) = self
+            .push_stream_activity(recipient, message_id, text, "streaming")
+            .await
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                "Teams draft update failed"
+            );
         }
         Ok(())
     }
 
-    /// Progress/status line (tool execution etc.). Personal chats show it
-    /// as the gray informative text over the streaming bubble; group
-    /// chats skip it (an edit would overwrite real content with status).
+    /// Progress/status line (tool execution etc.), shown as the gray
+    /// informative text over the streaming bubble. Opens the stream if
+    /// this is the draft's first real content.
     async fn update_draft_progress(
         &self,
         recipient: &str,
         message_id: &str,
         text: &str,
     ) -> Result<()> {
-        let Some(sequence) = self.next_stream_sequence(message_id) else {
-            return Ok(());
-        };
         let Some(cfg) = self.config() else {
             return Ok(());
         };
+        if text.trim().is_empty() {
+            return Ok(());
+        }
         if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
             return Ok(());
         }
-        let (_, ctx) = self.send_context(recipient).await?;
-        let body = streaming_activity_body(
-            "typing",
-            text,
-            "informative",
-            Some(sequence),
-            Some(message_id),
-        );
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-        if let Err(err) = Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await {
+        if let Err(err) = self
+            .push_stream_activity(recipient, message_id, text, "informative")
+            .await
+        {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"error": format!("{err}")})),
                 "Teams draft progress update failed"
             );
-        } else {
-            self.mark_draft_update(recipient);
         }
         Ok(())
     }
 
-    /// Close the draft with the complete response. Personal chats post
-    /// the final `message` activity — Teams replaces the gray streaming
-    /// bubble with a normal message and drops the status history. Group
-    /// chats apply a final edit.
+    /// Close the draft with the complete response. If the stream opened,
+    /// post the final `message` activity — Teams replaces the gray
+    /// streaming bubble with a normal message and drops the status
+    /// history. If it never opened (fast answer, no intermediate
+    /// updates), deliver a plain message.
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -797,28 +836,28 @@ impl Channel for MsTeamsChannel {
     ) -> Result<()> {
         let (_, ctx) = self.send_context(recipient).await?;
         let text = crate::util::strip_tool_call_tags(text);
-        let streaming = self.draft_streams.lock().contains_key(message_id);
-        self.clear_draft_state(recipient, message_id);
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
 
-        if streaming {
-            let body = streaming_activity_body("message", &text, "final", None, Some(message_id));
-            let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
-            Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
-        } else {
-            let body = serde_json::json!({ "type": "message", "text": text });
-            let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(message_id))?;
-            Self::activity_request(&ctx, reqwest::Method::PUT, url, &body).await?;
-        }
+        let body = match self.clear_draft_state(recipient, message_id) {
+            Some(stream_id) => {
+                streaming_activity_body("message", &text, "final", None, Some(&stream_id))
+            }
+            None => serde_json::json!({ "type": "message", "text": text }),
+        };
+        Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
         Ok(())
     }
 
-    /// Best-effort removal of an abandoned draft.
+    /// Best-effort removal of an abandoned draft. Drafts whose stream
+    /// never opened have nothing on the wire to delete.
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
-        self.clear_draft_state(recipient, message_id);
+        let Some(stream_id) = self.clear_draft_state(recipient, message_id) else {
+            return Ok(());
+        };
         let Ok((_, ctx)) = self.send_context(recipient).await else {
             return Ok(());
         };
-        let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(message_id))?;
+        let url = Self::activities_url(&ctx.reference, &ctx.base_id, Some(&stream_id))?;
         let _ =
             Self::activity_request(&ctx, reqwest::Method::DELETE, url, &serde_json::Value::Null)
                 .await;
@@ -1396,9 +1435,11 @@ mod tests {
         );
     }
 
-    /// Full personal-chat streaming sequence: informative open →
-    /// informative progress → streaming content → final message, with a
-    /// consistent streamId and monotonic streamSequence.
+    /// Full personal-chat streaming sequence with lazy open: the draft
+    /// itself hits no network; the first real progress line opens the
+    /// stream (sequence 1, no streamId, no placeholder frame), then
+    /// content chunks and the final message carry the Teams-assigned
+    /// streamId with monotonic streamSequence.
     #[tokio::test]
     async fn personal_streaming_draft_lifecycle() {
         let connector = MockServer::start().await;
@@ -1415,11 +1456,15 @@ mod tests {
         record_reference(&ch, &connector, "a:1conv", "personal");
 
         let draft_id = ch
-            .send_draft(&SendMessage::new("", "a:1conv"))
+            .send_draft(&SendMessage::new("...", "a:1conv"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(draft_id, "stream-1");
+        assert_eq!(
+            connector.received_requests().await.unwrap().len(),
+            0,
+            "opening a draft must not hit the network"
+        );
 
         ch.update_draft_progress("a:1conv", &draft_id, "Running tools...")
             .await
@@ -1437,30 +1482,71 @@ mod tests {
             .filter(|r| r.url.path().ends_with("/activities"))
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
-        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies.len(), 3);
 
+        // First visible frame is the real status line, not a placeholder.
         assert_eq!(bodies[0]["type"], "typing");
+        assert_eq!(bodies[0]["text"], "Running tools...");
         assert_eq!(bodies[0]["entities"][0]["streamType"], "informative");
         assert_eq!(bodies[0]["entities"][0]["streamSequence"], 1);
         assert!(bodies[0]["entities"][0].get("streamId").is_none());
 
         assert_eq!(bodies[1]["type"], "typing");
-        assert_eq!(bodies[1]["text"], "Running tools...");
-        assert_eq!(bodies[1]["entities"][0]["streamType"], "informative");
+        assert_eq!(bodies[1]["text"], "Partial answer");
+        assert_eq!(bodies[1]["entities"][0]["streamType"], "streaming");
         assert_eq!(bodies[1]["entities"][0]["streamSequence"], 2);
         assert_eq!(bodies[1]["entities"][0]["streamId"], "stream-1");
 
-        assert_eq!(bodies[2]["type"], "typing");
-        assert_eq!(bodies[2]["text"], "Partial answer");
-        assert_eq!(bodies[2]["entities"][0]["streamType"], "streaming");
-        assert_eq!(bodies[2]["entities"][0]["streamSequence"], 3);
+        assert_eq!(bodies[2]["type"], "message");
+        assert_eq!(bodies[2]["text"], "Final answer");
+        assert_eq!(bodies[2]["entities"][0]["streamType"], "final");
+        assert_eq!(bodies[2]["entities"][0]["streamId"], "stream-1");
 
-        assert_eq!(bodies[3]["type"], "message");
-        assert_eq!(bodies[3]["text"], "Final answer");
-        assert_eq!(bodies[3]["entities"][0]["streamType"], "final");
-        assert_eq!(bodies[3]["entities"][0]["streamId"], "stream-1");
+        assert!(ch.draft_streams.lock().is_empty());
+    }
 
-        // Draft state is gone: another update would use the edit fallback.
+    /// Fast answers that produce no intermediate updates never open a
+    /// stream: finalize delivers one plain message with no streaminfo.
+    #[tokio::test]
+    async fn draft_without_updates_finalizes_as_plain_message() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .and(body_partial_json(
+                serde_json::json!({ "type": "message", "text": "Quick answer" }),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.finalize_draft("a:1conv", &draft_id, "Quick answer", false)
+            .await
+            .unwrap();
+
+        let bodies: Vec<serde_json::Value> = connector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/activities"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        assert!(
+            bodies[0].get("entities").is_none(),
+            "plain delivery must not carry streaminfo: {}",
+            bodies[0]
+        );
         assert!(ch.draft_streams.lock().is_empty());
     }
 
@@ -1515,8 +1601,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Inside the 60s window: both updates short-circuit before the
-        // network.
+        // The first update opens the stream; the second lands inside the
+        // 60s window and short-circuits before the network.
         ch.update_draft("a:1conv", &draft_id, "one").await.unwrap();
         ch.update_draft("a:1conv", &draft_id, "two").await.unwrap();
 
@@ -1527,7 +1613,10 @@ mod tests {
             .iter()
             .filter(|r| r.url.path().ends_with("/activities"))
             .count();
-        assert_eq!(activity_posts, 1, "only the draft open may hit the network");
+        assert_eq!(
+            activity_posts, 1,
+            "only the stream-opening update may hit the network"
+        );
     }
 
     #[tokio::test]
@@ -1556,9 +1645,32 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // Open the stream so there is a wire activity to delete.
+        ch.update_draft("a:1conv", &draft_id, "partial")
+            .await
+            .unwrap();
         ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
         assert!(ch.draft_streams.lock().is_empty());
         assert!(ch.last_draft_update.lock().is_empty());
+    }
+
+    /// Cancelling a draft whose stream never opened has nothing on the
+    /// wire to delete and must not hit the network at all.
+    #[tokio::test]
+    async fn cancel_unopened_draft_makes_no_network_calls() {
+        let connector = MockServer::start().await;
+        let ch = draft_channel(streaming_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("hi", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        ch.cancel_draft("a:1conv", &draft_id).await.unwrap();
+
+        assert!(ch.draft_streams.lock().is_empty());
+        assert!(connector.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

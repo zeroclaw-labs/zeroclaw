@@ -131,12 +131,13 @@ crates/zeroclaw-channels/src/msteams/
 | `self_addressed_mention()` | `<at>BotName</at>` form for the per-channel system prompt |
 | `is_direct_message()` | `conversationType == "personal"` |
 | `health_check()` | true once listener is bound |
-| `supports_draft_updates()` | `true` when `stream_mode != Off` |
-| `send_draft()` | 1:1: open a Teams stream (first informative `typing` activity, returns `streamId`). Group/channel: POST an initial message, return its activity id. |
-| `update_draft_progress()` | 1:1: informative update (`streamType: "informative"`) — this is the gray status text ("thinking…", tool status). Group/channel: no-op or edit. |
-| `update_draft()` | 1:1: content chunk (`streamType: "streaming"`, accumulated text). Group/channel: PUT edit of the initial message. |
-| `finalize_draft()` | 1:1: final `message` activity (`streamType: "final"`) — the gray bubble is replaced by the normal message and the progress text disappears. Group/channel: final PUT edit. |
-| `cancel_draft()` | best-effort delete/edit of the draft |
+| `supports_draft_updates()` | `true` when `stream_mode == Partial` |
+| `supports_draft_updates_for()` | additionally requires a personal (1:1) conversation — group chats and team channels never open drafts (Teams would notify on the placeholder, not the edited answer) |
+| `send_draft()` | register a lazy local draft handle only; **no activity is POSTed** and the orchestrator's placeholder text is dropped. The Teams stream opens on the first real update (mirrors OpenClaw's lazy `HttpStream`), so the gray bubble never flashes "..." |
+| `update_draft_progress()` | informative update (`streamType: "informative"`) — the gray status text ("thinking…", tool status). Opens the stream if it's the draft's first content. |
+| `update_draft()` | content chunk (`streamType: "streaming"`, accumulated text). Opens the stream if it's the draft's first content. |
+| `finalize_draft()` | stream opened: final `message` activity (`streamType: "final"`) — the gray bubble is replaced by the normal message and the progress text disappears. Never opened (fast answer): one plain message. |
+| `cancel_draft()` | best-effort DELETE of the streaming activity; nothing on the wire if the stream never opened |
 | everything else | trait defaults (deferred) |
 
 ### Streaming protocol detail (the gray "thinking" message)
@@ -159,12 +160,12 @@ needed):
 
 Platform constraints, and how we handle them:
 
-- Native streaming is only supported in **one-on-one chats**. In group
-  chats and team channels the channel falls back to message edits
-  (POST initial message, then `PUT
-  {service_url}/v3/conversations/{conv}/activities/{activityId}`),
-  which is also how Telegram/Slack implement the zeroclaw draft
-  pipeline.
+- Native streaming is only supported in **one-on-one chats**. Group
+  chats and team channels don't open drafts at all: they show the
+  ordinary typing indicator and receive one final reply. (A message-edit
+  fallback was tried first; Teams notifies on the initial placeholder
+  and stays silent on the edit that carries the real answer, which is
+  exactly backwards.)
 - Updates are rate-limited (~1/s). `draft_update_interval_ms` defaults
   to `1000`; the orchestrator already throttles draft flushes on this
   interval, so no extra limiter is needed.
