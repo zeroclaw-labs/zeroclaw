@@ -12,6 +12,7 @@ pub mod audit;
 pub mod backend;
 pub mod budget;
 pub mod chunker;
+pub mod classify;
 pub mod conflict;
 pub mod consolidation;
 pub mod decay;
@@ -26,6 +27,7 @@ pub mod lucid;
 pub mod markdown;
 pub mod merge;
 pub mod none;
+pub mod normalize;
 pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
@@ -786,6 +788,42 @@ pub fn create_memory_for_migration(
     )
 }
 
+/// Wrap an agent memory handle in the [`RetrievalPipeline`] decorator.
+///
+/// The decorator makes one hybrid backend-recall call per query. Its only
+/// add-on is an optional in-process hot cache, enabled when `[memory]
+/// retrieval_stages` names `"cache"`. The default carries no `"cache"`, so
+/// activating the decorator does not change default per-agent recall. The
+/// reserved `"fts"` / `"vector"` names and `fts_early_return_score` are inert
+/// until `Memory` exposes distinct FTS and vector operations.
+fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) -> Arc<dyn Memory> {
+    let cache_enabled = config.retrieval_stages.iter().any(|stage| stage == "cache");
+    Arc::new(retrieval::RetrievalPipeline::new(
+        memory,
+        RetrievalConfig {
+            cache_enabled,
+            ..RetrievalConfig::default()
+        },
+    ))
+}
+
+/// Build the per-agent memory wrapper for `agent_alias`.
+///
+/// Wraps the appropriate inner backend with `AgentScopedMemory` (for
+/// SQL- and Qdrant-backed agents — single shared backend, agent_id
+/// column distinguishes rows) or `AgentScopedMarkdownMemory` (for
+/// Markdown-backed agents — per-agent dirs, peer set composed from
+/// the resolved `read_memory_from` allowlist). `NoneMemory` agents
+/// pass through unwrapped.
+///
+/// The scoped handle is then wrapped in the [`RetrievalPipeline`] decorator
+/// (outermost), so per-turn injection recall and memory tools share one
+/// `Memory` contract. `NoneMemory` agents skip the decorator.
+///
+/// Cross-backend allowlist entries are rejected at config load, so by
+/// the time we get here every entry on
+/// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
+/// at a sibling on the same backend kind.
 pub async fn create_memory_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -797,6 +835,34 @@ pub async fn create_memory_for_agent(
         .get(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     let backend_kind = agent_cfg.memory.backend;
+
+    // Typed-memory producers are SQLite-only. Config::validate already
+    // rejects this combination on every save path, but boot is
+    // deliberately validation-resilient (a hand-edited config still
+    // starts the daemon so the operator can repair it via /config), so
+    // enforce again here: failing agent-memory construction is an
+    // operator-visible startup error and keeps background consolidation
+    // from ever running typed writes into a backend that would reject
+    // them deep inside spawned work.
+    if config.memory.types.enabled || config.memory.consolidation_extract_facts {
+        let flag = if config.memory.types.enabled {
+            "memory.types.enabled"
+        } else {
+            "memory.consolidation_extract_facts"
+        };
+        let global_kind = backend_kind_from_dotted(&config.memory.backend);
+        if global_kind != "sqlite" {
+            anyhow::bail!(
+                "{flag} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
+                config.memory.backend
+            );
+        }
+        if !matches!(backend_kind, ConfigBackend::Sqlite) {
+            anyhow::bail!(
+                "{flag} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{agent_alias}.memory.backend = {backend_kind:?}"
+            );
+        }
+    }
 
     // Markdown branch: the wrapper composes per-agent dirs, not a
     // shared backend. Skip the inner-backend factory entirely.
@@ -820,11 +886,12 @@ pub async fn create_memory_for_agent(
         // default-off passes it through untouched (byte-identical). The
         // audit db is rooted at the install `data_dir` (shared across
         // agents), mirroring how the SQL/Qdrant/Lucid arms compose it.
-        return Ok(Arc::from(wrap_audit(
+        let audited: Arc<dyn Memory> = Arc::from(wrap_audit(
             scoped,
             &config.data_dir,
             config.memory.audit_enabled,
-        )?));
+        )?);
+        return Ok(wrap_in_retrieval_pipeline(audited, &config.memory));
     }
 
     // None branch: nothing to scope, no agents-table lookup needed. Still
@@ -858,7 +925,7 @@ pub async fn create_memory_for_agent(
     }
 
     let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
-    Ok(Arc::new(scoped))
+    Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory))
 }
 
 /// Factory: create an optional response cache from config.
@@ -1300,6 +1367,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stores, 1, "none-backed agent store attempt must be audited");
+    }
+
+    /// Boot is validation-resilient (a hand-edited config that fails
+    /// `Config::validate` still starts the daemon), so the SQLite-only
+    /// typed-memory boundary must ALSO hold at agent-memory construction:
+    /// the last chokepoint before background consolidation could produce
+    /// typed writes into a backend that rejects them.
+    #[tokio::test]
+    async fn create_memory_for_agent_rejects_typed_flags_on_non_sqlite_backend() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.types.enabled = true;
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let err = match create_memory_for_agent(&cfg, "scribe", None).await {
+            Ok(_) => panic!("typed flags with a non-sqlite agent backend must fail startup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("SQLite-only"),
+            "expected the SQLite-only boundary in the error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_memory_for_agent_allows_typed_flags_on_sqlite() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let install_root = tmp.path();
+        let mut cfg = Config {
+            data_dir: install_root.join("data"),
+            config_path: install_root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.types.enabled = true;
+        cfg.memory.consolidation_extract_facts = true;
+        cfg.agents.insert(
+            "scribe".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Sqlite,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        create_memory_for_agent(&cfg, "scribe", None)
+            .await
+            .expect("typed flags on the default sqlite backend must construct");
     }
 
     #[test]
@@ -2009,5 +2143,128 @@ mod tests {
         assert_eq!(value["severity_text"], "WARN");
         assert_eq!(value["attributes"]["provider_ref"], "custom.myembed");
         assert_eq!(value["attributes"]["provider_kind"], "custom");
+    }
+
+    // -- create_memory_for_agent x retrieval pipeline --------------
+
+    fn agent_config(tmp: &TempDir) -> zeroclaw_config::schema::Config {
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..zeroclaw_config::schema::Config::default()
+        }
+    }
+
+    /// The agent factory wraps the scoped handle in the retrieval decorator
+    /// without introducing a handle-local cache over the shared store.
+    #[tokio::test]
+    async fn create_memory_for_agent_keeps_cross_handle_reads_coherent() {
+        let tmp = TempDir::new().unwrap();
+        let config = agent_config(&tmp);
+
+        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+
+        handle_a
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let first = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(first.len(), 1, "seed row must be recallable");
+
+        handle_b
+            .store("k2", "second fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let fresh_after_sibling_write =
+            handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            fresh_after_sibling_write.len(),
+            2,
+            "a sibling write must be visible through an existing handle"
+        );
+
+        handle_a
+            .store("k3", "third fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let fresh = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(fresh.len(), 3, "the decorator must preserve direct recall");
+    }
+
+    /// The reserved `"fts"` / `"vector"` stage names do not enable caching, so
+    /// recall stays coherent across handles exactly like the default.
+    #[tokio::test]
+    async fn factory_reserved_stages_do_not_cache() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.memory.retrieval_stages = vec!["fts".to_string(), "vector".to_string()];
+
+        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+
+        handle_a
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_a
+                .recall("fact", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        handle_b
+            .store("k2", "second fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let after = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "reserved stages must not cache; a sibling write stays visible"
+        );
+    }
+
+    /// Opting the hot cache in via `retrieval_stages = ["cache"]` keeps a
+    /// handle coherent with its own writes (a mutation invalidates the cache).
+    #[tokio::test]
+    async fn factory_optin_cache_reflects_own_writes() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.memory.retrieval_stages = vec!["cache".to_string()];
+
+        let handle = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        handle
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .recall("fact", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        handle
+            .store("k2", "second fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let after = handle.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "a handle must see its own writes even with the cache on"
+        );
     }
 }
