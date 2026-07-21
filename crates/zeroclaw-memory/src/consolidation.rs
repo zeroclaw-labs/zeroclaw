@@ -83,16 +83,33 @@ pub async fn consolidate_turn(
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
 
     // Phase 1: Write history entry to Daily category.
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
-    memory
-        .store(
-            &history_key,
+    //
+    // Gated two ways, independently of the Phase-2 Core dedup (which is
+    // governed by `dedup_on_write`):
+    //   - `consolidate_daily = false` disables the per-turn Daily write
+    //     entirely (Core fact extraction below still runs).
+    //   - `daily_dedup = true` (default) skips the write when an exact or
+    //     near-identical Daily summary already exists, so ordinary question
+    //     turns do not accumulate near-duplicate transient rows on an
+    //     append-only backend.
+    //
+    // In-turn cross-path skip: when THIS turn also produces a Core
+    // `memory_update` and the Daily `history_entry` is a near-identical
+    // paraphrase of it (same fact, different wording), skip the redundant
+    // Daily write and keep only the durable Core row. There was no
+    // cross-category dedup before, so such a fact was stored as both a #core
+    // and a #daily row and surfaced twice at recall. Gated by the existing
+    // `daily_dedup` switch and `dedup_jaccard_threshold`; a Daily-only turn
+    // (no Core update) still writes as before.
+    if memory_config.consolidate_daily {
+        maybe_write_daily_history(
+            memory,
+            memory_config,
             &result.history_entry,
-            MemoryCategory::Daily,
-            None,
+            result.memory_update.as_deref(),
         )
         .await?;
+    }
 
     // Phase 2: Write memory update to Core category (if present).
     if let Some(ref update) = result.memory_update
@@ -202,6 +219,84 @@ pub async fn consolidate_turn(
     Ok(())
 }
 
+/// Decide whether to write this turn's Daily history entry, applying the in-turn
+/// cross-path skip before delegating to [`write_daily_history`].
+///
+/// When this turn also produced a Core `memory_update` and the Daily
+/// `history_entry` says the same thing (near-identical under the existing
+/// Jaccard threshold, gated by `daily_dedup`), the redundant Daily write is
+/// skipped so the fact is not persisted as both a #core and a #daily row. A
+/// Daily-only turn (`core_update = None`) always falls through to the normal
+/// Daily write path.
+async fn maybe_write_daily_history(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    history_entry: &str,
+    core_update: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(update) = core_update
+        && dedup::daily_duplicates_core(history_entry, update, memory_config)
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "skipped per-turn Daily write duplicating this turn's Core fact"
+        );
+        return Ok(());
+    }
+    write_daily_history(memory, memory_config, history_entry).await
+}
+
+/// Write the per-turn Daily history summary, applying the `daily_dedup` gate.
+///
+/// When `daily_dedup` is on (default), recalls recent Daily entries and skips
+/// the write if the incoming summary is an exact or near-identical duplicate
+/// (see [`dedup::should_write_daily`]). A blank summary is always skipped. This
+/// keeps the transient Daily log from accumulating near-duplicate rows on an
+/// append-only backend without touching the Phase-2 Core dedup path.
+async fn write_daily_history(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    history_entry: &str,
+) -> anyhow::Result<()> {
+    if memory_config.daily_dedup {
+        // Recall recent entries similar to this summary; keep only Daily
+        // candidates. Recall failures must not drop the write - fall back to
+        // inserting (fail-open) so a transient recall error never silently
+        // loses history.
+        let candidates = match memory.recall(history_entry, 10, None, None, None).await {
+            Ok(entries) => dedup::daily_candidates(entries),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "daily dedup recall failed; inserting without dedup"
+                );
+                Vec::new()
+            }
+        };
+        match dedup::should_write_daily(&candidates, history_entry, memory_config) {
+            dedup::DailyWrite::Insert => {}
+            dedup::DailyWrite::Skip { dup_of } => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                    "memory consolidation skipped duplicate daily history entry"
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
+    memory
+        .store(&history_key, history_entry, MemoryCategory::Daily, None)
+        .await
+}
+
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
 fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
     // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
@@ -238,6 +333,155 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite::SqliteMemory;
+    use tempfile::TempDir;
+
+    async fn daily_row_count(mem: &SqliteMemory) -> usize {
+        mem.list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_turns_do_not_accumulate_daily_rows() {
+        // With the default gate (daily_dedup on), writing the same summary
+        // several times must leave exactly one Daily row.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+        assert!(cfg.daily_dedup);
+
+        for _ in 0..4 {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            1,
+            "identical turn summaries must be deduplicated to a single Daily row"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_off_writes_every_turn() {
+        // daily_dedup off restores the old unconditional-append behavior.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            daily_dedup: false,
+            ..MemoryConfig::default()
+        };
+
+        for _ in 0..3 {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(daily_row_count(&mem).await, 3);
+    }
+
+    #[tokio::test]
+    async fn consolidate_daily_off_writes_no_daily_row() {
+        // The top-level toggle skips the Daily write entirely. Mirror the
+        // gate consolidate_turn applies (it calls write_daily_history only when
+        // consolidate_daily is true).
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            consolidate_daily: false,
+            ..MemoryConfig::default()
+        };
+
+        if cfg.consolidate_daily {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(daily_row_count(&mem).await, 0);
+    }
+
+    #[tokio::test]
+    async fn novel_summaries_still_write_distinct_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+
+        write_daily_history(&mem, &cfg, "User asked what time it is")
+            .await
+            .unwrap();
+        write_daily_history(&mem, &cfg, "User configured a Postgres memory backend")
+            .await
+            .unwrap();
+
+        assert_eq!(daily_row_count(&mem).await, 2);
+    }
+
+    #[tokio::test]
+    async fn daily_skipped_when_it_duplicates_this_turns_core_fact() {
+        // Turn produces a Core memory_update AND a near-identical Daily
+        // history_entry (same fact, reworded). The Daily write must be skipped
+        // so the fact is not stored as both a #core and a #daily row.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+        assert!(cfg.daily_dedup);
+
+        let core = "relative_a is user_a's mentor and advisor to user_b and user_c";
+        let daily = "relative_a is user_a's mentor and also advisor to user_b and user_c";
+        maybe_write_daily_history(&mem, &cfg, daily, Some(core))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            0,
+            "Daily write must be skipped when it duplicates this turn's Core fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_written_when_core_fact_is_unrelated() {
+        // Same turn has a Core fact and an UNRELATED Daily summary: the Daily
+        // timeline must still record the independent info.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+
+        maybe_write_daily_history(
+            &mem,
+            &cfg,
+            "User asked what the weather is like today",
+            Some("user_a prefers the metric system for unit conversions"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            1,
+            "an unrelated Daily summary must still be written alongside the Core fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_only_turn_still_writes() {
+        // No Core memory_update this turn (Daily-only): the Daily write happens
+        // exactly as before.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+
+        maybe_write_daily_history(&mem, &cfg, "User asked what time it is", None)
+            .await
+            .unwrap();
+
+        assert_eq!(daily_row_count(&mem).await, 1);
+    }
 
     #[test]
     fn parse_valid_json_response() {

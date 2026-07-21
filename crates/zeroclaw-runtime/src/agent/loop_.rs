@@ -940,7 +940,14 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
+    let mut has_memory_recall = false;
+    let mut has_memory_store = false;
     for tool in tools {
+        match tool.name() {
+            "memory_recall" => has_memory_recall = true,
+            "memory_store" => has_memory_store = true,
+            _ => {}
+        }
         let desc = tool.description();
         let _ = writeln!(
             instructions,
@@ -949,6 +956,36 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
             desc,
             tool.parameters_schema()
         );
+    }
+
+    // Memory-usage guidance: relevant memories are already injected into the
+    // prompt each turn ([Memory context]) and each turn's facts are persisted
+    // automatically after the reply, so the model should not reflexively call
+    // memory_recall / memory_store every turn. Those redundant calls each add a
+    // full sequential model round (measured 3-8s/turn). Only emitted when the
+    // relevant tools are actually present, so gating them off removes the hint
+    // too. Explicit "remember this" and targeted lookups still work.
+    if has_memory_recall || has_memory_store {
+        instructions.push_str("### Memory usage\n\n");
+        instructions.push_str(
+            "Relevant long-term memories are ALREADY injected into your context each turn \
+             (look for the `[Memory context]` block), and the facts from each turn are saved \
+             automatically after you reply. Therefore:\n",
+        );
+        if has_memory_store {
+            instructions.push_str(
+                "- Do NOT call `memory_store` to save the current turn; it is redundant. Call it \
+                 ONLY when the user explicitly asks you to remember something (\"remember that …\").\n",
+            );
+        }
+        if has_memory_recall {
+            instructions.push_str(
+                "- Do NOT call `memory_recall` for context that is already in the injected \
+                 `[Memory context]`. Use it only for a targeted lookup of something specific that \
+                 is not already present.\n",
+            );
+        }
+        instructions.push('\n');
     }
 
     instructions
@@ -1827,7 +1864,9 @@ pub async fn run(
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
                                     cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                                        limit: config.effective_memory_recall_limit(agent_alias),
                                         min_relevance_score: config.memory.min_relevance_score,
+                                        max_entries: config.effective_memory_inject_max_entries(),
                                         ..Default::default()
                                     },
                                 }),
@@ -2370,7 +2409,11 @@ pub async fn run(
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
                                         cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                                            limit: config
+                                                .effective_memory_recall_limit(agent_alias),
                                             min_relevance_score: config.memory.min_relevance_score,
+                                            max_entries: config
+                                                .effective_memory_inject_max_entries(),
                                             ..Default::default()
                                         },
                                     }),
@@ -3184,7 +3227,9 @@ pub async fn process_message(
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
                         cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                            limit: config.effective_memory_recall_limit(agent_alias),
                             min_relevance_score: config.memory.min_relevance_score,
+                            max_entries: config.effective_memory_inject_max_entries(),
                             ..Default::default()
                         },
                     }),
