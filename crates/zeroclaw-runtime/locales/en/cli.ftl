@@ -84,6 +84,8 @@ cli-skills-install-skill-not-in-catalog-empty = skill '{$skill}' not found in {$
 cli-skills-install-skill-not-in-catalog =
     skill '{$skill}' not found in {$url}.
     Available skills: {$available}
+cli-skills-install-catalog-root-symlink = skill catalog {$url} has a symlinked skills/ directory; refusing to inspect it
+cli-skills-install-catalog-root-escapes = skill catalog {$url} has a skills/ directory that resolves outside the cloned catalog; refusing to inspect it
 cli-skills-install-catalog-skill-symlink = skill '{$skill}' in {$url} is a symlink; catalog skills must be real directories inside the repository
 cli-skills-install-catalog-skill-escapes = skill '{$skill}' in {$url} resolves outside the cloned catalog; refusing to install
 cli-skills-install-git-failed = failed to install git skill source: {$source}

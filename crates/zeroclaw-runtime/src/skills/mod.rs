@@ -2280,6 +2280,21 @@ fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
     names
 }
 
+/// List real directory entries under an already-contained catalog `skills/`
+/// root without following entry symlinks.
+fn list_contained_catalog_skill_names(skills_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(skills_root) else {
+        return vec![];
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Install a single skill by name from a git catalog repository.
 ///
 /// Clones `url` into a throwaway directory, resolves `skills/<skill_name>/`
@@ -2316,9 +2331,108 @@ pub fn install_git_catalog_skill_source(
     })?;
 
     let result = (|| {
-        let skill_dir = clone_dir.join("skills").join(skill_name);
-        if !skill_dir.is_dir() {
-            let available = list_registry_skill_names(&clone_dir);
+        // Establish the catalog trust boundary before looking up a selected
+        // name or enumerating available names. A catalog controls `skills/`,
+        // so following it before this check could inspect an arbitrary host
+        // directory even when the requested skill does not exist.
+        let clone_root = clone_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize catalog clone {}",
+                clone_dir.display()
+            )
+        })?;
+        let skills_dir = clone_dir.join("skills");
+        let skills_meta = match std::fs::symlink_metadata(&skills_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog-empty",
+                    &[("skill", skill_name), ("url", url)]
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read metadata for catalog skills root {}",
+                        skills_dir.display()
+                    )
+                });
+            }
+        };
+        if skills_meta.file_type().is_symlink() {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-root-symlink",
+                &[("url", url)]
+            ));
+        }
+        let skills_root = skills_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize catalog skills root {}",
+                skills_dir.display()
+            )
+        })?;
+        if !skills_root.starts_with(&clone_root) {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-root-escapes",
+                &[("url", url)]
+            ));
+        }
+        if !skills_root.is_dir() {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-skill-not-in-catalog-empty",
+                &[("skill", skill_name), ("url", url)]
+            ));
+        }
+
+        let skill_dir = skills_root.join(skill_name);
+        let entry_meta = match std::fs::symlink_metadata(&skill_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let available = list_contained_catalog_skill_names(&skills_root);
+                if available.is_empty() {
+                    anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                        "cli-skills-install-skill-not-in-catalog-empty",
+                        &[("skill", skill_name), ("url", url)]
+                    ));
+                }
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog",
+                    &[
+                        ("skill", skill_name),
+                        ("url", url),
+                        ("available", &available.join(", ")),
+                    ]
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read metadata for selected catalog skill {}",
+                        skill_dir.display()
+                    )
+                });
+            }
+        };
+        if entry_meta.file_type().is_symlink() {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-skill-symlink",
+                &[("skill", skill_name), ("url", url)]
+            ));
+        }
+        let selected = skill_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize selected skill {}",
+                skill_dir.display()
+            )
+        })?;
+        if !selected.starts_with(&skills_root) {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-skill-escapes",
+                &[("skill", skill_name), ("url", url)]
+            ));
+        }
+        if !selected.is_dir() {
+            let available = list_contained_catalog_skill_names(&skills_root);
             if available.is_empty() {
                 anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
                     "cli-skills-install-skill-not-in-catalog-empty",
@@ -2334,47 +2448,12 @@ pub fn install_git_catalog_skill_source(
                 ]
             ));
         }
-        // Containment: the selected `skills/<name>` entry must be a real
-        // directory that lives inside our transient clone — not a symlink the
-        // catalog committed to escape it. `is_dir()` above follows symlinks,
-        // and `install_local_skill_source` canonicalizes its source before
-        // auditing or copying, which would resolve such a symlink to an
-        // out-of-clone target and then walk/copy it. Reject a symlinked entry
-        // *before* that canonicalize, then confirm the canonicalized selection
-        // is still contained by the clone (this also catches a symlinked
-        // `skills/` directory, where the final component is not itself a link).
-        let entry_meta = std::fs::symlink_metadata(&skill_dir)
-            .with_context(|| format!("failed to read metadata for {}", skill_dir.display()))?;
-        if entry_meta.file_type().is_symlink() {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-catalog-skill-symlink",
-                &[("skill", skill_name), ("url", url)]
-            ));
-        }
-        let clone_root = clone_dir.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize catalog clone {}",
-                clone_dir.display()
-            )
-        })?;
-        let selected = skill_dir.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize selected skill {}",
-                skill_dir.display()
-            )
-        })?;
-        if !selected.starts_with(&clone_root) {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-catalog-skill-escapes",
-                &[("skill", skill_name), ("url", url)]
-            ));
-        }
         // i18n-exempt: internal invariant — the clone path is our own ASCII
         // `.skill-catalog-<hex>` scratch dir, so this only fires on a broken
         // host filesystem; it is a developer diagnostic, not normal CLI output.
-        let skill_dir_str = skill_dir
+        let skill_dir_str = selected
             .to_str()
-            .with_context(|| format!("skill path is not valid UTF-8: {}", skill_dir.display()))?;
+            .with_context(|| format!("skill path is not valid UTF-8: {}", selected.display()))?;
         install_local_skill_source(skill_dir_str, skills_path, allow_scripts)
     })();
 
@@ -3116,6 +3195,81 @@ mod registry_tests {
             .filter_map(|e| e.ok())
             .any(|e| {
                 e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_missing_skill_rejects_symlinked_skills_root_before_enumeration() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external-skills");
+        let external_entry = external.join("external-private-name");
+        std::fs::create_dir_all(&external_entry).unwrap();
+        let external_manifest = external_entry.join("SKILL.md");
+        let external_contents =
+            "---\nname: external-private-name\ndescription: outside the catalog\n---\n";
+        std::fs::write(&external_manifest, external_contents).unwrap();
+
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&external, catalog.join("skills")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&catalog)
+            .output()
+            .expect("git init");
+        git_commit_all(&catalog, "symlink skills root out of the repo");
+
+        let skills_path = tmp.path().join("dest-skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "missing-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a symlinked catalog skills root must be rejected before enumeration");
+        let message = err.to_string();
+        assert!(message.contains("symlink"), "got: {message}");
+        assert!(
+            !message.contains("external-private-name"),
+            "external entry names must not be enumerated; got: {message}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&skills_path).unwrap().count(),
+            0,
+            "nothing may be installed after rejecting the catalog root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external_manifest).unwrap(),
+            external_contents,
+            "the external target must remain untouched"
+        );
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
                     .to_string_lossy()
                     .starts_with(".skill-catalog-")
             });
