@@ -82,124 +82,268 @@ pub async fn consolidate_turn(
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
 
-    // Phase 1: Write history entry to Daily category.
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
+    // Ordering (fixes the "Daily lost on Core reject/fail" regression): the Core
+    // write runs FIRST, and its outcome decides whether the redundant Daily
+    // write is suppressed. Previously Daily was written (or cross-path-skipped)
+    // in Phase 1 BEFORE Core had passed policy validation, dedup, conflict
+    // resolution, and persistence, so a rejected or failing Core turn lost BOTH
+    // the Daily row and the durable Core row. Now the same-turn Daily row is
+    // suppressed ONLY when the matching Core fact is confirmed durable; on any
+    // unsuccessful Core outcome (policy reject, dedup reject, store error) the
+    // Daily history is still written so the turn is never silently dropped.
+    //
+    // Phase 1: Write memory update to Core category (if present). The result is
+    // captured but NOT propagated yet: an unsuccessful Core outcome (policy
+    // rejection or store failure surfaced as `Err`) must still let the Daily
+    // history be written below before the error is returned, so a failing Core
+    // never silently drops the turn's Daily record.
+    let core_result =
+        write_core_update(memory, memory_config, result.memory_update.as_deref()).await;
+    // Core is treated as durable ONLY on an explicit `Ok(true)` (fresh insert,
+    // merge into a survivor, or a dedup reject where an equivalent Core row
+    // already exists). A rejection/failure (`Err`) or a no-op (`Ok(false)`)
+    // leaves `core_durable = false`, so the Daily row is preserved.
+    let core_durable = matches!(core_result, Ok(true));
+
+    // Phase 2: Write the per-turn Daily history entry (if enabled).
+    //
+    //   - `consolidate_daily = false` disables the per-turn Daily write
+    //     entirely (Core extraction above still ran).
+    //   - When this turn produced a durable Core fact AND the Daily
+    //     `history_entry` is a near-identical paraphrase of it (same fact,
+    //     different wording), skip the redundant Daily write so the fact is not
+    //     stored as both a #core and a #daily row. This cross-path skip is
+    //     applied ONLY on a durable Core outcome; if Core was rejected or failed
+    //     the Daily row is preserved as the turn's only record.
+    //   - `daily_dedup` (opt-in) additionally skips a Daily write that
+    //     duplicates a recent PRIVATE Daily row.
+    if memory_config.consolidate_daily {
+        // Only offer the Core fact as a cross-path suppression key when it
+        // actually became durable; otherwise pass None so the Daily row is kept.
+        let core_for_skip = if core_durable {
+            result.memory_update.as_deref()
+        } else {
+            None
+        };
+        maybe_write_daily_history(memory, memory_config, &result.history_entry, core_for_skip)
+            .await?;
+    }
+
+    // Now surface any Core rejection/failure. The Daily history has already been
+    // preserved above, satisfying "write Daily on any unsuccessful Core
+    // outcome" while keeping the Core write-gate fail-closed.
+    core_result.map(|_| ())
+}
+
+/// Run the Core-category write phase for this turn's `memory_update` and report
+/// whether a matching Core row became durable.
+///
+/// Returns `Ok(true)` only when a Core row for this fact is persisted (inserted
+/// or merged into a survivor). A policy rejection propagates as `Err` (the turn
+/// fails, preserving the previous fail-closed behavior); a dedup rejection or an
+/// absent/empty update returns `Ok(false)` so the caller keeps the Daily row.
+async fn write_core_update(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    memory_update: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(update) = memory_update else {
+        return Ok(false);
+    };
+    if update.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let mem_key = format!("core_{}", uuid::Uuid::new_v4());
+
+    // Compute importance score heuristically.
+    let imp = importance::compute_importance(update, &MemoryCategory::Core);
+
+    // A: fail-closed policy write-gate on the autonomous consolidation path.
+    let policy = PolicyEnforcer::new(&memory_config.policy);
+    if let Err(e) =
+        policy_gate::validate_store(memory, &policy, "default", &MemoryCategory::Core).await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+            "memory consolidation write denied by policy"
+        );
+        anyhow::bail!("memory consolidation write denied by policy: {e}");
+    }
+
+    // A: write-time near-duplicate detection.
+    let candidates = memory.recall(update, 10, None, None, None).await?;
+    let candidates = dedup::core_candidates(candidates);
+    match dedup::dedup_gate(&candidates, update, memory_config) {
+        DedupAction::Insert => {}
+        DedupAction::Reject { dup_of } => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                "memory consolidation skipped duplicate core update"
+            );
+            // A dedup reject means an equivalent Core fact ALREADY exists and is
+            // durable, so the same-turn Daily paraphrase is still redundant.
+            return Ok(true);
+        }
+        DedupAction::Merge { into } => {
+            if let Some(survivor) = candidates.iter().find(|entry| entry.id == into) {
+                let merged = merge::merge_into_survivor(survivor, update);
+                let options = StoreOptions {
+                    namespace: Some(survivor.namespace.clone()),
+                    importance: merged.importance,
+                    ..StoreOptions::default()
+                };
+                memory
+                    .store_with_options(
+                        &survivor.key,
+                        &merged.content,
+                        MemoryCategory::Core,
+                        survivor.session_id.as_deref(),
+                        options,
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        }
+    }
+
+    // A: detect conflicts, store, then reversibly supersede the losers.
+    let superseded_ids = match conflict::check_and_resolve_conflicts(
+        memory,
+        &mem_key,
+        update,
+        &MemoryCategory::Core,
+        memory_config.conflict_threshold,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "conflict check skipped"
+            );
+            Vec::new()
+        }
+    };
+
+    // Store with importance metadata. A store error propagates as `Err` (the
+    // turn fails) BEFORE the caller writes Daily, so a failed Core never
+    // suppresses the Daily row.
+    let options = StoreOptions {
+        importance: Some(imp),
+        ..StoreOptions::default()
+    };
     memory
-        .store(
-            &history_key,
-            &result.history_entry,
-            MemoryCategory::Daily,
-            None,
-        )
+        .store_with_options(&mem_key, update, MemoryCategory::Core, None, options)
         .await?;
 
-    // Phase 2: Write memory update to Core category (if present).
-    if let Some(ref update) = result.memory_update
-        && !update.trim().is_empty()
+    // A: reversible soft-hide of superseded rows (gated, default-on).
+    if memory_config.conflict_supersede_enabled
+        && let Err(e) = memory.supersede(&superseded_ids, &mem_key).await
     {
-        let mem_key = format!("core_{}", uuid::Uuid::new_v4());
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "memory supersede skipped"
+        );
+    }
 
-        // Compute importance score heuristically.
-        let imp = importance::compute_importance(update, &MemoryCategory::Core);
+    Ok(true)
+}
 
-        // A: fail-closed policy write-gate on the autonomous consolidation path.
-        let policy = PolicyEnforcer::new(&memory_config.policy);
-        if let Err(e) =
-            policy_gate::validate_store(memory, &policy, "default", &MemoryCategory::Core).await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "memory consolidation write denied by policy"
-            );
-            anyhow::bail!("memory consolidation write denied by policy: {e}");
-        }
+/// Decide whether to write this turn's Daily history entry, applying the in-turn
+/// cross-path skip before delegating to [`write_daily_history`].
+///
+/// When this turn also produced a Core `memory_update` and the Daily
+/// `history_entry` says the same thing (near-identical under the existing
+/// Jaccard threshold, gated by `daily_dedup`), the redundant Daily write is
+/// skipped so the fact is not persisted as both a #core and a #daily row. A
+/// Daily-only turn (`core_update = None`) always falls through to the normal
+/// Daily write path.
+async fn maybe_write_daily_history(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    history_entry: &str,
+    core_update: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(update) = core_update
+        && dedup::daily_duplicates_core(history_entry, update, memory_config)
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "skipped per-turn Daily write duplicating this turn's Core fact"
+        );
+        return Ok(());
+    }
+    write_daily_history(memory, memory_config, history_entry).await
+}
 
-        // A: write-time near-duplicate detection.
-        let candidates = memory.recall(update, 10, None, None, None).await?;
-        let candidates = dedup::core_candidates(candidates);
-        match dedup::dedup_gate(&candidates, update, memory_config) {
-            DedupAction::Insert => {}
-            DedupAction::Reject { dup_of } => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
-                    "memory consolidation skipped duplicate core update"
-                );
-                return Ok(());
-            }
-            DedupAction::Merge { into } => {
-                if let Some(survivor) = candidates.iter().find(|entry| entry.id == into) {
-                    let merged = merge::merge_into_survivor(survivor, update);
-                    let options = StoreOptions {
-                        namespace: Some(survivor.namespace.clone()),
-                        importance: merged.importance,
-                        ..StoreOptions::default()
-                    };
-                    memory
-                        .store_with_options(
-                            &survivor.key,
-                            &merged.content,
-                            MemoryCategory::Core,
-                            survivor.session_id.as_deref(),
-                            options,
-                        )
-                        .await?;
-                    return Ok(());
-                }
-            }
-        }
-
-        // A: detect conflicts, store, then reversibly supersede the losers.
-        let superseded_ids = match conflict::check_and_resolve_conflicts(
-            memory,
-            &mem_key,
-            update,
-            &MemoryCategory::Core,
-            memory_config.conflict_threshold,
-        )
-        .await
-        {
-            Ok(ids) => ids,
+/// Write the per-turn Daily history summary, applying the `daily_dedup` gate.
+///
+/// When `daily_dedup` is on (default), recalls recent Daily entries and skips
+/// the write if the incoming summary is an exact or near-identical duplicate
+/// (see [`dedup::should_write_daily`]). A blank summary is always skipped. This
+/// keeps the transient Daily log from accumulating near-duplicate rows on an
+/// append-only backend without touching the Phase-2 Core dedup path.
+async fn write_daily_history(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    history_entry: &str,
+) -> anyhow::Result<()> {
+    if memory_config.daily_dedup {
+        // Candidate lookup for the Daily dedup gate: read THIS agent's OWN
+        // PRIVATE Daily rows, scoped BEFORE any limit. Previously this used
+        // `recall(history_entry, 10, ...)` then filtered to Daily, which on
+        // hindsight merges private+shared+system and truncates the merged result
+        // FIRST - so a shared/system Daily row could suppress this agent's
+        // private history, and unrelated categories could crowd the real private
+        // duplicate out of the top ten. `list_own_daily_history` returns only
+        // the private, Daily-scoped rows (single-store backends keep the old
+        // `list(Daily)` behavior via the trait default). Lookup failures must
+        // not drop the write - fall back to inserting (fail-open) so a transient
+        // error never silently loses history.
+        let candidates = match memory.list_own_daily_history().await {
+            Ok(entries) => dedup::daily_candidates(entries),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "conflict check skipped"
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "daily dedup candidate lookup failed; inserting without dedup"
                 );
                 Vec::new()
             }
         };
-
-        // Store with importance metadata.
-        let options = StoreOptions {
-            importance: Some(imp),
-            ..StoreOptions::default()
-        };
-        memory
-            .store_with_options(&mem_key, update, MemoryCategory::Core, None, options)
-            .await?;
-
-        // A: reversible soft-hide of superseded rows (gated, default-on).
-        if memory_config.conflict_supersede_enabled
-            && let Err(e) = memory.supersede(&superseded_ids, &mem_key).await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "memory supersede skipped"
-            );
+        match dedup::should_write_daily(&candidates, history_entry, memory_config) {
+            dedup::DailyWrite::Insert => {}
+            dedup::DailyWrite::Skip { dup_of } => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                    "memory consolidation skipped duplicate daily history entry"
+                );
+                return Ok(());
+            }
         }
     }
 
-    Ok(())
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
+    memory
+        .store(&history_key, history_entry, MemoryCategory::Daily, None)
+        .await
 }
 
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
@@ -238,6 +382,164 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite::SqliteMemory;
+    use tempfile::TempDir;
+
+    async fn daily_row_count(mem: &SqliteMemory) -> usize {
+        mem.list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_turns_do_not_accumulate_daily_rows() {
+        // daily_dedup is opt-in (default off); with it explicitly enabled,
+        // writing the same summary several times must leave exactly one Daily row.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            daily_dedup: true,
+            ..MemoryConfig::default()
+        };
+
+        for _ in 0..4 {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            1,
+            "identical turn summaries must be deduplicated to a single Daily row"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_off_writes_every_turn() {
+        // daily_dedup off restores the old unconditional-append behavior.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            daily_dedup: false,
+            ..MemoryConfig::default()
+        };
+
+        for _ in 0..3 {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(daily_row_count(&mem).await, 3);
+    }
+
+    #[tokio::test]
+    async fn consolidate_daily_off_writes_no_daily_row() {
+        // The top-level toggle skips the Daily write entirely. Mirror the
+        // gate consolidate_turn applies (it calls write_daily_history only when
+        // consolidate_daily is true).
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            consolidate_daily: false,
+            ..MemoryConfig::default()
+        };
+
+        if cfg.consolidate_daily {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(daily_row_count(&mem).await, 0);
+    }
+
+    #[tokio::test]
+    async fn novel_summaries_still_write_distinct_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+
+        write_daily_history(&mem, &cfg, "User asked what time it is")
+            .await
+            .unwrap();
+        write_daily_history(&mem, &cfg, "User configured a Postgres memory backend")
+            .await
+            .unwrap();
+
+        assert_eq!(daily_row_count(&mem).await, 2);
+    }
+
+    #[tokio::test]
+    async fn daily_skipped_when_it_duplicates_this_turns_core_fact() {
+        // Turn produces a Core memory_update AND a near-identical Daily
+        // history_entry (same fact, reworded). The Daily write must be skipped
+        // so the fact is not stored as both a #core and a #daily row.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            daily_dedup: true,
+            ..MemoryConfig::default()
+        };
+
+        let core = "relative_a is user_a's mentor and advisor to user_b and user_c";
+        let daily = "relative_a is user_a's mentor and also advisor to user_b and user_c";
+        maybe_write_daily_history(&mem, &cfg, daily, Some(core))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            0,
+            "Daily write must be skipped when it duplicates this turn's Core fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_written_when_core_fact_is_unrelated() {
+        // Same turn has a Core fact and an UNRELATED Daily summary: the Daily
+        // timeline must still record the independent info.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        // Enable the gate explicitly so this exercises the "unrelated" branch
+        // rather than trivially passing via the default-off short circuit.
+        let cfg = MemoryConfig {
+            daily_dedup: true,
+            ..MemoryConfig::default()
+        };
+
+        maybe_write_daily_history(
+            &mem,
+            &cfg,
+            "User asked what the weather is like today",
+            Some("user_a prefers the metric system for unit conversions"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            1,
+            "an unrelated Daily summary must still be written alongside the Core fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_only_turn_still_writes() {
+        // No Core memory_update this turn (Daily-only): the Daily write happens
+        // exactly as before.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+
+        maybe_write_daily_history(&mem, &cfg, "User asked what time it is", None)
+            .await
+            .unwrap();
+
+        assert_eq!(daily_row_count(&mem).await, 1);
+    }
 
     #[test]
     fn parse_valid_json_response() {
@@ -666,6 +968,10 @@ mod consolidate_turn_tests {
 
     #[tokio::test]
     async fn policy_gate_rejection_bails_the_core_write() {
+        // Regression for the S4 review blocker "Daily-after-Core-durable":
+        // Core runs FIRST; a policy REJECTION means `core_durable = false`, so
+        // the Daily row for this turn is written (not cross-path-skipped) and
+        // the turn is never silently dropped even though Core failed.
         let tmp = TempDir::new().unwrap();
         let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
 
@@ -681,12 +987,189 @@ mod consolidate_turn_tests {
         assert_eq!(
             count(&memory, MemoryCategory::Daily).await,
             1,
-            "the history entry precedes the gate and is kept"
+            "Core policy rejection must not drop the Daily row for this turn"
         );
         assert_eq!(
             count(&memory, MemoryCategory::Core).await,
             0,
             "the gated core write never lands"
+        );
+    }
+
+    /// A `Memory` wrapper around `SqliteMemory` that makes every Core-category
+    /// `store_with_options` call fail, while delegating every other operation
+    /// (Daily writes, recall, count, etc.) to the inner store unchanged. Used
+    /// to prove the Daily row survives a Core write that fails AFTER policy/
+    /// dedup pass (e.g. a transient backend store error), not only a policy
+    /// rejection.
+    struct CoreStoreFailingMemory {
+        inner: SqliteMemory,
+    }
+
+    impl Attributable for CoreStoreFailingMemory {
+        fn role(&self) -> Role {
+            self.inner.role()
+        }
+        fn alias(&self) -> &str {
+            self.inner.alias()
+        }
+    }
+
+    #[async_trait]
+    impl Memory for CoreStoreFailingMemory {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.store(key, content, category, session_id).await
+        }
+
+        async fn store_with_options(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            options: StoreOptions,
+        ) -> anyhow::Result<()> {
+            if matches!(category, MemoryCategory::Core) {
+                anyhow::bail!("simulated Core store failure");
+            }
+            self.inner
+                .store_with_options(key, content, category, session_id, options)
+                .await
+        }
+
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner
+                .recall(query, limit, session_id, since, until)
+                .await
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            self.inner.get(key).await
+        }
+
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.list(category, session_id).await
+        }
+
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            self.inner.forget(key).await
+        }
+
+        async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+            self.inner.forget_for_agent(key, agent_id).await
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.inner.count().await
+        }
+
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+
+        async fn count_in_scope(
+            &self,
+            namespace: Option<&str>,
+            category: Option<&MemoryCategory>,
+        ) -> anyhow::Result<u64> {
+            self.inner.count_in_scope(namespace, category).await
+        }
+
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            namespace: Option<&str>,
+            importance: Option<f64>,
+            agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .store_with_agent(
+                    key, content, category, session_id, namespace, importance, agent_id,
+                )
+                .await
+        }
+
+        async fn recall_for_agents(
+            &self,
+            allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner
+                .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn core_store_failure_still_preserves_the_daily_row() {
+        // Regression for the S4 review blocker "Daily-after-Core-durable",
+        // FAILING Core path: policy validation and dedup both pass, but the
+        // actual store call fails (e.g. a transient backend error). Ordering
+        // must still preserve the Daily row instead of losing both records.
+        let tmp = TempDir::new().unwrap();
+        let memory = CoreStoreFailingMemory {
+            inner: SqliteMemory::new("sqlite", tmp.path()).unwrap(),
+        };
+        let provider = ScriptedProvider::update_reply("User tracks tasks in a bullet journal.");
+
+        let err = consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &memory,
+            &MemoryConfig::default(),
+            "user message",
+            "assistant response",
+        )
+        .await
+        .expect_err("a failing Core store must surface as an error");
+        assert!(err.to_string().contains("simulated Core store failure"));
+
+        assert_eq!(
+            memory
+                .inner
+                .count_in_scope(None, Some(&MemoryCategory::Daily))
+                .await
+                .unwrap(),
+            1,
+            "a failing Core store must not drop the Daily row for this turn"
+        );
+        assert_eq!(
+            memory
+                .inner
+                .count_in_scope(None, Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            0,
+            "the failed core write never lands"
         );
     }
 

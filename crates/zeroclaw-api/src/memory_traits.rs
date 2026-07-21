@@ -359,6 +359,20 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// List THIS agent's OWN Daily-history rows, scoped to the private store
+    /// BEFORE any limit, for the per-turn Daily dedup gate.
+    ///
+    /// Default: `list(Some(Daily), None)` - correct for single-store backends
+    /// (SQLite/markdown/none) where `list` already returns only this store's
+    /// rows. Backends that MERGE other scopes into ordinary reads (hindsight
+    /// merges the shared/system tiers into `recall`/`list`) MUST override this
+    /// to return only the agent's PRIVATE Daily rows, so a shared/system Daily
+    /// row can never suppress a private Daily write and unrelated categories can
+    /// never crowd the private duplicate out of a truncated candidate set.
+    async fn list_own_daily_history(&self) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.list(Some(&MemoryCategory::Daily), None).await
+    }
+
     /// Remove a memory by key. Deletes every row matching `key`, regardless
     /// of agent attribution. Agent-scoped callers (the `AgentScopedMemory`
     /// wrapper) use [`forget_for_agent`](Self::forget_for_agent) instead.

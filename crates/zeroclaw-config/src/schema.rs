@@ -10567,6 +10567,32 @@ pub struct MemoryConfig {
     /// Action to take when a duplicate is detected.
     #[serde(default)]
     pub dedup_action: MemoryDedupAction,
+    /// Write a per-turn "Daily history" entry during auto-consolidation. Each
+    /// substantive turn otherwise appends one timestamped Daily summary row, so
+    /// with a shared/append-only backend (e.g. hindsight) ordinary question
+    /// turns steadily accumulate transient rows. Turn this off to stop the
+    /// per-turn Daily write entirely (Core fact extraction still runs). Default:
+    /// true (keep the daily log), but see `daily_dedup` which gates it against
+    /// near-duplicates by default so it does not flood.
+    #[serde(default = "default_true")]
+    pub consolidate_daily: bool,
+    /// Dedup-gate the per-turn Daily history write: before appending a Daily
+    /// summary, recall recent Daily entries and skip the write when an
+    /// exact or near-identical (Jaccard >= `dedup_jaccard_threshold`) summary
+    /// already exists. Independent of `dedup_on_write` (which governs only the
+    /// Phase-2 Core write), so the transient Daily log can be deduplicated
+    /// without changing Core behavior.
+    ///
+    /// OPT-IN (default: false). The gate uses a raw token-set Jaccard score, a
+    /// lexical (not meaning-aware) criterion: two long summaries that differ by
+    /// a single meaning-changing token (e.g. a negation) can still clear the
+    /// threshold and be dropped, which is a lossy retention decision. Enabling
+    /// it globally by default would be a new default-on retention policy, so it
+    /// stays off until it has semantics-aware evidence; any opinionated
+    /// default-on flip routes to #8995 (per the #8891 merge-gate decision).
+    /// Operators who accept the lexical trade-off can enable it explicitly.
+    #[serde(default)]
+    pub daily_dedup: bool,
 
     // ── Memory Budget / Pinning ────────────────────────────────
     /// Maximum Core rows before budget compaction. 0 = unbounded.
@@ -11095,6 +11121,8 @@ impl Default for MemoryConfig {
             dedup_on_write: false,
             dedup_jaccard_threshold: default_dedup_jaccard_threshold(),
             dedup_action: MemoryDedupAction::default(),
+            consolidate_daily: true,
+            daily_dedup: false,
             core_max_rows: 0,
             core_max_bytes: 0,
             daily_max_rows: 0,
@@ -20608,19 +20636,40 @@ impl Config {
                         self.memory.hindsight.system_bank_configured(),
                     ),
                 ] {
-                    if let Some(tier_bank) = configured {
-                        if let Some(owner) = resolved_banks.get(tier_bank) {
-                            validation_bail!(
-                                InvalidFormat,
-                                format!("memory.hindsight.{field}"),
-                                "memory.hindsight.{field} = {tier_bank:?} aliases agents.{owner}'s \
-                                 resolved private Hindsight bank; a {tier} tier bank readable and \
-                                 writable by every agent must never equal any agent's private bank, \
-                                 or that agent's private memory leaks across the whole install",
-                            );
-                        }
+                    if let Some(tier_bank) = configured
+                        && let Some(owner) = resolved_banks.get(tier_bank)
+                    {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("memory.hindsight.{field}"),
+                            "memory.hindsight.{field} = {tier_bank:?} aliases agents.{owner}'s \
+                             resolved private Hindsight bank; a {tier} tier bank readable and \
+                             writable by every agent must never equal any agent's private bank, \
+                             or that agent's private memory leaks across the whole install",
+                        );
                     }
                 }
+            }
+        }
+
+        // Daily-dedup threshold: when the opt-in `daily_dedup` gate is enabled,
+        // it drops any Daily summary whose raw token-set Jaccard score reaches
+        // `dedup_jaccard_threshold`. A threshold outside `[0.0, 1.0]` is a
+        // meaningless similarity cutoff (a Jaccard score is always in that
+        // range), so reject it at load rather than silently never/always
+        // suppressing. Only validated when the gate is actually on, so an
+        // install that leaves `daily_dedup` off is never blocked by an unused
+        // threshold value.
+        if self.memory.daily_dedup {
+            let t = self.memory.dedup_jaccard_threshold;
+            if !(0.0..=1.0).contains(&t) {
+                validation_bail!(
+                    InvalidFormat,
+                    "memory.dedup_jaccard_threshold".to_string(),
+                    "memory.dedup_jaccard_threshold = {t} is out of range; a Jaccard similarity \
+                     threshold must be between 0.0 and 1.0 (daily_dedup uses it as the Daily \
+                     near-duplicate suppression cutoff)",
+                );
             }
         }
 
@@ -29850,6 +29899,41 @@ high_entropy_tokens = false
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn memory_daily_dedup_defaults_off() {
+        // daily_dedup is opt-in: the lossy raw-Jaccard suppression must never
+        // be default-on for any backend.
+        assert!(!super::MemoryConfig::default().daily_dedup);
+    }
+
+    #[test]
+    async fn memory_validation_rejects_out_of_range_daily_dedup_threshold_when_enabled() {
+        let mut config = Config::default();
+        config.memory.daily_dedup = true;
+        config.memory.dedup_jaccard_threshold = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected out-of-range daily_dedup threshold to be rejected");
+        assert!(
+            err.to_string().contains("memory.dedup_jaccard_threshold"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn memory_validation_ignores_out_of_range_threshold_when_daily_dedup_disabled() {
+        // An unused threshold value must never block an install that leaves
+        // the opt-in gate off.
+        let mut config = Config::default();
+        config.memory.daily_dedup = false;
+        config.memory.dedup_jaccard_threshold = 1.5;
+
+        config
+            .validate()
+            .expect("threshold must not be validated while daily_dedup is off");
     }
 
     #[test]
