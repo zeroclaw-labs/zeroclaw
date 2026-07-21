@@ -147,6 +147,8 @@ function blankSop(name: string): Sop {
     steps: [blankStep(1)],
     cooldown_secs: 0,
     max_concurrent: 1,
+    admission_policy: 'parallel',
+    max_pending_approvals: 0,
     deterministic: false,
   };
 }
