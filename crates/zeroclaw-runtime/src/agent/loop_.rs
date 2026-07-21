@@ -1291,8 +1291,12 @@ pub async fn run(
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -2884,8 +2888,12 @@ pub async fn process_message(
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
