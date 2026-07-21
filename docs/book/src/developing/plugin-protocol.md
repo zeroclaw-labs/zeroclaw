@@ -59,10 +59,13 @@ before you design around a capability that is not there.
 
 - **`logging`, config injection, `http_client`, and host-fed inbound are wired.**
   Of the permissions a manifest can declare, `config_read` injects the plugin's
-  own config section, and `http_client` attaches an outbound `wasi:http` surface
-  so the plugin can make HTTP requests. Filesystem and memory-access permissions
-  are still accepted by the manifest schema but inert: their host functions are
-  not yet registered in the linker. See Permissions and Host imports below.
+  own config section for tools and novel channels. A channel mirror instead
+  receives the canonical built-in alias selected by `provides`, potentially
+  including plaintext credentials. `http_client` attaches an outbound
+  `wasi:http` surface so the plugin can make HTTP requests. Filesystem and
+  memory-access permissions are still accepted by the manifest schema but inert:
+  their host functions are not yet registered in the linker. See Permissions
+  and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
   through ambient WASI. A `http_client` plugin gets outbound `wasi:http` and
@@ -113,12 +116,9 @@ hold a warm store guarded by an async mutex for the lifetime of the plugin.
 Tool plugins are discovered and registered end to end: the runtime walks
 `channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
 The channel host adapter (`WasmChannel`, its `wasi:http` gating, `configure`
-jail, and host-fed `inbound` queue) is complete and unit-covered, and
-`PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
-to register. Wiring those into the live orchestrator (the discovery-to-channel
-loop in the runtime, plus a per-vendor host listener that drains its transport
-into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice. The memory bridge
+jail, and host-fed `inbound` queue) is also registered with the shared channel
+supervisor. A real messaging integration still needs its vendor-specific host
+transport to feed that queue. The memory bridge
 (`WasmMemory`) is in the same position one step earlier: the adapter implements
 the full `Memory` trait against the `memory-plugin` world, but the host does not
 yet expose a memory counterpart to `channel_plugin_details()` and the runtime
@@ -299,8 +299,9 @@ Be aware of the gap between declared and enforced: in the component host today
 `config_read` and `http_client` have behavioral effect. `runtime.rs` passes a
 tool plugin's resolved config section into `execute` only when the manifest
 grants `config_read`, and strips any caller-supplied `__config` so the section
-cannot be spoofed; a channel plugin receives the same section through its
-`configure` export under the same rule. `http_client` attaches an outbound
+cannot be spoofed. A novel channel receives its own resolved plugin section
+through `configure`; a mirror receives the admitted canonical channel alias
+section instead. `http_client` attaches an outbound
 `wasi:http` context to the plugin's store and links the `wasi:http` interface,
 so a granted plugin can make HTTP requests and one without the permission has no
 network surface at all. The remaining variants (`file_read`, `file_write`,
@@ -449,7 +450,12 @@ A channel mirror intentionally expands `config_read` to its selected built-in
 channel alias. After duplicate-provider, enabled-owner, and native-collision
 admission, the host passes exactly that canonical `[channels.<type>.<alias>]`
 section to `configure`. It cannot select another channel family or alias, and
-the value is materialized on demand rather than copied into plugin config.
+the value is materialized on demand rather than copied into plugin config. The
+object can contain plaintext credentials, so an operator must trust the admitted
+guest with every value in that alias. Host-controlled materialization does not
+persist the section to a second config home or log it, but the host cannot
+prevent guest code from copying a received value or including it in a
+guest-supplied log event.
 
 ## WASI Component Host
 

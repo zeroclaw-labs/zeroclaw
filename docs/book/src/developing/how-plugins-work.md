@@ -93,13 +93,14 @@ A manifest declares two separate things, and the distinction matters.
   is a host function the plugin cannot reach.
 
 The host grants permissions narrowly: a permission the manifest does not declare
-is a host function the plugin cannot reach. The HTTP-egress and per-plugin
-configuration boundaries (SSRF-guarded egress that cannot reach loopback,
-private, link-local, or cloud-metadata addresses or redirect into one; config
-injected per-alias so a plugin reads only its own resolved values and never the
-raw process environment or another plugin's secrets) are delivered by the
-companion plugin-hardening work and are documented alongside those changes. This
-page covers the signature-policy boundary.
+is a host function the plugin cannot reach. Tools and novel channels granted
+`config_read` receive their own resolved plugin entry. A channel mirror granted
+`config_read` receives the canonical built-in alias selected by `provides`, which
+can include plaintext credentials; admission limits which alias is exposed, but
+the guest must be trusted with the values it receives. The plugin never receives
+the raw process environment. The HTTP-egress boundary is documented alongside
+the companion plugin-hardening work; this page otherwise focuses on signature
+policy.
 
 ## Configuration reference
 

@@ -115,7 +115,8 @@ pub enum PluginPermission {
     FileRead,
     /// Can write to the filesystem (within sandbox)
     FileWrite,
-    /// Can read its own resolved per-plugin config section
+    /// Can read host-selected configuration: its own resolved plugin section,
+    /// or a mirrored channel's canonical alias section when `provides` is set.
     #[serde(alias = "env_read")]
     ConfigRead,
     /// Can read agent memory

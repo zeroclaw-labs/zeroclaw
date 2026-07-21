@@ -85,8 +85,9 @@ fn split_channel_ref(channel_ref: &str) -> (&str, Option<&str>) {
 
 /// Resolve the JSON config section handed to a channel plugin's `configure`.
 /// Withheld (an empty object) unless the manifest grants `ConfigRead`, so a
-/// plugin without the permission can never be configured with another channel's
-/// secrets. Mirrors the tool-plugin `__config` rule.
+/// plugin without the permission cannot receive the host-selected section.
+/// For a mirror, that section is the canonical built-in channel alias selected
+/// during admission and can include plaintext credentials.
 fn resolve_configure_json(
     config: &HashMap<String, String>,
     permissions: &[PluginPermission],

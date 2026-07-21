@@ -15,11 +15,9 @@ checked against `wit/v0/channel.wit` and the host adapter in
 
 > **Wiring status.** The host side of channel plugins is complete and
 > unit-covered: `WasmChannel` implements the runtime's `Channel` trait, and
-> `PluginHost::channel_plugin_details()` exposes discovered channel plugins.
-> The remaining seam is orchestrator registration plus the per-vendor host
-> listener; until that lands, a channel plugin loads and passes its contract
-> tests but is not yet constructed by a running daemon. Build against the
-> contract now; the contract is what freezes.
+> `PluginHost::channel_plugin_details()` exposes discovered channel plugins to
+> the shared channel supervisor. A production integration still needs its
+> vendor-specific host transport to feed the plugin's inbound queue.
 
 ## The lifecycle
 
@@ -35,10 +33,11 @@ ways, and each drives a design decision in your code:
 2. **Configuration arrives before anything else.** The host calls your
    `configure` export exactly once, at load, before any other call. The
    argument is a JSON object of your channel's resolved settings, secrets
-   already decrypted, supplied only when the manifest grants `config_read`
-   (otherwise you receive `{}`, per `resolve_configure_json` in
-   `wasm_channel.rs`). Parse it, validate it, store it in your component's
-   state; return an error string to fail the load if the config is unusable.
+   already decrypted, supplied only when the manifest grants `config_read`. A
+   novel channel without that permission receives `{}` from
+   `resolve_configure_json`; a mirror without it is rejected during admission
+   before `configure` runs. Parse the object, validate it, store it in your
+   component's state; return an error string to fail the load if unusable.
 3. **You do not listen; the host feeds you.** The WASI context has no network
    listener capability. Inbound traffic reaches you through the imported
    `inbound` interface: the host runs the actual listener (webhook server,
@@ -241,6 +240,11 @@ must grant `config_read`; ZeroClaw then supplies each enabled, agent-owned
 `[channels.<type>.<alias>]` section directly to `configure`. Do not add a
 parallel `plugins.entries` config block. Omit `provides` for a novel channel,
 which binds as `plugin.<manifest-name>` and reads its own plugin entry.
+The canonical alias object can include plaintext credentials. Admission limits
+which alias the host supplies. Host code does not persist that object to a
+second config home or log it, but the guest controls what it stores and emits
+after `configure`; operators must therefore trust the mirror with the selected
+alias's values.
 
 Declare how the guest represents inbound sender identities with `sender_match`:
 `exact`, `case_insensitive`, `handle`, or `email`. For example, a guest that
@@ -258,9 +262,10 @@ identities in `peer_groups`, which the host resolves live for every message.
 ## Testing against the host contract
 
 The host adapter's unit tests in `wasm_channel.rs` are the executable
-specification: they cover the configure jail (a plugin without `config_read`
-receives `{}`, never another channel's secrets), the inbound queue handoff,
-capability-gated dispatch, and poll-health accounting.
+specification: they cover the configure jail (the adapter substitutes `{}`
+without `config_read`). Production-builder tests additionally prove that a
+mirror without that permission invokes no guest export. The suite also covers
+the inbound queue handoff, capability-gated dispatch, and poll-health accounting.
 
 To run your own component under those exact semantics, write an integration
 test that instantiates it through the real host adapter. `zeroclaw-plugins`

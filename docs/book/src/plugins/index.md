@@ -80,11 +80,14 @@ The manifest declares two orthogonal things:
   it marks a markdown [skill bundle](../tools/skill-bundles.md) riding the
   install machinery, not code, and needs no component.
 - **Permissions**: what host services the plugin's code may *reach*. The
-  `PluginPermission` enum in the same file. Today `config_read` (the plugin
-  receives its own resolved config section) and `http_client` (outbound
-  `wasi:http` is wired into its store and linker) are enforced; the
-  filesystem and memory-access permissions are accepted by the schema but not
-  yet backed by host functions, so declaring them grants nothing.
+  `PluginPermission` enum in the same file. Today `config_read` (tools and novel
+  channels receive their own resolved plugin section; a channel mirror receives
+  the canonical built-in alias selected by `provides`) and `http_client`
+  (outbound `wasi:http` is wired into its store and linker) are enforced. A
+  mirrored alias can contain plaintext credentials, so the admitted guest must
+  be trusted with that object. The filesystem and memory-access permissions are
+  accepted by the schema but not yet backed by host functions, so declaring
+  them grants nothing.
 
 ## The worlds
 
@@ -144,7 +147,7 @@ not yet reachable from a running daemon:
 |------------|--------------|----------------|
 | `tool` | `WasmTool` | Registered end to end; discovered tool plugins appear in the agent's tool set |
 | `skill` | markdown loader | Registered end to end; skills load namespaced as `plugin:<plugin>/<skill>` |
-| `channel` | `WasmChannel`, complete and unit-covered | Orchestrator registration and the per-vendor host listener are the remaining seam |
+| `channel` | `WasmChannel`, complete and unit-covered | Registered with the shared channel supervisor; each production integration still needs a vendor-specific host transport that feeds its inbound queue |
 | `memory` | `WasmMemory`, implements the full `Memory` trait | The runtime does not yet construct it as a configurable backend |
 | `observer` | none | `PluginCapability::Observer` is reserved; no WIT world or adapter exists yet |
 
@@ -174,10 +177,12 @@ zeroclaw config set plugins.limits.max_memory_mb 256
 ```
 
 Per-plugin settings live under `plugins.entries`, keyed by plugin name; each
-entry carries a secret-marked key-value map that is what a `config_read`
-plugin receives at call time. One known seam: `config set` routes list paths
-by natural keys already present in live config, and `plugin install` does not
-yet seed an entry, so the **first** write to a fresh plugin's entry fails
+entry carries a secret-marked key-value map that a `config_read` tool or novel
+channel receives at call time. A `provides` channel mirror instead receives its
+admitted canonical `[channels.<type>.<alias>]` object. One known `config set`
+seam: list paths route by natural keys already present in live config, and
+`plugin install` does not yet seed an entry, so the **first** write to a fresh
+plugin's entry fails
 with `Unknown property` and currently requires adding the entry to the config
 file by hand (tracked in issue #8636); once the entry exists, every surface
 reads and writes it normally. Values written through the CLI are stored
