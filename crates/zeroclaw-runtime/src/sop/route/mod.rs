@@ -5,6 +5,12 @@ use super::condition::evaluate_condition;
 use super::rundata::RunData;
 use super::types::{Sop, SopRun, SopStep, SopStepStatus};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Explicit,
+    Linear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NextStep {
     Step(u32),
@@ -80,13 +86,13 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
             let Some(target) = rule.goto else {
                 return NextStep::Fail(format!("switch port '{}' has no target", rule.name));
             };
-            return resolve_target(ctx, target);
+            return resolve_target(ctx, target, TargetKind::Explicit);
         }
         return NextStep::Complete;
     }
 
     if let Some(next_target) = current.routing.next {
-        return resolve_target(ctx, next_target);
+        return resolve_target(ctx, next_target, TargetKind::Explicit);
     }
 
     if current.routing.terminal {
@@ -96,29 +102,26 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
     resolve_linear(ctx)
 }
 
-/// Resolve an explicit successor step number (from a switch port or
-/// `routing.next`) into the final `NextStep`. Looks the step up, enforces
-/// the visit bound, and applies dependency-based eligibility.
-fn resolve_target(ctx: &RouteCtx<'_>, target: u32) -> NextStep {
+/// Resolve a successor step number into the final `NextStep`. Explicit
+/// targets fail when missing; a linear target past the declared end completes.
+fn resolve_target(ctx: &RouteCtx<'_>, target: u32, kind: TargetKind) -> NextStep {
     let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
-        return NextStep::Fail(format!("step {target} does not exist"));
+        return match kind {
+            TargetKind::Explicit => NextStep::Fail(format!("step {target} does not exist")),
+            TargetKind::Linear if target > ctx.run.total_steps => NextStep::Complete,
+            TargetKind::Linear => NextStep::Fail(format!("step {target} does not exist")),
+        };
     };
     resolve_step_decision(ctx, target, step)
 }
 
-/// Resolve the linear successor (`current_step + 1`). Completes when the
-/// successor is past the end of the SOP; fails when the successor falls in
-/// a gap; otherwise delegates to the shared target resolution.
+/// Resolve the linear successor (`current_step + 1`).
 fn resolve_linear(ctx: &RouteCtx<'_>) -> NextStep {
-    let next_step = ctx.run.current_step.saturating_add(1);
-    let Some(step) = ctx.sop.steps.iter().find(|s| s.number == next_step) else {
-        return if next_step > ctx.run.total_steps {
-            NextStep::Complete
-        } else {
-            NextStep::Fail(format!("step {next_step} does not exist"))
-        };
-    };
-    resolve_step_decision(ctx, next_step, step)
+    resolve_target(
+        ctx,
+        ctx.run.current_step.saturating_add(1),
+        TargetKind::Linear,
+    )
 }
 
 /// Apply the visit-bound and dependency checks shared by every target
@@ -323,7 +326,7 @@ mod tests {
 
         let sop = sop_with_steps(vec![step1, step(2), step(3)]);
         let run = run_at(1, 3);
-        let run_data = RunData::default(); // No outputs, making when condition false
+        let run_data = RunData::default();
         let ctx = route_ctx(&sop, &run, &run_data);
 
         // Should go to linear successor (step 2 = 1+1), NOT switch target
