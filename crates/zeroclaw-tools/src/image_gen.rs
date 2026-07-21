@@ -1,6 +1,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -15,6 +16,29 @@ static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Maximum redirect hops the download loop follows before giving up.
 const MAX_REDIRECT_HOPS: usize = 10;
+
+/// Production DNS resolver for the download pipeline. Exists as a free
+/// function so the injectable-resolver seam can take `&F` and the
+/// production path passes `&resolve_host_for_download` — the same shape
+/// `http_request.rs` uses for `resolve_host_for_request`.
+async fn resolve_host_for_download(
+    host: String,
+    port: u16,
+) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .context(ImageGenTool::tool_msg(
+            "tool-image-gen-error-resolved-url-resolve-failed",
+        ))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!(ImageGenTool::tool_msg_with_args(
+            "tool-image-gen-error-resolved-url-resolve-empty",
+            &[("host", &host)],
+        ));
+    }
+    Ok(addrs)
+}
 
 /// A download target that has passed both SSRF gates: the validated URL
 /// string, its bare hostname, and the resolved-and-validated socket
@@ -249,10 +273,15 @@ impl ImageGenTool {
     /// caller can bind the download connection to them via
     /// `resolve_to_addrs` (keyed by the hostname, NOT the full URL),
     /// closing the TOCTOU window between DNS check and transport connect.
-    async fn validate_image_url_resolved(
+    async fn validate_image_url_resolved_with_resolver<F, Fut>(
         &self,
         validated_url: &str,
-    ) -> anyhow::Result<(String, Vec<std::net::SocketAddr>)> {
+        resolve_host: &F,
+    ) -> anyhow::Result<(String, Vec<std::net::SocketAddr>)>
+    where
+        F: Fn(String, u16) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<std::net::SocketAddr>>>,
+    {
         let parsed = reqwest::Url::parse(validated_url).map_err(|e| {
             anyhow::Error::msg(Self::tool_msg_with_args(
                 "tool-image-gen-error-resolved-url-parse",
@@ -266,12 +295,7 @@ impl ImageGenTool {
             anyhow::Error::msg(Self::tool_msg("tool-image-gen-error-resolved-url-no-port"))
         })?;
 
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .context(Self::tool_msg(
-                "tool-image-gen-error-resolved-url-resolve-failed",
-            ))?
-            .collect();
+        let addrs = resolve_host(host.to_string(), port).await?;
 
         if addrs.is_empty() {
             anyhow::bail!(Self::tool_msg_with_args(
@@ -314,16 +338,45 @@ impl ImageGenTool {
         Ok((host.to_string(), addrs))
     }
 
+    /// Public entry point: same as `validate_image_url_resolved_with_resolver`
+    /// but always resolves via `tokio::net::lookup_host` (the production path).
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn validate_image_url_resolved(
+        &self,
+        validated_url: &str,
+    ) -> anyhow::Result<(String, Vec<std::net::SocketAddr>)> {
+        self.validate_image_url_resolved_with_resolver(validated_url, &resolve_host_for_download)
+            .await
+    }
+
     /// Run both SSRF gates for one download URL — the host-string gate
     /// (`validate_image_url`) followed by the resolved-IP gate
     /// (`validate_image_url_resolved`) — and bundle the outcome into a
     /// single `ValidatedImageTarget`. The download loop calls this for the
     /// initial URL and again for every redirect target, so each hop is
     /// validated, resolved, and pinned before any connection to it.
-    async fn validate_image_target(&self, raw_url: &str) -> anyhow::Result<ValidatedImageTarget> {
+    async fn validate_image_target_with_resolver<F, Fut>(
+        &self,
+        raw_url: &str,
+        resolve_host: &F,
+    ) -> anyhow::Result<ValidatedImageTarget>
+    where
+        F: Fn(String, u16) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<std::net::SocketAddr>>>,
+    {
         let url = self.validate_image_url(raw_url)?;
-        let (host, addrs) = self.validate_image_url_resolved(&url).await?;
+        let (host, addrs) = self
+            .validate_image_url_resolved_with_resolver(&url, resolve_host)
+            .await?;
         Ok(ValidatedImageTarget { url, host, addrs })
+    }
+
+    /// Public entry point: same as `validate_image_target_with_resolver`
+    /// but always resolves via `tokio::net::lookup_host` (the production path).
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn validate_image_target(&self, raw_url: &str) -> anyhow::Result<ValidatedImageTarget> {
+        self.validate_image_target_with_resolver(raw_url, &resolve_host_for_download)
+            .await
     }
 
     /// Build the download client for one validated hop: the connection is
@@ -367,8 +420,18 @@ impl ImageGenTool {
     /// private, local, or metadata address is rejected before any
     /// connection to it is attempted. Relative `Location` values are
     /// resolved against the current hop's URL.
-    async fn download_image(&self, image_url: &str) -> anyhow::Result<reqwest::Response> {
-        let mut target = self.validate_image_target(image_url).await?;
+    async fn download_image_with_resolver<F, Fut>(
+        &self,
+        image_url: &str,
+        resolve_host: &F,
+    ) -> anyhow::Result<reqwest::Response>
+    where
+        F: Fn(String, u16) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<std::net::SocketAddr>>>,
+    {
+        let mut target = self
+            .validate_image_target_with_resolver(image_url, resolve_host)
+            .await?;
         let mut redirects_followed = 0usize;
 
         loop {
@@ -409,8 +472,17 @@ impl ImageGenTool {
                     ))
                 })?;
 
-            target = self.validate_image_target(next.as_str()).await?;
+            target = self
+                .validate_image_target_with_resolver(next.as_str(), resolve_host)
+                .await?;
         }
+    }
+
+    /// Public entry point: same as `download_image_with_resolver` but
+    /// always resolves via `tokio::net::lookup_host` (the production path).
+    async fn download_image(&self, image_url: &str) -> anyhow::Result<reqwest::Response> {
+        self.download_image_with_resolver(image_url, &resolve_host_for_download)
+            .await
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -1465,6 +1537,201 @@ mod tests {
         assert!(
             err.contains("Location"),
             "expected missing-Location error, got: {err}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Resolver-injection tests: `download_image_with_resolver` exercises
+    // the production download pipeline with controlled DNS resolution.
+    //
+    // Each test injects a closure that maps synthetic hostnames to
+    // controlled `SocketAddr`s — no external DNS is performed. The
+    // assertions anchor on wiremock listener hit counts, so the outcome
+    // does not depend on how the environment resolves (or fails to
+    // resolve) any hostname.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// An unresolvable synthetic hostname reaches ONLY the validated
+    /// listener when the injected resolver returns the listener's
+    /// address.  If `download_image` ever bypasses `build_download_client`
+    /// (or the `resolve_to_addrs` call is dropped), the unresolvable
+    /// hostname has no other path to the listener and the request fails.
+    #[tokio::test]
+    async fn download_image_with_resolver_pins_initial_connection_to_validated_listener() {
+        use std::net::SocketAddr;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pinned-body".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Wildcard lifts the resolved-IP gate for the injected loopback
+        // address so the pinning test can exercise the full pipeline.
+        let tool = test_tool_with_private_hosts(vec!["*"]);
+        let resp = tool
+            .download_image_with_resolver(
+                "http://download-test-synthetic.invalid/img.png",
+                &|host, p| {
+                    assert_eq!(host, "download-test-synthetic.invalid");
+                    assert_eq!(p, 80);
+                    async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) }
+                },
+            )
+            .await
+            .expect("download_image must succeed with injected resolver");
+
+        assert!(resp.status().is_success());
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..], b"pinned-body");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one request must reach the validated listener");
+    }
+
+    /// A redirect target with a different synthetic hostname reaches ONLY
+    /// its validated listener — the per-hop resolver is called for each
+    /// target independently.  If the loop reuses the initial hop's address
+    /// set for the redirect, the second synthetic hostname cannot reach
+    /// its listener.
+    #[tokio::test]
+    async fn download_image_with_resolver_pins_redirected_connection_to_validated_listener() {
+        use std::net::SocketAddr;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let redirect_server = MockServer::start().await;
+        let redirect_port = redirect_server.address().port();
+        let target_server = MockServer::start().await;
+        let target_port = target_server.address().port();
+
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"redirect-body".to_vec()))
+            .expect(1)
+            .mount(&target_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/start.png"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                "http://download-test-redirect-target.invalid/img.png",
+            ))
+            .expect(1)
+            .mount(&redirect_server)
+            .await;
+
+        let tool = test_tool_with_private_hosts(vec!["*"]);
+        let resp = tool
+            .download_image_with_resolver(
+                "http://download-test-redirect.invalid/start.png",
+                &|host, _p| {
+                    async move {
+                        match host.as_str() {
+                            "download-test-redirect.invalid" => {
+                                Ok(vec![SocketAddr::from(([127, 0, 0, 1], redirect_port))])
+                            }
+                            "download-test-redirect-target.invalid" => {
+                                Ok(vec![SocketAddr::from(([127, 0, 0, 1], target_port))])
+                            }
+                            other => panic!("unexpected resolver host: {other}"),
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("redirect with per-hop resolver must succeed");
+
+        assert!(resp.status().is_success());
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(&body[..], b"redirect-body");
+
+        assert_eq!(redirect_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(target_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A public-looking redirect hostname that the injected resolver maps
+    /// to a loopback address is rejected by the resolved-IP gate with
+    /// ZERO target-listener requests.  The host string looks legitimate
+    /// (passes the host-string gate), but the resolved-IP classification
+    /// catches the non-global address.  If resolved-IP classification is
+    /// dropped, the redirect is followed onto the target listener and the
+    /// `.expect(0)` assertion fails — this is the exact DNS-rebinding
+    /// regression the prior `localhost` redirect test could not detect
+    /// because literal `localhost` is stopped by the host-string gate.
+    #[tokio::test]
+    async fn download_image_rejects_redirect_to_public_hostname_resolving_to_private_address() {
+        use std::net::SocketAddr;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let redirect_server = MockServer::start().await;
+        let redirect_port = redirect_server.address().port();
+        let target_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"must-not-reach".to_vec()))
+            .expect(0) // ZERO requests — resolved-IP gate must block before connect
+            .mount(&target_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/start.png"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                "http://public-looking-cdn.example/img.png",
+            ))
+            .expect(1)
+            .mount(&redirect_server)
+            .await;
+
+        // The initial synthetic host is the only allowed one.
+        // "public-looking-cdn.example" is NOT in the allowlist — its host
+        // string passes the host-string gate (it looks like a normal CDN
+        // hostname), but the injected resolver returns a loopback address
+        // that the resolved-IP gate must reject before any connection.
+        let tool = test_tool_with_private_hosts(vec!["download-test-start.invalid"]);
+
+        let err = tool
+            .download_image_with_resolver(
+                "http://download-test-start.invalid/start.png",
+                &|host, _p| {
+                    let target_port = target_server.address().port();
+                    async move {
+                        match host.as_str() {
+                            "download-test-start.invalid" => {
+                                Ok(vec![SocketAddr::from(([127, 0, 0, 1], redirect_port))])
+                            }
+                            "public-looking-cdn.example" => Ok(vec![SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                                target_port,
+                            )]),
+                            other => panic!("unexpected resolver host: {other}"),
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("non-global"),
+            "expected resolved-IP 'non-global' rejection, got: {err}"
+        );
+
+        let followed = target_server.received_requests().await.unwrap();
+        assert_eq!(
+            followed.len(),
+            0,
+            "rejected redirect target must never be connected to"
         );
     }
 }
