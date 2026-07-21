@@ -426,12 +426,59 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embeddings::EmbeddingProvider;
     use crate::sqlite::SqliteMemory;
     use tempfile::TempDir;
+    use zeroclaw_config::schema::SearchMode;
 
     fn fresh_sqlite() -> (TempDir, Arc<SqliteMemory>) {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        (tmp, Arc::new(mem))
+    }
+
+    /// The query text alone maps to the live vector axis. Stored rows stay
+    /// FTS-only, which makes the test exercise FTS normalization in the real
+    /// `AgentScopedMemory -> recall_for_agents -> SqliteMemory` path.
+    struct SessionScopeEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for SessionScopeEmbedding {
+        fn name(&self) -> &str {
+            "session-scope"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if *text == "archive axis bridge cipher delta ember frost glyph" {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn fresh_live_sqlite() -> (TempDir, Arc<SqliteMemory>) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(SessionScopeEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
         (tmp, Arc::new(mem))
     }
 
@@ -550,6 +597,163 @@ mod tests {
         assert!(
             hits.iter().any(|e| e.key == "sibling-key"),
             "rows attributed to an allowlisted sibling must surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_vector_recall_scopes_fts_before_ranking_and_keeps_allowed_agents() {
+        let (_tmp, inner) = fresh_live_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta", "foreign"]).await;
+        let alpha = &uuids[0];
+        let beta = &uuids[1];
+        let foreign = &uuids[2];
+        let query = "archive axis bridge cipher delta ember frost glyph";
+        let excluded_session_match = format!("{} ", query).repeat(16);
+        let excluded_agent_match = format!("{} ", query).repeat(20);
+
+        inner
+            .store_with_agent(
+                "current_eligible",
+                "archive",
+                MemoryCategory::Conversation,
+                Some("current-session"),
+                None,
+                None,
+                Some(alpha),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_with_agent(
+                "other_session_stronger",
+                &excluded_session_match,
+                MemoryCategory::Conversation,
+                Some("other-session"),
+                None,
+                None,
+                Some(alpha),
+            )
+            .await
+            .unwrap();
+        for (key, category) in [
+            ("foreign_global_core", MemoryCategory::Core),
+            ("foreign_global_daily", MemoryCategory::Daily),
+        ] {
+            inner
+                .store_with_agent(
+                    key,
+                    "archive foreign note",
+                    category,
+                    None,
+                    None,
+                    None,
+                    Some(foreign),
+                )
+                .await
+                .unwrap();
+        }
+        inner
+            .store_with_agent(
+                "foreign_agent_stronger",
+                &excluded_agent_match,
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(foreign),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_with_agent(
+                "allowlisted_global",
+                "archive shared note",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(beta),
+            )
+            .await
+            .unwrap();
+
+        let current_id = inner
+            .get_for_agent("current_eligible", alpha)
+            .await
+            .unwrap()
+            .expect("current eligible row must exist")
+            .id;
+        let excluded_id = inner
+            .get_for_agent("other_session_stronger", alpha)
+            .await
+            .unwrap()
+            .expect("other-session row must exist")
+            .id;
+        let foreign_agent_id = inner
+            .get_for_agent("foreign_agent_stronger", foreign)
+            .await
+            .unwrap()
+            .expect("foreign-agent row must exist")
+            .id;
+        let unscoped_fts = {
+            let conn = inner.connection().lock();
+            SqliteMemory::fts5_search(&conn, query, 10).unwrap()
+        };
+        let eligible_raw_score = unscoped_fts
+            .iter()
+            .find(|(id, _)| id == &current_id)
+            .map(|(_, score)| *score)
+            .expect("current-session row must match the unscoped FTS query");
+        let excluded_raw_score = unscoped_fts
+            .iter()
+            .find(|(id, _)| id == &excluded_id)
+            .map(|(_, score)| *score)
+            .expect("other-session row must match the unscoped FTS query");
+        let foreign_agent_raw_score = unscoped_fts
+            .iter()
+            .find(|(id, _)| id == &foreign_agent_id)
+            .map(|(_, score)| *score)
+            .expect("foreign-agent row must match the unscoped FTS query");
+        assert!(
+            excluded_raw_score > eligible_raw_score * 2.5,
+            "the excluded row must be strong enough to reproduce batch normalization pressure: excluded={excluded_raw_score}, eligible={eligible_raw_score}"
+        );
+        assert!(
+            foreign_agent_raw_score > eligible_raw_score * 2.5,
+            "the foreign-agent row must be strong enough to reproduce agent-scope normalization pressure: foreign={foreign_agent_raw_score}, eligible={eligible_raw_score}"
+        );
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha, vec![beta.clone()]);
+        let hits = wrapper
+            .recall(query, 10, Some("current-session"), None, None)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = hits.iter().map(|entry| entry.key.as_str()).collect();
+        let eligible_score = hits
+            .iter()
+            .find(|entry| entry.key == "current_eligible")
+            .and_then(|entry| entry.score)
+            .expect("the current-session FTS candidate must be recalled");
+
+        assert!(
+            eligible_score >= 0.4,
+            "excluded session/agent rows must not depress the best eligible FTS score below the default relevance floor: {eligible_score}"
+        );
+        assert!(
+            keys.contains(&"allowlisted_global"),
+            "an explicitly allowlisted sibling's durable global row must remain visible: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"other_session_stronger"),
+            "rows bound to another session must not surface: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"foreign_agent_stronger"),
+            "rows bound to a non-allowlisted agent must not surface or depress allowed scores: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"foreign_global_core") && !keys.contains(&"foreign_global_daily"),
+            "foreign agents' durable global rows must remain outside the wrapper allowlist: {keys:?}"
         );
     }
 

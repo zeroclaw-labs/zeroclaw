@@ -26,6 +26,7 @@ pub mod lucid;
 pub mod markdown;
 pub mod merge;
 pub mod none;
+pub mod normalize;
 pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
