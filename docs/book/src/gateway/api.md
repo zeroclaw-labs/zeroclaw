@@ -23,6 +23,29 @@ Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
 safe to expose unauthenticated regardless of TLS posture.
 
+## Plugin webhook ingress
+
+`POST /plugin/<path>` is the transport boundary for a channel plugin that
+advertises webhook ingress. It is not pairing-authenticated: the plugin verifies
+the platform signature against its own canonical channel config while decoding
+the raw headers and body. The gateway still applies the same per-client webhook
+rate limiter and trusted-forwarded-header policy as `POST /webhook`, plus the
+global 64 KiB request-body ceiling.
+
+Public failures are deliberately fixed: `401 unauthorized webhook`,
+`400 invalid webhook`, `429` admission/queue rejection, `503` unavailable, and
+`504 webhook processing timed out`. Plugin rejection text and runtime traps are
+logged internally and never reflected to an unauthenticated caller. Request
+cancellation reaches the component parser itself; timed-out parser stores are
+discarded so a later webhook cannot be blocked by the prior request.
+
+After successful guest authentication and parsing, non-empty provider message
+IDs use the gateway's existing bounded idempotency store. The reservation is
+kept only after the normalized message reaches the channel queue, so an invalid,
+timed-out, or undeliverable request does not consume its retry identity. If two
+enabled plugin instances declare the same webhook path, every claimant is
+withheld; startup iteration order never chooses an alias implicitly.
+
 ## Discovering the surface
 
 Two endpoints answer the question "what can I do here?":

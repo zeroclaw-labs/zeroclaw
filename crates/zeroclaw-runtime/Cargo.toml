@@ -79,6 +79,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+zeroize.workspace = true
 zeroclaw-macros.workspace = true
 
 # Optional deps
