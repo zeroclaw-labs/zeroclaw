@@ -1588,10 +1588,17 @@ pub async fn handle_api_health(
 // ── Helpers ─────────────────────────────────────────────────────
 
 /// Derive the canonical storage key for a client-visible session ID.
-/// Chat, WS, abort, and all session-management endpoints must use the
-/// same sanitized form so queue serialization, cancel tokens, and
-/// persistence all agree on one key.
+///
+/// Accepts three forms:
+/// - Bare gateway ID → prefixed with `gw_` after sanitization.
+/// - Already-canonical `gw_` key → sanitized in place.
+/// - Channel composite key (contains `_`) → sanitized without `gw_` prefix.
 fn canonical_session_key(id: &str) -> String {
+    // Already canonical: `gw_` prefix or channel key (contains `_`).
+    if id.starts_with("gw_") || id.contains('_') {
+        return zeroclaw_api::session_keys::sanitize_session_key(id);
+    }
+    // Bare gateway ID — prepend `gw_`.
     format!(
         "gw_{}",
         zeroclaw_api::session_keys::sanitize_session_key(id)
@@ -1993,13 +2000,7 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    // Sanitize so the lookup matches the key the turn runner registers;
-    // without this, `/api/sessions/{id}/abort` against an HTTP
-    // chat-completions turn returns `no_active_response`.
-    let session_key = format!(
-        "gw_{}",
-        zeroclaw_api::session_keys::sanitize_session_key(&id)
-    );
+    let session_key = canonical_session_key(&id);
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
@@ -4670,5 +4671,37 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+    }
+
+    // ── canonical_session_key ───────────────────────────────────
+
+    #[test]
+    fn canonical_session_key_preserves_gw_prefixed_key() {
+        assert_eq!(canonical_session_key("gw_foo"), "gw_foo");
+        assert_eq!(canonical_session_key("gw_test-session"), "gw_test-session");
+    }
+
+    #[test]
+    fn canonical_session_key_preserves_channel_key() {
+        assert_eq!(
+            canonical_session_key("discord.clamps_user123"),
+            "discord_clamps_user123"
+        );
+        assert_eq!(canonical_session_key("slack.thread_42"), "slack_thread_42");
+    }
+
+    #[test]
+    fn canonical_session_key_prefixes_bare_id() {
+        assert_eq!(canonical_session_key("my-session"), "gw_my-session");
+        assert_eq!(
+            canonical_session_key("550e8400-e29b-41d4-a716-446655440000"),
+            "gw_550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn canonical_session_key_sanitizes_special_characters() {
+        assert_eq!(canonical_session_key("gw_foo.bar"), "gw_foo_bar");
+        assert_eq!(canonical_session_key("my session"), "gw_my_session");
     }
 }

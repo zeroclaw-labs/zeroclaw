@@ -759,6 +759,7 @@ mod tests {
         let tool: Box<dyn Tool> = Box::new(CountingTool::new("shell", invocations.clone()));
         let meta = crate::agent::turn::TurnMeta {
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "http",
         };
@@ -804,6 +805,7 @@ mod tests {
         let tool: Box<dyn Tool> = Box::new(CountingTool::new("shell", invocations.clone()));
         let meta = crate::agent::turn::TurnMeta {
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "wss",
         };
