@@ -157,9 +157,10 @@ controls ZeroClaw's best-effort local history budgeting; it is deliberately not
 sent to Hailo-Ollama. Call-level native thinking requests are rejected before
 any backend request. Responses must be a completed non-streaming response
 (`done=true`), and an empty completed response is treated as an error. A low
-`context_window` actively trims older history before the 12-message cap is
-applied. System instructions are folded into plain user prose, at most 12 recent
-messages are kept, and each normalized message is bounded to 2,000 Unicode characters.
+`context_window` actively trims older history; together with the 12-message cap,
+the two local budgets keep the retained history bounded. System instructions are
+folded into plain user prose, and each normalized message is bounded to 2,000
+Unicode characters.
 Native tool calling, streaming, and vision are not advertised.
 Prompt-guided tool calls and results remain available as plain text history when
 the complete injected tool protocol fits in the bounded first message; ZeroClaw
