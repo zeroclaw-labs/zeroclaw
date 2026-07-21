@@ -24,12 +24,23 @@ pub struct RouteCtx<'a> {
 
 /// Pick the next step, preserving linear behavior when no routing is declared.
 ///
-/// Resolution precedence (highest to lowest):
-/// 1. Top-level `when` guard — if false, bypasses ALL routing and routes linearly (only linear successor/terminal considered)
-/// 2. Switch evaluation — top-to-bottom matching on port `when` guards when `when` is true/None
-/// 3. Explicit `next` target (from switch evaluation or declared on step)
-/// 4. Linear successor (current_step + 1) when neither switch nor explicit_next provides a target
-/// 5. Terminal completion when no successor exists
+/// Resolution precedence (highest to lowest). The branches are mutually
+/// exclusive — only one of them fires per call — so the linear narrative
+/// reads as a *decision tree*, not a fallback chain:
+///
+/// 1. **False top-level `when` guard** → terminal completes; otherwise the
+///    linear successor is taken. `switch` ports and `routing.next` are
+///    bypassed entirely.
+/// 2. **True or absent top-level `when` guard** with a non-empty `switch` →
+///    the first matching port's `goto` is taken, or the run completes if no
+///    port matches. `routing.next` and the linear successor are NOT
+///    consulted.
+/// 3. **True or absent top-level `when` guard** with no `switch` and a
+///    declared `routing.next` → that explicit successor is taken (visit
+///    limit, dependency, and existence checks still apply).
+/// 4. **True or absent top-level `when` guard** with no `switch` and no
+///    `routing.next` → `terminal: true` completes the run; otherwise the
+///    linear successor (`current_step + 1`) is taken.
 pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
     if ctx.last_status == SopStepStatus::Failed {
         return NextStep::Fail("step failed".into());
@@ -50,38 +61,14 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
         Some(when) => evaluate_condition(when, Some(&payload)),
     };
 
-    // When top-level `when` guard is false, bypass ALL routing decisions (switch, explicit_next)
-    // and route directly to linear successor or terminal completion
-    // Restores the linear-successor behavior for a false guard that predates
-    // unconditional switch evaluation.
     if !when_allows_jump {
         if current.routing.terminal {
             return NextStep::Complete;
         }
-        let next_step = ctx.run.current_step.saturating_add(1);
-        let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
-            return if next_step > ctx.run.total_steps {
-                NextStep::Complete
-            } else {
-                NextStep::Fail(format!("step {next_step} does not exist"))
-            };
-        };
-
-        if !guard::within_visit_bound(ctx.run, next_step, ctx.max_step_visits) {
-            return NextStep::Fail(format!("step {next_step} visit limit reached"));
-        }
-
-        if eligible(step, ctx.run_data) {
-            return NextStep::Step(next_step);
-        } else {
-            return NextStep::Wait(next_step);
-        }
+        return resolve_linear(ctx);
     }
 
-    // When guard is true or None: proceed with normal routing decisions
-    // Switch evaluation runs first when the guard allows it.
     if !current.routing.switch.is_empty() {
-        let payload = ctx.run_data.to_payload().to_string();
         for rule in &current.routing.switch {
             let matched = match rule.when.as_deref() {
                 Some(when) => evaluate_condition(when, Some(&payload)),
@@ -93,48 +80,47 @@ pub fn resolve_next(ctx: &RouteCtx<'_>) -> NextStep {
             let Some(target) = rule.goto else {
                 return NextStep::Fail(format!("switch port '{}' has no target", rule.name));
             };
-            let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
-                return NextStep::Fail(format!("step {target} does not exist"));
-            };
-            if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
-                return NextStep::Fail(format!("step {target} visit limit reached"));
-            }
-            return if eligible(step, ctx.run_data) {
-                NextStep::Step(target)
-            } else {
-                NextStep::Wait(target)
-            };
+            return resolve_target(ctx, target);
         }
-        // No switch rules matched, fall through to declared next/linear
+        return NextStep::Complete;
     }
 
-    // Check for explicit next target (from routing configuration)
     if let Some(next_target) = current.routing.next {
-        if next_target == ctx.run.current_step {
-            // Self-loop, but still need to handle terminal case
-        }
-        let Some(step) = ctx.sop.steps.iter().find(|s| s.number == next_target) else {
-            return NextStep::Fail(format!("step {next_target} does not exist"));
-        };
-
-        if !guard::within_visit_bound(ctx.run, next_target, ctx.max_step_visits) {
-            return NextStep::Fail(format!("step {next_target} visit limit reached"));
-        }
-
-        if eligible(step, ctx.run_data) {
-            return NextStep::Step(next_target);
-        } else {
-            return NextStep::Wait(next_target);
-        }
+        return resolve_target(ctx, next_target);
     }
 
-    // No explicit next, no switch matched: use linear successor
     if current.routing.terminal {
         return NextStep::Complete;
     }
 
+    resolve_linear(ctx)
+}
+
+/// Resolve an explicit successor step number (from a switch port or
+/// `routing.next`) into the final `NextStep`. Looks the step up, enforces
+/// the visit bound, and applies dependency-based eligibility.
+fn resolve_target(ctx: &RouteCtx<'_>, target: u32) -> NextStep {
+    let Some(step) = ctx.sop.steps.iter().find(|s| s.number == target) else {
+        return NextStep::Fail(format!("step {target} does not exist"));
+    };
+
+    if !guard::within_visit_bound(ctx.run, target, ctx.max_step_visits) {
+        return NextStep::Fail(format!("step {target} visit limit reached"));
+    }
+
+    if eligible(step, ctx.run_data) {
+        NextStep::Step(target)
+    } else {
+        NextStep::Wait(target)
+    }
+}
+
+/// Resolve the linear successor (`current_step + 1`). Completes when the
+/// successor is past the end of the SOP; fails when the successor falls in
+/// a gap; otherwise delegates to the shared target resolution.
+fn resolve_linear(ctx: &RouteCtx<'_>) -> NextStep {
     let next_step = ctx.run.current_step.saturating_add(1);
-    let Some(step) = ctx.sop.steps.iter().find(|step| step.number == next_step) else {
+    let Some(step) = ctx.sop.steps.iter().find(|s| s.number == next_step) else {
         return if next_step > ctx.run.total_steps {
             NextStep::Complete
         } else {
@@ -380,5 +366,136 @@ mod tests {
 
         // Should use the FIRST matching switch port (target3 = step 3), NOT linear successor (2)
         assert_eq!(resolve_next(&ctx), NextStep::Step(3));
+    }
+
+    // Regression: a true top-level `when` plus a non-empty switch with no
+    // matching port must complete, even when an explicit `routing.next` is
+    // also declared. Pre-#8771 and the pre-PR master both return Complete
+    // here; the original patch incorrectly fell through to `next`.
+    #[test]
+    fn true_guard_unmatched_switch_with_explicit_next_completes() {
+        let switch_rules = vec![SwitchRule {
+            name: "no_match".to_string(),
+            when: Some("$.steps.1.enabled == false".to_string()),
+            goto: Some(3),
+        }];
+
+        let mut step1 = step(1);
+        step1.routing.when = Some("$.steps.1.enabled == true".to_string());
+        step1.routing.switch = switch_rules;
+        // The explicit `next` would route to step 2 if reached; the
+        // unmatched switch must prevent that and complete instead.
+        step1.routing.next = Some(2);
+
+        let mut run_data = RunData::default();
+        run_data.insert_output_str(1, r#"{"enabled": true}"#);
+
+        let sop = sop_with_steps(vec![step1, step(2), step(3)]);
+        let run = run_at(1, 3);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
+    }
+
+    // Regression: same as above but no explicit `next`; the linear
+    // successor (step 2) exists and would be the natural fallthrough if
+    // the unmatched switch fell through. The unmatched switch must still
+    // complete the run.
+    #[test]
+    fn true_guard_unmatched_switch_with_linear_successor_completes() {
+        let switch_rules = vec![SwitchRule {
+            name: "no_match".to_string(),
+            when: Some("$.steps.1.enabled == false".to_string()),
+            goto: Some(3),
+        }];
+
+        let mut step1 = step(1);
+        step1.routing.when = Some("$.steps.1.enabled == true".to_string());
+        step1.routing.switch = switch_rules;
+        // No `next`, no `terminal` — natural linear fallthrough would
+        // route to step 2. The unmatched switch must complete instead.
+
+        let mut run_data = RunData::default();
+        run_data.insert_output_str(1, r#"{"enabled": true}"#);
+
+        let sop = sop_with_steps(vec![step1, step(2), step(3)]);
+        let run = run_at(1, 3);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
+    }
+
+    // Regression: same branch as above but with an absent top-level
+    // `when` (None). Absent is the same as true for the routing decision;
+    // it must also complete on an unmatched switch.
+    #[test]
+    fn absent_guard_unmatched_switch_with_linear_successor_completes() {
+        let switch_rules = vec![SwitchRule {
+            name: "no_match".to_string(),
+            when: Some("$.steps.1.enabled == false".to_string()),
+            goto: Some(3),
+        }];
+
+        let mut step1 = step(1);
+        // No `when` set on the step — treated as "always allow".
+        step1.routing.switch = switch_rules;
+
+        let run_data = RunData::default();
+
+        let sop = sop_with_steps(vec![step1, step(2), step(3)]);
+        let run = run_at(1, 3);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
+    }
+
+    // Regression: same branch with absent guard and explicit `next` —
+    // still must complete, not fall through to `next`.
+    #[test]
+    fn absent_guard_unmatched_switch_with_explicit_next_completes() {
+        let switch_rules = vec![SwitchRule {
+            name: "no_match".to_string(),
+            when: Some("$.steps.1.enabled == false".to_string()),
+            goto: Some(3),
+        }];
+
+        let mut step1 = step(1);
+        step1.routing.switch = switch_rules;
+        step1.routing.next = Some(2);
+
+        let run_data = RunData::default();
+
+        let sop = sop_with_steps(vec![step1, step(2), step(3)]);
+        let run = run_at(1, 3);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
+    }
+
+    // Regression: false top-level `when` + `terminal: true` + an
+    // available linear successor — terminal must win. Lifts the
+    // precedence note out of prose and pins it as executable behavior.
+    #[test]
+    fn false_guard_terminal_with_available_successor_completes() {
+        let mut step1 = step(1);
+        step1.routing.when = Some("$.steps.1.enabled == true".to_string());
+        step1.routing.terminal = true;
+        // Also wire a non-empty switch with a catch-all so the test would
+        // catch a regression that lets the switch evaluate when guard is
+        // false. With terminal=true and a false guard, the answer must be
+        // Complete regardless.
+        step1.routing.switch = vec![SwitchRule {
+            name: "catch_all".to_string(),
+            when: None,
+            goto: Some(2),
+        }];
+
+        let run_data = RunData::default();
+
+        let sop = sop_with_steps(vec![step1, step(2), step(3)]);
+        let run = run_at(1, 3);
+        let ctx = route_ctx(&sop, &run, &run_data);
+
+        assert_eq!(resolve_next(&ctx), NextStep::Complete);
     }
 }
