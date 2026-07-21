@@ -1,14 +1,5 @@
 #![allow(dead_code)]
 
-/// A single help entry: one or more keys that trigger the same action.
-///
-/// The renderer joins keys with " / " so you don't have to format manually.
-/// An entry with all-empty keys/action renders as a blank spacer row.
-///
-/// Keys are owned `String`s so callers can pass live chord displays resolved
-/// from the keymap (`Action::Variant.resolved()[..].display()`) instead of
-/// hardcoded literals — the help always reflects the actual bindings, including
-/// user overrides.
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
     /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
@@ -60,21 +51,6 @@ impl HelpEntry {
     }
 }
 
-/// A node in the help context tree.
-///
-/// The help system cascades: Pane → Tab → Widget (or Screen → Tab → Widget
-/// for the config pane). Each level produces one `HelpNode`. The modal renders
-/// them depth-first:
-///
-///   [title]
-///   [description, soft-wrapped]
-///   key   action
-///   key   action
-///   ── dim separator ──
-///   [child title]
-///   ...
-///
-/// Any field may be empty/None — the renderer skips it cleanly.
 #[derive(Debug, Clone, Default)]
 pub struct HelpNode {
     /// Short label shown as a dim section header (e.g. "Tab", "Widget"). None = no header.
@@ -125,7 +101,6 @@ use ratatui::{
 };
 
 /// A one-row context-window usage bar.
-///
 /// Renders left-aligned into whatever `Rect` you hand it.
 /// Returns `None` from `widget()` when there is nothing to show.
 pub struct CtxBar {
@@ -318,11 +293,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState},
 };
 
-/// A reusable centered modal list picker over a `Vec<String>`. Owns its items,
-/// cursor, and an optional title; renders a bordered, scrollable list with the
-/// highlighted row styled. The caller owns the state (see [`PickerState`]) and
-/// keys; this type is the renderer plus cursor-movement helpers so other
-/// surfaces can reuse it.
 pub struct PickerModal<'a> {
     title: &'a str,
     items: &'a [String],

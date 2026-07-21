@@ -35,14 +35,6 @@ pub struct Route {
     pub model: String,
 }
 
-/// Multi-model router — routes requests to different model_provider+model combos
-/// based on a task hint encoded in the model parameter.
-///
-/// The model parameter can be:
-/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default model_provider
-/// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
-///
-/// This wraps multiple pre-created model_providers and selects the right one per request.
 pub struct RouterModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -54,7 +46,6 @@ pub struct RouterModelProvider {
 
 impl RouterModelProvider {
     /// Create a new router with a default model_provider and optional routes.
-    ///
     /// `model_providers` is a list of (name, model_provider) pairs. The first one is the default.
     /// `routes` maps hint names to Route structs containing provider_name and model.
     pub fn new(
@@ -93,14 +84,6 @@ impl RouterModelProvider {
             default_model,
         }
     }
-    /// Resolve a model parameter to the cheapest qualifying route based on pricing.
-    ///
-    /// If the model starts with `"hint:cost-optimized"` or `"hint:cheapest"`, this
-    /// method scores each route by `input_price + output_price` (a simple proxy for
-    /// total cost), optionally filtering by capability requirements, and returns the
-    /// cheapest qualifying route.
-    ///
-    /// Falls back to the default route when no pricing data matches.
     pub fn resolve_cost_optimized(
         &self,
         model: &str,
@@ -156,11 +139,6 @@ impl RouterModelProvider {
         (self.default_index, self.default_model.clone())
     }
 
-    /// Resolve a model parameter to a (model_provider, actual_model) pair.
-    ///
-    /// If the model starts with "hint:", look up the hint in the route table.
-    /// Otherwise, use the default model_provider with the given model name.
-    /// Resolve a model parameter to a (provider_index, actual_model) pair.
     fn resolve(&self, model: &str) -> (usize, String) {
         if let Some(hint) = model.strip_prefix("hint:") {
             if let Some((idx, resolved_model)) = self.routes.get(hint) {
@@ -180,13 +158,6 @@ impl RouterModelProvider {
     }
 }
 
-/// A cost-optimized routing strategy that selects the cheapest qualifying
-/// model_provider from the route table based on per-provider pricing maps.
-///
-/// Pricing is keyed by model_provider name (the alias under
-/// `[providers.models.<model_provider>.<alias>]`); each model_provider's pricing map
-/// holds user-defined keys (model identifiers, optionally suffixed with
-/// `.input` / `.output`) mapped to USD-per-1M-token rates.
 #[derive(Debug, Clone)]
 pub struct CostOptimizedStrategy {
     /// Per-provider pricing data (model_provider name → user-keyed pricing map).
@@ -309,19 +280,6 @@ impl ModelProvider for RouterModelProvider {
             .any(|(_, model_provider)| model_provider.supports_streaming_tool_events())
     }
 
-    fn streams_text_with_tools(&self) -> bool {
-        // stream_chat resolves the model hint to one child, but this query is
-        // not model-aware. Answer conservatively: only claim the capability
-        // when every selectable route honors it, so a capable child can never
-        // open the runtime live gate for a route that would leak text-tool
-        // syntax.
-        !self.model_providers.is_empty()
-            && self
-                .model_providers
-                .iter()
-                .all(|(_, model_provider)| model_provider.streams_text_with_tools())
-    }
-
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -368,6 +326,26 @@ impl ModelProvider for RouterModelProvider {
             temperature,
             options,
         )
+    }
+
+    fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+        // Mirror `supports_vision()`'s delegation to the default provider so the
+        // wrapped surface's `capabilities().vision` stays consistent with
+        // `supports_vision()` when an inner capability decorator (e.g. the config
+        // `vision` override) has patched it. Without this, `capabilities()` would
+        // fall back to the trait default and disagree with `supports_vision()`.
+        self.model_providers
+            .get(self.default_index)
+            .map(|(_, p)| p.capabilities())
+            .unwrap_or_default()
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .map(|(_, provider)| provider.capabilities_for_model(&resolved_model))
+            .unwrap_or_default()
     }
 
     fn supports_vision(&self) -> bool {
@@ -427,7 +405,6 @@ mod tests {
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
         vision: bool,
-        streams_text: bool,
     }
 
     impl MockModelProvider {
@@ -437,17 +414,11 @@ mod tests {
                 response,
                 last_model: parking_lot::Mutex::new(String::new()),
                 vision: false,
-                streams_text: false,
             }
         }
 
         fn with_vision(mut self, vision: bool) -> Self {
             self.vision = vision;
-            self
-        }
-
-        fn with_streams_text(mut self, streams_text: bool) -> Self {
-            self.streams_text = streams_text;
             self
         }
 
@@ -476,10 +447,6 @@ mod tests {
 
         fn supports_vision(&self) -> bool {
             self.vision
-        }
-
-        fn streams_text_with_tools(&self) -> bool {
-            self.streams_text
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
@@ -1373,7 +1340,7 @@ mod tests {
         assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
     }
 
-    // Regression for #6589: supports_vision() must reflect the default provider,
+    // supports_vision() must reflect the default provider,
     // not .any() across all sub-providers. Otherwise the multimodal.vision_provider
     // fallback in run_tool_call_loop and the image-marker stripping in the context
     // compressor are silently bypassed in mixed-provider configurations.
@@ -1425,51 +1392,79 @@ mod tests {
         assert!(router.supports_vision());
     }
 
-    #[test]
-    fn streams_text_with_tools_false_when_any_selectable_route_lacks_it() {
-        let capable = Box::new(MockModelProvider::new("ok").with_streams_text(true));
-        let incapable = Box::new(MockModelProvider::new("nope").with_streams_text(false));
-
+    #[tokio::test]
+    async fn model_capability_matches_the_route_that_receives_dispatch() {
+        let default = Arc::new(MockModelProvider::new("default").with_vision(true));
+        let text_route = Arc::new(MockModelProvider::new("text").with_vision(false));
         let router = RouterModelProvider::new(
             "test",
             vec![
-                ("capable".into(), capable as Box<dyn ModelProvider>),
-                ("incapable".into(), incapable as Box<dyn ModelProvider>),
+                (
+                    "default".into(),
+                    Box::new(Arc::clone(&default)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(Arc::clone(&text_route)) as Box<dyn ModelProvider>,
+                ),
             ],
             vec![(
-                "hint:incapable".into(),
+                "text".into(),
                 Route {
-                    provider_name: "incapable".into(),
-                    model: "incapable-model".into(),
+                    provider_name: "text".into(),
+                    model: "text-model".into(),
                 },
             )],
-            "default-model".into(),
+            "vision-model".into(),
         );
 
         assert!(
-            !router.streams_text_with_tools(),
-            "router must not claim streams_text_with_tools when a selectable route lacks it, or a capable child could open the live gate for the incapable route"
+            router.capabilities_for_model("vision-model").vision,
+            "an unhinted request dispatches to the vision-capable default"
         );
+        assert!(
+            !router.capabilities_for_model("hint:text").vision,
+            "the hinted request must report the selected text route"
+        );
+        assert_eq!(
+            router
+                .chat_with_system(None, "hello", "hint:text", None)
+                .await
+                .expect("text route succeeds"),
+            "text"
+        );
+        assert_eq!(default.call_count(), 0);
+        assert_eq!(text_route.call_count(), 1);
+        assert_eq!(text_route.last_model(), "text-model");
     }
 
     #[test]
-    fn streams_text_with_tools_true_only_when_every_route_supports_it() {
-        let a = Box::new(MockModelProvider::new("a").with_streams_text(true));
-        let b = Box::new(MockModelProvider::new("b").with_streams_text(true));
-
+    fn capabilities_vision_matches_supports_vision_on_final_wrapped_router() {
+        // Regression: the final wrapped RouterModelProvider must report the SAME
+        // `vision` on `capabilities().vision` and `supports_vision()`. The default
+        // provider carries the config `vision` decorator forcing vision ON; the
+        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // delegated to the default provider, the outer returned the trait default
+        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        let default_provider = crate::vision_override::VisionOverrideProvider::new(
+            Box::new(MockModelProvider::new("forced").with_vision(false)) as Box<dyn ModelProvider>,
+            true,
+        );
         let router = RouterModelProvider::new(
             "test",
-            vec![
-                ("a".into(), a as Box<dyn ModelProvider>),
-                ("b".into(), b as Box<dyn ModelProvider>),
-            ],
+            vec![(
+                "default".into(),
+                Box::new(default_provider) as Box<dyn ModelProvider>,
+            )],
             vec![],
             "default-model".into(),
         );
 
+        assert!(router.supports_vision());
         assert!(
-            router.streams_text_with_tools(),
-            "router may claim streams_text_with_tools only when every selectable route honors it"
+            router.capabilities().vision,
+            "outer capabilities().vision must match the delegated supports_vision()"
         );
+        assert_eq!(router.capabilities().vision, router.supports_vision());
     }
 }

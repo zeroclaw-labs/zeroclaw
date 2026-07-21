@@ -1,10 +1,4 @@
 //! Integration tests for WhatsApp webhook signature verification.
-//!
-//! These tests validate that:
-//! 1. Webhooks with valid signatures are accepted
-//! 2. Webhooks with invalid signatures are rejected
-//! 3. Webhooks with missing signatures are rejected
-//! 4. Webhooks are rejected even if JSON is valid but signature is bad
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

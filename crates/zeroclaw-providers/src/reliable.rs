@@ -12,12 +12,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-// ── ModelProvider Fallback Notification ──────────────────────────────────────
-// When ReliableModelProvider uses a fallback (different model_provider or model than
-// requested), it records the details here so channel code can notify the user.
-// Uses tokio::task_local to avoid cross-request leakage between concurrent
-// users (the old global static had a race window).
-
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
 pub struct ProviderFallbackInfo {
@@ -69,18 +63,6 @@ fn record_provider_fallback(
     });
 }
 
-// ── Error Classification ─────────────────────────────────────────────────
-// Errors are split into retryable (transient server/network failures) and
-// non-retryable (permanent client errors). This distinction drives whether
-// the retry loop continues, falls back to the next model_provider, or aborts
-// immediately — avoiding wasted latency on errors that cannot self-heal.
-
-/// Return a short user-facing string for transient provider errors, or `None`
-/// for errors that warrant showing the technical detail to the user.
-///
-/// Callers should use this instead of forwarding raw error strings so that
-/// transient overloads and rate-limits produce a brief, friendly reply rather
-/// than a multi-line technical dump.
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     let msg = err.to_string();
     // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
@@ -197,11 +179,6 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| msg_lower.contains(hint))
 }
 
-/// Check if an error is a tool schema validation failure (e.g. Groq returning
-/// "tool call validation failed: attempted to call tool '...' which was not in request").
-/// These errors should NOT be classified as non-retryable because the model_provider's
-/// built-in fallback logic (`compatible.rs::is_native_tool_schema_unsupported`)
-/// can recover by switching to prompt-guided tool instructions.
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
@@ -243,12 +220,6 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
-/// Check if a 429 is a business/quota-plan error that retries cannot fix.
-///
-/// Examples:
-/// - plan does not include requested model
-/// - insufficient balance / package not active
-/// - known model_provider business codes (e.g. Z.AI: 1311, 1113)
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     if !is_rate_limited(err) {
         return false;
@@ -626,15 +597,6 @@ fn push_failure(
     failures.push(failure);
 }
 
-/// True when a syntactically-successful response carries no usable content:
-/// no text, no tool calls, and no reasoning. Such "empty completions" (a 2xx
-/// with a null/blank message, a 0-token sample, a content-filter soft block, or
-/// a truncated stream) are never a legitimate final answer — they are almost
-/// always a transient provider hiccup — so callers re-roll them like a
-/// retryable error instead of surfacing a blank turn.
-///
-/// Prompt-guided tool calls embed the call in `text`, so a response carrying
-/// `<tool_call>…` is non-empty here and is never misclassified.
 fn is_empty_completion(resp: &ChatResponse) -> bool {
     resp.text_or_empty().trim().is_empty()
         && resp.tool_calls.is_empty()
@@ -643,16 +605,6 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
             .as_deref()
             .is_none_or(|r| r.trim().is_empty())
 }
-
-// ── Resilient ModelProvider Wrapper ────────────────────────────────────────────
-// Two-level strategy: model_provider chain → retry loop.
-//   Outer loop: iterate registered model_providers in priority order. The production
-//               caller always wires a single primary; tests construct multi-
-//               element chains directly to exercise failover semantics.
-//   Inner loop: retry the same (model_provider, model) pair with exponential backoff,
-//               rotating API keys on rate-limit errors.
-// Loop invariant: `failures` accumulates every failed attempt so the final
-// error message gives operators a complete diagnostic trail.
 
 pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
@@ -690,7 +642,6 @@ pub struct ReliableModelProvider {
     /// Per-model failover chains. Test-only: model_name → [alt1, alt2, ...].
     model_fallbacks: HashMap<String, Vec<String>>,
     /// Transient provider cooldowns after retryable rate limits.
-    ///
     /// Source of truth: live provider 429 / Retry-After evidence observed by
     /// this wrapper. It is intentionally in-memory and per wrapper instance.
     rate_limit_cooldowns: Mutex<HashMap<String, Instant>>,
@@ -736,8 +687,6 @@ impl ReliableModelProvider {
         self
     }
 
-    /// Test-only hook: install per-model failover chains. Production builds
-    /// never call this — the schema has no surface for it.
     #[cfg(test)]
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
@@ -1317,6 +1266,38 @@ impl ModelProvider for ReliableModelProvider {
         )
     }
 
+    fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+        let mut capabilities = self
+            .model_providers
+            .first()
+            .map(|entry| entry.provider.capabilities())
+            .unwrap_or_default();
+        // A request may advance past the primary after a retryable failure.
+        // Report vision only when every reachable provider can accept images;
+        // otherwise the turn engine must select a dedicated vision route before
+        // dispatch instead of admitting an image that a fallback could reject.
+        capabilities.vision = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider.supports_vision());
+        capabilities
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
+        let mut capabilities = self
+            .model_providers
+            .first()
+            .map(|entry| entry.provider.capabilities_for_model(model))
+            .unwrap_or_default();
+        capabilities.vision = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider.capabilities_for_model(model).vision);
+        capabilities
+    }
+
     fn supports_native_tools(&self) -> bool {
         self.model_providers
             .first()
@@ -1325,10 +1306,7 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_providers
-            .first()
-            .map(|entry| entry.provider.supports_vision())
-            .unwrap_or(false)
+        self.capabilities().vision
     }
 
     async fn chat_with_tools(
@@ -1761,12 +1739,6 @@ impl ModelProvider for ReliableModelProvider {
             .any(|entry| entry.provider.supports_streaming_tool_events())
     }
 
-    fn streams_text_with_tools(&self) -> bool {
-        self.model_providers
-            .iter()
-            .any(|entry| entry.provider.streams_text_with_tools())
-    }
-
     fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -1783,10 +1755,7 @@ impl ModelProvider for ReliableModelProvider {
                 continue;
             }
 
-            if needs_tool_events
-                && !model_provider.supports_streaming_tool_events()
-                && !model_provider.streams_text_with_tools()
-            {
+            if needs_tool_events && !model_provider.supports_streaming_tool_events() {
                 continue;
             }
 
@@ -1986,12 +1955,6 @@ impl ModelProvider for ReliableModelProvider {
 
 impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        // Delegate to the primary (first) inner provider so the on-disk
-        // model_provider_type reflects the concrete provider
-        // (`anthropic`, `openai`, …) rather than the wrapper kind.
-        // If the wrapper somehow held zero providers we fall back to
-        // the parent `System` role — log emissions in that degenerate
-        // state are not user-facing.
         match self.model_providers.first() {
             Some(entry) => ::zeroclaw_api::attribution::Attributable::role(&*entry.provider),
             None => ::zeroclaw_api::attribution::Role::System,
@@ -3560,8 +3523,6 @@ mod tests {
 
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
 
-    /// Gap 2: `chat()` returns an aggregated error when all model_providers fail,
-    /// matching behavior of `returns_aggregated_error_when_all_providers_fail`.
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
         let model_provider = ReliableModelProvider::new(
@@ -3670,8 +3631,6 @@ mod tests {
 
     // Arc<NativeModelAwareMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    /// Gap 3: `chat()` tries fallback models on failure,
-    /// matching behavior of `model_failover_tries_fallback_model`.
     #[tokio::test]
     async fn chat_tries_model_failover_on_failure() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3714,8 +3673,6 @@ mod tests {
         assert_eq!(seen[1], "claude-sonnet");
     }
 
-    /// Gap 4: `chat()` skips retries on non-retryable errors (401, 403, etc.),
-    /// matching behavior of `skips_retries_on_non_retryable_error`.
     #[tokio::test]
     async fn chat_skips_non_retryable_errors() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
@@ -4005,7 +3962,6 @@ mod tests {
     struct StreamingToolEventMock {
         stream_calls: Arc<AtomicUsize>,
         supports_tool_events: bool,
-        streams_text_with_tools: bool,
     }
 
     impl StreamingToolEventMock {
@@ -4013,15 +3969,6 @@ mod tests {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
                 supports_tool_events,
-                streams_text_with_tools: false,
-            }
-        }
-
-        fn text_with_tools() -> Self {
-            Self {
-                stream_calls: Arc::new(AtomicUsize::new(0)),
-                supports_tool_events: false,
-                streams_text_with_tools: true,
             }
         }
     }
@@ -4046,10 +3993,6 @@ mod tests {
             self.supports_tool_events
         }
 
-        fn streams_text_with_tools(&self) -> bool {
-            self.streams_text_with_tools
-        }
-
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
@@ -4058,13 +4001,6 @@ mod tests {
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            if self.streams_text_with_tools && !self.supports_tool_events {
-                return stream::iter(vec![
-                    Ok(StreamEvent::TextDelta(StreamChunk::delta("answer"))),
-                    Ok(StreamEvent::Final),
-                ])
-                .boxed();
-            }
             stream::iter(vec![
                 Ok(StreamEvent::ToolCall(super::super::traits::ToolCall {
                     id: "call_1".to_string(),
@@ -4186,48 +4122,6 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn stream_chat_accepts_text_with_tools_provider() {
-        let provider = Arc::new(StreamingToolEventMock::text_with_tools());
-        let model_provider = ReliableModelProvider::new(
-            "test",
-            vec![(
-                "primary".into(),
-                Box::new(Arc::clone(&provider)) as Box<dyn ModelProvider>,
-            )],
-            0,
-            1,
-        );
-
-        let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec::new(
-            "shell",
-            "run shell",
-            serde_json::json!({"type": "object"}),
-        )];
-        let mut stream = model_provider.stream_chat(
-            ChatRequest {
-                messages: &messages,
-                tools: Some(&tools),
-                thinking: None,
-            },
-            "model",
-            Some(0.0),
-            StreamOptions::new(true),
-        );
-
-        let first = stream.next().await.unwrap().unwrap();
-        let second = stream.next().await.unwrap().unwrap();
-        assert!(stream.next().await.is_none());
-
-        match first {
-            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "answer"),
-            other => panic!("expected text delta from text-with-tools provider, got {other:?}"),
-        }
-        assert!(matches!(second, StreamEvent::Final));
-        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     }
 
     // ── stream_chat_with_history failover tests ──────────────────────
@@ -4503,11 +4397,11 @@ mod tests {
         .await;
     }
 
-    // Regression for #6589: ReliableModelProvider::supports_vision() must reflect the
-    // primary (first) provider, not .any() across the fallback chain. This mirrors
-    // supports_native_tools() which already uses .first().
+    // Vision must be safe for every provider the request can reach. Unlike
+    // native tools, a fallback cannot recover after receiving an unsupported
+    // image payload, so mixed chains report non-vision at the outer gate.
     #[test]
-    fn supports_vision_reflects_first_provider_not_any_fallback() {
+    fn supports_vision_requires_every_fallback_to_support_images() {
         struct VisionMock(bool);
 
         #[async_trait]
@@ -4576,7 +4470,168 @@ mod tests {
             0,
         );
 
+        assert!(
+            !provider.supports_vision(),
+            "a text-only fallback makes the effective chain non-vision even when the primary supports images"
+        );
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
         assert!(provider.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn model_capability_rejects_images_before_text_only_fallback_dispatch() {
+        struct VisionDispatchMock {
+            vision: bool,
+            fail: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for VisionDispatchMock {
+            fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+                crate::traits::ProviderCapabilities {
+                    vision: self.vision,
+                    ..Default::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail {
+                    anyhow::bail!("503 unavailable");
+                }
+                Ok("fallback".to_string())
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for VisionDispatchMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "VisionDispatchMock"
+            }
+        }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(VisionDispatchMock {
+                        vision: true,
+                        fail: true,
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(VisionDispatchMock {
+                        vision: false,
+                        fail: false,
+                        calls: Arc::clone(&fallback_calls),
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(
+            !provider.capabilities_for_model("requested-model").vision,
+            "the pre-dispatch gate must account for the text-only fallback"
+        );
+        assert_eq!(
+            provider
+                .simple_chat("hello", "requested-model", None)
+                .await
+                .expect("fallback succeeds"),
+            "fallback"
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            1,
+            "the text-only provider is an actual reachable dispatch target"
+        );
+    }
+
+    #[test]
+    fn capabilities_vision_matches_supports_vision_on_final_wrapped_reliable() {
+        // Regression: the final wrapped ReliableModelProvider must report the SAME
+        // `vision` on `capabilities().vision` and `supports_vision()`. Wrap the
+        // config `vision` decorator forcing vision ON over a non-vision inner; the
+        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // delegated to the primary, the outer returned the trait default
+        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        struct PlainMock;
+        #[async_trait]
+        impl ModelProvider for PlainMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PlainMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainMock"
+            }
+        }
+
+        let inner = crate::vision_override::VisionOverrideProvider::new(
+            Box::new(PlainMock) as Box<dyn ModelProvider>,
+            true,
+        );
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![("primary".into(), Box::new(inner) as Box<dyn ModelProvider>)],
+            0,
+            0,
+        );
+        assert!(provider.supports_vision());
+        assert!(
+            provider.capabilities().vision,
+            "outer capabilities().vision must match the delegated supports_vision()"
+        );
+        assert_eq!(provider.capabilities().vision, provider.supports_vision());
     }
 
     #[tokio::test]
