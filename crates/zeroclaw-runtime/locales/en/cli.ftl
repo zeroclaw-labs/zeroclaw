@@ -1056,3 +1056,5 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 
+# ── Gateway WebSocket lifecycle ──
+cli-ws-session-turn-active = This session already has a running turn. Wait for it to finish or abort it before sending another message.

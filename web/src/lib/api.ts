@@ -12,6 +12,7 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  SessionStateResponse,
   TuiEntry,
 } from "../types/api";
 import type { components } from "./api-generated";
@@ -23,9 +24,22 @@ import { apiOrigin, basePath } from "./basePath";
 // ---------------------------------------------------------------------------
 
 export class UnauthorizedError extends Error {
+  public readonly status = 401;
+
   constructor() {
     super("Unauthorized");
     this.name = "UnauthorizedError";
+  }
+}
+
+/** An HTTP failure whose body does not use a structured API error envelope. */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
   }
 }
 
@@ -162,7 +176,10 @@ export async function apiFetch<T = unknown>(
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
+    throw new HttpError(
+      result.status,
+      `API ${result.status}: ${result.text || result.statusText}`,
+    );
   }
 
   // Only 204 No Content is a genuinely empty success. A non-204 success with
@@ -2104,6 +2121,13 @@ export function getSessionMessages(
 ): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+/** Resolve the canonical lifecycle state for a gateway chat session. */
+export function getSessionState(id: string): Promise<SessionStateResponse> {
+  return apiFetch<SessionStateResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/state`,
   );
 }
 

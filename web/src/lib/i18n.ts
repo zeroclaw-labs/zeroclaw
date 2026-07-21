@@ -1404,6 +1404,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.history_trimmed_unknown_reason': 'history limit exceeded',
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',
+    'agent.session_recovery_error': 'Could not verify whether this session still has a running turn. Reconnect after checking authentication and gateway availability.',
     'agent.copy_message': 'Copy message',
     'agent.connected_status': 'Connected',
     'agent.disconnected_status': 'Disconnected',
