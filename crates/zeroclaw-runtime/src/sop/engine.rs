@@ -2360,6 +2360,7 @@ impl SopEngine {
                     output: reason.clone(),
                     started_at: now.clone(),
                     completed_at: Some(now.clone()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 });
             }
@@ -3213,6 +3214,7 @@ impl SopEngine {
             output: recorded_output,
             started_at,
             completed_at,
+            effective_agent: None,
             tool_calls: Vec::new(),
         });
 
@@ -3291,6 +3293,7 @@ impl SopEngine {
                 output: reason.clone(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                effective_agent: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -3403,6 +3406,7 @@ impl SopEngine {
                     output: output.to_string(),
                     started_at: state.persisted_at.clone(),
                     completed_at: Some(state.persisted_at.clone()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 });
             }
@@ -5376,6 +5380,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5394,6 +5399,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5423,6 +5429,7 @@ mod tests {
                     output: "valve stuck".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5573,6 +5580,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5615,6 +5623,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5647,6 +5656,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5682,6 +5692,7 @@ mod tests {
                     output: "first failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5706,6 +5717,7 @@ mod tests {
                     output: "second failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5726,6 +5738,7 @@ mod tests {
                     output: "third failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5754,6 +5767,7 @@ mod tests {
                     output: "needs compensation".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5780,6 +5794,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5825,6 +5840,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -5844,6 +5860,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6661,6 +6678,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6674,6 +6692,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -6990,6 +7009,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -7163,6 +7183,7 @@ mod tests {
                     output: "fabricated".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -7208,6 +7229,7 @@ mod tests {
                     output: "fabricated".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -7246,6 +7268,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -7312,6 +7335,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -7325,6 +7349,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -10099,6 +10124,7 @@ mod tests {
                         output: "ok".into(),
                         started_at: now_iso8601(),
                         completed_at: Some(now_iso8601()),
+                        effective_agent: None,
                         tool_calls: Vec::new(),
                     },
                 )
@@ -10141,6 +10167,7 @@ mod tests {
                         output: "ok".into(),
                         started_at: now_iso8601(),
                         completed_at: Some(now_iso8601()),
+                        effective_agent: None,
                         tool_calls: Vec::new(),
                     },
                 )
@@ -10449,6 +10476,7 @@ type = "manual"
                     output: "step1-output".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -10467,6 +10495,7 @@ type = "manual"
                     output: "step2-output".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -10561,6 +10590,7 @@ type = "manual"
                     output: "boom".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -10610,6 +10640,7 @@ type = "manual"
                     output: "step1-output".into(),
                     started_at: started.clone(),
                     completed_at: Some(completed.clone()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )
@@ -10663,6 +10694,7 @@ type = "manual"
                     output: "s3-out".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    effective_agent: None,
                     tool_calls: Vec::new(),
                 },
             )

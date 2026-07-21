@@ -479,6 +479,27 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             .await
     }
 
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.log_audit(
+            AuditOp::Store,
+            Some(key),
+            options.namespace.as_deref(),
+            session_id,
+            None,
+        );
+        self.inner
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
+            .await
+    }
+
     async fn store_with_agent(
         &self,
         key: &str,
