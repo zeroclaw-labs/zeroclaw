@@ -5,6 +5,8 @@ pub mod acp_session_store;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
+#[cfg(feature = "backend-oracle")]
+pub mod session_oracle;
 #[cfg(feature = "backend-postgres")]
 pub mod session_postgres;
 pub mod session_queue;
@@ -137,6 +139,17 @@ pub fn make_session_backend(
         }
         #[cfg(not(feature = "backend-oracle"))]
         "oracle" => Err(uncompiled_backend_error("oracle")),
+        #[cfg(feature = "backend-oracle")]
+        "oracle" => {
+            // The blocking ODPI-C client uses OCI's native session pool. The
+            // credentials, DSN, and pool size resolve from the canonical
+            // dotted-path channel configuration environment overrides.
+            let backend = session_oracle::OracleSessionBackend::new(
+                workspace_dir,
+                session_oracle::read_pool_size(),
+            )?;
+            Ok(Arc::new(backend))
+        }
         #[cfg(not(feature = "backend-db2"))]
         "db2" => Err(uncompiled_backend_error("db2")),
         other => {
@@ -351,6 +364,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "backend-oracle"))]
     fn make_session_backend_oracle_fail_fast_when_feature_disabled() {
         assert_fail_fast_uncompiled("oracle");
     }

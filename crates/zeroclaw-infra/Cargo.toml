@@ -52,7 +52,7 @@ tokio = { version = "1.50", default-features = false, features = ["sync", "time"
 backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
 backend-mysql = ["dep:mysql"]
 backend-mariadb = ["dep:mysql"]
-backend-oracle = []
+backend-oracle = ["dep:oracle"]
 backend-db2 = []
 
 [dependencies.mysql]
@@ -67,6 +67,11 @@ version = "25"
 # fails to resolve with "You need to choose a zlib backend").
 default-features = false
 features = ["chrono", "minimal"]
+optional = true
+
+[dependencies.oracle]
+version = "0.6.3"
+features = ["chrono"]
 optional = true
 
 [dependencies.postgres]
