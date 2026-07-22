@@ -292,8 +292,8 @@ Examples:
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
-        /// Telegram channel alias to bind to (the <alias> in
-        /// channels.telegram.<alias>). Defaults to `default`.
+        /// Telegram channel alias to bind to (the `<alias>` in
+        /// `channels.telegram.<alias>`). Defaults to `default`.
         #[arg(long, default_value = "default")]
         alias: String,
     },

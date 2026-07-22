@@ -170,7 +170,7 @@ impl std::fmt::Display for ResumeAtCapacity {
 
 impl std::error::Error for ResumeAtCapacity {}
 
-/// True when `err` is the typed [`ResumeAtCapacity`] backpressure marker (an
+/// True when `err` is the typed `ResumeAtCapacity` backpressure marker (an
 /// over-cap resume was refused), as opposed to a store fault. Lets a caller in
 /// another module or crate (e.g. `resolve_gate`, or the gateway resume endpoint)
 /// render it as backpressure (HTTP 503) rather than a fault without depending on
