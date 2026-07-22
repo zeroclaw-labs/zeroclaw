@@ -956,7 +956,7 @@ This ensures a tool outside the requested subset can never run, regardless of wh
 - **Simple conversations**: Use `x-session-key` + single message, rely on backend auto-load
 - **Precise context control**: Provide full `messages` array (> 1 entry) for consistent context
 - **System prompts**: Pass via `system` role messages; they don't affect session persistence
-- **Cross-transport sessions**: WebSocket connections load session history once at connection setup and reuse the in-memory agent for subsequent turns. If HTTP chat completions endpoints modify the same session while a WebSocket connection is open, the WebSocket's next turn will not reflect HTTP-side changes. Use separate sessions for different transports to avoid inconsistency.
+- **Cross-transport sessions**: WebSocket connections rehydrate the agent's in-memory history from the backend before each turn, so messages appended via HTTP chat completions on the same `x-session-key` are visible to the next WebSocket turn. Both transports share one authoritative transcript in the session backend.
 
 ### 5. Tool Control
 

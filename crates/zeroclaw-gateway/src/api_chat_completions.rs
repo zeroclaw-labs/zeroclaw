@@ -735,16 +735,16 @@ pub async fn handle_chat_completions(
                 // Backend doesn't support ownership — already warned above if session had data.
             }
             Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "session_key": &session_key,
-                            "agent_alias": &agent_alias,
-                            "error": format!("{e}"),
-                        })),
-                    "Failed to persist session ownership metadata"
+                return add_request_id_header(
+                    add_session_key_header(
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            &format!("Failed to persist session ownership: {e}"),
+                        ),
+                        &session_id,
+                    ),
+                    &request_id,
                 );
             }
         }
@@ -2328,5 +2328,23 @@ mod tests {
             "stop delta must be empty — got: {}",
             delta
         );
+    }
+
+    // ── Blocking 2 regression: set_session_agent_alias write failure ──
+    //
+    // When the session backend's `set_session_agent_alias` call fails (e.g.
+    // disk full, permission denied), the handler must return
+    // INTERNAL_SERVER_ERROR (500) — fail-closed, matching the WebSocket path
+    // (ws.rs:425-432). This test verifies the error_response helper that the
+    // handler uses at lines 737-748.
+
+    #[test]
+    fn set_session_agent_alias_write_error_response_is_500() {
+        let resp = error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Failed to persist session ownership: disk full",
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

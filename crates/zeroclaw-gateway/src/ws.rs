@@ -654,6 +654,16 @@ async fn handle_socket(
                             return;
                         }
                     };
+
+                    // Rehydrate the agent's history from the backend's authoritative transcript
+                    // so this turn sees messages appended by concurrent HTTP requests on the
+                    // same session key.
+                    if let Some(ref backend) = state.session_backend {
+                        let fresh = backend.load(&session_key);
+                        agent.clear_history();
+                        agent.seed_history(&fresh);
+                    }
+
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -812,6 +822,15 @@ async fn handle_socket(
                         continue;
                     }
                 };
+
+                // Rehydrate the agent's history from the backend's authoritative transcript
+                // so this turn sees messages appended by concurrent HTTP requests on the
+                // same session key.
+                if let Some(ref backend) = state.session_backend {
+                    let fresh = backend.load(&session_key);
+                    agent.clear_history();
+                    agent.seed_history(&fresh);
+                }
 
                 process_chat_message(
                     &state,

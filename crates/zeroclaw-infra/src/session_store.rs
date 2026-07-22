@@ -185,7 +185,7 @@ impl SessionBackend for SessionStore {
                     .session_mtime(&key)
                     .map(DateTime::<Utc>::from)
                     .unwrap_or_else(Utc::now);
-                crate::session_backend::SessionMetadata {
+                let mut meta = crate::session_backend::SessionMetadata {
                     name: None,
                     created_at: last_activity,
                     last_activity,
@@ -195,7 +195,15 @@ impl SessionBackend for SessionStore {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                };
+                // Hydrate agent_alias and name from the sidecar .meta.json.
+                if let Ok(json) = std::fs::read_to_string(self.meta_path(&meta.key))
+                    && let Ok(sidecar) = serde_json::from_str::<SessionMeta>(&json)
+                {
+                    meta.agent_alias = sidecar.agent_alias;
+                    meta.name = sidecar.name;
                 }
+                meta
             })
             .collect()
     }
@@ -631,5 +639,28 @@ mod tests {
         backend.delete_session("gw_cleanup").unwrap();
         // After delete, .meta.json should also be gone
         assert!(!store.meta_path("gw_cleanup").exists());
+    }
+
+    #[test]
+    fn list_sessions_with_metadata_includes_agent_alias_from_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // Create a gateway session and stamp its alias
+        backend
+            .append("gw_test_visible", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_test_visible", "sales")
+            .unwrap();
+
+        // The session must appear in the listing with its alias
+        let listed = backend.list_sessions_with_metadata();
+        let row = listed
+            .iter()
+            .find(|m| m.key == "gw_test_visible")
+            .expect("gateway session should appear in metadata listing");
+        assert_eq!(row.agent_alias.as_deref(), Some("sales"));
     }
 }

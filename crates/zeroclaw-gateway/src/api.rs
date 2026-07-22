@@ -1587,30 +1587,45 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// Error returned when a session key cannot be resolved unambiguously
+/// because both `gw_{id}` and `{id}` exist in the backend.
+#[derive(Debug)]
+struct SessionKeyResolutionError {
+    id: String,
+    gw_candidate: String,
+    bare_candidate: String,
+}
+
 /// Resolve a session key from a caller-supplied ID by consulting the backend.
 ///
 /// Strategy (in order):
 /// 1. `gw_` prefix → already a full gateway key (identity after sanitize).
-/// 2. Try `gw_{sanitize(id)}` — covers callers using the `session_id` display
-///    form returned by `GET /api/sessions`.
-/// 3. Try `sanitize(id)` bare — covers channel keys.
-/// 4. Default to `gw_{sanitize(id)}` — new or not-yet-created gateway sessions.
+/// 2. Probe both `gw_{sanitize(id)}` and `{sanitize(id)}` bare.
+///    - Both exist → `Err(SessionKeyResolutionError)` — ambiguous.
+///    - Only `gw_` exists → return `gw_` form.
+///    - Only bare exists → return bare form (channel key).
+///    - Neither exists → default to `gw_{sanitize(id)}`.
 fn resolve_session_key(
     id: &str,
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
-) -> String {
+) -> Result<String, SessionKeyResolutionError> {
     if id.starts_with("gw_") {
-        return zeroclaw_api::session_keys::sanitize_session_key(id);
+        return Ok(zeroclaw_api::session_keys::sanitize_session_key(id));
     }
     let bare = zeroclaw_api::session_keys::sanitize_session_key(id);
     let gw_key = format!("gw_{}", bare);
-    if backend.session_exists(&gw_key) {
-        return gw_key;
+    let gw_exists = backend.session_exists(&gw_key);
+    let bare_exists = backend.session_exists(&bare);
+    match (gw_exists, bare_exists) {
+        (true, true) => Err(SessionKeyResolutionError {
+            id: id.to_string(),
+            gw_candidate: gw_key,
+            bare_candidate: bare,
+        }),
+        (true, false) => Ok(gw_key),
+        (false, true) => Ok(bare),
+        (false, false) => Ok(gw_key),
     }
-    if backend.session_exists(&bare) {
-        return bare;
-    }
-    gw_key
 }
 
 // ── Session API handlers ─────────────────────────────────────────
@@ -1701,7 +1716,20 @@ pub async fn handle_api_session_messages(
     // Accept either the full DB key (channel-driven sessions like
     // `discord.clamps_…`) or the stripped form (legacy callers that pass
     // just the UUID for gateway sessions).
-    let session_key = resolve_session_key(&id, backend.as_ref());
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
+                    "candidates": [e.gw_candidate, e.bare_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                })),
+            ).into_response();
+        }
+    };
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1749,7 +1777,20 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = resolve_session_key(&id, backend.as_ref());
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
+                    "candidates": [e.gw_candidate, e.bare_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                })),
+            ).into_response();
+        }
+    };
     if !backend
         .list_sessions()
         .iter()
@@ -1831,7 +1872,20 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = resolve_session_key(&id, backend.as_ref());
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
+                    "candidates": [e.gw_candidate, e.bare_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                })),
+            ).into_response();
+        }
+    };
 
     let token = state
         .cancel_tokens
@@ -1913,7 +1967,20 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = resolve_session_key(&id, backend.as_ref());
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
+                    "candidates": [e.gw_candidate, e.bare_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                })),
+            ).into_response();
+        }
+    };
 
     // Verify the session exists before renaming
     let sessions = backend.list_sessions();
@@ -1987,7 +2054,20 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = resolve_session_key(&id, backend.as_ref());
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
+                    "candidates": [e.gw_candidate, e.bare_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                })),
+            ).into_response();
+        }
+    };
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -2027,7 +2107,20 @@ pub async fn handle_api_session_abort(
     }
 
     let session_key = match state.session_backend.as_ref() {
-        Some(backend) => resolve_session_key(&id, backend.as_ref()),
+        Some(backend) => match resolve_session_key(&id, backend.as_ref()) {
+            Ok(key) => key,
+            Err(e) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "ambiguous_session_key",
+                        "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
+                        "candidates": [e.gw_candidate, e.bare_candidate],
+                        "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                    })),
+                ).into_response();
+            }
+        },
         None => format!(
             "gw_{}",
             zeroclaw_api::session_keys::sanitize_session_key(&id)
@@ -4713,12 +4806,15 @@ pub(crate) mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &store;
-        assert_eq!(resolve_session_key("gw_foo", backend), "gw_foo");
+        assert_eq!(resolve_session_key("gw_foo", backend).unwrap(), "gw_foo");
         assert_eq!(
-            resolve_session_key("gw_test-session", backend),
+            resolve_session_key("gw_test-session", backend).unwrap(),
             "gw_test-session"
         );
-        assert_eq!(resolve_session_key("gw_foo.bar", backend), "gw_foo_bar");
+        assert_eq!(
+            resolve_session_key("gw_foo.bar", backend).unwrap(),
+            "gw_foo_bar"
+        );
     }
 
     #[test]
@@ -4729,9 +4825,12 @@ pub(crate) mod tests {
         let backend: &dyn SessionBackend = &store;
 
         // No sessions exist: bare ID → gw_ prefix (step 4).
-        assert_eq!(resolve_session_key("my-session", backend), "gw_my-session");
         assert_eq!(
-            resolve_session_key("550e8400-e29b-41d4-a716-446655440000", backend),
+            resolve_session_key("my-session", backend).unwrap(),
+            "gw_my-session"
+        );
+        assert_eq!(
+            resolve_session_key("550e8400-e29b-41d4-a716-446655440000", backend).unwrap(),
             "gw_550e8400-e29b-41d4-a716-446655440000"
         );
 
@@ -4739,14 +4838,17 @@ pub(crate) mod tests {
         store
             .append("gw_my-session", &ChatMessage::user("hello"))
             .unwrap();
-        assert_eq!(resolve_session_key("my-session", backend), "gw_my-session");
+        assert_eq!(
+            resolve_session_key("my-session", backend).unwrap(),
+            "gw_my-session"
+        );
 
         // Create a channel key: bare lookup should find it (step 3).
         store
             .append("discord_clamps_user123", &ChatMessage::user("hi"))
             .unwrap();
         assert_eq!(
-            resolve_session_key("discord_clamps_user123", backend),
+            resolve_session_key("discord_clamps_user123", backend).unwrap(),
             "discord_clamps_user123"
         );
     }
@@ -4757,7 +4859,10 @@ pub(crate) mod tests {
         let store = SessionStore::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &store;
         // Spaces and dots are sanitized; no session exists → gw_ prefix (step 4).
-        assert_eq!(resolve_session_key("my session", backend), "gw_my_session");
+        assert_eq!(
+            resolve_session_key("my session", backend).unwrap(),
+            "gw_my_session"
+        );
     }
 
     // ── DELETE handler session_queue serialization tests ─────────────
@@ -4875,5 +4980,61 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         // Session was NOT deleted (timeout → fail-closed)
         assert!(backend.session_exists("gw_del_timeout"));
+    }
+
+    #[tokio::test]
+    async fn resolve_session_key_ambiguous_returns_409_on_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_discord_clamps_user123",
+                &ChatMessage::user("gateway-msg"),
+            )
+            .unwrap();
+        backend
+            .append("discord_clamps_user123", &ChatMessage::user("channel-msg"))
+            .unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        // DELETE with ambiguous key → 409
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("discord_clamps_user123".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Both sessions still exist (nothing was deleted)
+        assert!(backend.session_exists("gw_discord_clamps_user123"));
+        assert!(backend.session_exists("discord_clamps_user123"));
+
+        // Using the full gw_ key (identity escape hatch) succeeds
+        let state2 = test_state_with_session_backend(
+            zeroclaw_config::schema::Config {
+                data_dir: tmp.path().join("workspace"),
+                config_path: tmp.path().join("config.toml"),
+                ..Default::default()
+            },
+            backend.clone(),
+        );
+        let response2 = handle_api_session_delete(
+            State(state2),
+            HeaderMap::new(),
+            Path("gw_discord_clamps_user123".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response2.status(), StatusCode::OK);
+        assert!(!backend.session_exists("gw_discord_clamps_user123"));
+        assert!(backend.session_exists("discord_clamps_user123"));
     }
 }
