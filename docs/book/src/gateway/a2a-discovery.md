@@ -12,7 +12,7 @@ is illustrative.
 
 The two discovery GETs are unauthenticated: the catalog card and the per-alias
 agent card are readable without a token so a peer can discover your published
-surface before pairing. The `message/send` POST is different. It runs a full
+surface before pairing. The `SendMessage` POST is different. It runs a full
 tool-enabled agent turn, so it is behind the gateway's pairing auth like every
 other write surface. When `[gateway] require_pairing` is on (the default), pass
 a pairing-derived bearer token on the task POST:
@@ -20,8 +20,9 @@ a pairing-derived bearer token on the task POST:
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
   -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "A2A-Version: 1.0" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{...}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{...}}'
 ```
 
 An unauthenticated task POST gets `401`, never an agent turn. The discovery GETs
@@ -238,58 +239,59 @@ outside world can see.
 ## Sending a task
 
 Once you have an agent's interface URL and a skill, you send work as a JSON-RPC
-`message/send` POST to that URL:
+`SendMessage` POST to that URL, advertising the A2A protocol version you speak
+in the `A2A-Version` header (this server speaks `1.0`):
 
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
   -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "A2A-Version: 1.0" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
-        "role": "user",
-        "parts": [{ "kind": "text", "text": "Reply with PONG" }]
+        "messageId": "msg-1",
+        "role": "ROLE_USER",
+        "parts": [{ "text": "Reply with PONG" }]
       }
     }
   }'
 ```
 
-The agent runs the turn and answers with a completed task. The reply is the text
-part inside the task's artifact:
+The agent runs the turn and answers with a completed task. The reply is the
+text part inside the task's artifact; the result is a `SendMessageResponse`
+whose `task` branch carries the `Task`:
 
 ```
 {
     "id": 1,
     "jsonrpc": "2.0",
     "result": {
-        "artifacts": [
-            {
-                "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": "PONG"
-                    }
-                ]
-            }
-        ],
-        "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
-        "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
-        "kind": "task",
-        "status": {
-            "state": "completed"
+        "task": {
+            "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
+            "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
+            "status": { "state": "TASK_STATE_COMPLETED" },
+            "artifacts": [
+                {
+                    "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
+                    "parts": [
+                        { "text": "PONG" }
+                    ]
+                }
+            ]
         }
     }
 }
 ```
 
 The interface URL is the same for discovery and for tasks; only the request
-changes. The endpoint accepts only `message/send`; any other `method` returns a
-JSON-RPC `-32601`, an empty message returns `-32602`, and a body that is not
-JSON-RPC returns HTTP `400`.
+changes. The endpoint accepts only `SendMessage` and only `A2A-Version: 1.0`;
+any other `method` returns a JSON-RPC `-32601`, an empty message returns
+`-32602`, an unsupported version returns a `VERSION_NOT_SUPPORTED` error, and a
+body that is not JSON-RPC returns HTTP `400`.
 
 ## Exposure and the one sharp edge
 
@@ -310,7 +312,7 @@ HTTP/1.1 200 OK
 content-type: text/html
 ```
 
-Discovery (the `.well-known` paths) and the `message/send` POST are the supported
+Discovery (the `.well-known` paths) and the `SendMessage` POST are the supported
 surface. A bare GET on the interface URL is not part of the protocol; read the
 card at the `.well-known` path instead.
 

@@ -1525,7 +1525,11 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Thread the live config handle through so A2A peer/credential/
+            // security settings resolve from the hot-reloadable config at
+            // call time (not the startup snapshot). The CLI snapshot path
+            // (`from_config`) passes `None`, which falls back to a snapshot.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter

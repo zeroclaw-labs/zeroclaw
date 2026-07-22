@@ -405,8 +405,8 @@ pub fn build_spec() -> serde_json::Value {
     #[cfg(feature = "a2a")]
     augment_spec_with_a2a(
         &mut spec,
-        schema_value::<crate::a2a::JsonRpcRequest>(),
-        schema_value::<crate::a2a::OutTask>(),
+        schema_value::<zeroclaw_api::a2a_wire::JsonRpcRequest>(),
+        schema_value::<zeroclaw_api::a2a_wire::Task>(),
     );
     flatten_defs_into_components(&mut spec);
     spec
@@ -435,21 +435,30 @@ fn augment_spec_with_a2a(
                 "post": {
                     "tags": ["a2a"],
                     "summary": "Send a task to a published A2A agent",
-                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
-                    "parameters": [{
-                        "name": "alias",
-                        "in": "path",
-                        "required": true,
-                        "schema": { "type": "string" },
-                        "description": "Published agent alias, as listed in the discovery catalog."
-                    }],
+                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only the v1 `SendMessage` method is handled (the request must carry `A2A-Version: 1.0`): the message `parts` carrying a `text` branch are joined into the agent prompt, the agent runs one turn, and a `SendMessageResponse` whose `task` branch carries the completed A2A `Task` is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
+                    "parameters": [
+                        {
+                            "name": "alias",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "string" },
+                            "description": "Published agent alias, as listed in the discovery catalog."
+                        },
+                        {
+                            "name": "A2A-Version",
+                            "in": "header",
+                            "required": true,
+                            "schema": { "type": "string" },
+                            "description": "A2A protocol version. This server only accepts `1.0`; any other value returns a `VERSION_NOT_SUPPORTED` error."
+                        }
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTaskRequest" } } }
                     },
                     "responses": {
                         "200": {
-                            "description": "JSON-RPC response. On success `result` is a completed A2A Task; on a JSON-RPC error (unknown method, bad params) `error` carries the code and message.",
+                            "description": "JSON-RPC response. On success `result` is a `SendMessageResponse` whose `task` branch carries the completed A2A `Task`; on a JSON-RPC error (unknown method, bad params, unsupported version) `error` carries the code, message, and (for A2A-specific errors) a `data.reason` field.",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTask" } } }
                         },
                         "401": {

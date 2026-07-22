@@ -159,6 +159,145 @@ pub struct A2aServerSection {
     /// Inbound A2A discovery server (`[a2a.server]`).
     #[nested]
     pub server: A2aServerConfig,
+    /// Outbound A2A client (`[a2a.client]`): the agent-to-agent delegation
+    /// surface that calls remote A2A peers. Default-closed; opt in via
+    /// `[a2a.client] enabled = true`. See the A2ATool RFC.
+    #[nested]
+    pub client: A2aClientConfig,
+}
+
+/// `[a2a.client]` — outbound A2A client (caller role).
+///
+/// Symmetric counterpart to [`A2aServerConfig`]: the server is the inbound
+/// (responder) surface, the client is the outbound (caller) surface that
+/// delegates tasks to remote A2A-compliant agents. Default-closed — the
+/// four `a2a_*` tools register only when `enabled = true`, so an
+/// unconfigured install carries no A2A outbound footprint. Peers are
+/// declared statically under `[[a2a.client.peers]]`; DNS auto-discovery is
+/// a non-goal (peers are explicitly configured, not auto-discovered).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "a2a_client"]
+#[serde(default)]
+pub struct A2aClientConfig {
+    /// Master switch for the outbound A2A client. Default `false`: no
+    /// `a2a_*` tools register, no peer connections are attempted.
+    pub enabled: bool,
+    /// Per-request timeout (seconds) for JSON-RPC calls to a peer, covering
+    /// `message/send` blocking waits. A peer that does not return a
+    /// terminal/interrupted task state within this window yields a
+    /// `ToolResult::err` with no retry. Default 120s.
+    #[serde(default = "default_a2a_client_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Agent Card cache TTL (seconds). `0` disables caching: every
+    /// `a2a_discover` / `a2a_send` re-fetches the peer's card. A positive
+    /// value caches the parsed card keyed by peer name to avoid repeated
+    /// well-known fetches within the window. Default 300s.
+    #[serde(default = "default_a2a_client_card_cache_ttl_secs")]
+    pub card_cache_ttl_secs: u64,
+    /// Allow peers on private/loopback/link-local hosts. Default `false`
+    /// (secure-by-default: A2A is an outbound SSRF surface, same posture as
+    /// `http_request`). Set `true` for local/intra-net deployments where a
+    /// peer lives on `127.0.0.1` or an RFC1918 segment. Reuses the exact
+    /// `helpers::domain_guard` policy `http_request` uses — no duplicated
+    /// private-host authority.
+    #[serde(default)]
+    pub allow_private_hosts: bool,
+    /// Explicit allowlist of private hosts a peer may target even when
+    /// `allow_private_hosts = false`. Entries are domains, hostnames, or IPs
+    /// (with `*.suffix` glob support), normalized via
+    /// `helpers::domain_guard::normalize_allowed_domains`. Per-host pinning
+    /// without loosening the global private-host posture. Default empty.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
+    /// Maximum response body size (bytes) accepted from a peer for a card
+    /// fetch, JSON-RPC result, or error. A response exceeding this is
+    /// rejected before deserialization so a malicious or compromised peer
+    /// cannot exhaust daemon memory with a large or chunked body. `0` means
+    /// no limit (not recommended). Default 1MB, mirroring `http_request`.
+    #[serde(default = "default_a2a_client_max_response_bytes")]
+    pub max_response_bytes: usize,
+    /// Declared remote peers (`[[a2a.client.peers]]`). Empty (with
+    /// `enabled = true`) registers the tools but every call fails fast
+    /// with "unknown peer" — useful for staging the config before peers
+    /// are wired.
+    #[nested]
+    #[natural_key = "name"]
+    pub peers: Vec<A2aClientPeerConfig>,
+}
+
+fn default_a2a_client_request_timeout_secs() -> u64 {
+    120
+}
+
+fn default_a2a_client_card_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn default_a2a_client_max_response_bytes() -> usize {
+    1_000_000 // 1MB, mirrors http_request's default_http_max_response_size
+}
+
+impl Default for A2aClientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            request_timeout_secs: default_a2a_client_request_timeout_secs(),
+            card_cache_ttl_secs: default_a2a_client_card_cache_ttl_secs(),
+            allow_private_hosts: false,
+            allowed_private_hosts: Vec::new(),
+            max_response_bytes: default_a2a_client_max_response_bytes(),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// `[[a2a.client.peers]]` — one declared remote A2A peer.
+///
+/// A peer is an A2A server origin (another ZeroClaw install, or any
+/// A2A-compliant agent) identified by its base URL. The optional bearer
+/// `token` is resolved from an env var when the value is a `${VAR}`
+/// placeholder, reusing the same env-interpolation path as
+/// `http_request`'s auth secrets. `tags` are operator metadata surfaced
+/// by `a2a_discover` for filtering; they are not protocol-level.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "a2a_client_peer"]
+#[serde(default)]
+pub struct A2aClientPeerConfig {
+    /// Globally unique peer name. Used as the `peer` argument to every
+    /// `a2a_*` tool; the agent never types a URL.
+    pub name: String,
+    /// Base URL of the remote A2A server origin, e.g.
+    /// `https://team.example.com`. The well-known card path and the
+    /// JSON-RPC task path are derived from this.
+    pub base_url: String,
+    /// Bearer token for the peer. A `${VAR}` value is resolved from the
+    /// environment at call time; a literal value is used as-is. Empty
+    /// sends no `Authorization` header (public/anonymous peer). Marked
+    /// Bearer token for the peer. A `${VAR}` value is resolved from the
+    /// environment at call time; a literal value is used as-is. Empty
+    /// sends no `Authorization` header (public/anonymous peer). Marked
+    /// `#[secret]` so config/schema/UI surfaces treat it as write-only
+    /// encrypted credential material rather than a readable value (mirrors
+    /// `http_request`'s secret posture).
+    ///
+    /// **Auth extension boundary** (binding RFC condition): bearer is the
+    /// MVP's first authentication mode, not the permanent abstraction. This
+    /// field is the single canonical peer-credential surface — future OAuth
+    /// or mTLS support will extend the peer schema with additional optional
+    /// fields (e.g. `oauth_*` / `mtls_*`) or a tagged `auth` enum, without
+    /// duplicating credential or policy resolution or requiring a breaking
+    /// change to this field. The `resolve_peer_token` path in the client
+    /// is the single auth-resolution seam that such an extension would
+    /// branch on.
+    #[secret]
+    #[serde(default)]
+    pub token: String,
+    /// Optional operator tags for `a2a_discover` filtering (e.g.
+    /// `["production"]`). Not interpreted by the protocol.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Per-agent A2A publication and exposed-skill configuration.
@@ -386,6 +525,71 @@ public_base_url = "https://agents.example.com"
         assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(parsed.port, Some(9000));
         assert_eq!(parsed.public_base_url, "https://agents.example.com");
+    }
+
+    #[test]
+    fn a2a_client_config_default_is_closed_with_sane_timeouts() {
+        let cfg = A2aClientConfig::default();
+        assert!(!cfg.enabled);
+        // Zero timeout would fire immediately on every call; the defaults
+        // must be the documented 120s / 300s, not 0.
+        assert_eq!(cfg.request_timeout_secs, 120);
+        assert_eq!(cfg.card_cache_ttl_secs, 300);
+        assert!(cfg.peers.is_empty());
+    }
+
+    #[test]
+    fn a2a_client_config_round_trips_with_peers() {
+        let toml_input = r#"
+enabled = true
+request_timeout_secs = 60
+card_cache_ttl_secs = 0
+
+[[peers]]
+name = "team-deploy"
+base_url = "https://team.example.com"
+token = "${TEAM_DEPLOY_TOKEN}"
+tags = ["production"]
+
+[[peers]]
+name = "staging"
+base_url = "https://staging.example.com"
+"#;
+        let parsed: A2aClientConfig = toml::from_str(toml_input).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.request_timeout_secs, 60);
+        assert_eq!(parsed.card_cache_ttl_secs, 0);
+        assert_eq!(parsed.peers.len(), 2);
+        assert_eq!(parsed.peers[0].name, "team-deploy");
+        assert_eq!(parsed.peers[0].base_url, "https://team.example.com");
+        assert_eq!(parsed.peers[0].token, "${TEAM_DEPLOY_TOKEN}");
+        assert_eq!(parsed.peers[0].tags, vec!["production".to_string()]);
+        // Peer with no tags still parses (skip_serializing_if round-trips
+        // through default, not through an absent field).
+        assert_eq!(parsed.peers[1].name, "staging");
+        assert!(parsed.peers[1].tags.is_empty());
+    }
+
+    #[test]
+    fn a2a_section_carries_client_sibling_alongside_server() {
+        // The `a2a` wrapper must host both `server` and `client` as sibling
+        // sub-tables without one moving the other.
+        let toml_input = r#"
+[server]
+enabled = true
+
+[client]
+enabled = true
+
+[[client.peers]]
+name = "peer-a"
+base_url = "https://peer-a.example.com"
+"#;
+        let parsed: A2aServerSection = toml::from_str(toml_input).unwrap();
+        assert!(parsed.server.enabled);
+        assert!(parsed.client.enabled);
+        assert_eq!(parsed.client.peers.len(), 1);
+        assert_eq!(parsed.client.peers[0].name, "peer-a");
     }
 
     #[test]
