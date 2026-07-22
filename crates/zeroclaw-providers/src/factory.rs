@@ -1118,6 +1118,9 @@ impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
         if opts.think == Some(true) {
             anyhow::bail!("Hailo-Ollama does not support think=true");
         }
+        if opts.vision == Some(true) {
+            anyhow::bail!("Hailo-Ollama does not support vision=true");
+        }
         if opts.provider_extra.is_some() {
             anyhow::bail!("Hailo-Ollama does not support provider_extra");
         }

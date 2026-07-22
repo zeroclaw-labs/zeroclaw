@@ -64,6 +64,48 @@ async fn capture_raw_chat(State(capture): State<RawCapture>, body: Bytes) -> Jso
     }))
 }
 
+async fn emulate_native_hailo_prompt_parser(
+    State(capture): State<Capture>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let Some(messages) = body["messages"].as_array() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing messages"})),
+        );
+    };
+    let structured_prompt = messages
+        .iter()
+        .map(|message| {
+            let role = message["role"].as_str().unwrap_or_default();
+            let content = message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .replace('"', "\\\"");
+            format!(r#"{{"role":"{role}","content":"{content}"}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let structured_prompt = format!("[{structured_prompt}]");
+
+    match serde_json::from_str::<Value>(&structured_prompt) {
+        Ok(decoded) => {
+            *capture.lock().expect("prompt capture lock") = Some(decoded);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "message": {"role": "assistant", "content": "HAILO_NATIVE_OK"},
+                    "done": true,
+                })),
+            )
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        ),
+    }
+}
+
 async fn capture_chat_headers(
     State(capture): State<HeaderCapture>,
     headers: HeaderMap,
@@ -535,6 +577,72 @@ async fn native_hailo_emits_ascii_only_json_for_wire_compatibility() {
     assert!(raw.windows(6).any(|window| window == br"\u00f6"));
     assert!(raw.windows(12).any(|window| window == br"\ud83e\uddea"));
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_preserves_literal_backslashes_through_prompt_parser() {
+    let capture: Capture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(emulate_native_hailo_prompt_parser))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let prompt = concat!(
+        r#"regex \d+; literal \n and \u263a; path C:\temp\file; escaped quote \"ok\"; "#,
+        "actual\r\n\tcontrols"
+    );
+    hailo_provider(&format!("http://{addr}"))
+        .simple_chat(prompt, "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("native Hailo prompt parser accepts literal backslashes");
+
+    let decoded = capture
+        .lock()
+        .expect("prompt capture lock")
+        .clone()
+        .expect("structured prompt captured");
+    assert_eq!(decoded[0]["content"], prompt);
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_truncates_without_splitting_prompt_escape_units() {
+    let capture: Capture = Arc::new(Mutex::new(None));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(emulate_native_hailo_prompt_parser))
+        .with_state(capture.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let prompt = "\\".repeat(1_001);
+    hailo_provider(&format!("http://{addr}"))
+        .simple_chat(&prompt, "qwen3:1.7b", Some(0.2))
+        .await
+        .expect("native prompt truncation must preserve complete escape units");
+
+    let decoded = capture
+        .lock()
+        .expect("prompt capture lock")
+        .clone()
+        .expect("structured prompt captured");
+    let expected = format!("{}...{}", "\\".repeat(499), "\\".repeat(499));
+    assert_eq!(decoded[0]["content"], expected);
     server.abort();
 }
 
@@ -1278,6 +1386,27 @@ fn typed_hailo_factory_rejects_unsupported_shared_options() {
     }
 }
 
+#[test]
+fn production_factory_rejects_hailo_vision_override() {
+    let error = match zeroclaw_providers::create_model_provider_with_options(
+        "hailo_ollama",
+        None,
+        &ModelProviderRuntimeOptions {
+            vision: Some(true),
+            ..Default::default()
+        },
+    ) {
+        Ok(_) => panic!("text-only Hailo must reject vision=true"),
+        Err(error) => error,
+    }
+    .to_string();
+
+    assert!(
+        error.contains("vision"),
+        "vision missing from error: {error}"
+    );
+}
+
 #[tokio::test]
 async fn native_hailo_rejects_image_inputs_instead_of_dropping_them() {
     let provider = hailo_provider("http://127.0.0.1:9");
@@ -1586,7 +1715,7 @@ async fn live_native_hailo_catalog_and_chat() {
     let provider = HailoOllamaModelProvider::new(
         "live_hardware",
         Some(&base_url),
-        90,
+        240,
         5,
         OllamaTuning {
             num_ctx: 2048,
@@ -1615,4 +1744,48 @@ async fn live_native_hailo_catalog_and_chat() {
         .await
         .expect("live normalized multiline chat succeeds");
     assert_eq!(response.trim(), "NATIVE_PROVIDER_OK");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Hailo-Ollama endpoint"]
+async fn live_native_hailo_accepts_prompt_escape_corner_cases() {
+    let base_url = std::env::var("HAILO_OLLAMA_LIVE_URL")
+        .expect("set HAILO_OLLAMA_LIVE_URL for the ignored hardware test");
+    let model =
+        std::env::var("HAILO_OLLAMA_LIVE_MODEL").unwrap_or_else(|_| "qwen3:1.7b".to_string());
+    let provider = HailoOllamaModelProvider::new(
+        "live_escape_hardware",
+        Some(&base_url),
+        240,
+        5,
+        OllamaTuning {
+            num_ctx: 2048,
+            num_predict: 32,
+            temperature_override: None,
+        },
+    )
+    .expect("valid live Hailo URL");
+
+    let cases = [
+        (
+            "literal escapes",
+            r#"Regex \d+; literal \n and \u263a; path C:\temp\file; quote \"ok\". Reply briefly."#
+                .to_string(),
+        ),
+        (
+            "escape-pair truncation boundary",
+            format!(
+                "{} Reply briefly to confirm this request was accepted.",
+                "\\".repeat(1_001)
+            ),
+        ),
+    ];
+
+    for (name, prompt) in cases {
+        let response = provider
+            .simple_chat(&prompt, &model, Some(0.0))
+            .await
+            .unwrap_or_else(|error| panic!("live {name} request failed: {error}"));
+        assert!(!response.trim().is_empty(), "live {name} response is empty");
+    }
 }

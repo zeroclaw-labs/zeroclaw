@@ -141,9 +141,9 @@ work after `queue_timeout_secs`.
 
 Hailo-Ollama rejects transport options it cannot honor rather than silently
 ignoring them. In particular, `extra_headers`, `tls_ca_cert_path`, `think=true`,
-call-level native `thinking`, `provider_extra`, `api_path`, `wire_api`, and
-`chat_template_kwargs` are not supported. Set `native_tools = false` (or leave
-it unset).
+`vision=true`, call-level native `thinking`, `provider_extra`, `api_path`,
+`wire_api`, and `chat_template_kwargs` are not supported. Set
+`native_tools = false` (or leave it unset).
 
 If an accepted request reaches its HTTP timeout or ends with another post-connect
 transport failure, ZeroClaw quarantines that endpoint for the rest of the process
@@ -152,7 +152,10 @@ backend is idle (restart it if necessary), then restart ZeroClaw to clear the
 quarantine. A connection-establishment failure does not quarantine the endpoint.
 
 For native-backend compatibility, ZeroClaw omits unsupported `think` and
-`num_ctx` wire fields rather than claiming to control them. `context_window`
+`num_ctx` wire fields rather than claiming to control them. The native service
+parses each decoded message as structured-prompt JSON a second time, so ZeroClaw
+escapes both literal backslashes and CR/LF/tab controls in the API value to
+preserve their original meaning through that parse. `context_window`
 controls ZeroClaw's best-effort local history budgeting; it is deliberately not
 sent to Hailo-Ollama. Call-level native thinking requests are rejected before
 any backend request. Responses must be a completed non-streaming response
@@ -161,7 +164,10 @@ any backend request. Responses must be a completed non-streaming response
 the two local budgets keep the retained history bounded. System instructions are
 folded into plain user prose, and each normalized message is bounded to 2,000
 Unicode characters.
-Native tool calling, streaming, and vision are not advertised.
+Native tool calling, streaming, and vision are not advertised. Because the
+Hailo-Ollama 0.5.1 chat DTO has no image field, `vision=true` is rejected rather
+than overriding that text-only capability; configure a separate vision-capable
+provider instead.
 Prompt-guided tool calls and results remain available as plain text history when
 the complete injected tool protocol fits in the bounded first message; ZeroClaw
 rejects an oversized protocol instead of sending truncated tool instructions.
