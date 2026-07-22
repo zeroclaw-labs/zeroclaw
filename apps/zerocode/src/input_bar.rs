@@ -15,7 +15,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -33,8 +32,10 @@ const MAX_INPUT_ROWS: u16 = 5;
 const SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
+    "/browse",
     "/clear-queue",
     "/detach",
+    "/help",
     "/model",
     "/model-provider",
     "/new",
@@ -74,6 +75,10 @@ pub(crate) enum InputBarAction {
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
     ToggleThinking,
+    /// User typed `/browse` — parent should enter transcript browse mode.
+    EnterBrowseMode,
+    /// User typed `/help` — parent should open the app-level Help overlay.
+    OpenHelp,
     /// User chose a model directly (`/model <name>`) — parent applies it via
     /// `session/configure`.
     SetModel(String),
@@ -110,6 +115,8 @@ enum SlashCommand<'a> {
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
     RestartSession,
+    EnterBrowseMode,
+    OpenHelp,
     NotACommand,
 }
 
@@ -135,6 +142,10 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::RestartSession
     } else if trimmed == "/toggle-thinking" {
         SlashCommand::ToggleThinking
+    } else if trimmed == "/browse" {
+        SlashCommand::EnterBrowseMode
+    } else if trimmed == "/help" {
+        SlashCommand::OpenHelp
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
         let name = name.trim();
         if name.is_empty() {
@@ -167,12 +178,14 @@ struct VisualLine {
     width: u16,
 }
 
-fn char_cell_width(ch: char) -> u16 {
-    ch.width().and_then(|w| u16::try_from(w).ok()).unwrap_or(0)
+fn str_cell_width(text: &str) -> u16 {
+    crate::display_width::display_width(text)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
-fn str_cell_width(text: &str) -> u16 {
-    UnicodeWidthStr::width(text).try_into().unwrap_or(u16::MAX)
+fn grapheme_is_whitespace(grapheme: &str) -> bool {
+    grapheme.chars().next().is_some_and(char::is_whitespace)
 }
 
 fn push_hard_wrapped(
@@ -185,13 +198,16 @@ fn push_hard_wrapped(
     let mut line_start = start;
     let mut line_width = 0;
 
-    for (offset, ch) in text[start..end].char_indices() {
+    // Advance by grapheme so presentation sequences (e.g. ⚠️) stay one unit.
+    for (offset, grapheme, g_width_usize) in
+        crate::display_width::grapheme_widths(&text[start..end])
+    {
         let byte_idx = start + offset;
-        let ch_width = char_cell_width(ch);
-        if ch_width > width {
+        let g_width = u16::try_from(g_width_usize).unwrap_or(u16::MAX);
+        if g_width > width {
             continue;
         }
-        if line_width > 0 && line_width + ch_width > width {
+        if line_width > 0 && line_width + g_width > width {
             lines.push(VisualLine {
                 start: line_start,
                 end: byte_idx,
@@ -200,7 +216,9 @@ fn push_hard_wrapped(
             line_start = byte_idx;
             line_width = 0;
         }
-        line_width += ch_width;
+        // Silence unused-binding lint if grapheme is only needed for width.
+        let _ = grapheme;
+        line_width = line_width.saturating_add(g_width);
     }
 
     if line_start < end || line_width > 0 {
@@ -230,30 +248,29 @@ fn push_wrapped_physical_line(
 
     let mut line_start = start;
     let mut line_end = start;
-    let mut line_width = 0;
+    let mut line_width = 0u16;
     let mut pending_ws_start: Option<usize> = None;
     let mut pending_ws_end = start;
-    let mut pending_ws_width = 0;
+    let mut pending_ws_width = 0u16;
     let mut idx = start;
 
     while idx < end {
-        let Some(ch) = text[idx..end].chars().next() else {
+        let Some((_, first_grapheme, _)) =
+            crate::display_width::grapheme_widths(&text[idx..end]).next()
+        else {
             break;
         };
 
-        if ch.is_whitespace() {
+        if grapheme_is_whitespace(first_grapheme) {
             let ws_start = idx;
             let mut ws_end = idx;
-            let mut ws_width = 0;
-            while ws_end < end {
-                let Some(ws_ch) = text[ws_end..end].chars().next() else {
-                    break;
-                };
-                if !ws_ch.is_whitespace() {
+            let mut ws_width = 0u16;
+            for (off, g, w) in crate::display_width::grapheme_widths(&text[idx..end]) {
+                if !grapheme_is_whitespace(g) {
                     break;
                 }
-                ws_width += char_cell_width(ws_ch);
-                ws_end += ws_ch.len_utf8();
+                ws_width = ws_width.saturating_add(u16::try_from(w).unwrap_or(u16::MAX));
+                ws_end = idx + off + g.len();
             }
             pending_ws_start = Some(ws_start);
             pending_ws_end = ws_end;
@@ -264,16 +281,13 @@ fn push_wrapped_physical_line(
 
         let word_start = idx;
         let mut word_end = idx;
-        let mut word_width = 0;
-        while word_end < end {
-            let Some(word_ch) = text[word_end..end].chars().next() else {
-                break;
-            };
-            if word_ch.is_whitespace() {
+        let mut word_width = 0u16;
+        for (off, g, w) in crate::display_width::grapheme_widths(&text[idx..end]) {
+            if grapheme_is_whitespace(g) {
                 break;
             }
-            word_width += char_cell_width(word_ch);
-            word_end += word_ch.len_utf8();
+            word_width = word_width.saturating_add(u16::try_from(w).unwrap_or(u16::MAX));
+            word_end = idx + off + g.len();
         }
 
         if word_width > width {
@@ -313,7 +327,9 @@ fn push_wrapped_physical_line(
             }
         } else if line_width + pending_ws_width + word_width <= width {
             line_end = word_end;
-            line_width += pending_ws_width + word_width;
+            line_width = line_width
+                .saturating_add(pending_ws_width)
+                .saturating_add(word_width);
         } else {
             lines.push(VisualLine {
                 start: line_start,
@@ -467,12 +483,15 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
         return text.len();
     };
 
-    let mut col = 0;
-    for (offset, ch) in text[line.start..line.end].char_indices() {
+    let mut col = 0u16;
+    for (offset, _grapheme, g_width_usize) in
+        crate::display_width::grapheme_widths(&text[line.start..line.end])
+    {
         if col >= target_col {
             return line.start + offset;
         }
-        col += char_cell_width(ch);
+        let g_width = u16::try_from(g_width_usize).unwrap_or(u16::MAX);
+        col = col.saturating_add(g_width);
         if col > target_col {
             return line.start + offset;
         }
@@ -1300,6 +1319,8 @@ impl InputBarState {
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+                SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
+                SlashCommand::OpenHelp => InputBarAction::OpenHelp,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -1681,15 +1702,7 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>()).with_child(
-            HelpNode::titled(
-                crate::i18n::t("zc-input-help-slash-commands"),
-                SLASH_COMMANDS
-                    .iter()
-                    .map(|cmd| E::key(*cmd, String::new()))
-                    .collect(),
-            ),
-        )
+        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>())
     }
 }
 
@@ -1984,6 +1997,14 @@ mod tests {
             SlashCommand::ToggleThinking
         ));
         assert!(matches!(
+            parse_slash_command("/browse"),
+            SlashCommand::EnterBrowseMode
+        ));
+        assert!(matches!(
+            parse_slash_command("/help"),
+            SlashCommand::OpenHelp
+        ));
+        assert!(matches!(
             parse_slash_command("hello"),
             SlashCommand::NotACommand
         ));
@@ -2154,24 +2175,22 @@ mod tests {
     }
 
     #[test]
-    fn help_context_lists_slash_commands_from_canonical_source() {
+    fn help_context_keeps_slash_commands_out_of_general_help() {
         use crate::widgets::HelpContext;
         let bar = InputBarState::new();
         let node = bar.help_context();
-        let title = crate::i18n::t("zc-input-help-slash-commands");
-        let section = node
-            .children
+        let listed = node
+            .entries
             .iter()
-            .find(|c| c.title.as_deref() == Some(title.as_str()))
-            .expect("slash-commands section present");
-        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
-        for cmd in SLASH_COMMANDS {
+            .chain(node.children.iter().flat_map(|child| child.entries.iter()))
+            .map(|entry| entry.key_str())
+            .collect::<Vec<_>>();
+        for command in SLASH_COMMANDS {
             assert!(
-                listed.iter().any(|k| k == cmd),
-                "slash command {cmd} must appear in the help section"
+                !listed.iter().any(|key| key == command),
+                "{command} stays in autocomplete, not the general Help modal"
             );
         }
-        assert_eq!(listed.len(), SLASH_COMMANDS.len());
     }
 
     #[test]
@@ -2182,6 +2201,23 @@ mod tests {
             bar.handle_enter(),
             InputBarAction::OpenModelProviderPicker
         ));
+    }
+
+    #[test]
+    fn browse_command_returns_enter_browse_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/browse");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::EnterBrowseMode
+        ));
+    }
+
+    #[test]
+    fn help_command_returns_open_help_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/help");
+        assert!(matches!(bar.handle_enter(), InputBarAction::OpenHelp));
     }
 
     #[test]
@@ -2297,6 +2333,57 @@ mod tests {
     fn cursor_to_visual_uses_terminal_cell_width() {
         let text = "abcd界";
         assert_eq!(cursor_to_visual(text, text.len(), 5), (1, 2));
+    }
+
+    #[test]
+    fn cursor_to_visual_emoji_presentation_is_two_cells() {
+        // 🏔️ is U+1F3D4 + U+FE0F. unicode-width string width is 2; char-wise
+        // sum of the base alone is 1 and leaves the cursor one cell short.
+        let emoji = "\u{1F3D4}\u{FE0F}";
+        let text = format!("{emoji}x");
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 3));
+        assert_eq!(str_cell_width(emoji), 2);
+        assert_eq!(str_cell_width(&format!("{emoji} ")), 3);
+    }
+
+    #[test]
+    fn cursor_to_visual_text_default_presentation_sequence_is_two_cells() {
+        // ⚠️ is text-default ⚠ + VS16. Scalar loops that cannot see FE0F would
+        // count base width 1 + selector 0 and leave the cursor short.
+        let emoji = "\u{26A0}\u{FE0F}";
+        let text = format!("{emoji}x");
+        assert_eq!(str_cell_width(emoji), 2);
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 3));
+        // Bare text form stays width 1.
+        let bare = "\u{26A0}x";
+        assert_eq!(str_cell_width("\u{26A0}"), 1);
+        assert_eq!(cursor_to_visual(bare, bare.len(), 10), (0, 2));
+    }
+
+    #[test]
+    fn hard_wrap_keeps_text_default_presentation_sequence_together() {
+        // Width 2 must not split ⚠️ across lines; the sequence is one unit.
+        let emoji = "\u{26A0}\u{FE0F}";
+        let text = format!("ab{emoji}cd");
+        let lines = wrap_visual_lines(&text, 2);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(&text[lines[0].start..lines[0].end], "ab");
+        assert_eq!(&text[lines[1].start..lines[1].end], emoji);
+        assert_eq!(&text[lines[2].start..lines[2].end], "cd");
+        assert_eq!(lines[1].width, 2);
+    }
+
+    #[test]
+    fn visual_to_cursor_text_default_presentation_sequence() {
+        // Reverse mapping must land on grapheme boundaries for ⚠️.
+        let emoji = "\u{26A0}\u{FE0F}";
+        let text = format!("a{emoji}b");
+        // col 0 -> 'a', col 1/2 -> start of ⚠️, col 3 -> 'b'
+        assert_eq!(visual_to_cursor(&text, 0, 0, 10), 0);
+        assert_eq!(visual_to_cursor(&text, 0, 1, 10), 1);
+        assert_eq!(visual_to_cursor(&text, 0, 2, 10), 1);
+        assert_eq!(visual_to_cursor(&text, 0, 3, 10), text.len() - 1);
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 4));
     }
 
     #[test]

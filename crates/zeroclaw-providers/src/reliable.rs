@@ -1266,6 +1266,38 @@ impl ModelProvider for ReliableModelProvider {
         )
     }
 
+    fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+        let mut capabilities = self
+            .model_providers
+            .first()
+            .map(|entry| entry.provider.capabilities())
+            .unwrap_or_default();
+        // A request may advance past the primary after a retryable failure.
+        // Report vision only when every reachable provider can accept images;
+        // otherwise the turn engine must select a dedicated vision route before
+        // dispatch instead of admitting an image that a fallback could reject.
+        capabilities.vision = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider.supports_vision());
+        capabilities
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
+        let mut capabilities = self
+            .model_providers
+            .first()
+            .map(|entry| entry.provider.capabilities_for_model(model))
+            .unwrap_or_default();
+        capabilities.vision = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider.capabilities_for_model(model).vision);
+        capabilities
+    }
+
     fn supports_native_tools(&self) -> bool {
         self.model_providers
             .first()
@@ -1274,10 +1306,7 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.model_providers
-            .first()
-            .map(|entry| entry.provider.supports_vision())
-            .unwrap_or(false)
+        self.capabilities().vision
     }
 
     async fn chat_with_tools(
@@ -4368,11 +4397,11 @@ mod tests {
         .await;
     }
 
-    // ReliableModelProvider::supports_vision() must reflect the
-    // primary (first) provider, not .any() across the fallback chain. This mirrors
-    // supports_native_tools() which already uses .first().
+    // Vision must be safe for every provider the request can reach. Unlike
+    // native tools, a fallback cannot recover after receiving an unsupported
+    // image payload, so mixed chains report non-vision at the outer gate.
     #[test]
-    fn supports_vision_reflects_first_provider_not_any_fallback() {
+    fn supports_vision_requires_every_fallback_to_support_images() {
         struct VisionMock(bool);
 
         #[async_trait]
@@ -4441,7 +4470,168 @@ mod tests {
             0,
         );
 
+        assert!(
+            !provider.supports_vision(),
+            "a text-only fallback makes the effective chain non-vision even when the primary supports images"
+        );
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
         assert!(provider.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn model_capability_rejects_images_before_text_only_fallback_dispatch() {
+        struct VisionDispatchMock {
+            vision: bool,
+            fail: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for VisionDispatchMock {
+            fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+                crate::traits::ProviderCapabilities {
+                    vision: self.vision,
+                    ..Default::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail {
+                    anyhow::bail!("503 unavailable");
+                }
+                Ok("fallback".to_string())
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for VisionDispatchMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "VisionDispatchMock"
+            }
+        }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(VisionDispatchMock {
+                        vision: true,
+                        fail: true,
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(VisionDispatchMock {
+                        vision: false,
+                        fail: false,
+                        calls: Arc::clone(&fallback_calls),
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(
+            !provider.capabilities_for_model("requested-model").vision,
+            "the pre-dispatch gate must account for the text-only fallback"
+        );
+        assert_eq!(
+            provider
+                .simple_chat("hello", "requested-model", None)
+                .await
+                .expect("fallback succeeds"),
+            "fallback"
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            1,
+            "the text-only provider is an actual reachable dispatch target"
+        );
+    }
+
+    #[test]
+    fn capabilities_vision_matches_supports_vision_on_final_wrapped_reliable() {
+        // Regression: the final wrapped ReliableModelProvider must report the SAME
+        // `vision` on `capabilities().vision` and `supports_vision()`. Wrap the
+        // config `vision` decorator forcing vision ON over a non-vision inner; the
+        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // delegated to the primary, the outer returned the trait default
+        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        struct PlainMock;
+        #[async_trait]
+        impl ModelProvider for PlainMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PlainMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainMock"
+            }
+        }
+
+        let inner = crate::vision_override::VisionOverrideProvider::new(
+            Box::new(PlainMock) as Box<dyn ModelProvider>,
+            true,
+        );
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![("primary".into(), Box::new(inner) as Box<dyn ModelProvider>)],
+            0,
+            0,
+        );
+        assert!(provider.supports_vision());
+        assert!(
+            provider.capabilities().vision,
+            "outer capabilities().vision must match the delegated supports_vision()"
+        );
+        assert_eq!(provider.capabilities().vision, provider.supports_vision());
     }
 
     #[tokio::test]

@@ -75,7 +75,7 @@ pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
-pub use zeroclaw_tools::mcp_client::McpRegistry;
+pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
 pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
@@ -1194,12 +1194,16 @@ pub fn all_tools_with_runtime(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
             ));
             tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopApproveTool::new(Arc::clone(sop_engine))
+                    .with_agent_alias(agent_alias)
+                    .with_audit(Arc::clone(sop_audit)),
             ));
         } else {
             tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
+            ));
         }
         tool_arcs.push(Arc::new(
             SopStatusTool::new(Arc::clone(sop_engine))
@@ -1455,7 +1459,8 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let count = details.len();
+                    let discovered_count = details.len();
+                    let mut registered_count = 0_usize;
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1472,20 +1477,53 @@ pub fn all_tools_with_runtime(
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                            wasm_path.to_path_buf(),
-                            manifest.permissions.clone(),
-                            manifest.name.clone(),
-                            manifest.description.clone().unwrap_or_default(),
-                            plugin_config,
-                            plugin_limits,
-                        )));
+                        let tool = (|| -> anyhow::Result<_> {
+                            let scope =
+                                zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+                                    manifest,
+                                    zeroclaw_plugins::PluginCapability::Tool,
+                                    manifest.name.clone(),
+                                    manifest.permissions.iter().copied(),
+                                )?;
+                            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                                wasm_path.to_path_buf(),
+                                scope,
+                                plugin_config,
+                                plugin_limits,
+                            )
+                        })();
+                        match tool {
+                            Ok(tool) => {
+                                tool_arcs.push(Arc::new(tool));
+                                registered_count += 1;
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Load
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": manifest.name,
+                                            "error": format!("{e:#}"),
+                                        })
+                                    ),
+                                    "Failed to register WASM plugin tool"
+                                );
+                            }
+                        }
                     }
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
-                        "Loaded  WASM plugin tools"
+                            .with_attrs(::serde_json::json!({
+                                "discovered": discovered_count,
+                                "registered": registered_count,
+                            })),
+                        "Registered WASM plugin tools"
                     );
                 }
                 Err(e) => {
@@ -1542,7 +1580,10 @@ pub fn all_tools_with_runtime(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+    use zeroclaw_config::schema::{
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
+        SopApprovalConfig,
+    };
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -1577,6 +1618,66 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn component_with_failed_metadata_probe_is_not_registered() {
+        let tmp = TempDir::new().unwrap();
+        let package_dir = tmp.path().join("plugins").join("metadata-probe");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            "name = \"metadata-probe\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), b"not a component").unwrap();
+
+        let mut config = test_config(&tmp);
+        config.plugins.enabled = true;
+        config.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
+        let security = Arc::new(SecurityPolicy::default());
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "markdown".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+
+        let tools = all_tools(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            memory,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        assert!(
+            tools.iter().all(|tool| tool.name() != "metadata-probe"),
+            "a component whose required metadata probe fails must not receive manifest fallback metadata"
+        );
     }
 
     #[test]
@@ -1844,6 +1945,154 @@ mod tests {
         // copying state.
         assert!(Arc::strong_count(&shared_engine) >= 3);
         assert!(Arc::strong_count(&shared_audit) >= 3);
+    }
+
+    #[tokio::test]
+    async fn sop_approve_registry_binds_the_calling_agent_alias() {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopRunStatus, SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: vec!["agent:ZeroClawOperator".to_string()],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".to_string()),
+                quorum: 1,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let mut engine = SopEngine::new(zeroclaw_config::schema::SopConfig {
+            approval: SopApprovalConfig { groups, policies },
+            ..Default::default()
+        })
+        .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![Sop {
+            name: "deploy".into(),
+            description: "test".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "gate".into(),
+                    kind: SopStepKind::Execute,
+                    requires_confirmation: true,
+                    policy: Some("prod".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "execute".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "deploy",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected WaitApproval, got {other:?}"),
+        };
+        let shared_engine = Arc::new(Mutex::new(engine));
+        let cfg = test_config(&tmp);
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let build = |agent_alias: &str, memory: Arc<dyn Memory>| {
+            all_tools_with_runtime(
+                Arc::new(Config::default()),
+                &security,
+                &risk,
+                agent_alias,
+                Arc::new(NativeRuntime::new()),
+                memory,
+                None,
+                None,
+                &browser,
+                &http,
+                &web,
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                Some(shared_engine.clone()),
+                None,
+                None,
+            )
+            .tools
+        };
+        let unauthorized_tools = build("ZeroClawAgent", mem.clone());
+        let authorized_tools = build("ZeroClawOperator", mem);
+
+        let unauthorized = unauthorized_tools
+            .iter()
+            .find(|tool| tool.name() == "sop_approve")
+            .expect("unauthorized registry has sop_approve");
+        let result = unauthorized
+            .execute(serde_json::json!({ "run_id": run_id.clone() }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            shared_engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::WaitingApproval)
+        );
+
+        let authorized = authorized_tools
+            .iter()
+            .find(|tool| tool.name() == "sop_approve")
+            .expect("authorized registry has sop_approve");
+        let result = authorized
+            .execute(serde_json::json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        assert!(result.success, "authorized alias must resolve: {result:?}");
     }
 
     #[test]

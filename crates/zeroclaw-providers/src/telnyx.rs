@@ -17,13 +17,28 @@ pub struct TelnyxModelProvider {
     client: Client,
 }
 
-impl TelnyxModelProvider {
-    /// Create a new Telnyx AI model_provider.
-    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
-        let resolved_key = resolve_telnyx_api_key(api_key);
-        Self {
-            alias: alias.to_string(),
-            api_key: resolved_key,
+/// Typed builder for [`TelnyxModelProvider`].
+///
+/// Only `alias` is required; `api_key` falls back to the
+/// `TELNYX_API_KEY` environment variable.
+#[must_use]
+pub struct TelnyxBuilder {
+    alias: String,
+    api_key: Option<String>,
+}
+
+impl TelnyxBuilder {
+    /// Set an explicit Telnyx API key. When unset, `build()` reads
+    /// `TELNYX_API_KEY` from the environment via `resolve_telnyx_api_key`.
+    pub fn api_key(mut self, api_key: Option<&str>) -> Self {
+        self.api_key = api_key.map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> TelnyxModelProvider {
+        TelnyxModelProvider {
+            alias: self.alias,
+            api_key: resolve_telnyx_api_key(self.api_key.as_deref()),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -31,10 +46,16 @@ impl TelnyxModelProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
-    /// Create a model_provider with a custom base URL (for testing or proxies).
-    pub fn with_base_url(alias: &str, api_key: Option<&str>, _base_url: &str) -> Self {
-        // Note: custom base URL support for testing
-        Self::new(alias, api_key)
+}
+
+impl TelnyxModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`TelnyxBuilder`].
+    pub fn builder(alias: &str) -> TelnyxBuilder {
+        TelnyxBuilder {
+            alias: alias.to_string(),
+            api_key: None,
+        }
     }
 
     /// List available models from Telnyx AI.
@@ -316,13 +337,15 @@ mod tests {
 
     #[test]
     fn creates_provider_with_key() {
-        let model_provider = TelnyxModelProvider::new("test", Some("test-key"));
+        let model_provider = TelnyxModelProvider::builder("test")
+            .api_key(Some("test-key"))
+            .build();
         assert!(model_provider.api_key.is_some());
     }
 
     #[test]
     fn creates_provider_without_key() {
-        let _provider = TelnyxModelProvider::new("test", None);
+        let _provider = TelnyxModelProvider::builder("test").api_key(None).build();
         // Will be None if env vars not set
     }
 

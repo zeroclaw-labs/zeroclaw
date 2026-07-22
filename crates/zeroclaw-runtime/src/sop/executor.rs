@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use super::approval::{BrokerOutcome, ResolveOutcome};
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
 use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
@@ -166,6 +167,25 @@ pub fn spawn_headless_run_driver(
     });
 }
 
+/// Drive a broker-approved run from a headless approval surface.
+///
+/// Every transport that resolves through `SopEngine::resolve_via_broker` calls
+/// this instead of independently extracting `Resolved(Resumed(_))`. That keeps
+/// the transport response separate from the lifecycle obligation to schedule
+/// the resumed action.
+pub fn drive_resumed_broker_action(
+    config: &zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    outcome: &BrokerOutcome,
+) {
+    let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
+        return;
+    };
+
+    spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
+}
+
 async fn drive_headless_run(
     config: zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
@@ -215,6 +235,7 @@ async fn drive_headless_run(
                         output,
                         started_at,
                         completed_at: Some(completed_at),
+                        effective_agent: Some(agent_alias.clone()),
                         tool_calls: Vec::new(),
                     },
                     Err(e) => SopStepResult {
@@ -223,6 +244,7 @@ async fn drive_headless_run(
                         output: e.to_string(),
                         started_at,
                         completed_at: Some(completed_at),
+                        effective_agent: Some(agent_alias.clone()),
                         tool_calls: Vec::new(),
                     },
                 };
@@ -448,6 +470,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -483,6 +507,7 @@ mod tests {
             &engine,
             &run_id,
             SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "ok".to_string(),

@@ -178,6 +178,13 @@ pub(crate) async fn finish_after_max_iterations(
     }
     history.push(summary_msg);
     accumulated_display_text.push_str(&text);
+    // Graceful shutdown with a visible reason so the user knows why the
+    // agent stopped making progress.
+    accumulated_display_text.push_str("\n\n");
+    accumulated_display_text.push_str(&crate::i18n::get_required_cli_string_with_args(
+        "turn-max-iterations-reached",
+        &[("max_iterations", &max_iterations.to_string())],
+    ));
     Ok(accumulated_display_text)
 }
 
@@ -281,6 +288,14 @@ mod graceful_summary_metering_tests {
             .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        // The returned display text must carry both the summary and the visible
+        // stop reason — deleting the stop-reason append would leave this green
+        // on `wrap-up summary` alone, so the stop-reason assertion pins the
+        // user-observed contract.
+        assert!(
+            out.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "stop reason with iteration count must reach returned output: {out}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "provider called once");
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
@@ -316,6 +331,131 @@ mod graceful_summary_metering_tests {
             calls.load(Ordering::SeqCst),
             0,
             "budget gate must fire before the provider call"
+        );
+    }
+
+    /// Provider stub that records the exact messages it was dispatched, so a
+    /// test can assert on what actually reached the provider.
+    struct CapturingProvider {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CapturingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let joined = request
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.seen.lock().unwrap().push(joined);
+            Ok(ChatResponse {
+                text: Some("wrap-up summary".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for CapturingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "capturing-provider"
+        }
+    }
+
+    // The graceful-summary path dispatches the accumulated history directly
+    // through `run_model_query`, which does NOT run
+    // `prepare_messages_for_provider`. A tool-result `[AUDIO:/path]` in that
+    // history must be stripped before it reaches the provider, or the raw
+    // filesystem path leaks and is hallucinated over on the max-iteration exit.
+    #[tokio::test]
+    async fn graceful_summary_strips_tool_audio_marker_before_dispatch() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+        };
+        // A properly paired assistant tool_call + native tool-result JSON blob,
+        // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
+        // the exchange intact and the audio marker survives to dispatch. This
+        // also exercises stripping a marker embedded inside a tool-result JSON
+        // object (the native-dispatcher shape), not just plain text.
+        let mut history = vec![
+            ChatMessage::user("call the tool and tell me what you hear"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_1"}]}"#),
+            ChatMessage::tool(
+                r#"{"content":"[AUDIO:/tmp/clip.wav] recorded 3:00 PM","tool_call_id":"toolu_1"}"#,
+            ),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-audio",
+            &knobs,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains("/tmp/clip.wav"),
+            "raw audio path reached the provider on the max-iteration path: {captured}"
+        );
+        assert!(
+            captured.contains("[media attachment]"),
+            "audio marker should be replaced with a placeholder: {captured}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod i18n_message_tests {
+    /// The graceful max-iteration shutdown must include the iteration count in
+    /// the user-visible message so the operator knows why the agent stopped.
+    #[test]
+    fn max_iterations_message_includes_count() {
+        let msg = crate::i18n::get_required_cli_string_with_args(
+            "turn-max-iterations-reached",
+            &[("max_iterations", "42")],
+        );
+        assert!(
+            msg.contains("42"),
+            "message should contain iteration count: {msg}"
+        );
+        assert!(
+            msg.contains("maximum tool iterations"),
+            "message should describe the limit: {msg}"
         );
     }
 }
