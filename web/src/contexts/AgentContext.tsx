@@ -7,6 +7,7 @@ import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSessio
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
+import { classifyCompletion } from '@/contexts/turnStream.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -245,38 +246,37 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'message':
       case 'done': {
-        const raw_content = msg.full_response ?? msg.content ?? pendingContentRef.current;
-        // Skip whitespace-only content (e.g. models that emit "\n\n"
-        // alongside tool_calls) to avoid accumulating blank lines in the
-        // assistant bubble. Ref: #6702.
-        const content = raw_content.trim();
-        const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
-        // Reasoning-only turns: some models (GLM, Qwen, DeepSeek) put their
-        // whole output in reasoning_content and return empty content with no
-        // tool calls. Without this the turn ends silently — the Thinking block
-        // vanishes and no bubble appears, so the user thinks it hung. When
-        // thinking is present, commit the message even with empty content so
-        // the reasoning stays visible alongside an (empty) answer bubble. The
-        // #6702 case (whitespace content + tool_calls, no thinking) still skips.
-        if (content || thinking) {
+        // Classify the finished turn with the pure reducer so the reasoning-only
+        // / empty / tool-only decision is unit-tested (turnStream.logic.ts). The
+        // four refs below are this turn's accumulated stream state.
+        const outcome = classifyCompletion(
+          {
+            pendingContent: pendingContentRef.current,
+            pendingThinking: pendingThinkingRef.current,
+            capturedThinking: capturedThinkingRef.current,
+            hadToolCall: turnHadToolCallRef.current,
+          },
+          { full_response: msg.full_response, content: msg.content },
+        );
+        if (outcome.kind === 'commit') {
+          // `commit` includes reasoning-only turns: empty content but present
+          // thinking, so the turn renders instead of vanishing silently.
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
             {
               id: generateUUID(),
               role: 'agent',
-              content,
-              thinking,
+              content: outcome.content,
+              thinking: outcome.thinking,
               markdown: true,
               timestamp: new Date(),
             },
           ]);
-        } else if (!turnHadToolCallRef.current) {
-          // Nothing at all — no content, no reasoning, no tool calls — but the
-          // turn completed cleanly. Render a diagnostic so the user knows the
-          // turn finished rather than silently vanishing. When tool calls ran,
-          // their cards are the visible record, so no diagnostic is needed.
-          // Mirrors zerocode's zc-turn-no-output fallback (#8779).
+        } else if (outcome.kind === 'diagnostic') {
+          // Clean completion with nothing at all — surface a one-off notice so
+          // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
+          // fallback (#8779). `skip` (empty + tool calls ran) renders nothing.
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
