@@ -42,9 +42,10 @@ impl LucidMemory {
 
     /// Construct with config-sourced overrides (`[storage.lucid.<alias>]`).
     /// Each `None` falls back to the built-in default, so an unconfigured
-    /// alias behaves exactly like [`Self::new`]. Blank commands and zero
-    /// deadlines also fall back because normal config loading warns and keeps
-    /// the process available for operator repair after validation errors.
+    /// alias behaves exactly like [`Self::new`]. Explicit blank commands stay
+    /// invalid instead of falling through to `PATH`; zero deadlines fall back
+    /// because normal config loading warns and keeps the process available for
+    /// operator repair after validation errors.
     pub fn with_overrides(
         alias: &str,
         workspace_dir: &Path,
@@ -53,9 +54,7 @@ impl LucidMemory {
         recall_timeout_ms: Option<u64>,
         store_timeout_ms: Option<u64>,
     ) -> Self {
-        let lucid_cmd = lucid_cmd
-            .filter(|command| !command.trim().is_empty())
-            .unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string());
+        let lucid_cmd = lucid_cmd.unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string());
         let recall_timeout_ms = recall_timeout_ms
             .filter(|timeout| *timeout > 0)
             .unwrap_or(Self::DEFAULT_RECALL_TIMEOUT_MS);
@@ -605,6 +604,39 @@ impl Memory for LucidMemory {
     }
 }
 
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn with_overrides_keeps_blank_command_invalid_and_normalizes_zero_timeouts() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some("   ".into()),
+            Some(0),
+            Some(0),
+        );
+
+        assert_eq!(
+            memory.lucid_cmd, "   ",
+            "an explicit invalid selector must not fall through to PATH"
+        );
+        assert_eq!(
+            memory.recall_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            memory.store_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS)
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -690,6 +722,37 @@ fi
 echo "unsupported command" >&2
 exit 1
 "#;
+
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        script_path.display().to_string()
+    }
+
+    fn write_delayed_store_lucid_script(dir: &Path, marker_path: &Path) -> String {
+        let script_path = dir.join("delayed-store-lucid.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+
+if [ "${{1:-}}" = "store" ]; then
+  sleep 1.5
+  printf 'completed\n' > "{}"
+  printf '{{"success":true,"id":"mem_1"}}\n'
+  exit 0
+fi
+
+if [ "${{1:-}}" = "context" ]; then
+  printf '<lucid-context>\n</lucid-context>\n'
+  exit 0
+fi
+
+echo "unsupported command" >&2
+exit 1
+"#,
+            marker_path.display()
+        );
 
         fs::write(&script_path, script).unwrap();
         let mut perms = fs::metadata(&script_path).unwrap().permissions();
@@ -857,6 +920,31 @@ exit 1
     }
 
     #[tokio::test]
+    async fn store_handles_lucid_cold_start_delay_with_default_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = tmp.path().join("store-completed.marker");
+        let delayed_cmd = write_delayed_store_lucid_script(tmp.path(), &marker_path);
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory =
+            LucidMemory::with_overrides("test", tmp.path(), sqlite, Some(delayed_cmd), None, None);
+
+        memory
+            .store(
+                "cold_start",
+                "Store survives Lucid cold start",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            marker_path.exists(),
+            "the default store timeout must allow the simulated 1.5s cold start"
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_terminates_and_reaps_lucid_child() {
         let tmp = TempDir::new().unwrap();
         let pid_path = tmp.path().join("child.pid");
@@ -907,30 +995,6 @@ exit 1
                 .any(|e| e.content.contains("Delayed token refresh guidance")),
             "with_overrides(None, None, None) must apply the same raised \
              default timeout as `new`, tolerating the simulated 1.5s cold start"
-        );
-    }
-
-    #[test]
-    fn with_overrides_normalizes_invalid_values_to_defaults() {
-        let tmp = TempDir::new().unwrap();
-        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory = LucidMemory::with_overrides(
-            "test",
-            tmp.path(),
-            sqlite,
-            Some("   ".into()),
-            Some(0),
-            Some(0),
-        );
-
-        assert_eq!(memory.lucid_cmd, LucidMemory::DEFAULT_LUCID_CMD);
-        assert_eq!(
-            memory.recall_timeout,
-            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS)
-        );
-        assert_eq!(
-            memory.store_timeout,
-            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS)
         );
     }
 

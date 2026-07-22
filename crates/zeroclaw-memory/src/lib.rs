@@ -1757,11 +1757,11 @@ if [ "${{1:-}}" = "store" ]; then
   printf 'store-start:%s\n' "${{2:-}}" >> "{}"
   case "${{2:-}}" in
     fast_store:*)
-      sleep 0.2
+      sleep 0.1
       printf 'fast-store-complete\n' >> "{}"
       ;;
     slow_store:*)
-      sleep 0.5
+      sleep 1.2
       printf 'slow-store-complete\n' >> "{}"
       ;;
   esac
@@ -1769,7 +1769,7 @@ if [ "${{1:-}}" = "store" ]; then
 fi
 if [ "${{1:-}}" = "context" ]; then
   printf 'context-start\n' >> "{}"
-  sleep 0.2
+  sleep 1.0
   printf 'context-complete\n' >> "{}"
   cat <<'EOF'
 <lucid-context>
@@ -1824,8 +1824,8 @@ backend = "lucid.selected"
 
 [storage.lucid.selected]
 binary_path = "{selected_cmd}"
-recall_timeout_ms = 100
-store_timeout_ms = 300
+recall_timeout_ms = 200
+store_timeout_ms = 500
 
 [storage.lucid.decoy]
 binary_path = "{decoy_cmd}"
@@ -1860,7 +1860,7 @@ store_timeout_ms = 900
             .unwrap();
         let entries = memory.recall("factory", 5, None, None, None).await.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
         let selected_calls = fs::read_to_string(&selected_log).unwrap_or_default();
         assert!(selected_calls.contains("store-start:fast_store:"));
         assert!(selected_calls.contains("fast-store-complete"));
@@ -1898,8 +1898,8 @@ backend = "lucid.selected"
 
 [storage.lucid.selected]
 binary_path = "{selected_cmd}"
-recall_timeout_ms = 100
-store_timeout_ms = 300
+recall_timeout_ms = 200
+store_timeout_ms = 500
 
 [storage.lucid.decoy]
 binary_path = "{decoy_cmd}"
