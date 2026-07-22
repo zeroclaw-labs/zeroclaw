@@ -1478,8 +1478,12 @@ impl Agent {
                 // CLI / standalone path: no channel map is wired here, so the route
                 // adapter is the no-op (log-only). The daemon path builds the SOP
                 // engine with a real channel-delivering adapter instead.
-                let (engine, audit) =
-                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem, None);
+                let (engine, audit) = crate::sop::build_sop_engine(
+                    config.sop.clone(),
+                    &config.data_dir,
+                    mem,
+                    Default::default(),
+                );
                 (Some(engine), Some(audit))
             }
             _ => (None, None),

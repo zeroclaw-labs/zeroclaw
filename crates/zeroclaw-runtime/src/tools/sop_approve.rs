@@ -72,6 +72,17 @@ impl Tool for SopApproveTool {
             anyhow::Error::msg("Missing 'run_id' parameter")
         })?;
 
+        // Lock the engine, route through the chokepoint, then drop the lock.
+        // resolve_gate records both the append-only ledger row and the approval
+        // completion metric (every principal meters identically there); the tool
+        // no longer writes a legacy Memory audit key nor a separate metric. Under
+        // approval_mode=out_of_band_required this returns RejectedSelfApproval (the
+        // gate stays open for a CLI/gateway approver).
+        //
+        // A deterministic SOP paused at a checkpoint is resolved by the SAME
+        // chokepoint: `resolve_via_broker` owns the checkpoint bridge (audited
+        // resume via `approve_step` + headless drive of the following capability
+        // steps), so approval gates and checkpoints behave identically here.
         let result = {
             let mut engine = self.engine.lock().map_err(|e| {
                 ::zeroclaw_log::record!(
@@ -136,6 +147,13 @@ impl Tool for SopApproveTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Run {run_id} was denied.")),
+            }),
+            // Unreachable from this tool (it only sends Approve), but a stable
+            // report beats a panic if the outcome set grows another producer.
+            Ok(BrokerOutcome::Resolved(ResolveOutcome::Revised)) => Ok(ToolResult {
+                success: true,
+                output: format!("Run {run_id} re-drafted; the gate was re-presented.").into(),
+                error: None,
             }),
             Ok(BrokerOutcome::Resolved(ResolveOutcome::NotWaiting))
             | Ok(BrokerOutcome::NotWaiting) => Ok(ToolResult {

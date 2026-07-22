@@ -51,6 +51,20 @@ pub fn resolve_gate(
         return Ok(ResolveOutcome::RejectedSelfApproval);
     }
 
+    // Amend/Revise are deterministic-checkpoint decisions (resolve_checkpoint
+    // owns them); an approval gate has no draft to edit or re-run. Refuse HERE,
+    // before the claim reacquire and the ledger append, so no side effect records
+    // a decision that was never applied.
+    if matches!(
+        decision,
+        ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. }
+    ) {
+        return Err(anyhow::Error::msg(format!(
+            "run {run_id} is parked at an approval gate; amend/revise apply only to \
+             deterministic checkpoints — approve or deny instead"
+        )));
+    }
+
     // 2a. Refuse to resolve an approval while the run's parked snapshot has not
     //     yet been durably persisted (`persist_parked_snapshot_then_release_claim`'s
     //     fail-closed keep, tracked in `claims_pending_persist`). That claim
@@ -108,9 +122,16 @@ pub fn resolve_gate(
     //    The row and the run transition below must commit as ONE store outcome:
     //    an immutable `gate_resolved` row is only true if the corresponding
     //    `WaitingApproval -> Running/Cancelled` state transition also persisted.
+    let gate_revision = engine
+        .get_run(run_id)
+        .map(|run| run.revision)
+        .unwrap_or_default();
     let gate_event = GateLedgerEntry {
         run_id: run_id.to_string(),
         step,
+        gate_revision: Some(gate_revision),
+        checkpoint_revision: None,
+        decision_identity: None,
         kind: GateEventKind::Resolved,
         decision: Some(decision.clone()),
         principal: principal.clone(),
@@ -143,6 +164,13 @@ pub fn resolve_gate(
                 &gate_event,
             )?;
             ResolveOutcome::Denied
+        }
+        // Rejected at entry (before the claim reacquire and ledger append);
+        // defensive so this match stays exhaustive without a panic path.
+        ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. } => {
+            return Err(anyhow::Error::msg(
+                "amend/revise apply only to deterministic checkpoints",
+            ));
         }
     };
 

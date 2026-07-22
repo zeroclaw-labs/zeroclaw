@@ -320,8 +320,9 @@ impl SopEngine {
     /// quorum), then its single transition owner.
     /// This is the entry point out-of-band surfaces (gateway / CLI / tools) should
     /// call so a `[sop.approval]` policy is enforced; with no policy it is exactly
-    /// `resolve_gate`. The broker is cloned out first so it does not borrow `self`
-    /// while `self` is mutated by the chokepoint.
+    /// `resolve_gate` for a `WaitingApproval` run or the historical checkpoint
+    /// resolver for a `PausedCheckpoint` run. The broker is cloned out first so it
+    /// does not borrow `self` while `self` is mutated by the chokepoint.
     pub fn resolve_via_broker(
         &mut self,
         run_id: &str,
@@ -337,6 +338,17 @@ impl SopEngine {
             {
                 return Ok(outcome);
             }
+            if let super::approval::ApprovalDecision::Revise { guidance } = &decision {
+                self.revise_checkpoint_with_principal(
+                    run_id,
+                    guidance,
+                    decision.clone(),
+                    principal,
+                )?;
+                return Ok(super::approval::BrokerOutcome::Resolved(
+                    super::approval::ResolveOutcome::Revised,
+                ));
+            }
             let action = self.decide_checkpoint_with_principal(run_id, decision, principal)?;
             return Ok(super::approval::BrokerOutcome::Resolved(
                 super::approval::ResolveOutcome::Resumed(Box::new(action)),
@@ -350,6 +362,13 @@ impl SopEngine {
         match self.store.load_active_runs() {
             Ok(runs) => {
                 let mut restored = 0usize;
+                // Parking is durable before its out-of-band notice is attempted. A
+                // daemon can therefore exit in the interval between those two
+                // operations; replay the existing request seam after restore so a
+                // parked gate cannot become invisible forever. Delivery is
+                // intentionally at-least-once and keeps the canonical gate
+                // reference, allowing adapters to de-duplicate it if needed.
+                let mut replay_parked_requests = Vec::new();
                 for pr in runs {
                     // A1: a run persisted while parked at a HITL approval / paused at
                     // a deterministic checkpoint normally holds NO exec claim - it
@@ -462,13 +481,19 @@ impl SopEngine {
                         );
                         continue;
                     }
-                    if self
-                        .active_runs
-                        .insert(pr.run.run_id.clone(), pr.run)
-                        .is_none()
-                    {
+                    let run_id = pr.run.run_id.clone();
+                    if self.active_runs.insert(run_id.clone(), pr.run).is_none() {
                         restored += 1;
+                        if parked {
+                            replay_parked_requests.push(run_id);
+                        }
                     }
+                }
+                // Reuse the same policy resolution and request construction used
+                // by a newly parked run. Restored runs already released any claim,
+                // so this is delivery recovery only, not another park transition.
+                for run_id in replay_parked_requests {
+                    self.notify_park_request(&run_id);
                 }
                 if restored > 0 {
                     let span = ::zeroclaw_log::info_span!(
@@ -877,6 +902,16 @@ impl SopEngine {
     /// maintenance tick's retry durably persists the park.
     pub(crate) fn is_park_persist_pending(&self, run_id: &str) -> bool {
         self.claims_pending_persist.contains(run_id)
+    }
+
+    /// A prompt becomes stale only after a replacement presentation is durable.
+    /// A gate can update its in-memory revision before its parked snapshot saves;
+    /// finalizing the old prompt in that window would leave operators without a
+    /// recoverable replacement after a crash.
+    pub fn is_gate_reference_superseded(&self, run_id: &str, reference_revision: u32) -> bool {
+        self.active_runs.get(run_id).is_some_and(|run| {
+            run.revision != reference_revision && !self.is_park_persist_pending(run_id)
+        })
     }
 
     /// Admit a run through the store CAS claim before it becomes locally active.
@@ -1700,7 +1735,10 @@ impl SopEngine {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
+        let first_input = step_input_value(&run, 1);
         self.active_runs.insert(run_id.clone(), run);
 
         if deterministic {
@@ -1712,7 +1750,7 @@ impl SopEngine {
                     run_id, sop.name
                 )
             );
-            match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
+            match self.dispatch_deterministic_step(&run_id, &sop, 1, first_input) {
                 Ok(action) => Ok(action),
                 Err(e) => Err(self.rollback_failed_start(&run_id, &claim, e)),
             }
@@ -2247,6 +2285,15 @@ impl SopEngine {
         // approval_mode-conditional escalation), so the mode param is gone.
         let action = resolve_step_action(sop, &step, run_id.to_string(), context);
         let parked_for_approval = matches!(action, SopRunAction::WaitApproval { .. });
+        let has_prior_gate_presentation = parked_for_approval
+            && self.run_events(run_id).is_ok_and(|events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event.kind.as_str(),
+                        "gate_vote" | "gate_resolved" | "gate_escalated" | "gate_timed_out"
+                    )
+                })
+            });
 
         // A1: free the exec slot while the run waits on a human - but only AFTER
         // the parked snapshot is durably persisted (else keep the claim, fail
@@ -2259,6 +2306,9 @@ impl SopEngine {
             if let Some(run) = self.active_runs.get_mut(run_id) {
                 run.status = SopRunStatus::WaitingApproval;
                 run.waiting_since = Some(now_iso8601());
+                if run.revision > 0 || has_prior_gate_presentation {
+                    run.revision += 1;
+                }
             }
             match self.persist_parked_snapshot_then_release_claim(run_id) {
                 // Deliver only after the parked snapshot is durable. A failed persist
@@ -2291,16 +2341,55 @@ impl SopEngine {
     /// with no policy, a policy with no request route, or a delivery error all leave
     /// the (already-parked, already-durable) gate untouched.
     fn notify_park_request(&self, run_id: &str) {
-        let (sop_name, step) = match self.get_run(run_id) {
-            Some(r) => (r.sop_name.clone(), r.current_step),
-            None => return,
+        let Some(run) = self.get_run(run_id) else {
+            return;
         };
+        let (sop_name, step, revision) = (run.sop_name.clone(), run.current_step, run.revision);
+        // Edit/Revise resolve ONLY through the deterministic-checkpoint path
+        // (`resolve_checkpoint`); a broker-owned approval gate refuses them
+        // fail-closed. Offering the choices on a non-checkpoint park would
+        // render buttons whose submissions are always rejected — the operator's
+        // typed text silently lost behind a success-looking ack.
+        let is_checkpoint = run.status == SopRunStatus::PausedCheckpoint;
+        // The notice carries WHAT is being approved: the parked step's piped
+        // input (trigger payload at step 1, previous step's output later) plus
+        // the step's authored `- prompt:` template when it has one.
+        let context = step_input_value(run, step);
+        let step_def = self
+            .resolve_active_run_sop(run_id)
+            .ok()
+            .and_then(|(_, sop)| self.resolve_sop_step(&sop, step).ok());
+        let gate_prompt = step_def.as_ref().and_then(|s| s.gate_prompt.clone());
+        // Input-bearing choices: Edit needs the step's `- edit:` declaration;
+        // Revise needs an llm.generate predecessor and headroom under the cap.
+        let edit_field = step_def
+            .as_ref()
+            .filter(|_| is_checkpoint)
+            .and_then(|s| s.edit.as_deref())
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string);
+        let can_revise = is_checkpoint
+            && revision.saturating_sub(run.revision_base) < MAX_GATE_REVISIONS
+            && self.revisable_predecessor(run_id).is_some();
         let Some(policy_name) = self.current_step_policy_name(run_id) else {
             return;
         };
         let broker = self.approval_broker();
         if let Some(route) = broker.request_route(self.approval_config(), &policy_name) {
-            broker.deliver_request(&route, run_id, &sop_name, step);
+            broker.deliver_request(
+                &route,
+                &super::approval::GateNotice {
+                    run_id,
+                    sop_name: &sop_name,
+                    step,
+                    context: &context,
+                    gate_prompt: gate_prompt.as_deref(),
+                    revision,
+                    edit_field: edit_field.as_deref(),
+                    can_revise,
+                },
+            );
         }
     }
 
@@ -2554,6 +2643,28 @@ impl SopEngine {
     }
 
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
+        self.resume_checkpoint(run_id, None)
+    }
+
+    /// Resume a run paused at a deterministic checkpoint, optionally amending one
+    /// field of the piped value first (`amend = (field, text)`, the operator-edited
+    /// draft). The amended value becomes the checkpoint's recorded output, so the
+    /// human-approved text flows downstream while the predecessor step keeps the
+    /// model's original.
+    fn resume_checkpoint(
+        &mut self,
+        run_id: &str,
+        amend: Option<(String, String)>,
+    ) -> Result<SopRunAction> {
+        self.resume_checkpoint_inner(run_id, amend, false)
+    }
+
+    fn resume_checkpoint_inner(
+        &mut self,
+        run_id: &str,
+        amend: Option<(String, String)>,
+        claim_already_reacquired: bool,
+    ) -> Result<SopRunAction> {
         let status = self
             .active_runs
             .get(run_id)
@@ -2594,19 +2705,42 @@ impl SopEngine {
         // A1: fail-closed - re-acquire the exec claim released when this run parked
         // BEFORE flipping it to Running; if it cannot, abort and leave the run paused
         // (re-resolvable) rather than execute uncounted.
-        self.reacquire_claim_on_resume(run_id)?;
+        if !claim_already_reacquired {
+            self.reacquire_claim_on_resume(run_id)?;
+        }
         // A deterministic run paused at a checkpoint resumes through the
         // deterministic piping path: the checkpoint step is recorded as
-        // completed and its output (or the previous step's) is piped forward.
+        // completed and its input (the previous step's output — or, for a
+        // checkpoint parked at step 1, the trigger payload) is piped forward.
+        // Same step-1 mapping as `step_input_value`; `.last()` alone starved an
+        // intake-gate pipeline (checkpoint BEFORE the first work step) of its
+        // trigger payload.
         let run = self
             .active_runs
             .get_mut(run_id)
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
-        let piped = run
-            .step_results
-            .last()
-            .map(step_result_value)
-            .unwrap_or(serde_json::Value::Null);
+        let mut piped = step_input_value(run, run.current_step);
+        // Operator amendment: replace the declared editable field BEFORE any run
+        // mutation, so a non-amendable input (pre-flighted by
+        // `can_amend_checkpoint`, so defensive here) leaves the run parked.
+        if let Some((field, text)) = amend {
+            match piped.as_object_mut() {
+                Some(map) => {
+                    map.insert(field, serde_json::Value::String(text));
+                }
+                None => {
+                    self.release_claim_on_park(run_id);
+                    bail!(
+                        "Run {run_id} checkpoint input is not a JSON object; \
+                         cannot amend field '{field}'"
+                    );
+                }
+            }
+        }
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         let prior_waiting_since = run.waiting_since.clone();
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
@@ -2626,6 +2760,253 @@ impl SopEngine {
                 Err(e)
             }
         }
+    }
+
+    /// The `- edit:` field the run's current checkpoint step declares, or why an
+    /// amend cannot apply. Resolved under the engine lock at resolution time, so
+    /// the field an operator edits is always the step's live declaration.
+    fn checkpoint_edit_field(&self, run_id: &str) -> Result<String> {
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let current_step = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
+            .current_step;
+        let step = self.resolve_sop_step(&sop, current_step)?;
+        step.edit
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "SOP '{}' step {current_step} does not declare an editable field \
+                     (`- edit:`); an amend cannot apply",
+                    sop.name
+                ))
+            })
+    }
+
+    /// Pre-flight an `Amend` WITHOUT mutating anything: the step must declare an
+    /// editable field and the checkpoint's piped value must be a JSON object the
+    /// field can replace into.
+    fn can_amend_checkpoint(&self, run_id: &str) -> Result<()> {
+        self.checkpoint_edit_field(run_id)?;
+        let run = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        if !step_input_value(run, run.current_step).is_object() {
+            bail!(
+                "Run {run_id} checkpoint input is not a JSON object; \
+                 there is no field an amend could replace"
+            );
+        }
+        Ok(())
+    }
+
+    /// The step a `Revise` would re-run: the last COMPLETED step before the
+    /// checkpoint, but only when it is an `llm.generate` capability (the only
+    /// step kind a re-draft is meaningful for). `None` = this gate is not
+    /// revisable.
+    fn revisable_predecessor(&self, run_id: &str) -> Option<u32> {
+        let run = self.get_run(run_id)?;
+        let pred = run
+            .step_results
+            .iter()
+            .rev()
+            .find(|r| r.status == SopStepStatus::Completed && r.step_number < run.current_step)?
+            .step_number;
+        let (_, sop) = self.resolve_active_run_sop(run_id).ok()?;
+        let step = self.resolve_sop_step(&sop, pred).ok()?;
+        (step.kind == SopStepKind::Capability && step.capability_id() == Some("llm.generate"))
+            .then_some(pred)
+    }
+
+    /// Pre-flight a `Revise` WITHOUT mutating anything: the revision cap has not
+    /// been reached and the gate has an `llm.generate` predecessor to re-run.
+    fn can_revise_checkpoint(&self, run_id: &str) -> Result<()> {
+        let run = self
+            .get_run(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        // Per-GATE budget: presentations spent at THIS gate, not run-wide
+        // (`revision` also advances when a later gate first parks).
+        if run.revision.saturating_sub(run.revision_base) >= MAX_GATE_REVISIONS {
+            bail!(
+                "Run {run_id} has reached this gate's revision limit ({MAX_GATE_REVISIONS}); \
+                 approve, edit, or deny the current draft"
+            );
+        }
+        if self.revisable_predecessor(run_id).is_none() {
+            bail!(
+                "Run {run_id} has no llm.generate predecessor step to re-run; \
+                 this gate is not revisable"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-run the checkpoint's predecessor `llm.generate` step with the operator's
+    /// guidance framed as reviewer feedback, replace the recorded draft, bump the
+    /// gate revision, and re-present the gate. The run never leaves
+    /// `PausedCheckpoint`: a failed re-draft keeps the OLD draft parked and
+    /// answerable. The caller commits the new snapshot and ledger event together.
+    /// The model call blocks under the engine lock — the same tradeoff as a normal
+    /// `llm.generate` step.
+    fn revise_checkpoint_draft(&mut self, run_id: &str, guidance: &str) -> Result<()> {
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let pred_number = self.revisable_predecessor(run_id).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "Run {run_id} has no llm.generate predecessor step to re-run"
+            ))
+        })?;
+        let pred_step = self.resolve_sop_step(&sop, pred_number)?;
+        let piped = {
+            let run = self
+                .get_run(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            replay_input_for_step(run, pred_number)
+        };
+
+        // The guidance rides in the step's STATIC config plane (alongside the
+        // authored instruction), NOT the untrusted payload frame: it comes from
+        // an authenticated approver, and it must be able to steer the redraft.
+        let mut step = pred_step.clone();
+        let mut configured = step
+            .capability_input
+            .take()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = configured.as_object_mut() {
+            object.insert(
+                "revision_feedback".to_string(),
+                serde_json::Value::String(guidance.to_string()),
+            );
+        }
+        step.capability_input = Some(configured);
+
+        // The re-draft is real work: hold an exec slot for its duration (the run
+        // released its slot when it parked).
+        self.reacquire_claim_on_resume(run_id)?;
+        let ctx = super::capability::CapabilityContext {
+            run_id: run_id.to_string(),
+            sop_name: sop.name.clone(),
+            step_number: pred_number,
+            sop_location: sop.location.clone(),
+        };
+        let result = self.capabilities.execute_step(ctx, &step, piped);
+        self.metrics.record_capability_executed(&sop.name);
+
+        let output = match result {
+            Ok(r) if r.success => match self.validate_step_output(&pred_step, &r.output) {
+                Ok(()) => r.output,
+                Err(reason) => {
+                    self.release_claim_on_park(run_id);
+                    bail!(
+                        "Run {run_id} revised draft failed step {pred_number}'s output \
+                         schema (previous draft kept): {reason}"
+                    );
+                }
+            },
+            Ok(r) => {
+                self.release_claim_on_park(run_id);
+                bail!(
+                    "Run {run_id} re-draft failed (previous draft kept): {}",
+                    r.error
+                        .unwrap_or_else(|| "capability returned failure".to_string())
+                );
+            }
+            Err(e) => {
+                self.release_claim_on_park(run_id);
+                bail!("Run {run_id} re-draft failed (previous draft kept): {e}");
+            }
+        };
+
+        {
+            let run = self
+                .active_runs
+                .get_mut(run_id)
+                .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+            if let Some(recorded) = run
+                .step_results
+                .iter_mut()
+                .rev()
+                .find(|r| r.step_number == pred_number && r.status == SopStepStatus::Completed)
+            {
+                recorded.output = output.to_string();
+                recorded.completed_at = Some(now_iso8601());
+            }
+            run.revision += 1;
+            run.waiting_since = Some(now_iso8601());
+        }
+
+        Ok(())
+    }
+
+    /// Apply a revise decision while preserving the current store contract: the
+    /// new parked draft and its gate-resolution event commit together, or the
+    /// in-memory run rolls back to the previous answerable draft.
+    fn revise_checkpoint_with_principal(
+        &mut self,
+        run_id: &str,
+        guidance: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<()> {
+        let prior_run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        if prior_run.status != SopRunStatus::PausedCheckpoint {
+            bail!(
+                "Run {run_id} is not paused at a checkpoint (status: {})",
+                prior_run.status
+            );
+        }
+        if self.is_park_persist_pending(run_id) {
+            bail!(
+                "Run {run_id} cannot re-draft: its parked checkpoint snapshot is not yet \
+                 durably persisted (retrying)"
+            );
+        }
+        self.can_revise_checkpoint(run_id)?;
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        self.revise_checkpoint_draft(run_id, guidance)?;
+
+        let event = super::approval::GateLedgerEntry {
+            run_id: run_id.to_string(),
+            step: prior_run.current_step,
+            gate_revision: Some(prior_run.revision),
+            checkpoint_revision: Some(prior_run.revision),
+            decision_identity: super::approval::broker::checkpoint_decision_identity(&decision)
+                .map(|(_, identity)| identity),
+            kind: super::approval::GateEventKind::Resolved,
+            decision: Some(decision),
+            principal,
+            ts: now_iso8601(),
+        }
+        .into_event_record();
+        if let Err(e) = self.persist_active_with_gate_event(run_id, &event) {
+            self.active_runs.insert(run_id.to_string(), prior_run);
+            self.release_claim_on_park(run_id);
+            return Err(e);
+        }
+
+        // The run store is authoritative. Refresh the rehydration artifact after
+        // the atomic store write, then release the temporary execution claim and
+        // present the versioned replacement prompt.
+        if let Err(e) = self.persist_deterministic_state(run_id, &sop, true) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"run_id": run_id, "error": e.to_string()})),
+                "SOP engine: revised state-file refresh failed (run store remains authoritative)"
+            );
+        }
+        self.release_claim_on_park(run_id);
+        self.notify_park_request(run_id);
+        Ok(())
     }
 
     /// Pre-flight ONLY the fallible SOP/step lookups that
@@ -2692,6 +3073,12 @@ impl SopEngine {
             super::approval::ApprovalDecision::Deny { reason } => {
                 self.deny_checkpoint(run_id, reason)
             }
+            super::approval::ApprovalDecision::Amend { .. }
+            | super::approval::ApprovalDecision::Revise { .. } => {
+                bail!(
+                    "checkpoint edit and revise decisions must resolve through the approval broker"
+                )
+            }
         }
     }
 
@@ -2722,15 +3109,28 @@ impl SopEngine {
             );
         }
 
+        if matches!(decision, super::approval::ApprovalDecision::Revise { .. }) {
+            bail!("checkpoint revise decisions use the revision persistence path")
+        }
+        if matches!(decision, super::approval::ApprovalDecision::Amend { .. }) {
+            self.can_amend_checkpoint(run_id)?;
+        }
+
         let (_, sop) = self.resolve_active_run_sop(run_id)?;
         let current_step = self.resolve_sop_step(&sop, prior_run.current_step)?;
-        let piped = prior_run
-            .step_results
-            .last()
-            .map(step_result_value)
-            .unwrap_or(serde_json::Value::Null);
+        let mut piped = step_input_value(&prior_run, current_step.number);
+        if let super::approval::ApprovalDecision::Amend { text } = &decision {
+            let field = self.checkpoint_edit_field(run_id)?;
+            let Some(object) = piped.as_object_mut() else {
+                bail!(
+                    "Run {run_id} checkpoint input is not a JSON object; cannot amend field '{field}'"
+                );
+            };
+            object.insert(field, serde_json::Value::String(text.clone()));
+        }
         let (status, recorded_output, routed_output, started_at, completed_at) = match &decision {
-            super::approval::ApprovalDecision::Approve => (
+            super::approval::ApprovalDecision::Approve
+            | super::approval::ApprovalDecision::Amend { .. } => (
                 SopStepStatus::Completed,
                 piped.to_string(),
                 piped,
@@ -2752,6 +3152,9 @@ impl SopEngine {
                     now.clone(),
                     Some(now),
                 )
+            }
+            super::approval::ApprovalDecision::Revise { .. } => {
+                bail!("checkpoint revise decisions use the revision persistence path")
             }
         };
 
@@ -2841,6 +3244,10 @@ impl SopEngine {
         let event = super::approval::GateLedgerEntry {
             run_id: run_id.to_string(),
             step: current_step.number,
+            gate_revision: Some(prior_run.revision),
+            checkpoint_revision: Some(prior_run.revision),
+            decision_identity: super::approval::broker::checkpoint_decision_identity(&decision)
+                .map(|(_, identity)| identity),
             kind: super::approval::GateEventKind::Resolved,
             decision: Some(decision),
             principal,
@@ -3358,6 +3765,331 @@ impl SopEngine {
         )
     }
 
+    fn forge_comment_authorized_by_prior_checkpoint(
+        &self,
+        sop: &Sop,
+        run_id: &str,
+        step_number: u32,
+        input: &serde_json::Value,
+    ) -> bool {
+        let Some(run) = self.active_runs.get(run_id) else {
+            return false;
+        };
+        let checkpoint_revision = run.revision;
+        let Some(checkpoint_result) = run
+            .step_results
+            .iter()
+            .rev()
+            .find(|result| result.status == SopStepStatus::Completed)
+        else {
+            return false;
+        };
+        let checkpoint_step_number = checkpoint_result.step_number;
+        if !sop.steps.iter().any(|step| {
+            step.number == checkpoint_step_number && step.kind == SopStepKind::Checkpoint
+        }) {
+            return false;
+        }
+        if checkpoint_step_number >= step_number {
+            return false;
+        }
+        if !forge_comment_input_matches_checkpoint_output(input, checkpoint_result) {
+            return false;
+        }
+
+        self.run_events(run_id).is_ok_and(|events| {
+            events.iter().any(|event| {
+                event.kind.as_str() == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64())
+                        == Some(u64::from(checkpoint_step_number))
+                    && event
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(u64::from(checkpoint_revision))
+                    && event
+                        .payload
+                        .get("source")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|source| source != "agent" && source != "system")
+                    && matches!(
+                        event
+                            .payload
+                            .get("decision")
+                            .and_then(|value| value.as_str()),
+                        Some("approve") | Some("amend")
+                    )
+            })
+        })
+    }
+
+    fn forge_comment_effect_payload(
+        &self,
+        sop: &Sop,
+        step_number: u32,
+        input: &Value,
+    ) -> Result<Value> {
+        let target =
+            super::capability::resolve_forge_comment_target(input).map_err(anyhow::Error::msg)?;
+        Ok(::serde_json::json!({
+            "capability": "forge.comment",
+            "sop_name": sop.name,
+            "step": step_number,
+            "channel": target.channel,
+            "repo": target.repo,
+            "number": target.number,
+            "body": target.body,
+        }))
+    }
+
+    fn forge_comment_success_output(&self, input: &Value) -> Result<Value> {
+        let target =
+            super::capability::resolve_forge_comment_target(input).map_err(anyhow::Error::msg)?;
+        Ok(::serde_json::json!({
+            "posted": true,
+            "repo": target.repo,
+            "number": target.number,
+        }))
+    }
+
+    fn forge_comment_effect_state(
+        &self,
+        run_id: &str,
+        effect_payload: &Value,
+    ) -> Result<(bool, bool), StoreError> {
+        let mut started = false;
+        let mut completed = false;
+        for event in self.store.list_events(run_id)? {
+            if event.payload == *effect_payload {
+                match event.kind.as_str() {
+                    "capability_effect_started" => started = true,
+                    "capability_effect_completed" => completed = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok((started, completed))
+    }
+
+    fn record_forge_comment_effect_marker(
+        &self,
+        run_id: &str,
+        kind: &str,
+        effect_payload: Value,
+    ) -> Result<(), StoreError> {
+        self.store
+            .append_event(&SopEventRecord {
+                run_id: run_id.to_string(),
+                seq: 0,
+                ts: now_iso8601(),
+                kind: kind.to_string(),
+                actor: None,
+                reason: None,
+                payload: effect_payload,
+            })
+            .map(|_| ())
+    }
+
+    fn record_forge_comment_failure(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step: &SopStep,
+        error: String,
+        started_at: String,
+    ) -> Result<SopRunAction> {
+        self.metrics.record_capability_executed(&sop.name);
+        let completed_at = Some(now_iso8601());
+        self.record_deterministic_step_result(
+            run_id,
+            sop,
+            step,
+            SopStepStatus::Failed,
+            error.clone(),
+            serde_json::Value::String(error),
+            started_at,
+            completed_at,
+        )
+    }
+
+    fn execute_forge_comment_step(
+        &mut self,
+        sop: &Sop,
+        run_id: &str,
+        step: &SopStep,
+        input: Value,
+        capability_input: Value,
+        started_at: String,
+    ) -> Result<SopRunAction> {
+        if !self.forge_comment_authorized_by_prior_checkpoint(
+            sop,
+            run_id,
+            step.number,
+            &capability_input,
+        ) {
+            return self.record_forge_comment_failure(
+                run_id,
+                sop,
+                step,
+                "forge.comment requires the immediately preceding checkpoint to approve the exact repo, number, body, and channel"
+                    .to_string(),
+                started_at,
+            );
+        }
+
+        let effect_payload =
+            match self.forge_comment_effect_payload(sop, step.number, &capability_input) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    return self.record_forge_comment_failure(
+                        run_id,
+                        sop,
+                        step,
+                        format!("forge.comment: invalid target for effect ledger: {e}"),
+                        started_at,
+                    );
+                }
+            };
+        let success_output = match self.forge_comment_success_output(&capability_input) {
+            Ok(output) => output,
+            Err(e) => {
+                return self.record_forge_comment_failure(
+                    run_id,
+                    sop,
+                    step,
+                    format!("forge.comment: invalid target for success replay: {e}"),
+                    started_at,
+                );
+            }
+        };
+
+        match self.forge_comment_effect_state(run_id, &effect_payload) {
+            Ok((_started, true)) => {
+                self.metrics.record_capability_executed(&sop.name);
+                let completed_at = Some(now_iso8601());
+                return self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Completed,
+                    success_output.to_string(),
+                    success_output,
+                    started_at,
+                    completed_at,
+                );
+            }
+            Ok((true, false)) => {
+                return self.record_forge_comment_failure(
+                    run_id,
+                    sop,
+                    step,
+                    "forge.comment has a prior unconfirmed public-send attempt for this run/step/target; refusing to replay automatically"
+                        .to_string(),
+                    started_at,
+                );
+            }
+            Ok((false, false)) => {}
+            Err(e) => {
+                return self.record_forge_comment_failure(
+                    run_id,
+                    sop,
+                    step,
+                    format!(
+                        "forge.comment cannot inspect durable effect ledger (fail-closed): {e}"
+                    ),
+                    started_at,
+                );
+            }
+        }
+
+        if let Err(e) = self.record_forge_comment_effect_marker(
+            run_id,
+            "capability_effect_started",
+            effect_payload.clone(),
+        ) {
+            return self.record_forge_comment_failure(
+                run_id,
+                sop,
+                step,
+                format!(
+                    "forge.comment cannot persist public-send attempt marker (fail-closed): {e}"
+                ),
+                started_at,
+            );
+        }
+
+        let ctx = super::capability::CapabilityContext {
+            run_id: run_id.to_string(),
+            sop_name: sop.name.clone(),
+            step_number: step.number,
+            sop_location: sop.location.clone(),
+        };
+        let result = self.capabilities.execute_step(ctx, step, input);
+        self.metrics.record_capability_executed(&sop.name);
+        let completed_at = Some(now_iso8601());
+        match result {
+            Ok(result) if result.success => {
+                if let Err(e) = self.record_forge_comment_effect_marker(
+                    run_id,
+                    "capability_effect_completed",
+                    effect_payload,
+                ) {
+                    let error = format!(
+                        "forge.comment posted but could not persist success marker (fail-closed; refusing replay): {e}"
+                    );
+                    return self.record_deterministic_step_result(
+                        run_id,
+                        sop,
+                        step,
+                        SopStepStatus::Failed,
+                        error.clone(),
+                        serde_json::Value::String(error),
+                        started_at,
+                        completed_at,
+                    );
+                }
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Completed,
+                    result.output.to_string(),
+                    result.output,
+                    started_at,
+                    completed_at,
+                )
+            }
+            Ok(result) => {
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "capability returned failure".to_string());
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Failed,
+                    error.clone(),
+                    serde_json::Value::String(error),
+                    started_at,
+                    completed_at,
+                )
+            }
+            Err(e) => {
+                let error = e.to_string();
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Failed,
+                    error.clone(),
+                    serde_json::Value::String(error),
+                    started_at,
+                    completed_at,
+                )
+            }
+        }
+    }
+
     fn execute_capability_step(
         &mut self,
         sop: &Sop,
@@ -3366,6 +4098,18 @@ impl SopEngine {
         input: serde_json::Value,
     ) -> Result<SopRunAction> {
         let started_at = now_iso8601();
+        let capability_input = step.capability_call_input(input.clone());
+        if step.capability_id() == Some("forge.comment") {
+            return self.execute_forge_comment_step(
+                sop,
+                run_id,
+                step,
+                input,
+                capability_input,
+                started_at,
+            );
+        }
+
         let ctx = super::capability::CapabilityContext {
             run_id: run_id.to_string(),
             sop_name: sop.name.clone(),
@@ -3731,10 +4475,28 @@ impl SopEngine {
                 // execution claim still heartbeat-eligible.
                 let state_file = self.persist_deterministic_state(run_id, sop, true)?;
 
+                // A prior checkpoint's recorded result (it records on resolve)
+                // means this run has presented a gate before.
+                let has_prior_gate = self.active_runs.get(run_id).is_some_and(|run| {
+                    run.step_results.iter().any(|r| {
+                        sop.steps
+                            .iter()
+                            .any(|s| s.number == r.step_number && s.kind == SopStepKind::Checkpoint)
+                    })
+                });
                 // Pause at checkpoint - persist state and wait for approval
                 if let Some(run) = self.active_runs.get_mut(run_id) {
                     run.status = SopRunStatus::PausedCheckpoint;
                     run.waiting_since = Some(now_iso8601());
+                    // A NEW gate presentation (not a revise re-park): after the
+                    // run's first-ever park, bump the presentation counter so
+                    // this gate's prompt reference can never collide with an
+                    // earlier gate's leftover buttons, and rebase the per-gate
+                    // revise budget (`revision - revision_base`).
+                    if run.revision > 0 || has_prior_gate {
+                        run.revision += 1;
+                    }
+                    run.revision_base = run.revision;
                 }
 
                 ::zeroclaw_log::record!(
@@ -3847,6 +4609,35 @@ impl SopEngine {
         std::fs::write(&state_file, json)?;
 
         Ok(state_file)
+    }
+
+    /// Best-effort removal of a run's park-snapshot file once the run is
+    /// terminal. Mirrors `persist_deterministic_state`'s path resolution; a
+    /// missing file (the run never parked) is not an error.
+    fn remove_deterministic_state_file(&self, run: &SopRun) {
+        let temp_dir = std::env::temp_dir();
+        let dir = self
+            .get_sop(&run.sop_name)
+            .and_then(|sop| sop.location.clone())
+            .unwrap_or(temp_dir);
+        let path = dir.join(format!("{}.state.json", run.run_id));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run.run_id,
+                            "path": path.display().to_string(),
+                            "error": e.to_string(),
+                        })),
+                    "SOP engine: terminal run's park snapshot could not be removed"
+                );
+            }
+        }
     }
 
     /// Load a persisted deterministic run state from a JSON file.
@@ -4048,6 +4839,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
+        // The park snapshot is purely a rehydration artifact: a terminal run must
+        // not leave one behind claiming `paused_at_checkpoint`. Decisions and the
+        // final status live in the run store / approval ledger, not the snapshot.
+        self.remove_deterministic_state_file(&run);
         self.finished_runs.push(run);
 
         // Evict oldest finished runs when over capacity
@@ -4091,6 +4886,7 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
+        self.remove_deterministic_state_file(&run);
         self.finished_runs.push(run);
 
         let max = self.config.max_finished_runs;
@@ -4263,15 +5059,94 @@ impl SopEngine {
         run_id: &str,
         step: u32,
         policy: &str,
+        gate_revision: u32,
+        principal: &super::approval::ApprovalPrincipal,
+    ) -> Result<(), StoreError> {
+        self.record_gate_vote_scoped(
+            run_id,
+            step,
+            policy,
+            Some(gate_revision),
+            None,
+            None,
+            principal,
+        )
+    }
+
+    /// Record a quorum vote for a deterministic checkpoint presentation. Checkpoint
+    /// votes must be scoped tighter than approval-gate votes because the same step
+    /// can be answered with materially different public-mutation decisions.
+    pub(crate) fn record_checkpoint_gate_vote(
+        &self,
+        run_id: &str,
+        step: u32,
+        policy: &str,
+        checkpoint_revision: u32,
+        decision_label: &str,
+        decision_identity: &str,
+        principal: &super::approval::ApprovalPrincipal,
+    ) -> Result<(), StoreError> {
+        self.record_gate_vote_scoped(
+            run_id,
+            step,
+            policy,
+            Some(checkpoint_revision),
+            Some(decision_label),
+            Some(decision_identity),
+            principal,
+        )
+    }
+
+    fn record_gate_vote_scoped(
+        &self,
+        run_id: &str,
+        step: u32,
+        policy: &str,
+        gate_revision: Option<u32>,
+        decision_label: Option<&str>,
+        decision_identity: Option<&str>,
         principal: &super::approval::ApprovalPrincipal,
     ) -> Result<(), StoreError> {
         let voter_key = principal.voter_key();
-        if self
-            .gate_votes_for_step(run_id, step)?
-            .iter()
-            .any(|v| v.voter_key == voter_key && v.policy.as_deref() == Some(policy))
-        {
+        if self.gate_votes_for_step(run_id, step)?.iter().any(|vote| {
+            vote.voter_key == voter_key
+                && vote.policy.as_deref() == Some(policy)
+                && vote.gate_revision == gate_revision
+                && vote.decision_identity.as_deref() == decision_identity
+        }) {
             return Ok(());
+        }
+        let mut payload = serde_json::json!({
+            "step": step,
+            "source": principal.source_label(),
+            "policy": policy,
+            "identity": principal.identity,
+        });
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(revision) = gate_revision {
+                object.insert(
+                    "gate_revision".to_string(),
+                    serde_json::Value::Number(revision.into()),
+                );
+                if decision_identity.is_some() {
+                    object.insert(
+                        "checkpoint_revision".to_string(),
+                        serde_json::Value::Number(revision.into()),
+                    );
+                }
+            }
+            if let Some(label) = decision_label {
+                object.insert(
+                    "decision".to_string(),
+                    serde_json::Value::String(label.to_string()),
+                );
+            }
+            if let Some(identity) = decision_identity {
+                object.insert(
+                    "decision_identity".to_string(),
+                    serde_json::Value::String(identity.to_string()),
+                );
+            }
         }
         let ev = SopEventRecord {
             run_id: run_id.to_string(),
@@ -4288,12 +5163,7 @@ impl SopEngine {
             // `source`/`identity` capture enough to REVALIDATE the voter against the
             // current required group at count time - so a mid-flight policy or group
             // change cannot let a stale vote count toward the new quorum.
-            payload: serde_json::json!({
-                "step": step,
-                "source": principal.source_label(),
-                "policy": policy,
-                "identity": principal.identity,
-            }),
+            payload,
         };
         self.store.append_event(&ev).map(|_| ())
     }
@@ -4346,6 +5216,18 @@ impl SopEngine {
                     policy: str_field("policy"),
                     source: str_field("source"),
                     identity: str_field("identity"),
+                    gate_revision: ev
+                        .payload
+                        .get("gate_revision")
+                        .or_else(|| ev.payload.get("checkpoint_revision"))
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok()),
+                    checkpoint_revision: ev
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok()),
+                    decision_identity: str_field("decision_identity"),
                 });
             }
         }
@@ -4396,6 +5278,12 @@ pub(crate) struct GateVote {
     /// The voter's recorded identity (paired-token subject / agent alias / OS user),
     /// for membership revalidation. Recorded, not trusted.
     pub identity: Option<String>,
+    /// Gate presentation revision used to prevent stale votes from a prior visit.
+    pub gate_revision: Option<u32>,
+    /// Checkpoint presentation revision, absent for ordinary approval-gate votes.
+    pub checkpoint_revision: Option<u32>,
+    /// Canonical hash identifying the exact positive checkpoint decision payload.
+    pub decision_identity: Option<String>,
 }
 
 /// Classification of a run's approval-gate state (EPIC C `resolve_gate`).
@@ -4659,7 +5547,7 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
     ctx
 }
 
-fn step_input_value(run: &SopRun, step_number: u32) -> Value {
+pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
     if step_number <= 1 {
         return run
             .trigger_event
@@ -4673,6 +5561,38 @@ fn step_input_value(run: &SopRun, step_number: u32) -> Value {
         .last()
         .map(step_result_value)
         .unwrap_or(Value::Null)
+}
+
+/// Gate re-presentations per checkpoint a `Revise` may spend before the gate
+/// insists on approve / edit / deny. Bounds operator-driven model spend.
+pub(crate) const MAX_GATE_REVISIONS: u32 = 3;
+
+/// The input that fed `step_number` when it originally ran: the output of the
+/// step completed immediately BEFORE it in EXECUTION order (`step_results` is
+/// append-only, so vec order IS execution order — numeric order would lie under
+/// `Goto` routing), or the trigger payload when nothing ran before it. Used to
+/// replay a step (a gate `Revise` re-draft) with exactly what it saw the first
+/// time.
+pub(crate) fn replay_input_for_step(run: &SopRun, step_number: u32) -> Value {
+    let executed_at = run
+        .step_results
+        .iter()
+        .rposition(|r| r.step_number == step_number && r.status == SopStepStatus::Completed);
+    executed_at
+        .and_then(|idx| {
+            run.step_results[..idx]
+                .iter()
+                .rev()
+                .find(|r| r.status == SopStepStatus::Completed)
+                .map(step_result_value)
+        })
+        .unwrap_or_else(|| {
+            run.trigger_event
+                .payload
+                .as_deref()
+                .map(jsonish_value)
+                .unwrap_or(Value::Null)
+        })
 }
 
 fn retry_input_value(run: &SopRun, step_number: u32) -> Value {
@@ -4697,6 +5617,40 @@ fn retry_input_value(run: &SopRun, step_number: u32) -> Value {
 
 fn step_result_value(result: &SopStepResult) -> Value {
     jsonish_value(&result.output)
+}
+
+fn forge_comment_input_matches_checkpoint_output(
+    input: &Value,
+    checkpoint_result: &SopStepResult,
+) -> bool {
+    let Ok(target) = super::capability::resolve_forge_comment_target(input) else {
+        return false;
+    };
+    let approved = step_result_value(checkpoint_result);
+    let Some(approved) = approved.as_object() else {
+        return false;
+    };
+    let approved_repo = approved
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty());
+    let approved_number = approved.get("number").and_then(Value::as_u64);
+    let approved_body = approved.get("body").and_then(Value::as_str);
+    let approved_channel = approved
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty());
+    let channel_matches = match target.channel {
+        Some(channel) => approved_channel == Some(channel),
+        None => true,
+    };
+
+    approved_repo == Some(target.repo)
+        && approved_number == Some(target.number)
+        && approved_body == Some(target.body)
+        && channel_matches
 }
 
 fn jsonish_value(raw: &str) -> Value {
@@ -6274,6 +7228,8 @@ mod tests {
                 step_results: Vec::new(),
                 waiting_since: Some(now),
                 llm_calls_saved: 0,
+                revision: 0,
+                revision_base: 0,
             },
         );
         assert_eq!(
@@ -6322,6 +7278,8 @@ mod tests {
                     step_results: Vec::new(),
                     waiting_since: Some(now.clone()),
                     llm_calls_saved: 0,
+                    revision: 0,
+                    revision_base: 0,
                 },
             );
         }
@@ -6363,6 +7321,8 @@ mod tests {
                 step_results: Vec::new(),
                 waiting_since: None,
                 llm_calls_saved: 0,
+                revision: 0,
+                revision_base: 0,
             },
         );
         let step = SopStep {
@@ -6403,6 +7363,7 @@ mod tests {
                 "run-1",
                 1,
                 "p",
+                0,
                 &ApprovalPrincipal::http(Some("ZeroClawOperator".into())),
             )
             .unwrap();
@@ -6411,6 +7372,7 @@ mod tests {
                 "run-1",
                 1,
                 "p",
+                0,
                 &ApprovalPrincipal::ws("c".into(), Some("ZeroClawOperator".into())),
             )
             .unwrap();
@@ -6420,6 +7382,7 @@ mod tests {
                 "run-1",
                 1,
                 "p",
+                0,
                 &ApprovalPrincipal::http(Some("ZeroClawOperator".into())),
             )
             .unwrap();
@@ -6429,6 +7392,7 @@ mod tests {
                 "run-1",
                 1,
                 "p",
+                0,
                 &ApprovalPrincipal::cli(Some("ZeroClawMaintainer".into())),
             )
             .unwrap();
@@ -6438,6 +7402,7 @@ mod tests {
                 "run-1",
                 2,
                 "p",
+                0,
                 &ApprovalPrincipal::cli(Some("carol".into())),
             )
             .unwrap();
@@ -6477,10 +7442,10 @@ mod tests {
         let zero_claw_operator = ApprovalPrincipal::cli(Some("ZeroClawOperator".into()));
 
         engine
-            .record_gate_vote("run-1", 1, "prod", &zero_claw_operator)
+            .record_gate_vote("run-1", 1, "prod", 0, &zero_claw_operator)
             .unwrap();
         engine
-            .record_gate_vote("run-1", 1, "prod", &zero_claw_operator)
+            .record_gate_vote("run-1", 1, "prod", 0, &zero_claw_operator)
             .unwrap();
         assert_eq!(
             engine.gate_votes_for_step("run-1", 1).unwrap().len(),
@@ -6489,7 +7454,7 @@ mod tests {
         );
 
         engine
-            .record_gate_vote("run-1", 1, "prod2", &zero_claw_operator)
+            .record_gate_vote("run-1", 1, "prod2", 0, &zero_claw_operator)
             .unwrap();
         assert_eq!(
             engine.gate_votes_for_step("run-1", 1).unwrap().len(),
@@ -7036,6 +8001,8 @@ mod tests {
                 step_results: Vec::new(),
                 waiting_since: None,
                 llm_calls_saved: 0,
+                revision: 0,
+                revision_base: 0,
             };
             store
                 .save_run(&PersistedRun::new(
@@ -7107,18 +8074,16 @@ mod tests {
     impl crate::sop::approval::ApprovalRouteAdapter for RecordingRouteAdapter {
         fn deliver(
             &self,
-            notice: crate::sop::approval::ApprovalNoticeKind,
+            kind: crate::sop::approval::ApprovalNoticeKind,
             route: &str,
-            run_id: &str,
-            sop_name: &str,
-            step: u32,
+            notice: &crate::sop::approval::GateNotice<'_>,
         ) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push((
-                notice,
+                kind,
                 route.to_string(),
-                run_id.to_string(),
-                sop_name.to_string(),
-                step,
+                notice.run_id.to_string(),
+                notice.sop_name.to_string(),
+                notice.step,
             ));
             Ok(())
         }
@@ -7567,6 +8532,8 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
         assert!(ctx.contains("pump-shutdown"));
@@ -7695,6 +8662,37 @@ mod tests {
                 .iter()
                 .any(|ev| ev.kind == "gate_escalated"),
             "escalation is recorded in the ledger"
+        );
+    }
+
+    #[test]
+    fn timeout_escalation_without_distinct_route_resurfaces_request_route() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut engine = policied_supervised_engine(Some("discord.ops:123456789"), adapter);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        calls.lock().unwrap().clear();
+
+        crate::sop::approval::timeout::apply_timeout_action(
+            &mut engine,
+            &run_id,
+            zeroclaw_config::schema::ApprovalTimeoutAction::Escalate,
+        );
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(
+                crate::sop::approval::ApprovalNoticeKind::Escalation,
+                "discord.ops:123456789".to_string(),
+                run_id,
+                "s1".to_string(),
+                1
+            )],
+            "an unset escalation_route must re-surface the gate to request_route"
         );
     }
 
@@ -8418,6 +9416,8 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: Some(now.clone()),
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         store
             .save_run(&PersistedRun::new(
@@ -8469,6 +9469,8 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: Some(now.clone()),
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         store
             .save_run(&PersistedRun::new(parked, now, SopTriggerSource::Manual))
@@ -8535,6 +9537,8 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: Some(now.clone()),
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         store
             .save_run(&PersistedRun::new(
@@ -8707,8 +9711,94 @@ mod tests {
         );
     }
 
-    /// Delegates to an in-memory store but can be flipped to fail an audit append
-    /// or terminal persistence, exercising both claim-ordering failure paths.
+    #[test]
+    fn checkpoint_approve_reacquire_failure_writes_no_ledger() {
+        let store = std::sync::Arc::new(FailingReacquireStore {
+            inner: InMemoryRunStore::new(),
+            fail_claim: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine =
+            engine_with_sops(vec![capability_checkpoint_sop("cp-claim")]).with_store(store.clone());
+        let first = engine.start_run("cp-claim", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+        store
+            .fail_claim
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            res.is_err(),
+            "checkpoint approve must abort when the exec claim cannot be re-acquired"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "the checkpoint must stay parked and re-resolvable"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a failed checkpoint approve must not write a gate_resolved row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_amend_reacquire_failure_writes_no_ledger() {
+        let store = std::sync::Arc::new(FailingReacquireStore {
+            inner: InMemoryRunStore::new(),
+            fail_claim: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![editable_checkpoint_sop("cp-amend-claim")])
+            .with_store(store.clone());
+        let first = engine
+            .start_run(
+                "cp-amend-claim",
+                payload_event(r#"{"body":"model draft","repo":"o/r"}"#),
+            )
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+        store
+            .fail_claim
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            ApprovalDecision::Amend {
+                text: "operator edit".into(),
+            },
+            ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            res.is_err(),
+            "checkpoint amend must abort when the exec claim cannot be re-acquired"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "the checkpoint must stay parked and re-resolvable"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a failed checkpoint amend must not write a gate_resolved row: {events:?}"
+        );
+    }
+
+    /// Delegates to an in-memory store but can be flipped to fail every
+    /// `append_event`, to prove the audit-append failure path rolls back the
+    /// reacquired exec claim.
     struct FailingAppendStore {
         inner: InMemoryRunStore,
         fail: std::sync::atomic::AtomicBool,
@@ -10216,6 +11306,8 @@ mod tests {
                 step_results: Vec::new(),
                 waiting_since: Some(now),
                 llm_calls_saved: 0,
+                revision: 0,
+                revision_base: 0,
             },
         );
         let out = engine
@@ -11201,6 +12293,1796 @@ type = "manual"
         );
     }
 
+    /// `capability(noop) -> checkpoint -> capability(noop)`: the shape the
+    /// checkpoint bridge exists for (an approved write-back tail, e.g.
+    /// `forge.comment`, executing headlessly after an out-of-band approval).
+    fn capability_checkpoint_sop(name: &str) -> Sop {
+        let cap_step = |number: u32| SopStep {
+            number,
+            title: format!("Capability {number}"),
+            kind: SopStepKind::Capability,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        };
+        Sop {
+            name: name.into(),
+            description: "cap -> checkpoint -> cap".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                cap_step(1),
+                SopStep {
+                    number: 2,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                cap_step(3),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    struct CountingForgeCommentAdapter {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::capability::ForgeCommentAdapter for CountingForgeCommentAdapter {
+        fn post_comment(
+            &self,
+            _channel: Option<&str>,
+            _repo: &str,
+            _number: u64,
+            _body: &str,
+        ) -> std::result::Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct MutatesForgePayload;
+
+    impl super::super::capability::SopCapability for MutatesForgePayload {
+        fn id(&self) -> &'static str {
+            "mutate.forge"
+        }
+
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "Change the approved forge comment body",
+                deterministic: true,
+                idempotent: true,
+                reversible: false,
+                supports_retry: false,
+                required_permissions: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: super::super::capability::CapabilityContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<super::super::capability::CapabilityResult> {
+            Ok(super::super::capability::CapabilityResult::success(
+                serde_json::json!({
+                    "repo": "o/r",
+                    "number": 7,
+                    "body": "mutated after approval",
+                    "looped": true,
+                }),
+            ))
+        }
+    }
+
+    fn forge_comment_registry(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<SopCapabilityRegistry> {
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        let adapter: Arc<dyn super::super::capability::ForgeCommentAdapter> =
+            Arc::new(CountingForgeCommentAdapter { calls });
+        registry.register(super::super::capability::ForgeCommentCapability::new(Some(
+            adapter,
+        )));
+        Arc::new(registry)
+    }
+
+    fn forge_comment_registry_with_mutator(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<SopCapabilityRegistry> {
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(MutatesForgePayload);
+        let adapter: Arc<dyn super::super::capability::ForgeCommentAdapter> =
+            Arc::new(CountingForgeCommentAdapter { calls });
+        registry.register(super::super::capability::ForgeCommentCapability::new(Some(
+            adapter,
+        )));
+        Arc::new(registry)
+    }
+
+    fn forge_comment_event() -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: Some(
+                serde_json::json!({
+                    "channel": "git.main",
+                    "repo": "o/r",
+                    "number": 7,
+                    "body": "triage approved",
+                })
+                .to_string(),
+            ),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    fn forge_comment_step(number: u32) -> SopStep {
+        forge_comment_step_with_channel(number, "git.main")
+    }
+
+    fn forge_comment_step_with_channel(number: u32, channel: &str) -> SopStep {
+        SopStep {
+            number,
+            title: format!("Forge comment {number}"),
+            kind: SopStepKind::Capability,
+            capability: Some("forge.comment".into()),
+            capability_input: Some(serde_json::json!({
+                "channel": channel,
+                "repo": "o/r",
+                "number": 7,
+                "body": "triage approved",
+            })),
+            ..SopStep::default()
+        }
+    }
+
+    fn direct_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "forge without checkpoint".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![forge_comment_step(1)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn checkpoint_forge_comment_sop(name: &str) -> Sop {
+        checkpoint_forge_comment_sop_with_channel(name, "git.main")
+    }
+
+    fn checkpoint_forge_comment_sop_with_channel(name: &str, channel: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                forge_comment_step_with_channel(2, channel),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn two_checkpoint_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> noop -> checkpoint -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "First checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Bridge".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("noop".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 3,
+                    title: "Second checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                forge_comment_step(4),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn checkpoint_mutates_before_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> mutator -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Mutate approved body".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("mutate.forge".into()),
+                    ..SopStep::default()
+                },
+                forge_comment_step(3),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn same_step_revisit_forge_comment_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: "checkpoint -> marker -> checkpoint -> forge".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Checkpoint".into(),
+                    kind: SopStepKind::Checkpoint,
+                    routing: crate::sop::step_contract::StepRouting {
+                        switch: vec![
+                            crate::sop::step_contract::SwitchRule {
+                                name: "second-visit".into(),
+                                when: Some("$.steps.2.looped == true".into()),
+                                goto: Some(3),
+                            },
+                            crate::sop::step_contract::SwitchRule {
+                                name: "first-visit".into(),
+                                when: None,
+                                goto: Some(2),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Mark loop".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("mutate.forge".into()),
+                    routing: crate::sop::step_contract::StepRouting {
+                        next: Some(1),
+                        ..Default::default()
+                    },
+                    ..SopStep::default()
+                },
+                forge_comment_step(3),
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    struct FailFirstFinishStore {
+        inner: InMemoryRunStore,
+        fail_next_finish: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailFirstFinishStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryRunStore::new(),
+                fail_next_finish: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl SopRunStore for FailFirstFinishStore {
+        fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.save_run(run)
+        }
+
+        fn save_run_with_event(
+            &self,
+            run: &PersistedRun,
+            event: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.save_run_with_event(run, event)
+        }
+
+        fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
+            if self
+                .fail_next_finish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Backend(
+                    "injected first terminal persistence failure".into(),
+                ));
+            }
+            self.inner.finish_run(run_id, terminal)
+        }
+
+        fn finish_run_with_event(
+            &self,
+            run_id: &str,
+            terminal: &PersistedRun,
+            event: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(run_id, terminal, event)
+        }
+
+        fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_active_runs()
+        }
+
+        fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
+
+        fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
+            self.inner.load_run(run_id)
+        }
+
+        fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
+            self.inner.last_terminal_completed_at(sop_name)
+        }
+
+        fn try_claim_run(
+            &self,
+            run_id: &str,
+            sop_name: &str,
+            per_sop_cap: usize,
+            global_cap: usize,
+        ) -> Result<Option<ClaimToken>, StoreError> {
+            self.inner
+                .try_claim_run(run_id, sop_name, per_sop_cap, global_cap)
+        }
+
+        fn renew_claim_for_restore(
+            &self,
+            run_id: &str,
+            sop_name: &str,
+        ) -> Result<ClaimToken, StoreError> {
+            self.inner.renew_claim_for_restore(run_id, sop_name)
+        }
+
+        fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+            self.inner.claim_counts(sop_name)
+        }
+
+        fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.heartbeat_claim(token)
+        }
+
+        fn release_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.release_claim(token)
+        }
+
+        fn expired_claims(&self, now_iso: &str) -> Result<Vec<ClaimToken>, StoreError> {
+            self.inner.expired_claims(now_iso)
+        }
+
+        fn append_event(&self, event: &SopEventRecord) -> Result<u64, StoreError> {
+            self.inner.append_event(event)
+        }
+
+        fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+            self.inner.list_events(run_id)
+        }
+
+        fn save_proposal(&self, proposal: &ProposalRecord) -> Result<(), StoreError> {
+            self.inner.save_proposal(proposal)
+        }
+
+        fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+            self.inner.load_proposal(id)
+        }
+
+        fn list_proposals(
+            &self,
+            status: Option<ProposalStatus>,
+        ) -> Result<Vec<ProposalRecord>, StoreError> {
+            self.inner.list_proposals(status)
+        }
+
+        fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
+            self.inner.prune(policy)
+        }
+
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+
+        fn backend(&self) -> &'static str {
+            "fail-first-finish-test"
+        }
+    }
+
+    #[test]
+    fn intake_gate_pipeline_pipes_the_trigger_payload_through_a_step_one_checkpoint() {
+        // A step-one intake gate can use `checkpoint -> capability -> ...`. The
+        // step-1 checkpoint has no prior step result, so its resume must pipe
+        // the TRIGGER PAYLOAD forward (mapping identical to `step_input_value`),
+        // not Null — otherwise the first work step is starved of the event.
+        let sop = Sop {
+            name: "intake-gate".into(),
+            description: "checkpoint before work".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Intake gate".into(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "Work".into(),
+                    kind: SopStepKind::Capability,
+                    capability: Some("noop".into()),
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let mut engine = engine_with_sops(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"o/r","number":7}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        let first = engine.start_run("intake-gate", event).unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the step-1 intake gate: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("intake gate approve resolves");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(
+                    super::super::approval::ResolveOutcome::Resumed(_)
+                )
+            ),
+            "expected Resolved(Resumed), got {outcome:?}"
+        );
+        // The noop capability echoes its input: the recorded step-2 output must
+        // BE the trigger payload, proving it crossed the step-1 checkpoint.
+        let run = engine
+            .last_finished_run("intake-gate")
+            .expect("run completed");
+        assert_eq!(run.status, SopRunStatus::Completed);
+        let step2 = run
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 2)
+            .expect("step 2 recorded");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&step2.output).expect("step-2 output is json");
+        assert_eq!(
+            parsed,
+            serde_json::json!({"repo": "o/r", "number": 7}),
+            "the trigger payload must survive the step-1 checkpoint"
+        );
+    }
+
+    #[test]
+    fn forge_comment_refuses_without_prior_ledgered_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![direct_forge_comment_sop("forge-direct")])
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine.start_run("forge-direct", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let final_action = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("direct forge run should fail closed");
+
+        assert!(
+            matches!(final_action, SopRunAction::Failed { .. }),
+            "direct forge.comment must fail closed, got {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not be called before a ledgered checkpoint"
+        );
+        let run = engine
+            .last_finished_run("forge-direct")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 1)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("immediately preceding checkpoint"),
+            "failure should name the missing authorization invariant: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_runs_after_checkpoint_resolution() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-approved")])
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-approved", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "forge run must park at the checkpoint before writing: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Completed { .. }),
+            "approved forge tail must complete headlessly: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "forge adapter should run exactly once after checkpoint approval"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "checkpoint resolution must append the ledger row before forge.comment executes: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.kind == "capability_effect_completed"),
+            "forge.comment success must write a durable effect marker: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-approved")
+            .expect("run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Completed);
+    }
+
+    #[test]
+    fn forge_comment_replay_after_terminal_persist_failure_does_not_repost() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn SopRunStore> = Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-replay")])
+            .with_store(Arc::clone(&store))
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-replay", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "forge run must park before writing: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let first_error = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect_err("injected terminal persistence failure must propagate");
+        assert!(
+            first_error
+                .to_string()
+                .contains("terminal persistence failed"),
+            "injected terminal persistence failure must fail closed: {first_error}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first approval performs the public forge write once"
+        );
+        assert!(
+            engine.get_run(&run_id).is_some(),
+            "terminal persistence failure keeps the in-memory run active"
+        );
+        assert!(
+            engine.last_finished_run("forge-replay").is_none(),
+            "terminal persistence failure must not move the run to finished_runs"
+        );
+        let first_events = engine.run_events(&run_id).unwrap();
+        assert_eq!(
+            first_events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_started")
+                .count(),
+            1,
+            "forge write must have a durable started marker before the public send: {first_events:?}"
+        );
+        assert_eq!(
+            first_events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_completed")
+                .count(),
+            1,
+            "forge write must have a durable completed marker after the public send: {first_events:?}"
+        );
+
+        drop(engine);
+
+        let mut restarted = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-replay")])
+            .with_store(Arc::clone(&store))
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+        restarted.restore_runs();
+        assert_eq!(
+            restarted.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::Running),
+            "restart restores the durable in-flight capability state"
+        );
+
+        let restored_run = restarted.get_run(&run_id).cloned().unwrap();
+        let restored_sop = restarted.get_sop("forge-replay").cloned().unwrap();
+        let restored_step = restored_sop
+            .steps
+            .iter()
+            .find(|step| step.capability_id() == Some("forge.comment"))
+            .cloned()
+            .unwrap();
+        let restored_step_number = restored_step.number;
+        let replay_input = step_input_value(&restored_run, restored_step_number);
+        let capability_input = restored_step.capability_call_input(replay_input.clone());
+        assert!(
+            restarted.forge_comment_authorized_by_prior_checkpoint(
+                &restored_sop,
+                &run_id,
+                restored_step_number,
+                &capability_input,
+            ),
+            "restored checkpoint authorization must still match: run={restored_run:?}, input={capability_input:?}, events={:?}",
+            restarted.run_events(&run_id).unwrap()
+        );
+        let replay_action = restarted
+            .dispatch_deterministic_step(&run_id, &restored_sop, restored_step_number, replay_input)
+            .expect("restored forge step dispatches");
+        let second_final_action = restarted
+            .drive_headless_deterministic(&run_id, replay_action)
+            .expect("restored deterministic capability resumes");
+        assert!(
+            matches!(second_final_action, SopRunAction::Completed { .. }),
+            "replay with a completed effect marker must complete without posting again: {second_final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replay after terminal persistence failure must not create a second public comment"
+        );
+        let events = restarted.run_events(&run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_started")
+                .count(),
+            1,
+            "replay must not write a second started marker: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| ev.kind == "capability_effect_completed")
+                .count(),
+            1,
+            "replay must reuse the completed effect marker: {events:?}"
+        );
+        let run = restarted
+            .last_finished_run("forge-replay")
+            .expect("replayed run reaches finished list");
+        assert_eq!(run.status, SopRunStatus::Completed);
+    }
+
+    #[test]
+    fn forge_comment_rejects_agent_resolved_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop("forge-agent")])
+            .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-agent", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "forge run must park at the checkpoint before writing: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::agent("triage-agent"),
+            )
+            .expect("agent checkpoint approve resolves through default approval mode");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Failed { .. }),
+            "agent-cleared checkpoint must not authorize forge.comment: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not run after an agent-sourced checkpoint approval"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("source").and_then(|value| value.as_str()) == Some("agent")
+            }),
+            "test must prove the rejected ledger row was agent-sourced: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-agent")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 2)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("immediately preceding checkpoint"),
+            "failure should name the checkpoint authorization invariant: {result:?}"
+        );
+    }
+    #[test]
+    fn forge_comment_rejects_payload_mutated_after_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_mutates_before_forge_comment_sop(
+            "forge-mutated",
+        )])
+        .with_capabilities(forge_comment_registry_with_mutator(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-mutated", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the checkpoint before any forge write: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Failed { .. }),
+            "mutated forge payload must require a new checkpoint: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not run after an intervening capability changes the approved body"
+        );
+        let run = engine
+            .last_finished_run("forge-mutated")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 3)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result
+                .output
+                .contains("exact repo, number, body, and channel"),
+            "failure should name the exact payload invariant: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_rejects_channel_changed_after_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![checkpoint_forge_comment_sop_with_channel(
+            "forge-channel-mismatch",
+            "git.admin",
+        )])
+        .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-channel-mismatch", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the checkpoint before any forge write: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+
+        assert!(
+            matches!(*final_action, SopRunAction::Failed { .. }),
+            "changed forge channel must require a new checkpoint: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "forge adapter must not run when the approved channel differs from the static forge target"
+        );
+        let run = engine
+            .last_finished_run("forge-channel-mismatch")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 2)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result
+                .output
+                .contains("exact repo, number, body, and channel"),
+            "failure should name the exact target invariant: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_rejects_stale_ledger_from_prior_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine =
+            engine_with_sops(vec![two_checkpoint_forge_comment_sop("forge-stale-ledger")])
+                .with_capabilities(forge_comment_registry(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-stale-ledger", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the first checkpoint: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+
+        let first_outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("first checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(parked_at_second),
+        ) = first_outcome
+        else {
+            panic!("expected first checkpoint to resume into second gate, got {first_outcome:?}");
+        };
+        assert!(
+            matches!(*parked_at_second, SopRunAction::CheckpointWait { .. }),
+            "first approval should drive the noop bridge and park at checkpoint 3: {parked_at_second:?}"
+        );
+
+        let final_action = engine
+            .decide_checkpoint(&run_id, super::super::approval::ApprovalDecision::Approve)
+            .expect("direct second checkpoint approval should resume into guarded forge step");
+        assert!(
+            matches!(final_action, SopRunAction::Failed { .. }),
+            "unaudited second checkpoint must fail before forge.comment, got {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stale checkpoint-1 ledger row must not authorize checkpoint-3 forge write"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+            }),
+            "first checkpoint must write the audited ledger row: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(3)
+            }),
+            "direct checkpoint approval must not synthesize a ledger row for step 3: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-stale-ledger")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 4)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("immediately preceding checkpoint"),
+            "failure should name the missing checkpoint-specific ledger row: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_rejects_stale_ledger_from_prior_visit_of_same_checkpoint() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = engine_with_sops(vec![same_step_revisit_forge_comment_sop(
+            "forge-same-step-revisit",
+        )])
+        .with_capabilities(forge_comment_registry_with_mutator(Arc::clone(&calls)));
+
+        let first = engine
+            .start_run("forge-same-step-revisit", forge_comment_event())
+            .unwrap();
+        assert!(
+            matches!(first, SopRunAction::CheckpointWait { .. }),
+            "run must park at the first checkpoint visit: {first:?}"
+        );
+        let run_id = extract_run_id(&first).to_string();
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.revision),
+            Some(0),
+            "first checkpoint presentation starts at revision 0"
+        );
+
+        let first_outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("first checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(second_visit),
+        ) = first_outcome
+        else {
+            panic!("expected first checkpoint to resume into second visit, got {first_outcome:?}");
+        };
+        assert!(
+            matches!(*second_visit, SopRunAction::CheckpointWait { .. }),
+            "first approval should loop back and park at checkpoint step 1 again: {second_visit:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).map(|run| run.revision),
+            Some(1),
+            "same-step checkpoint revisit must carry a fresh revision"
+        );
+
+        let final_action = engine
+            .decide_checkpoint(&run_id, super::super::approval::ApprovalDecision::Approve)
+            .expect("direct second checkpoint approval should resume into guarded forge step");
+        assert!(
+            matches!(final_action, SopRunAction::Failed { .. }),
+            "direct second visit approval must not reuse the revision-0 ledger row: {final_action:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stale first-visit ledger row must not authorize the second-visit forge write"
+        );
+
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                    && event
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(0)
+            }),
+            "first visit must write the revision-0 ledger row: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.kind == "gate_resolved"
+                    && event.payload.get("step").and_then(|value| value.as_u64()) == Some(1)
+                    && event
+                        .payload
+                        .get("checkpoint_revision")
+                        .and_then(|value| value.as_u64())
+                        == Some(1)
+            }),
+            "direct second visit approval must not synthesize a revision-1 ledger row: {events:?}"
+        );
+        let run = engine
+            .last_finished_run("forge-same-step-revisit")
+            .expect("failed run should be retained");
+        let result = run
+            .step_results
+            .iter()
+            .find(|result| result.step_number == 3)
+            .expect("forge step result recorded");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains("immediately preceding checkpoint"),
+            "failure should name the checkpoint authorization invariant: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_via_broker_approves_checkpoint_and_drives_capability_tail() {
+        // The checkpoint bridge (B3): an out-of-band approve of a PausedCheckpoint
+        // through the chokepoint must (a) write the audit ledger row, (b) resume via
+        // approve_step, and (c) DRIVE the post-checkpoint capability steps
+        // headlessly to completion - no live agent turn involved.
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-tail")]);
+        let first = engine.start_run("cp-tail", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(
+            matches!(parked, SopRunAction::CheckpointWait { .. }),
+            "run must park at the step-2 checkpoint: {parked:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(final_action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+        assert!(
+            matches!(*final_action, SopRunAction::Completed { .. }),
+            "the capability tail must run to completion headlessly: {final_action:?}"
+        );
+        let run = engine
+            .last_finished_run("cp-tail")
+            .expect("run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Completed);
+        assert_eq!(
+            run.step_results.len(),
+            3,
+            "all three steps (cap, checkpoint, cap) recorded results"
+        );
+        // The resolution is ledger-audited like any approval gate.
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "checkpoint resolution must append a gate_resolved ledger row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn deterministic_start_pipes_the_trigger_payload_into_step_one() {
+        // Regression: `start_deterministic_run` hardcoded step 1's input to Null,
+        // so a channel-triggered pipeline's first step never saw the event that
+        // triggered it (a triage step received `null` instead of the issue). The
+        // start path must apply the same step-1 = trigger-payload mapping as
+        // `step_input_value` on the resume/retry paths.
+        // `deterministic_sop` has an Execute-kind step 1, whose start action
+        // carries the input (a capability step 1 would execute inline instead).
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-payload")]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"o/r","number":12}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        let first = engine.start_run("det-payload", event).unwrap();
+        match &first {
+            SopRunAction::DeterministicStep { step, input, .. } => {
+                assert_eq!(step.number, 1);
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"repo": "o/r", "number": 12}),
+                    "step 1 must receive the parsed trigger payload, not Null"
+                );
+            }
+            other => panic!("expected the step-1 DeterministicStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_via_broker_denies_checkpoint_through_failure_route() {
+        // Deny of a parked checkpoint through the chokepoint follows the authored
+        // failure route, records the reason, and audits the resolution. With the
+        // default failure route, the run terminates as Failed. Previously a
+        // checkpoint could not be denied out-of-band at all (the surfaces returned
+        // not_waiting).
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deny")]);
+        let first = engine.start_run("cp-deny", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny {
+                    reason: Some("not appropriate".into()),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint deny resolves");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(
+                    super::super::approval::ResolveOutcome::Resumed(_)
+                )
+            ),
+            "expected Resolved(Resumed), got {outcome:?}"
+        );
+        let run = engine
+            .last_finished_run("cp-deny")
+            .expect("denied run reached the finished list");
+        assert_eq!(run.status, SopRunStatus::Failed);
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "checkpoint deny must append a gate_resolved ledger row: {events:?}"
+        );
+    }
+
+    /// `capability(noop) -> checkpoint(edit: body) -> capability(noop)`: the
+    /// operator-amendable review-gate shape.
+    fn editable_checkpoint_sop(name: &str) -> Sop {
+        let mut sop = capability_checkpoint_sop(name);
+        sop.steps[1].edit = Some("body".into());
+        sop
+    }
+
+    fn payload_event(payload: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: Some(payload.into()),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    #[test]
+    fn resolve_via_broker_amends_checkpoint_and_pipes_the_edited_field() {
+        // An Amend IS an approval of the operator's text: the edited field must
+        // replace its counterpart in the piped value, become the checkpoint's
+        // recorded output, and flow into the post-checkpoint capability tail —
+        // while the predecessor step keeps the model's original for audit.
+        let mut engine = engine_with_sops(vec![editable_checkpoint_sop("cp-amend")]);
+        let first = engine
+            .start_run(
+                "cp-amend",
+                payload_event(r#"{"body":"model draft","repo":"o/r"}"#),
+            )
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Amend {
+                    text: "the operator rewrite".into(),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint amend resolves");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(
+                    super::super::approval::ResolveOutcome::Resumed(_)
+                )
+            ),
+            "expected Resolved(Resumed), got {outcome:?}"
+        );
+        let run = engine
+            .last_finished_run("cp-amend")
+            .expect("amended run completed");
+        assert_eq!(run.status, SopRunStatus::Completed);
+        // Step 1 keeps the model's original.
+        let step1: serde_json::Value = serde_json::from_str(
+            &run.step_results
+                .iter()
+                .find(|r| r.step_number == 1)
+                .unwrap()
+                .output,
+        )
+        .unwrap();
+        assert_eq!(step1["body"], "model draft");
+        // The checkpoint's output AND the tail step's input carry the rewrite,
+        // with the untouched fields intact.
+        for step_number in [2u32, 3] {
+            let out: serde_json::Value = serde_json::from_str(
+                &run.step_results
+                    .iter()
+                    .find(|r| r.step_number == step_number)
+                    .unwrap()
+                    .output,
+            )
+            .unwrap();
+            assert_eq!(
+                out["body"], "the operator rewrite",
+                "step {step_number} must carry the amended body"
+            );
+            assert_eq!(out["repo"], "o/r", "unedited fields must survive");
+        }
+        // The ledger records the resolution as an amend.
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.kind == "gate_resolved" && ev.payload["decision"] == "amend"),
+            "amend must append a decision=amend ledger row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn amend_without_a_declared_edit_field_fails_closed() {
+        // No `- edit:` on the checkpoint → an Amend must be refused BEFORE any
+        // ledger row or run mutation, leaving the gate parked and answerable.
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-noedit")]);
+        let first = engine.start_run("cp-noedit", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            super::super::approval::ApprovalDecision::Amend { text: "x".into() },
+            super::super::approval::ApprovalPrincipal::cli(None),
+        );
+        assert!(res.is_err(), "amend without `- edit:` must fail closed");
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint,
+            "the gate must stay parked"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().all(|ev| ev.kind != "gate_resolved"),
+            "a refused amend must not leave a gate_resolved row: {events:?}"
+        );
+    }
+
+    /// A stub `llm.generate` that bakes the reviewer feedback into its output,
+    /// so a revise's re-draft is distinguishable from the original.
+    struct StubLlmGenerate;
+
+    impl super::super::capability::SopCapability for StubLlmGenerate {
+        fn id(&self) -> &'static str {
+            "llm.generate"
+        }
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "stub llm.generate",
+                deterministic: true,
+                idempotent: false,
+                reversible: true,
+                supports_retry: true,
+                required_permissions: vec![],
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: super::super::capability::CapabilityContext,
+            input: serde_json::Value,
+        ) -> Result<super::super::capability::CapabilityResult> {
+            let feedback = input
+                .get("revision_feedback")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+            Ok(super::super::capability::CapabilityResult::success(
+                serde_json::json!({"body": format!("draft [feedback: {feedback}]")}),
+            ))
+        }
+    }
+
+    /// A stub `llm.generate` that succeeds on the FIRST draft (no
+    /// `revision_feedback`) but fails on the RE-draft — so the run reaches the
+    /// checkpoint normally, and only the Revise re-run models a provider outage.
+    struct FailsOnlyOnRevise;
+
+    impl super::super::capability::SopCapability for FailsOnlyOnRevise {
+        fn id(&self) -> &'static str {
+            "llm.generate"
+        }
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "stub llm.generate that fails only on re-draft",
+                deterministic: true,
+                idempotent: false,
+                reversible: true,
+                supports_retry: true,
+                required_permissions: vec![],
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+        fn execute(
+            &self,
+            _ctx: super::super::capability::CapabilityContext,
+            input: serde_json::Value,
+        ) -> Result<super::super::capability::CapabilityResult> {
+            if input.get("revision_feedback").is_some() {
+                Ok(super::super::capability::CapabilityResult::failure(
+                    "model provider unavailable",
+                ))
+            } else {
+                Ok(super::super::capability::CapabilityResult::success(
+                    serde_json::json!({"body": "original draft"}),
+                ))
+            }
+        }
+    }
+
+    /// `capability(llm.generate stub) -> checkpoint`: the revisable review-gate
+    /// shape, with the stub registered over the fail-closed builtin.
+    fn revisable_checkpoint_engine(name: &str) -> SopEngine {
+        let mut sop = capability_checkpoint_sop(name);
+        sop.steps[0].capability = Some("llm.generate".into());
+        sop.steps.truncate(2);
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(StubLlmGenerate);
+        engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry))
+    }
+
+    #[test]
+    fn failed_revise_writes_no_resolved_row_and_leaves_the_draft_unchanged() {
+        // The resolved ledger row must not be appended before the re-draft's
+        // fallible model call. A failed Revise leaves zero gate_resolved rows, the
+        // original draft parked, and the revision counter untouched.
+        let mut sop = capability_checkpoint_sop("cp-revise-fail");
+        sop.steps[0].capability = Some("llm.generate".into());
+        sop.steps.truncate(2);
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(FailsOnlyOnRevise);
+        let mut engine = engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry));
+
+        let first = engine.start_run("cp-revise-fail", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        let original_draft = engine
+            .get_run(&run_id)
+            .unwrap()
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .unwrap()
+            .output
+            .clone();
+
+        let res = engine.resolve_via_broker(
+            &run_id,
+            super::super::approval::ApprovalDecision::Revise {
+                guidance: "make it shorter".into(),
+            },
+            super::super::approval::ApprovalPrincipal::cli(None),
+        );
+        assert!(res.is_err(), "a failed re-draft must surface an error");
+
+        let run = engine.get_run(&run_id).expect("run stays parked");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert_eq!(
+            run.revision, 0,
+            "a failed revise must not bump the revision"
+        );
+        assert_eq!(
+            run.step_results
+                .iter()
+                .find(|r| r.step_number == 1)
+                .unwrap()
+                .output,
+            original_draft,
+            "the original draft must remain untouched"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events.iter().all(|ev| ev.kind != "gate_resolved"),
+            "a failed revise must leave NO gate_resolved ledger row: {events:?}"
+        );
+
+        // The gate is still answerable: the run must admit a fresh exec claim
+        // (a leaked claim from the failed revise would block this deny).
+        engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny { reason: None },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("the gate is still resolvable after a failed revise");
+        assert_eq!(
+            engine.last_finished_run("cp-revise-fail").unwrap().status,
+            SopRunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn resolve_via_broker_revises_checkpoint_and_represents_the_gate() {
+        let mut engine = revisable_checkpoint_engine("cp-revise");
+        let first = engine.start_run("cp-revise", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to the checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Revise {
+                    guidance: "make it shorter".into(),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("checkpoint revise resolves");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(
+                    super::super::approval::ResolveOutcome::Revised
+                )
+            ),
+            "expected Resolved(Revised), got {outcome:?}"
+        );
+        // The run never left the gate; the draft was replaced and the gate
+        // revision bumped so the old prompt's reference is superseded.
+        let run = engine.get_run(&run_id).expect("run still active");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert_eq!(run.revision, 1);
+        let redraft = &run
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .unwrap()
+            .output;
+        assert!(
+            redraft.contains("make it shorter"),
+            "the re-draft must reflect the guidance: {redraft}"
+        );
+        let events = engine.run_events(&run_id).unwrap_or_default();
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.kind == "gate_resolved" && ev.payload["decision"] == "revise"),
+            "revise must append a decision=revise ledger row: {events:?}"
+        );
+
+        // The revised gate is still answerable: approve completes with the NEW
+        // draft as the checkpoint's output.
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("revised gate approves");
+        assert!(matches!(
+            outcome,
+            super::super::approval::BrokerOutcome::Resolved(
+                super::super::approval::ResolveOutcome::Resumed(_)
+            )
+        ));
+        let finished = engine.last_finished_run("cp-revise").unwrap();
+        assert_eq!(finished.status, SopRunStatus::Completed);
+    }
+
+    #[test]
+    fn revise_is_capped_and_refuses_on_a_non_llm_predecessor() {
+        // Cap: MAX_GATE_REVISIONS re-drafts, then fail closed (bounded spend).
+        let mut engine = revisable_checkpoint_engine("cp-revise-cap");
+        let first = engine.start_run("cp-revise-cap", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        for i in 1..=MAX_GATE_REVISIONS {
+            engine
+                .resolve_via_broker(
+                    &run_id,
+                    super::super::approval::ApprovalDecision::Revise {
+                        guidance: format!("round {i}"),
+                    },
+                    super::super::approval::ApprovalPrincipal::cli(None),
+                )
+                .unwrap_or_else(|e| panic!("revision {i} within the cap must resolve: {e}"));
+        }
+        let res = engine.resolve_via_broker(
+            &run_id,
+            super::super::approval::ApprovalDecision::Revise {
+                guidance: "one too many".into(),
+            },
+            super::super::approval::ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            res.is_err(),
+            "the revision cap must refuse further re-drafts"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().revision,
+            MAX_GATE_REVISIONS
+        );
+
+        // A noop predecessor is not revisable at all (nothing to re-draft).
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-norevise")]);
+        let first = engine.start_run("cp-norevise", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        let res = engine.resolve_via_broker(
+            &run_id,
+            super::super::approval::ApprovalDecision::Revise {
+                guidance: "shorter".into(),
+            },
+            super::super::approval::ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            res.is_err(),
+            "a gate without an llm.generate predecessor must refuse revise"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+    }
+
+    #[test]
+    fn gate_presentations_get_unique_revisions_and_a_per_gate_revise_budget() {
+        // llm -> checkpoint -> llm -> checkpoint. Every gate presentation the
+        // run ever makes must carry a UNIQUE revision (so a stale earlier-gate
+        // prompt can never resolve a later gate), and the revise cap must be a
+        // per-GATE budget, not a run-wide one.
+        let mut sop = capability_checkpoint_sop("cp-two-gates");
+        sop.steps[0].capability = Some("llm.generate".into());
+        sop.steps[2].capability = Some("llm.generate".into());
+        sop.steps.push(SopStep {
+            number: 4,
+            title: "Gate 2".into(),
+            kind: SopStepKind::Checkpoint,
+            ..SopStep::default()
+        });
+        let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+        registry.register(StubLlmGenerate);
+        let mut engine = engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry));
+
+        let first = engine.start_run("cp-two-gates", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        {
+            let run = engine.get_run(&run_id).unwrap();
+            assert_eq!(run.current_step, 2, "parked at gate 1");
+            assert_eq!(run.revision, 0, "the run's first gate is revision 0");
+            assert_eq!(run.revision_base, 0);
+        }
+        // One revise at gate 1: revision 1.
+        engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Revise {
+                    guidance: "shorter".into(),
+                },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert_eq!(engine.get_run(&run_id).unwrap().revision, 1);
+        // Approve gate 1 -> the tail drives to gate 2, whose presentation must
+        // be revision 2 (unique vs gate 1's 0 and 1) with a FRESH revise budget.
+        engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        {
+            let run = engine.get_run(&run_id).unwrap();
+            assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+            assert_eq!(run.current_step, 4, "parked at gate 2");
+            assert_eq!(
+                run.revision, 2,
+                "a new gate presentation bumps past every earlier reference"
+            );
+            assert_eq!(run.revision_base, 2, "the revise budget rebases per gate");
+        }
+        // Gate 2 has its FULL budget despite gate 1's spend.
+        for i in 1..=MAX_GATE_REVISIONS {
+            engine
+                .resolve_via_broker(
+                    &run_id,
+                    super::super::approval::ApprovalDecision::Revise {
+                        guidance: format!("gate2 round {i}"),
+                    },
+                    super::super::approval::ApprovalPrincipal::cli(None),
+                )
+                .unwrap_or_else(|e| panic!("gate 2 revision {i} within its own budget: {e}"));
+        }
+        assert!(
+            engine
+                .resolve_via_broker(
+                    &run_id,
+                    super::super::approval::ApprovalDecision::Revise {
+                        guidance: "over budget".into(),
+                    },
+                    super::super::approval::ApprovalPrincipal::cli(None),
+                )
+                .is_err(),
+            "gate 2's own cap must still bound spend"
+        );
+    }
+
+    #[test]
+    fn terminal_run_removes_the_park_snapshot_file() {
+        // Fix 0b: a resolved run must not leave a stale `<run_id>.state.json`
+        // claiming it is still paused — the run store and approval ledger are
+        // the durable record, the snapshot is only a rehydration artifact.
+        let dir = std::env::temp_dir().join(format!("zc-snapshot-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sop = capability_checkpoint_sop("cp-snapshot");
+        sop.location = Some(dir.clone());
+        let mut engine = engine_with_sops(vec![sop]);
+
+        // Denied run: snapshot written at park, gone after the deny.
+        let first = engine.start_run("cp-snapshot", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        let state_file = dir.join(format!("{run_id}.state.json"));
+        assert!(state_file.exists(), "the park must write the snapshot");
+        engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Deny { reason: None },
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(
+            !state_file.exists(),
+            "a terminally denied run must remove its park snapshot"
+        );
+
+        // Approved run: snapshot gone after completion too.
+        let first = engine.start_run("cp-snapshot", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let _ = engine.drive_headless_deterministic(&run_id, first).unwrap();
+        let state_file = dir.join(format!("{run_id}.state.json"));
+        assert!(state_file.exists());
+        engine
+            .resolve_via_broker(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .unwrap();
+        assert!(
+            !state_file.exists(),
+            "a completed run must remove its park snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn sop_approve_tool_resumes_deterministic_checkpoint() {
         // Regression guard: the sop_approve tool must route a
@@ -11263,6 +14145,8 @@ type = "manual"
             step_results: Vec::new(),
             waiting_since: Some(now_iso8601()),
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         store
             .save_run(&PersistedRun::new(
@@ -11305,6 +14189,8 @@ type = "manual"
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         engine.active_runs.insert(run.run_id.clone(), run.clone());
 
@@ -11379,6 +14265,67 @@ type = "manual"
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn restored_policied_checkpoint_replays_request_route() {
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let broker = std::sync::Arc::new(crate::sop::approval::ApprovalBroker::with_route(adapter));
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: Some("discord.ops:123456789".to_string()),
+                escalation_route: None,
+            },
+        );
+        let mut sop = deterministic_sop("det-restore-route");
+        sop.steps[1].policy = Some("prod".to_string());
+
+        let mut source = engine_with_config_sops(config.clone(), vec![sop.clone()])
+            .with_store(store.clone())
+            .with_approval_broker(broker.clone());
+        let action = source
+            .start_run("det-restore-route", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = source
+            .advance_deterministic_step(&run_id, serde_json::json!({"step": 1}), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(calls.lock().unwrap().len(), 1, "initial park delivers once");
+
+        // Model a daemon exit after persistence but before the external adapter's
+        // fire-and-forget delivery completes. Only the restored engine may send.
+        calls.lock().unwrap().clear();
+        let mut restarted = engine_with_config_sops(config, vec![sop])
+            .with_store(store)
+            .with_approval_broker(broker);
+        restarted.restore_runs();
+
+        assert_eq!(
+            restarted.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(
+                crate::sop::approval::ApprovalNoticeKind::Request,
+                "discord.ops:123456789".to_string(),
+                run_id,
+                "det-restore-route".to_string(),
+                2
+            )],
+            "restore replays the persisted checkpoint through its request route"
+        );
     }
 
     #[test]
@@ -11838,6 +14785,8 @@ type = "manual"
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         store
             .save_run(&PersistedRun::new(

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use super::approval::{BrokerOutcome, ResolveOutcome};
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
 use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
@@ -164,6 +165,25 @@ pub fn spawn_headless_run_driver(
     zeroclaw_spawn::spawn!(async move {
         drive_headless_run(config, engine, audit, first_action).await;
     });
+}
+
+/// Drive a broker-approved run from a headless approval surface.
+///
+/// Every transport that resolves through `SopEngine::resolve_via_broker` calls
+/// this instead of independently extracting `Resolved(Resumed(_))`. That keeps
+/// the transport response separate from the lifecycle obligation to schedule
+/// the resumed action.
+pub fn drive_resumed_broker_action(
+    config: &zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    outcome: &BrokerOutcome,
+) {
+    let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
+        return;
+    };
+
+    spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
 }
 
 async fn drive_headless_run(

@@ -17,6 +17,10 @@ pub enum ApprovalSource {
     Http,
     /// The timeout tick (escalate/cancel). Not an approval, a transition.
     System,
+    /// A chat-channel gate answer (a SOP-gate button click or a
+    /// `<choice> <reference>` text reply), attributed to the channel user who
+    /// answered. Constructed only by the orchestrator's channel-gate intercept.
+    Channel,
 }
 
 /// WHO resolved a gate and from WHERE. Recorded into the append-only ledger.
@@ -68,6 +72,16 @@ impl ApprovalPrincipal {
         }
     }
 
+    /// A chat-channel gate answer. `channel_key` is the answering channel
+    /// (`discord.gnosis`), `user` the platform user id that clicked/replied.
+    pub fn channel(channel_key: String, user: Option<String>) -> Self {
+        Self {
+            source: ApprovalSource::Channel,
+            identity: user,
+            channel: Some(channel_key),
+        }
+    }
+
     /// The daemon timeout tick.
     pub fn system() -> Self {
         Self {
@@ -112,10 +126,20 @@ impl ApprovalPrincipal {
 
     /// Quorum-distinctness key. Qualified by the *voter source* (see
     /// [`Self::voter_source`]) so a different identity on a different source stays
-    /// distinct, while the same paired credential over HTTP+WS counts once. An
-    /// identity-less principal keys to its source alone, so anonymous votes from one
-    /// source count once and cannot inflate a quorum.
+    /// distinct, while the same paired credential over HTTP+WS counts once. Channel
+    /// voters are additionally namespaced by channel key so same-looking sender ids
+    /// from different channels/aliases cannot satisfy each other's quorum. An
+    /// identity-less principal keys to its source (and channel, for channel answers)
+    /// so anonymous votes from one source count once and cannot inflate a quorum.
     pub fn voter_key(&self) -> String {
+        if self.source == ApprovalSource::Channel {
+            return match (self.channel.as_deref(), self.identity.as_deref()) {
+                (Some(channel), Some(id)) => format!("channel:{channel}:{id}"),
+                (Some(channel), None) => format!("channel:{channel}"),
+                (None, Some(id)) => format!("channel:{id}"),
+                (None, None) => "channel".to_string(),
+            };
+        }
         match &self.identity {
             Some(id) => format!("{}:{}", self.voter_source(), id),
             None => self.voter_source().to_string(),
@@ -130,6 +154,7 @@ impl ApprovalPrincipal {
             ApprovalSource::Ws => "ws",
             ApprovalSource::Http => "http",
             ApprovalSource::System => "system",
+            ApprovalSource::Channel => "channel",
         }
     }
 }
@@ -191,6 +216,19 @@ mod tests {
         assert_ne!(
             ApprovalPrincipal::http(Some("a".into())).voter_key(),
             ApprovalPrincipal::http(Some("b".into())).voter_key()
+        );
+    }
+
+    #[test]
+    fn voter_key_namespaces_channel_principals_by_channel_key() {
+        assert_eq!(
+            ApprovalPrincipal::channel("discord.ops".into(), Some("123".into())).voter_key(),
+            "channel:discord.ops:123"
+        );
+        assert_ne!(
+            ApprovalPrincipal::channel("discord.ops".into(), Some("123".into())).voter_key(),
+            ApprovalPrincipal::channel("slack.ops".into(), Some("123".into())).voter_key(),
+            "same-looking sender ids on different channels must be distinct voters"
         );
     }
 
