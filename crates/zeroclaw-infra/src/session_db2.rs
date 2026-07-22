@@ -81,7 +81,7 @@ use crate::session_backend::{
 /// `odbc_api::Environment` owns the global driver-manager state. We
 /// materialise one environment lazily on first use (`OnceLock` is
 /// overkill because all backend methods are already serialised through
-/// `spawn_blocking` upstream — see PR 1 of the series for that
+/// `spawn_blocking` upstream at the session-backend factory
 /// boundary). `Connection<'env>` borrows from the environment, so we
 /// store the environment alongside the connection and never hand out a
 /// `Db2SessionBackend` that owns a detached connection.
@@ -126,8 +126,8 @@ impl Db2SessionBackend {
                  environment. Populate `channels.db2_conn_str` with an ODBC \
                  connection string such as `DRIVER={DB2};DATABASE=ZCTEST;\
                  HOSTNAME=db2.example.com;PORT=50000;UID=zeroclaw;PWD=…;\
-                 PROTOCOL=TCPIP;` (see PR 4 of the multi-database session \
-                 backend series for the operator-facing docs).",
+                 PROTOCOL=TCPIP;` (the operator-facing setup is \
+                 documented on the `db2_conn_str` config field).",
             )
         })?;
         Self::new_with_conn_str(&conn_str)
@@ -238,8 +238,8 @@ impl Db2SessionBackend {
                 std::io::ErrorKind::NotFound,
                 "session_backend=db2: no ZEROCLAW_channels__db2_conn_str / \
                  ZEROCLAW_TEST_DB2_URL in environment; cannot open a Db2 \
-                 connection. See PR 4 of the multi-database session backend \
-                 series for the operator-facing docs.",
+                 connection. The operator-facing setup is documented \
+                 on the `db2_conn_str` config field.",
             )),
         }
     }

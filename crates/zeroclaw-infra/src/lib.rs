@@ -143,9 +143,8 @@ pub fn make_session_backend(
         "db2" => Err(uncompiled_backend_error("db2")),
         #[cfg(feature = "backend-db2")]
         "db2" => {
-            // PR 4 of the multi-database session backend series (the
-            // foundation series root: #9249; MySQL/MariaDB: #9250;
-            // Postgres: #9251; this one: Db2; next one: Oracle).
+            // Db2 remote session backend (one of the multi-database
+            // session backends, alongside Postgres/MySQL/MariaDB/Oracle).
             //
             // The Db2 backend reads `ZEROCLAW_channels__db2_conn_str`
             // (the canonical config-override env var documented on
@@ -210,8 +209,8 @@ fn uncompiled_backend_error(name: &str) -> std::io::Error {
              'backend-{name}' was not compiled into this binary. Rebuild \
              with `--features backend-{name}` (or omit the remote backend \
              from `channels.session_backend` to use the local sqlite/jsonl \
-             default). See PR 1 of the multi-database session backend series \
-             for the foundation that the driver implementation plugs into."
+             default). The shared session-backend foundation provides \
+             the dispatch and config plumbing this driver plugs into."
         ),
     )
 }
