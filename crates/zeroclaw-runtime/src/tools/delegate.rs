@@ -4476,9 +4476,9 @@ mod tests {
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone());
 
-        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+        let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> =
             match crate::control_plane::control_plane() {
-                Some(control_plane) => Arc::clone(&control_plane.store),
+                Some(control_plane) => Arc::clone(&control_plane.goal_store),
                 None => {
                     let sqlite_store =
                         Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
@@ -4493,27 +4493,39 @@ mod tests {
                             data_dir_lock: None,
                         },
                     );
-                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().goal_store)
                 }
             };
-        store
-            .create(crate::control_plane::TaskRecord {
-                id: goal_id.clone(),
-                kind: crate::control_plane::TaskKind::Goal,
-                agent: caller_alias.clone(),
-                status: crate::control_plane::TaskStatus::Running,
-                owner_pid: std::process::id(),
-                owner_boot_id: "test-boot".into(),
-                heartbeat_at: None,
-                depth: 0,
-                parent_id: None,
-                originator_route: Some(route.clone()),
-                delivered: false,
-                idem_key: None,
-                principal_id: Some(principal.clone()),
-                started_at: chrono::Utc::now().to_rfc3339(),
-                finished_at: None,
-            })
+        goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: goal_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: caller_alias.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route.clone()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal.clone()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id: goal_id.clone(),
+                    objective: "attribute synchronous delegation usage".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
             .await
             .unwrap();
 
