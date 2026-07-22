@@ -1381,6 +1381,12 @@ async fn process_chat_message(
         } else {
             None
         };
+        // Tool-narration guarantee: the soul asks the model to narrate its
+        // steps aloud, but when it goes straight to a tool call without
+        // saying anything, the gateway speaks a short templated line
+        // instead — multi-step work must never be silent on a voice turn.
+        let mut spoke_since_last_tool = false;
+        let mut last_narration_at: Option<std::time::Instant> = None;
         // A client message/speech_end that arrives during the post-turn TTS
         // drain is the user's NEXT turn — stash it for the caller to replay
         // instead of silently swallowing it.
@@ -1587,11 +1593,12 @@ async fn process_chat_message(
                                         }
                                     }
                                 }
-                                // Suppress an empty caption frame (text held
-                                // back inside an unresolved bracket).
-                                if routed.caption.is_empty() {
+                                if routed.caption.trim().is_empty() {
+                                    // Suppress an empty caption frame (text
+                                    // held back inside an unresolved bracket).
                                     continue;
                                 }
+                                spoke_since_last_tool = true;
                                 serde_json::json!({ "type": "chunk", "content": routed.caption })
                             } else {
                                 serde_json::json!({ "type": "chunk", "content": delta })
@@ -1601,6 +1608,39 @@ async fn process_chat_message(
                             serde_json::json!({ "type": "thinking", "content": delta })
                         }
                         TurnEvent::ToolCall { id, name, args } => {
+                            // Narrate the step aloud when the model went
+                            // quiet before acting (rate-limited so a burst
+                            // of tool calls speaks once, not a stutter).
+                            if let Some(router) = voice_router.as_mut() {
+                                let now = std::time::Instant::now();
+                                let gap_ok = last_narration_at.is_none_or(|t| {
+                                    now.duration_since(t).as_millis()
+                                        >= crate::voice_duplex::TOOL_NARRATION_MIN_GAP_MS
+                                });
+                                if !spoke_since_last_tool && gap_ok && tts_unit_tx.is_some() {
+                                    let line = crate::voice_duplex::tool_narration(&name);
+                                    let (seq, unit) = router.inject_unit(line);
+                                    let send_failed = match tts_unit_tx.as_ref() {
+                                        Some(tx) => tx.send((seq, unit)).is_err(),
+                                        None => true,
+                                    };
+                                    if send_failed {
+                                        tts_unit_tx = None;
+                                    } else {
+                                        last_narration_at = Some(now);
+                                        // Caption the narration too, so eyes
+                                        // and ears agree.
+                                        let cap = serde_json::json!({
+                                            "type": "chunk",
+                                            "content": format!("{line} "),
+                                        });
+                                        let _ = sender
+                                            .send(Message::Text(cap.to_string().into()))
+                                            .await;
+                                    }
+                                }
+                            }
+                            spoke_since_last_tool = false;
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
                         TurnEvent::ToolResult { id, name, output } => {

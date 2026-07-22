@@ -233,6 +233,16 @@ const AGENCY =
   'You can use the computer: run commands, read files, open apps, look at ' +
   'the screen when asked. Do real work; narrate briefly while you do it.';
 
+const WORKING_ALOUD =
+  'When a task takes several steps, work OUT LOUD. Before each step, say ' +
+  'one short spoken line about what you are doing — "Let me check your ' +
+  'calendar." "Okay, searching for that." After each meaningful result, ' +
+  'give a one-line spoken summary of what you found before moving on — ' +
+  '"Three meetings today, two after lunch." Never go quiet for more than a ' +
+  'few seconds while working; a few words of progress beat silence every ' +
+  'time. When the work is done, give the short spoken conclusion first, ' +
+  'details only if asked.';
+
 const FIDELITY_INSTRUCTION =
   'Everything quoted above is ground truth, in its author\'s own words. ' +
   'Follow it strictly — never contradict it, never dilute it. Your creative ' +
@@ -284,6 +294,9 @@ export function generateSoulMd(spec: SoulSpec): string {
 
   parts.push('## Agency');
   parts.push(AGENCY);
+
+  parts.push('## Working aloud');
+  parts.push(WORKING_ALOUD);
 
   parts.push('## How you evolve');
   const evolution = spec.evolution.trim();

@@ -307,6 +307,33 @@ impl SentenceChunker {
     }
 }
 
+/// Spoken narration for a tool call on a voice turn, used when the model
+/// itself went silent before acting (the soul asks it to narrate; this is
+/// the guarantee). Short, present-tense, no jargon — it's said aloud.
+#[must_use]
+pub fn tool_narration(tool_name: &str) -> &'static str {
+    match tool_name {
+        "web_search" | "web_search_tool" => "Searching the web.",
+        "web_fetch" | "text_browser" => "Reading that page.",
+        "browser" | "browser_open" | "browser_delegate" => "Using the browser.",
+        "shell" => "Running a command.",
+        "file_read" | "glob_search" | "content_search" => "Looking through files.",
+        "file_write" | "file_edit" => "Writing that down.",
+        "memory_store" => "Making a note of that.",
+        "memory_recall" => "Checking my memory.",
+        "screenshot" => "Taking a look at the screen.",
+        "cron_add" | "schedule" => "Setting that up on a schedule.",
+        "http_request" => "Calling that service.",
+        "image_gen" => "Drawing that up.",
+        "delegate" | "spawn_subagent" => "Handing that to a helper.",
+        _ => "Working on it.",
+    }
+}
+
+/// Minimum quiet time between synthesized tool narrations, so a rapid burst
+/// of tool calls yields one spoken line, not a stutter of them.
+pub const TOOL_NARRATION_MIN_GAP_MS: u128 = 2500;
+
 fn ends_at_sentence_boundary(buf: &str) -> bool {
     const TERMINATORS: [char; 4] = ['.', '!', '?', '…'];
     let mut rev = buf.chars().rev();
@@ -695,6 +722,17 @@ impl VoiceTurnRouter {
             next_seq: 0,
             pending: Vec::new(),
         }
+    }
+
+    /// Emit `text` as its own TTS unit RIGHT NOW, without disturbing any
+    /// partially buffered model sentence (which keeps accumulating and will
+    /// emit after this unit, in order). Used for server-side tool narration
+    /// on voice turns — the spoken "Searching the web." while the model has
+    /// gone quiet to act. Returns the unit with its assigned seq.
+    pub fn inject_unit(&mut self, text: &str) -> (u64, String) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        (seq, text.to_string())
     }
 
     /// Feed a streamed assistant delta.
