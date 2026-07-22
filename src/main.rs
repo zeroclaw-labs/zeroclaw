@@ -4090,18 +4090,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // SOP loading is gated on `[sop] sops_dir`: unset disables all
                 // SOP runtime behavior, matching the documented rollback path.
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory(
-                            &current_config.memory,
-                            &current_config.data_dir,
-                            None,
-                        )?);
-                    let route_adapter = build_sop_route_adapter(&current_config);
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
+                    );
+                    let sop_adapters = build_sop_adapters(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
                         mem,
-                        route_adapter,
+                        sop_adapters,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -4856,15 +4853,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
-                        zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
-                    );
-                    let route_adapter = build_sop_route_adapter(&config);
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
+                    let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
                         mem,
-                        route_adapter,
+                        sop_adapters,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -7558,17 +7554,73 @@ fn gate_security_posture(
     Ok(Some(handle))
 }
 
-/// Build the SOP approval route adapter from the configured channel map, so a SOP
-/// that parks at a policied gate (or later times out) can deliver its approval
-/// request / escalation notice to a real channel (Discord, Slack, ...). Returns
-/// `None` when no channels are configured, in which case `build_sop_engine` falls
-/// back to the log-only no-op adapter (unchanged behavior). MUST be called from
-/// within the tokio runtime: it captures `Handle::current()` so the sync,
-/// under-the-engine-lock `deliver` can fire-and-forget the async channel `send`.
+/// Build the SOP channel-backed adapters from one shared channel map:
+/// - the approval ROUTE adapter, so a SOP that parks at a policied gate (or later
+///   times out) can deliver its approval request / escalation notice to a real
+///   channel (Discord, Slack, ...);
+/// - the FORGE-WRITE adapter, so an approved `forge.comment` capability step can
+///   post its comment back to the forge by driving the git channel's normal
+///   outbound path.
+///
+/// - the LLM adapter, so an `llm.generate` capability step can run one bounded
+///   model call on the default agent's resolved provider.
+///
+/// Each field is `None` when not applicable (no channels at all; no git channel
+/// for the forge half; no resolvable default model provider for the llm half), in
+/// which case `build_sop_engine` falls back to the log-only no-op route adapter
+/// and the fail-closed `forge.comment` / `llm.generate` placeholders (unchanged
+/// behavior). MUST be called from within the tokio runtime: it captures
+/// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
+/// to the async channel/provider calls.
 #[cfg(feature = "agent-runtime")]
-fn build_sop_route_adapter(
-    config: &Config,
-) -> Option<std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter>> {
+fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
+    // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
+    // daemon-level model of record. No resolvable provider = fail-closed.
+    let llm: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>> =
+        config
+            .resolved_model_provider_for_agent("default")
+            .and_then(|(provider_type, alias, entry)| {
+                // Alias-aware factory WITH the alias's runtime options: the options
+                // carry zeroclaw_dir (auth-profile store) and per-alias runtime
+                // knobs — without them, OAuth/subscription providers (codex,
+                // opencode) sit unauthenticated and never answer. This mirrors the
+                // delegate tool's provider construction.
+                let options = zeroclaw::providers::provider_runtime_options_for_alias(
+                    config,
+                    provider_type,
+                    alias,
+                );
+                let provider = match zeroclaw::providers::create_model_provider_for_alias(
+                    config,
+                    provider_type,
+                    alias,
+                    entry.api_key.as_deref(),
+                    &options,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "SOP llm.generate adapter unavailable: default model provider failed to build"
+                        );
+                        return None;
+                    }
+                };
+                let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
+                Some(std::sync::Arc::new(
+                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+                        std::sync::Arc::from(provider),
+                        model,
+                    ),
+                ) as _)
+            });
+
     let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
     // Startup validation: this send-only adapter's channel map omits channels that
     // need runtime SOP handles (e.g. AMQP SOP-dispatch channels). Surface at BOOT any
@@ -7631,14 +7683,31 @@ fn build_sop_route_adapter(
         }
     }
     if channels.is_empty() {
-        return None;
+        return zeroclaw_runtime::sop::SopEngineAdapters {
+            llm,
+            ..Default::default()
+        };
     }
-    Some(std::sync::Arc::new(
-        zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
-            channels,
-            tokio::runtime::Handle::current(),
-        ),
-    ))
+    let handle = tokio::runtime::Handle::current();
+    let route: std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter> =
+        std::sync::Arc::new(zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
+            channels.clone(),
+            handle.clone(),
+        ));
+    // Only offer the forge adapter when a git channel actually exists, so
+    // `forge.comment` stays fail-closed on daemons without a forge.
+    let has_git = channels.keys().any(|k| k == "git" || k.starts_with("git."));
+    let forge: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::ForgeCommentAdapter>> =
+        has_git.then(|| {
+            std::sync::Arc::new(zeroclaw_runtime::sop::capability::ChannelForgeAdapter::new(
+                channels,
+            )) as _
+        });
+    zeroclaw_runtime::sop::SopEngineAdapters {
+        route: Some(route),
+        forge,
+        llm,
+    }
 }
 
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it

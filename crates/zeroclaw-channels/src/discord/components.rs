@@ -304,6 +304,9 @@ pub(crate) struct ModalField {
     pub(crate) placeholder: Option<String>,
     pub(crate) min_length: Option<u16>,
     pub(crate) max_length: Option<u16>,
+    /// Pre-filled text the input opens with (Discord caps it at 4000 chars) —
+    /// e.g. the current draft an Edit starts from. `None` = an empty box.
+    pub(crate) value: Option<String>,
 }
 
 /// A modal opened in response to a button/slash interaction (response type 9).
@@ -329,7 +332,10 @@ impl DiscordModal {
                 let mut input = json!({
                     "type": 4,
                     "custom_id": f.custom_id,
-                    "label": f.label,
+                    // Discord rejects a text-input label over 45 chars; clamp so
+                    // a long caller-derived label degrades instead of 400ing the
+                    // whole modal open.
+                    "label": f.label.chars().take(45).collect::<String>(),
                     "style": f.style.wire(),
                     "required": f.required,
                 });
@@ -341,6 +347,10 @@ impl DiscordModal {
                 }
                 if let Some(m) = f.max_length {
                     input["max_length"] = json!(m);
+                }
+                if let Some(v) = &f.value {
+                    // Discord rejects a text-input `value` over 4000 chars.
+                    input["value"] = json!(v.chars().take(4000).collect::<String>());
                 }
                 json!({ "type": 1, "components": [input] })
             })
@@ -494,6 +504,7 @@ mod tests {
                 placeholder: Some("why?".into()),
                 min_length: None,
                 max_length: Some(500),
+                value: Some("prefilled".into()),
             }],
         };
         let api = modal.to_api().unwrap();
@@ -507,6 +518,7 @@ mod tests {
         assert_eq!(input["style"], json!(2)); // paragraph
         assert_eq!(input["max_length"], json!(500));
         assert!(input.get("min_length").is_none());
+        assert_eq!(input["value"], json!("prefilled"));
     }
 
     #[test]

@@ -142,6 +142,7 @@ impl Observer for LogObserver {
                 backend,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(
@@ -203,6 +204,7 @@ impl Observer for LogObserver {
                 messages_count,
                 channel: _,
                 agent_alias: _,
+                parent_agent_alias: _,
                 turn_id: _,
             } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "messages_count": messages_count})), "llm.request");
@@ -364,6 +366,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(150),
@@ -377,6 +380,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
@@ -390,6 +394,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),

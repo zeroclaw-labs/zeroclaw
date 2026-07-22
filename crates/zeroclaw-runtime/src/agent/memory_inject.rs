@@ -1,5 +1,25 @@
 //! Unified memory-context injection: ONE policy and ONE renderer for the
 //! memory preamble, applied at the turn engine.
+//!
+//! Replaces the per-path inline renderers (the three `loop_` sites, the
+//! channel orchestrator's budgeted renderer, the agent-direct loader, and
+//! the cron/daemon pre-prompt blocks). The injection decision is keyed on
+//! [`TurnOrigin`] (who initiated the turn), resolved by
+//! [`resolve_inject_policy`]; the pipeline in [`render_memory_context`] is
+//! the uniform superset of the legacy renderers' behavior. Divergences from
+//! any individual legacy path are deliberate and documented on the PR that
+//! wires this module (uniform rigour: a per-path difference is an error
+//! unless documented).
+//!
+//! Pipeline: recall (per session, key-deduped) -> time decay OR the gated
+//! rerank stage (`rerank_enabled`: over-fetched candidate pool, then
+//! recency/importance blend + duplicate collapse + optional MMR + trim,
+//! replacing decay on that arm) -> relevance filter -> skip set (autosave
+//! keys/content, `*_history` keys, `[IMAGE:` markers, `<tool_result`
+//! blocks, optional Conversation-category exclusion) -> budget caps (entry
+//! count, per-entry chars, total chars) -> `[Memory context]` wrapper.
+//! Exactly one `MemoryRecall` observer event is emitted per render,
+//! covering all recalls.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -8,9 +28,11 @@ use std::time::Instant;
 use zeroclaw_api::ingress::TurnOrigin;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, MemoryEntry, decay,
+    rerank,
 };
 
 use super::loop_::make_query_summary;
+use crate::agent::TurnMeta;
 use crate::observability::{Observer, ObserverEvent};
 use crate::util::truncate_with_ellipsis;
 
@@ -41,6 +63,15 @@ pub struct MemoryInjectConfig {
     pub entry_max_chars: usize,
     /// Total character budget for the block.
     pub max_total_chars: usize,
+    /// Gate for the rerank stage. Off (the default) keeps the pipeline on
+    /// the time-decay arm, byte-identical to the pre-rerank renderer.
+    pub rerank_enabled: bool,
+    /// Candidate pool multiplier over `limit` when reranking: the stage
+    /// over-fetches so blend/dedup/MMR have a pool to trim back down.
+    pub candidate_multiplier: usize,
+    /// Rerank stage parameters (strategy, threshold, blend weights, floor,
+    /// final trim). Only consulted when `rerank_enabled` is set.
+    pub rerank: rerank::RerankConfig,
 }
 
 impl Default for MemoryInjectConfig {
@@ -51,7 +82,84 @@ impl Default for MemoryInjectConfig {
             max_entries: DEFAULT_MAX_ENTRIES,
             entry_max_chars: DEFAULT_ENTRY_MAX_CHARS,
             max_total_chars: DEFAULT_MAX_TOTAL_CHARS,
+            rerank_enabled: false,
+            candidate_multiplier: 1,
+            rerank: rerank::RerankConfig::disabled(DEFAULT_RECALL_LIMIT, 0.0),
         }
+    }
+}
+
+impl MemoryInjectConfig {
+    /// Build the injection config from the agent's resolved memory config
+    /// plus the effective recall limit. Threads the relevance floor and the
+    /// rerank stage settings; budgets stay at the renderer defaults.
+    #[must_use]
+    pub fn from_memory_config(
+        memory: &zeroclaw_config::schema::MemoryConfig,
+        limit: usize,
+    ) -> Self {
+        let limit = if memory.rerank_enabled {
+            rerank::bounded_final_limit(limit)
+        } else {
+            limit
+        };
+        Self {
+            limit,
+            min_relevance_score: memory.min_relevance_score,
+            rerank_enabled: memory.rerank_enabled,
+            candidate_multiplier: memory.candidate_multiplier.max(1),
+            rerank: build_rerank_config(memory, limit),
+            ..Default::default()
+        }
+    }
+}
+
+/// Materialize the rerank stage config from the canonical memory config.
+/// An unknown `rerank_strategy` falls back to no advanced rerank (the blend,
+/// duplicate collapse, and trim still run) with a once-per-process warning.
+fn build_rerank_config(
+    memory: &zeroclaw_config::schema::MemoryConfig,
+    final_limit: usize,
+) -> rerank::RerankConfig {
+    let strategy = match memory.rerank_strategy.trim().to_ascii_lowercase().as_str() {
+        "mmr" => rerank::RerankStrategy::Mmr {
+            lambda: memory.mmr_lambda,
+        },
+        "none" | "" => rerank::RerankStrategy::None,
+        other => {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "rerank_strategy": other,
+                        })),
+                    "unknown memory rerank_strategy; falling back to no advanced rerank"
+                );
+            });
+            rerank::RerankStrategy::None
+        }
+    };
+
+    // Cap the candidate pool at the requested over-fetch (limit * multiplier),
+    // bounded so a mis-sized config or an over-returning backend cannot feed an
+    // unbounded pool into the rerank scans. `candidate_multiplier` is validated
+    // to `1..=MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER` at config load.
+    let final_limit = rerank::bounded_final_limit(final_limit);
+    let candidate_pool_cap = final_limit
+        .max(1)
+        .saturating_mul(memory.candidate_multiplier.max(1));
+
+    rerank::RerankConfig {
+        strategy,
+        threshold: memory.rerank_threshold,
+        importance_weight: memory.importance_weight,
+        recency_weight: memory.recency_weight,
+        min_relevance_score: memory.min_relevance_score,
+        final_limit,
+        candidate_pool_cap: rerank::bounded_pool_cap(final_limit, candidate_pool_cap),
     }
 }
 
@@ -148,9 +256,23 @@ pub async fn render_memory_context(
     sessions: &[Option<&str>],
     cfg: &MemoryInjectConfig,
     exclude_conversation: bool,
+    turn: TurnMeta<'_>,
 ) -> String {
     let backend = mem.name().to_string();
     let query_summary = make_query_summary(user_msg);
+
+    // Over-fetch a larger candidate pool only when reranking is enabled;
+    // otherwise recall exactly `limit` so the default path is unchanged.
+    let recall_limit = if cfg.rerank_enabled {
+        let requested_pool = cfg
+            .limit
+            .saturating_mul(cfg.candidate_multiplier)
+            .max(cfg.limit)
+            .max(cfg.rerank.candidate_pool_cap);
+        rerank::bounded_pool_cap(cfg.limit.max(cfg.rerank.final_limit), requested_pool)
+    } else {
+        cfg.limit
+    };
 
     let start = Instant::now();
     let mut entries: Vec<MemoryEntry> = Vec::new();
@@ -164,7 +286,7 @@ pub async fn render_memory_context(
     };
     for session_id in scopes {
         match mem
-            .recall(user_msg, cfg.limit, *session_id, None, None)
+            .recall(user_msg, recall_limit, *session_id, None, None)
             .await
         {
             Ok(recalled) => {
@@ -188,10 +310,29 @@ pub async fn render_memory_context(
         num_entries: entries.len(),
         backend,
         success: any_ok,
+        channel: Some(turn.channel_name.to_string()),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: Some(turn.turn_id.to_string()),
     });
 
-    // Older non-Core memories score lower; Core is evergreen.
-    decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+    if cfg.rerank_enabled {
+        // Relevance plane: blend (retrieval + importance + recency), collapse
+        // near-duplicates, optionally diversify via MMR, apply the floor, and
+        // trim back to the recall limit. The blend's recency factor subsumes
+        // time decay, so this arm replaces it; the budget loop below still
+        // caps the rendered block. The eligibility predicate mirrors the
+        // renderer's skip set so ineligible rows are dropped before the trim,
+        // not after, letting over-fetched candidates fill the freed slots.
+        entries = rerank::run(entries, &cfg.rerank, |entry| {
+            if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
+                return false;
+            }
+            !should_skip_entry(&entry.key, &entry.content)
+        });
+    } else {
+        // Older non-Core memories score lower; Core is evergreen.
+        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+    }
 
     let mut context = String::new();
     let mut included = 0usize;
@@ -275,19 +416,29 @@ mod tests {
     }
 
     /// Recall returns the fixture list for the requested session scope;
-    /// `fail` simulates a backend error.
+    /// `fail` simulates a backend error. `recalls` counts backend recalls
+    /// for decorator-composition tests, while requested limits are recorded
+    /// so rerank tests can assert the over-fetch gating.
     struct FixtureMemory {
         by_session: HashMap<Option<String>, Vec<MemoryEntry>>,
         fail: bool,
+        recalls: std::sync::atomic::AtomicUsize,
+        recorded_limits: Mutex<Vec<usize>>,
     }
 
     impl FixtureMemory {
         fn with(entries: Vec<MemoryEntry>) -> Self {
             let mut by_session = HashMap::new();
             by_session.insert(None, entries);
+            Self::with_sessions(by_session)
+        }
+
+        fn with_sessions(by_session: HashMap<Option<String>, Vec<MemoryEntry>>) -> Self {
             Self {
                 by_session,
                 fail: false,
+                recalls: std::sync::atomic::AtomicUsize::new(0),
+                recorded_limits: Mutex::new(Vec::new()),
             }
         }
 
@@ -295,6 +446,8 @@ mod tests {
             Self {
                 by_session: HashMap::new(),
                 fail: true,
+                recalls: std::sync::atomic::AtomicUsize::new(0),
+                recorded_limits: Mutex::new(Vec::new()),
             }
         }
     }
@@ -314,11 +467,14 @@ mod tests {
         async fn recall(
             &self,
             _query: &str,
-            _limit: usize,
+            limit: usize,
             session_id: Option<&str>,
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recalls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.recorded_limits.lock().push(limit);
             if self.fail {
                 anyhow::bail!("backend down");
             }
@@ -402,10 +558,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingObserver {
         recalls: Mutex<Vec<(usize, bool)>>,
+        events: Mutex<Vec<ObserverEvent>>,
     }
 
     impl Observer for RecordingObserver {
         fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
             if let ObserverEvent::MemoryRecall {
                 num_entries,
                 success,
@@ -513,6 +671,12 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -520,6 +684,60 @@ mod tests {
         assert!(context.contains("- user_preference: prefers concise answers"));
         assert!(context.ends_with(&format!("{MEMORY_CONTEXT_CLOSE}\n\n")));
         assert_eq!(observer.recalls.lock().as_slice(), &[(1, true)]);
+    }
+
+    #[tokio::test]
+    async fn recall_event_carries_the_turn_correlation_triple() {
+        let mem = FixtureMemory::with(vec![entry(
+            "user_preference",
+            "prefers concise answers",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]);
+        let observer = RecordingObserver::default();
+
+        let _ = render_memory_context(
+            &mem,
+            &observer,
+            "how should I answer",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("default"),
+                turn_id: "turn-42",
+                channel_name: "cli",
+            },
+        )
+        .await;
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::MemoryRecall { .. }))
+            .expect("render_memory_context must emit MemoryRecall")
+        {
+            ObserverEvent::MemoryRecall {
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                assert_eq!(channel.as_deref(), Some("cli"));
+                assert_eq!(agent_alias.as_deref(), Some("default"));
+                assert_eq!(turn_id.as_deref(), Some("turn-42"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::MemoryRecall { .. }))
+                .count(),
+            1,
+            "exactly one recall event per turn — the #8619 contract"
+        );
     }
 
     #[tokio::test]
@@ -534,6 +752,12 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -553,6 +777,12 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -580,6 +810,12 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             true,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -614,6 +850,12 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -636,7 +878,21 @@ mod tests {
             min_relevance_score: 0.5,
             ..Default::default()
         };
-        let context = render_memory_context(&mem, &observer, "query", &[], &cfg, false).await;
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
 
         assert!(!context.contains("barely related"));
         assert!(context.contains("- high: very related"));
@@ -662,6 +918,12 @@ mod tests {
             &[],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -687,7 +949,21 @@ mod tests {
             max_total_chars: 1_500,
             ..Default::default()
         };
-        let context = render_memory_context(&mem, &observer, "query", &[], &cfg, false).await;
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
 
         assert!(context.contains("- a: "));
         assert!(context.contains("- b: "));
@@ -711,10 +987,7 @@ mod tests {
                 entry("only_sender", "s", MemoryCategory::Core, None),
             ],
         );
-        let mem = FixtureMemory {
-            by_session,
-            fail: false,
-        };
+        let mem = FixtureMemory::with_sessions(by_session);
         let observer = RecordingObserver::default();
 
         let context = render_memory_context(
@@ -724,6 +997,12 @@ mod tests {
             &[Some("history"), Some("sender")],
             &MemoryInjectConfig::default(),
             false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
         )
         .await;
 
@@ -733,5 +1012,817 @@ mod tests {
         assert!(context.contains("- only_first: h"));
         assert!(context.contains("- only_sender: s"));
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
+    }
+
+    /// Injection-path smoke for the retrieval decorator: when the turn's
+    /// memory handle is pipeline-wrapped (as `create_memory_for_agent` now
+    /// builds it), each renderer recall reaches the scoped backend and the
+    /// rendered block remains unchanged.
+    #[tokio::test]
+    async fn recall_routes_through_retrieval_pipeline_decorator() {
+        let fixture = std::sync::Arc::new(FixtureMemory::with(vec![entry(
+            "fact",
+            "server is prod-3",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]));
+        let pipeline = zeroclaw_memory::RetrievalPipeline::new(
+            fixture.clone() as std::sync::Arc<dyn Memory>,
+            zeroclaw_memory::RetrievalConfig::default(),
+        );
+        let observer = RecordingObserver::default();
+
+        let first = render_memory_context(
+            &pipeline,
+            &observer,
+            "which server",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+        let second = render_memory_context(
+            &pipeline,
+            &observer,
+            "which server",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        assert!(first.contains("- fact: server is prod-3"));
+        assert_eq!(
+            first, second,
+            "direct backend recall must render identically"
+        );
+        assert_eq!(
+            fixture.recalls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each render must reach the backend through the decorator"
+        );
+        assert_eq!(
+            observer.recalls.lock().as_slice(),
+            &[(1, true), (1, true)],
+            "both renders emit a MemoryRecall event"
+        );
+    }
+
+    // -- rerank stage + injection goldens --------------------------------
+
+    fn scored_entry(
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        score: Option<f64>,
+        importance: Option<f64>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> MemoryEntry {
+        MemoryEntry {
+            timestamp: timestamp.to_rfc3339(),
+            importance,
+            ..entry(key, content, category, score)
+        }
+    }
+
+    /// The golden fixture corpus: a near-duplicate pair (single-entry pools
+    /// cannot distinguish the rerank arm), a Conversation entry, a stale
+    /// scored entry old enough for time decay to drop it, and an autosave
+    /// key the skip set filters on every arm. Recall order is fixture order.
+    fn golden_corpus() -> Vec<MemoryEntry> {
+        let now = chrono::Utc::now();
+        vec![
+            scored_entry(
+                "alpha",
+                "deploy target is prod-cluster-3",
+                MemoryCategory::Core,
+                Some(0.9),
+                Some(0.8),
+                now,
+            ),
+            scored_entry(
+                "alpha_dup",
+                "deploy target is prod-cluster-3 for staging",
+                MemoryCategory::Core,
+                Some(0.85),
+                Some(0.1),
+                now,
+            ),
+            scored_entry(
+                "beta",
+                "team standup moved to 0930",
+                MemoryCategory::Daily,
+                Some(0.7),
+                Some(0.5),
+                now,
+            ),
+            scored_entry(
+                "chat",
+                "user said hello",
+                MemoryCategory::Conversation,
+                None,
+                None,
+                now,
+            ),
+            scored_entry(
+                "stale",
+                "quarterly report workflow uses legacy tool",
+                MemoryCategory::Daily,
+                Some(0.6),
+                Some(0.4),
+                now - chrono::Duration::days(60),
+            ),
+            scored_entry(
+                "user_msg_9",
+                "raw autosave user message",
+                MemoryCategory::Core,
+                Some(0.99),
+                None,
+                now,
+            ),
+        ]
+    }
+
+    /// Resolve the injection policy for `origin` and render against it,
+    /// mirroring the engine's policy-then-render wiring.
+    async fn render_for_origin(
+        origin: TurnOrigin,
+        has_session: bool,
+        suppress: bool,
+        mem: &FixtureMemory,
+        cfg: &MemoryInjectConfig,
+    ) -> String {
+        match resolve_inject_policy(origin, has_session, suppress) {
+            InjectPolicy::Skip => String::new(),
+            InjectPolicy::Inject {
+                exclude_conversation,
+            } => {
+                render_memory_context(
+                    mem,
+                    &RecordingObserver::default(),
+                    "query",
+                    &[],
+                    cfg,
+                    exclude_conversation,
+                    TurnMeta {
+                        parent_agent_alias: None,
+                        agent_alias: None,
+                        turn_id: "t",
+                        channel_name: "test",
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    // Flags-off goldens: captured from the pre-rerank renderer's behavior on
+    // the corpus (decay drops `stale`, the skip set drops `user_msg_9`, the
+    // near-duplicate pair renders twice, recall order is preserved). Later
+    // pipeline stages re-prove against these.
+    const GOLDEN_FULL: &str = "[Memory context]\n\
+        - alpha: deploy target is prod-cluster-3\n\
+        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - beta: team standup moved to 0930\n\
+        - chat: user said hello\n\
+        [/Memory context]\n\n";
+    const GOLDEN_NO_CONVERSATION: &str = "[Memory context]\n\
+        - alpha: deploy target is prod-cluster-3\n\
+        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - beta: team standup moved to 0930\n\
+        [/Memory context]\n\n";
+    const GOLDEN_TIGHT_BUDGET: &str = "[Memory context]\n\
+        - alpha: deploy target is prod-cluster-3\n\
+        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        [/Memory context]\n\n";
+    // Rerank arm on the same corpus: the blend re-sorts, MMR demotes the
+    // near-duplicate to the tail, the trim drops the unscored Conversation
+    // entry, and `stale` survives (the blend's recency factor replaces the
+    // decay drop). Divergence from the flags-off goldens is the point.
+    const GOLDEN_RERANK: &str = "[Memory context]\n\
+        - alpha: deploy target is prod-cluster-3\n\
+        - beta: team standup moved to 0930\n\
+        - stale: quarterly report workflow uses legacy tool\n\
+        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        [/Memory context]\n\n";
+    // Conversation exclusion is an eligibility boundary, so it runs before
+    // duplicate collapse and MMR. Once the ineligible rows are removed, this
+    // fixture is below the advanced-strategy threshold and keeps blend order.
+    const GOLDEN_RERANK_NO_CONVERSATION: &str = "[Memory context]\n\
+        - alpha: deploy target is prod-cluster-3\n\
+        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - beta: team standup moved to 0930\n\
+        - stale: quarterly report workflow uses legacy tool\n\
+        [/Memory context]\n\n";
+
+    #[tokio::test]
+    async fn injection_goldens_across_origin_budget_and_flags() {
+        let flags_off = MemoryInjectConfig::from_memory_config(
+            &zeroclaw_config::schema::MemoryConfig::default(),
+            DEFAULT_RECALL_LIMIT,
+        );
+        let rerank_on = MemoryInjectConfig::from_memory_config(
+            &zeroclaw_config::schema::MemoryConfig {
+                rerank_enabled: true,
+                rerank_strategy: "mmr".into(),
+                ..Default::default()
+            },
+            DEFAULT_RECALL_LIMIT,
+        );
+
+        let cases: Vec<(&str, TurnOrigin, bool, bool, MemoryInjectConfig, &str)> = vec![
+            (
+                "interactive_scoped",
+                TurnOrigin::Interactive,
+                true,
+                false,
+                flags_off,
+                GOLDEN_FULL,
+            ),
+            (
+                "channel_unscoped_excludes_conversation",
+                TurnOrigin::Channel,
+                false,
+                false,
+                flags_off,
+                GOLDEN_NO_CONVERSATION,
+            ),
+            (
+                "cron_excludes_conversation",
+                TurnOrigin::Cron,
+                true,
+                false,
+                flags_off,
+                GOLDEN_NO_CONVERSATION,
+            ),
+            (
+                "daemon_excludes_conversation",
+                TurnOrigin::Daemon,
+                false,
+                false,
+                flags_off,
+                GOLDEN_NO_CONVERSATION,
+            ),
+            (
+                "sub_turn_never_injects",
+                TurnOrigin::SubTurn,
+                true,
+                false,
+                flags_off,
+                "",
+            ),
+            // The cron `uses_memory = false` spawn-site opt-out arrives here
+            // as `suppress`, so the whole render is skipped.
+            (
+                "cron_uses_memory_false_suppresses",
+                TurnOrigin::Cron,
+                true,
+                true,
+                flags_off,
+                "",
+            ),
+            (
+                "tight_entry_budget",
+                TurnOrigin::Interactive,
+                true,
+                false,
+                MemoryInjectConfig {
+                    max_entries: 2,
+                    ..flags_off
+                },
+                GOLDEN_TIGHT_BUDGET,
+            ),
+            (
+                "tight_total_char_budget",
+                TurnOrigin::Interactive,
+                true,
+                false,
+                MemoryInjectConfig {
+                    max_total_chars: 100,
+                    ..flags_off
+                },
+                GOLDEN_TIGHT_BUDGET,
+            ),
+            (
+                "rerank_on_interactive",
+                TurnOrigin::Interactive,
+                true,
+                false,
+                rerank_on,
+                GOLDEN_RERANK,
+            ),
+            (
+                "rerank_on_cron",
+                TurnOrigin::Cron,
+                true,
+                false,
+                rerank_on,
+                GOLDEN_RERANK_NO_CONVERSATION,
+            ),
+        ];
+
+        for (name, origin, has_session, suppress, cfg, want) in cases {
+            let mem = FixtureMemory::with(golden_corpus());
+            let got = render_for_origin(origin, has_session, suppress, &mem, &cfg).await;
+            assert_eq!(got, want, "golden mismatch for case {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_on_mmr_drops_near_duplicate_and_reorders() {
+        let now = chrono::Utc::now();
+        let pool = vec![
+            scored_entry(
+                "a",
+                "rust memory scoring pipeline",
+                MemoryCategory::Daily,
+                Some(0.95),
+                None,
+                now,
+            ),
+            scored_entry(
+                "b",
+                "rust memory scoring pipeline latency",
+                MemoryCategory::Daily,
+                Some(0.93),
+                None,
+                now,
+            ),
+            scored_entry(
+                "c",
+                "garden tomatoes irrigation calendar",
+                MemoryCategory::Daily,
+                Some(0.75),
+                None,
+                now,
+            ),
+        ];
+
+        // Flags off: the near-duplicate pair renders untouched, recall order.
+        let mem = FixtureMemory::with(pool.clone());
+        let off = MemoryInjectConfig {
+            min_relevance_score: 0.4,
+            ..Default::default()
+        };
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &off,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+        assert!(context.contains("- a: "));
+        assert!(context.contains("- b: "));
+        assert!(context.contains("- c: "));
+
+        // Rerank on with a 2-slot trim: MMR demotes the near-duplicate below
+        // the unrelated entry and the trim drops it.
+        let mem = FixtureMemory::with(pool);
+        let on = MemoryInjectConfig {
+            limit: 2,
+            min_relevance_score: 0.4,
+            rerank_enabled: true,
+            candidate_multiplier: 3,
+            rerank: rerank::RerankConfig {
+                strategy: rerank::RerankStrategy::Mmr { lambda: 0.5 },
+                threshold: 2,
+                importance_weight: 0.2,
+                recency_weight: 0.1,
+                min_relevance_score: 0.4,
+                final_limit: 2,
+                candidate_pool_cap: 6,
+            },
+            ..Default::default()
+        };
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &on,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+        let a_pos = context.find("- a: ").expect("top entry renders");
+        let c_pos = context.find("- c: ").expect("diverse entry renders");
+        assert!(a_pos < c_pos, "relevance leader stays first");
+        assert!(
+            !context.contains("- b: "),
+            "near-duplicate must be demoted out of the trimmed set"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_gates_candidate_over_fetch() {
+        // On: recall over-fetches limit * candidate_multiplier.
+        let mem = FixtureMemory::with(vec![]);
+        let cfg = MemoryInjectConfig {
+            limit: 5,
+            rerank_enabled: true,
+            candidate_multiplier: 4,
+            ..Default::default()
+        };
+        render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "q",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+        assert_eq!(mem.recorded_limits.lock().as_slice(), &[20]);
+
+        // Off: the multiplier is inert; recall requests exactly `limit`.
+        let mem = FixtureMemory::with(vec![]);
+        let cfg = MemoryInjectConfig {
+            limit: 5,
+            rerank_enabled: false,
+            candidate_multiplier: 4,
+            ..Default::default()
+        };
+        render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "q",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+        assert_eq!(mem.recorded_limits.lock().as_slice(), &[5]);
+    }
+
+    #[tokio::test]
+    async fn rerank_bounds_unlimited_recall_sentinel_before_backend_and_scan() {
+        let now = chrono::Utc::now();
+        let mut pool: Vec<MemoryEntry> = (0..rerank::MAX_CANDIDATE_POOL)
+            .map(|i| {
+                scored_entry(
+                    &format!("bounded_{i:04}"),
+                    &format!("unique bounded topic {i} marker_{i}"),
+                    MemoryCategory::Daily,
+                    Some(0.2 + (i as f64 / 10_000.0)),
+                    Some(0.0),
+                    now,
+                )
+            })
+            .collect();
+        pool.push(scored_entry(
+            "out_of_bound_winner",
+            "tail candidate should never enter rerank scans",
+            MemoryCategory::Core,
+            Some(1.0),
+            Some(1.0),
+            now,
+        ));
+
+        let mem = FixtureMemory::with(pool);
+        let mut memory = zeroclaw_config::schema::MemoryConfig {
+            rerank_enabled: true,
+            candidate_multiplier: 20,
+            min_relevance_score: 0.0,
+            ..Default::default()
+        };
+        memory.rerank_strategy = "none".into();
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, usize::MAX);
+
+        assert_eq!(cfg.limit, rerank::MAX_CANDIDATE_POOL);
+        assert_eq!(cfg.rerank.final_limit, rerank::MAX_CANDIDATE_POOL);
+        assert_eq!(cfg.rerank.candidate_pool_cap, rerank::MAX_CANDIDATE_POOL);
+
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            mem.recorded_limits.lock().as_slice(),
+            &[rerank::MAX_CANDIDATE_POOL],
+            "unlimited profile sentinel must be capped before backend recall"
+        );
+        assert!(
+            !context.contains("out_of_bound_winner"),
+            "over-returned tail candidate must be truncated before rerank work"
+        );
+        assert_eq!(
+            context.matches("\n- ").count(),
+            DEFAULT_MAX_ENTRIES,
+            "renderer entry budget still applies after bounded rerank"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_output_still_flows_through_budget_caps() {
+        let now = chrono::Utc::now();
+        let pool: Vec<MemoryEntry> = (0..6)
+            .map(|i| {
+                scored_entry(
+                    &format!("k{i}"),
+                    &format!("distinct topic number {i} zebra{i}"),
+                    MemoryCategory::Daily,
+                    Some(0.9 - i as f64 * 0.05),
+                    None,
+                    now,
+                )
+            })
+            .collect();
+        let mem = FixtureMemory::with(pool);
+        let cfg = MemoryInjectConfig {
+            limit: 6,
+            rerank_enabled: true,
+            candidate_multiplier: 2,
+            rerank: rerank::RerankConfig::disabled(6, 0.0),
+            ..Default::default()
+        };
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+        // Rerank returned 6 candidates; the entry-count budget still caps
+        // the rendered block at the default 4.
+        assert_eq!(context.matches("\n- ").count(), DEFAULT_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn from_memory_config_threads_rerank_settings() {
+        let mut memory = zeroclaw_config::schema::MemoryConfig::default();
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 7);
+        assert_eq!(cfg.limit, 7);
+        assert!((cfg.min_relevance_score - memory.min_relevance_score).abs() < f64::EPSILON);
+        assert!(!cfg.rerank_enabled);
+        assert_eq!(cfg.candidate_multiplier, memory.candidate_multiplier);
+        assert_eq!(cfg.rerank.strategy, rerank::RerankStrategy::None);
+        assert_eq!(cfg.rerank.threshold, memory.rerank_threshold);
+        assert_eq!(cfg.rerank.final_limit, 7);
+
+        // Strategy parsing is case- and whitespace-tolerant.
+        memory.rerank_enabled = true;
+        memory.rerank_strategy = " MMR ".into();
+        memory.mmr_lambda = 0.6;
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
+        assert!(cfg.rerank_enabled);
+        assert_eq!(
+            cfg.rerank.strategy,
+            rerank::RerankStrategy::Mmr { lambda: 0.6 }
+        );
+
+        // Unknown strategies fall back to no advanced rerank.
+        memory.rerank_strategy = "llm_judge".into();
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
+        assert_eq!(cfg.rerank.strategy, rerank::RerankStrategy::None);
+
+        // A zero multiplier is clamped so over-fetch never zeroes recall.
+        memory.candidate_multiplier = 0;
+        let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
+        assert_eq!(cfg.candidate_multiplier, 1);
+    }
+
+    /// Regression: a high-scoring but render-ineligible entry must not consume
+    /// a final-selection slot. With a five-entry budget and five eligible facts
+    /// plus one ineligible top-scored row, the pre-trim eligibility filter lets
+    /// all five eligible facts render instead of only four.
+    #[tokio::test]
+    async fn rerank_eligibility_filter_frees_slots_for_valid_candidates() {
+        let now = chrono::Utc::now();
+        let pool = vec![
+            // Ineligible (`_history` key) yet outranks every fact.
+            scored_entry(
+                "channel_history",
+                "raw transcript blob",
+                MemoryCategory::Core,
+                Some(0.99),
+                Some(1.0),
+                now,
+            ),
+            scored_entry(
+                "fact_a",
+                "alpha apples",
+                MemoryCategory::Core,
+                Some(0.9),
+                Some(0.5),
+                now,
+            ),
+            scored_entry(
+                "fact_b",
+                "beta bananas",
+                MemoryCategory::Daily,
+                Some(0.8),
+                Some(0.5),
+                now,
+            ),
+            scored_entry(
+                "fact_c",
+                "gamma grapes",
+                MemoryCategory::Daily,
+                Some(0.7),
+                Some(0.5),
+                now,
+            ),
+            scored_entry(
+                "fact_d",
+                "delta dates",
+                MemoryCategory::Daily,
+                Some(0.6),
+                Some(0.5),
+                now,
+            ),
+            scored_entry(
+                "fact_e",
+                "epsilon elderberry",
+                MemoryCategory::Daily,
+                Some(0.5),
+                Some(0.5),
+                now,
+            ),
+        ];
+        let mem = FixtureMemory::with(pool);
+        let cfg = MemoryInjectConfig {
+            limit: 5,
+            min_relevance_score: 0.0,
+            max_entries: 5,
+            rerank_enabled: true,
+            candidate_multiplier: 2,
+            rerank: rerank::RerankConfig {
+                strategy: rerank::RerankStrategy::None,
+                threshold: usize::MAX,
+                importance_weight: 0.2,
+                recency_weight: 0.1,
+                min_relevance_score: 0.0,
+                final_limit: 5,
+                candidate_pool_cap: 10,
+            },
+            ..Default::default()
+        };
+
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &cfg,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        assert_eq!(
+            context.matches("\n- ").count(),
+            5,
+            "all five eligible facts fill the budget"
+        );
+        assert!(
+            !context.contains("channel_history"),
+            "ineligible row dropped"
+        );
+        assert!(context.contains("- fact_e: epsilon elderberry"));
+    }
+
+    /// Composed score-domain regression: current SQLite recall owns BM25
+    /// calibration, while this module owns the blend and relevance floor.
+    /// Exercise the stock no-embedding backend through the real renderer so
+    /// those two layers cannot silently drift back onto incompatible scales.
+    #[tokio::test]
+    async fn noop_sqlite_bm25_recall_stays_ranked_through_rerank_injection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory = zeroclaw_memory::SqliteMemory::new("rerank-bm25", tmp.path()).unwrap();
+        assert_eq!(
+            memory.embedder_dimensions(),
+            0,
+            "the regression must exercise the BM25-only recall path"
+        );
+
+        memory
+            .store(
+                "best_match",
+                "orbital vault orbital vault passphrase",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        memory
+            .store(
+                "supporting_match",
+                "orbital vault maintenance schedule",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recalled = memory
+            .recall("orbital vault", 20, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 2);
+        assert!(
+            recalled.iter().all(|entry| {
+                entry
+                    .score
+                    .is_some_and(|score| (0.0..=1.0).contains(&score))
+            }),
+            "the recall boundary must normalize every BM25 score"
+        );
+        assert!(
+            recalled[0].score > recalled[1].score,
+            "term-frequency relevance must remain distinguishable"
+        );
+
+        let config = zeroclaw_config::schema::MemoryConfig {
+            rerank_enabled: true,
+            rerank_strategy: "none".into(),
+            min_relevance_score: 0.4,
+            ..Default::default()
+        };
+        let inject = MemoryInjectConfig::from_memory_config(&config, 5);
+        let context = render_memory_context(
+            &memory,
+            &RecordingObserver::default(),
+            "orbital vault",
+            &[],
+            &inject,
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        let best = context
+            .find("- best_match: ")
+            .expect("the relevance leader survives the configured floor");
+        let supporting = context
+            .find("- supporting_match: ")
+            .expect("the weaker relevant entry survives the configured floor");
+        assert!(best < supporting, "BM25 relevance order survives blending");
     }
 }

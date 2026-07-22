@@ -83,6 +83,12 @@ pub enum ObserverEvent {
         messages_count: usize,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// Result of a single LLM model_provider call.
@@ -102,6 +108,12 @@ pub enum ObserverEvent {
         messages: Option<LlmMessageSnapshot>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// The agent session has finished.
@@ -133,6 +145,12 @@ pub enum ObserverEvent {
         arguments: Option<String>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
@@ -157,6 +175,12 @@ pub enum ObserverEvent {
         result: Option<String>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// A memory recall (search) operation has completed.
@@ -177,6 +201,9 @@ pub enum ObserverEvent {
         /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`, `"none"`).
         backend: String,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A memory store (write) operation has completed.
     ///
@@ -193,6 +220,9 @@ pub enum ObserverEvent {
         backend: String,
         duration: Duration,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A memory audit/operator action was recorded on the audit trail.
     ///
@@ -219,6 +249,9 @@ pub enum ObserverEvent {
         duration: Duration,
         num_chunks: usize,
         num_boards: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -479,6 +512,7 @@ mod tests {
             result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
@@ -498,18 +532,27 @@ mod tests {
             num_entries: 3,
             backend: "sqlite".into(),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let store = ObserverEvent::MemoryStore {
             category: "conversation".into(),
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let rag = ObserverEvent::RagRetrieve {
             query_summary: None,
             duration: Duration::from_millis(120),
             num_chunks: 5,
             num_boards: 2,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let audit = ObserverEvent::MemoryAudit {
             action: "store".into(),
@@ -518,7 +561,12 @@ mod tests {
             success: true,
         };
 
-        assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
+        match recall.clone() {
+            ObserverEvent::MemoryRecall { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            other => panic!("clone changed variant: {other:?}"),
+        }
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
         assert!(matches!(audit.clone(), ObserverEvent::MemoryAudit { .. }));

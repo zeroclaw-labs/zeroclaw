@@ -21,6 +21,10 @@ task_local! {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn maybe_run_skill_review(
+    // Full config, for resolving the configured `vision_model_provider`'s
+    // alias-specific options on the review fork's vision route. `None` on
+    // configless (test) paths; the production caller (`run`) threads `Some`.
+    full_config: Option<&zeroclaw_config::schema::Config>,
     workspace_dir: PathBuf,
     config: SkillImprovementConfig,
     allow_scripts: bool,
@@ -76,6 +80,7 @@ pub async fn maybe_run_skill_review(
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: provider,
@@ -90,6 +95,7 @@ pub async fn maybe_run_skill_review(
                         silent: true,
                         approval: None,
                         multimodal_config: multimodal,
+                        config: full_config,
                         hooks: None,
                         activated_tools: None,
                         model_switch_callback: None,
@@ -127,6 +133,7 @@ pub async fn maybe_run_skill_review(
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias,
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .await

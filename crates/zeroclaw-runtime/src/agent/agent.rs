@@ -839,11 +839,10 @@ impl AgentBuilder {
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
             memory_inject_cfg: self.memory_inject_cfg.unwrap_or_else(|| {
-                crate::agent::memory_inject::MemoryInjectConfig {
-                    min_relevance_score: zeroclaw_config::schema::MemoryConfig::default()
-                        .min_relevance_score,
-                    ..Default::default()
-                }
+                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                    &zeroclaw_config::schema::MemoryConfig::default(),
+                    crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                )
             }),
             config,
             structured_history_cap_resolver: self.structured_history_cap_resolver,
@@ -902,6 +901,19 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// The full `Config` the agent was constructed from, when available. Sourced
+    /// from `provider_switch_config` - the single canonical config snapshot the
+    /// agent already carries for provider-alias resolution. `None` only on
+    /// configless (test-builder) agents; every production construction path
+    /// (`from_config` / `from_config_with_tui_env`) populates it. Used by the
+    /// vision route to resolve the configured `vision_model_provider`'s
+    /// alias-specific options (the `vision` override, endpoint URI, credentials).
+    fn full_config(&self) -> Option<&zeroclaw_config::schema::Config> {
+        self.provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.config.as_deref())
     }
 
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
@@ -1045,6 +1057,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
+        turn_id: &str,
     ) {
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
@@ -1064,6 +1077,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.to_string()),
             });
         }
 
@@ -1466,8 +1482,12 @@ impl Agent {
                 // CLI / standalone path: no channel map is wired here, so the route
                 // adapter is the no-op (log-only). The daemon path builds the SOP
                 // engine with a real channel-delivering adapter instead.
-                let (engine, audit) =
-                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem, None);
+                let (engine, audit) = crate::sop::build_sop_engine(
+                    config.sop.clone(),
+                    &config.data_dir,
+                    mem,
+                    Default::default(),
+                );
                 (Some(engine), Some(audit))
             }
             _ => (None, None),
@@ -1625,11 +1645,12 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
-                limit: config.effective_memory_recall_limit(agent_alias),
-                min_relevance_score: config.memory.min_relevance_score,
-                ..Default::default()
-            })
+            .memory_inject_cfg(
+                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                    &config.memory,
+                    config.effective_memory_recall_limit(agent_alias),
+                ),
+            )
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
@@ -2157,6 +2178,19 @@ impl Agent {
                 )));
         }
 
+        let effective_model = self.classify_model(user_message);
+
+        let turn_id = Self::new_turn_id();
+        let turn_observer = Arc::clone(&self.observer);
+        let mut guard = crate::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            self.model_provider_name.clone(),
+            effective_model.clone(),
+            Some(self.channel_name.clone()),
+            self.observer_agent_alias(),
+            Some(turn_id.clone()),
+        );
+
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
         if self.auto_save {
@@ -2175,6 +2209,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
             });
         }
 
@@ -2190,27 +2227,16 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
-
-        let turn_id = Self::new_turn_id();
-        let turn_observer = Arc::clone(&self.observer);
-        let mut guard = crate::observability::AgentTurnGuard::start(
-            turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
-            Some(self.channel_name.clone()),
-            self.observer_agent_alias(),
-            Some(turn_id.clone()),
-        );
-
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
+                    self.full_config(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
                     &self.model_provider_name,
+                    &effective_model,
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -2219,7 +2245,8 @@ impl Agent {
                     }
                 };
             let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_deref()
+                .as_ref()
+                .map(|resolved| resolved.provider.as_ref())
                 .unwrap_or(self.model_provider.as_ref());
             tool_dispatcher_for_provider(&self.config, active_provider)
         };
@@ -2293,6 +2320,12 @@ impl Agent {
                                 silent: false,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 model_switch_callback: None,
@@ -2340,7 +2373,18 @@ impl Agent {
                         }),
                         ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
                         turn_id: &turn_id,
+                        // Live-daemon SOP path: re-assemble a nested step's agent
+                        // when it delegates elsewhere. Config survives only via
+                        // `provider_switch_config`; with `None` (test builder) a
+                        // cross-agent step FAILS CLOSED rather than inheriting
+                        // this turn's context.
+                        sop_reassembly: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|c| c.config.as_deref())
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
                     }),
                 ),
             )
@@ -2467,9 +2511,6 @@ impl Agent {
         }
 
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
-        self.append_streamed_user_message_to_history(user_message, &mut new_msgs)
-            .await;
-
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_pending_model_switch`) can rebind it for later rounds
@@ -2491,15 +2532,19 @@ impl Agent {
             self.observer_agent_alias(),
             Some(turn_id.clone()),
         );
+        self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
+            .await;
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
+                    self.full_config(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
                     &self.model_provider_name,
+                    &effective_model,
                 ) {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -2513,7 +2558,8 @@ impl Agent {
                     }
                 };
             let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_deref()
+                .as_ref()
+                .map(|resolved| resolved.provider.as_ref())
                 .unwrap_or(self.model_provider.as_ref());
             tool_dispatcher_for_provider(&self.config, active_provider)
         };
@@ -2612,8 +2658,12 @@ impl Agent {
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
-                    .await;
+                self.append_streamed_user_message_to_history(
+                    &steering_message,
+                    &mut new_msgs,
+                    &turn_id,
+                )
+                .await;
                 if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
                     loop_history.push(user_msg.clone());
                 }
@@ -2642,6 +2692,12 @@ impl Agent {
                                 silent: true,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 model_switch_callback: Some(
@@ -2691,7 +2747,18 @@ impl Agent {
                         }),
                         ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
                         turn_id: &turn_id,
+                        // Live-daemon SOP path: re-assemble a nested step's
+                        // agent when it delegates elsewhere. Config survives
+                        // only via `provider_switch_config`; with `None`
+                        // (test builder) a cross-agent step FAILS CLOSED
+                        // rather than inheriting this turn's context.
+                        sop_reassembly: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|c| c.config.as_deref())
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
                     }),
                 ),
             );
@@ -8254,7 +8321,10 @@ mod tests {
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
             | ObserverEvent::ToolCall { turn_id, .. }
-            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
             _ => None,
         }
     }
@@ -8303,6 +8373,24 @@ mod tests {
                     turn_id,
                     ..
                 } => ("ToolCall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryRecall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryRecall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryStore {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryStore", channel, agent_alias, turn_id),
+                ObserverEvent::RagRetrieve {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("RagRetrieve", channel, agent_alias, turn_id),
                 _ => continue,
             };
             assert!(
@@ -8335,7 +8423,10 @@ mod tests {
                     | ObserverEvent::LlmRequest { agent_alias, .. }
                     | ObserverEvent::LlmResponse { agent_alias, .. }
                     | ObserverEvent::ToolCallStart { agent_alias, .. }
-                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    | ObserverEvent::ToolCall { agent_alias, .. }
+                    | ObserverEvent::MemoryRecall { agent_alias, .. }
+                    | ObserverEvent::MemoryStore { agent_alias, .. }
+                    | ObserverEvent::RagRetrieve { agent_alias, .. } => agent_alias,
                     _ => continue,
                 };
                 assert_eq!(
@@ -8354,7 +8445,10 @@ mod tests {
                     | ObserverEvent::LlmResponse { channel: ch, .. }
                     | ObserverEvent::ToolCallStart { channel: ch, .. }
                     | ObserverEvent::ToolCall { channel: ch, .. }
-                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    | ObserverEvent::AgentEnd { channel: ch, .. }
+                    | ObserverEvent::MemoryRecall { channel: ch, .. }
+                    | ObserverEvent::MemoryStore { channel: ch, .. }
+                    | ObserverEvent::RagRetrieve { channel: ch, .. } => ch,
                     _ => continue,
                 };
                 assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
@@ -8830,12 +8924,70 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .agent_alias("test-agent".into())
+            .auto_save(true)
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must cause Agent::turn to emit a MemoryStore event \
+             so its (channel, agent_alias, turn_id) triple is actually asserted below"
+        );
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_events_share_consistent_turn_id() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("test", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+        while event_rx.recv().await.is_some() {}
+
+        let events = capturing.events.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must cause the streamed turn to emit a MemoryStore event"
+        );
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 

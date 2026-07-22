@@ -6,8 +6,13 @@ zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
 zc-pane-sop = SOPs
+zc-chrome-summary-sessions = sessions
+zc-chrome-summary-ram = ram
+zc-chrome-summary-cpu = cpu
+zc-chrome-summary-loading = loading
 
 zc-app-help-cycle-mode = Cycle mode
+zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
 
@@ -25,6 +30,7 @@ zc-app-quit-explainer = The TUI closes. The daemon keeps running; reconnect anyt
 zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
+zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -89,7 +95,6 @@ zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
 zc-input-placeholder-chat = Type to chat
 
-zc-input-help-slash-commands = Slash commands
 zc-input-help-completions-navigate = Navigate completions
 zc-input-help-completions-accept = Accept
 zc-input-help-completions-dismiss = Dismiss
@@ -184,14 +189,28 @@ zc-dashboard-agent-rename-success-warnings = Renamed { $from } to { $to } with w
 zc-dashboard-agent-rename-failed = Rename failed: { $error }
 
 zc-dashboard-label-connected = Connected
+zc-dashboard-label-daemon = Daemon
+zc-dashboard-label-socket = Socket
 zc-dashboard-label-server = Server
-zc-dashboard-label-protocol = Protocol
+zc-dashboard-label-protocol = RPC API
 zc-dashboard-label-sessions = Sessions
+zc-dashboard-label-config = Config
+zc-dashboard-label-config-file = File
+zc-dashboard-label-endpoint = Endpoint
+zc-dashboard-label-workspace = Workspace
+zc-dashboard-label-code-cwd = Code CWD
+zc-dashboard-label-chat-cwd = Chat CWD
 zc-dashboard-label-memory = Memory
 zc-dashboard-label-cpu = CPU
 zc-dashboard-label-insecure-tls = ⚠ unverified TLS — certificate not checked
 zc-dashboard-label-uptime = Uptime
 zc-dashboard-label-pid = PID
+zc-dashboard-config-kind-default = default
+zc-dashboard-config-kind-custom = custom
+zc-dashboard-config-kind-temporary = temporary
+zc-dashboard-daemon-local = local
+zc-dashboard-daemon-remote = remote
+zc-dashboard-cpu-with-cores = { $cpu } ({ $cores } cores)
 
 zc-dashboard-no-tuis = No TUIs connected
 zc-dashboard-no-session = No session selected
@@ -437,6 +456,8 @@ zc-chat-approval-action-edit = Edit
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
+zc-chat-copy-message = [Copy]
+zc-chat-copy-message-copied = [Copied]
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

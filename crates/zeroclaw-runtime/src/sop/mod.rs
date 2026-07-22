@@ -31,8 +31,8 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine};
-pub use executor::spawn_headless_run_driver;
+pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
+pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
     GraphWire, LayoutGeometry, LegendEntry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState,
@@ -89,6 +89,21 @@ pub fn tool_specs_from_config(
         .collect()
 }
 
+/// Injected side-effect adapters for [`build_sop_engine`]. Each is optional and
+/// fail-closed when absent: the route falls back to the log-only no-op adapter,
+/// and the `forge.comment` / `llm.generate` capabilities report a clear failure
+/// instead of acting. The daemon injects real implementations; CLI / standalone
+/// callers pass `SopEngineAdapters::default()`.
+#[derive(Default)]
+pub struct SopEngineAdapters {
+    /// Delivers approval request / escalation notices to a channel.
+    pub route: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
+    /// Posts a SOP step's comment to a git forge (`forge.comment`).
+    pub forge: Option<Arc<dyn capability::ForgeCommentAdapter>>,
+    /// Runs one bounded model call as a pipeline step (`llm.generate`).
+    pub llm: Option<Arc<dyn capability::LlmGenerateAdapter>>,
+}
+
 /// Build a single shared SopEngine + SopAuditLogger pair.
 /// This is the sole construction site for SOP state within a daemon.
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
@@ -98,8 +113,13 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
-    route_adapter: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
+    adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    let SopEngineAdapters {
+        route: route_adapter,
+        forge: forge_adapter,
+        llm: llm_adapter,
+    } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
     // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
@@ -124,11 +144,20 @@ pub fn build_sop_engine(
     let route: Arc<dyn approval::ApprovalRouteAdapter> =
         route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
     let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
+    // Deterministic capability registry: builtins + the injected-adapter
+    // capabilities (`forge.comment` write-back, `llm.generate` bounded model
+    // call). The daemon injects real adapters; CLI/standalone callers pass
+    // `SopEngineAdapters::default()`, leaving both fail-closed exactly like
+    // `shell.exec`/`notify.channel`.
+    let mut capabilities = capability::SopCapabilityRegistry::with_builtins();
+    capabilities.register(capability::ForgeCommentCapability::new(forge_adapter));
+    capabilities.register(capability::LlmGenerateCapability::new(llm_adapter));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
         .with_run_notifier(run_tx)
-        .with_approval_broker(approval_broker);
+        .with_approval_broker(approval_broker)
+        .with_capabilities(Arc::new(capabilities));
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -581,9 +610,23 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
                     current.calls.push(call);
                 }
+            } else if let Some(val) = bullet.strip_prefix("prompt:") {
+                let val = val.trim();
+                if !val.is_empty() {
+                    current.gate_prompt = Some(val.to_string());
+                }
             } else if let Some(val) = bullet.strip_prefix("policy:") {
                 let val = val.trim();
                 current.policy = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
+            } else if let Some(val) = bullet.strip_prefix("edit:") {
+                // Editable-field opt-in for a checkpoint gate: the named field of
+                // the piped value an approver may amend before the run resumes.
+                let val = val.trim();
+                current.edit = if val.is_empty() {
                     None
                 } else {
                     Some(val.to_string())
@@ -631,6 +674,8 @@ struct StepParseState {
     calls: Vec<PlannedToolCall>,
     agent: Option<String>,
     policy: Option<String>,
+    gate_prompt: Option<String>,
+    edit: Option<String>,
 }
 
 impl StepParseState {
@@ -663,6 +708,8 @@ impl StepParseState {
             pos: None,
             agent: self.agent.take(),
             policy: self.policy.take(),
+            gate_prompt: self.gate_prompt.take(),
+            edit: self.edit.take(),
         });
         *self = Self::default();
     }

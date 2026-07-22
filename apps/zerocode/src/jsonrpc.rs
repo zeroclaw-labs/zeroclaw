@@ -1,7 +1,18 @@
-//! JSON-RPC 2.0 transport — copied from `zeroclaw-api::jsonrpc` so
-//! `apps/zerocode` does not depend on that crate. Wire shape is the
-//! contract; if the daemon evolves its envelope, this file evolves
-//! to match.
+//! JSON-RPC 2.0 transport.
+//!
+//! `apps/zerocode` keeps local ownership of its transport plumbing.
+//! Wire shape is the contract; if the daemon evolves its envelope, this file
+//! evolves to match.
+//!
+//! `RpcOutbound` carries the writer channel + a pending-request map
+//! so concurrent notifications and outbound calls cannot interleave
+//! bytes. The TUI uses it both for client-issued requests
+//! (`session/turn`, `quickstart/apply`, …) and for routing
+//! daemon-originated notifications.
+//!
+//! Constants in `error_codes` cover the full set the daemon may emit
+//! — some are only consumed by error-routing branches that may not
+//! exercise every code today.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};

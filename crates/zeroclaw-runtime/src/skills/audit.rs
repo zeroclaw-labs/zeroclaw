@@ -110,7 +110,13 @@ fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
     while let Some(current) = stack.pop() {
         out.push(current.clone());
 
-        if !current.is_dir() {
+        let metadata = fs::symlink_metadata(&current).with_context(|| {
+            format!(
+                "failed to read metadata for {}",
+                current.display().to_string()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
 
@@ -536,6 +542,35 @@ mod tests {
 
         let report = audit_skill_directory(&skill_dir).unwrap();
         assert!(report.is_clean(), "{:#?}", report.findings);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_does_not_descend_into_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skill");
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Skill\n").unwrap();
+        std::fs::write(
+            outside_dir.join("outside.md"),
+            "# Outside\n[local](file:///etc/passwd)\n",
+        )
+        .unwrap();
+        symlink(&outside_dir, skill_dir.join("escape")).unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+
+        assert_eq!(report.files_scanned, 3, "{:#?}", report.findings);
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert!(
+            report.findings[0].contains("escape: symlinks are not allowed"),
+            "{:#?}",
+            report.findings
+        );
     }
 
     #[test]
