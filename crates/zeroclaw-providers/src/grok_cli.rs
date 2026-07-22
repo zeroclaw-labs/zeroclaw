@@ -3,6 +3,8 @@
 //! Every inference request uses the documented `grok agent stdio` ACP
 //! transport. The assembled prompt is sent as JSON-RPC on child stdin; it is
 //! never placed in argv or a temporary file.
+//! Authentication comes only from the Grok CLI login cache; run `grok login`
+//! before selecting this provider.
 //!
 //! # Usage
 //!
@@ -23,8 +25,8 @@
 //! path. The provider therefore:
 //!
 //! - requires an explicit absolute working directory;
-//! - clears the inherited environment and forwards only runtime/auth entries
-//!   plus explicit per-alias `env_passthrough` names;
+//! - clears the inherited environment and forwards only process-runtime entries
+//!   plus explicit per-alias tool `env_passthrough` names;
 //! - defaults to `--sandbox strict`, `--permission-mode dontAsk`, and an empty
 //!   built-in tool set;
 //! - cancels every ACP permission request rather than approving it;
@@ -158,8 +160,8 @@ const VALUE_TAKING_EXTRA_ARG_FLAGS: &[&str] = &[
     "--tools",
 ];
 
-/// Environment variable names required for process startup, local Grok auth,
-/// locale, and explicitly configured network proxies.
+/// Environment variable names required for process startup, locale, and
+/// explicitly configured network proxies.
 const ENV_ALLOWLIST_EXACT: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -188,7 +190,6 @@ const ENV_ALLOWLIST_EXACT: &[&str] = &[
     "XDG_CACHE_HOME",
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
-    "XAI_API_KEY",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
@@ -451,6 +452,11 @@ impl GrokCliModelProvider {
             if !is_valid_env_var_name(name) {
                 anyhow::bail!(
                     "grok_cli env_passthrough entry `{name}` is invalid; expected [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+            if is_provider_owned_env_var(name) {
+                anyhow::bail!(
+                    "grok_cli env_passthrough entry `{name}` is provider-owned; use `grok login` for authentication and `extra_args` for Grok policy"
                 );
             }
             if !normalized.iter().any(|existing| existing == name) {
@@ -762,11 +768,13 @@ fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
+fn is_provider_owned_env_var(name: &str) -> bool {
+    name.starts_with("XAI_") || name.starts_with("GROK_")
+}
+
 fn env_var_allowed(key: &str, env_passthrough: &[String]) -> bool {
     ENV_ALLOWLIST_EXACT.contains(&key)
         || key.starts_with("LC_")
-        || key.starts_with("GROK_")
-        || key.starts_with("XAI_")
         || env_passthrough.iter().any(|name| name == key)
 }
 
@@ -895,6 +903,17 @@ mod tests {
             .env_passthrough(vec!["AWS-SECRET".to_string()])
             .build();
         assert!(invalid.is_err(), "invalid environment name must fail");
+
+        for reserved in ["XAI_API_KEY", "XAI_AUTH_TOKEN", "GROK_SANDBOX"] {
+            let result = GrokCliModelProvider::builder("test")
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .env_passthrough(vec![reserved.to_string()])
+                .build();
+            assert!(
+                result.is_err(),
+                "provider-owned environment variable must fail: {reserved}"
+            );
+        }
     }
 
     #[test]
@@ -1018,9 +1037,10 @@ mod tests {
     fn env_allowlist_blocks_unrelated_secrets() {
         let none = &[];
         assert!(env_var_allowed("PATH", none));
-        assert!(env_var_allowed("XAI_API_KEY", none));
-        assert!(env_var_allowed("GROK_SANDBOX", none));
         assert!(env_var_allowed("LC_ALL", none));
+        assert!(!env_var_allowed("XAI_API_KEY", none));
+        assert!(!env_var_allowed("XAI_AUTH_TOKEN", none));
+        assert!(!env_var_allowed("GROK_SANDBOX", none));
         assert!(!env_var_allowed("ZEROCLAW_SLACK_BOT_TOKEN", none));
         assert!(!env_var_allowed("AWS_SECRET_ACCESS_KEY", none));
         assert!(!env_var_allowed("OPENAI_API_KEY", none));
@@ -1050,6 +1070,8 @@ mod tests {
                     "ZEROCLAW_SLACK_BOT_TOKEN".to_string(),
                     "test-token".to_string(),
                 ),
+                ("XAI_API_KEY".to_string(), "test-xai-key".to_string()),
+                ("GROK_SANDBOX".to_string(), "off".to_string()),
             ],
         );
         let copied: Vec<_> = command
@@ -1077,6 +1099,8 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name == "ZEROCLAW_SLACK_BOT_TOKEN")
         );
+        assert!(!copied.iter().any(|(name, _)| name == "XAI_API_KEY"));
+        assert!(!copied.iter().any(|(name, _)| name == "GROK_SANDBOX"));
     }
 
     #[tokio::test]

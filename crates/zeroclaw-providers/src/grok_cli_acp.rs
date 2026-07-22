@@ -110,7 +110,7 @@ where
     )
     .await?;
 
-    let method_id = select_auth_method_id(&initialize, std::env::var_os("XAI_API_KEY").is_some())?;
+    let method_id = select_auth_method_id(&initialize)?;
     rpc_request(
         stdin,
         &mut reader,
@@ -390,10 +390,7 @@ fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result
     Ok(())
 }
 
-fn select_auth_method_id(
-    initialize: &Value,
-    xai_api_key_available: bool,
-) -> Result<String, AcpError> {
+fn select_auth_method_id(initialize: &Value) -> Result<String, AcpError> {
     let ids: Vec<&str> = initialize
         .get("authMethods")
         .or_else(|| initialize.get("auth_methods"))
@@ -408,9 +405,6 @@ fn select_auth_method_id(
         })
         .collect();
 
-    if xai_api_key_available && ids.contains(&"xai.api_key") {
-        return Ok("xai.api_key".to_string());
-    }
     for preferred in ["cached_token", "xai.oauth"] {
         if ids.contains(&preferred) {
             return Ok(preferred.to_string());
@@ -482,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_selection_uses_api_key_only_when_available() {
+    fn auth_selection_uses_only_cli_login_methods() {
         let initialize = json!({
             "authMethods": [
                 { "id": "xai.api_key" },
@@ -490,13 +484,17 @@ mod tests {
             ]
         });
         assert_eq!(
-            select_auth_method_id(&initialize, true).expect("API-key auth"),
-            "xai.api_key"
-        );
-        assert_eq!(
-            select_auth_method_id(&initialize, false).expect("cached auth"),
+            select_auth_method_id(&initialize).expect("cached auth"),
             "cached_token"
         );
+
+        let api_key_only = json!({
+            "authMethods": [{ "id": "xai.api_key" }]
+        });
+        assert!(matches!(
+            select_auth_method_id(&api_key_only),
+            Err(AcpError::NoAuthenticationMethod)
+        ));
     }
 
     #[tokio::test]

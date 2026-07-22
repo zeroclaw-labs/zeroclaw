@@ -39,22 +39,27 @@ Shells out to the `gemini` CLI; uses the CLI's existing auth.
 ### Grok Build CLI: slot `grok_cli`
 
 Shells out to the Grok Build CLI through the documented **`grok agent stdio`**
-ACP surface and uses the CLI's own login / `XAI_API_KEY`. This is the only
-transport: initialize → authenticate → session/new → session/prompt over
-newline-delimited JSON-RPC. Small and large prompts both travel on stdin and
-never appear in argv or a prompt file.
+ACP surface and uses the CLI's login cache. Run `grok login` before selecting
+this provider. The typed alias `api_key` and ambient `XAI_API_KEY` are not used,
+so authentication has one owner. This is the only transport: initialize →
+authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
+Small and large prompts both travel on stdin and never appear in argv or a
+prompt file.
 
 An existing absolute `working_directory` is required. It is canonicalized and
 used for both the child cwd and ACP session boundary, so the provider never
 falls back to the daemon cwd. Optional `binary_path` selects a non-`PATH`
 binary. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 
-The child environment is cleared before spawn. Runtime/auth variables on the
-built-in allowlist remain available; all other names are blocked unless that
-provider alias lists them in `env_passthrough`. Values are read from the
-ZeroClaw process environment at spawn time and are not stored in provider
-config. The default list is empty. Keep it narrow because every listed secret
-is exposed to Grok and any tools enabled for that alias.
+The child environment is cleared before spawn. Process-runtime, locale, proxy,
+and CA variables on the built-in allowlist remain available; all other names
+are blocked unless that provider alias lists them in `env_passthrough`. This
+field is for environment variables required by explicitly enabled Grok tools,
+such as cloud CLI credentials. Values are read from the ZeroClaw process
+environment at spawn time and are not stored in provider config. The default
+list is empty. Keep it narrow because every listed secret is exposed to Grok
+and any tools enabled for that alias. Provider-owned `XAI_*` and `GROK_*` names
+are rejected; use `grok login` for authentication and `extra_args` for policy.
 
 The default argv adds `--no-auto-update`, `--sandbox strict`,
 `--permission-mode dontAsk`, and `--tools ""`. The ACP client also cancels
