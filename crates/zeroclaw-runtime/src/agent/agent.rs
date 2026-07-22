@@ -113,7 +113,11 @@ pub(crate) enum RoutedApproval {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
     },
-    /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
+    /// Explicit `InheritOriginator` — defer to the caller's trusted fallback.
+    ///
+    /// Ordinary turns use the originating-channel fan-out. Goal turns instead
+    /// use their durable continuation binding, so they never recover authority
+    /// from mutable inbound routing.
     Fallthrough,
 }
 
@@ -125,9 +129,8 @@ pub(crate) async fn resolve_routed_approval(
 ) -> RoutedApproval {
     let approver: Option<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = handles
         .read()
-        .iter()
-        .find(|(name, _)| name.as_str() == route.approver_channel)
-        .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+        .get(route.approver_channel.as_str())
+        .map(|channel| (route.approver_channel.clone(), Arc::clone(channel)));
 
     let reason: &str = if let Some((channel_name, channel)) = approver {
         let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));

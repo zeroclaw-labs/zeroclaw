@@ -151,28 +151,10 @@ impl Channel for AskUserApprovalBridge {
         if matches!(goal_binding, GoalApprovalBindingState::DenyOnly) {
             return Ok(None);
         }
-        if let GoalApprovalBindingState::Bound(binding) = &goal_binding {
-            if binding.principal.trim().is_empty() {
-                return Ok(None);
-            }
-            let handle = self
-                .handles
-                .read()
-                .iter()
-                .find(|(name, _)| name.as_str() == binding.channel.as_str())
-                .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
-            let Some((name, channel)) = handle else {
-                return Ok(None);
-            };
-            return channel
-                .request_approval_for_principal(&binding.recipient, &binding.principal, request)
-                .await
-                .map(|response| {
-                    response.map(|response| AttributedApprovalResponse {
-                        response,
-                        decided_by: Some(name),
-                    })
-                });
+        if let GoalApprovalBindingState::Bound(binding) = &goal_binding
+            && binding.principal.trim().is_empty()
+        {
+            return Ok(None);
         }
 
         // ── Cross-channel HITL route ───────────────────────────────────────
@@ -180,7 +162,14 @@ impl Channel for AskUserApprovalBridge {
         // approver channel rather than the originating fan-out. The approver is
         // asked alone, bounded by `timeout_secs`; any non-decisive outcome is
         // resolved by `on_no_approver` — fail-closed `Deny` by default, or fall
-        // through to the originating fan-out on explicit `InheritOriginator`.
+        // through to the caller's trusted fallback on explicit
+        // `InheritOriginator`.
+        //
+        // Goal records bind the task to a durable origin so that fallback can
+        // prove its identity. They do not replace the configured approval
+        // policy: a configured distinct approver still decides first. This
+        // keeps durable task attribution separate from operator routing while
+        // an unavailable route remains fail-closed by its policy.
         if let Some(route) = &self.route {
             match resolve_routed_approval(&self.handles, route, recipient, request).await {
                 RoutedApproval::Decided { response, decider } => {
@@ -193,6 +182,26 @@ impl Channel for AskUserApprovalBridge {
                     // explicit InheritOriginator → originating fan-out below
                 }
             }
+        }
+
+        if let GoalApprovalBindingState::Bound(binding) = &goal_binding {
+            let handle = self
+                .handles
+                .read()
+                .get(binding.channel.as_str())
+                .map(|channel| (binding.channel.clone(), Arc::clone(channel)));
+            let Some((name, channel)) = handle else {
+                return Ok(None);
+            };
+            return channel
+                .request_approval_for_principal(&binding.recipient, &binding.principal, request)
+                .await
+                .map(|response| {
+                    response.map(|response| AttributedApprovalResponse {
+                        response,
+                        decided_by: Some(name),
+                    })
+                });
         }
 
         let channels: Vec<(String, Arc<dyn Channel>)> = self
@@ -245,6 +254,7 @@ mod tests {
     struct RecipientScopedApprover {
         name: String,
         approves_recipient: String,
+        reject_principal_delivery: bool,
     }
 
     impl ::zeroclaw_api::attribution::Attributable for RecipientScopedApprover {
@@ -289,6 +299,9 @@ mod tests {
             principal: &str,
             request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            if self.reject_principal_delivery {
+                anyhow::bail!("durable fallback must not be queried")
+            }
             if principal.is_empty() {
                 return Ok(None);
             }
@@ -300,6 +313,15 @@ mod tests {
         Arc::new(RecipientScopedApprover {
             name: name.to_string(),
             approves_recipient: approves_recipient.to_string(),
+            reject_principal_delivery: false,
+        })
+    }
+
+    fn failing_durable_approver(name: &str, approves_recipient: &str) -> Arc<dyn Channel> {
+        Arc::new(RecipientScopedApprover {
+            name: name.to_string(),
+            approves_recipient: approves_recipient.to_string(),
+            reject_principal_delivery: true,
         })
     }
 
@@ -358,6 +380,95 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(decided.decided_by.as_deref(), Some("durable"));
+    }
+
+    #[tokio::test]
+    async fn goal_binding_honors_configured_distinct_approver_before_durable_fallback() {
+        use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![
+                approver("configured-approver", "inbound-recipient"),
+                failing_durable_approver("durable", "durable-recipient"),
+            ]),
+            Some(ApprovalRoute {
+                approver_channel: "configured-approver".into(),
+                on_no_approver: OnNoApprover::Deny,
+                timeout_secs: 1,
+            }),
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "durable".into(),
+            recipient: "durable-recipient".into(),
+            principal: "principal-a".into(),
+        }));
+
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Approve);
+        assert_eq!(decided.decided_by.as_deref(), Some("configured-approver"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_configured_goal_approver_denies_without_durable_fallback() {
+        use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![failing_durable_approver(
+                "durable",
+                "durable-recipient",
+            )]),
+            Some(ApprovalRoute {
+                approver_channel: "unregistered-approver".into(),
+                on_no_approver: OnNoApprover::Deny,
+                timeout_secs: 1,
+            }),
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "durable".into(),
+            recipient: "durable-recipient".into(),
+            principal: "principal-a".into(),
+        }));
+
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+        assert!(decided.decided_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_binding_uses_durable_fallback_only_when_route_explicitly_inherits() {
+        use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![approver("durable", "durable-recipient")]),
+            Some(ApprovalRoute {
+                approver_channel: "unregistered-approver".into(),
+                on_no_approver: OnNoApprover::InheritOriginator,
+                timeout_secs: 1,
+            }),
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "durable".into(),
+            recipient: "durable-recipient".into(),
+            principal: "principal-a".into(),
+        }));
+
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+
         assert_eq!(decided.decided_by.as_deref(), Some("durable"));
     }
 
