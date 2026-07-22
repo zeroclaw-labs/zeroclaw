@@ -5,6 +5,8 @@ pub mod acp_session_store;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
+#[cfg(feature = "backend-postgres")]
+pub mod session_postgres;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
@@ -88,6 +90,17 @@ pub fn make_session_backend(
         // not need to change.
         #[cfg(not(feature = "backend-postgres"))]
         "postgres" => Err(uncompiled_backend_error("postgres")),
+        #[cfg(feature = "backend-postgres")]
+        "postgres" => {
+            // The blocking PostgreSQL client is pooled with r2d2. The
+            // connection URL and pool size resolve from the canonical
+            // dotted-path channel configuration environment overrides.
+            let backend = session_postgres::PostgresSessionBackend::new(
+                workspace_dir,
+                session_postgres::read_pool_size(),
+            )?;
+            Ok(Arc::new(backend))
+        }
         #[cfg(not(feature = "backend-mysql"))]
         "mysql" => Err(uncompiled_backend_error("mysql")),
         #[cfg(feature = "backend-mysql")]
@@ -320,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "backend-postgres"))]
     fn make_session_backend_postgres_fail_fast_when_feature_disabled() {
         assert_fail_fast_uncompiled("postgres");
     }
