@@ -1,9 +1,10 @@
 //! setup.bat renderer. The hand-written imperative glue (toolchain bootstrap,
 //! PATH, copy, quickstart, prebuilt download) stays in setup.bat; only the
 //! drift-prone data lives in sentinel-delimited regions this renderer owns.
-//! setup.bat has two such zones - the build-mode menu/routing and the per-mode
+//! setup.bat has three such zones: build-mode routing, per-mode presets, and
+//! post-install guidance.
 
-use super::spec::{self, Selection};
+use super::spec::{self, QUICKSTART_COMMAND, Selection, ZEROCODE_APP};
 use std::path::Path;
 
 /// A named generated zone, delimited by id-tagged sentinels so multiple regions
@@ -17,6 +18,7 @@ fn end(id: &str) -> String {
 
 const ZONE_MENU: &str = "menu";
 const ZONE_PRESETS: &str = "presets";
+const ZONE_POST_INSTALL: &str = "post-install";
 
 /// Render the menu/routing zone body: non-interactive MODE routing plus the
 /// interactive numbered menu, walked from `Selection::menu()`. Option 1 is the
@@ -87,17 +89,44 @@ fn render_presets(manifest_dir: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// setup.bat is its own interactive installer surface. Its PATH and branch
+/// behavior intentionally do not inherit the manual PowerShell route contract;
+/// only shared command and app identities come from the canonical spec.
+fn render_post_install() -> String {
+    format!(
+        "echo   Next steps:\n\
+if /I \"%INSTALL_ROUTE%\"==\"prebuilt\" (\n\
+echo     1. PATH is ready in this terminal and future terminals\n\
+echo     2. Run: {QUICKSTART_COMMAND}\n\
+echo     3. Configure a model provider during Quickstart\n\
+echo     4. Launch the TUI when installed: {ZEROCODE_APP}\n\
+) else (\n\
+echo     1. PATH is ready in this terminal and future terminals\n\
+if /I \"%MODE%\"==\"minimal\" (\n\
+echo     2. Minimal build excludes quickstart ^({QUICKSTART_COMMAND} is unavailable^)\n\
+echo     3. Configure model providers with the supported config surface\n\
+echo     4. Use reduced CLI path: zeroclaw agent --message \"Hello\"\n\
+) else (\n\
+echo     2. Run: {QUICKSTART_COMMAND}\n\
+echo     3. Configure a model provider during Quickstart\n\
+echo     4. Launch the TUI when installed: {ZEROCODE_APP}\n\
+)\n\
+)"
+    )
+}
+
 /// The recommended default selection's id - what the prebuilt-fallback path
 /// jumps to. Derived, not hardcoded: `Dist` is the recommended build.
 pub fn fallback_build_id() -> &'static str {
     Selection::Dist.id()
 }
 
-/// Splice both generated zones into the current setup.bat, leaving all
-/// hand-written glue untouched. Errors if either zone's sentinels are missing.
+/// Splice all three generated zones into the current setup.bat, leaving all
+/// hand-written glue untouched. Errors if any zone's sentinels are missing.
 pub fn render_file(manifest_dir: &Path, current: &str) -> anyhow::Result<String> {
     let with_menu = splice(current, ZONE_MENU, &render_menu(manifest_dir))?;
-    splice(&with_menu, ZONE_PRESETS, &render_presets(manifest_dir)?)
+    let with_presets = splice(&with_menu, ZONE_PRESETS, &render_presets(manifest_dir)?)?;
+    splice(&with_presets, ZONE_POST_INSTALL, &render_post_install())
 }
 
 fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
@@ -193,5 +222,23 @@ mod tests {
     #[test]
     fn fallback_is_recommended_dist() {
         assert_eq!(fallback_build_id(), "dist");
+    }
+
+    #[test]
+    fn windows_post_install_preserves_setup_bat_runtime_contract() {
+        let post_install = render_post_install();
+        assert!(post_install.contains("PATH is ready in this terminal and future terminals"));
+        assert!(!post_install.contains("Restart your terminal"));
+        assert!(post_install.contains(&format!("Run: {QUICKSTART_COMMAND}")));
+        assert!(post_install.contains(&format!("installed: {ZEROCODE_APP}")));
+    }
+
+    #[test]
+    fn real_setup_bat_contains_post_install_zone() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        let once = render_file(&root(), &current).unwrap();
+        let twice = render_file(&root(), &once).unwrap();
+        assert!(once.contains("generated:post-install"));
+        assert_eq!(once, twice, "render must be idempotent");
     }
 }

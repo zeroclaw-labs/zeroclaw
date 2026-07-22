@@ -24,13 +24,16 @@ die() {
 }
 bold() { printf "${BOLD}%s${RESET}" "$*"; }
 
+  # >>> generated:route-contract by `cargo generate installers` - do not edit <<<
 TUI_BIN_NAME="zerocode"
-
-# Apps installed by default (the rest are discovered and listed but off
-# until selected via --apps or the interactive picker). Intentionally a
-# fixed list: zeroclaw-desktop needs the Tauri toolchain + webview deps,
-# so it ships off-by-default.
 DEFAULT_APPS="zerocode"
+PIPED_INSTALL_MODE="prebuilt"
+QUICKSTART_COMMAND="zeroclaw quickstart"
+QUICKSTART_SUBCOMMAND="quickstart"
+GUIDED_INSTALL_MODE="choice"
+GUIDED_QUICKSTART_MODE="offer"
+UNIX_PATH_RELOAD="true"
+  # >>> end generated:route-contract <<<
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
 
@@ -878,7 +881,7 @@ fi
 if [ "$INSTALL_MODE" = "" ]; then
   triple=$(detect_target_triple)
   if [ -n "$triple" ]; then
-    if [ -t 0 ]; then
+    if [ "$GUIDED_INSTALL_MODE" = "choice" ] && [ -t 0 ]; then
       echo
       printf "  %s\n" "$(bold "How would you like to install ZeroClaw?")"
       printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
@@ -891,7 +894,7 @@ if [ "$INSTALL_MODE" = "" ]; then
       esac
     else
       # Non-interactive (curl | bash): default to pre-built silently
-      INSTALL_MODE="prebuilt"
+      INSTALL_MODE="$PIPED_INSTALL_MODE"
     fi
   else
     INSTALL_MODE="source"
@@ -1319,7 +1322,9 @@ elif [ "$MODIFY_PATH" = true ] && [ "$PREFIX" = "$HOME" ]; then
     printf '# <<< zeroclaw <<<\n'
   } >>"$PROFILE" 2>/dev/null; then
     info "Added $CARGO_HOME/bin to PATH in $PROFILE"
-    printf "    Reload your shell or run: source %s\n" "$PROFILE"
+    if [ "$UNIX_PATH_RELOAD" = true ]; then
+      printf "    Reload your shell or run: source %s\n" "$PROFILE"
+    fi
   else
     warn "Could not write to $PROFILE — add this line manually:"
     print_path_help
@@ -1336,15 +1341,15 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
   # ZeroClaw — re-installs should not re-prompt.
   if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
-    info "Run 'zeroclaw quickstart' to reconfigure."
-  elif [ -t 0 ]; then
+    info "Run '$QUICKSTART_COMMAND' to reconfigure."
+  elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ]; then
     # 3-way setup choice. Bare Enter accepts the [1] CLI quickstart default;
     # option [2] foregrounds the daemon so the operator can finish in the
     # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
     # Non-TTY runs fall through to the silent skip in the else branch.
     echo
     printf "%s\n" "$(bold "ZeroClaw installed. How would you like to complete setup?")"
-    printf "  [1] CLI quickstart  (zeroclaw quickstart)\n"
+    printf "  [1] CLI quickstart  ($QUICKSTART_COMMAND)\n"
     printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
     printf "  [3] Skip for now\n"
     printf "  Choice [1-3, default 1]: "
@@ -1352,7 +1357,7 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
     case "${quickstart_choice:-1}" in
     1 | "")
       echo
-      "$BIN" quickstart || warn "Quickstart exited with an error — run 'zeroclaw quickstart' manually"
+      "$BIN" "$QUICKSTART_SUBCOMMAND" || warn "Quickstart exited with an error — run '$QUICKSTART_COMMAND' manually"
       ;;
     2)
       echo
@@ -1362,14 +1367,14 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
       "$BIN" daemon || warn "Daemon exited with an error — run 'zeroclaw daemon' manually"
       ;;
     3)
-      info "Skipped setup. Run 'zeroclaw quickstart' (CLI) or 'zeroclaw daemon' (browser) when ready."
+      info "Skipped setup. Run '$QUICKSTART_COMMAND' (CLI) or 'zeroclaw daemon' (browser) when ready."
       ;;
     *)
-      warn "Unknown choice '$quickstart_choice' — skipping. Run 'zeroclaw quickstart' to configure."
+      warn "Unknown choice '$quickstart_choice' — skipping. Run '$QUICKSTART_COMMAND' to configure."
       ;;
     esac
   else
-    info "Non-interactive — skipping setup prompt. Run 'zeroclaw quickstart' to configure."
+    info "Non-interactive — skipping setup prompt. Run '$QUICKSTART_COMMAND' to configure."
   fi
 fi
 

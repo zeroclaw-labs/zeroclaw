@@ -33,9 +33,10 @@ if ($current -ne $ver) {
     Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
 }
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$environment = [Environment]
+$userPath = $environment::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $dst) {
-    [Environment]::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+    $environment::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
 }
 if (($env:Path -split ';') -notcontains $dst) {
     $env:Path = "$dst;$env:Path"
@@ -44,7 +45,9 @@ if (($env:Path -split ';') -notcontains $dst) {
 & $exe quickstart
 ```
 
-The zip ships a self-contained binary, with no Rust toolchain, no Visual Studio Build Tools needed.
+For the stable behavior shared by the Windows prebuilt and source routes, see the [canonical installation paths](../getting-started/quickstart.md#install). Release availability and the PowerShell download block remain documented here because they depend on live GitHub assets.
+
+The prebuilt zip is self-contained; Visual Studio Build Tools are required only when building from source.
 
 After install, verify:
 

@@ -6,6 +6,7 @@
 pub mod container;
 pub mod container_base;
 pub mod docker_tags;
+pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
@@ -40,6 +41,11 @@ fn registry() -> Vec<Surface> {
             name: "setup-bat",
             file: "setup.bat",
             render: |root, cur| setup_bat::render_file(root, cur),
+        },
+        Surface {
+            name: "install-docs",
+            file: "docs/book/src/_snippets/install.md",
+            render: docs::render_file,
         },
         Surface {
             name: "containerfile",

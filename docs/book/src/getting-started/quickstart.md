@@ -10,8 +10,6 @@ where you are.
 
 {{#include ../_snippets/install.md}}
 
-Every installation includes `zeroclaw`. A release archive or selected source apps may also include the `zerocode` terminal interface. For a source install, pass `--apps zerocode` when it is not already selected. Without `zerocode`, use the CLI or web Quickstart paths below.
-
 ## The steps
 
 > **Important:** if any of these terms are unfamiliar, read
