@@ -57,9 +57,11 @@ impl WebhookIdempotency {
 /// verification handshakes that echo a challenge in the HTTP response — Slack
 /// `url_verification` (POST) and WhatsApp/wecom `hub.challenge` (GET). A
 /// `parse-webhook` that returns a single message whose `channel` equals this
-/// sentinel is answered with that message's `content` as the response body; the
-/// message is not enqueued. This keeps the challenge feature additive — no
-/// `channel`-interface signature change, so existing plugins need no rebuild.
+/// sentinel is answered with that message's `content` as the response body when
+/// it is no larger than [`MAX_WEBHOOK_RESPONSE_BODY_BYTES`]; an oversized body
+/// is rejected. The message is not enqueued. This keeps the challenge feature
+/// additive — no `channel`-interface signature change, so existing plugins need
+/// no rebuild.
 pub const WEBHOOK_REPLY_CHANNEL: &str = "__webhook_reply__";
 
 /// Maximum UTF-8 byte length of a plugin-supplied webhook response body.
@@ -102,8 +104,10 @@ pub struct RawWebhook {
 pub enum WebhookOutcome {
     /// 200 with an empty body (events accepted / enqueued — the default).
     Ack,
-    /// 200 with this exact body: a verification-handshake echo (Slack
-    /// `url_verification` challenge, WhatsApp `hub.challenge`).
+    /// 200 with this exact body when its UTF-8 byte length is no larger than
+    /// [`MAX_WEBHOOK_RESPONSE_BODY_BYTES`]: a verification-handshake echo
+    /// (Slack `url_verification` challenge, WhatsApp `hub.challenge`).
+    /// Oversized values are rejected with a fixed public 502 response.
     Body(String),
 }
 

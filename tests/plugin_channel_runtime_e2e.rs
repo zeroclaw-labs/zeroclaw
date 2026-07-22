@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use zeroclaw_api::channel::SendMessage;
-use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook, WebhookCancellation};
+use zeroclaw_api::webhook::{
+    PluginWebhookRegistry, RawWebhook, WebhookCancellation, WebhookOutcome,
+};
 use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
 use zeroclaw_config::providers::ChannelRef;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config, PluginChannelConfig, PluginEntryConfig};
@@ -153,6 +155,8 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
         .expect("runtime registers the guest-declared webhook path");
     let (reply, response) = tokio::sync::oneshot::channel();
     sink.send(RawWebhook {
+        method: "POST".to_string(),
+        query: String::new(),
         headers: vec![(
             "x-fixture-secret".to_string(),
             "token-operations".to_string(),
@@ -164,7 +168,7 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     })
     .await
     .expect("registered runtime sink accepts a webhook");
-    assert!(matches!(response.await, Ok(Ok(()))));
+    assert!(matches!(response.await, Ok(Ok(WebhookOutcome::Ack))));
     let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("runtime webhook reaches the shared listener")

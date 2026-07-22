@@ -415,15 +415,21 @@ clone to the listener task so enqueued traffic is visible to the plugin's drain.
 
 A channel that includes `webhook-ingress` in `channel-capabilities` may expose
 one single-segment path with `webhook-path`. The daemon registers that logical
-instance at `POST /plugin/<path>`. Empty paths, `.` and `..`, embedded `/`, and
-ambiguous claims are rejected by the host; guest metadata cannot choose a
-different channel alias or route owner.
+instance at `GET /plugin/<path>` and `POST /plugin/<path>`. Empty paths, `.` and
+`..`, embedded `/`, and ambiguous claims are rejected by the host; guest
+metadata cannot choose a different channel alias or route owner.
 
 The gateway passes lower-cased raw headers and the bounded raw body to
-`parse-webhook`. The guest must authenticate the platform request before
+`parse-webhook`. Before dispatch, the host removes caller-supplied copies of the
+reserved `x-webhook-method` and `x-webhook-query` headers and regenerates them
+from the actual request. The guest must authenticate the platform request before
 returning messages, normally by reading the current public config and scoped
 secret with `config.get` and `secrets.get` in that call. It returns either a
 list of inbound messages or a typed `unauthorized` / `bad-request` rejection.
+For a provider verification handshake, one message with channel
+`__webhook_reply__` returns its content as the HTTP 200 body without enqueueing
+an agent message. The content is limited to 4 KiB (4096 UTF-8 bytes); an
+oversized response produces a fixed 502 response and no delivery.
 The host replaces guest-supplied channel identity with the admitted `plugin`
 endpoint, checks each sender against the current `peer_groups` policy for that
 alias, and only then applies gateway idempotency to non-empty message IDs.

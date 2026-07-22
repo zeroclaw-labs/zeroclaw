@@ -337,9 +337,11 @@ interface channel {
     /// challenge in the HTTP *response* body (Slack `url_verification` POST,
     /// WhatsApp/wecom `hub.challenge` GET), return exactly one `inbound-message`
     /// whose `channel` is the reserved value `__webhook_reply__` and whose
-    /// `content` is the body to send; the host replies 200 with that body and
-    /// enqueues nothing. This keeps the response-body path additive — the
-    /// signature here is unchanged, so existing plugins need no rebuild.
+    /// `content` is the body to send. The content may contain at most 4 KiB
+    /// (4096 UTF-8 bytes). The host replies 200 with a body within that limit and
+    /// enqueues nothing; for an oversized body, the gateway returns a fixed 502
+    /// response and enqueues nothing. This keeps the response-body path additive
+    /// — the signature here is unchanged, so existing plugins need no rebuild.
     /// Gated by `webhook-ingress`; stub: return
     /// `err(bad-request("unsupported"))`.
     parse-webhook: func(
