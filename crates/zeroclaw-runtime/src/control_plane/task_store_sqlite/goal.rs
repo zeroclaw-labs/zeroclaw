@@ -593,6 +593,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
             .context("conditionally complete running goal task")?;
         Ok(updated == 1)
     }
+
+    async fn complete_running_goal_task_if_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+        output: String,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
+        let token_limit = token_limit.map(i64::try_from).transpose()?;
+        let updated = conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', output = COALESCE(?4, output), finished_at = ?5
+                 WHERE id = ?1 AND kind = 'goal' AND status = 'running'
+                   AND EXISTS (SELECT 1 FROM goal_tasks
+                       WHERE task_id = ?1
+                         AND effective_token_limit IS ?2
+                         AND effective_cost_limit_usd IS ?3)",
+                params![task_id, token_limit, cost_limit_usd, output, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("conditionally complete goal task with verified limits")?;
+        Ok(updated == 1)
+    }
     async fn resume_paused_goal_task(
         &self,
         task_id: &str,
@@ -1560,5 +1584,45 @@ mod tests {
             )
             .unwrap();
         assert!(output.is_none());
+    }
+
+    #[tokio::test]
+    async fn completion_with_verified_limits_loses_to_a_concurrent_budget_update() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-limit-cas", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-limit-cas".into(),
+                objective: "honor current policy".into(),
+                effective_token_limit: Some(100),
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        s.update_goal_limits("goal-limit-cas", Some(1), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !s.complete_running_goal_task_if_limits(
+                "goal-limit-cas",
+                Some(100),
+                None,
+                "stale completion".into(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            s.get("goal-limit-cas").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
     }
 }

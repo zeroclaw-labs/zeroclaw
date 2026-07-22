@@ -458,9 +458,11 @@ pub async fn record_tool_loop_cost_usage(
 /// Record optional provider usage while enforcing goal-owned accounting.
 ///
 /// Provider APIs legitimately omit usage for ordinary calls, so those callers
-/// keep best-effort metering. A trusted goal attribution changes that contract:
-/// the same successful response must return an error before it can advance the
-/// loop if the canonical budget ledger cannot be charged.
+/// keep best-effort metering. Goal calls still persist an exact-task observation
+/// when usage is absent; an unlimited goal can continue with that uncertainty,
+/// while a bounded goal fails closed because it cannot derive remaining budget.
+/// A missing ledger is different: no goal can truthfully retain attribution, so
+/// the provider boundary returns an accounting error before the loop advances.
 pub(crate) async fn record_tool_loop_cost_usage_optional(
     model_provider_name: &str,
     model: &str,
