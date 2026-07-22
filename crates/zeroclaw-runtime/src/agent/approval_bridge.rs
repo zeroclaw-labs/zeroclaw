@@ -192,7 +192,8 @@ impl Channel for AskUserApprovalBridge {
                     }));
                 }
                 RoutedApproval::Fallthrough => {
-                    // explicit InheritOriginator → originating fan-out below
+                    // Goal turns use their durable binding below; ordinary
+                    // turns retain the originating-channel fan-out.
                 }
             }
         }
