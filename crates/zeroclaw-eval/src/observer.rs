@@ -10,6 +10,7 @@ pub struct RecordingObserver {
     tool_calls: Mutex<Vec<(String, bool)>>,
     input_tokens: Mutex<u64>,
     output_tokens: Mutex<u64>,
+    llm_calls: Mutex<u32>,
 }
 
 impl RecordingObserver {
@@ -39,6 +40,11 @@ impl RecordingObserver {
             *self.output_tokens.lock().unwrap(),
         )
     }
+
+    /// Number of LLM responses observed during the run.
+    pub fn llm_calls(&self) -> u32 {
+        *self.llm_calls.lock().unwrap()
+    }
 }
 
 impl Observer for RecordingObserver {
@@ -55,6 +61,7 @@ impl Observer for RecordingObserver {
                 output_tokens,
                 ..
             } => {
+                *self.llm_calls.lock().unwrap() += 1;
                 if let Some(i) = input_tokens {
                     *self.input_tokens.lock().unwrap() += i;
                 }
@@ -148,6 +155,19 @@ mod tests {
         obs.record_event(&llm_event(100, 50));
         obs.record_event(&llm_event(200, 80));
         assert_eq!(obs.tokens(), (300, 130));
+    }
+
+    #[test]
+    fn llm_calls_counted_per_response_event() {
+        let obs = RecordingObserver::new();
+        assert_eq!(obs.llm_calls(), 0);
+        obs.record_event(&llm_event(1, 1));
+        obs.record_event(&llm_event(1, 1));
+        obs.record_event(&llm_event(1, 1));
+        assert_eq!(obs.llm_calls(), 3);
+        // Non-LLM events do not affect the count.
+        obs.record_event(&tool_call_event("echo", true));
+        assert_eq!(obs.llm_calls(), 3);
     }
 
     #[test]

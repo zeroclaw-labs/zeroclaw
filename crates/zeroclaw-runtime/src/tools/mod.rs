@@ -32,6 +32,7 @@ pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
+pub use zeroclaw_tools::MEMORY_TOOL_NAMES;
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
@@ -255,6 +256,17 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
+}
+
+/// Create the memory tool registry for a memory backend and security policy.
+pub fn memory_tools(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+        Box::new(MemoryRecallTool::new(memory.clone())),
+        Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+        Box::new(MemoryExportTool::new(memory.clone())),
+        Box::new(MemoryPurgeTool::new(memory, security)),
+    ]
 }
 
 /// Create the default tool registry with explicit runtime adapter.
@@ -1618,6 +1630,18 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[test]
+    fn memory_tools_match_memory_tool_inventory() {
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+        let security = Arc::new(SecurityPolicy::default());
+        let names: Vec<_> = memory_tools(memory, security)
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+
+        assert_eq!(names, zeroclaw_tools::MEMORY_TOOL_NAMES);
     }
 
     #[cfg(feature = "plugins-wasm")]

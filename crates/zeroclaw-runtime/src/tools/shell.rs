@@ -97,6 +97,8 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
+    pub const NAME: &'static str = "shell";
+
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         let timeout_secs = security.shell_timeout_secs;
         Self {
@@ -238,7 +240,7 @@ fn get_session_id() -> Option<String> {
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
-        "shell"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
