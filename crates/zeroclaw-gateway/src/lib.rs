@@ -2583,9 +2583,17 @@ fn plugin_webhook_routes(
                 .post(handle_plugin_webhook)
                 // Axum otherwise falls back from HEAD to the GET handler. Keep
                 // the plugin contract closed to the documented methods only.
-                .head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+                .head(reject_plugin_webhook_method)
+                .fallback(reject_plugin_webhook_method),
         )
         .layer(axum::Extension(registry))
+}
+
+async fn reject_plugin_webhook_method() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "GET, POST")],
+    )
 }
 
 async fn handle_plugin_webhook(
@@ -4720,6 +4728,13 @@ mod tests {
             .expect("plugin route is infallible");
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, POST")
+        );
         assert!(
             rx.try_recv().is_err(),
             "HEAD must not cross the plugin boundary"
