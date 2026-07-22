@@ -253,12 +253,8 @@ impl Doctor {
 
             // Surface the resolved active log path first when the daemon
             // advertised one — it is the operator's primary entry point for
-            // post-mortem log navigation (#8650).
-            if let Some(log_path) = self
-                .result
-                .as_ref()
-                .and_then(|r| r.log_path.as_deref())
-            {
+            // post-mortem log navigation (8650).
+            if let Some(log_path) = self.result.as_ref().and_then(|r| r.log_path.as_deref()) {
                 out.push(Line::from(Span::styled(
                     crate::i18n::t_args("zc-doctor-log-path", &[("path", log_path)]),
                     theme::body_style(),
@@ -268,7 +264,7 @@ impl Doctor {
 
             // Always show the partial-results banner when a phase timed
             // out, even if the user has selected a specific diagnostic row.
-            // This ensures the incomplete-run state from #8647 stays
+            // This ensures the incomplete-run state from 8647 stays
             // persistently visible alongside any selected-row detail.
             let is_partial = self
                 .result
@@ -681,7 +677,7 @@ mod tests {
 
     /// Pairs with `doctor_timeout_error_is_generic_not_model_probing_specific`
     /// above to pin the whole-RPC-vs-structured-probe discrimination from
-    /// review #8647: the "model probing" hint must only surface on the
+    /// review 8647: the "model probing" hint must only surface on the
     /// structured-partial banner path, never on the error path. A future
     /// refactor that swaps the discriminator (e.g. on freeform substring
     /// matching) will be caught here even though `format_doctor_error`'s own
@@ -817,7 +813,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Tests from #8650 (log_path) — kept verbatim with `timed_out_phase: None`
+    // Tests from 8650 (log_path) — kept verbatim with `timed_out_phase: None`
     // to match the merged DoctorRunResult shape.
     // ─────────────────────────────────────────────────────────
 
@@ -846,7 +842,7 @@ mod tests {
 
     /// Render Doctor with `log_persistence = "file"` and a long realistic
     /// resolved path. Asserts the path appears in the detail panel buffer
-    /// (the operator's discoverability contract from #8650) and dumps the
+    /// (the operator's discoverability contract from 8650) and dumps the
     /// rendered buffer to stdout so `cargo test -- --nocapture` produces a
     /// capture suitable for pasting into the PR as first-hand evidence.
     #[tokio::test]
@@ -955,7 +951,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Test from #8647 (partial-results banner) — kept verbatim.
+    // Test from 8647 (partial-results banner) — kept verbatim.
     // ─────────────────────────────────────────────────────────
 
     /// Render Doctor when `probe_models` has timed out: the partial-results
@@ -988,7 +984,7 @@ mod tests {
 
         let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
 
-        // The banner from #8647 must be discoverable in the detail panel,
+        // The banner from 8647 must be discoverable in the detail panel,
         // above the selected entry's `detail_lines` content.
         assert!(
             rendered.contains("⚠ Partial results"),
