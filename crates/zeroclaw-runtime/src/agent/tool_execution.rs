@@ -751,6 +751,7 @@ mod tests {
         ];
         let meta = crate::agent::turn::TurnMeta {
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
         };
@@ -794,6 +795,7 @@ mod tests {
         let meta = super::super::turn::TurnMeta {
             channel_name: "test",
             agent_alias: Some("agent"),
+            parent_agent_alias: None,
             turn_id: "turn-1",
         };
 

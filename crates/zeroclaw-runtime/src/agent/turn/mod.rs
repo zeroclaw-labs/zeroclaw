@@ -1372,6 +1372,7 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         None,
+        crate::tools::GoalAdmissionToolPolicy::Omit,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // The same gated seam run(), process_message, and independent delegation use:

@@ -2239,6 +2239,7 @@ mod tests {
                 Some(shared_engine.clone()),
                 None,
                 None,
+                GoalAdmissionToolPolicy::Omit,
             )
             .tools
         };
