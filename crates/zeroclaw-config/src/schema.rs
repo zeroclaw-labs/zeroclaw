@@ -2662,21 +2662,6 @@ pub struct GeminiCliModelProviderConfig {
 
 // ── Grok Build CLI (subprocess wrapper) ──
 
-/// How ZeroClaw drives the local `grok` binary for `providers.models.grok_cli`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum GrokCliTransport {
-    /// Documented headless one-shot (`--single` / large prompt via stdin).
-    #[default]
-    Headless,
-    /// Agent Client Protocol over `grok agent stdio` (JSON-RPC). Prefer for
-    /// large structured prompts without argv/temp-file handoff.
-    Acp,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.grok_cli"]
@@ -2687,29 +2672,20 @@ pub struct GrokCliModelProviderConfig {
     /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
-    /// Working directory for the `grok` subprocess. Project-scoped Grok
-    /// config (`.grok/config.toml` permissions, skills, agents) is resolved
-    /// relative to this path. Defaults to the daemon process cwd when unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<String>,
-    /// Subprocess transport. Defaults to headless one-shot; set `acp` to
-    /// drive `grok agent stdio` (JSON-RPC) for long prompts without a
-    /// headless prompt file.
-    #[serde(default, skip_serializing_if = "is_default_grok_cli_transport")]
-    pub transport: GrokCliTransport,
-    /// Extra argv tokens appended after the built-in headless plumbing flags
-    /// (for example `["--max-turns", "20"]` or `["--sandbox", "off"]`).
-    /// Reserved transport flags (`--single`, `--prompt-file`, `--output-format`,
-    /// `-m`, session flags, `--cwd`, …) are rejected at provider construction.
-    /// When `extra_args` does not set `--sandbox`, ZeroClaw injects
-    /// `--sandbox strict` (fail-closed). Prefer workspace `.grok` permission
-    /// rules for tools; use `extra_args` for explicit CLI opt-in behavior.
+    /// Required absolute working directory for the `grok` subprocess and ACP
+    /// session boundary. The directory must exist when the provider is built.
+    /// Project-scoped Grok config is resolved relative to this path.
+    pub working_directory: String,
+    /// Extra global Grok long flags inserted before `agent stdio`. Known
+    /// options may put their value in the next token; other value-taking
+    /// options use `--flag=value`. Positional and short arguments are rejected.
+    /// ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`,
+    /// and an empty built-in tool set. Providing the corresponding flags here
+    /// is an explicit per-alias opt-in to relax those defaults. ACP transport,
+    /// prompt/model/session, cwd, debug-file, and update-policy flags are
+    /// reserved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-}
-
-fn is_default_grok_cli_transport(value: &GrokCliTransport) -> bool {
-    *value == GrokCliTransport::Headless
 }
 
 // ── LMStudio (local default) ──
@@ -24188,6 +24164,25 @@ auto_save = true
         assert!(parsed.num_ctx.is_none());
         assert!(parsed.num_predict.is_none());
         assert!(parsed.temperature_override.is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_requires_working_directory() {
+        let error = toml::from_str::<GrokCliModelProviderConfig>("model = \"grok-4.5\"")
+            .expect_err("missing ACP session boundary must fail");
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_deserializes_explicit_working_directory() {
+        let parsed: GrokCliModelProviderConfig = toml::from_str(
+            r#"
+                model = "grok-4.5"
+                working_directory = "/srv/zeroclaw/workspace"
+            "#,
+        )
+        .expect("explicit Grok ACP cwd");
+        assert_eq!(parsed.working_directory, "/srv/zeroclaw/workspace");
     }
 
     #[test]

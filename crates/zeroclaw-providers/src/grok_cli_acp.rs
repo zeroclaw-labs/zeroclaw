@@ -1,54 +1,117 @@
-//! Minimal ACP (Agent Client Protocol) client for `grok agent stdio`.
+//! Bounded one-shot ACP client for `grok agent stdio`.
 //!
-//! One-shot: initialize → authenticate → session/new → session/prompt,
-//! collecting `session/update` agent message chunks. No multi-turn resume.
+//! The wire sequence follows Grok Build's documented example:
+//! initialize → authenticate → session/new → session/prompt. Assistant text
+//! arrives in `session/update` notifications. Every input frame and aggregate
+//! byte count is bounded before allocation grows, and server permission
+//! requests are always cancelled.
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::Path;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
+use std::time::Duration;
+use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
+use zeroclaw_api::jsonrpc::{
+    ACP_PROTOCOL_VERSION, JSONRPC_VERSION, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
+    error_codes::METHOD_NOT_FOUND, field,
+};
 
-/// Run a single ACP prompt against an already-spawned `grok agent stdio` child.
-///
-/// `cwd` is sent in `session/new` (Grok project config / sandbox CWD).
-pub async fn run_oneshot_prompt(
-    stdin: &mut ChildStdin,
-    stdout: ChildStdout,
+/// Maximum size of one newline-delimited JSON-RPC frame.
+const MAX_ACP_FRAME_BYTES: usize = 1_048_576;
+
+/// Maximum aggregate stdout consumed during one ACP request.
+const MAX_ACP_STDOUT_BYTES: usize = 4_194_304;
+
+/// Maximum assistant text returned to the channel/runtime.
+const MAX_ACP_ASSISTANT_BYTES: usize = 1_048_576;
+
+/// Grok's published example waits for two stable 150 ms intervals after the
+/// prompt response so trailing `session/update` chunks are not lost.
+const OUTPUT_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
+const OUTPUT_SETTLE_INTERVALS: usize = 2;
+
+#[derive(Debug, Error)]
+pub(crate) enum AcpError {
+    #[error("Grok ACP transport failed while writing {phase}")]
+    Write { phase: &'static str },
+    #[error("Grok ACP transport failed while reading {phase}")]
+    Read { phase: &'static str },
+    #[error("Grok ACP process closed before {phase} completed")]
+    Closed { phase: &'static str },
+    #[error("Grok ACP stdout frame exceeded {limit} bytes")]
+    FrameLimit { limit: usize },
+    #[error("Grok ACP stdout exceeded {limit} bytes")]
+    StdoutLimit { limit: usize },
+    #[error("Grok ACP assistant output exceeded {limit} bytes")]
+    AssistantLimit { limit: usize },
+    #[error("Grok ACP returned invalid JSON during {phase}")]
+    InvalidJson { phase: &'static str },
+    #[error("Grok ACP returned an error during {phase}")]
+    Remote { phase: &'static str },
+    #[error("Grok ACP {phase} response was incomplete")]
+    Incomplete { phase: &'static str },
+    #[error("Grok ACP initialize returned no usable authentication method")]
+    NoAuthenticationMethod,
+    #[error("Grok ACP session/prompt completed without agent message text")]
+    EmptyOutput,
+    #[error("Grok ACP could not encode an internal request")]
+    Encode,
+}
+
+impl AcpError {
+    pub(crate) fn error_key(&self) -> &'static str {
+        match self {
+            Self::Write { .. } => "grok_cli_acp_write_failed",
+            Self::Read { .. } => "grok_cli_acp_read_failed",
+            Self::Closed { .. } => "grok_cli_acp_closed",
+            Self::FrameLimit { .. } => "grok_cli_acp_frame_limit",
+            Self::StdoutLimit { .. } => "grok_cli_acp_stdout_limit",
+            Self::AssistantLimit { .. } => "grok_cli_acp_assistant_limit",
+            Self::InvalidJson { .. } => "grok_cli_acp_invalid_json",
+            Self::Remote { .. } => "grok_cli_acp_remote_error",
+            Self::Incomplete { .. } => "grok_cli_acp_incomplete_response",
+            Self::NoAuthenticationMethod => "grok_cli_acp_auth_unavailable",
+            Self::EmptyOutput => "grok_cli_acp_empty_output",
+            Self::Encode => "grok_cli_acp_encode_failed",
+        }
+    }
+}
+
+/// Run one prompt against an already-spawned `grok agent stdio` child.
+pub(crate) async fn run_oneshot_prompt<W, R>(
+    stdin: &mut W,
+    stdout: R,
     prompt: &str,
     cwd: &Path,
-    model: Option<&str>,
-) -> anyhow::Result<String> {
-    let mut reader = BufReader::new(stdout);
-    let mut next_id: u64 = 1;
+) -> Result<String, AcpError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut reader = AcpReader::new(stdout);
+    let mut next_id = 1_u64;
     let mut assistant = String::new();
 
-    let init = rpc_request(
+    let initialize = rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
         "initialize",
         json!({
-            "protocolVersion": 1,
+            "protocolVersion": ACP_PROTOCOL_VERSION,
             "clientCapabilities": {
                 "fs": { "readTextFile": false, "writeTextFile": false },
                 "terminal": false
-            },
-            "_meta": {
-                "startupHints": {
-                    "nonInteractive": true,
-                    "skipGitStatus": true,
-                    "skipProjectLayout": true
-                },
-                "clientType": "zeroclaw-grok-cli",
-                "clientVersion": env!("CARGO_PKG_VERSION")
             }
         }),
         &mut assistant,
     )
     .await?;
 
-    let method_id = select_auth_method_id(&init)?;
-    let _auth = rpc_request(
+    let method_id = select_auth_method_id(&initialize, std::env::var_os("XAI_API_KEY").is_some())?;
+    rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
@@ -61,38 +124,29 @@ pub async fn run_oneshot_prompt(
     )
     .await?;
 
-    let mut new_params = json!({
-        "cwd": cwd,
-        "mcpServers": []
-    });
-    if let Some(model_id) = model {
-        new_params["_meta"] = json!({ "modelId": model_id });
-    }
-
     let new_session = rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
         "session/new",
-        new_params,
+        json!({
+            "cwd": cwd,
+            "mcpServers": []
+        }),
         &mut assistant,
     )
     .await?;
-
     let session_id = new_session
         .get("sessionId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "Grok ACP session/new missing sessionId: {new_session}"
-            ))
+        .and_then(Value::as_str)
+        .ok_or(AcpError::Incomplete {
+            phase: "session/new",
         })?
         .to_string();
 
-    // Clear any noise collected before the real prompt turn.
+    // Authentication/session notifications are not part of the answer.
     assistant.clear();
-
-    let _prompt_result = rpc_request(
+    rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
@@ -105,235 +159,292 @@ pub async fn run_oneshot_prompt(
     )
     .await?;
 
+    settle_trailing_output(stdin, &mut reader, &mut assistant).await?;
     let trimmed = assistant.trim();
     if trimmed.is_empty() {
-        anyhow::bail!(
-            "Grok ACP session/prompt completed without agent message text. \
-             Check authentication and that the agent produced a reply."
-        );
+        return Err(AcpError::EmptyOutput);
     }
     Ok(trimmed.to_string())
 }
 
-fn select_auth_method_id(init_result: &Value) -> anyhow::Result<String> {
-    let methods = init_result
-        .get("authMethods")
-        .or_else(|| init_result.get("auth_methods"))
-        .and_then(|v| v.as_array())
-        .cloned()
+struct AcpReader<R> {
+    inner: BufReader<R>,
+    bytes_read: usize,
+}
+
+impl<R> AcpReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn new(reader: R) -> Self {
+        Self {
+            inner: BufReader::new(reader),
+            bytes_read: 0,
+        }
+    }
+
+    async fn next_message(&mut self, phase: &'static str) -> Result<Option<Value>, AcpError> {
+        loop {
+            let Some(frame) = self.read_frame(phase).await? else {
+                return Ok(None);
+            };
+            let trimmed = trim_ascii_whitespace(&frame);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let message =
+                serde_json::from_slice(trimmed).map_err(|_| AcpError::InvalidJson { phase })?;
+            return Ok(Some(message));
+        }
+    }
+
+    async fn read_frame(&mut self, phase: &'static str) -> Result<Option<Vec<u8>>, AcpError> {
+        let mut frame = Vec::new();
+        loop {
+            let available = self
+                .inner
+                .fill_buf()
+                .await
+                .map_err(|_| AcpError::Read { phase })?;
+            if available.is_empty() {
+                return if frame.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(frame))
+                };
+            }
+
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |position| position + 1);
+            let next_total = self
+                .bytes_read
+                .checked_add(take)
+                .ok_or(AcpError::StdoutLimit {
+                    limit: MAX_ACP_STDOUT_BYTES,
+                })?;
+            if next_total > MAX_ACP_STDOUT_BYTES {
+                return Err(AcpError::StdoutLimit {
+                    limit: MAX_ACP_STDOUT_BYTES,
+                });
+            }
+            let next_frame = frame.len().checked_add(take).ok_or(AcpError::FrameLimit {
+                limit: MAX_ACP_FRAME_BYTES,
+            })?;
+            if next_frame > MAX_ACP_FRAME_BYTES {
+                return Err(AcpError::FrameLimit {
+                    limit: MAX_ACP_FRAME_BYTES,
+                });
+            }
+
+            frame.extend_from_slice(&available[..take]);
+            self.inner.consume(take);
+            self.bytes_read = next_total;
+            if newline.is_some() {
+                return Ok(Some(frame));
+            }
+        }
+    }
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+async fn rpc_request<W, R>(
+    stdin: &mut W,
+    reader: &mut AcpReader<R>,
+    next_id: &mut u64,
+    method: &'static str,
+    params: Value,
+    assistant: &mut String,
+) -> Result<Value, AcpError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let id = *next_id;
+    *next_id = next_id.saturating_add(1);
+    let request = JsonRpcRequest::new(method, params, Value::from(id));
+    write_line(stdin, &request, method).await?;
+
+    loop {
+        let Some(message) = reader.next_message(method).await? else {
+            return Err(AcpError::Closed { phase: method });
+        };
+
+        if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
+            handle_server_request(stdin, &message).await?;
+            continue;
+        }
+        if message.get(field::METHOD).is_some() && message.get(field::ID).is_none() {
+            append_agent_message_chunk(&message, assistant)?;
+            continue;
+        }
+        if message.get(field::ID).and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if message.get(field::ERROR).is_some() {
+            return Err(AcpError::Remote { phase: method });
+        }
+        return Ok(message.get(field::RESULT).cloned().unwrap_or(Value::Null));
+    }
+}
+
+async fn write_line<W, T>(stdin: &mut W, value: &T, phase: &'static str) -> Result<(), AcpError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let mut encoded = serde_json::to_vec(value).map_err(|_| AcpError::Encode)?;
+    encoded.push(b'\n');
+    stdin
+        .write_all(&encoded)
+        .await
+        .map_err(|_| AcpError::Write { phase })?;
+    stdin.flush().await.map_err(|_| AcpError::Write { phase })
+}
+
+async fn handle_server_request<W>(stdin: &mut W, message: &Value) -> Result<(), AcpError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let id = message.get(field::ID).cloned().unwrap_or(Value::Null);
+    let method = message
+        .get(field::METHOD)
+        .and_then(Value::as_str)
         .unwrap_or_default();
 
-    let ids: Vec<String> = methods
-        .iter()
-        .filter_map(|m| {
-            m.get("id")
-                .and_then(|id| id.as_str())
-                .map(str::to_string)
-                .or_else(|| {
-                    // Some wires nest id as { "id": "..." } already string.
-                    m.get("methodId")
-                        .and_then(|id| id.as_str())
-                        .map(str::to_string)
-                })
+    if method.contains("permission") {
+        let response = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!({ "outcome": { "outcome": "cancelled" } })),
+            error: None,
+            id,
+        };
+        return write_line(stdin, &response, "permission response").await;
+    }
+
+    let response = JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        result: None,
+        error: Some(JsonRpcError {
+            code: METHOD_NOT_FOUND,
+            message: "Method not supported by the ZeroClaw ACP client".to_string(),
+            data: None,
+        }),
+        id,
+    };
+    write_line(stdin, &response, "unsupported server request response").await
+}
+
+async fn settle_trailing_output<W, R>(
+    stdin: &mut W,
+    reader: &mut AcpReader<R>,
+    assistant: &mut String,
+) -> Result<(), AcpError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut quiet_intervals = 0_usize;
+    while quiet_intervals < OUTPUT_SETTLE_INTERVALS {
+        match timeout(OUTPUT_SETTLE_INTERVAL, reader.next_message("output settle")).await {
+            Err(_) => quiet_intervals += 1,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(Some(message))) => {
+                quiet_intervals = 0;
+                if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
+                    handle_server_request(stdin, &message).await?;
+                } else if message.get(field::METHOD).is_some() {
+                    append_agent_message_chunk(&message, assistant)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result<(), AcpError> {
+    let Some(chunk) = extract_agent_message_chunk(message) else {
+        return Ok(());
+    };
+    let next_len = assistant
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(AcpError::AssistantLimit {
+            limit: MAX_ACP_ASSISTANT_BYTES,
+        })?;
+    if next_len > MAX_ACP_ASSISTANT_BYTES {
+        return Err(AcpError::AssistantLimit {
+            limit: MAX_ACP_ASSISTANT_BYTES,
+        });
+    }
+    assistant.push_str(chunk);
+    Ok(())
+}
+
+fn select_auth_method_id(
+    initialize: &Value,
+    xai_api_key_available: bool,
+) -> Result<String, AcpError> {
+    let ids: Vec<&str> = initialize
+        .get("authMethods")
+        .or_else(|| initialize.get("auth_methods"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|method| {
+            method
+                .get("id")
+                .or_else(|| method.get("methodId"))
+                .and_then(Value::as_str)
         })
         .collect();
 
-    // Prefer API key when present; otherwise cached login / first method.
-    for prefer in ["xai.api_key", "cached_token", "xai.oauth"] {
-        if ids.iter().any(|id| id == prefer) {
-            return Ok(prefer.to_string());
+    if xai_api_key_available && ids.contains(&"xai.api_key") {
+        return Ok("xai.api_key".to_string());
+    }
+    for preferred in ["cached_token", "xai.oauth"] {
+        if ids.contains(&preferred) {
+            return Ok(preferred.to_string());
         }
     }
-    if let Some(first) = ids.first() {
-        return Ok(first.clone());
-    }
-    // Grok often works with ambient CLI login even if methods are empty;
-    // still require an explicit method when the server listed none.
-    anyhow::bail!(
-        "Grok ACP initialize returned no auth methods. \
-         Run `grok login` or set XAI_API_KEY."
-    )
+    Err(AcpError::NoAuthenticationMethod)
 }
 
-async fn rpc_request(
-    stdin: &mut ChildStdin,
-    reader: &mut BufReader<ChildStdout>,
-    next_id: &mut u64,
-    method: &str,
-    params: Value,
-    assistant: &mut String,
-) -> anyhow::Result<Value> {
-    let id = *next_id;
-    *next_id += 1;
-    let req = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-    write_line(stdin, &req).await?;
-    read_until_response(stdin, reader, &json!(id), assistant).await
-}
-
-async fn write_line(stdin: &mut ChildStdin, value: &Value) -> anyhow::Result<()> {
-    let mut line = serde_json::to_string(value)?;
-    line.push('\n');
-    stdin.write_all(line.as_bytes()).await?;
-    stdin.flush().await?;
-    Ok(())
-}
-
-async fn read_until_response(
-    stdin: &mut ChildStdin,
-    reader: &mut BufReader<ChildStdout>,
-    expected_id: &Value,
-    assistant: &mut String,
-) -> anyhow::Result<Value> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            anyhow::bail!("Grok ACP process closed stdout before completing the request");
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let msg: Value = serde_json::from_str(trimmed).map_err(|err| {
-            anyhow::Error::msg(format!("Grok ACP invalid JSON line: {err}: {trimmed}"))
-        })?;
-
-        // Server → client request (permission, etc.)
-        if msg.get("method").is_some() && msg.get("id").is_some() {
-            handle_server_request(stdin, &msg).await?;
-            continue;
-        }
-
-        // Notification (no id)
-        if msg.get("method").is_some() && msg.get("id").is_none() {
-            if let Some(chunk) = extract_agent_message_chunk(&msg) {
-                assistant.push_str(&chunk);
-            }
-            continue;
-        }
-
-        // Response
-        if msg.get("id") == Some(expected_id) {
-            if let Some(err) = msg.get("error") {
-                let summary = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("ACP error");
-                anyhow::bail!("Grok ACP error: {summary}");
-            }
-            return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
-        }
-    }
-}
-
-async fn handle_server_request(stdin: &mut ChildStdin, msg: &Value) -> anyhow::Result<()> {
-    let id = msg.get("id").cloned().unwrap_or(Value::Null);
-    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-    if method.contains("permission") || method.ends_with("request_permission") {
-        // Auto-select first option when present; otherwise cancelled.
-        let option_id = msg
-            .pointer("/params/options/0/optionId")
-            .or_else(|| msg.pointer("/params/options/0/option_id"))
-            .or_else(|| msg.pointer("/params/options/0/id"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        // Prefer AllowOnce-style options when labeled.
-        let option_id = msg
-            .pointer("/params/options")
-            .and_then(|o| o.as_array())
-            .and_then(|opts| {
-                opts.iter()
-                    .find(|o| {
-                        o.get("kind")
-                            .and_then(|k| k.as_str())
-                            .is_some_and(|k| k.eq_ignore_ascii_case("allowonce") || k == "allow")
-                    })
-                    .or_else(|| opts.first())
-                    .and_then(|o| {
-                        o.get("optionId")
-                            .or_else(|| o.get("option_id"))
-                            .or_else(|| o.get("id"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-            })
-            .or(option_id);
-
-        let result = if let Some(option_id) = option_id {
-            json!({
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": option_id
-                }
-            })
-        } else {
-            json!({ "outcome": { "outcome": "cancelled" } })
-        };
-
-        write_line(
-            stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result
-            }),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // Decline unknown server requests so the agent can proceed or error cleanly.
-    write_line(
-        stdin,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32601,
-                "message": format!("Method not supported by zeroclaw-grok-cli client: {method}")
-            }
-        }),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Pull assistant text from a `session/update` notification if present.
-pub fn extract_agent_message_chunk(msg: &Value) -> Option<String> {
-    let method = msg.get("method")?.as_str()?;
-    if method != "session/update" && !method.ends_with("session/update") {
+/// Extract only documented agent text chunks. User-message echoes, thoughts,
+/// tool events, and non-text payloads are deliberately ignored.
+fn extract_agent_message_chunk(message: &Value) -> Option<&str> {
+    let method = message.get(field::METHOD)?.as_str()?;
+    if method != "session/update" && !method.ends_with("/session/update") {
         return None;
     }
-    let update = msg.pointer("/params/update")?;
-    let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
-    if kind != "agent_message_chunk" {
+    let update = message.pointer("/params/update")?;
+    if update.get("sessionUpdate")?.as_str()? != "agent_message_chunk" {
         return None;
     }
     let content = update.get("content")?;
-    if content.get("type").and_then(Value::as_str) != Some("text") {
+    if content.get("type")?.as_str()? != "text" {
         return None;
     }
-    content
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    content.get("text")?.as_str()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     #[test]
-    fn extract_agent_message_chunk_from_session_update() {
-        let msg = json!({
+    fn extracts_only_agent_text_chunks() {
+        let agent = json!({
             "jsonrpc": "2.0",
             "method": "session/update",
             "params": {
@@ -344,18 +455,15 @@ mod tests {
                 }
             }
         });
-        assert_eq!(extract_agent_message_chunk(&msg).as_deref(), Some("hello"));
-    }
+        assert_eq!(extract_agent_message_chunk(&agent), Some("hello"));
 
-    #[test]
-    fn extract_agent_message_chunk_ignores_prompt_echo_and_other_updates() {
         for kind in [
             "user_message_chunk",
             "agent_thought_chunk",
             "tool_call",
             "message",
         ] {
-            let msg = json!({
+            let echo = json!({
                 "jsonrpc": "2.0",
                 "method": "session/update",
                 "params": {
@@ -364,51 +472,116 @@ mod tests {
                         "sessionUpdate": kind,
                         "content": {
                             "type": "text",
-                            "text": "system prompt and user input must not be returned"
+                            "text": "system prompt must not be returned"
                         }
                     }
                 }
             });
-            assert_eq!(
-                extract_agent_message_chunk(&msg),
-                None,
-                "unexpectedly captured {kind}"
-            );
+            assert_eq!(extract_agent_message_chunk(&echo), None);
         }
     }
 
     #[test]
-    fn extract_agent_message_chunk_ignores_non_text_content() {
-        let msg = json!({
+    fn auth_selection_uses_api_key_only_when_available() {
+        let initialize = json!({
+            "authMethods": [
+                { "id": "xai.api_key" },
+                { "id": "cached_token" }
+            ]
+        });
+        assert_eq!(
+            select_auth_method_id(&initialize, true).expect("API-key auth"),
+            "xai.api_key"
+        );
+        assert_eq!(
+            select_auth_method_id(&initialize, false).expect("cached auth"),
+            "cached_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_requests_are_always_cancelled() {
+        let (mut client, mut peer) = duplex(4096);
+        let request = json!({
             "jsonrpc": "2.0",
+            "id": 41,
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    { "optionId": "allow", "kind": "allow_once" },
+                    { "optionId": "deny", "kind": "reject_once" }
+                ]
+            }
+        });
+        handle_server_request(&mut client, &request)
+            .await
+            .expect("permission response");
+        drop(client);
+
+        let mut encoded = String::new();
+        peer.read_to_string(&mut encoded)
+            .await
+            .expect("read response");
+        let response: Value = serde_json::from_str(encoded.trim()).expect("valid response");
+        assert_eq!(
+            response.pointer("/result/outcome/outcome"),
+            Some(&Value::String("cancelled".to_string()))
+        );
+        assert!(response.pointer("/result/outcome/optionId").is_none());
+        assert!(!encoded.contains("allow"));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_error_does_not_echo_the_frame() {
+        let secret = "RAW_FRAME_SECRET_MUST_NOT_ESCAPE";
+        let payload = format!("not-json-{secret}\n");
+        let (mut peer, client) = duplex(payload.len() + 1);
+        peer.write_all(payload.as_bytes())
+            .await
+            .expect("write frame");
+        drop(peer);
+
+        let mut reader = AcpReader::new(client);
+        let error = reader
+            .next_message("test")
+            .await
+            .expect_err("invalid JSON must fail");
+        assert!(matches!(error, AcpError::InvalidJson { .. }));
+        assert!(!error.to_string().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn frame_limit_is_enforced_before_unbounded_growth() {
+        let payload = vec![b'x'; MAX_ACP_FRAME_BYTES + 1];
+        let (mut peer, client) = duplex(payload.len() + 1);
+        peer.write_all(&payload)
+            .await
+            .expect("write oversized frame");
+        drop(peer);
+
+        let mut reader = AcpReader::new(client);
+        let error = reader
+            .next_message("test")
+            .await
+            .expect_err("oversized frame must fail");
+        assert!(matches!(error, AcpError::FrameLimit { .. }));
+    }
+
+    #[test]
+    fn assistant_limit_is_hard_not_posthoc_truncation() {
+        let mut assistant = "x".repeat(MAX_ACP_ASSISTANT_BYTES);
+        let message = json!({
             "method": "session/update",
             "params": {
-                "sessionId": "s1",
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "image", "text": "not answer text" }
+                    "content": { "type": "text", "text": "y" }
                 }
             }
         });
-        assert_eq!(extract_agent_message_chunk(&msg), None);
-    }
-
-    #[test]
-    fn select_auth_prefers_api_key() {
-        let init = json!({
-            "authMethods": [
-                { "id": "cached_token" },
-                { "id": "xai.api_key" }
-            ]
-        });
-        assert_eq!(select_auth_method_id(&init).unwrap(), "xai.api_key");
-    }
-
-    #[test]
-    fn select_auth_falls_back_to_cached() {
-        let init = json!({
-            "authMethods": [ { "id": "cached_token" } ]
-        });
-        assert_eq!(select_auth_method_id(&init).unwrap(), "cached_token");
+        let error = append_agent_message_chunk(&message, &mut assistant)
+            .expect_err("assistant overflow must fail");
+        assert!(matches!(error, AcpError::AssistantLimit { .. }));
+        assert_eq!(assistant.len(), MAX_ACP_ASSISTANT_BYTES);
     }
 }
