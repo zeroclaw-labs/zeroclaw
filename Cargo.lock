@@ -7790,7 +7790,7 @@ dependencies = [
  "indexmap 2.14.0",
  "nix 0.30.1",
  "tokio",
- "windows 0.61.3",
+ "windows",
 ]
 
 [[package]]
@@ -13419,6 +13419,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "parking_lot",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "strum 0.28.0",
@@ -13569,7 +13570,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 1.0.7",
- "windows 0.61.3",
+ "windows",
  "zeroclaw-api",
  "zeroclaw-infra",
  "zeroclaw-log",

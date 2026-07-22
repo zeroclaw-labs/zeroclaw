@@ -1641,11 +1641,11 @@ impl Agent {
             sop_engine,
             sop_audit,
             // Daemon-backed constructors supply the shared handle; tools that
-            // resolve config per call (plugin tools, `send_via` authority) must
-            // follow reloads rather than this call's `config` snapshot. `None`
-            // here would silently pin them to startup state for the Agent's
-            // whole lifetime. One-shot callers pass `None` and keep the
-            // documented snapshot fallback.
+            // resolve config per call (plugin tools, `send_via` authority, and
+            // the A2A outbound client) must follow reloads rather than this
+            // call's `config` snapshot. `None` here would silently pin them to
+            // startup state for the Agent's whole lifetime. One-shot callers
+            // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
