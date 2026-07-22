@@ -30,7 +30,7 @@ pub struct FileDownloadTool {
     /// written inside the container but invisible on the host and discarded at
     /// session end. When `false`, a successful download carries a loud
     /// ephemeral-workspace warning. Mirrors
-    /// [`super::file_write::FileWriteTool`]. See issue #4627.
+    /// [`super::file_write::FileWriteTool`].
     persistent_writes: bool,
 }
 
@@ -683,7 +683,7 @@ impl Tool for FileDownloadTool {
                     );
                     // The download landed in an ephemeral workspace and will not
                     // reach the host — warn loudly rather than report a bare
-                    // success (issue #4627).
+                    // success (issue 4627).
                     let output = if self.persistent_writes {
                         output
                     } else {
@@ -946,7 +946,7 @@ mod tests {
 
     /// On an ephemeral runtime a successful download lands in a workspace that
     /// won't persist; the output must carry the loud warning while preserving
-    /// the original status, and the bytes must still be written (issue #4627).
+    /// the original status, and the bytes must still be written (issue 4627).
     #[tokio::test]
     async fn execute_warns_on_ephemeral_workspace() {
         let server = MockServer::start().await;
