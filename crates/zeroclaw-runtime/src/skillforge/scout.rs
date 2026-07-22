@@ -16,23 +16,14 @@ pub enum ScoutSource {
 }
 
 impl std::str::FromStr for ScoutSource {
-    type Err = std::convert::Infallible;
+    type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(match s.to_lowercase().as_str() {
-            "github" => Self::GitHub,
-            "huggingface" | "hf" => Self::HuggingFace,
-            _ => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"source": s})),
-                    "Unknown scout source, defaulting to GitHub"
-                );
-                Self::GitHub
-            }
-        })
+        match s.to_lowercase().as_str() {
+            "github" => Ok(Self::GitHub),
+            "huggingface" | "hf" => Ok(Self::HuggingFace),
+            _ => Err(format!("unknown scout source: {s}")),
+        }
     }
 }
 
@@ -255,11 +246,7 @@ mod tests {
             "hf".parse::<ScoutSource>().unwrap(),
             ScoutSource::HuggingFace
         );
-        // unknown falls back to GitHub
-        assert_eq!(
-            "unknown".parse::<ScoutSource>().unwrap(),
-            ScoutSource::GitHub
-        );
+        assert!("unknown".parse::<ScoutSource>().is_err());
     }
 
     #[test]
