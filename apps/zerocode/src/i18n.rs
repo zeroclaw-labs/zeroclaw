@@ -266,6 +266,10 @@ mod tests {
             "zc-zerocode-queue-saved",
             "zc-zerocode-queue-edit-number",
             "zc-zerocode-queue-edit-bool",
+            "zc-zerocode-config-invalid-number",
+            "zc-zerocode-config-positive-required",
+            "zc-zerocode-config-width-order",
+            "zc-zerocode-config-save-mismatch",
             // Help hints
             "zc-zerocode-help-todo-tracker",
             "zc-zerocode-help-message-queue",
@@ -285,6 +289,21 @@ mod tests {
                 "key `{key}` renders as its raw identifier instead of a translation"
             );
         }
+        let save_failed = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-zerocode-config-save-failed",
+            &[("error", "disk unavailable")],
+        )
+        .expect("argument-bearing Config-pane save error key must format");
+        assert!(save_failed.contains("disk unavailable"));
+        assert_ne!(
+            t_args(
+                "zc-zerocode-config-save-failed",
+                &[("error", "disk unavailable")]
+            ),
+            "{zc-zerocode-config-save-failed}"
+        );
     }
 
     #[test]

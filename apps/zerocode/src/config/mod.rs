@@ -153,7 +153,7 @@ pub(crate) enum TodoTrackerLocation {
 }
 
 /// The `[todotracker]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TodoTrackerSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -179,6 +179,32 @@ impl Default for TodoTrackerSection {
     }
 }
 
+impl TodoTrackerSection {
+    /// Reject values that the runtime resolver would otherwise normalize.
+    /// Config-pane saves call this before persistence so a success message
+    /// always describes the values the next session will consume.
+    pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
+        if self.width == 0 || self.max_height == 0 {
+            return Err(UiSectionValidationError::PositiveRequired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve(&self) -> TodoTrackerSettings {
+        TodoTrackerSettings {
+            enabled: self.enabled,
+            enabled_at_start: self.enabled_at_start,
+            location: match self.location {
+                TodoTrackerLocation::Bottom => TodoLocation::Bottom,
+                TodoTrackerLocation::Left => TodoLocation::Left,
+                TodoTrackerLocation::Right => TodoLocation::Right,
+            },
+            width: self.width.max(1),
+            max_height: self.max_height.max(1),
+        }
+    }
+}
+
 /// Where the todo tracker renders, as consumed by the
 /// [`TodoTracker`](crate::todo_tracker::TodoTracker) widget. This is the
 /// runtime mirror of [`TodoTrackerLocation`] (the serde section enum);
@@ -194,7 +220,7 @@ pub(crate) enum TodoLocation {
 /// Runtime `[todotracker]` settings, resolved from the config section by
 /// [`ZerocodeConfig::resolve_todo_tracker`]. Values are validated at that
 /// boundary, so downstream consumers can trust them as-is.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TodoTrackerSettings {
     pub enabled: bool,
     pub enabled_at_start: bool,
@@ -218,7 +244,7 @@ impl Default for TodoTrackerSettings {
 // ── Message queue ─────────────────────────────────────────────────────────────
 
 /// The `[message_queue]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MessageQueueSection {
     #[serde(default = "default_queue_cap")]
     pub cap: usize,
@@ -249,6 +275,62 @@ impl Default for MessageQueueSection {
         }
     }
 }
+
+impl MessageQueueSection {
+    /// Reject values that the runtime resolver would otherwise normalize.
+    /// The ordering check covers the complete candidate section, not only the
+    /// leaf currently being edited.
+    pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
+        if self.cap == 0
+            || self.default_width == 0
+            || self.min_width == 0
+            || self.max_width == 0
+            || self.width_step == 0
+        {
+            return Err(UiSectionValidationError::PositiveRequired);
+        }
+        if self.min_width > self.default_width || self.default_width > self.max_width {
+            return Err(UiSectionValidationError::WidthOrder);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve(&self) -> MessageQueueSettings {
+        let cap = self.cap.max(1);
+        let width_step = self.width_step.max(1);
+        let min_width = self.min_width.max(1);
+        let max_width = self.max_width.max(min_width);
+        let default_width = self.default_width.clamp(min_width, max_width);
+        MessageQueueSettings {
+            cap,
+            default_width,
+            min_width,
+            max_width,
+            width_step,
+            auto_open: self.auto_open,
+            stay_open_when_empty: self.stay_open_when_empty,
+        }
+    }
+}
+
+/// Validation failures shared by the local UI config sections. User-facing
+/// wording is supplied by the Config pane's Fluent catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiSectionValidationError {
+    PositiveRequired,
+    WidthOrder,
+}
+
+impl std::fmt::Display for UiSectionValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PositiveRequired => f.write_str("numeric values must be greater than zero"),
+            Self::WidthOrder => f.write_str("queue widths must satisfy min <= default <= max"),
+        }
+    }
+}
+
+impl std::error::Error for UiSectionValidationError {}
 
 // ── Runtime settings types ────────────────────────────────────────────────────
 
@@ -422,17 +504,7 @@ impl ZerocodeConfig {
     /// so a `0` (which would collapse the panel/strip) can never reach
     /// the runtime.
     pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
-        TodoTrackerSettings {
-            enabled: self.todotracker.enabled,
-            enabled_at_start: self.todotracker.enabled_at_start,
-            location: match self.todotracker.location {
-                TodoTrackerLocation::Bottom => TodoLocation::Bottom,
-                TodoTrackerLocation::Left => TodoLocation::Left,
-                TodoTrackerLocation::Right => TodoLocation::Right,
-            },
-            width: self.todotracker.width.max(1),
-            max_height: self.todotracker.max_height.max(1),
-        }
+        self.todotracker.resolve()
     }
 
     /// Convert the `[message_queue]` section into the runtime settings type.
@@ -450,22 +522,7 @@ impl ZerocodeConfig {
     ///   `max_width < min_width`, or a `default_width` outside the band)
     ///   is clamped rather than allowed to produce an unusable sidebar.
     pub fn resolve_message_queue(&self) -> MessageQueueSettings {
-        let s = &self.message_queue;
-        let cap = s.cap.max(1);
-        let width_step = s.width_step.max(1);
-        let min_width = s.min_width.max(1);
-        // Keep max at or above min, then clamp the default into [min, max].
-        let max_width = s.max_width.max(min_width);
-        let default_width = s.default_width.clamp(min_width, max_width);
-        MessageQueueSettings {
-            cap,
-            default_width,
-            min_width,
-            max_width,
-            width_step,
-            auto_open: s.auto_open,
-            stay_open_when_empty: s.stay_open_when_empty,
-        }
+        self.message_queue.resolve()
     }
 }
 
@@ -663,6 +720,7 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// Persist the entire `[todotracker]` section, editing only that section.
 /// Other sections (theme, keybindings, connection, etc.) are preserved.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
+    section.validate()?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     let serialized = toml::Value::try_from(section)
@@ -674,25 +732,13 @@ pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSectio
     write_document(&path, &doc)
 }
 
-/// Persist a single `[todotracker.<field>]` leaf, leaving the rest of the
-/// section and all other sections intact.
-pub(crate) fn persist_todotracker_field(
-    config_dir: &Path,
-    field: &str,
-    value: toml::Value,
-) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    section_mut(&mut doc, "todotracker")?.insert(field.to_string(), value);
-    write_document(&path, &doc)
-}
-
 /// Persist the entire `[message_queue]` section, editing only that section.
 /// Other sections are preserved.
 pub(crate) fn persist_message_queue(
     config_dir: &Path,
     section: &MessageQueueSection,
 ) -> Result<()> {
+    section.validate()?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     let serialized = toml::Value::try_from(section)
@@ -701,19 +747,6 @@ pub(crate) fn persist_message_queue(
         .cloned()
         .unwrap_or_default();
     doc.insert("message_queue".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
-}
-
-/// Persist a single `[message_queue.<field>]` leaf, leaving the rest of the
-/// section and all other sections intact.
-pub(crate) fn persist_message_queue_field(
-    config_dir: &Path,
-    field: &str,
-    value: toml::Value,
-) -> Result<()> {
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    section_mut(&mut doc, "message_queue")?.insert(field.to_string(), value);
     write_document(&path, &doc)
 }
 
@@ -1397,20 +1430,6 @@ mod tests {
     }
 
     #[test]
-    fn persist_todotracker_field_updates_single_leaf() {
-        let dir = tempfile::tempdir().unwrap();
-        seed(
-            dir.path(),
-            "[todotracker]\nenabled = true\nwidth = 32\n\n[theme]\nname = \"nord\"\n",
-        );
-        persist_todotracker_field(dir.path(), "width", toml::Value::Integer(50)).unwrap();
-        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
-        assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(true));
-        assert_eq!(doc["todotracker"]["width"].as_integer(), Some(50));
-        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
-    }
-
-    #[test]
     fn persist_todotracker_round_trips_through_load() {
         let dir = tempfile::tempdir().unwrap();
         let section = TodoTrackerSection {
@@ -1485,20 +1504,6 @@ mod tests {
             doc["message_queue"]["stay_open_when_empty"].as_bool(),
             Some(true)
         );
-    }
-
-    #[test]
-    fn persist_message_queue_field_updates_single_leaf() {
-        let dir = tempfile::tempdir().unwrap();
-        seed(
-            dir.path(),
-            "[message_queue]\ncap = 32\ndefault_width = 36\n\n[theme]\nname = \"nord\"\n",
-        );
-        persist_message_queue_field(dir.path(), "cap", toml::Value::Integer(128)).unwrap();
-        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
-        assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(128));
-        assert_eq!(doc["message_queue"]["default_width"].as_integer(), Some(36));
-        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
     }
 
     #[test]
@@ -1656,24 +1661,13 @@ mod tests {
         let t1 = cfg1.resolve_todo_tracker();
 
         // A Config-pane save persists changed fields to the same file.
-        persist_message_queue_field(
-            dir.path(),
-            "cap",
-            toml::Value::Integer((q1.cap + 11) as i64),
-        )
-        .unwrap();
-        persist_message_queue_field(
-            dir.path(),
-            "default_width",
-            toml::Value::Integer((q1.default_width + 5) as i64),
-        )
-        .unwrap();
-        persist_todotracker_field(
-            dir.path(),
-            "width",
-            toml::Value::Integer((t1.width + 7) as i64),
-        )
-        .unwrap();
+        let mut queue = cfg1.message_queue.clone();
+        queue.cap = q1.cap + 11;
+        queue.default_width = q1.default_width + 5;
+        persist_message_queue(dir.path(), &queue).unwrap();
+        let mut tracker = cfg1.todotracker.clone();
+        tracker.width = t1.width + 7;
+        persist_todotracker(dir.path(), &tracker).unwrap();
 
         // "Session 2" must resolve the *edited* values, not the cached copy.
         let cfg2 = ensure_and_load(dir.path()).unwrap();
