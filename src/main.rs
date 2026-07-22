@@ -2498,6 +2498,25 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     }
 }
 
+/// Dirty every generated leaf under a newly created map alias so required
+/// default-valued fields survive the incremental writer's empty-leaf pruning.
+fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
+    let prefix = format!("{alias_path}.");
+    let leaf_paths: Vec<String> = config
+        .prop_fields()
+        .into_iter()
+        .filter_map(|field| field.name.starts_with(&prefix).then_some(field.name))
+        .collect();
+
+    if leaf_paths.is_empty() {
+        config.mark_dirty(alias_path);
+    } else {
+        for path in leaf_paths {
+            config.mark_dirty(&path);
+        }
+    }
+}
+
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
@@ -5551,18 +5570,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     .into_iter()
                     .map(str::to_string)
                     .collect();
+                for section in &initialized {
+                    config.mark_dirty(section);
+                }
                 // `init_defaults` only instantiates nested struct sections. A
                 // `<section>.<alias>` argument names a dynamic-map entry, which
                 // has to be materialized through `create_map_key` instead.
                 if let Some(arg) = section.as_deref()
                     && let Some(created) = init_map_alias(&mut config, arg)?
                 {
+                    mark_new_map_alias_dirty(&mut config, &created);
                     initialized.push(created);
                 }
                 if !initialized.is_empty() {
-                    for section in &initialized {
-                        config.mark_dirty(section);
-                    }
                     Box::pin(config.save_dirty()).await?;
                 }
                 if json {

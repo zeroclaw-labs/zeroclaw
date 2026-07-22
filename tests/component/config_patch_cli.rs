@@ -558,6 +558,25 @@ fn run_cli_init(config_dir: &std::path::Path, section: &str) -> serde_json::Valu
     serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
 }
 
+fn run_cli_get(config_dir: &std::path::Path, path: &str) -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "get", path, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config get");
+    assert!(
+        output.status.success(),
+        "config get should succeed after reloading the saved file: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
+}
+
 #[test]
 fn config_init_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -581,5 +600,30 @@ fn config_init_materializes_new_map_alias_and_persists() {
     assert!(
         cfg.risk_profiles.contains_key("strict"),
         "the new alias must survive save_dirty + reload: {saved}"
+    );
+}
+
+#[test]
+fn config_init_channel_alias_survives_config_reload() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+
+    let envelope = run_cli_init(config_dir.path(), "channels.telegram.main");
+    assert_eq!(
+        envelope["initialized"],
+        serde_json::json!(["channels.telegram.main"])
+    );
+
+    let reloaded = run_cli_get(config_dir.path(), "channels.telegram.main.enabled");
+    assert_eq!(
+        reloaded,
+        serde_json::json!({
+            "path": "channels.telegram.main.enabled",
+            "value": "false",
+        }),
+        "the initialized channel alias must remain addressable after Config reload",
     );
 }
