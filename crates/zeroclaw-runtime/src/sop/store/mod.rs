@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::sop::types::SopRunStatus;
 use zeroclaw_config::schema::{SopConfig, SopRunStoreBackend};
 
 pub use model::{
@@ -22,11 +23,51 @@ pub trait SopRunStore: Send + Sync {
     /// byte-identical idempotent retry, else `RevisionConflict`; a newer
     /// revision wins.
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError>;
+    /// Persist a parked approval/checkpoint run only if this SOP still has room
+    /// in its pending pool. Returns `Ok(false)` without saving when the pool is
+    /// full. Store implementations should make the count and save one atomic
+    /// critical section; the default preserves compatibility for test wrappers.
+    fn save_run_with_pending_capacity(
+        &self,
+        run: &PersistedRun,
+        max_pending: usize,
+    ) -> Result<bool, StoreError> {
+        if max_pending > 0 {
+            let pending = self
+                .load_active_runs()?
+                .into_iter()
+                .filter(|existing| pending_capacity_member(existing, run))
+                .count();
+            if pending >= max_pending {
+                return Ok(false);
+            }
+        }
+        self.save_run(run)?;
+        Ok(true)
+    }
+    /// Persist an active run transition and append its audit event as one store
+    /// outcome. Implementations must make both writes visible together or neither
+    /// visible at all; callers use this for approval gate resolution so a durable
+    /// `gate_resolved` row cannot exist without the run transition it authorizes.
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Move a run to terminal state (kept as a terminal record, not deleted) and
     /// release any live claim. Revision-guarded exactly like `save_run`, so a
     /// stale or divergent terminal write cannot clobber newer state or release a
     /// live claim.
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError>;
+    /// Move a run to terminal state and append its audit event as one store
+    /// outcome. Claim release is part of the terminal transition and must be in
+    /// the same atomic boundary as the audit append.
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError>;
     /// Boot-rehydrate source: every non-terminal run (latest revision per id).
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
     /// Boot-rehydrate source for the display retention window: terminal runs,
@@ -55,6 +96,17 @@ pub trait SopRunStore: Send + Sync {
         run_id: &str,
         sop_name: &str,
     ) -> Result<ClaimToken, StoreError>;
+    /// Mark an existing live claim as intentionally retained while a failed
+    /// terminal checkpoint decision is retried. No-op if the claim is already
+    /// gone; the caller is already failing closed on the original transition.
+    fn mark_claim_retained_after_terminal_rollback(&self, _run_id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Whether the live claim for `run_id` is an intentional terminal-rollback
+    /// retention marker rather than a stale parked claim from old behavior.
+    fn has_retained_terminal_rollback_claim(&self, _run_id: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Live claim counts as `(for_sop, total)`, used by read-only admission
     /// checks so status surfaces observe the same concurrency source as CAS.
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError>;
@@ -85,6 +137,17 @@ pub trait SopRunStore: Send + Sync {
     fn health_check(&self) -> bool;
     /// Backend name (for logs + the "never a silent no-op" guard).
     fn backend(&self) -> &'static str;
+}
+
+pub(crate) const RETAINED_TERMINAL_ROLLBACK_HOLDER: &str = "engine:terminal-rollback-retained";
+
+pub(super) fn pending_capacity_member(existing: &PersistedRun, incoming: &PersistedRun) -> bool {
+    existing.run_id() != incoming.run_id()
+        && existing.run.sop_name == incoming.run.sop_name
+        && matches!(
+            existing.run.status,
+            SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+        )
 }
 
 /// Errors a store may surface. Never swallowed by callers.
@@ -147,6 +210,21 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
+/// Build the configured run store.
+///
+/// - `persist_runs = true` (default), backend `"sqlite"` (default) -> [`SqliteRunStore`] at
+///   `<run_state_dir | data_dir/sop>/runs.db` (dir created mode-0700), so in-flight runs -
+///   including runs parked at a HITL approval - survive a restart.
+/// - `persist_runs = false` -> ephemeral [`InMemoryRunStore`] (opt back into non-durable state).
+/// - `persist_runs = true`, backend `"memory"` -> ephemeral [`InMemoryRunStore`] (degraded/tests).
+///
+/// The backend is the closed `SopRunStoreBackend` enum, so an out-of-set value is
+/// rejected at config-deserialize time rather than here (no runtime unknown arm).
+///
+/// Called by `build_sop_engine`, which injects the result via `with_store` and
+/// then calls `restore_runs()` to rehydrate in-flight runs at startup. A
+/// backend-open failure is non-fatal there: the daemon logs and falls back to
+/// the in-memory store rather than failing to boot.
 pub fn build_run_store(
     cfg: &SopConfig,
     data_dir: &Path,
@@ -240,12 +318,54 @@ fn revision_guard(
     Ok(())
 }
 
+fn append_event_locked(g: &mut Inner, ev: &SopEventRecord) -> u64 {
+    g.seq += 1;
+    let seq = g.seq;
+    let mut rec = ev.clone();
+    rec.seq = seq;
+    g.events.entry(ev.run_id.clone()).or_default().push(rec);
+    seq
+}
+
 impl SopRunStore for InMemoryRunStore {
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
         revision_guard(g.runs.get(run.run_id()), run)?;
         g.runs.insert(run.run_id().to_string(), run.clone());
         Ok(())
+    }
+
+    fn save_run_with_pending_capacity(
+        &self,
+        run: &PersistedRun,
+        max_pending: usize,
+    ) -> Result<bool, StoreError> {
+        let mut g = self.lock()?;
+        if max_pending > 0 {
+            let pending = g
+                .runs
+                .values()
+                .filter(|existing| !g.terminal.contains(existing.run_id()))
+                .filter(|existing| pending_capacity_member(existing, run))
+                .count();
+            if pending >= max_pending {
+                return Ok(false);
+            }
+        }
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
+        Ok(true)
+    }
+
+    fn save_run_with_event(
+        &self,
+        run: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
@@ -255,6 +375,20 @@ impl SopRunStore for InMemoryRunStore {
         g.terminal.insert(run_id.to_string());
         g.claims.remove(run_id);
         Ok(())
+    }
+
+    fn finish_run_with_event(
+        &self,
+        run_id: &str,
+        terminal: &PersistedRun,
+        ev: &SopEventRecord,
+    ) -> Result<u64, StoreError> {
+        let mut g = self.lock()?;
+        revision_guard(g.runs.get(run_id), terminal)?;
+        g.runs.insert(run_id.to_string(), terminal.clone());
+        g.terminal.insert(run_id.to_string());
+        g.claims.remove(run_id);
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
@@ -357,6 +491,21 @@ impl SopRunStore for InMemoryRunStore {
         Ok(token)
     }
 
+    fn mark_claim_retained_after_terminal_rollback(&self, run_id: &str) -> Result<(), StoreError> {
+        let mut g = self.lock()?;
+        if let Some(claim) = g.claims.get_mut(run_id) {
+            claim.holder = RETAINED_TERMINAL_ROLLBACK_HOLDER.to_string();
+        }
+        Ok(())
+    }
+
+    fn has_retained_terminal_rollback_claim(&self, run_id: &str) -> Result<bool, StoreError> {
+        let g = self.lock()?;
+        Ok(g.claims
+            .get(run_id)
+            .is_some_and(|claim| claim.holder == RETAINED_TERMINAL_ROLLBACK_HOLDER))
+    }
+
     fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
         let g = self.lock()?;
         let per_sop = g.claims.values().filter(|c| c.sop_name == sop_name).count();
@@ -383,12 +532,7 @@ impl SopRunStore for InMemoryRunStore {
 
     fn append_event(&self, ev: &SopEventRecord) -> Result<u64, StoreError> {
         let mut g = self.lock()?;
-        g.seq += 1;
-        let seq = g.seq;
-        let mut rec = ev.clone();
-        rec.seq = seq;
-        g.events.entry(ev.run_id.clone()).or_default().push(rec);
-        Ok(seq)
+        Ok(append_event_locked(&mut g, ev))
     }
 
     fn list_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
@@ -518,6 +662,8 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         PersistedRun {
             version: SOP_STORE_VERSION,
@@ -821,9 +967,24 @@ mod tests {
     }
 
     #[test]
-    fn factory_defaults_to_in_memory() {
-        // persist_runs defaults false -> ephemeral, data_dir untouched.
-        let s = build_run_store(&cfg(), Path::new("/nonexistent")).unwrap();
+    fn factory_defaults_to_durable_sqlite() {
+        // persist_runs now defaults on (HITL admission durability) -> the durable
+        // sqlite backend is selected so a run parked at an approval survives restart.
+        let dir = std::env::temp_dir().join(format!("zc-sop-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = cfg();
+        c.run_state_dir = Some(dir.to_string_lossy().into_owned());
+        let s = build_run_store(&c, Path::new("/unused")).unwrap();
+        assert_eq!(s.backend(), "sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn factory_in_memory_when_persist_disabled() {
+        // Opt back out: persist_runs = false -> ephemeral in-memory, data_dir untouched.
+        let mut c = cfg();
+        c.persist_runs = false;
+        let s = build_run_store(&c, Path::new("/nonexistent")).unwrap();
         assert_eq!(s.backend(), "in-memory");
     }
 

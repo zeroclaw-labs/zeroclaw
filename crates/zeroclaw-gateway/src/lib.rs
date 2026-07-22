@@ -699,13 +699,9 @@ pub async fn run_gateway(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_with_storage_and_routes(
-            &config.memory,
-            &config.embedding_routes,
-            config.resolve_active_storage(),
-            &config.data_dir,
+        match zeroclaw_memory::create_memory_from_config(
+            &config,
             fallback.and_then(|e| e.api_key.as_deref()),
-            Some(&config.providers.models),
         ) {
             Ok(m) => Arc::from(m),
             Err(e) => {
@@ -815,6 +811,9 @@ pub async fn run_gateway(
                 runtime: Arc::clone(&runtime),
                 caller_allowed: None,
                 connect_mcp: true,
+                // Gateway tool-listing path: short-lived, no cross-turn reuse
+                // contract, so the per-call connect is correct.
+                mcp_registry: None,
                 // Listing-only registry: loading peripherals physically opens
                 // hardware (exclusive serial holds) that the live turn paths
                 // need. Never connect them for a registry no turn runs against.
@@ -949,6 +948,9 @@ pub async fn run_gateway(
             runtime: Arc::clone(&runtime),
             caller_allowed: None,
             connect_mcp: true,
+            // Gateway tool-listing path: short-lived, no cross-turn reuse
+            // contract, so the per-call connect is correct.
+            mcp_registry: None,
             // Same as the seed: never open hardware for a listing (and
             // `config.peripherals` is global - N per-agent opens of the same
             // boards would fail against the first holder anyway).

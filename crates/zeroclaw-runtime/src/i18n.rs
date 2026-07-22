@@ -611,6 +611,23 @@ mod tests {
                 &[("model", "gpt-test"), ("provider", "openai.default")][..],
                 ["gpt-test", "openai.default"].as_slice(),
             ),
+            (
+                "channel-runtime-agent-scope-rejected",
+                &[
+                    ("sender", "zeroclaw_user"),
+                    ("agent", "agent-alpha"),
+                    ("model", "gpt-test"),
+                ][..],
+                [
+                    "zeroclaw_user",
+                    "agent-alpha",
+                    "/model --agent",
+                    "/model --user gpt-test",
+                    "admin_for_agent_scope",
+                    "true",
+                ]
+                .as_slice(),
+            ),
             ("channel-runtime-request-timeout", &[][..], [].as_slice()),
             (
                 "channel-runtime-current-model-status",

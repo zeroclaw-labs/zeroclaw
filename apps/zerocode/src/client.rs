@@ -1,12 +1,12 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
 //!
-//! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
-//! plumbing the daemon uses for bidirectional calls.
+//! Uses local JSON-RPC transport types so `zerocode` stays an RPC-only surface.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -17,7 +17,9 @@ use tokio::sync::{broadcast, mpsc};
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
-const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
+const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -65,6 +67,7 @@ pub mod method {
     pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
+    pub const CONFIG_RENAME_MAP_KEY: &str = "config/map-key-rename";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
     pub const CONFIG_SECTIONS: &str = "config/sections";
     pub const CONFIG_CATALOG_MODELS: &str = "config/catalog-models";
@@ -252,6 +255,13 @@ pub enum SessionUpdate {
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
     },
+    /// Older complete turns were removed from structured session history.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: u64,
+        kept_turns: u64,
+        reason: String,
+    },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
     /// or a failure; the daemon-composed `content` carries the attributed
@@ -323,6 +333,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+        }),
+        "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
+            session_id: sid,
+            dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            kept_turns: params.get("kept_turns")?.as_u64()?,
+            reason: params.get("reason")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -427,6 +443,34 @@ impl fmt::Display for DaemonVersionMismatch {
 
 impl std::error::Error for DaemonVersionMismatch {}
 
+/// The transport connected, but the daemon did not finish the ACP handshake.
+#[derive(Debug)]
+pub struct DaemonInitializeTimeout {
+    timeout: Duration,
+}
+
+impl DaemonInitializeTimeout {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    pub fn timeout_seconds(&self) -> u64 {
+        self.timeout.as_secs()
+    }
+}
+
+impl fmt::Display for DaemonInitializeTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "daemon did not complete initialization within {}s",
+            self.timeout_seconds()
+        )
+    }
+}
+
+impl std::error::Error for DaemonInitializeTimeout {}
+
 #[derive(Debug)]
 struct InitializeResponse {
     server_version: String,
@@ -452,6 +496,21 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
             .and_then(Value::as_str)
             .map(String::from),
     })
+}
+
+async fn request_initialize(
+    rpc: &RpcOutbound,
+    init_params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    match tokio::time::timeout(timeout, rpc.request(method::INITIALIZE, init_params)).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(anyhow::Error::msg(format!(
+            "initialize: {} ({})",
+            e.message, e.code
+        ))),
+        Err(_) => Err(DaemonInitializeTimeout::new(timeout).into()),
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────
@@ -628,14 +687,11 @@ impl RpcClient {
         // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
-        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+        let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
-                return Err(anyhow::Error::msg(format!(
-                    "initialize: {} ({})",
-                    e.message, e.code
-                )));
+                return Err(e);
             }
         };
 
@@ -779,14 +835,11 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
-        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+        let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
-                return Err(anyhow::Error::msg(format!(
-                    "initialize: {} ({})",
-                    e.message, e.code
-                )));
+                return Err(e);
             }
         };
 
@@ -1056,6 +1109,20 @@ impl RpcClient {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn config_map_key_rename(
+        &self,
+        path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<ConfigRenameMapKeyResult> {
+        self.call_with_timeout(
+            method::CONFIG_RENAME_MAP_KEY,
+            serde_json::json!({ "path": path, "from": from, "to": to }),
+            CONFIG_RENAME_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn config_templates(&self) -> Result<Vec<ConfigTemplateEntry>> {
@@ -1695,6 +1762,28 @@ mod initialize_version_tests {
     }
 }
 
+#[cfg(test)]
+mod initialize_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_request_times_out_when_transport_never_responds() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        let rpc = RpcOutbound::new(writer_tx);
+        let receiver = tokio::spawn(async move {
+            writer_rx.recv().await.expect("initialize request");
+            std::future::pending::<()>().await;
+        });
+
+        let err = request_initialize(&rpc, serde_json::json!({}), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<DaemonInitializeTimeout>().is_some());
+        receiver.abort();
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigDeleteResult {}
@@ -1738,6 +1827,14 @@ pub struct LocalesFetchResult {
 #[serde(rename_all = "snake_case")]
 pub struct ConfigMapKeysResult {
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfigRenameMapKeyResult {
+    pub renamed: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2718,6 +2815,62 @@ pub struct StatusResult {
     pub server_version: String,
     pub protocol_version: u64,
     pub active_sessions: usize,
+    #[serde(default)]
+    pub config_dir: Option<String>,
+    #[serde(default)]
+    pub config_file: Option<String>,
+    #[serde(default)]
+    pub config_kind: Option<String>,
+    #[serde(default)]
+    pub local_ipc_endpoint: Option<String>,
+}
+
+#[cfg(test)]
+mod dashboard_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_result_decodes_runtime_context_fields() {
+        let value = serde_json::json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 2,
+            "config_dir": "/tmp/zeroclaw-profile",
+            "config_file": "/tmp/zeroclaw-profile/config.toml",
+            "config_kind": "temporary",
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+        });
+
+        let status: StatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(status.config_dir.as_deref(), Some("/tmp/zeroclaw-profile"));
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some("/tmp/zeroclaw-profile/config.toml")
+        );
+        assert_eq!(status.config_kind.as_deref(), Some("temporary"));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some("/tmp/zeroclaw-profile/data/daemon.sock")
+        );
+    }
+
+    #[test]
+    fn status_result_decodes_legacy_payload_without_runtime_context() {
+        let value = serde_json::json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 2
+        });
+
+        let status: StatusResult = serde_json::from_value(value).unwrap();
+
+        assert_eq!(status.server_version, "0.8.4");
+        assert_eq!(status.config_dir, None);
+        assert_eq!(status.config_file, None);
+        assert_eq!(status.config_kind, None);
+        assert_eq!(status.local_ipc_endpoint, None);
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3404,6 +3557,48 @@ mod session_method_tests {
             .unwrap()
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn config_map_key_rename_sends_path_and_aliases() {
+        assert_eq!(CONFIG_RENAME_TIMEOUT, std::time::Duration::from_secs(120));
+
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task =
+            tokio::spawn(async move { client.config_map_key_rename("agents", "old", "new").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.config_map_key_rename must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "config/map-key-rename");
+        assert_eq!(req["params"]["path"], "agents");
+        assert_eq!(req["params"]["from"], "old");
+        assert_eq!(req["params"]["to"], "new");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "path": "agents",
+                "from": "old",
+                "to": "new",
+                "renamed": true,
+                "warnings": ["workspace move skipped"]
+            })),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.config_map_key_rename must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert!(result.renamed);
+        assert_eq!(result.warnings, vec!["workspace move skipped"]);
+    }
 }
 
 #[cfg(test)]
@@ -3652,6 +3847,27 @@ mod plan_parse_tests {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
         }
+    }
+
+    #[test]
+    fn parses_history_trimmed_update() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                session_id,
+                dropped_messages: 12,
+                kept_turns: 3,
+                reason,
+            }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
     }
 
     #[test]
