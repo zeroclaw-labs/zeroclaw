@@ -313,42 +313,18 @@ pub fn extract_agent_message_chunk(msg: &Value) -> Option<String> {
         return None;
     }
     let update = msg.pointer("/params/update")?;
-
-    // sessionUpdate: "agent_message_chunk" | "agent_message" | ...
-    let kind = update
-        .get("sessionUpdate")
-        .or_else(|| update.get("session_update"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if !(kind.contains("agent_message")
-        || kind.contains("agentMessage")
-        || kind == "message"
-        || kind.is_empty())
-    {
-        // Still try content extraction for forward-compat shapes.
+    let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
+    if kind != "agent_message_chunk" {
+        return None;
     }
-
     let content = update.get("content")?;
-    if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
-        return Some(text.to_string());
+    if content.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
     }
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-    // Array of content blocks
-    if let Some(arr) = content.as_array() {
-        let mut out = String::new();
-        for block in arr {
-            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                out.push_str(t);
-            }
-        }
-        if !out.is_empty() {
-            return Some(out);
-        }
-    }
-    None
+    content
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -369,6 +345,52 @@ mod tests {
             }
         });
         assert_eq!(extract_agent_message_chunk(&msg).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn extract_agent_message_chunk_ignores_prompt_echo_and_other_updates() {
+        for kind in [
+            "user_message_chunk",
+            "agent_thought_chunk",
+            "tool_call",
+            "message",
+        ] {
+            let msg = json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "s1",
+                    "update": {
+                        "sessionUpdate": kind,
+                        "content": {
+                            "type": "text",
+                            "text": "system prompt and user input must not be returned"
+                        }
+                    }
+                }
+            });
+            assert_eq!(
+                extract_agent_message_chunk(&msg),
+                None,
+                "unexpectedly captured {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_agent_message_chunk_ignores_non_text_content() {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "image", "text": "not answer text" }
+                }
+            }
+        });
+        assert_eq!(extract_agent_message_chunk(&msg), None);
     }
 
     #[test]
