@@ -28,8 +28,7 @@ tokio = { version = "1.50", default-features = false, features = ["sync", "time"
 # real `dep:`-style optional dependency and replaces the matching
 # `#[cfg(not(feature = "backend-<name>"))]` fail-fast arm in
 # `make_session_backend` with a real `#[cfg(feature =
-# "backend-<name>")]` ctor. Backends still pending: postgres,
-# oracle, db2 — each lands in its own follow-up PR.
+# "backend-<name>")]` ctor. Backends still pending: oracle (db2 landed in PR 4 of the series).
 #
 # MySQL and MariaDB speak the same wire protocol and accept the
 # same SQL for the operations we use (CREATE TABLE / INSERT /
@@ -53,7 +52,7 @@ backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
 backend-mysql = ["dep:mysql"]
 backend-mariadb = ["dep:mysql"]
 backend-oracle = []
-backend-db2 = []
+backend-db2 = ["dep:odbc-api"]
 
 [dependencies.mysql]
 version = "25"
@@ -81,6 +80,29 @@ optional = true
 
 [dependencies.r2d2_postgres]
 version = "0.18"
+optional = true
+
+[dependencies.odbc-api]
+# Db2 ODBC client wrapper. Pulled in only by the `backend-db2`
+# feature. No first-party IBM Db2 wire-protocol crate exists on
+# crates.io, so the only realistic Rust path is `odbc-api` against
+# the IBM Db2 CLI ODBC driver (`clidriver/` shipped with Db2 12.x).
+# `odbc-api` ships its own ODBC-level connection pool managed by
+# unixODBC / the Windows ODBC driver manager, so we do not pull in
+# a second pooler on top. The crate is synchronous, matching the
+# `spawn_blocking` model this crate uses for every other backend.
+#
+# We keep `odbc-api` on its DEFAULT features: that retains the
+# `odbc_version_3_80` feature upstream uses to expose ODBC 3.8
+# structs (the IBM Db2 12.1 driver is ODBC 3.8 compliant) and is
+# what makes `Environment::new()` compile cleanly. We deliberately
+# do NOT enable the `iodbc` feature, which switches the crate to
+# iODBC instead of unixODBC / Windows-ODBC -- iODBC does not bundle
+# the same Db2-client-friendly defaults and complicates operator
+# setups. We also do NOT use the `narrow` feature, which strips
+# `wchar` support: Db2 stores very long agent names / sender
+# identifiers where wide-char roundtripping helps.
+version = "2.2"
 optional = true
 
 [dev-dependencies]

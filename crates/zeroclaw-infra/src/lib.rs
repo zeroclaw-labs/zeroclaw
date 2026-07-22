@@ -5,6 +5,8 @@ pub mod acp_session_store;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
+#[cfg(feature = "backend-db2")]
+pub mod session_db2;
 #[cfg(feature = "backend-postgres")]
 pub mod session_postgres;
 pub mod session_queue;
@@ -139,6 +141,36 @@ pub fn make_session_backend(
         "oracle" => Err(uncompiled_backend_error("oracle")),
         #[cfg(not(feature = "backend-db2"))]
         "db2" => Err(uncompiled_backend_error("db2")),
+        #[cfg(feature = "backend-db2")]
+        "db2" => {
+            // PR 4 of the multi-database session backend series (the
+            // foundation series root: #9249; MySQL/MariaDB: #9250;
+            // Postgres: #9251; this one: Db2; next one: Oracle).
+            //
+            // The Db2 backend reads `ZEROCLAW_channels__db2_conn_str`
+            // (the canonical config-override env var documented on
+            // `ChannelsConfig.db2_conn_str`) and falls back to
+            // `ZEROCLAW_TEST_DB2_URL` for the live-DB integration
+            // tests. The connection string is a `DRIVER={DB2};...`
+            // ODBC attribute string consumed by `odbc-api` against the
+            // IBM Db2 CLI ODBC driver (`clidriver/`). Pool size comes
+            // from `ZEROCLAW_channels__pool_size`, mirroring the
+            // MySQL/MariaDB / Postgres backends.
+            //
+            // The `workspace_dir` and `pool_size` arguments are not
+            // material to the Db2 backend today: the CLI driver
+            // maintains its own session cache across calls in a
+            // process, and the CLI driver itself manages ODBC
+            // connection pooling (rather than us layering a separate
+            // pooler like r2d2 on top, which the odbc-api crate
+            // deliberately does not provide). We accept the same
+            // constructor signature as the sibling backends so the
+            // `make_session_backend` factory does not have to special-
+            // case the call site.
+            let backend =
+                session_db2::Db2SessionBackend::new(workspace_dir, session_db2::read_pool_size())?;
+            Ok(Arc::new(backend))
+        }
         other => {
             // Genuinely-unrecognized value (typo, leftover legacy
             // config, …). There is no live connection to risk — the
@@ -356,6 +388,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "backend-db2"))]
     fn make_session_backend_db2_fail_fast_when_feature_disabled() {
         assert_fail_fast_uncompiled("db2");
     }
