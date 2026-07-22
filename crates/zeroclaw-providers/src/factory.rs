@@ -1383,13 +1383,14 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::grok_cli::GrokCliModelProvider::new(
-            alias,
-            self.binary_path.as_deref(),
-            &self.working_directory,
-            self.extra_args.clone(),
-            self.base.timeout_secs,
-        )?))
+        Ok(Box::new(
+            crate::grok_cli::GrokCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .extra_args(self.extra_args.clone())
+                .timeout_secs(self.base.timeout_secs)
+                .build()?,
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {

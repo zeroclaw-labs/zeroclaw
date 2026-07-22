@@ -216,6 +216,71 @@ pub struct GrokCliModelProvider {
     timeout: Duration,
 }
 
+/// Typed builder for [`GrokCliModelProvider`].
+///
+/// `alias` and an existing absolute `working_directory` are required. Other
+/// values use the provider's fail-closed defaults when unset.
+#[must_use]
+pub struct GrokCliBuilder {
+    alias: String,
+    binary_path: Option<String>,
+    working_directory: Option<String>,
+    extra_args: Vec<String>,
+    timeout_secs: Option<u64>,
+}
+
+impl GrokCliBuilder {
+    /// Override the `grok` binary path. Whitespace-only inputs use PATH lookup.
+    pub fn binary_path(mut self, path: Option<&str>) -> Self {
+        self.binary_path = path
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    /// Set the subprocess cwd and ACP session boundary.
+    pub fn working_directory(mut self, path: &str) -> Self {
+        self.working_directory = Some(path.to_string());
+        self
+    }
+
+    /// Set operator-selected Grok global flags.
+    pub fn extra_args(mut self, args: Vec<String>) -> Self {
+        self.extra_args = args;
+        self
+    }
+
+    /// Set the complete ACP request deadline. Zero uses the provider default.
+    pub fn timeout_secs(mut self, timeout_secs: Option<u64>) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
+    pub fn build(self) -> anyhow::Result<GrokCliModelProvider> {
+        let binary_path = self
+            .binary_path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_GROK_CLI_BINARY));
+        let working_directory = GrokCliModelProvider::validate_working_directory(
+            self.working_directory.as_deref().unwrap_or_default(),
+        )?;
+        let extra_args = GrokCliModelProvider::normalize_and_validate_extra_args(self.extra_args)?;
+        let timeout = self
+            .timeout_secs
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_GROK_CLI_TIMEOUT);
+        Ok(GrokCliModelProvider {
+            alias: self.alias,
+            binary_path,
+            working_directory,
+            extra_args,
+            timeout,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct StderrSummary {
     bytes_seen: usize,
@@ -334,35 +399,15 @@ impl ProcessTreeGuard {
 }
 
 impl GrokCliModelProvider {
-    /// Create an ACP-backed provider.
-    ///
-    /// `working_directory` must be an existing absolute directory. The path is
-    /// canonicalized once and used both as the child cwd and ACP session cwd.
-    pub fn new(
-        alias: &str,
-        binary_path: Option<&str>,
-        working_directory: &str,
-        extra_args: Vec<String>,
-        timeout_secs: Option<u64>,
-    ) -> anyhow::Result<Self> {
-        let binary_path = binary_path
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_GROK_CLI_BINARY));
-        let working_directory = Self::validate_working_directory(working_directory)?;
-        let extra_args = Self::normalize_and_validate_extra_args(extra_args)?;
-        let timeout = timeout_secs
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_GROK_CLI_TIMEOUT);
-        Ok(Self {
+    /// Start a labelled construction chain for an ACP-backed provider.
+    pub fn builder(alias: &str) -> GrokCliBuilder {
+        GrokCliBuilder {
             alias: alias.to_string(),
-            binary_path,
-            working_directory,
-            extra_args,
-            timeout,
-        })
+            binary_path: None,
+            working_directory: None,
+            extra_args: Vec::new(),
+            timeout_secs: None,
+        }
     }
 
     fn validate_working_directory(value: &str) -> anyhow::Result<PathBuf> {
@@ -743,25 +788,27 @@ mod tests {
         extra: Vec<String>,
         timeout_secs: Option<u64>,
     ) -> GrokCliModelProvider {
-        GrokCliModelProvider::new(
-            "test",
-            binary,
-            cwd.to_str().expect("UTF-8 test path"),
-            extra,
-            timeout_secs,
-        )
-        .expect("provider")
+        GrokCliModelProvider::builder("test")
+            .binary_path(binary)
+            .working_directory(cwd.to_str().expect("UTF-8 test path"))
+            .extra_args(extra)
+            .timeout_secs(timeout_secs)
+            .build()
+            .expect("provider")
     }
 
     #[test]
-    fn new_requires_explicit_absolute_working_directory() {
-        let missing = match GrokCliModelProvider::new("test", None, "", vec![], None) {
+    fn builder_requires_explicit_absolute_working_directory() {
+        let missing = match GrokCliModelProvider::builder("test").build() {
             Ok(_) => panic!("blank cwd must fail"),
             Err(error) => error,
         };
         assert!(missing.to_string().contains("requires an explicit"));
 
-        let relative = match GrokCliModelProvider::new("test", None, "relative", vec![], None) {
+        let relative = match GrokCliModelProvider::builder("test")
+            .working_directory("relative")
+            .build()
+        {
             Ok(_) => panic!("relative cwd must fail"),
             Err(error) => error,
         };
@@ -769,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn new_canonicalizes_working_directory() {
+    fn builder_canonicalizes_working_directory() {
         let temp = TempDir::new().expect("tempdir");
         let model_provider = provider(None, temp.path(), vec![], None);
         assert_eq!(
@@ -781,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_reserved_transport_flags() {
+    fn builder_rejects_reserved_transport_flags() {
         let temp = TempDir::new().expect("tempdir");
         for flag in [
             "--prompt-file",
@@ -793,42 +840,38 @@ mod tests {
             "agent",
             "stdio",
         ] {
-            let result = GrokCliModelProvider::new(
-                "test",
-                None,
-                temp.path().to_str().expect("UTF-8 test path"),
-                vec![flag.to_string()],
-                None,
-            );
+            let result = GrokCliModelProvider::builder("test")
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .extra_args(vec![flag.to_string()])
+                .build();
             assert!(result.is_err(), "reserved flag must fail: {flag}");
         }
     }
 
     #[test]
-    fn new_rejects_positional_extra_args() {
+    fn builder_rejects_positional_extra_args() {
         let temp = TempDir::new().expect("tempdir");
         for extra in [
             vec!["PRIVATE_PROMPT".to_string()],
             vec!["-pPRIVATE_PROMPT".to_string()],
             vec!["--".to_string()],
         ] {
-            let result = GrokCliModelProvider::new(
-                "test",
-                None,
-                temp.path().to_str().expect("UTF-8 test path"),
-                extra,
-                None,
-            );
+            let result = GrokCliModelProvider::builder("test")
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .extra_args(extra)
+                .build();
             assert!(result.is_err(), "positional form must fail");
         }
     }
 
     #[test]
-    fn new_validates_values_that_could_consume_acp_command() {
+    fn builder_validates_values_that_could_consume_acp_command() {
         let temp = TempDir::new().expect("tempdir");
         let cwd = temp.path().to_str().expect("UTF-8 test path");
-        let missing_value =
-            GrokCliModelProvider::new("test", None, cwd, vec!["--tools".to_string()], None);
+        let missing_value = GrokCliModelProvider::builder("test")
+            .working_directory(cwd)
+            .extra_args(vec!["--tools".to_string()])
+            .build();
         let error = match missing_value {
             Ok(_) => panic!("missing inline value must fail"),
             Err(error) => error,
@@ -836,18 +879,15 @@ mod tests {
         assert!(error.to_string().contains("missing its value"));
 
         assert!(
-            GrokCliModelProvider::new(
-                "test",
-                None,
-                cwd,
-                vec![
+            GrokCliModelProvider::builder("test")
+                .working_directory(cwd)
+                .extra_args(vec![
                     "--tools".to_string(),
                     "Read,Grep".to_string(),
                     "--always-approve".to_string(),
-                ],
-                None,
-            )
-            .is_ok()
+                ])
+                .build()
+                .is_ok()
         );
     }
 
