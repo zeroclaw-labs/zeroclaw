@@ -1,4 +1,4 @@
-//! Bounded one-shot ACP client for `grok agent stdio`.
+//! Internal bounded one-shot ACP client for `grok agent stdio`.
 //!
 //! The wire sequence follows Grok Build's documented example:
 //! initialize → authenticate → session/new → session/prompt. Assistant text
@@ -33,7 +33,7 @@ const OUTPUT_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
 const OUTPUT_SETTLE_INTERVALS: usize = 2;
 
 #[derive(Debug, Error)]
-pub(crate) enum AcpError {
+pub(super) enum AcpError {
     #[error("Grok ACP transport failed while writing {phase}")]
     Write { phase: &'static str },
     #[error("Grok ACP transport failed while reading {phase}")]
@@ -61,7 +61,7 @@ pub(crate) enum AcpError {
 }
 
 impl AcpError {
-    pub(crate) fn error_key(&self) -> &'static str {
+    pub(super) fn error_key(&self) -> &'static str {
         match self {
             Self::Write { .. } => "grok_cli_acp_write_failed",
             Self::Read { .. } => "grok_cli_acp_read_failed",
@@ -80,7 +80,7 @@ impl AcpError {
 }
 
 /// Run one prompt against an already-spawned `grok agent stdio` child.
-pub(crate) async fn run_oneshot_prompt<W, R>(
+pub(super) async fn run_oneshot_prompt<W, R>(
     stdin: &mut W,
     stdout: R,
     prompt: &str,

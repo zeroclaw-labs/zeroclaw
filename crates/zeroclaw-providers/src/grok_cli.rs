@@ -47,6 +47,8 @@
 //! - Only temperatures `0.7` and `1.0` are accepted because Grok Build has no
 //!   corresponding sampling flag.
 
+mod acp;
+
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -658,12 +660,7 @@ impl GrokCliModelProvider {
 
         let request_result = timeout(
             self.timeout,
-            crate::grok_cli_acp::run_oneshot_prompt(
-                &mut stdin,
-                stdout,
-                message,
-                &self.working_directory,
-            ),
+            acp::run_oneshot_prompt(&mut stdin, stdout, message, &self.working_directory),
         )
         .await;
 
