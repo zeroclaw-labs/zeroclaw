@@ -2259,7 +2259,6 @@ mod tests {
         std::fs::create_dir_all(&bin_dir).unwrap();
         let exe = bin_dir.join("zeroclaw");
         std::fs::write(&exe, b"zeroclaw").unwrap();
-
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Known companion — must be installed.
@@ -2296,6 +2295,9 @@ mod tests {
         std::fs::create_dir_all(&bin_dir).unwrap();
         let exe = bin_dir.join("zeroclaw");
         std::fs::write(&exe, b"zeroclaw").unwrap();
+        let installed_dist = bin_dir.join("web").join("dist");
+        std::fs::create_dir_all(&installed_dist).unwrap();
+        std::fs::write(installed_dist.join("index.html"), b"OLD INDEX").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
