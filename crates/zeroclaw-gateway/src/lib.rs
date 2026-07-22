@@ -2579,7 +2579,11 @@ fn plugin_webhook_routes(
     Router::new()
         .route(
             "/plugin/{path}",
-            get(handle_plugin_webhook).post(handle_plugin_webhook),
+            get(handle_plugin_webhook)
+                .post(handle_plugin_webhook)
+                // Axum otherwise falls back from HEAD to the GET handler. Keep
+                // the plugin contract closed to the documented methods only.
+                .head(|| async { StatusCode::METHOD_NOT_ALLOWED }),
         )
         .layer(axum::Extension(registry))
 }
@@ -4693,6 +4697,33 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_text(response).await, "echo-me-42");
         worker.await.expect("verification worker completes");
+    }
+
+    #[tokio::test]
+    async fn plugin_webhook_router_rejects_head_without_dispatching() {
+        use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = admin_paircode_state(&tmp, false, false);
+        let registry = Arc::new(PluginWebhookRegistry::new());
+        let (sink, mut rx) = tokio::sync::mpsc::channel(1);
+        assert!(registry.insert("fixture".to_string(), sink));
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/plugin/fixture?challenge=must-not-dispatch")
+            .body(Body::empty())
+            .expect("valid HEAD request");
+        let response = plugin_webhook_test_router(state, registry)
+            .oneshot(request)
+            .await
+            .expect("plugin route is infallible");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            rx.try_recv().is_err(),
+            "HEAD must not cross the plugin boundary"
+        );
     }
 
     #[tokio::test]
