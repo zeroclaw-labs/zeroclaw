@@ -10,13 +10,16 @@ pub enum PluginError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("invalid plugin instance identity: {0}")]
+    InvalidInstanceId(String),
+
     #[error("failed to load WASM module: {0}")]
     LoadFailed(String),
 
     #[error("plugin execution failed: {0}")]
     ExecutionFailed(String),
 
-    #[error("permission denied: plugin '{plugin}' requires '{permission}'")]
+    #[error("permission denied: plugin '{plugin}' is not authorized for '{permission}'")]
     PermissionDenied { plugin: String, permission: String },
 
     #[error("plugin '{0}' is already loaded")]

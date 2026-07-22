@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(parsed.tool_name, "shell");
     }
 
-    // ── Regression: #4247 default approved tools in channels ──
+    // ──default approved tools in channels ──
 
     #[test]
     fn non_interactive_allows_default_auto_approve_tools() {

@@ -1,5 +1,4 @@
 // Line-based markdown chunker — splits documents into semantic chunks.
-//
 // Splits on markdown headings and paragraph boundaries, respecting
 // a max token limit per chunk. Preserves heading context.
 
@@ -13,14 +12,6 @@ pub struct Chunk {
     pub heading: Option<Rc<str>>,
 }
 
-/// Split markdown text into chunks, each under `max_tokens` approximate tokens.
-///
-/// Strategy:
-/// 1. Split on `## ` and `# ` headings (keeps heading with its content)
-/// 2. If a section exceeds `max_tokens`, split on blank lines (paragraphs)
-/// 3. If a paragraph still exceeds, split on line boundaries
-///
-/// Token estimation: ~4 chars per token (rough English average).
 pub fn chunk_markdown(text: &str, max_tokens: usize) -> Vec<Chunk> {
     if text.trim().is_empty() {
         return Vec::new();

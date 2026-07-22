@@ -1,8 +1,4 @@
 //! Lightweight LLM task tool for structured JSON-only sub-calls.
-//!
-//! Runs a single prompt through an LLM model_provider with no tool access and
-//! optionally validates the response against a caller-supplied JSON Schema.
-//! Ideal for structured data extraction in workflows.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -203,11 +199,6 @@ impl Tool for LlmTaskTool {
     }
 }
 
-/// Validate a JSON response string against a JSON Schema value.
-///
-/// Performs lightweight validation: parses the response as JSON, checks that
-/// required fields exist, and verifies basic type constraints (string, number,
-/// integer, boolean, array, object) for each declared property.
 fn validate_json_response(response: &str, schema: &serde_json::Value) -> Result<String, String> {
     // Strip markdown code fences if the LLM wrapped the response
     let trimmed = response.trim();

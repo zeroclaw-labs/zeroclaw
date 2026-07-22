@@ -1,42 +1,5 @@
 //! `zeroclaw-spawn` — the sanctioned interface against `tokio::spawn` for
 //! the ZeroClaw workspace.
-//!
-//! Every call site that needs to fan out a background task must go
-//! through [`spawn!`] instead of reaching for `tokio::spawn` directly.
-//! Doing so buys two things, neither of which changes runtime behavior:
-//!
-//! 1. **Attribution propagation.** The spawned future is wrapped with
-//!    `Instrument::in_current_span()` so any `record!` it emits while
-//!    running inherits the caller's `attribution_span` (channel, agent,
-//!    session, cron job, …). Without this wrapper, tokio detaches the
-//!    task from the caller's span stack and records orphan.
-//!
-//! 2. **Lifecycle telemetry.** Two structured log events are emitted
-//!    through the standard `zeroclaw_log::record!` pipeline:
-//!    - `runtime.task.spawn` (`Action::Spawn`) at spawn time, attributed
-//!      to the caller's current span.
-//!    - `runtime.task.spawn` (`Action::Complete`) when the future
-//!      resolves, attributed to the spawned task's span (which is the
-//!      caller's by inheritance), carrying elapsed `duration_ms`.
-//!
-//!    Both records carry `zc_file` / `zc_line` of the call site via the
-//!    standard `record!` machinery, and a `task_site` attribute giving
-//!    the same as a single string for grep convenience.
-//!
-//! The returned [`tokio::task::JoinHandle`] is the unmodified handle
-//! from `tokio::spawn` — panics propagate as `JoinError::Panic`, cancel
-//! semantics are unchanged, and the future's output type is preserved.
-//! `zeroclaw-spawn` adds telemetry, not control flow.
-//!
-//! ## Layering
-//!
-//! `zeroclaw-spawn` depends on `zeroclaw-log`. Crates that already depend
-//! on `zeroclaw-log` (i.e. almost everything in the workspace) can add
-//! `zeroclaw-spawn` as a peer dependency without inverting the graph.
-//! The lowest-level crate (`zeroclaw-api`) intentionally does NOT depend
-//! on `zeroclaw-spawn` — its small handful of internal spawn needs go
-//! through the workspace-wide `disallowed_methods` exemption documented
-//! in `clippy.toml`.
 
 #![forbid(unsafe_code)]
 
@@ -57,26 +20,6 @@ pub mod __private {
 /// of recomputing it.
 pub const TASK_EVENT_NAME: &str = "runtime.task.spawn";
 
-/// Spawn a future onto the current tokio runtime with attribution
-/// propagation and lifecycle telemetry. Drop-in replacement for
-/// `tokio::spawn` — same signature, same `JoinHandle<T>`, same panic
-/// and cancel semantics.
-///
-/// ```ignore
-/// use zeroclaw_spawn::spawn;
-///
-/// let handle = spawn!(async move {
-///     do_work().await
-/// });
-/// let output = handle.await?;
-/// ```
-///
-/// On spawn the macro emits one `Action::Spawn` record attributed to
-/// the caller's current span. When the future resolves it emits one
-/// `Action::Complete` record with elapsed `duration_ms`, attributed to
-/// the spawned task's span (which is the caller's by inheritance via
-/// `in_current_span`). Neither record alters the future's output or the
-/// returned `JoinHandle`.
 #[macro_export]
 macro_rules! spawn {
     ($body:expr) => {{
@@ -190,13 +133,6 @@ mod tests {
         assert_eq!(handle.await.unwrap(), "done");
     }
 
-    /// Load-bearing test for the whole point of this crate: an event
-    /// emitted *inside* a spawned task must observe the caller's
-    /// `attribution_span` on its span stack. If this regresses, every
-    /// `record!` from inside a `spawn!` body silently re-attributes to
-    /// the tokio root and dashboards lose session/channel/agent
-    /// attribution — exactly the bug `.in_current_span()` exists to
-    /// prevent.
     #[tokio::test]
     async fn spawn_propagates_callers_span_into_task() {
         let capture = SpanCapture::default();

@@ -13,7 +13,6 @@ const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
 const MAX_BASE64_BYTES: usize = 2_097_152;
 
 /// Tool for capturing screenshots using platform-native commands.
-///
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
 pub struct ScreenshotTool {
