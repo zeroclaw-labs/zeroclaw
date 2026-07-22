@@ -1,4 +1,4 @@
-//! RFC #7141 inbound authentication seam: the [`AuthProvider`] trait + a
+//! RFC inbound authentication seam: the [`AuthProvider`] trait + a
 //! default-deny [`ProviderRegistry`].
 //!
 //! Each provider verifies ONE credential kind (OIDC token, SSH signature, peer
@@ -24,15 +24,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason};
 
-/// A credential presented for verification (the input to the #7141 `initialize`
+/// A credential presented for verification (the input to the `initialize`
 /// handshake). Secret material is **redacted** in `Debug` — never log it raw.
 ///
-/// Scoped to the accepted RFC #7141 provider set (bearer for native/OIDC, SSH
+/// Scoped to the accepted RFC provider set (bearer for native/OIDC, SSH
 /// signature, peer uid). Not-yet-accepted credential kinds (e.g. a local
 /// username/password) are added by their own scoped change, so this seam never
 /// silently carries an unaccepted credential shape.
 ///
-/// SECURITY follow-up (#7141): the secret-bearing arms are redacted in `Debug`
+/// SECURITY follow-up: the secret-bearing arms are redacted in `Debug`
 /// and never `Eq`-compared here, but the plaintext is not yet zeroized on drop.
 /// In-memory secret scrubbing is currently absent tree-wide (even the encrypted
 /// `config::secrets` store keeps plaintext un-scrubbed), so a `Zeroizing`/
@@ -73,7 +73,7 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-/// An RFC #7141 authentication provider: verifies one credential kind and emits a
+/// An RFC authentication provider: verifies one credential kind and emits a
 /// uniform [`AuthOutcome`]. Implementations live beside their identity source
 /// (e.g. `oidc` next to the IdP introspection code, `native` over `PairingGuard`).
 ///
@@ -129,7 +129,7 @@ impl ProviderRegistry {
     }
 
     /// The configured provider names, in registration order — the enumeration
-    /// surface #7141 exposes over RPC (no hardcoded provider lists).
+    /// surface exposes over RPC (no hardcoded provider lists).
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.name()).collect()
@@ -293,7 +293,7 @@ mod tests {
         ));
     }
 
-    /// Regression (review #8063): a provider that accepts a credential and rejects
+    /// Regression (review): a provider that accepts a credential and rejects
     /// it with a SPECIFIC reason (MfaRequired) must not be bypassed by a later
     /// provider that would authenticate the same credential.
     #[tokio::test]

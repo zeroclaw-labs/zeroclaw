@@ -1,10 +1,4 @@
 //! Shared built-in channel slash command catalogue.
-//!
-//! This crate is the source of truth for built-in command metadata that is
-//! accepted or advertised by channel runtimes. Web and TUI command discovery are
-//! intentionally not represented here until those clients consume a generated or
-//! RPC-backed catalogue; keeping local client command lists out of this crate
-//! avoids pretending duplicated metadata is shared state.
 
 use serde::Serialize;
 
@@ -58,11 +52,6 @@ pub enum CommandExecution {
     GoalAdmission,
 }
 
-/// Built-in command metadata.
-///
-/// This is descriptive catalogue state, not an execution dispatcher. Command
-/// handlers still parse their own arguments so the catalogue does not become a
-/// second copy of runtime policy or command semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CommandSpec {
     /// Stable id for code that should not branch on display text.
@@ -261,11 +250,49 @@ mod tests {
     }
 
     #[test]
+    fn command_lookup_normalizes_case_whitespace_and_bot_suffix() {
+        assert_eq!(
+            normalize_command_name("  /MODEL@ZeroClaw_Bot  "),
+            Some("model".to_string())
+        );
+        assert_eq!(
+            command_by_name("  /THINK@ZeroClaw_Bot  ").map(|spec| spec.id),
+            Some(BuiltinCommandId::Thinking)
+        );
+        assert_eq!(
+            parse_command_token("  /NEW-SESSION@ZeroClaw_Bot  ", CommandSurface::Channel)
+                .map(|parsed| parsed.command.id),
+            Some(BuiltinCommandId::New)
+        );
+    }
+
+    #[test]
     fn surface_filter_rejects_unavailable_commands() {
         assert!(parse_command_token("/config", CommandSurface::Channel).is_some());
         assert!(parse_command_token("/config", CommandSurface::Web).is_none());
         assert!(parse_command_token("/attach", CommandSurface::Tui).is_none());
         assert!(parse_command_token("/attach", CommandSurface::Channel).is_none());
+    }
+
+    #[test]
+    fn normalize_command_name_empty_and_whitespace_returns_none() {
+        assert_eq!(normalize_command_name(""), None);
+        assert_eq!(normalize_command_name("   "), None);
+        assert_eq!(normalize_command_name("\t\n"), None);
+    }
+
+    #[test]
+    fn normalize_command_name_pure_slash_or_at_suffix_returns_none() {
+        assert_eq!(normalize_command_name("/"), None);
+        assert_eq!(normalize_command_name("@bot"), None);
+        assert_eq!(normalize_command_name("/@bot"), None);
+        assert_eq!(normalize_command_name("  /  @bot  "), None);
+    }
+
+    #[test]
+    fn normalize_command_name_unicode_preserved() {
+        assert_eq!(normalize_command_name("/新"), Some("新".to_string()));
+        assert_eq!(normalize_command_name("/新@my_bot"), Some("新".to_string()));
     }
 
     #[test]

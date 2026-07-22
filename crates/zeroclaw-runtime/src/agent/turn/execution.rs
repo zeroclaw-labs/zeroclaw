@@ -1,30 +1,10 @@
 //! The resolved per-agent execution context the turn engine requires.
-//!
-//! `ToolLoop` (the engine's input) carries two kinds of state: values that are
-//! stable for every turn to a given agent (the model binding, the gated tool
-//! registry, the approval policy, the resolved runtime knobs) and values that
-//! change every message (history, streaming sinks, steering, the ingress
-//! envelope). This module groups the *stable* half into one bundle so the
-//! engine accepts it as a single required input.
-//!
-//! Two layers:
-//! - [`ResolvedModelAccess`]: the bare model binding (provider + model +
-//!   temperature). Any LLM call needs it; the agent bundle composes it.
-//! - [`ResolvedAgentExecution`]: the full per-agent policy: the model access
-//!   plus the tool registry, approval, observability, and the resolved runtime
-//!   knobs.
-//!
-//! G0 is a behavior-neutral regrouping: the field names mirror the engine's
-//! former flat `ToolLoop` fields one-for-one, so the loop body is unchanged
-//! after it destructures the bundle. Later epics move the *resolution* of these
-//! fields into a single `resolve()` constructor and seal the inputs so a turn
-//! cannot run with a partially- or un-resolved policy.
 
 use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::{ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -45,25 +25,28 @@ pub struct ResolvedModelAccess<'a> {
 }
 
 impl ResolvedModelAccess<'_> {
-    /// The one metered, attribution-preserving, non-streaming provider call.
-    ///
-    /// Budget-gate, then dispatch through [`ProviderDispatch`] (which opens the
-    /// single `attribution_span!` for the call - see #7748; do NOT wrap another),
-    /// then record token usage against the enclosing tool-loop cost tracker.
-    ///
-    /// Metering degrades to a no-op (not an error) when there is no
-    /// `TOOL_LOOP_COST_TRACKING_CONTEXT` scope on the current task (tests, CLI
-    /// without cost tracking): the budget check allows and usage recording is
-    /// skipped. This is the shared entry point for one-shot LLM queries that are
-    /// not full agentic turns (skill reflection today; the reply-intent
-    /// classifier, graceful-summary, and other ad-hoc callers as they are routed
-    /// through it). The engine's streaming turn call stays in
-    /// `provider_call::call_provider`, which additionally emits the
-    /// `TurnCtx`-bound announce/observer surface this method deliberately omits.
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        // This one-shot seam does NOT run `prepare_messages_for_provider` (the
+        // main iteration path does that upstream), so a tool-result
+        // `[AUDIO:/path]` in the history — e.g. the max-iteration graceful
+        // summary sends the accumulated history verbatim — would otherwise
+        // reach the provider as a raw filesystem path and be hallucinated
+        // over. Strip loadable audio markers here so every direct
+        // `run_model_query` caller is covered. Borrows untouched when clean.
+        let ChatRequest {
+            messages,
+            tools,
+            thinking,
+        } = request;
+        let sanitized = multimodal::sanitize_audio_markers(messages);
+        let request = ChatRequest {
+            messages: &sanitized,
+            tools,
+            thinking,
+        };
         let resp = ProviderDispatch::from_ref(self.model_provider)
             .chat(request, self.model, self.temperature)
             .await?;
@@ -76,11 +59,6 @@ impl ResolvedModelAccess<'_> {
     }
 }
 
-/// The per-agent-stable execution context the turn engine requires: the model
-/// binding plus the tool registry, policy, observability, and resolved runtime
-/// knobs that do not change between messages to the same agent. The engine
-/// takes this as one input; per-message state (history, streaming, steering,
-/// ingress, cancellation) stays on `ToolLoop` alongside it.
 pub struct ResolvedAgentExecution<'a> {
     /// Provider + model + temperature.
     pub model_access: ResolvedModelAccess<'a>,
@@ -94,6 +72,11 @@ pub struct ResolvedAgentExecution<'a> {
     pub approval: Option<&'a ApprovalManager>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config, for resolving the configured `vision_model_provider`'s
+    /// alias-specific runtime options (the `vision` override, endpoint URI,
+    /// credentials) on the vision route. `None` on configless (test) paths,
+    /// where the route falls back to the legacy factory.
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     /// Agentic loop iteration cap.
     pub max_tool_iterations: usize,
     /// Lifecycle hooks; `None` when unconfigured.
@@ -132,6 +115,9 @@ pub struct ResolvedIo<'a> {
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config for vision-route provider-alias resolution; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::config`].
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     pub hooks: Option<&'a HookRunner>,
     pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,
     pub model_switch_callback: Option<ModelSwitchCallback>,
@@ -154,13 +140,6 @@ pub struct ResolvedRuntimeKnobs<'a> {
 }
 
 impl<'a> ResolvedAgentExecution<'a> {
-    /// The single seam every turn-construction path produces the bundle through,
-    /// so a turn's per-agent policy is assembled in one place rather than re-derived
-    /// inline at each call site. Today it spreads already-resolved inputs into the
-    /// bundle (behavior-neutral); later surface PRs move the per-field resolution
-    /// (tools via a scoped registry, approval, the runtime knobs) into this
-    /// constructor and seal the inputs, at which point the flat fields collapse into
-    /// the [`ResolvedIo`] / [`ResolvedRuntimeKnobs`] layers passed here.
     pub fn resolve(
         model_access: ResolvedModelAccess<'a>,
         io: ResolvedIo<'a>,
@@ -173,6 +152,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             silent: io.silent,
             approval: io.approval,
             multimodal_config: io.multimodal_config,
+            config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,
             hooks: io.hooks,
             excluded_tools: runtime.excluded_tools,

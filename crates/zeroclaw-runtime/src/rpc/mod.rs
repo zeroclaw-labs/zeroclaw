@@ -1,4 +1,4 @@
-//! Transport-agnostic JSON-RPC 2.0 dispatch for the runtime. See #6837.
+//! Transport-agnostic JSON-RPC 2.0 dispatch for the runtime.
 
 pub mod approval_channel;
 pub mod attachments;

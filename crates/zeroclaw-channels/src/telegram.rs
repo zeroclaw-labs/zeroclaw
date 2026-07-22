@@ -363,13 +363,6 @@ fn is_image_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Map a TTS audio output format to the Telegram send method, multipart field
-/// name, upload filename, and MIME type.
-///
-/// Telegram `sendVoice` only renders OGG/Opus as a true voice note, so only
-/// `opus`/`ogg` takes that path. Every other format (WAV from Groq Orpheus or
-/// Piper, MP3 from ElevenLabs/Google/Edge, …) is uploaded via `sendAudio` with
-/// its real MIME type so it stays playable instead of being mislabeled.
 fn telegram_audio_send_spec(
     format: &str,
 ) -> anyhow::Result<(&'static str, &'static str, &'static str, &'static str)> {
@@ -396,12 +389,6 @@ fn telegram_audio_send_spec(
     })
 }
 
-/// Build the user-facing content string for an incoming attachment.
-///
-/// Photos with a recognized image extension use `[IMAGE:/path]` so the
-/// multimodal pipeline can validate vision capability. Non-image files
-/// always use `[Document: name] /path` regardless of how Telegram
-/// classified them.
 fn format_attachment_content(
     kind: IncomingAttachmentKind,
     local_filename: &str,
@@ -555,11 +542,6 @@ pub struct TelegramChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle. `None` in tests and one-shot
-    /// builds (pairing then doesn't survive restart). `Some` in the
-    /// long-running daemon, wired via `.with_persistence(config)`.
-    /// RwLock so concurrent peer reads from sibling channels don't
-    /// serialize; only the rare pairing-write path takes the exclusive lock.
     persist: Option<Arc<RwLock<Config>>>,
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
@@ -623,12 +605,31 @@ impl TelegramChannel {
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         mention_only: bool,
     ) -> Self {
+        let alias = alias.into();
         let has_peers = !peer_resolver().is_empty();
         let pairing = if has_peers {
             None
         } else {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
+                // Surface the one-time bind code through the structured log,
+                // not just stdout. A backgrounded daemon (launchd/systemd/
+                // GUI-spawned) discards stdout, so the println! alone leaves
+                // the operator with no way to retrieve the code. The log
+                // lands in runtime-trace.jsonl, the gateway log stream, and
+                // `zeroclaw service logs`. Tag it `Channel` (not the default
+                // `Internal`) so it survives the web Logs page's default
+                // hide-internal filter and is visible without unticking it.
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias.as_str(),
+                            "pairing_code": code.as_str(),
+                        })),
+                    "Telegram pairing required; one-time bind code issued"
+                );
                 println!("  🔐 Telegram pairing required. One-time bind code: {code}");
                 println!("     Send `{TELEGRAM_BIND_COMMAND} <code>` from your Telegram account.");
             }
@@ -637,7 +638,7 @@ impl TelegramChannel {
 
         Self {
             bot_token,
-            alias: alias.into(),
+            alias,
             peer_resolver,
             persist: None,
             pairing,
@@ -744,16 +745,6 @@ impl TelegramChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                // Wire the resolved STT backend alias here so the channel-internal
-                // voice path (`try_parse_voice_message` -> `manager.transcribe`)
-                // dispatches to a configured provider. The orchestrator only wires
-                // the alias for the MediaPipeline/attachment path, which inbound
-                // Telegram voice notes never traverse. Bind to the sole registered
-                // provider when exactly one is configured so the single-provider
-                // case dispatches without an agent context; multi-provider setups
-                // keep the alias empty and still require explicit
-                // `agent.<alias>.transcription_provider` routing through the
-                // orchestrator (mirrors `wati.rs` / `lark.rs` / `mattermost.rs`).
                 let names = m.available_providers();
                 let m = if names.len() == 1 {
                     let only = names[0].to_string();
@@ -777,14 +768,6 @@ impl TelegramChannel {
         self
     }
 
-    /// Load typed `[providers.transcription.<family>.<alias>]` entries into the
-    /// channel-internal `TranscriptionManager` and bind `agent_alias` as the
-    /// resolved provider. Must be called after `with_transcription`.
-    ///
-    /// If no legacy manager exists yet (e.g. `[transcription]` is absent or
-    /// disabled), an empty manager shell is created first so typed-only configs
-    /// still work. The full dotted alias (e.g. `"groq.default"`) is stored
-    /// without stripping so it resolves against the typed provider keys.
     pub fn with_typed_transcription_providers(
         mut self,
         typed: &zeroclaw_config::providers::TranscriptionProviders,
@@ -836,18 +819,8 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure text-to-speech for outgoing voice replies.
-    ///
-    /// Builds a [`super::tts::TtsManager`] from the
-    /// `[tts_providers.<type>.<alias>]` map. Disabled when `[tts].enabled = false`
-    /// or when the manager fails to construct (logged at warn).
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            // Bind the TTS manager to the agent that owns THIS channel so the
-            // voice reply uses that agent's `tts_provider`. Without this the
-            // shared manager resolves the lexicographically-smallest enabled
-            // agent, which silently breaks TTS when that agent has no
-            // `tts_provider` set (e.g. a background/delegate agent).
             let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
             match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
@@ -951,7 +924,7 @@ impl TelegramChannel {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot-token=<token>` to configure.",
+                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot_token <token>` to configure.",
                     self.alias
                 );
             }
@@ -994,6 +967,18 @@ impl TelegramChannel {
             .as_ref()
             .and_then(PairingGuard::pairing_code)
             .is_some()
+    }
+
+    /// Build the operator-facing `zeroclaw channel bind-telegram` command for
+    /// this channel's alias. The CLI defaults to the `default` alias, so only
+    /// non-default aliases need the explicit `--alias` flag — emitting it for
+    /// the default case would just be noise.
+    fn suggested_bind_command(alias: &str, identity: &str) -> String {
+        if alias == "default" {
+            format!("zeroclaw channel bind-telegram {identity}")
+        } else {
+            format!("zeroclaw channel bind-telegram {identity} --alias {alias}")
+        }
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -1120,17 +1105,6 @@ impl TelegramChannel {
         }
     }
 
-    /// Check whether a voice reply should be queued for the given recipient and
-    /// content. Shared between `send()` and `finalize_draft()` so the TTS
-    /// voice-reply path works regardless of `stream_mode`.
-    ///
-    /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
-    /// debounce is skipped and `synthesize_and_send_voice` is called directly,
-    /// since the text is already the final response.
-    /// Returns true if this recipient should receive a TTS voice reply —
-    /// either because they triggered a voice-note session (`voice_chats`) or
-    /// because their peer group has `output_modality = "voice"` in config
-    /// (resolved live via `voice_peer_resolver`).
     fn is_voice_chat(&self, recipient: &str) -> bool {
         self.voice_chats
             .lock()
@@ -1479,24 +1453,6 @@ impl TelegramChannel {
             .is_some_and(|id| id == bot_id)
     }
 
-    /// Apply the `mention_only` gate to a non-text update (photo / document /
-    /// voice) using its caption as the channel for the mention.
-    ///
-    /// Returns:
-    /// - `Some(None)` — gate does not apply (DM, or `mention_only = false`,
-    ///   or the message is not in a group). The caller should use the raw
-    ///   caption / transcript as-is.
-    /// - `Some(Some(trimmed))` — caption mentions the bot; the trimmed
-    ///   caption (mention preserved) is suitable for use as message content.
-    /// - `None` — gated and rejected; the caller must drop the update
-    ///   without performing any expensive work (no download, no
-    ///   transcription).
-    ///
-    /// Voice notes typically arrive without a caption, so under
-    /// `mention_only = true` they are rejected here before transcription
-    /// runs. If a future change wants to honor a verbal mention inside the
-    /// transcript, this gate would need to be split into a pre-download and
-    /// a post-transcription stage. See #6229.
     fn check_media_mention_gate(
         &self,
         message: &serde_json::Value,
@@ -1699,19 +1655,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or_else(|| "YOUR_TELEGRAM_ID".to_string());
 
+        // Emit the bind command scoped to THIS channel's alias. The CLI
+        // handler defaults to the `default` alias, so an alias-less command
+        // would silently bind the wrong peer group for a non-default agent
+        // and the bot would keep demanding approval.
+        let bind_command = Self::suggested_bind_command(&self.alias, &suggested_identity);
+
         let _ = self
             .send(&SendMessage::new(
                 format!(
-                    "🔐 This bot requires operator approval.\n\nCopy this command to operator terminal:\n`zeroclaw channel bind-telegram {suggested_identity}`\n\nAfter operator runs it, send your message again."
+                    "🔐 This bot requires operator approval.\n\nCopy this command to the operator terminal:\n`{bind_command}`\n\nAfter the operator runs it, send your message again."
                 ),
                 &chat_id,
             ))
             .await;
 
-        if self.pairing_code_active() {
+        // Only offer the `/bind <code>` path while the channel is genuinely
+        // unpaired. Once peers exist (resolved live), the one-time code is
+        // moot and the hint just confuses an operator who already authorized
+        // someone — the "already assigned but still asks" complaint.
+        if self.pairing_code_active() && (self.peer_resolver)().is_empty() {
             let _ = self
                 .send(&SendMessage::new(
-                    "ℹ️ If operator provides a one-time pairing code, you can also run `/bind <code>`.",
+                    "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
                     &chat_id,
                 ))
                 .await;
@@ -1766,7 +1732,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Extract attachment metadata from an incoming Telegram message (document or photo).
-    ///
     /// Returns `None` for text-only, voice, and other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         // Try document first
@@ -1811,12 +1776,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         None
     }
 
-    /// Attempt to parse a Telegram update as a document/photo attachment.
-    ///
-    /// Downloads the file to `{workspace_dir}/telegram_files/` and returns a
-    /// `ChannelMessage` with the local file path. Returns `None` if the message
-    /// is not an attachment, workspace_dir is not configured, or the file exceeds
-    /// size limits.
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
@@ -1853,7 +1812,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Apply mention_only gate before downloading. Photo / document
         // updates carry no `text` field, so the text-only gate in
         // `parse_update_message` can never see them and they used to slip
-        // through unconditionally. See #6229.
+        // through unconditionally.
         let gated_caption =
             self.check_media_mention_gate(message, attachment.caption.as_deref())?;
 
@@ -1998,7 +1957,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
-    ///
     /// Returns `None` if the message is not a voice message, transcription is disabled,
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
@@ -2031,13 +1989,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Apply mention_only gate before downloading + transcribing. Voice
-        // notes typically have no caption, so under `mention_only = true`
-        // they are rejected here — the bot has no reliable way to know it
-        // was mentioned without first transcribing, and we don't want to
-        // pay that cost for messages that will likely be dropped. See #6229.
-        // The transcription itself is discarded; we only care whether the
-        // gate returns Some (allowed) vs None (rejected).
         let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
         self.check_media_mention_gate(message, voice_caption)?;
 
@@ -2190,7 +2141,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Build a forwarding attribution prefix from Telegram forward fields.
-    ///
     /// Returns `Some("[Forwarded from ...] ")` when the message is forwarded,
     /// `None` otherwise.
     fn format_forward_attribution(message: &serde_json::Value) -> Option<String> {
@@ -2275,12 +2225,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     fn extract_reply_context(&self, message: &serde_json::Value) -> Option<String> {
         let reply = message.get("reply_to_message")?;
 
-        // Skip the auto-injected topic-root reference Telegram adds to every
-        // message in a non-General forum topic. Its message_id equals the
-        // parent message's message_thread_id. Treating it as a real reply
-        // produces a spurious `> @user:\n> [Message]` blockquote prefix that
-        // downstream reply-intent classification reads as "user is replying
-        // to someone else" and rejects.
         let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
         let thread_id = message
             .get("message_thread_id")
@@ -2361,17 +2305,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let is_group = Self::is_group_message(message);
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                // If the user is replying directly to the bot's message, bypass
-                // the mention check — replies are an unambiguous signal of intent.
-                if !Self::contains_bot_mention(text, bot_username) {
-                    let bot_id = *self.bot_id.lock();
-                    if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
-                        return None;
-                    }
+            let bot_username = bot_username.as_ref()?;
+            // If the user is replying directly to the bot's message, bypass
+            // the mention check — replies are an unambiguous signal of intent.
+            if !Self::contains_bot_mention(text, bot_username) {
+                let bot_id = *self.bot_id.lock();
+                if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                    return None;
                 }
-            } else {
-                return None;
             }
         }
 
@@ -3300,13 +3241,6 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
-    /// Telegram's `getMe` username, populated lazily by
-    /// `fetch_bot_username` and cached in `bot_username`. Returning
-    /// the cache here lets the SDK self-loop guard
-    /// (`Channel::drop_self_messages`) drop the bot's own messages
-    /// once the cache is hot. Before the first `getMe` resolves, the
-    /// cache is `None` and the guard falls through to the agent-loop
-    /// fallback in the orchestrator.
     fn self_handle(&self) -> Option<String> {
         self.bot_username.lock().clone()
     }
@@ -3755,11 +3689,6 @@ impl Channel for TelegramChannel {
             "channel listening for messages..."
         );
 
-        // Startup probe: claim the getUpdates slot before entering the long-poll loop.
-        // A previous daemon's 30-second poll may still be active on Telegram's server.
-        // We retry with timeout=0 until we receive a successful (non-409) response,
-        // confirming the slot is ours. This prevents the long-poll loop from entering
-        // a self-sustaining 409 cycle where each rejected request is immediately retried.
         loop {
             let url = self.api_url("getUpdates");
             let probe = serde_json::json!({
@@ -4456,11 +4385,6 @@ mod tests {
         assert_eq!(ch.name(), "telegram");
     }
 
-    /// Regression for #6999 / #7000: the channel-internal voice path
-    /// (`try_parse_voice_message` -> `manager.transcribe`) must dispatch to a
-    /// configured STT backend. When exactly one provider is registered,
-    /// `with_transcription` binds it as the resolved alias so `transcribe()`
-    /// no longer fails with "Agent has no transcription_provider configured".
     #[tokio::test]
     async fn telegram_with_transcription_binds_sole_provider_alias() {
         // SAFETY: test-only, single-threaded test runner.
@@ -4960,6 +4884,27 @@ mod tests {
     fn telegram_extract_bind_code_rejects_invalid_forms() {
         assert_eq!(TelegramChannel::extract_bind_code("/bind"), None);
         assert_eq!(TelegramChannel::extract_bind_code("/start"), None);
+    }
+
+    #[test]
+    fn suggested_bind_command_omits_alias_flag_for_default() {
+        // The CLI defaults to the `default` alias, so the short form must
+        // stay byte-identical for existing default-alias users.
+        assert_eq!(
+            TelegramChannel::suggested_bind_command("default", "123456789"),
+            "zeroclaw channel bind-telegram 123456789"
+        );
+    }
+
+    #[test]
+    fn suggested_bind_command_appends_alias_flag_for_non_default() {
+        // A non-default agent must get the `--alias` flag or the operator's
+        // copy-pasted command binds the wrong peer group and the bot keeps
+        // asking for approval.
+        assert_eq!(
+            TelegramChannel::suggested_bind_command("alerts", "123456789"),
+            "zeroclaw channel bind-telegram 123456789 --alias alerts"
+        );
     }
 
     #[test]
@@ -6129,11 +6074,6 @@ mod tests {
         msg
     }
 
-    /// Regression test for #6229 — when `mention_only = true` and a group
-    /// photo/document arrives without any caption mentioning the bot, the
-    /// gate must reject it. Before the fix, photo/document updates skipped
-    /// the gate entirely (the gate only inspected `message.text`) and the
-    /// bot replied to every photo posted in a group.
     #[test]
     fn check_media_mention_gate_rejects_group_media_without_mention() {
         let ch = TelegramChannel::new(
@@ -6165,9 +6105,6 @@ mod tests {
         );
     }
 
-    /// When the caption mentions the bot, the gate admits and returns the
-    /// trimmed caption with the mention preserved verbatim, matching the
-    /// text-message behavior of `normalize_incoming_content`.
     #[test]
     fn check_media_mention_gate_admits_and_preserves_caption_mention() {
         let ch = TelegramChannel::new(
@@ -6189,8 +6126,6 @@ mod tests {
         );
     }
 
-    /// `mention_only = true` only applies to groups. DMs always pass with
-    /// the caption preserved verbatim.
     #[test]
     fn check_media_mention_gate_passes_dm_unchanged() {
         let ch = TelegramChannel::new(
@@ -6222,7 +6157,6 @@ mod tests {
         );
     }
 
-    /// When `mention_only = false` the gate is a no-op even in groups.
     #[test]
     fn check_media_mention_gate_passes_when_mention_only_disabled() {
         let ch = TelegramChannel::new(
@@ -6239,10 +6173,6 @@ mod tests {
         );
     }
 
-    /// Edge case: `mention_only = true` and the bot username has not yet
-    /// been resolved (e.g., `/getMe` hasn't completed). The gate must
-    /// reject in groups rather than fail-open, matching the existing text
-    /// path's behavior at telegram.rs:1640.
     #[test]
     fn check_media_mention_gate_rejects_group_when_bot_username_unknown() {
         let ch = TelegramChannel::new(
@@ -6262,7 +6192,7 @@ mod tests {
 
     // ─────────────────────────────────────────────────────────────────────
     // TG6: Channel platform limit edge cases for Telegram (4096 char limit)
-    // Prevents: Pattern 6 — issues #574, #499
+    // Prevents: Pattern 6 — issues
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -6818,20 +6748,6 @@ mod tests {
     // Live e2e: voice transcription via Groq Whisper + reply cache lookup
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Live test: voice transcription via Groq Whisper + reply cache lookup.
-    ///
-    /// Loads a pre-recorded MP3 fixture ("hello"), sends it to Groq Whisper
-    /// API, verifies the transcription contains "hello", then caches it and
-    /// checks that `extract_reply_context` returns the cached text instead
-    /// of the `[Voice message]` fallback placeholder.
-    ///
-    /// Skipped automatically when `GROQ_API_KEY` is not set.
-    /// Run: `GROQ_API_KEY=<key> cargo test --lib -- telegram::tests::e2e_live_voice_transcription_and_reply_cache --ignored`
-    ///
-    /// Production code no longer reads `GROQ_API_KEY` from env — this
-    /// test still uses the env var as a test-runner setup hook (the
-    /// canonical way to supply credentials to integration tests) and
-    /// plumbs the value into `TranscriptionConfig.api_key` directly.
     #[tokio::test]
     #[ignore = "requires GROQ_API_KEY environment variable"]
     async fn e2e_live_voice_transcription_and_reply_cache() {
@@ -7036,8 +6952,6 @@ mod tests {
 
     // ── Attachment content format tests ──────────────────────────────
 
-    /// Photo attachments with image extension must use `[IMAGE:/path]` marker
-    /// so the multimodal pipeline validates vision capability on the model_provider.
     #[test]
     fn attachment_photo_content_uses_image_marker() {
         let local_path = std::path::Path::new("/tmp/workspace/photo_123_45.jpg");
@@ -7051,7 +6965,6 @@ mod tests {
         assert!(content.ends_with(']'));
     }
 
-    /// Document attachments keep `[Document: name] /path` format.
     #[test]
     fn attachment_document_content_uses_document_label() {
         let local_path = std::path::Path::new("/tmp/workspace/report.pdf");
@@ -7064,7 +6977,6 @@ mod tests {
         assert!(!content.contains("[IMAGE:"));
     }
 
-    /// Markdown files must never produce `[IMAGE:]` markers (issue #1274).
     #[test]
     fn markdown_file_never_produces_image_marker() {
         let local_path = std::path::Path::new("/tmp/workspace/telegram_files/notes.md");
@@ -7088,7 +7000,6 @@ mod tests {
         );
     }
 
-    /// Non-image files classified as Photo fall back to `[Document:]` format.
     #[test]
     fn non_image_photo_falls_back_to_document_format() {
         for (filename, ext_path) in [
@@ -7113,7 +7024,6 @@ mod tests {
         }
     }
 
-    /// All recognized image extensions produce `[IMAGE:]` when classified as Photo.
     #[test]
     fn image_extensions_produce_image_marker() {
         for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp"] {
@@ -7128,8 +7038,6 @@ mod tests {
         }
     }
 
-    /// Multimodal pipeline must return 0 image markers for document-formatted
-    /// content — even for a file misclassified as Photo (issue #1274).
     #[test]
     fn markdown_attachment_not_detected_by_multimodal_image_markers() {
         let content = format_attachment_content(
@@ -7145,7 +7053,6 @@ mod tests {
         );
     }
 
-    /// `is_image_extension` helper recognizes image formats and rejects others.
     #[test]
     fn is_image_extension_recognizes_images() {
         assert!(is_image_extension(std::path::Path::new("photo.png")));
@@ -7163,8 +7070,6 @@ mod tests {
         assert!(!is_image_extension(std::path::Path::new("file")));
     }
 
-    /// `count_image_markers` from the multimodal module must detect the
-    /// `[IMAGE:]` marker produced by photo attachment formatting.
     #[test]
     fn photo_image_marker_detected_by_multimodal() {
         let photo_content = "[IMAGE:/tmp/workspace/photo_1_2.jpg]";
@@ -7178,7 +7083,6 @@ mod tests {
         );
     }
 
-    /// Photo with caption: `[IMAGE:/path]\n\nCaption text`.
     #[test]
     fn photo_image_marker_with_caption() {
         let local_path = std::path::Path::new("/tmp/workspace/photo_1_2.jpg");
@@ -7202,8 +7106,6 @@ mod tests {
 
     // ── E2E: attachment saves file and formats content ───────────────
 
-    /// Full pipeline test: simulate file download → save to workspace →
-    /// verify content format for both document and photo attachments.
     #[test]
     fn e2e_attachment_saves_file_and_formats_content() {
         let workspace = tempfile::tempdir().expect("create temp workspace");
@@ -7272,7 +7174,7 @@ mod tests {
             "caption text must be present in content"
         );
 
-        // ── Markdown file sent as Photo (issue #1274) ────────────────
+        // ── Markdown file sent as Photo────────────────
         let md_filename = "notes.md";
         let md_path = workspace.path().join(md_filename);
         std::fs::write(&md_path, b"# Hello\nSome markdown").expect("write md fixture");
@@ -7292,21 +7194,17 @@ mod tests {
 
     // ── Groq model_provider rejects photo with vision error ────────────────
 
-    /// Verify that the Groq model_provider (OpenAI-compatible) does not support
-    /// vision, so the existing `count_image_markers > 0 && !supports_vision()`
-    /// guard in `agent/loop_.rs` will reject photo messages.
     #[test]
     fn groq_provider_rejects_photo_with_vision_error() {
         use zeroclaw_providers::ModelProvider;
         use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 
-        let groq = OpenAiCompatibleModelProvider::new(
-            "test",
-            "Groq",
-            "https://api.groq.com/openai",
-            Some("fake_key"),
-            AuthStyle::Bearer,
-        );
+        let groq = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Groq")
+            .base_url("https://api.groq.com/openai")
+            .credential(Some("fake_key"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
 
         // Groq must not support vision.
         assert!(
@@ -7839,13 +7737,6 @@ mod tests {
 
     #[test]
     fn truncate_telegram_command_description_multibyte_within_char_limit() {
-        // Multibyte string within Telegram's 100-character description limit
-        // but well over 100 bytes in UTF-8 encoding. The function must use
-        // character count (not byte count) to decide whether to truncate, so
-        // a string like this should pass through unchanged with no trailing
-        // ellipsis. Construction is deterministic via `repeat` so the byte
-        // arithmetic is verifiable from the source: 31 ASCII bytes + 30 × 4
-        // bytes (`🌧` is U+1F327, 4 bytes UTF-8) = 151 bytes, 61 chars.
         let desc = format!("Multibyte weather description: {}", "🌧".repeat(30));
         assert!(desc.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
         assert!(desc.len() > TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
