@@ -1591,7 +1591,11 @@ mod tests {
         assert_eq!(&body[..], b"pinned-body");
 
         let received = server.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1, "exactly one request must reach the validated listener");
+        assert_eq!(
+            received.len(),
+            1,
+            "exactly one request must reach the validated listener"
+        );
     }
 
     /// A redirect target with a different synthetic hostname reaches ONLY
@@ -1631,17 +1635,15 @@ mod tests {
         let resp = tool
             .download_image_with_resolver(
                 "http://download-test-redirect.invalid/start.png",
-                &|host, _p| {
-                    async move {
-                        match host.as_str() {
-                            "download-test-redirect.invalid" => {
-                                Ok(vec![SocketAddr::from(([127, 0, 0, 1], redirect_port))])
-                            }
-                            "download-test-redirect-target.invalid" => {
-                                Ok(vec![SocketAddr::from(([127, 0, 0, 1], target_port))])
-                            }
-                            other => panic!("unexpected resolver host: {other}"),
+                &|host, _p| async move {
+                    match host.as_str() {
+                        "download-test-redirect.invalid" => {
+                            Ok(vec![SocketAddr::from(([127, 0, 0, 1], redirect_port))])
                         }
+                        "download-test-redirect-target.invalid" => {
+                            Ok(vec![SocketAddr::from(([127, 0, 0, 1], target_port))])
+                        }
+                        other => panic!("unexpected resolver host: {other}"),
                     }
                 },
             )
@@ -1684,10 +1686,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/start.png"))
-            .respond_with(ResponseTemplate::new(302).insert_header(
-                "location",
-                "http://public-looking-cdn.example/img.png",
-            ))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://public-looking-cdn.example/img.png"),
+            )
             .expect(1)
             .mount(&redirect_server)
             .await;
