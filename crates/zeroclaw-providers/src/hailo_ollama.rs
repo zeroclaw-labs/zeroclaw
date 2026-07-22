@@ -521,12 +521,14 @@ impl HailoOllamaModelProvider {
     }
 
     /// Hailo-Ollama 0.5.1 parses the decoded `content` string as JSON again
-    /// while rendering the prompt. Keep layout controls semantically intact
-    /// for that second parse by escaping them once more in the API value.
-    fn encode_layout_controls_for_native(content: &str) -> String {
+    /// while rendering the prompt. Preserve literal backslashes and layout
+    /// controls through that second parse by escaping them once more in the
+    /// API value.
+    fn encode_content_for_native_prompt(content: &str) -> String {
         let mut encoded = String::with_capacity(content.len());
         for character in content.chars() {
             match character {
+                '\\' => encoded.push_str(r"\\"),
                 '\r' => encoded.push_str(r"\r"),
                 '\n' => encoded.push_str(r"\n"),
                 '\t' => encoded.push_str(r"\t"),
@@ -536,20 +538,61 @@ impl HailoOllamaModelProvider {
         encoded
     }
 
-    fn truncate_content(content: &str, max_chars: usize) -> String {
+    /// Bound already-encoded native prompt content without splitting one of
+    /// the two-character escape units consumed by Hailo's second JSON parse.
+    fn truncate_native_content(content: &str, max_chars: usize) -> String {
         let char_count = content.chars().count();
         if char_count <= max_chars {
             return content.to_string();
         }
-        if max_chars <= 3 {
-            return content.chars().take(max_chars).collect();
+
+        let has_ellipsis = max_chars > 3;
+        let head_chars = if has_ellipsis {
+            (max_chars - 3) / 2
+        } else {
+            max_chars
+        };
+        let tail_chars = max_chars.saturating_sub(3 + head_chars);
+        let mut head = String::new();
+        let mut head_used = 0;
+        let mut collecting_head = true;
+        let mut tail_units = std::collections::VecDeque::new();
+        let mut tail_used = 0;
+        let mut chars = content.char_indices().peekable();
+
+        while let Some((start, character)) = chars.next() {
+            if character == '\\' {
+                let _ = chars.next();
+            }
+            let end = chars.peek().map_or(content.len(), |(index, _)| *index);
+            let unit = &content[start..end];
+            let unit_chars = unit.chars().count();
+
+            if collecting_head {
+                if head_used + unit_chars <= head_chars {
+                    head.push_str(unit);
+                    head_used += unit_chars;
+                } else {
+                    collecting_head = false;
+                }
+            }
+
+            if has_ellipsis {
+                tail_units.push_back(unit);
+                tail_used += unit_chars;
+                while tail_used > tail_chars {
+                    if let Some(removed) = tail_units.pop_front() {
+                        tail_used -= removed.chars().count();
+                    }
+                }
+            }
         }
 
-        let head_chars = (max_chars - 3) / 2;
-        let tail_chars = max_chars - 3 - head_chars;
-        let head: String = content.chars().take(head_chars).collect();
-        let tail_reversed: String = content.chars().rev().take(tail_chars).collect();
-        let tail: String = tail_reversed.chars().rev().collect();
+        if !has_ellipsis {
+            return head;
+        }
+
+        let tail = tail_units.into_iter().collect::<String>();
         format!("{head}...{tail}")
     }
 
@@ -603,8 +646,8 @@ impl HailoOllamaModelProvider {
             );
         }
 
-        let system = Self::truncate_content(system, system_budget);
-        let user = Self::truncate_content(user, user_budget);
+        let system = Self::truncate_native_content(system, system_budget);
+        let user = Self::truncate_native_content(user, user_budget);
         Ok(format!(
             "{INSTRUCTIONS_PREFIX}{system}{REQUEST_PREFIX}{user}"
         ))
@@ -634,7 +677,7 @@ impl HailoOllamaModelProvider {
                     "Hailo-Ollama bounded a merged history message"
                 );
             }
-            previous.content = Some(Self::truncate_content(
+            previous.content = Some(Self::truncate_native_content(
                 &format!("{previous_content} {content}"),
                 HAILO_MAX_MESSAGE_CHARS,
             ));
@@ -660,7 +703,10 @@ impl HailoOllamaModelProvider {
 
         messages.push(Message {
             role,
-            content: Some(Self::truncate_content(&content, HAILO_MAX_MESSAGE_CHARS)),
+            content: Some(Self::truncate_native_content(
+                &content,
+                HAILO_MAX_MESSAGE_CHARS,
+            )),
             images: None,
             tool_calls: None,
             tool_name: None,
@@ -682,7 +728,7 @@ impl HailoOllamaModelProvider {
             let mut content = Self::normalize_content(message.content.as_deref().unwrap_or(""));
             if message.role == "system" {
                 if !content.is_empty() {
-                    system_parts.push(Self::encode_layout_controls_for_native(&content));
+                    system_parts.push(Self::encode_content_for_native_prompt(&content));
                 }
                 continue;
             }
@@ -714,7 +760,6 @@ impl HailoOllamaModelProvider {
                 };
             }
 
-            let content = Self::encode_layout_controls_for_native(&content);
             let (kind, content) = match message.role.as_str() {
                 "user" => (MessageKind::User, content),
                 "assistant" => (MessageKind::Assistant, content),
@@ -730,6 +775,7 @@ impl HailoOllamaModelProvider {
                 }
                 _ => continue,
             };
+            let content = Self::encode_content_for_native_prompt(&content);
             if !content.is_empty() {
                 candidates.push(MessageCandidate { kind, content });
             }
@@ -1371,12 +1417,12 @@ mod tests {
     }
 
     #[test]
-    fn native_layout_controls_are_double_escaped_for_prompt_parser() {
+    fn native_prompt_content_escapes_backslashes_and_layout_controls() {
         assert_eq!(
-            HailoOllamaModelProvider::encode_layout_controls_for_native(
-                "first\r\n\tindented\nlast"
+            HailoOllamaModelProvider::encode_content_for_native_prompt(
+                "regex \\d first\r\n\tindented\nlast"
             ),
-            r"first\r\n\tindented\nlast"
+            r"regex \\d first\r\n\tindented\nlast"
         );
     }
 
