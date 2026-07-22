@@ -1667,7 +1667,11 @@ impl RpcDispatcher {
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
         // max_context_tokens`), not the provider model-window helper (which
         // falls back to 32_000 when `context_window` is unset).
-        let (agent_alias, model_provider, model, max_ctx, model_ctx_window) = {
+        // model_context_window is now resolved per Usage event from the live
+        // provider so it follows in-turn switches (session/configure or
+        // model_switch tool). max_context_tokens remains the agent-profile
+        // budget and is resolved once at turn start.
+        let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
                 .sessions
@@ -1680,15 +1684,11 @@ impl RpcDispatcher {
             } else {
                 (String::new(), String::new())
             };
-            let (max_ctx, model_ctx_window) = {
+            let max_ctx = {
                 let cfg = self.ctx.config.read();
-                (
-                    Some(context_usage_max_tokens(&cfg, &alias)),
-                    cfg.effective_model_context_window_opt(&alias)
-                        .map(|v| v as u64),
-                )
+                Some(context_usage_max_tokens(&cfg, &alias))
             };
-            (alias, mp, m, max_ctx, model_ctx_window)
+            (alias, mp, m, max_ctx)
         };
 
         let rpc = self.rpc.clone();
@@ -1705,6 +1705,9 @@ impl RpcDispatcher {
         let attribution_agent_alias = agent_alias.clone();
         let attribution_model_provider = model_provider.clone();
         let attribution_model = model.clone();
+        // Config and agent handles for per-event window resolution.
+        let config = self.ctx.config.clone();
+        let agent_handle = agent.clone();
         // Cost-tracking context for this turn. Built from the daemon-scoped
         // tracker + the live pricing map and stamped with the agent alias so
         // `execute_turn` can persist token usage and attribute spend. `None`
@@ -1735,6 +1738,8 @@ impl RpcDispatcher {
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
+                let config = config.clone();
+                let agent_handle = agent_handle.clone();
                 async move {
                     if let (
                         Some(store),
@@ -1753,6 +1758,24 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
+                    // Resolve model_context_window per event from the live provider.
+                    // Single source: agent.attribution_fields().1 (live provider name).
+                    // Covers: no-switch, session/configure, and in-turn model_switch.
+                    let model_ctx_window = if let TurnEvent::Usage { .. } = &event {
+                        let live_provider = {
+                            let guard = agent_handle.lock().await;
+                            let (_, model_provider, _) = guard.attribution_fields();
+                            model_provider
+                        };
+                        if live_provider.is_empty() {
+                            None
+                        } else {
+                            let cfg = config.read();
+                            crate::agent::resolve_live_model_context_window(&cfg, &live_provider)
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(n) =
                         notification_for_turn_event(&sid, &event, max_ctx, model_ctx_window)
                     {
@@ -6815,6 +6838,145 @@ mod tests {
             v["params"].get("model_context_window").is_none(),
             "model_context_window must be absent when provider has no context_window \
              — 32k stub would freeze meter (#8872)"
+        );
+    }
+
+    /// Regression: model_context_window follows the live session provider
+    /// after a session/configure switch. Configures provider A (128k) and B
+    /// (1M), static agent binding is A. session/configure switches live
+    /// session to B. The emitted ContextUsage must carry B's window (1M).
+    #[tokio::test]
+    async fn context_usage_model_window_follows_live_session_provider_switch() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        // Provider A: context_window = 128_000 (static binding)
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let provider_a = config
+            .providers
+            .models
+            .ensure("openai", "provider-a")
+            .expect("ensure provider A");
+        provider_a.api_key = Some("test-key-a".into());
+        provider_a.uri = Some("http://127.0.0.1:1".into());
+        provider_a.model = Some("model-a".into());
+        provider_a.context_window = Some(128_000);
+
+        // Provider B: context_window = 1_000_000 (switched to via session/configure)
+        let provider_b = config
+            .providers
+            .models
+            .ensure("openai", "provider-b")
+            .expect("ensure provider B");
+        provider_b.api_key = Some("test-key-b".into());
+        provider_b.uri = Some("http://127.0.0.1:2".into());
+        provider_b.model = Some("model-b".into());
+        provider_b.context_window = Some(1_000_000);
+
+        config.agents = HashMap::from([(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.provider-a".into(), // Static binding = A
+                runtime_profile: "test-profile".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        )]);
+        config
+            .runtime_profiles
+            .insert("test-profile".into(), RuntimeProfileConfig::default());
+        config
+            .risk_profiles
+            .insert("default".into(), Default::default());
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        // Create session bound to agent "test-agent" (static provider A)
+        let session_res = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace_dir,
+            }))
+            .await
+            .expect("session/new should create the agent");
+        let session_id = session_res
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .expect("session/new result includes session_id")
+            .to_string();
+
+        // Verify initial state: agent is bound to provider A
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session exists");
+        assert_eq!(overrides.model_provider, None);
+
+        // Switch live session to provider B via session/configure
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.provider-b"
+                }
+            }))
+            .await;
+        assert!(res.is_ok(), "session/configure must succeed: {res:?}");
+
+        // Verify the override was committed
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session still exists");
+        assert_eq!(overrides.model_provider, Some("openai.provider-b".into()));
+
+        // Now emit a Usage event through the turn closure to test
+        // that model_context_window is resolved from the live provider B
+        // (not the static alias A). We simulate what the turn closure does.
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("agent exists");
+        let (_, live_provider, _) = agent.lock().await.attribution_fields();
+        assert_eq!(live_provider, "openai.provider-b");
+
+        // Resolve model_context_window from the live provider
+        let cfg = dispatcher.ctx.config.read();
+        let model_ctx_window =
+            crate::agent::resolve_live_model_context_window(&cfg, &live_provider);
+        assert_eq!(model_ctx_window, Some(1_000_000));
+
+        // Now simulate the notification emission
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: None,
+        };
+        let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
+        let json =
+            notification_for_turn_event("s1", &event, Some(max_ctx), model_ctx_window).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["model_context_window"], 1_000_000,
+            "emitted context_usage must carry B's model_context_window (1M), not A's (128k)"
         );
     }
 
