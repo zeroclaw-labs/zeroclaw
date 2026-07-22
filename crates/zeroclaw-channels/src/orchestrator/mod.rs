@@ -14865,8 +14865,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
     }
 
-    #[tokio::test]
-    async fn passive_context_records_history_without_channel_or_model_side_effects() {
+    async fn assert_passive_context_records_history_without_channel_or_model_side_effects() {
         Box::pin(async {
             let channel_impl = Arc::new(RecordingChannel::default());
             let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -14959,6 +14958,13 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         })
         .await;
+    }
+
+    #[test]
+    fn passive_context_records_history_without_channel_or_model_side_effects() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_passive_context_records_history_without_channel_or_model_side_effects())
+        });
     }
 
     struct DelayedHistoryCaptureModelProvider {
