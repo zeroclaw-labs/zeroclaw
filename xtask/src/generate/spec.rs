@@ -1046,14 +1046,17 @@ mod tests {
         )
         .unwrap();
         assert!(manual.contains("distribution:"));
-        assert!(manual.contains("- dist-broad"));
+        assert!(
+            manual.contains(
+                "default: dist\n        options:\n          - dist\n          - dist-broad"
+            )
+        );
         assert!(
             manual.contains(
                 "timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}"
             )
         );
         assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
-        assert!(manual.contains("zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}"));
         assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
         assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
         assert_eq!(
@@ -1067,8 +1070,15 @@ mod tests {
 
         let target_env = manual.find("- name: Configure target environment").unwrap();
         let release_step = manual.find("- name: Build release").unwrap();
+        let zeroclaw_upload = manual
+            .find("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
+            .unwrap();
         let companion = manual.find("- name: Build ZeroCode companion").unwrap();
-        assert!(target_env < release_step && release_step < companion);
+        assert!(
+            target_env < release_step
+                && release_step < zeroclaw_upload
+                && zeroclaw_upload < companion
+        );
         assert!(
             manual[target_env..release_step]
                 .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
