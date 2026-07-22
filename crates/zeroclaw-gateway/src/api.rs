@@ -129,7 +129,7 @@ pub struct CronAddBody {
     pub uses_memory: Option<bool>,
     /// Shell output format for shell-type cron jobs. `"wrapped"` (default) or
     /// `"raw"`. Only meaningful when `job_type` is `"shell"` (or inferred as
-    /// shell when no prompt is given). Ignored for agent jobs.
+    /// shell when no prompt is given). Rejected for agent jobs.
     #[serde(default)]
     pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
@@ -677,10 +677,11 @@ pub async fn handle_api_cron_patch(
             .into_response();
         }
         if existing.source == "declarative" {
-            return bad_request(
-                "shell_output_format for a declarative job is set via config.toml, not the API; \
-                 the DB column is not read for declarative jobs and this PATCH would have no effect",
-            )
+            return bad_request(format!(
+                "shell_output_format for declarative job '{id}' is set via \
+                 cron.{id}.shell_output_format in config.toml, not the API; \
+                 the DB column is not read for declarative jobs and this PATCH would have no effect"
+            ))
             .into_response();
         }
     }
@@ -4225,12 +4226,14 @@ pub(crate) mod tests {
             "a declarative job's shell_output_format is owned by config.toml, not the API"
         );
         let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
         assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("declarative"),
+            error.contains("declarative"),
             "error should explain the field is config-owned for declarative jobs"
+        );
+        assert!(
+            error.contains("cron.decl-job.shell_output_format"),
+            "error should name the exact config key to edit instead: {error}"
         );
         let unchanged =
             zeroclaw_runtime::cron::get_job(&state.config.read().clone(), "decl-job").unwrap();
