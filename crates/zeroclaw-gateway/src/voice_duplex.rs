@@ -168,6 +168,11 @@ pub struct SentenceChunker {
     line_start_ticks: usize,
     at_line_start: bool,
     in_fence: bool,
+    /// Units emitted so far this turn. The FIRST unit skips the
+    /// minimum-length merge: time-to-first-audio beats prosody, so a short
+    /// opener like "Sure!" starts synthesizing immediately instead of
+    /// waiting to be merged with the next sentence.
+    emitted: usize,
 }
 
 impl Default for SentenceChunker {
@@ -188,6 +193,7 @@ impl SentenceChunker {
             line_start_ticks: 0,
             at_line_start: true,
             in_fence: false,
+            emitted: 0,
         }
     }
 
@@ -284,13 +290,18 @@ impl SentenceChunker {
             self.buf.clear();
             return true;
         }
-        if !force && trimmed_chars < self.min_chars {
+        // First-audio fast path: the turn's opening sentence ships as soon
+        // as its boundary arrives, however short — every millisecond before
+        // the companion starts speaking is dead air.
+        let min = if self.emitted == 0 { 1 } else { self.min_chars };
+        if !force && trimmed_chars < min {
             return false;
         }
         let unit = strip_markdown_for_speech(&self.buf);
         self.buf.clear();
         if !unit.is_empty() {
             out.push(unit);
+            self.emitted += 1;
         }
         true
     }
@@ -832,6 +843,9 @@ mod tests {
 
     #[test]
     fn chunker_merges_tiny_sentences_up_to_min_length() {
+        // The FIRST unit ships at its sentence boundary regardless of length
+        // (time-to-first-audio fast path); the min-length merge applies from
+        // the second unit onward.
         let mut chunker = SentenceChunker::new(); // min 40
         let units = push_all(
             &mut chunker,
@@ -839,9 +853,20 @@ mod tests {
         );
         assert_eq!(
             units,
-            vec!["Yes. OK. This is now a much longer sentence that crosses the threshold."]
+            vec![
+                "Yes.",
+                "OK. This is now a much longer sentence that crosses the threshold."
+            ]
         );
         assert_eq!(chunker.flush().as_deref(), Some("Tail"));
+    }
+
+    #[test]
+    fn chunker_first_unit_ships_immediately_even_when_short() {
+        let mut chunker = SentenceChunker::new(); // min 40
+        assert_eq!(push_all(&mut chunker, "Sure! Let me lo"), vec!["Sure!"]);
+        // Second unit still merges up to the threshold.
+        assert_eq!(push_all(&mut chunker, "ok. And"), Vec::<String>::new());
     }
 
     #[test]

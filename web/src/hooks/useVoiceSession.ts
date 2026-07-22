@@ -274,6 +274,7 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
       turnActiveRef.current = true;
       turnHeartbeatRef.current = Date.now();
       turnGenRef.current++;
+      scheduleThinkPulse(1800);
       playerRef.current?.beginUtterance();
       clearMascotCues();
       const image = await captureFrame();
@@ -286,16 +287,78 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
     [captureFrame, clearMascotCues, patch, resetReply],
   );
 
+  const transcribe = useCallback(async (wav: Blob): Promise<string> => {
+    const audio_b64 = await blobToB64(wav);
+    const res = await apiFetch<TranscribeResponse>('/api/voice/transcribe', {
+      method: 'POST',
+      body: JSON.stringify({ audio_b64, format: 'wav' }),
+    });
+    return res.text?.trim() ?? '';
+  }, []);
+
+  /** Thinking-presence pulse: while the model is silent (no text, no
+   * audio) a soft low blip every few seconds says "still here, working".
+   * Cleared the moment anything streams. */
+  const thinkPulseRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const stopThinkPulse = useCallback(() => {
+    if (thinkPulseRef.current) {
+      clearTimeout(thinkPulseRef.current);
+      thinkPulseRef.current = null;
+    }
+  }, []);
+
+  const scheduleThinkPulse = useCallback(
+    (delayMs: number) => {
+      stopThinkPulse();
+      thinkPulseRef.current = setTimeout(() => {
+        thinkPulseRef.current = null;
+        if (!turnActiveRef.current) return;
+        if (replyAccRef.current.length > 0) return;
+        if (playerRef.current?.playing) return;
+        playerRef.current?.chime('thinking');
+        scheduleThinkPulse(3500);
+      }, delayMs);
+    },
+    [stopThinkPulse],
+  );
+
+  /** Eager transcription started from an utterance PREVIEW (the mic thinks
+   * the user probably finished ~250ms before it's sure). Keyed by
+   * utterance id; consumed by handleUtterance when the preview held. */
+  const previewRef = useRef<{ id: number; promise: Promise<string> } | null>(null);
+
+  const handleUtterancePreview = useCallback(
+    (wav: Blob, utteranceId: number) => {
+      previewRef.current = {
+        id: utteranceId,
+        promise: transcribe(wav).catch(() => ''),
+      };
+    },
+    [transcribe],
+  );
+
   const handleUtterance = useCallback(
-    async (wav: Blob) => {
+    async (
+      wav: Blob,
+      info?: { utteranceId: number; previewValid: boolean },
+    ) => {
       patch({ phase: 'transcribing' });
       try {
-        const audio_b64 = await blobToB64(wav);
-        const res = await apiFetch<TranscribeResponse>('/api/voice/transcribe', {
-          method: 'POST',
-          body: JSON.stringify({ audio_b64, format: 'wav' }),
-        });
-        const text = res.text?.trim();
+        // "Heard you" — instant, before any network round-trip. Inside the
+        // try: a closed AudioContext (WebKit backgrounding quirk) must fail
+        // into the same recovery path as a network error, never strand the
+        // UI in 'transcribing'.
+        playerRef.current?.chime('commit');
+        const preview = previewRef.current;
+        previewRef.current = null;
+        let text = '';
+        if (info?.previewValid && preview && preview.id === info.utteranceId) {
+          // The eager transcript covers the same audio — usually already
+          // resolved by now, making STT latency effectively zero.
+          text = await preview.promise;
+        }
+        if (!text) text = await transcribe(wav);
         if (text) {
           await startVoiceTurn(text);
         } else {
@@ -308,10 +371,11 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
         });
       }
     },
-    [patch, startVoiceTurn],
+    [patch, startVoiceTurn, transcribe],
   );
 
   const bargeIn = useCallback(() => {
+    stopThinkPulse();
     playerRef.current?.cancel();
     wsRef.current?.sendRaw({ type: 'barge_in' });
     turnActiveRef.current = false;
@@ -344,6 +408,7 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
     };
 
     const endTurn = () => {
+      stopThinkPulse();
       turnActiveRef.current = false;
       flushReply();
       clearMascotCues();
@@ -367,6 +432,7 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
       turnHeartbeatRef.current = Date.now();
       switch (msg.type) {
         case 'chunk': {
+          stopThinkPulse();
           const delta = msg.content ?? '';
           replyAccRef.current += delta;
           // Flush right away at a sentence boundary; otherwise coalesce a
@@ -432,7 +498,8 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
 
     const mic = new MicCapture();
     micRef.current = mic;
-    mic.onUtterance = (wav) => void handleUtterance(wav);
+    mic.onUtterance = (wav, _durationMs, info) => void handleUtterance(wav, info);
+    mic.onUtterancePreview = handleUtterancePreview;
     mic.onSpeechStart = () => {
       // Onset while a turn is in flight (thinking, tool gap, or speaking)
       // is a real interruption — cancel it before starting the new
@@ -486,6 +553,7 @@ export function useVoiceSession(agentAlias: string): VoiceSessionApi {
 
     return () => {
       disposed = true;
+      stopThinkPulse();
       clearInterval(watchdog);
       cancelAnimationFrame(levelRaf);
       mic.dispose();

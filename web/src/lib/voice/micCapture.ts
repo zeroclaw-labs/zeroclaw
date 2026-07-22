@@ -27,6 +27,9 @@ export type MicState = 'idle' | 'armed' | 'speaking';
 export interface MicCaptureOptions {
   /** ms of silence that ends an utterance in continuous mode. */
   silenceHangoverMs?: number;
+  /** ms of silence at which a PREVIEW WAV is emitted for eager
+   * transcription (must be < silenceHangoverMs). */
+  previewAtMs?: number;
   /** ms of audio kept before the detected speech onset. */
   prerollMs?: number;
   /** Minimum utterance length to emit, ms (filters coughs/clicks). */
@@ -103,8 +106,24 @@ export class MicCapture {
    * (see `setPlaybackLevel`). Raises the onset bar while the agent talks. */
   private playbackLevel = 0;
 
-  /** Emitted with a finished utterance WAV. */
-  public onUtterance: ((wav: Blob, durationMs: number) => void) | null = null;
+  /** Monotonic id of the current/most recent utterance. */
+  private utteranceId = 0;
+  private previewFired = false;
+  private previewInvalidated = false;
+
+  /** Emitted with a finished utterance WAV. `previewValid` is true when an
+   * earlier onUtterancePreview for `utteranceId` still matches this final
+   * audio (no speech resumed after the preview) — its transcript can be
+   * used as-is. */
+  public onUtterance:
+    | ((
+        wav: Blob,
+        durationMs: number,
+        info: { utteranceId: number; previewValid: boolean },
+      ) => void)
+    | null = null;
+  /** Early utterance snapshot for eager transcription (continuous mode). */
+  public onUtterancePreview: ((wav: Blob, utteranceId: number) => void) | null = null;
   /** Speech onset detected in continuous mode. The caller decides whether
    * this counts as a fresh utterance or a barge-in based on its own turn
    * state — the mic has no notion of "turn". */
@@ -119,7 +138,8 @@ export class MicCapture {
 
   constructor(options: MicCaptureOptions = {}) {
     this.opts = {
-      silenceHangoverMs: options.silenceHangoverMs ?? 750,
+      silenceHangoverMs: options.silenceHangoverMs ?? 550,
+      previewAtMs: options.previewAtMs ?? 300,
       prerollMs: options.prerollMs ?? 400,
       minUtteranceMs: options.minUtteranceMs ?? 250,
       maxUtteranceMs: options.maxUtteranceMs ?? 45000,
@@ -210,8 +230,26 @@ export class MicCapture {
         // well still be speech), only read.
         if (rms >= this.idleThreshold()) {
           this.silenceMs = 0;
+          // Speech resumed after a preview fired — that transcript is
+          // stale; the final utterance will differ.
+          if (this.previewFired) this.previewInvalidated = true;
         } else {
           this.silenceMs += frameMs;
+        }
+        // Eager transcription: once silence PROBABLY means the utterance is
+        // over (but before the full hangover confirms it), hand the caller
+        // a preview WAV so STT can run concurrently with the remaining
+        // hangover. If the silence holds, the transcript is ready the
+        // instant the utterance commits — the STT wait vanishes from the
+        // perceived response time.
+        if (
+          !this.previewFired &&
+          this.silenceMs >= this.opts.previewAtMs &&
+          this.utteranceMs - this.silenceMs >= this.opts.minUtteranceMs
+        ) {
+          this.previewFired = true;
+          this.previewInvalidated = false;
+          this.onUtterancePreview?.(this.assembleWav(), this.utteranceId);
         }
         if (this.silenceMs >= this.opts.silenceHangoverMs || this.utteranceMs >= this.opts.maxUtteranceMs) {
           this.finishUtterance();
@@ -240,7 +278,21 @@ export class MicCapture {
     }
   }
 
+  /** Encode the samples captured so far without ending the utterance. */
+  private assembleWav(): Blob {
+    const all = new Float32Array(this.captured.reduce((n, c) => n + c.length, 0));
+    let off = 0;
+    for (const c of this.captured) {
+      all.set(c, off);
+      off += c.length;
+    }
+    return encodeWav(all, this.ctx?.sampleRate ?? 48000);
+  }
+
   private beginCapture(includePreroll: boolean): void {
+    this.utteranceId += 1;
+    this.previewFired = false;
+    this.previewInvalidated = false;
     this.capturing = true;
     this.captured = includePreroll ? [...this.ring] : [];
     this.capturedSamples = includePreroll ? this.ringSamples : 0;
@@ -256,9 +308,16 @@ export class MicCapture {
     const chunks = this.captured;
     this.captured = [];
     this.capturedSamples = 0;
-    // The capture always includes the full preroll ring, so subtract it —
-    // otherwise the minimum-length filter can never reject a blip.
-    if (durationMs - this.opts.prerollMs < this.opts.minUtteranceMs) return;
+    // Reject blips on ACTUAL SPEECH TIME. In continuous mode the trailing
+    // silence hangover is part of the elapsed capture, so a raw duration
+    // check could never reject anything — a cough would ride 550ms of
+    // silence past any threshold, chime, and burn an STT call. utteranceMs
+    // counts post-onset frames only (preroll excluded) and silenceMs is the
+    // trailing quiet, so their difference is the voiced span.
+    const speechMs = this.continuous
+      ? this.utteranceMs - this.silenceMs
+      : durationMs - this.opts.prerollMs;
+    if (speechMs < this.opts.minUtteranceMs) return;
     const all = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
     let off = 0;
     for (const c of chunks) {
@@ -266,7 +325,10 @@ export class MicCapture {
       off += c.length;
     }
     const wav = encodeWav(all, this.ctx?.sampleRate ?? 48000);
-    this.onUtterance?.(wav, durationMs);
+    this.onUtterance?.(wav, durationMs, {
+      utteranceId: this.utteranceId,
+      previewValid: this.previewFired && !this.previewInvalidated,
+    });
   }
 
   /** Push-to-talk: begin capturing now (includes preroll). */

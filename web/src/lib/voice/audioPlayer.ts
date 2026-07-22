@@ -90,6 +90,38 @@ export class StreamingAudioPlayer {
     this.ensureCtx();
   }
 
+  /**
+   * Tiny procedural UI sounds — the companion's non-verbal presence.
+   * `commit`: two quick soft blips the instant an utterance is accepted
+   * ("heard you"), long before any TTS can arrive. `thinking`: a single
+   * low, quiet blip pulsed occasionally during a long think, so silence
+   * never reads as death. Deliberately synthesized (not samples): they are
+   * part of the robot character and cost zero network.
+   */
+  chime(kind: 'commit' | 'thinking'): void {
+    const ctx = this.ensureCtx();
+    const t0 = ctx.currentTime + 0.01;
+    const blip = (at: number, hz: number, dur: number, peak: number) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(hz, at);
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.exponentialRampToValueAtTime(peak, at + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start(at);
+      osc.stop(at + dur + 0.02);
+    };
+    if (kind === 'commit') {
+      blip(t0, 660, 0.07, 0.05);
+      blip(t0 + 0.09, 880, 0.09, 0.045);
+    } else {
+      blip(t0, 330, 0.12, 0.03);
+    }
+  }
+
   /** Decode a headerless raw PCM chunk (base64 of little-endian int16 mono
    *  samples at 16 kHz) into a playable AudioBuffer. */
   private decodePcm16(ctx: AudioContext, audioB64: string): AudioBuffer {

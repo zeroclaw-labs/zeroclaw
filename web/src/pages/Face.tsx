@@ -66,6 +66,10 @@ function FaceSession({ alias }: { alias: string }) {
         c.setEmotion('curious');
         break;
       case 'transcribing':
+        // Quick "heard you" beat — an attentive perk-up, not a slow think.
+        c.setEmotion('curious');
+        void c.play('attention');
+        break;
       case 'thinking':
         c.setEmotion('thinking');
         void c.play('think');
@@ -216,7 +220,26 @@ function FaceSession({ alias }: { alias: string }) {
     return PHASE_LABEL[state.phase];
   }, [state]);
 
-  const caption = state.phase === 'speaking' || state.phase === 'thinking' ? state.reply : '';
+  // Keep the last reply readable for a few seconds after the voice stops —
+  // captions vanishing the instant playback ends felt abrupt.
+  const [linger, setLinger] = useState('');
+  const lingerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const live = state.phase === 'speaking' || state.phase === 'thinking';
+  useEffect(() => {
+    if (live && state.reply) {
+      if (lingerTimer.current) clearTimeout(lingerTimer.current);
+      setLinger(state.reply);
+      return;
+    }
+    if (!live && linger) {
+      lingerTimer.current = setTimeout(() => setLinger(''), 6000);
+      return () => {
+        if (lingerTimer.current) clearTimeout(lingerTimer.current);
+      };
+    }
+    return undefined;
+  }, [live, state.reply, linger]);
+  const caption = live ? state.reply : linger;
 
   return (
     <div
