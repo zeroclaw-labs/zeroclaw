@@ -1385,7 +1385,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         if has_api_key(key) {
             anyhow::bail!(
-                "grok_cli does not accept api_key; remove it from the provider alias and authenticate the CLI with `grok login`"
+                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
             );
         }
         Ok(Box::new(

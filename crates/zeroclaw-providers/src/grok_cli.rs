@@ -3,8 +3,9 @@
 //! Every inference request uses the documented `grok agent stdio` ACP
 //! transport. The assembled prompt is sent as JSON-RPC on child stdin; it is
 //! never placed in argv or a temporary file.
-//! Authentication comes only from the Grok CLI login cache; run `grok login`
-//! before selecting this provider.
+//! Authentication uses the Grok CLI login cache by default. API-key auth is an
+//! explicit per-alias opt-in: export `XAI_API_KEY` into the ZeroClaw process and
+//! include that exact name in `env_passthrough`.
 //!
 //! # Usage
 //!
@@ -26,7 +27,7 @@
 //!
 //! - requires an explicit absolute working directory;
 //! - clears the inherited environment and forwards only process-runtime entries
-//!   plus explicit per-alias tool `env_passthrough` names;
+//!   plus explicit per-alias `env_passthrough` names;
 //! - defaults to `--sandbox strict`, `--permission-mode dontAsk`, and an empty
 //!   built-in tool set;
 //! - cancels every ACP permission request rather than approving it;
@@ -65,6 +66,9 @@ use tokio::process::Child;
 
 /// Default `grok` binary name (resolved via `PATH`).
 const DEFAULT_GROK_CLI_BINARY: &str = "grok";
+
+/// The only provider-owned environment variable an alias may explicitly pass.
+const XAI_API_KEY_ENV: &str = "XAI_API_KEY";
 
 /// Model name used to signal "use the CLI / config default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
@@ -456,9 +460,9 @@ impl GrokCliModelProvider {
                     "grok_cli env_passthrough entry `{name}` is invalid; expected [A-Za-z_][A-Za-z0-9_]*"
                 );
             }
-            if is_provider_owned_env_var(name) {
+            if is_disallowed_provider_env_var(name) {
                 anyhow::bail!(
-                    "grok_cli env_passthrough entry `{name}` is provider-owned; use `grok login` for authentication and `extra_args` for Grok policy"
+                    "grok_cli env_passthrough entry `{name}` is provider-owned; only `XAI_API_KEY` may be passed for authentication, and Grok policy belongs in `extra_args`"
                 );
             }
             if !normalized.iter().any(|existing| existing == name) {
@@ -585,21 +589,26 @@ impl GrokCliModelProvider {
         args
     }
 
-    fn apply_env_allowlist(cmd: &mut Command, env_passthrough: &[String]) {
-        Self::apply_env_allowlist_from(cmd, env_passthrough, std::env::vars());
+    fn apply_env_allowlist(cmd: &mut Command, env_passthrough: &[String]) -> bool {
+        Self::apply_env_allowlist_from(cmd, env_passthrough, std::env::vars())
     }
 
     fn apply_env_allowlist_from(
         cmd: &mut Command,
         env_passthrough: &[String],
         variables: impl IntoIterator<Item = (String, String)>,
-    ) {
+    ) -> bool {
         cmd.env_clear();
+        let mut xai_api_key_available = false;
         for (key, value) in variables {
             if env_var_allowed(&key, env_passthrough) {
+                if key == XAI_API_KEY_ENV {
+                    xai_api_key_available = !value.is_empty();
+                }
                 cmd.env(key, value);
             }
         }
+        xai_api_key_available
     }
 
     async fn invoke_acp(&self, message: &str, model: &str) -> anyhow::Result<String> {
@@ -607,7 +616,7 @@ impl GrokCliModelProvider {
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(&args);
         cmd.current_dir(&self.working_directory);
-        Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
+        let xai_api_key_available = Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
         #[cfg(not(windows))]
         cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
@@ -660,7 +669,13 @@ impl GrokCliModelProvider {
 
         let request_result = timeout(
             self.timeout,
-            acp::run_oneshot_prompt(&mut stdin, stdout, message, &self.working_directory),
+            acp::run_oneshot_prompt(
+                &mut stdin,
+                stdout,
+                message,
+                &self.working_directory,
+                xai_api_key_available,
+            ),
         )
         .await;
 
@@ -765,8 +780,8 @@ fn is_valid_env_var_name(name: &str) -> bool {
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
-fn is_provider_owned_env_var(name: &str) -> bool {
-    name.starts_with("XAI_") || name.starts_with("GROK_")
+fn is_disallowed_provider_env_var(name: &str) -> bool {
+    name != XAI_API_KEY_ENV && (name.starts_with("XAI_") || name.starts_with("GROK_"))
 }
 
 fn env_var_allowed(key: &str, env_passthrough: &[String]) -> bool {
@@ -887,12 +902,17 @@ mod tests {
                 " AWS_ACCESS_KEY_ID ".to_string(),
                 "AWS_ACCESS_KEY_ID".to_string(),
                 "AWS_SECRET_ACCESS_KEY".to_string(),
+                XAI_API_KEY_ENV.to_string(),
             ])
             .build()
             .expect("valid env passthrough");
         assert_eq!(
             model_provider.env_passthrough,
-            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+            [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                XAI_API_KEY_ENV
+            ]
         );
 
         let invalid = GrokCliModelProvider::builder("test")
@@ -901,7 +921,7 @@ mod tests {
             .build();
         assert!(invalid.is_err(), "invalid environment name must fail");
 
-        for reserved in ["XAI_API_KEY", "XAI_AUTH_TOKEN", "GROK_SANDBOX"] {
+        for reserved in ["XAI_AUTH_TOKEN", "GROK_SANDBOX"] {
             let result = GrokCliModelProvider::builder("test")
                 .working_directory(temp.path().to_str().expect("UTF-8 test path"))
                 .env_passthrough(vec![reserved.to_string()])
@@ -1053,7 +1073,7 @@ mod tests {
     #[test]
     fn apply_env_allowlist_copies_only_builtin_and_explicit_entries() {
         let mut command = Command::new("grok");
-        GrokCliModelProvider::apply_env_allowlist_from(
+        let xai_api_key_available = GrokCliModelProvider::apply_env_allowlist_from(
             &mut command,
             &["AWS_ACCESS_KEY_ID".to_string()],
             [
@@ -1071,6 +1091,7 @@ mod tests {
                 ("GROK_SANDBOX".to_string(), "off".to_string()),
             ],
         );
+        assert!(!xai_api_key_available);
         let copied: Vec<_> = command
             .as_std()
             .get_envs()
@@ -1098,6 +1119,28 @@ mod tests {
         );
         assert!(!copied.iter().any(|(name, _)| name == "XAI_API_KEY"));
         assert!(!copied.iter().any(|(name, _)| name == "GROK_SANDBOX"));
+    }
+
+    #[test]
+    fn explicit_xai_api_key_passthrough_controls_acp_auth_availability() {
+        let mut command = Command::new("grok");
+        let available = GrokCliModelProvider::apply_env_allowlist_from(
+            &mut command,
+            &[XAI_API_KEY_ENV.to_string()],
+            [(XAI_API_KEY_ENV.to_string(), "test-api-key".to_string())],
+        );
+        assert!(available);
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == XAI_API_KEY_ENV && value.is_some_and(|value| value == "test-api-key")
+        }));
+
+        let mut empty_command = Command::new("grok");
+        let available = GrokCliModelProvider::apply_env_allowlist_from(
+            &mut empty_command,
+            &[XAI_API_KEY_ENV.to_string()],
+            [(XAI_API_KEY_ENV.to_string(), String::new())],
+        );
+        assert!(!available, "an empty API key must not select API-key auth");
     }
 
     #[tokio::test]

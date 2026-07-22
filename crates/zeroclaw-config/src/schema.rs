@@ -2676,10 +2676,12 @@ pub struct GrokCliModelProviderConfig {
     /// session boundary. The directory must exist when the provider is built.
     /// Project-scoped Grok config is resolved relative to this path.
     pub working_directory: String,
-    /// Extra tool environment variable names inherited by the `grok`
+    /// Extra environment variable names inherited by the `grok`
     /// subprocess. Values are resolved from the ZeroClaw process environment
     /// at spawn time. The default is empty so unrelated daemon secrets remain
-    /// blocked. Provider-owned `XAI_*` and `GROK_*` names are rejected.
+    /// blocked. `XAI_API_KEY` is the sole supported provider-owned name and
+    /// enables API-key authentication when explicitly listed and non-empty;
+    /// other `XAI_*` and all `GROK_*` names are rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,

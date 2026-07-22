@@ -39,12 +39,26 @@ Shells out to the `gemini` CLI; uses the CLI's existing auth.
 ### Grok Build CLI: slot `grok_cli`
 
 Shells out to the Grok Build CLI through the documented **`grok agent stdio`**
-ACP surface and uses the CLI's login cache. Run `grok login` before selecting
-this provider. The typed alias `api_key` and ambient `XAI_API_KEY` are not used,
-so authentication has one owner. This is the only transport: initialize →
+ACP surface and uses the CLI's login cache by default. Run `grok login`, or use
+the explicit API-key bridge shown below. The typed alias `api_key` is not used,
+and ambient `XAI_API_KEY` is not inherited unless the alias opts in, so the Grok
+CLI remains the authentication owner. This is the only transport: initialize →
 authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
 Small and large prompts both travel on stdin and never appear in argv or a
 prompt file.
+
+```toml
+[providers.models.grok_cli.default]
+model = "grok-4.5"
+working_directory = "/srv/zeroclaw/grok-workspace"
+env_passthrough = ["XAI_API_KEY"]
+```
+
+Export `XAI_API_KEY` into the daemon environment before starting ZeroClaw. The
+ACP client selects `xai.api_key` only when that exact name is listed and a
+non-empty value is copied to the child; otherwise it falls back to the CLI login
+cache. The key value remains owned by the daemon environment and is not stored
+in provider config.
 
 An existing absolute `working_directory` is required. It is canonicalized and
 used for both the child cwd and ACP session boundary, so the provider never
@@ -54,13 +68,14 @@ binary. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 The child environment is cleared before spawn. Process-runtime, locale, proxy,
 and CA variables on the built-in allowlist remain available; all other names
 are blocked unless that provider alias lists them in `env_passthrough`. This
-field is for environment variables required by explicitly enabled Grok tools,
-such as cloud CLI credentials. Values are read from the ZeroClaw process
-environment at spawn time and are not stored in provider config. The default
-list is empty. Keep it narrow because every listed secret is exposed to Grok
-and any tools enabled for that alias. Provider-owned `XAI_*` and `GROK_*` names
-are rejected; use `grok login` for authentication. Grok's discovered user and
-project configuration, together with alias `extra_args`, owns Grok tool policy.
+field is for the explicit `XAI_API_KEY` authentication bridge and environment
+variables required by explicitly enabled Grok tools, such as cloud CLI
+credentials. Values are read from the ZeroClaw process environment at spawn
+time and are not stored in provider config. The default list is empty. Keep it
+narrow because every listed secret is exposed to Grok and any tools enabled for
+that alias. Other provider-owned `XAI_*` names and all `GROK_*` names are
+rejected. Grok's discovered user and project configuration, together with alias
+`extra_args`, owns Grok tool policy.
 
 The default argv adds `--no-auto-update`, `--sandbox strict`,
 `--permission-mode dontAsk`, and `--tools ""`. The ACP client also cancels every

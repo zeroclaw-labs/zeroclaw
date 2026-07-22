@@ -85,6 +85,7 @@ pub(super) async fn run_oneshot_prompt<W, R>(
     stdout: R,
     prompt: &str,
     cwd: &Path,
+    xai_api_key_available: bool,
 ) -> Result<String, AcpError>
 where
     W: AsyncWrite + Unpin,
@@ -110,7 +111,7 @@ where
     )
     .await?;
 
-    let method_id = select_auth_method_id(&initialize)?;
+    let method_id = select_auth_method_id(&initialize, xai_api_key_available)?;
     rpc_request(
         stdin,
         &mut reader,
@@ -390,7 +391,10 @@ fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result
     Ok(())
 }
 
-fn select_auth_method_id(initialize: &Value) -> Result<String, AcpError> {
+fn select_auth_method_id(
+    initialize: &Value,
+    xai_api_key_available: bool,
+) -> Result<String, AcpError> {
     let ids: Vec<&str> = initialize
         .get("authMethods")
         .or_else(|| initialize.get("auth_methods"))
@@ -405,6 +409,9 @@ fn select_auth_method_id(initialize: &Value) -> Result<String, AcpError> {
         })
         .collect();
 
+    if xai_api_key_available && ids.contains(&"xai.api_key") {
+        return Ok("xai.api_key".to_string());
+    }
     for preferred in ["cached_token", "xai.oauth"] {
         if ids.contains(&preferred) {
             return Ok(preferred.to_string());
@@ -476,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_selection_uses_only_cli_login_methods() {
+    fn auth_selection_uses_explicit_api_key_then_cli_login() {
         let initialize = json!({
             "authMethods": [
                 { "id": "xai.api_key" },
@@ -484,15 +491,23 @@ mod tests {
             ]
         });
         assert_eq!(
-            select_auth_method_id(&initialize).expect("cached auth"),
+            select_auth_method_id(&initialize, true).expect("API-key auth"),
+            "xai.api_key"
+        );
+        assert_eq!(
+            select_auth_method_id(&initialize, false).expect("cached auth"),
             "cached_token"
         );
 
         let api_key_only = json!({
             "authMethods": [{ "id": "xai.api_key" }]
         });
+        assert_eq!(
+            select_auth_method_id(&api_key_only, true).expect("API-key auth"),
+            "xai.api_key"
+        );
         assert!(matches!(
-            select_auth_method_id(&api_key_only),
+            select_auth_method_id(&api_key_only, false),
             Err(AcpError::NoAuthenticationMethod)
         ));
     }
