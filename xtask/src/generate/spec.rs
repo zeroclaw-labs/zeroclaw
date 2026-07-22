@@ -1054,12 +1054,25 @@ mod tests {
         );
         assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
         assert!(manual.contains("zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}"));
+        assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
+        assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert_eq!(
+            manual
+                .matches("if: matrix.target != 'aarch64-linux-android'")
+                .count(),
+            2,
+            "both the ZeroCode build and upload must skip Android"
+        );
         assert!(!manual.contains("excluded_features"));
 
         let target_env = manual.find("- name: Configure target environment").unwrap();
         let release_step = manual.find("- name: Build release").unwrap();
         let companion = manual.find("- name: Build ZeroCode companion").unwrap();
         assert!(target_env < release_step && release_step < companion);
+        assert!(
+            manual[target_env..release_step]
+                .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
+        );
         assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
         assert!(!manual[release_step..companion].contains("matrix.linker_env"));
 
