@@ -1469,12 +1469,10 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
-    assert!(messages[0].content.contains("[IMAGE:"));
-    assert!(
-        messages[0]
-            .content
-            .contains(&image_path.display().to_string())
-    );
+    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    let content = payload["content"].as_str().unwrap();
+    assert!(content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
