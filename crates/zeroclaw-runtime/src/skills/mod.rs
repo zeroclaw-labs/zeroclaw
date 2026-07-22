@@ -2149,8 +2149,8 @@ pub fn parse_extra_registry_source(source: &str) -> Option<(String, String)> {
     Some((name.to_string(), skill.to_string()))
 }
 
-fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
-    if let Some(parent) = registry_dir.parent() {
+fn clone_skills_repository(target_dir: &Path, repo_url: &str) -> Result<()> {
+    if let Some(parent) = target_dir.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
                 "failed to create registry parent: {}",
@@ -2161,7 +2161,7 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
 
     let output = Command::new("git")
         .args(["clone", "--depth", "1", repo_url])
-        .arg(registry_dir)
+        .arg(target_dir)
         .output()
         .context("failed to run git clone for skills registry")?;
 
@@ -2175,9 +2175,14 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         &format!(
             "cloned skills registry to {}",
-            registry_dir.display().to_string()
+            target_dir.display().to_string()
         )
     );
+    Ok(())
+}
+
+fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
+    clone_skills_repository(registry_dir, repo_url)?;
     mark_skills_registry_synced(registry_dir)?;
     Ok(())
 }
@@ -2315,22 +2320,35 @@ pub fn install_git_catalog_skill_source(
         ));
     }
 
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    url.hash(&mut hasher);
-    let clone_dir = workspace_dir.join(format!(".skill-catalog-{:016x}", hasher.finish()));
-    if clone_dir.exists() {
-        let _ = std::fs::remove_dir_all(&clone_dir);
-    }
+    std::fs::create_dir_all(workspace_dir).with_context(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-catalog-clone-failed",
+            &[("url", url)],
+        )
+    })?;
+    let clone_tempdir = tempfile::Builder::new()
+        .prefix(".skill-catalog-")
+        .tempdir_in(workspace_dir)
+        .with_context(|| {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-clone-failed",
+                &[("url", url)],
+            )
+        })?;
+    let clone_dir = clone_tempdir.path();
 
-    clone_skills_registry(&clone_dir, url).with_context(|| {
+    // A transient catalog has no sync lifecycle, so clone it without writing
+    // the persistent registry marker into the untrusted checkout. Besides
+    // avoiding unnecessary state, this prevents a catalog-committed marker
+    // symlink from redirecting that write to an arbitrary host file.
+    clone_skills_repository(clone_dir, url).with_context(|| {
         crate::i18n::get_required_cli_string_with_args(
             "cli-skills-install-catalog-clone-failed",
             &[("url", url)],
         )
     })?;
 
-    let result = (|| {
+    (|| {
         // Establish the catalog trust boundary before looking up a selected
         // name or enumerating available names. A catalog controls `skills/`,
         // so following it before this check could inspect an arbitrary host
@@ -2449,16 +2467,13 @@ pub fn install_git_catalog_skill_source(
             ));
         }
         // i18n-exempt: internal invariant — the clone path is our own ASCII
-        // `.skill-catalog-<hex>` scratch dir, so this only fires on a broken
+        // `.skill-catalog-*` scratch dir, so this only fires on a broken
         // host filesystem; it is a developer diagnostic, not normal CLI output.
         let skill_dir_str = selected
             .to_str()
             .with_context(|| format!("skill path is not valid UTF-8: {}", selected.display()))?;
         install_local_skill_source(skill_dir_str, skills_path, allow_scripts)
-    })();
-
-    let _ = std::fs::remove_dir_all(&clone_dir);
-    result
+    })()
 }
 
 pub fn install_registry_skill_source(
@@ -3063,6 +3078,59 @@ mod registry_tests {
             "-m",
             message,
         ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_does_not_follow_registry_sync_marker_symlink() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external_marker = tmp.path().join("external-marker");
+        std::fs::write(&external_marker, "must remain unchanged").unwrap();
+
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill"]);
+        std::os::unix::fs::symlink(&external_marker, catalog.join(SKILLS_REGISTRY_SYNC_MARKER))
+            .unwrap();
+        git_commit_all(&catalog, "add hostile registry sync marker symlink");
+
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (dest, _) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("a catalog marker must not participate in transient clone state");
+
+        assert!(dest.join("SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(&external_marker).unwrap(),
+            "must remain unchanged",
+            "a catalog-controlled marker symlink must not redirect a host write"
+        );
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after install");
     }
 
     #[cfg(unix)]
