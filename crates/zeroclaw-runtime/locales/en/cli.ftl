@@ -76,6 +76,18 @@ cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
 cli-skills-install-start = Installing skill from: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
 cli-skills-install-resolving-extra-registry = { "  " }Resolving '{$source}' from registry '{$registry}'...
+cli-skills-install-skill-requires-git = --skill <name> requires a git repository URL as the source (got '{$source}')
+cli-skills-install-catalog-failed = failed to install skill '{$skill}' from catalog {$source}
+cli-skills-install-invalid-skill-name = invalid --skill name '{$skill}': use a bare skill name (letters, digits, '-', '_')
+cli-skills-install-catalog-clone-failed = failed to clone skill catalog {$url}
+cli-skills-install-skill-not-in-catalog-empty = skill '{$skill}' not found in {$url}: no skills/ directory, or it is empty
+cli-skills-install-skill-not-in-catalog =
+    skill '{$skill}' not found in {$url}.
+    Available skills: {$available}
+cli-skills-install-catalog-root-symlink = skill catalog {$url} has a symlinked skills/ directory; refusing to inspect it
+cli-skills-install-catalog-root-escapes = skill catalog {$url} has a skills/ directory that resolves outside the cloned catalog; refusing to inspect it
+cli-skills-install-catalog-skill-symlink = skill '{$skill}' in {$url} is a symlink; catalog skills must be real directories inside the repository
+cli-skills-install-catalog-skill-escapes = skill '{$skill}' in {$url} resolves outside the cloned catalog; refusing to install
 cli-skills-install-git-failed = failed to install git skill source: {$source}
 cli-skills-install-registry-failed = failed to install skill from registry: {$source}
 cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}

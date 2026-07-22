@@ -13669,7 +13669,6 @@ dependencies = [
  "directories",
  "encoding_rs",
  "filetime",
- "flate2",
  "fluent",
  "futures-util",
  "glob",
@@ -13738,7 +13737,6 @@ dependencies = [
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
  "zeroize",
- "zip",
 ]
 
 [[package]]
