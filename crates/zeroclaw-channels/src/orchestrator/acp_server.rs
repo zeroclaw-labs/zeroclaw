@@ -3918,6 +3918,7 @@ mod tests {
                     model: Some("claude-haiku-4-5".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         cfg.risk_profiles.insert(

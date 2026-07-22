@@ -1107,6 +1107,18 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Models Anthropic may fall back to **server-side, inside one API call**
+    /// when the requested model's safety classifiers decline a request
+    /// (`stop_reason: "refusal"`). Sent as the native `fallbacks` parameter with
+    /// the `server-side-fallback-2026-06-01` beta; entries are tried in order,
+    /// must differ from the requested model, and must be permitted fallback
+    /// targets for it (e.g. `claude-fable-5` → `["claude-opus-4-8"]`; a
+    /// non-permitted entry is rejected by the API). Applies to non-streaming
+    /// requests only. Distinct from the generic `fallback_models`, which
+    /// ZeroClaw itself retries client-side after an error. Empty (the default)
+    /// sends no fallback parameter and no beta value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_fallback_models: Vec<String>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -18688,6 +18700,7 @@ impl Config {
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
+        self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
@@ -18997,6 +19010,46 @@ impl Config {
                     ),
                     path,
                 ));
+            }
+        }
+    }
+
+    /// Surface `server_fallback_models` entries the Anthropic request builder
+    /// drops before sending: blank entries and entries that duplicate the
+    /// alias's primary `model` (the requested model can never be its own
+    /// server-side fallback target). This is the Anthropic-only sibling of
+    /// [`Self::collect_fallback_model_warnings`], which iterates the flattened
+    /// `base` and cannot see this typed-slot field. The empty-entry check runs
+    /// even when the alias configures no primary `model`; only the
+    /// duplicates-primary check is gated on a primary being set.
+    fn collect_server_fallback_model_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, cfg) in &self.providers.models.anthropic {
+            let primary = cfg.base.model.as_deref();
+            for (i, model) in cfg.server_fallback_models.iter().enumerate() {
+                let path =
+                    format!("providers.models.anthropic.{alias}.server_fallback_models[{i}]");
+                if model.trim().is_empty() {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        "empty_server_fallback_model",
+                        format!(
+                            "server_fallback_models entry {i} on anthropic.{alias} is empty; \
+                             it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                } else if primary == Some(model.as_str()) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        "server_fallback_model_duplicates_primary",
+                        format!(
+                            "server_fallback_models entry {model:?} on anthropic.{alias} \
+                             duplicates the primary model; it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                }
             }
         }
     }
@@ -25286,6 +25339,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         config.save().await.unwrap();
@@ -25475,6 +25529,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -27408,6 +27463,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -34883,6 +34939,66 @@ allowed_users = []
             .models
             .openai
             .insert("primary".to_string(), entry);
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn empty_server_fallback_model_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        // No primary `model` configured: the empty-entry check must still fire.
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                server_fallback_models: vec!["".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_server_fallback_model");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.anthropic.primary.server_fallback_models[0]"
+        );
+    }
+
+    #[test]
+    async fn server_fallback_model_duplicates_primary_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-fable-5".to_string()],
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "server_fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn server_fallback_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-opus-4-8".to_string()],
+            },
+        );
 
         assert!(config.collect_warnings().is_empty());
     }
