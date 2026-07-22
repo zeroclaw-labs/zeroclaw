@@ -46,4 +46,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
-process-wrap = { version = "9.1", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
