@@ -22,6 +22,11 @@ type Capture = Arc<Mutex<Option<Value>>>;
 type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
 type HeaderCapture = Arc<Mutex<Option<HeaderMap>>>;
 
+// Ignored tests still run in parallel under `cargo test -- --ignored`. Keep
+// live canaries for one physical Hailo endpoint out of each other's bounded
+// single-flight queue.
+static LIVE_HAILO_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn hailo_provider(base_url: &str) -> HailoOllamaModelProvider {
     hailo_provider_with_queue_timeout(base_url, 5)
 }
@@ -1708,6 +1713,7 @@ async fn native_hailo_queue_wait_is_bounded() {
 #[tokio::test]
 #[ignore = "requires a live Hailo-Ollama endpoint"]
 async fn live_native_hailo_catalog_and_chat() {
+    let _live_hardware_guard = LIVE_HAILO_TEST_LOCK.lock().await;
     let base_url = std::env::var("HAILO_OLLAMA_LIVE_URL")
         .expect("set HAILO_OLLAMA_LIVE_URL for the ignored hardware test");
     let model =
@@ -1749,6 +1755,7 @@ async fn live_native_hailo_catalog_and_chat() {
 #[tokio::test]
 #[ignore = "requires a live Hailo-Ollama endpoint"]
 async fn live_native_hailo_accepts_prompt_escape_corner_cases() {
+    let _live_hardware_guard = LIVE_HAILO_TEST_LOCK.lock().await;
     let base_url = std::env::var("HAILO_OLLAMA_LIVE_URL")
         .expect("set HAILO_OLLAMA_LIVE_URL for the ignored hardware test");
     let model =
