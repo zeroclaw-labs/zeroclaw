@@ -8,7 +8,7 @@
 > If anything in here feels heavyweight, that is intentional friction, we do
 > not yet have the automation discipline to remove it safely.
 
-Last verified against the `0.8.0-beta` cycle.
+Last verified against the `v0.8.2` release cycle.
 
 ---
 
@@ -67,14 +67,25 @@ feature lists from the canonical install spec (`Cargo.toml` plus
 never hand-edit a generated region. This script also refreshes the Nix git
 dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
 
-Then refresh the docs translation catalogues and pin them to the matching tag:
+### Refresh and pin translations
+
+After `bump-version.sh` sets the release version, refresh the docs translation
+catalogues and pin them to the matching tag. If the catalogues were prepared
+separately, inspect coverage and validate them before cutting the tag:
+
+```sh
+cargo mdbook stats
+cargo mdbook check
+```
+
+Then run the release wrapper:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-./scripts/release/refresh-translations.sh    # init submodule, refresh catalogues, tag, pin
+./scripts/release/refresh-translations.sh --model-provider anthropic.release
 ```
 
 </div>
@@ -85,8 +96,16 @@ hand), runs the translation pass, commits and pushes the catalogues to the
 submodule, cuts the `v{version}` tag there, and stages the main-repo gitlink
 pinned to that tag. It initialises the submodule if it is not already checked
 out. Run it after `bump-version.sh` so the `Cargo.toml` version it reads is the
-release version. Pass `--no-translate` to skip the sync pass when the catalogues
-are already current, or an explicit version to override the `Cargo.toml` default.
+release version. The configured provider alias is required explicitly so the
+release does not depend on a hardcoded backend; pass `--config-dir` when needed.
+The alias selected by `--model-provider` resolves from
+`providers.models.<kind>.<alias>`. Use `--no-translate` when the catalogues are
+already current, or pass an explicit version before `--model-provider` to
+override the `Cargo.toml` default, for example:
+
+```sh
+./scripts/release/refresh-translations.sh 0.8.2 --model-provider anthropic.release
+```
 
 Commit everything together:
 
@@ -103,8 +122,8 @@ gate in CI fails the PR if a generated surface is out of sync with the spec, so
 a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit
 and validates catalogue format and msgid parity, so a bad pin cannot land
-either. See [Docs & Translations](../maintainers/docs-and-translations.md) for
-catalogue refresh details.
+either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext)
+for translation pipeline details.
 
 **Confirm the merge landed correctly:**
 
@@ -424,6 +443,16 @@ If you need to raise the floor to drop support for an older version:
 ---
 
 ## If something goes wrong
+
+**The run dies instantly with `startup_failure` (zero jobs created):** Treat
+this as a symptom, not an allowlist diagnosis. Check the run summary and
+repository Actions policy. If GitHub reports a selected-actions rejection and
+the release workflow recently added or changed `uses:` refs, compare those refs
+with [Allowed actions](./ci-and-actions.md#allowed-actions). Add only the
+rejected pattern in Settings → Actions → General, wait a few minutes for the
+setting to propagate, then dispatch a fresh run. If GitHub does not report a
+policy rejection, investigate the workflow definition or other repository
+policy instead.
 
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.

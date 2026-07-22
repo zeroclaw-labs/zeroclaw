@@ -382,6 +382,7 @@ mod tests {
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
+            parent_agent_alias: None,
         }
     }
 

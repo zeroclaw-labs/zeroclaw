@@ -44,6 +44,7 @@ pub(crate) async fn announce_llm_request(
         messages_count: history.len(),
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
     });
     {
@@ -343,6 +344,7 @@ mod payload_capture_tests {
         draft_reasoning: StreamReasoningMode,
     ) -> TurnCtx<'a> {
         TurnCtx {
+            parent_agent_alias: None,
             observer,
             provider_name: "stub",
             model: "stub-model",

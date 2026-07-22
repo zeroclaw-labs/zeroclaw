@@ -1114,6 +1114,13 @@ mod tests {
         let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
         ev.message = Some(msg.to_string());
         record_event(ev);
+        // JSONL fsync runs off the async hot path, so `record_event` returns
+        // before the line is on disk. Tests that assert on the log file
+        // immediately after emitting must flush first (the explicit idiom used
+        // throughout this module); folding it into `emit` keeps every
+        // emit-then-read test correct — notably the `reinit_*` tests, which
+        // read the file right after emitting.
+        flush_for_test().unwrap();
     }
 
     fn set_mtime(path: &Path, when: SystemTime) {

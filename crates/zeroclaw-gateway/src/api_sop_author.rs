@@ -335,9 +335,10 @@ pub async fn handle_sop_run_overlay(
 }
 
 /// Resolve a gated live run. Body carries the raw `ApprovalDecision` wire
-/// value. A `WaitingApproval` run resolves through the audited `resolve_gate`
-/// chokepoint with an HTTP principal; a deterministic `PausedCheckpoint` run
-/// resolves through `decide_checkpoint`. Returns the refreshed overlay.
+/// value. Waiting approvals and deterministic checkpoints both resolve through
+/// the broker-backed chokepoint with an HTTP principal, so named approval
+/// policies, membership, and quorum are enforced before a gate or checkpoint can
+/// clear. Returns the refreshed overlay.
 pub async fn handle_sop_decide(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -404,7 +405,8 @@ pub async fn handle_sop_decide(
     );
     let _guard = span.enter();
 
-    let mut resumed_action: Option<zeroclaw_runtime::sop::types::SopRunAction> = None;
+    let mut resolved_outcome = None;
+    let mut pending_quorum = false;
     {
         let mut guard = match engine.lock() {
             Ok(g) => g,
@@ -416,20 +418,46 @@ pub async fn handle_sop_decide(
                     .into_response();
             }
         };
+        let run_sop_name = match guard.get_run(&run_id).map(|run| run.sop_name.clone()) {
+            Some(name) => name,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("Run {run_id} not found")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if run_sop_name != name {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("run '{run_id}' belongs to SOP '{run_sop_name}', not '{name}'")
+                })),
+            )
+                .into_response();
+        }
         let status = guard.get_run(&run_id).map(|r| r.status);
         match status {
-            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
+            Some(
+                zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval
+                | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint,
+            ) => {
                 use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
                 // Route through the broker (membership + quorum), not `resolve_gate`
                 // directly, otherwise this authoring surface would
                 // clear a policied approval gate without enforcing group membership or
                 // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
                 match guard.resolve_via_broker(&run_id, decision, principal) {
-                    Ok(BrokerOutcome::Resolved(ResolveOutcome::Resumed(action))) => {
-                        resumed_action = Some(*action);
+                    Ok(outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))) => {
+                        resolved_outcome = Some(outcome);
                     }
                     Ok(BrokerOutcome::Resolved(
-                        ResolveOutcome::Denied | ResolveOutcome::AlreadyResolved,
+                        ResolveOutcome::Denied
+                        | ResolveOutcome::AlreadyResolved
+                        | ResolveOutcome::Revised,
                     )) => {}
                     Ok(
                         BrokerOutcome::Resolved(ResolveOutcome::NotWaiting)
@@ -448,6 +476,16 @@ pub async fn handle_sop_decide(
                             StatusCode::FORBIDDEN,
                             Json(serde_json::json!({
                                 "error": "approval_mode forbids this principal from clearing the gate"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Ok(BrokerOutcome::Resolved(ResolveOutcome::DeferredAtCapacity)) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "outcome": "deferred_at_capacity",
+                                "run_id": run_id,
                             })),
                         )
                             .into_response();
@@ -472,17 +510,20 @@ pub async fn handle_sop_decide(
                         )
                             .into_response();
                     }
-                    // The vote counted but quorum is not yet met: the gate stays
-                    // waiting for the remaining approvers.
-                    Ok(BrokerOutcome::PendingQuorum { have, need }) => {
+                    Ok(BrokerOutcome::PolicyUnavailable { reason }) => {
                         return (
-                            StatusCode::ACCEPTED,
+                            StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
-                                "outcome": format!("pending_quorum ({have}/{need})"),
-                                "run_id": run_id,
+                                "error": "policy_unavailable",
+                                "reason": reason,
                             })),
                         )
                             .into_response();
+                    }
+                    // The vote counted but quorum is not yet met: the gate stays
+                    // waiting for the remaining approvers.
+                    Ok(BrokerOutcome::PendingQuorum { .. }) => {
+                        pending_quorum = true;
                     }
                     Err(e) => {
                         return (
@@ -493,28 +534,42 @@ pub async fn handle_sop_decide(
                     }
                 }
             }
-            _ => match guard.decide_checkpoint(&run_id, decision) {
-                Ok(action) => {
-                    resumed_action = Some(action);
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    )
-                        .into_response();
-                }
-            },
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Run {run_id} is not waiting for approval or paused at a checkpoint"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
 
-    if let Some(action) = resumed_action {
-        let config = state.config.read().clone();
-        zeroclaw_runtime::sop::spawn_headless_run_driver(
-            config,
+    if pending_quorum {
+        return match zeroclaw_runtime::sop::run_overlay_for(&sop, engine, &run_id) {
+            Ok(overlay) => (StatusCode::ACCEPTED, Json(overlay)).into_response(),
+            Err(e) => {
+                let msg = e.to_string();
+                let code = if msg.contains("not found") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            }
+        };
+    }
+
+    if let Some(outcome) = resolved_outcome {
+        let config = state.config.read();
+        zeroclaw_runtime::sop::drive_resumed_broker_action(
+            &config,
             std::sync::Arc::clone(engine),
             state.sop_audit.clone(),
-            action,
+            &outcome,
         );
     }
 
@@ -680,4 +735,344 @@ pub async fn handle_sop_graph_legend(
         return e.into_response();
     }
     Json(zeroclaw_runtime::sop::GraphLegend::canonical()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderValue, header};
+    use http_body_util::BodyExt;
+    use zeroclaw_config::schema::{
+        ApprovalGroupConfig, ApprovalPolicyConfig, SopApprovalConfig, SopConfig,
+    };
+    use zeroclaw_runtime::security::pairing::PairingGuard;
+    use zeroclaw_runtime::sop::approval::ApprovalBroker;
+    use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
+    use zeroclaw_runtime::sop::types::{
+        Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+        SopRunStatus, SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+    };
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    fn authoring_policy_sop() -> Sop {
+        Sop {
+            name: "deploy".into(),
+            description: "t".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "gate".into(),
+                requires_confirmation: true,
+                kind: SopStepKind::Execute,
+                policy: Some("prod".into()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn authoring_checkpoint_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("{name} checkpoint"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "gate".into(),
+                kind: SopStepKind::Checkpoint,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn authoring_state_with_policied_gate(
+        member_token: &str,
+        other_token: &str,
+    ) -> (tempfile::TempDir, AppState, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let member_hash = PairingGuard::token_hash(member_token);
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: vec![member_hash],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".into()),
+                quorum: 1,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let approval = SopApprovalConfig { groups, policies };
+        let sop = authoring_policy_sop();
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop).unwrap();
+
+        let mut engine = SopEngine::new(SopConfig {
+            approval,
+            ..SopConfig::default()
+        })
+        .with_approval_broker(Arc::new(ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "deploy",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected WaitApproval, got {other:?}"),
+        };
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[member_token.to_string(), other_token.to_string()],
+        ));
+        (tmp, state, run_id)
+    }
+
+    #[tokio::test]
+    async fn authoring_decide_enforces_broker_policy_membership() {
+        let member = "member-token";
+        let outsider = "outsider-token";
+        let (_tmp, state, run_id) = authoring_state_with_policied_gate(member, outsider);
+
+        let resp = handle_sop_decide(
+            State(state.clone()),
+            bearer(outsider),
+            Path(("deploy".to_string(), run_id.clone())),
+            Json(serde_json::json!("approve")),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a paired non-member must not clear a policied authoring gate"
+        );
+        let status = state
+            .sop_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_run(&run_id)
+            .map(|r| r.status);
+        assert_eq!(
+            status,
+            Some(SopRunStatus::WaitingApproval),
+            "the gate stays waiting after a broker-rejected authoring decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoring_decide_pending_quorum_returns_overlay_shape() {
+        let first_member = "member-token-1";
+        let second_member = "member-token-2";
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let first_hash = PairingGuard::token_hash(first_member);
+        let second_hash = PairingGuard::token_hash(second_member);
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: vec![first_hash, second_hash],
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".into()),
+                quorum: 2,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let approval = SopApprovalConfig { groups, policies };
+        let sop = authoring_policy_sop();
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop).unwrap();
+
+        let mut engine = SopEngine::new(SopConfig {
+            approval,
+            ..SopConfig::default()
+        })
+        .with_approval_broker(Arc::new(ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "deploy",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected WaitApproval, got {other:?}"),
+        };
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[first_member.to_string(), second_member.to_string()],
+        ));
+
+        let resp = handle_sop_decide(
+            State(state.clone()),
+            bearer(first_member),
+            Path(("deploy".to_string(), run_id.clone())),
+            Json(serde_json::json!("approve")),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "the first quorum member should leave the run pending"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.get("run_id").and_then(|value| value.as_str()),
+            Some(run_id.as_str())
+        );
+        assert_eq!(
+            json.get("sop_name").and_then(|value| value.as_str()),
+            Some("deploy")
+        );
+        assert_eq!(
+            json.get("waiting").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(
+            json.get("outcome").is_none(),
+            "pending quorum responses must keep the RunOverlay shape, got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoring_decide_rejects_run_id_from_different_sop_before_broker_resolution() {
+        let token = "member-token";
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_a = authoring_checkpoint_sop("deploy-a");
+        let sop_b = authoring_checkpoint_sop("deploy-b");
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop_a).unwrap();
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop_b).unwrap();
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop_a, sop_b]);
+        let action = engine
+            .start_run(
+                "deploy-b",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected CheckpointWait, got {other:?}"),
+        };
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+
+        let resp = handle_sop_decide(
+            State(state.clone()),
+            bearer(token),
+            Path(("deploy-a".to_string(), run_id.clone())),
+            Json(serde_json::json!("approve")),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a path SOP must not resolve a run owned by another SOP"
+        );
+        let guard = state.sop_engine.as_ref().unwrap().lock().unwrap();
+        let run = guard.get_run(&run_id).expect("deploy-b run remains active");
+        assert_eq!(run.sop_name, "deploy-b");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "mismatched authoring decision must not append a gate_resolved row"
+        );
+    }
 }
