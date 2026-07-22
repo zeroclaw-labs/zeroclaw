@@ -2676,6 +2676,12 @@ pub struct GrokCliModelProviderConfig {
     /// session boundary. The directory must exist when the provider is built.
     /// Project-scoped Grok config is resolved relative to this path.
     pub working_directory: String,
+    /// Extra environment variable names inherited by the `grok` subprocess.
+    /// Values are resolved from the ZeroClaw process environment at spawn
+    /// time. The default is empty so unrelated daemon secrets remain blocked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
     /// Extra global Grok long flags inserted before `agent stdio`. Known
     /// options may put their value in the next token; other value-taking
     /// options use `--flag=value`. Positional and short arguments are rejected.
@@ -24179,10 +24185,15 @@ auto_save = true
             r#"
                 model = "grok-4.5"
                 working_directory = "/srv/zeroclaw/workspace"
+                env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
             "#,
         )
         .expect("explicit Grok ACP cwd");
         assert_eq!(parsed.working_directory, "/srv/zeroclaw/workspace");
+        assert_eq!(
+            parsed.env_passthrough,
+            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        );
     }
 
     #[test]

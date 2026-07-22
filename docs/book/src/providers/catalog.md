@@ -49,6 +49,13 @@ used for both the child cwd and ACP session boundary, so the provider never
 falls back to the daemon cwd. Optional `binary_path` selects a non-`PATH`
 binary. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 
+The child environment is cleared before spawn. Runtime/auth variables on the
+built-in allowlist remain available; all other names are blocked unless that
+provider alias lists them in `env_passthrough`. Values are read from the
+ZeroClaw process environment at spawn time and are not stored in provider
+config. The default list is empty. Keep it narrow because every listed secret
+is exposed to Grok and any tools enabled for that alias.
+
 The default argv adds `--no-auto-update`, `--sandbox strict`,
 `--permission-mode dontAsk`, and `--tools ""`. The ACP client also cancels
 every permission request. To grant Grok tools or relax sandbox/permission
@@ -98,6 +105,7 @@ model = "grok-4.5"
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
 working_directory = "/path/to/agents/ops/workspace"
+env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
 extra_args = ["--tools=Read,Grep", "--allow=Read", "--allow=Grep"]
 
 [agents.default]

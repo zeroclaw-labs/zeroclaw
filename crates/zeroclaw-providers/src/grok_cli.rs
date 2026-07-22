@@ -23,7 +23,8 @@
 //! path. The provider therefore:
 //!
 //! - requires an explicit absolute working directory;
-//! - clears the inherited environment and forwards only runtime/auth entries;
+//! - clears the inherited environment and forwards only runtime/auth entries
+//!   plus explicit per-alias `env_passthrough` names;
 //! - defaults to `--sandbox strict`, `--permission-mode dontAsk`, and an empty
 //!   built-in tool set;
 //! - cancels every ACP permission request rather than approving it;
@@ -210,6 +211,8 @@ pub struct GrokCliModelProvider {
     binary_path: PathBuf,
     /// Canonical subprocess cwd and ACP session boundary.
     working_directory: PathBuf,
+    /// Operator-selected environment variable names inherited at spawn time.
+    env_passthrough: Vec<String>,
     /// Operator-supplied argv tokens, after provider-owned flag validation.
     extra_args: Vec<String>,
     /// Wall-clock timeout for the ACP request.
@@ -225,6 +228,7 @@ pub struct GrokCliBuilder {
     alias: String,
     binary_path: Option<String>,
     working_directory: Option<String>,
+    env_passthrough: Vec<String>,
     extra_args: Vec<String>,
     timeout_secs: Option<u64>,
 }
@@ -242,6 +246,12 @@ impl GrokCliBuilder {
     /// Set the subprocess cwd and ACP session boundary.
     pub fn working_directory(mut self, path: &str) -> Self {
         self.working_directory = Some(path.to_string());
+        self
+    }
+
+    /// Add operator-selected environment variables to the child allowlist.
+    pub fn env_passthrough(mut self, names: Vec<String>) -> Self {
+        self.env_passthrough = names;
         self
     }
 
@@ -265,6 +275,8 @@ impl GrokCliBuilder {
         let working_directory = GrokCliModelProvider::validate_working_directory(
             self.working_directory.as_deref().unwrap_or_default(),
         )?;
+        let env_passthrough =
+            GrokCliModelProvider::normalize_and_validate_env_passthrough(self.env_passthrough)?;
         let extra_args = GrokCliModelProvider::normalize_and_validate_extra_args(self.extra_args)?;
         let timeout = self
             .timeout_secs
@@ -275,6 +287,7 @@ impl GrokCliBuilder {
             alias: self.alias,
             binary_path,
             working_directory,
+            env_passthrough,
             extra_args,
             timeout,
         })
@@ -405,6 +418,7 @@ impl GrokCliModelProvider {
             alias: alias.to_string(),
             binary_path: None,
             working_directory: None,
+            env_passthrough: Vec::new(),
             extra_args: Vec::new(),
             timeout_secs: None,
         }
@@ -428,6 +442,22 @@ impl GrokCliModelProvider {
             anyhow::bail!("grok_cli working_directory must identify a directory");
         }
         Ok(canonical)
+    }
+
+    fn normalize_and_validate_env_passthrough(names: Vec<String>) -> anyhow::Result<Vec<String>> {
+        let mut normalized = Vec::with_capacity(names.len());
+        for name in names {
+            let name = name.trim();
+            if !is_valid_env_var_name(name) {
+                anyhow::bail!(
+                    "grok_cli env_passthrough entry `{name}` is invalid; expected [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+            if !normalized.iter().any(|existing| existing == name) {
+                normalized.push(name.to_string());
+            }
+        }
+        Ok(normalized)
     }
 
     fn normalize_and_validate_extra_args(extra_args: Vec<String>) -> anyhow::Result<Vec<String>> {
@@ -547,10 +577,18 @@ impl GrokCliModelProvider {
         args
     }
 
-    fn apply_env_allowlist(cmd: &mut Command) {
+    fn apply_env_allowlist(cmd: &mut Command, env_passthrough: &[String]) {
+        Self::apply_env_allowlist_from(cmd, env_passthrough, std::env::vars());
+    }
+
+    fn apply_env_allowlist_from(
+        cmd: &mut Command,
+        env_passthrough: &[String],
+        variables: impl IntoIterator<Item = (String, String)>,
+    ) {
         cmd.env_clear();
-        for (key, value) in std::env::vars() {
-            if env_var_allowed(&key) {
+        for (key, value) in variables {
+            if env_var_allowed(&key, env_passthrough) {
                 cmd.env(key, value);
             }
         }
@@ -561,7 +599,7 @@ impl GrokCliModelProvider {
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(&args);
         cmd.current_dir(&self.working_directory);
-        Self::apply_env_allowlist(&mut cmd);
+        Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
         #[cfg(not(windows))]
         cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
@@ -718,11 +756,18 @@ fn log_acp_failure(phase: &'static str, error_key: &'static str, stderr: StderrS
     );
 }
 
-fn env_var_allowed(key: &str) -> bool {
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn env_var_allowed(key: &str, env_passthrough: &[String]) -> bool {
     ENV_ALLOWLIST_EXACT.contains(&key)
         || key.starts_with("LC_")
         || key.starts_with("GROK_")
         || key.starts_with("XAI_")
+        || env_passthrough.iter().any(|name| name == key)
 }
 
 #[async_trait]
@@ -824,7 +869,32 @@ mod tests {
             std::fs::canonicalize(temp.path()).expect("canonical path")
         );
         assert_eq!(model_provider.binary_path, PathBuf::from("grok"));
+        assert!(model_provider.env_passthrough.is_empty());
         assert_eq!(model_provider.timeout, DEFAULT_GROK_CLI_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_validates_and_deduplicates_env_passthrough() {
+        let temp = TempDir::new().expect("tempdir");
+        let model_provider = GrokCliModelProvider::builder("test")
+            .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+            .env_passthrough(vec![
+                " AWS_ACCESS_KEY_ID ".to_string(),
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+            ])
+            .build()
+            .expect("valid env passthrough");
+        assert_eq!(
+            model_provider.env_passthrough,
+            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        );
+
+        let invalid = GrokCliModelProvider::builder("test")
+            .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+            .env_passthrough(vec!["AWS-SECRET".to_string()])
+            .build();
+        assert!(invalid.is_err(), "invalid environment name must fail");
     }
 
     #[test]
@@ -946,13 +1016,67 @@ mod tests {
 
     #[test]
     fn env_allowlist_blocks_unrelated_secrets() {
-        assert!(env_var_allowed("PATH"));
-        assert!(env_var_allowed("XAI_API_KEY"));
-        assert!(env_var_allowed("GROK_SANDBOX"));
-        assert!(env_var_allowed("LC_ALL"));
-        assert!(!env_var_allowed("ZEROCLAW_SLACK_BOT_TOKEN"));
-        assert!(!env_var_allowed("AWS_SECRET_ACCESS_KEY"));
-        assert!(!env_var_allowed("OPENAI_API_KEY"));
+        let none = &[];
+        assert!(env_var_allowed("PATH", none));
+        assert!(env_var_allowed("XAI_API_KEY", none));
+        assert!(env_var_allowed("GROK_SANDBOX", none));
+        assert!(env_var_allowed("LC_ALL", none));
+        assert!(!env_var_allowed("ZEROCLAW_SLACK_BOT_TOKEN", none));
+        assert!(!env_var_allowed("AWS_SECRET_ACCESS_KEY", none));
+        assert!(!env_var_allowed("OPENAI_API_KEY", none));
+    }
+
+    #[test]
+    fn env_allowlist_accepts_only_explicit_passthrough_names() {
+        let passthrough = vec!["AWS_ACCESS_KEY_ID".to_string()];
+        assert!(env_var_allowed("AWS_ACCESS_KEY_ID", &passthrough));
+        assert!(!env_var_allowed("AWS_SECRET_ACCESS_KEY", &passthrough));
+    }
+
+    #[test]
+    fn apply_env_allowlist_copies_only_builtin_and_explicit_entries() {
+        let mut command = Command::new("grok");
+        GrokCliModelProvider::apply_env_allowlist_from(
+            &mut command,
+            &["AWS_ACCESS_KEY_ID".to_string()],
+            [
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("AWS_ACCESS_KEY_ID".to_string(), "test-access".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "test-secret".to_string(),
+                ),
+                (
+                    "ZEROCLAW_SLACK_BOT_TOKEN".to_string(),
+                    "test-token".to_string(),
+                ),
+            ],
+        );
+        let copied: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(copied.contains(&("PATH".to_string(), Some("/usr/bin".to_string()))));
+        assert!(copied.contains(&(
+            "AWS_ACCESS_KEY_ID".to_string(),
+            Some("test-access".to_string())
+        )));
+        assert!(
+            !copied
+                .iter()
+                .any(|(name, _)| name == "AWS_SECRET_ACCESS_KEY")
+        );
+        assert!(
+            !copied
+                .iter()
+                .any(|(name, _)| name == "ZEROCLAW_SLACK_BOT_TOKEN")
+        );
     }
 
     #[tokio::test]

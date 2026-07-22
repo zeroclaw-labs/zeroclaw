@@ -1387,6 +1387,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
             crate::grok_cli::GrokCliModelProvider::builder(alias)
                 .binary_path(self.binary_path.as_deref())
                 .working_directory(&self.working_directory)
+                .env_passthrough(self.env_passthrough.clone())
                 .extra_args(self.extra_args.clone())
                 .timeout_secs(self.base.timeout_secs)
                 .build()?,
