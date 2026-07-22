@@ -32,7 +32,7 @@ For runtime, tools, and zerocode, English remains the base map. A translated dis
 
 ## gettext documentation strings
 
-English Markdown is the authored documentation source, but extraction also sees whatever generated references, included snippets, and preprocessor output are available during the extraction build. `cargo mdbook sync` injects the locale switcher and runs mdBook with xgettext output; it does not run `cargo mdbook refs` or the full generated-snippet preparation sequence. Regenerate an ignored reference or snippet before sync when its canonical input changed, or extraction can consume a stale local materialization.
+English Markdown is the authored documentation source, but extraction also sees generated references, included snippets, and preprocessor output materialized for the extraction build. Before running mdBook with xgettext output, `cargo mdbook sync` calls the shared `prepare_generated_book_inputs()` path used by locale builds and single-locale serving. That path regenerates the CLI and config references, locale switcher, theme, keymap, hardware, feature-matrix, and plugin inputs from their canonical sources. Extraction also runs with the built peer-groups preprocessor, so a clean checkout does not depend on ignored files or binaries left by an earlier docs build.
 
 `cargo mdbook sync` extracts English messages into `messages.pot`, normalizes the template, bootstraps or merges each locale without fuzzy matching, removes obsolete entries, and reports the untranslated delta. When a model provider is supplied, it fills missing translations through `tools/fill-translations`; otherwise it makes no provider calls. The maintainer guide owns the command options and operating procedure.
 

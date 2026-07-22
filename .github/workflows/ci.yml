@@ -78,6 +78,8 @@ jobs:
             sed 's/^/  /' "$gitlinks"
             exit 1
           fi
+      - name: Test translation release submodule handling
+        run: scripts/release/refresh-translations.test.sh
 
   # ── Post-format required quality gate ─────────────────────────────────────
 
@@ -146,7 +148,7 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
-      - name: Comment hygiene gate (no issue refs / gravitas / truncation artifacts)
+      - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
@@ -493,11 +495,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check firmware protocol crate
+        run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -680,6 +685,25 @@ jobs:
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
 
+  web-permission-tests:
+    name: Web Permission Tests
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Run permission and catalog regressions
+        working-directory: web
+        run: npm run test:permissions
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -687,7 +711,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

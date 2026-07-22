@@ -1,6 +1,7 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
 
+use crate::PluginCapability;
 use crate::PluginPermission;
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
@@ -9,7 +10,8 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     ChannelCapabilities, InboundMessage as WitInboundMessage,
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
-use crate::component::{PluginState, call_plugin, engine, load_component, wt};
+use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
+use crate::instance::{PluginGrantSet, PluginInstanceScope};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -28,7 +30,7 @@ use zeroclaw_api::media::MediaAttachment;
 
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
-    alias: String,
+    scope: PluginInstanceScope,
     capabilities: ChannelCapabilities,
     state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
     inbound: InboundQueue,
@@ -54,19 +56,16 @@ impl Attributable for WasmChannel {
         Role::Channel(ChannelKind::Plugin)
     }
     fn alias(&self) -> &str {
-        &self.alias
+        self.scope.id().binding()
     }
 }
 
 /// Resolve the JSON config section handed to a channel plugin's `configure`.
-/// Withheld (an empty object) unless the manifest grants `ConfigRead`, so a
+/// Withheld (an empty object) unless the admitted scope grants `ConfigRead`, so a
 /// plugin without the permission can never be configured with another channel's
 /// secrets. Mirrors the tool-plugin `__config` rule.
-fn resolve_configure_json(
-    config: &HashMap<String, String>,
-    permissions: &[PluginPermission],
-) -> String {
-    if permissions.contains(&PluginPermission::ConfigRead) {
+fn resolve_configure_json(config: &HashMap<String, String>, grants: &PluginGrantSet) -> String {
+    if grants.allows(PluginPermission::ConfigRead) {
         serde_json::to_string(config).unwrap_or_else(|_| "{}".to_string())
     } else {
         "{}".to_string()
@@ -94,16 +93,19 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 
 impl WasmChannel {
     pub async fn from_wasm(
-        alias: impl Into<String>,
+        scope: PluginInstanceScope,
         wasm_path: &Path,
-        permissions: &[PluginPermission],
         config: &HashMap<String, String>,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
+        scope.require_capability(PluginCapability::Channel)?;
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
-        let mut store =
-            crate::component::new_store_with_inbound(permissions, inbound.clone(), limits);
+        let mut store = crate::component::new_store(
+            PluginStoreSpec::new(scope.clone(), limits)
+                .with_granted_http()
+                .with_inbound(inbound.clone()),
+        );
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
@@ -115,10 +117,10 @@ impl WasmChannel {
         let channel = bindings.zeroclaw_plugin_channel();
 
         // Hand the plugin its resolved config once, before any other call. The
-        // section is withheld unless the manifest granted `ConfigRead`, matching
+        // section is withheld unless the admitted scope grants `ConfigRead`, matching
         // the tool-plugin `__config` rule, so a plugin without the permission is
         // configured with an empty object rather than another channel's secrets.
-        let config_json = resolve_configure_json(config, permissions);
+        let config_json = resolve_configure_json(config, scope.grants());
         wt(
             channel.call_configure(&mut store, &config_json).await,
             "channel.configure trapped",
@@ -158,7 +160,7 @@ impl WasmChannel {
             };
 
         Ok(Self {
-            alias: alias.into(),
+            scope,
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
             inbound,
@@ -243,7 +245,7 @@ fn from_wit_approval_response(r: WitApprovalResponse) -> ChannelApprovalResponse
 #[async_trait]
 impl Channel for WasmChannel {
     fn name(&self) -> &str {
-        &self.alias
+        self.scope.id().binding()
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -264,7 +266,7 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_name = self.alias.clone();
+        let channel_name = self.scope.id().binding().to_string();
         let state = Arc::clone(&self.state);
         let poll_healthy = Arc::clone(&self.poll_healthy);
         zeroclaw_spawn::spawn!(async move {
@@ -789,7 +791,12 @@ mod tests {
     fn configure_withholds_section_without_config_read() {
         let mut config = HashMap::new();
         config.insert("api_key".to_string(), "secret".to_string());
-        let json = resolve_configure_json(&config, &[PluginPermission::HttpClient]);
+        let scope = crate::instance::test_scope(
+            PluginCapability::Channel,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let json = resolve_configure_json(&config, scope.grants());
         assert_eq!(json, "{}", "no ConfigRead means an empty config object");
     }
 
@@ -797,9 +804,29 @@ mod tests {
     fn configure_passes_section_with_config_read() {
         let mut config = HashMap::new();
         config.insert("identity".to_string(), "on-call".to_string());
-        let json = resolve_configure_json(&config, &[PluginPermission::ConfigRead]);
+        let scope = crate::instance::test_scope(
+            PluginCapability::Channel,
+            "main",
+            [PluginPermission::ConfigRead],
+        );
+        let json = resolve_configure_json(&config, scope.grants());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["identity"], "on-call", "granted section round-trips");
+    }
+
+    #[tokio::test]
+    async fn from_wasm_rejects_a_scope_for_another_capability() {
+        let scope = crate::instance::test_scope(PluginCapability::Tool, "main", []);
+        let result = WasmChannel::from_wasm(
+            scope,
+            Path::new("/path/that/must/not/be-read.wasm"),
+            &HashMap::new(),
+            crate::component::test_limits(0),
+        )
+        .await;
+
+        let error = result.err().expect("capability mismatch must fail");
+        assert!(format!("{error:#}").contains("capability"));
     }
 
     #[test]

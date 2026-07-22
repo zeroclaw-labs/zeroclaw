@@ -14,6 +14,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
 | Risk is high or unclear | Treat as `risk:high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
+| Diff adds a parallel interpretive surface | Verify it is derived from, or explicitly points to, the canonical source | [Drift-surface review](#drift-surface-review) |
 | Automation output is wrong or noisy | Apply the override protocol | [Automation override](#automation-override) |
 | Need to hand off to another maintainer | Use the handoff template | [Handoff](#handoff) |
 
@@ -59,6 +60,48 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - MSRV, pinned toolchain, or other version-floor changes are called out as compatibility-impacting: the PR explains who must upgrade, CI and installer baselines agree, and release notes name the new floor when the change can affect source-build users.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
 - Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Architecture overview](../architecture/overview.md#core-traits)).
+
+### Drift-surface review
+
+Treat new duplicate interpretive surfaces as review risk. A PR should not add
+comments, examples, generated snapshots, mapping tables, configuration mirrors,
+or parallel registries that restate behavior already owned by code, schemas,
+tests, WIT, config, or runtime dispatch unless the new surface is mechanically
+derived from that owner or clearly points back to it.
+
+Block or request changes when the new surface can drift and future readers,
+reviewers, or automation might treat it as more authoritative than the source.
+Common examples include comments that describe behavior not enforced by code,
+docs that duplicate an enum or schema list by hand, tests that snapshot an
+implementation detail rather than user-observable behavior, and registries that
+copy a key space already owned by another module.
+
+Prefer one of these resolutions:
+
+- Remove the duplicate surface and make the canonical owner easier to read.
+- Generate the secondary surface from the canonical owner.
+- Replace the restatement with a source pointer plus the reason that the
+  pointer belongs there.
+
+`why` comments are still welcome when they capture non-obvious invariants,
+hazards, or tradeoffs that the type system and tests cannot express. They
+should explain intent, not restate the nearby control flow or become a second
+contract.
+
+#### Typed dispatch for shared key spaces
+
+For shared key spaces such as wire method names, compiled channel type keys,
+provider slots, or frontend/backend registry keys, apply this rule by resolving
+raw strings at the API or config boundary. Downstream code should dispatch
+through an enum, macro-generated table, trait/factory registry, or another
+canonical owner. Do not add parallel string `match` arms, hand-typed dispatch
+tables, or duplicate lists that must be kept in sync by reviewer memory.
+
+This does not ban string constants at API boundaries. It prevents a second
+dispatch surface where adding a new variant can compile while silently skipping
+one consumer. Good examples are the RPC `Method` registry for wire method names
+and `CHANNEL_COMPILE_SPECS` for channel compile keys, where one canonical owner
+drives downstream coverage.
 
 ### Deep-review checklist (high-risk only)
 
