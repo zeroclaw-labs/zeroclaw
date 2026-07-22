@@ -385,7 +385,7 @@ fn create_doctor_model_provider(
 /// canonical instance-wide runtime-state directory (databases, daemon
 /// state), honoring `ZEROCLAW_DATA_DIR` overrides. Both the CLI writer and
 /// the channel reader resolve this same path via [`Config::data_dir`].
-fn persist_model_cache(
+pub fn persist_model_cache(
     config: &Config,
     provider_name: &str,
     models: &[String],
@@ -431,11 +431,22 @@ fn persist_model_cache(
 
     let json = serde_json::to_string_pretty(&cache).context("Failed to serialize model cache")?;
 
-    // Atomic write: write to a temp file then rename to avoid truncated JSON
-    // on process interruption.
-    let tmp_path = cache_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json).context("Failed to write model cache temp file")?;
-    std::fs::rename(&tmp_path, &cache_path).context("Failed to rename model cache temp file")?;
+    // Atomic write: publish through a unique, exclusively-created temp file in
+    // the same directory, then rename into place. A fixed temp-file name would
+    // let two concurrent refreshes collide on the same inode, or let a
+    // pre-existing symlink at that predictable path get followed and
+    // truncated; `tempfile` picks a fresh random name each call and removes
+    // the file automatically if we return before `persist`.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(MODEL_CACHE_FILE)
+        .suffix(".tmp")
+        .tempfile_in(&cache_dir)
+        .context("Failed to create model cache temp file")?;
+    tmp.write_all(json.as_bytes())
+        .context("Failed to write model cache temp file")?;
+    tmp.persist(&cache_path)
+        .map_err(|e| e.error)
+        .context("Failed to rename model cache temp file")?;
 
     Ok(())
 }
@@ -2063,6 +2074,34 @@ mod tests {
             cache_path.is_dir(),
             "unreadable existing cache path must be left untouched, not replaced"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persist_model_cache_does_not_follow_a_preexisting_tmp_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Plant a symlink at the *old* fixed temp-file name, pointing outside
+        // the cache directory. The old `cache_path.with_extension("json.tmp")`
+        // scheme would write through this predictable path and truncate the
+        // decoy; the new unique/exclusive tempfile-based path must never pick
+        // this name at all.
+        let decoy = tmp.path().join("decoy.json");
+        std::fs::write(&decoy, "untouched").unwrap();
+        std::os::unix::fs::symlink(&decoy, state_dir.join("models_cache.json.tmp")).unwrap();
+
+        persist_model_cache(&config, "openrouter", &["a".to_string()]).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&decoy).unwrap(),
+            "untouched",
+            "persistence must not write through a pre-existing symlink at a predictable temp path"
+        );
+        let raw = std::fs::read_to_string(state_dir.join(MODEL_CACHE_FILE)).unwrap();
+        assert!(raw.contains("openrouter"));
     }
 
     #[tokio::test]

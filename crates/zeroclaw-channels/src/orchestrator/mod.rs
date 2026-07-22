@@ -11657,6 +11657,44 @@ mod tests {
     }
 
     #[test]
+    fn refresh_then_model_preview_joins_the_real_writer_and_reader() {
+        // Joins the two production halves of the refresh-to-preview contract
+        // directly, rather than exercising each in isolation: the actual
+        // `zeroclaw-runtime::doctor::persist_model_cache` writer (what
+        // `zeroclaw models refresh` calls), then this crate's actual
+        // `load_cached_model_preview` reader (what `/model` calls) — for a
+        // dotted provider ref and a custom, non-default agent workspace.
+        let data_root = TempDir::new().unwrap();
+        let custom_agent_workspace = TempDir::new().unwrap();
+
+        let config = Config {
+            config_path: data_root.path().join("config.toml"),
+            data_dir: data_root.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        zeroclaw_runtime::doctor::persist_model_cache(
+            &config,
+            "custom.local",
+            &["model-a".to_string(), "model-b".to_string()],
+        )
+        .unwrap();
+
+        let found = load_cached_model_preview(
+            data_root.path(),
+            custom_agent_workspace.path(),
+            "custom.local",
+        );
+
+        assert_eq!(
+            found,
+            vec!["model-a".to_string(), "model-b".to_string()],
+            "a refresh written by the real writer must be visible through the real reader \
+             for a non-default agent's custom workspace"
+        );
+    }
+
+    #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
         // The "no channels configured" message must point operators at the
         // current command (zeroclaw quickstart), not the deleted `zeroclaw onboard`.
