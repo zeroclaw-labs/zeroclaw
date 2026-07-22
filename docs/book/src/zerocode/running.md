@@ -31,6 +31,13 @@ The in-app help overlay shows your live key bindings for these actions.
 
 Chat/Code sessions and ACP-backed sessions use different stores. If you use the ACP protocol directly, use `session/load` when you need transcript replay and `session/resume` when you only need the server-side session state restored. See the [ACP documentation](../channels/acp.md) for protocol-level details.
 
+## Terminal text input
+
+zerocode runs as a terminal UI in raw mode. It receives terminal key and paste
+events, not native platform text-field events. On macOS, system text
+replacements therefore work only when your terminal expands them before
+zerocode receives the input.
+
 ## CLI flags
 
 | Flag | Description |
