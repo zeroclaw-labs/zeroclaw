@@ -1004,7 +1004,14 @@ mod tests {
                 .await
                 .expect("live Grok ACP response");
             eprintln!("{label}: {reply}");
-            assert_eq!(reply, marker);
+            // The live agent may prepend user-visible prose to an
+            // `agent_message_chunk`; the marker proves that the complete
+            // prompt reached Grok without treating model wording as
+            // deterministic test output.
+            assert!(
+                reply.contains(marker),
+                "live Grok ACP response must contain {marker}: {reply}"
+            );
         }
     }
 
