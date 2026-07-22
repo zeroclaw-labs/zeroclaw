@@ -25,6 +25,7 @@ pub mod openrouter_catalog;
 pub mod pricing;
 pub mod reliable;
 pub mod router;
+pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
@@ -32,6 +33,10 @@ pub mod vision_override;
 
 pub use anthropic::AnthropicRefusalError;
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
+    scope_safeguard_fallback, take_last_safeguard_fallback,
+};
 
 mod request_payload;
 
@@ -1334,30 +1339,36 @@ fn push_pinned_entries(
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push(ReliableModelProviderEntry::new(
-        family,
-        cooldown_key.clone(),
-        Box::new(
-            crate::model_pin::ModelPinnedProvider::builder(alias)
-                .pinned_model(primary_model)
-                .inner(Box::new(std::sync::Arc::clone(&built)))
-                .build(),
-        ),
-    ));
-    for model in extra_models {
-        if model.trim().is_empty() || model == primary_model {
-            continue;
-        }
-        out.push(ReliableModelProviderEntry::new(
+    out.push(
+        ReliableModelProviderEntry::new(
             family,
             cooldown_key.clone(),
             Box::new(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
-                    .pinned_model(model)
+                    .pinned_model(primary_model)
                     .inner(Box::new(std::sync::Arc::clone(&built)))
                     .build(),
             ),
-        ));
+        )
+        .with_pinned_model(primary_model),
+    );
+    for model in extra_models {
+        if model.trim().is_empty() || model == primary_model {
+            continue;
+        }
+        out.push(
+            ReliableModelProviderEntry::new(
+                family,
+                cooldown_key.clone(),
+                Box::new(
+                    crate::model_pin::ModelPinnedProvider::builder(alias)
+                        .pinned_model(model)
+                        .inner(Box::new(std::sync::Arc::clone(&built)))
+                        .build(),
+                ),
+            )
+            .with_pinned_model(model),
+        );
     }
 }
 

@@ -1,5 +1,9 @@
+use super::AnthropicRefusalError;
 use super::ModelProvider;
 use super::dispatch::ProviderDispatch;
+use super::safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
+};
 use super::stream_guard::AbortOnDrop;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
@@ -63,7 +67,50 @@ fn record_provider_fallback(
     });
 }
 
+/// Remember the first Anthropic safety refusal seen during a single reliability
+/// call. A refusal is non-retryable, so the loop advances to the next entry; the
+/// remembered error lets the loop (a) record a client-side safeguard notice
+/// naming the model that actually served the turn and (b) surface the typed
+/// refusal (with the attempts summary as context) if the whole chain refuses.
+fn remember_refusal(refusal_seen: &mut Option<AnthropicRefusalError>, err: &anyhow::Error) {
+    if refusal_seen.is_none()
+        && let Some(refusal) = err.downcast_ref::<AnthropicRefusalError>()
+    {
+        *refusal_seen = Some(refusal.clone());
+    }
+}
+
+/// After a rescued call, record a one-per-turn client-side safeguard notice
+/// naming the model that actually served the turn. No-op unless a refusal was
+/// seen earlier in this call. `served_model` is the succeeding entry's pinned
+/// model, or the passed-through `current_model` when the entry is unpinned.
+fn record_refusal_rescue(
+    refusal_seen: &Option<AnthropicRefusalError>,
+    entry: &ReliableModelProviderEntry,
+    requested_model: &str,
+    current_model: &str,
+) {
+    let Some(refusal) = refusal_seen else {
+        return;
+    };
+    record_safeguard_fallback(SafeguardFallbackNotice {
+        kind: SafeguardFallbackKind::ClientSide,
+        requested_model: requested_model.to_string(),
+        served_model: entry
+            .pinned_model
+            .clone()
+            .unwrap_or_else(|| current_model.to_string()),
+        category: refusal.category.clone(),
+    });
+}
+
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    // Anthropic safety refusal: the model declined the request itself.
+    if err.downcast_ref::<AnthropicRefusalError>().is_some() {
+        return Some(
+            "The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.",
+        );
+    }
     let msg = err.to_string();
     // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
     if msg.contains("503")
@@ -87,6 +134,13 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // Anthropic safety refusals never resolve by retrying the same model.
+    // Classify them non-retryable so every loop advances straight to the next
+    // provider/model entry. `downcast_ref` searches through `.context(...)`.
+    if err.downcast_ref::<AnthropicRefusalError>().is_some() {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -610,6 +664,9 @@ pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
     provider: Box<dyn ModelProvider>,
+    /// Concrete model this entry serves when its provider is model-pinned;
+    /// `None` only when the entry passes the requested model through unchanged.
+    pinned_model: Option<String>,
 }
 
 impl ReliableModelProviderEntry {
@@ -622,14 +679,23 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
             provider,
+            pinned_model: None,
         }
+    }
+
+    /// Record the concrete model this entry pins its inner provider to, so the
+    /// reliability loop can name the model that actually served the turn when a
+    /// refusal fails over to this entry.
+    pub(crate) fn with_pinned_model(mut self, pinned_model: impl Into<String>) -> Self {
+        self.pinned_model = Some(pinned_model.into());
+        self
     }
 }
 
 /// ModelProvider wrapper with retry + auth-key rotation. The model_provider Vec exists
 /// for tests to exercise multi-provider failover; production wiring always
-/// passes a single primary. Per-model failover chains are also test-only —
-/// the schema no longer surfaces them.
+/// passes a single primary. Production `fallback_models` entries are pinned
+/// siblings the loop fails over across.
 pub struct ReliableModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -871,6 +937,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut refusal_seen: Option<AnthropicRefusalError> = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -929,6 +996,7 @@ impl ModelProvider for ReliableModelProvider {
                                     current_model,
                                 );
                             }
+                            record_refusal_rescue(&refusal_seen, entry, model, current_model);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -955,6 +1023,7 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            remember_refusal(&mut refusal_seen, &e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
@@ -1057,6 +1126,12 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
+        if let Some(refusal) = refusal_seen {
+            return Err(anyhow::Error::new(refusal).context(format!(
+                "All model_providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            )));
+        }
         anyhow::bail!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -1071,6 +1146,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut refusal_seen: Option<AnthropicRefusalError> = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1128,6 +1204,7 @@ impl ModelProvider for ReliableModelProvider {
                                     current_model,
                                 );
                             }
+                            record_refusal_rescue(&refusal_seen, entry, model, current_model);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -1164,6 +1241,7 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            remember_refusal(&mut refusal_seen, &e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
@@ -1260,6 +1338,12 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
+        if let Some(refusal) = refusal_seen {
+            return Err(anyhow::Error::new(refusal).context(format!(
+                "All model_providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            )));
+        }
         anyhow::bail!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -1318,6 +1402,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut refusal_seen: Option<AnthropicRefusalError> = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1376,6 +1461,7 @@ impl ModelProvider for ReliableModelProvider {
                                     current_model,
                                 );
                             }
+                            record_refusal_rescue(&refusal_seen, entry, model, current_model);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -1412,6 +1498,7 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            remember_refusal(&mut refusal_seen, &e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
@@ -1508,6 +1595,12 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
+        if let Some(refusal) = refusal_seen {
+            return Err(anyhow::Error::new(refusal).context(format!(
+                "All model_providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            )));
+        }
         anyhow::bail!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -1522,6 +1615,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut refusal_seen: Option<AnthropicRefusalError> = None;
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
 
@@ -1585,6 +1679,7 @@ impl ModelProvider for ReliableModelProvider {
                                     current_model,
                                 );
                             }
+                            record_refusal_rescue(&refusal_seen, entry, model, current_model);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -1621,6 +1716,7 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
+                            remember_refusal(&mut refusal_seen, &e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
@@ -1721,6 +1817,12 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
+        if let Some(refusal) = refusal_seen {
+            return Err(anyhow::Error::new(refusal).context(format!(
+                "All model_providers/models failed. Attempts:\n{}",
+                failures.join("\n")
+            )));
+        }
         anyhow::bail!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -4706,5 +4808,566 @@ mod tests {
             "ReliableModelProvider must not surface as model_provider_type=reliable",
         );
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    // ── Safeguard-refusal client-side fallback (PR 2) ──
+
+    use crate::safeguard_notice::{scope_safeguard_fallback, take_last_safeguard_fallback};
+
+    #[derive(Clone)]
+    enum RefusalStubMode {
+        Refuse { category: Option<&'static str> },
+        Http500,
+        Succeed,
+    }
+
+    /// Production-shaped stub for the refusal path: it drives the `chat` and
+    /// `chat_with_tools` surfaces the reliability loop exercises, and returns a
+    /// typed [`AnthropicRefusalError`] (mirroring what the anthropic provider
+    /// emits) so the loop's classification/failover logic runs for real.
+    struct RefusalStub {
+        calls: Arc<AtomicUsize>,
+        mode: RefusalStubMode,
+        response: &'static str,
+    }
+
+    impl RefusalStub {
+        fn outcome(&self, model: &str) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.mode {
+                RefusalStubMode::Refuse { category } => {
+                    Err(anyhow::Error::new(AnthropicRefusalError {
+                        requested_model: model.to_string(),
+                        category: category.map(str::to_string),
+                    }))
+                }
+                RefusalStubMode::Http500 => anyhow::bail!("500 Internal Server Error"),
+                RefusalStubMode::Succeed => Ok(ChatResponse {
+                    text: Some(self.response.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusalStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.outcome(model)
+                .map(|resp| resp.text.unwrap_or_default())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.outcome(model)
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.outcome(model)
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for RefusalStub {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "RefusalStub"
+        }
+    }
+
+    /// Build a pinned sibling entry the production way: the stub wrapped in a
+    /// `ModelPinnedProvider` and the entry tagged with the same pinned model
+    /// (exactly as `push_pinned_entries`/`append_fallback_chain` do).
+    fn pinned_entry(
+        display_name: &str,
+        cooldown_key: &str,
+        pinned_model: &str,
+        stub: Box<dyn ModelProvider>,
+    ) -> ReliableModelProviderEntry {
+        ReliableModelProviderEntry::new(
+            display_name,
+            cooldown_key,
+            Box::new(
+                crate::model_pin::ModelPinnedProvider::builder(display_name)
+                    .pinned_model(pinned_model)
+                    .inner(stub)
+                    .build(),
+            ),
+        )
+        .with_pinned_model(pinned_model)
+    }
+
+    fn refusing_stub(
+        calls: &Arc<AtomicUsize>,
+        category: Option<&'static str>,
+    ) -> Box<dyn ModelProvider> {
+        Box::new(RefusalStub {
+            calls: Arc::clone(calls),
+            mode: RefusalStubMode::Refuse { category },
+            response: "unused",
+        })
+    }
+
+    fn succeeding_stub(calls: &Arc<AtomicUsize>, response: &'static str) -> Box<dyn ModelProvider> {
+        Box::new(RefusalStub {
+            calls: Arc::clone(calls),
+            mode: RefusalStubMode::Succeed,
+            response,
+        })
+    }
+
+    fn chat_req(messages: &[ChatMessage]) -> ChatRequest<'_> {
+        ChatRequest {
+            messages,
+            tools: None,
+            thinking: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_advances_to_next_entry_without_retrying() {
+        let refusing_calls = Arc::new(AtomicUsize::new(0));
+        let serving_calls = Arc::new(AtomicUsize::new(0));
+
+        let reliable = ReliableModelProvider::new_with_entries(
+            "anthropic",
+            vec![
+                pinned_entry(
+                    "anthropic",
+                    "anthropic.default",
+                    "claude-opus-4",
+                    refusing_stub(&refusing_calls, Some("cyber")),
+                ),
+                pinned_entry(
+                    "anthropic",
+                    "anthropic.default",
+                    "claude-sonnet-4",
+                    succeeding_stub(&serving_calls, "served by sonnet"),
+                ),
+            ],
+            // max_retries > 0 proves the refusal is NOT retried on the same model.
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let resp = reliable
+            .chat(chat_req(&messages), "claude-opus-4", Some(0.0))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.text.as_deref(), Some("served by sonnet"));
+        assert_eq!(
+            refusing_calls.load(Ordering::SeqCst),
+            1,
+            "a refusal must not be retried on the same model"
+        );
+        assert_eq!(serving_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refusal_rescue_records_client_side_notice_with_pinned_model() {
+        scope_safeguard_fallback(async {
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&Arc::new(AtomicUsize::new(0)), Some("cyber")),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-sonnet-4",
+                        succeeding_stub(&Arc::new(AtomicUsize::new(0)), "served by sonnet"),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let messages = vec![ChatMessage::user("hi")];
+            reliable
+                .chat(chat_req(&messages), "claude-opus-4", Some(0.0))
+                .await
+                .unwrap();
+
+            let notice = take_last_safeguard_fallback().expect("safeguard notice must be recorded");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ClientSide);
+            assert_eq!(notice.requested_model, "claude-opus-4");
+            assert_eq!(
+                notice.served_model, "claude-sonnet-4",
+                "served_model must be the succeeding entry's pinned model, not the requested one"
+            );
+            assert_eq!(notice.category.as_deref(), Some("cyber"));
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "the notice must be consumed exactly once"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refusal_via_chat_with_tools_also_rescued() {
+        scope_safeguard_fallback(async {
+            let refusing_calls = Arc::new(AtomicUsize::new(0));
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&refusing_calls, None),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-sonnet-4",
+                        succeeding_stub(&Arc::new(AtomicUsize::new(0)), "tools ok"),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let messages = vec![ChatMessage::user("use a tool")];
+            let tools: Vec<serde_json::Value> = vec![serde_json::json!({"name": "shell"})];
+            let resp = reliable
+                .chat_with_tools(&messages, &tools, "claude-opus-4", Some(0.0))
+                .await
+                .unwrap();
+
+            assert_eq!(resp.text.as_deref(), Some("tools ok"));
+            assert_eq!(refusing_calls.load(Ordering::SeqCst), 1);
+
+            let notice = take_last_safeguard_fallback().expect("safeguard notice must be recorded");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ClientSide);
+            assert_eq!(notice.served_model, "claude-sonnet-4");
+            assert_eq!(notice.category, None);
+        })
+        .await;
+    }
+
+    // The retry/failover loop is duplicated across all four trait methods.
+    // `chat` (production) and `chat_with_tools` are covered above; these two
+    // pin the remaining loops so a future edit that (e.g.) moved
+    // `record_refusal_rescue` inside the success-record if-gate in one loop
+    // would be caught by CI rather than silently dropping the notice.
+    #[tokio::test]
+    async fn refusal_via_chat_with_system_also_rescued() {
+        scope_safeguard_fallback(async {
+            let refusing_calls = Arc::new(AtomicUsize::new(0));
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&refusing_calls, Some("cyber")),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-sonnet-4",
+                        succeeding_stub(&Arc::new(AtomicUsize::new(0)), "system ok"),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let text = reliable
+                .chat_with_system(Some("be helpful"), "hi", "claude-opus-4", Some(0.0))
+                .await
+                .unwrap();
+
+            assert_eq!(text, "system ok");
+            assert_eq!(refusing_calls.load(Ordering::SeqCst), 1);
+
+            let notice = take_last_safeguard_fallback().expect("safeguard notice must be recorded");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ClientSide);
+            assert_eq!(notice.requested_model, "claude-opus-4");
+            assert_eq!(
+                notice.served_model, "claude-sonnet-4",
+                "served_model must be the succeeding entry's pinned model"
+            );
+            assert_eq!(notice.category.as_deref(), Some("cyber"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refusal_via_chat_with_history_also_rescued() {
+        scope_safeguard_fallback(async {
+            let refusing_calls = Arc::new(AtomicUsize::new(0));
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&refusing_calls, None),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-sonnet-4",
+                        succeeding_stub(&Arc::new(AtomicUsize::new(0)), "history ok"),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let messages = vec![ChatMessage::user("hi")];
+            let text = reliable
+                .chat_with_history(&messages, "claude-opus-4", Some(0.0))
+                .await
+                .unwrap();
+
+            assert_eq!(text, "history ok");
+            assert_eq!(refusing_calls.load(Ordering::SeqCst), 1);
+
+            let notice = take_last_safeguard_fallback().expect("safeguard notice must be recorded");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ClientSide);
+            assert_eq!(notice.requested_model, "claude-opus-4");
+            assert_eq!(notice.served_model, "claude-sonnet-4");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provider_ref_fallback_rescue_names_fallback_alias_model() {
+        scope_safeguard_fallback(async {
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    // Refusing primary alias, pinned to the requested model.
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&Arc::new(AtomicUsize::new(0)), Some("bio")),
+                    ),
+                    // provider-ref fallback alias: DIFFERENT display_name and
+                    // cooldown key, pinned to its OWN model (as append_fallback_chain builds).
+                    pinned_entry(
+                        "openai",
+                        "openai.rescue",
+                        "gpt-4o",
+                        succeeding_stub(&Arc::new(AtomicUsize::new(0)), "served by gpt"),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let messages = vec![ChatMessage::user("hi")];
+            reliable
+                .chat(chat_req(&messages), "claude-opus-4", Some(0.0))
+                .await
+                .unwrap();
+
+            let notice =
+                take_last_safeguard_fallback().expect("safeguard notice must be recorded");
+            assert_eq!(
+                notice.served_model, "gpt-4o",
+                "served_model must be the fallback alias's pinned model, never the refused requested model"
+            );
+            assert_eq!(notice.requested_model, "claude-opus-4");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn refusal_records_exactly_one_safeguard_notice() {
+        scope_safeguard_fallback(async {
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&Arc::new(AtomicUsize::new(0)), Some("cyber")),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-sonnet-4",
+                        refusing_stub(&Arc::new(AtomicUsize::new(0)), Some("bio")),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-haiku-4",
+                        succeeding_stub(&Arc::new(AtomicUsize::new(0)), "served by haiku"),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let messages = vec![ChatMessage::user("hi")];
+            reliable
+                .chat(chat_req(&messages), "claude-opus-4", Some(0.0))
+                .await
+                .unwrap();
+
+            let notice = take_last_safeguard_fallback().expect("exactly one safeguard notice");
+            assert_eq!(
+                notice.served_model, "claude-haiku-4",
+                "served_model must be the succeeding entry's model"
+            );
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "no more than one notice per call"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn whole_chain_refused_returns_refusal_error_with_context() {
+        scope_safeguard_fallback(async {
+            let reliable = ReliableModelProvider::new_with_entries(
+                "anthropic",
+                vec![
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-opus-4",
+                        refusing_stub(&Arc::new(AtomicUsize::new(0)), Some("cyber")),
+                    ),
+                    pinned_entry(
+                        "anthropic",
+                        "anthropic.default",
+                        "claude-sonnet-4",
+                        refusing_stub(&Arc::new(AtomicUsize::new(0)), Some("bio")),
+                    ),
+                ],
+                1,
+                1,
+            );
+
+            let messages = vec![ChatMessage::user("hi")];
+            let err = reliable
+                .chat(chat_req(&messages), "claude-opus-4", Some(0.0))
+                .await
+                .expect_err("a fully refused chain must return an error");
+
+            let refusal = err.downcast_ref::<AnthropicRefusalError>().expect(
+                "error must still downcast to AnthropicRefusalError through the added context",
+            );
+            assert_eq!(refusal.requested_model, "claude-opus-4");
+            assert!(
+                err.to_string()
+                    .contains("All model_providers/models failed"),
+                "the attempts summary must be preserved as context: {err:#}"
+            );
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "a fully refused chain records no rescue notice"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_refusal_failover_records_no_safeguard_notice() {
+        scope_provider_fallback(async {
+            scope_safeguard_fallback(async {
+                let reliable = ReliableModelProvider::new_with_entries(
+                    "anthropic",
+                    vec![
+                        // 500 is retryable/non-refusal; DIFFERENT display_name so the
+                        // existing ProviderFallbackInfo path records on rescue.
+                        pinned_entry(
+                            "anthropic",
+                            "anthropic.default",
+                            "claude-opus-4",
+                            Box::new(RefusalStub {
+                                calls: Arc::new(AtomicUsize::new(0)),
+                                mode: RefusalStubMode::Http500,
+                                response: "unused",
+                            }),
+                        ),
+                        pinned_entry(
+                            "openai",
+                            "openai.rescue",
+                            "gpt-4o",
+                            succeeding_stub(&Arc::new(AtomicUsize::new(0)), "served by gpt"),
+                        ),
+                    ],
+                    0,
+                    1,
+                );
+
+                let messages = vec![ChatMessage::user("hi")];
+                let resp = reliable
+                    .chat(chat_req(&messages), "claude-opus-4", Some(0.0))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.text.as_deref(), Some("served by gpt"));
+
+                assert!(
+                    take_last_provider_fallback().is_some(),
+                    "a non-refusal failover still records ProviderFallbackInfo"
+                );
+                assert!(
+                    take_last_safeguard_fallback().is_none(),
+                    "a non-refusal failover records no SafeguardFallbackNotice"
+                );
+            })
+            .await;
+        })
+        .await;
+    }
+
+    #[test]
+    fn transient_error_hint_covers_refusal() {
+        let expected = "The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.";
+
+        let err = anyhow::Error::new(AnthropicRefusalError {
+            requested_model: "claude-opus-4".to_string(),
+            category: Some("cyber".to_string()),
+        });
+        assert_eq!(transient_error_hint(&err), Some(expected));
+
+        // Still detected through a `.context(...)` layer.
+        let wrapped = err.context("upstream call failed");
+        assert_eq!(transient_error_hint(&wrapped), Some(expected));
     }
 }
