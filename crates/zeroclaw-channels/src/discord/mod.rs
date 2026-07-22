@@ -3900,6 +3900,18 @@ impl Channel for DiscordChannel {
         self.request_approval_inner(recipient, Some(principal), request)
             .await
     }
+
+    async fn send_gate_prompt(
+        &self,
+        recipient: &str,
+        prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        self.send_gate_prompt_inner(recipient, prompt).await
+    }
+
+    async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
+        self.finalize_gate_prompt_inner(reference, outcome).await
+    }
 }
 
 impl DiscordChannel {
@@ -3960,7 +3972,7 @@ impl DiscordChannel {
         }
     }
 
-    async fn send_gate_prompt(
+    async fn send_gate_prompt_inner(
         &self,
         recipient: &str,
         prompt: &ChannelGatePrompt,
@@ -4026,8 +4038,6 @@ impl DiscordChannel {
                 channel_alias: self.alias.clone(),
                 channel_id: channel_id.to_string(),
                 message_id,
-                title: prompt.title.clone(),
-                resolved_description: prompt.resolved_description.clone(),
                 inputs: prompt
                     .choices
                     .iter()
@@ -4044,7 +4054,11 @@ impl DiscordChannel {
         Ok(true)
     }
 
-    async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
+    async fn finalize_gate_prompt_inner(
+        &self,
+        reference: &str,
+        outcome: &str,
+    ) -> anyhow::Result<bool> {
         // Process-wide registry (see `gate_prompts`): the instance that sent the
         // prompt and the one finalizing it are usually DIFFERENT instances of
         // the same alias (separate channel maps). The registry records the
@@ -4056,16 +4070,16 @@ impl DiscordChannel {
         }
 
         while let Some(record) = records.pop() {
-            // Keep the approval CONTEXT in place and append the outcome under it —
-            // a resolved prompt should still show what was approved, not erase it.
+            // The generic gate layer has constructed and checked the complete
+            // final text under the current policy. Do not append title or
+            // context retained by this adapter: it can predate a policy reload
+            // and would make Discord the owner of cross-channel safety policy.
+            // The deliberate tradeoff is that a resolved embed shows the final
+            // decision, not a second copy of the original approval context.
             // PATCH with an EXPLICIT empty components array: omitting the key would
             // leave the buttons in place on Discord's side.
-            let description = match &record.resolved_description {
-                Some(base) => format!("{base}\n\n{outcome}"),
-                None => outcome.to_string(),
-            };
             let body = serde_json::json!({
-                "embeds": [{"title": record.title, "description": description}],
+                "embeds": [{"title": "SOP approval resolved", "description": outcome}],
                 "components": [],
             });
             let url = format!(

@@ -118,12 +118,6 @@ pub struct ChannelGatePrompt {
     pub reference: String,
     /// The presented choices, in order.
     pub choices: Vec<GateChoice>,
-    /// Body a RESOLVED prompt should keep showing (the context, without the
-    /// how-to-answer instructions): on finalize the channel appends the outcome
-    /// line under it, so the record of WHAT was approved survives in place.
-    /// `None` = the outcome replaces the body entirely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_description: Option<String>,
 }
 
 /// The fixed vocabulary of gate-answer tokens, and the single source of truth
@@ -852,9 +846,12 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Mark a previously sent gate prompt as resolved: strip its interactive
-    /// controls and replace the body with `outcome` (e.g. "Approved by @user —
-    /// run resumed"), so a decided gate cannot be clicked again and the
-    /// decision is visible in place. `reference` is the same correlation key
+    /// controls and replace the body with the complete `outcome` payload (e.g.
+    /// "Approved by @user — run resumed"), so a decided gate cannot be clicked
+    /// again and the decision is visible in place. Implementations must not
+    /// append adapter-local prompt text: the generic orchestration layer owns
+    /// final-payload safety and may apply a newer policy than was active when
+    /// the prompt was sent. `reference` is the same correlation key
     /// the prompt was sent with. Best-effort: `Ok(false)` when this channel
     /// has nothing to finalize (no native prompt, or the mapping was lost to a
     /// restart) — the gate state itself is never affected.

@@ -32,11 +32,6 @@ pub(crate) struct GatePromptRecord {
     pub(crate) channel_alias: String,
     pub(crate) channel_id: String,
     pub(crate) message_id: String,
-    pub(crate) title: String,
-    /// Body the finalized embed keeps (the approval context, minus the reply
-    /// instructions); the outcome line is appended under it so the record of
-    /// WHAT was approved survives resolution. `None` = outcome-only.
-    pub(crate) resolved_description: Option<String>,
     /// Input-bearing choices (Edit / Revise) so a live process can pre-fill
     /// their modals. Best-effort: lost on restart, after which the modal opens
     /// blank (the draft is still readable in the embed).
@@ -49,8 +44,6 @@ impl std::fmt::Debug for GatePromptRecord {
             .field("channel_alias", &self.channel_alias)
             .field("channel_id", &self.channel_id)
             .field("message_id", &self.message_id)
-            .field("title", &self.title)
-            .field("resolved_description", &self.resolved_description)
             .field("inputs", &self.inputs)
             .finish()
     }
@@ -130,13 +123,11 @@ pub(crate) fn input_for(reference: &str, choice_id: &str) -> Option<GatePromptIn
 mod tests {
     use super::*;
 
-    fn rec(title: &str) -> GatePromptRecord {
+    fn rec() -> GatePromptRecord {
         GatePromptRecord {
             channel_alias: "primary".into(),
             channel_id: "c1".into(),
             message_id: "m1".into(),
-            title: title.into(),
-            resolved_description: Some("the approval context".into()),
             inputs: vec![GatePromptInput {
                 choice_id: "edit".into(),
                 label: "Edited body".into(),
@@ -149,11 +140,10 @@ mod tests {
     fn record_is_visible_across_callers_and_take_consumes() {
         // Unique reference per test: the registry is process-wide by design.
         let reference = "run-registry-take";
-        record(reference, rec("A"));
+        record(reference, rec());
         // Any caller (a different channel instance) sees it…
         let mut got = take_for_alias(reference, "primary");
         let got = got.pop().expect("recorded entry is visible process-wide");
-        assert_eq!(got.title, "A");
         assert_eq!(got.channel_alias, "primary");
         // …and take consumed it.
         assert!(take_for_alias(reference, "primary").is_empty());
@@ -162,7 +152,7 @@ mod tests {
     #[test]
     fn reinsert_after_failed_finalize_allows_retry() {
         let reference = "run-registry-retry";
-        record(reference, rec("A"));
+        record(reference, rec());
         let got = take_for_alias(reference, "primary")
             .pop()
             .expect("first take");
@@ -177,7 +167,7 @@ mod tests {
     #[test]
     fn input_for_reads_without_consuming() {
         let reference = "run-registry-input";
-        record(reference, rec("A"));
+        record(reference, rec());
         let input = input_for(reference, "edit").expect("edit input recorded");
         assert_eq!(input.prefill.as_deref(), Some("draft"));
         assert!(input_for(reference, "revise").is_none(), "unknown choice");
@@ -190,8 +180,8 @@ mod tests {
     #[test]
     fn records_every_prompt_for_a_gate_and_partitions_by_sending_alias() {
         let reference = "run-registry-fanout";
-        record(reference, rec("Initial request"));
-        let mut escalation = rec("Escalation");
+        record(reference, rec());
+        let mut escalation = rec();
         escalation.channel_alias = "escalation".into();
         escalation.channel_id = "c2".into();
         escalation.message_id = "m2".into();
@@ -200,9 +190,9 @@ mod tests {
 
         let primary = take_for_alias(reference, "primary");
         assert_eq!(primary.len(), 1);
-        assert_eq!(primary[0].title, "Initial request");
+        assert_eq!(primary[0].channel_id, "c1");
         let escalation = take_for_alias(reference, "escalation");
         assert_eq!(escalation.len(), 1);
-        assert_eq!(escalation[0].title, "Escalation");
+        assert_eq!(escalation[0].channel_id, "c2");
     }
 }

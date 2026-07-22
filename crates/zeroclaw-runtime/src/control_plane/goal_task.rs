@@ -450,6 +450,17 @@ pub trait GoalTaskRegistry: Send + Sync {
         task_id: &str,
         output: String,
     ) -> anyhow::Result<bool>;
+
+    /// Complete a running goal only when its canonical effective limits still
+    /// match the policy that was verified. This prevents a verifier result from
+    /// bypassing an operator budget update that landed while it was running.
+    async fn complete_running_goal_task_if_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+        output: String,
+    ) -> anyhow::Result<bool>;
     /// Atomically clear goal pause state, claim ownership, and mark the task running.
     ///
     /// `continuation_context` is written only when supplied by trusted ingress.

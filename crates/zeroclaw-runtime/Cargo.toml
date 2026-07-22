@@ -76,6 +76,7 @@ toml = "1.0"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
 urlencoding = "2.1"
+url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"

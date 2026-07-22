@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use tokio::runtime::Handle;
 use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_config::schema::LeakDetectionConfig;
 
 use super::broker::{ApprovalNoticeKind, ApprovalRouteAdapter, GateNotice};
 
@@ -37,6 +38,49 @@ use super::broker::{ApprovalNoticeKind, ApprovalRouteAdapter, GateNotice};
 pub struct ChannelRouteAdapter {
     channels: HashMap<String, Arc<dyn Channel>>,
     handle: Handle,
+    /// Resolves the canonical outbound leak policy at delivery time. The
+    /// adapter is durable for a SOP-engine lifetime, while configuration may
+    /// reload; retaining a copied policy here would let later notices bypass
+    /// the policy the daemon is currently serving.
+    leak_detection_resolver: Arc<dyn Fn() -> LeakDetectionConfig + Send + Sync>,
+}
+
+struct OwnedGateNotice {
+    run_id: String,
+    sop_name: String,
+    step: u32,
+    context: serde_json::Value,
+    gate_prompt: Option<String>,
+    revision: u32,
+    edit_field: Option<String>,
+    can_revise: bool,
+}
+
+impl OwnedGateNotice {
+    fn from_notice(notice: &GateNotice<'_>) -> Self {
+        Self {
+            run_id: notice.run_id.to_string(),
+            sop_name: notice.sop_name.to_string(),
+            step: notice.step,
+            context: notice.context.clone(),
+            gate_prompt: notice.gate_prompt.map(str::to_string),
+            revision: notice.revision,
+            edit_field: notice.edit_field.map(str::to_string),
+            can_revise: notice.can_revise,
+        }
+    }
+    fn as_notice(&self) -> GateNotice<'_> {
+        GateNotice {
+            run_id: &self.run_id,
+            sop_name: &self.sop_name,
+            step: self.step,
+            context: &self.context,
+            gate_prompt: self.gate_prompt.as_deref(),
+            revision: self.revision,
+            edit_field: self.edit_field.as_deref(),
+            can_revise: self.can_revise,
+        }
+    }
 }
 
 /// A route configuration problem reported at daemon startup before a parked gate
@@ -61,8 +105,16 @@ impl ChannelRouteAdapter {
     /// The daemon passes `tokio::runtime::Handle::current()` from its async context;
     /// capturing it here (rather than calling `Handle::current()` inside `deliver`)
     /// keeps `deliver` callable from the sync engine without panicking off-runtime.
-    pub fn new(channels: HashMap<String, Arc<dyn Channel>>, handle: Handle) -> Self {
-        Self { channels, handle }
+    pub fn new(
+        channels: HashMap<String, Arc<dyn Channel>>,
+        handle: Handle,
+        leak_detection_resolver: Arc<dyn Fn() -> LeakDetectionConfig + Send + Sync>,
+    ) -> Self {
+        Self {
+            channels,
+            handle,
+            leak_detection_resolver,
+        }
     }
 }
 
@@ -254,6 +306,32 @@ fn render_notice(kind: ApprovalNoticeKind, notice: &GateNotice<'_>) -> String {
     format!("{context}\n\n{instructions}")
 }
 
+/// Apply the central, resolved leak policy at this approval-route egress
+/// boundary. The route renders untrusted SOP context into both native prompts
+/// and fallback text notices, neither of which reaches the normal channel-turn
+/// response guard. This boundary treats the rendered notice as opaque text:
+/// channel-specific Markdown or embed semantics belong to the adapter and must
+/// not decide which potential credentials are safe to display.
+fn redact_approval_route_content(
+    content: String,
+    detector: &crate::security::LeakDetector,
+) -> String {
+    let file_uri_spans = crate::security::leak_detector::outbound_file_uri_spans(&content);
+    match detector.scan_with_protected_spans(&content, &file_uri_spans) {
+        crate::security::LeakResult::Clean => content,
+        crate::security::LeakResult::Detected { patterns, redacted } => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"patterns": patterns})),
+                "output guardrail: credential leak detected in outbound SOP approval route"
+            );
+            redacted
+        }
+    }
+}
+
 /// Build the native gate prompt for channels that render one (buttons /
 /// keyboards). The description carries the text-reply form too, so a screenshot
 /// or forward of the prompt is still actionable. Edit/Revise are input-bearing
@@ -262,12 +340,13 @@ fn render_notice(kind: ApprovalNoticeKind, notice: &GateNotice<'_>) -> String {
 fn build_gate_prompt(
     kind: ApprovalNoticeKind,
     notice: &GateNotice<'_>,
+    detector: &crate::security::LeakDetector,
 ) -> zeroclaw_api::channel::ChannelGatePrompt {
     use zeroclaw_api::channel::{
         ChannelGatePrompt, GateChoice, GateChoiceEmphasis, GateChoiceInput, GateChoiceKind,
     };
     // Discord embeds cap descriptions at 4096 chars; stay comfortably under.
-    let mut description = render_notice(kind, notice);
+    let mut description = redact_approval_route_content(render_notice(kind, notice), detector);
     if description.chars().count() > 3500 {
         description = description.chars().take(3500).collect::<String>() + "\u{2026}";
     }
@@ -284,7 +363,7 @@ fn build_gate_prompt(
             .context
             .get(field)
             .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .map(|value| redact_approval_route_content(value.to_string(), detector));
         // A value over Discord's 4000-char text-input cap would be silently
         // truncated into the form and the TRUNCATED text posted as approved —
         // withhold Edit instead (Revise/deny remain; the operator can also
@@ -319,28 +398,19 @@ fn build_gate_prompt(
         emphasis: GateChoiceEmphasis::Negative,
         input: None,
     });
-    // What a RESOLVED prompt keeps showing: the context without the (no longer
-    // actionable) reply instructions; the channel appends the outcome line.
-    // Capped a little tighter than the live description so the appended
-    // outcome still fits Discord's 4096-char embed limit.
-    let mut resolved_description = render_context(kind, notice);
-    if resolved_description.chars().count() > 3400 {
-        resolved_description =
-            resolved_description.chars().take(3400).collect::<String>() + "\u{2026}";
-    }
+    let title = match kind {
+        ApprovalNoticeKind::Request => {
+            format!("SOP approval needed: {}", notice.sop_name)
+        }
+        ApprovalNoticeKind::Escalation => {
+            format!("SOP approval escalation: {}", notice.sop_name)
+        }
+    };
     ChannelGatePrompt {
-        title: match kind {
-            ApprovalNoticeKind::Request => {
-                format!("SOP approval needed: {}", notice.sop_name)
-            }
-            ApprovalNoticeKind::Escalation => {
-                format!("SOP approval escalation: {}", notice.sop_name)
-            }
-        },
+        title: redact_approval_route_content(title, detector),
         description,
         reference: gate_reference(notice),
         choices,
-        resolved_description: Some(resolved_description),
     }
 }
 
@@ -349,17 +419,12 @@ fn build_gate_prompt(
 /// message-shaping is unit-testable without a runtime.
 fn build_delivery(
     kind: ApprovalNoticeKind,
-    route: &str,
+    recipient: &str,
     notice: &GateNotice<'_>,
-) -> anyhow::Result<(String, SendMessage)> {
-    let Some((channel_key, recipient)) = parse_approval_route(route) else {
-        anyhow::bail!(
-            "approval route '{route}' is not 'channel:recipient' (e.g. \
-             'discord.ops:123456789') - both halves must be non-empty"
-        );
-    };
-    let msg = SendMessage::new(render_notice(kind, notice), recipient).suppress_voice();
-    Ok((channel_key.to_string(), msg))
+    detector: &crate::security::LeakDetector,
+) -> SendMessage {
+    let content = redact_approval_route_content(render_notice(kind, notice), detector);
+    SendMessage::new(content, recipient).suppress_voice()
 }
 
 impl ApprovalRouteAdapter for ChannelRouteAdapter {
@@ -369,8 +434,12 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
         route: &str,
         notice: &GateNotice<'_>,
     ) -> anyhow::Result<()> {
-        let (channel_key, msg) = build_delivery(kind, route, notice)?;
-        let Some(channel) = self.channels.get(&channel_key).cloned() else {
+        let Some((channel_key, recipient)) = parse_approval_route(route) else {
+            anyhow::bail!(
+                "approval route '{route}' is not 'channel:recipient' (e.g. 'discord.ops:123456789') - both halves must be non-empty"
+            );
+        };
+        let Some(channel) = self.channels.get(channel_key).cloned() else {
             // A misconfigured route (names a channel that isn't configured) is a real
             // operator error worth surfacing: return Err so the broker logs it. It
             // still never affects the gate (the broker's deliver_* wrappers only log).
@@ -394,11 +463,16 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
         // Native gate prompt first (buttons / keyboards, answered through the
         // channel's inbound path); channels without one fall back to the text
         // notice, whose `approve <run_id>` reply the orchestrator also resolves.
-        let prompt = build_gate_prompt(kind, notice);
-        let recipient = msg.recipient.clone();
-        let run_id = notice.run_id.to_string();
+        let notice = OwnedGateNotice::from_notice(notice);
+        let recipient = recipient.to_string();
+        let run_id = notice.run_id.clone();
         let route = route.to_string();
+        let leak_detection_resolver = Arc::clone(&self.leak_detection_resolver);
         self.handle.spawn(async move {
+            let leak_detection = leak_detection_resolver();
+            let detector = crate::security::LeakDetector::with_config(&leak_detection);
+            let notice = notice.as_notice();
+            let prompt = build_gate_prompt(kind, &notice, &detector);
             let prompted = match channel.send_gate_prompt(&recipient, &prompt).await {
                 Ok(prompted) => prompted,
                 Err(e) => {
@@ -414,16 +488,21 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
                     false
                 }
             };
-            if !prompted && let Err(e) = channel.send(&msg).await {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "route": route, "run_id": run_id, "error": e.to_string()
-                        })),
-                    "approval route channel send failed (gate unaffected)"
-                );
+            if !prompted {
+                let leak_detection = leak_detection_resolver();
+                let detector = crate::security::LeakDetector::with_config(&leak_detection);
+                let msg = build_delivery(kind, &recipient, &notice, &detector);
+                if let Err(e) = channel.send(&msg).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "route": route, "run_id": run_id, "error": e.to_string()
+                            })),
+                        "approval route channel send failed (gate unaffected)"
+                    );
+                }
             }
         });
         Ok(())
@@ -433,6 +512,14 @@ impl ApprovalRouteAdapter for ChannelRouteAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_leak_detection_resolver() -> Arc<dyn Fn() -> LeakDetectionConfig + Send + Sync> {
+        Arc::new(LeakDetectionConfig::default)
+    }
+
+    fn default_leak_detector() -> crate::security::LeakDetector {
+        crate::security::LeakDetector::with_config(&LeakDetectionConfig::default())
+    }
 
     #[test]
     fn template_resolves_dotted_paths_and_drops_missing_ones() {
@@ -496,7 +583,8 @@ mod tests {
             edit_field: Some("body"),
             can_revise: true,
         };
-        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &notice);
+        let detector = default_leak_detector();
+        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &notice, &detector);
         assert_eq!(
             prompt.reference, "run-42",
             "revision 0 keeps a bare reference"
@@ -519,37 +607,111 @@ mod tests {
             revision: 2,
             ..notice
         };
-        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &revised);
+        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &revised, &detector);
         assert_eq!(prompt.reference, "run-42#2");
         assert!(
             prompt.description.contains("approve run-42#2"),
             "text-reply instructions must name the versioned reference: {}",
             prompt.description
         );
-        // The resolved body keeps WHAT was approved but drops the (no longer
-        // actionable) reply instructions — the channel appends the outcome.
-        let resolved = prompt.resolved_description.as_deref().unwrap();
-        assert!(
-            resolved.contains("the model draft"),
-            "resolved body keeps the context: {resolved}"
-        );
-        assert!(
-            !resolved.contains("Reply `approve"),
-            "resolved body must not re-show the reply instructions: {resolved}"
-        );
-
         // No edit declaration, no revisable predecessor → plain approve/deny.
         let plain = GateNotice {
             edit_field: None,
             can_revise: false,
             ..notice
         };
-        let ids: Vec<String> = build_gate_prompt(ApprovalNoticeKind::Request, &plain)
+        let ids: Vec<String> = build_gate_prompt(ApprovalNoticeKind::Request, &plain, &detector)
             .choices
             .iter()
             .map(|c| c.id.clone())
             .collect();
         assert_eq!(ids, ["approve", "deny"]);
+    }
+
+    #[test]
+    fn approval_route_redacts_untrusted_context_before_native_or_fallback_rendering() {
+        // AWS documents this identifier as an example access-key shape. It is
+        // intentionally not a credential, but exercises deterministic redaction.
+        let fake_access_key = "AKIAIOSFODNN7EXAMPLE";
+        let context = serde_json::json!({
+            "body": fake_access_key,
+            "draft": fake_access_key,
+        });
+        let notice = GateNotice {
+            run_id: "run-42",
+            sop_name: fake_access_key,
+            step: 3,
+            context: &context,
+            gate_prompt: Some("Review {{body}}"),
+            revision: 0,
+            edit_field: Some("draft"),
+            can_revise: false,
+        };
+        let leak_detection = LeakDetectionConfig::default();
+        let detector = crate::security::LeakDetector::with_config(&leak_detection);
+
+        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &notice, &detector);
+        let fallback = build_delivery(ApprovalNoticeKind::Request, "98765", &notice, &detector);
+
+        for rendered in [
+            prompt.title.as_str(),
+            prompt.description.as_str(),
+            prompt
+                .choices
+                .iter()
+                .find(|choice| choice.id == "edit")
+                .and_then(|choice| choice.input.as_ref())
+                .and_then(|input| input.prefill.as_deref())
+                .unwrap_or_default(),
+            fallback.content.as_str(),
+        ] {
+            assert!(
+                !rendered.contains(fake_access_key),
+                "untrusted approval-route content must be redacted before egress: {rendered}"
+            );
+            assert!(
+                rendered.contains("[REDACTED"),
+                "the central detector must leave a visible redaction marker: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_route_honors_a_disabled_resolved_leak_policy() {
+        let fake_access_key = "AKIAIOSFODNN7EXAMPLE";
+        let context = serde_json::json!({"body": fake_access_key});
+        let notice = GateNotice {
+            run_id: "run-42",
+            sop_name: "triage",
+            step: 3,
+            context: &context,
+            gate_prompt: Some("Review {{body}}"),
+            revision: 0,
+            edit_field: None,
+            can_revise: false,
+        };
+        let leak_detection = LeakDetectionConfig {
+            enabled: false,
+            ..LeakDetectionConfig::default()
+        };
+        let detector = crate::security::LeakDetector::with_config(&leak_detection);
+
+        let prompt = build_gate_prompt(ApprovalNoticeKind::Request, &notice, &detector);
+        assert!(
+            prompt.description.contains(fake_access_key),
+            "the route must honor the resolved disabled policy instead of a hard-coded detector"
+        );
+    }
+
+    #[test]
+    fn approval_route_preserves_valid_file_uris_from_entropy_redaction() {
+        let uri = "file:///tmp/very-long-generated-name-4fE9qR6xV2mN8pT1kL7wZ3aC5dH0jB";
+        let detector = default_leak_detector();
+        assert_eq!(
+            redact_approval_route_content(uri.to_string(), &detector),
+            uri,
+            "valid file references are protected only from heuristic redaction"
+        );
     }
 
     use async_trait::async_trait;
@@ -648,9 +810,10 @@ mod tests {
 
     #[test]
     fn build_delivery_shapes_the_message_and_targets_the_recipient() {
-        let (key, msg) = build_delivery(
+        let detector = default_leak_detector();
+        let msg = build_delivery(
             ApprovalNoticeKind::Request,
-            "discord.ops:98765",
+            "98765",
             &GateNotice {
                 run_id: "run-7",
                 sop_name: "triage",
@@ -661,9 +824,8 @@ mod tests {
                 edit_field: None,
                 can_revise: false,
             },
-        )
-        .unwrap();
-        assert_eq!(key, "discord.ops");
+            &detector,
+        );
         assert_eq!(msg.recipient, "98765");
         assert!(msg.content.contains("run-7"), "identifies the run");
         assert!(msg.content.contains("triage"), "names the SOP");
@@ -689,27 +851,6 @@ mod tests {
         assert!(escalation.contains("approval escalation"));
         assert!(escalation.contains("timeout elapsed"));
         assert_ne!(request, escalation);
-    }
-
-    #[test]
-    fn build_delivery_errors_on_a_route_without_a_recipient() {
-        assert!(
-            build_delivery(
-                ApprovalNoticeKind::Request,
-                "discord.ops",
-                &GateNotice {
-                    run_id: "r",
-                    sop_name: "s",
-                    step: 1,
-                    context: &serde_json::Value::Null,
-                    gate_prompt: None,
-                    revision: 0,
-                    edit_field: None,
-                    can_revise: false,
-                }
-            )
-            .is_err()
-        );
     }
 
     // ── a stub Channel that records what it was asked to send ─────
@@ -782,7 +923,8 @@ mod tests {
         // send that silently succeeds without delivering the notice.
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         channels.insert("amqp.q".to_string(), Arc::new(InboundOnlyChannel));
-        let adapter = ChannelRouteAdapter::new(channels, Handle::current());
+        let adapter =
+            ChannelRouteAdapter::new(channels, Handle::current(), test_leak_detection_resolver());
         let err = adapter
             .deliver(
                 ApprovalNoticeKind::Request,
@@ -811,7 +953,8 @@ mod tests {
         let channel = Arc::new(RecordingChannel { sent: sent.clone() });
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         channels.insert("discord.ops".to_string(), channel);
-        let adapter = ChannelRouteAdapter::new(channels, Handle::current());
+        let adapter =
+            ChannelRouteAdapter::new(channels, Handle::current(), test_leak_detection_resolver());
 
         adapter
             .deliver(
@@ -847,8 +990,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_resolves_the_current_leak_policy_for_each_notice() {
+        let fake_access_key = "AKIAIOSFODNN7EXAMPLE";
+        let policy = Arc::new(Mutex::new(LeakDetectionConfig {
+            enabled: false,
+            ..LeakDetectionConfig::default()
+        }));
+        let resolver = {
+            let policy = Arc::clone(&policy);
+            Arc::new(move || policy.lock().unwrap().clone())
+                as Arc<dyn Fn() -> LeakDetectionConfig + Send + Sync>
+        };
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let channel = Arc::new(RecordingChannel { sent: sent.clone() });
+        let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels.insert("discord.ops".to_string(), channel);
+        let adapter = ChannelRouteAdapter::new(channels, Handle::current(), resolver);
+        let context = serde_json::json!({"body": fake_access_key});
+        let notice = GateNotice {
+            run_id: "run-7",
+            sop_name: "triage",
+            step: 3,
+            context: &context,
+            gate_prompt: Some("Review {{body}}"),
+            revision: 0,
+            edit_field: None,
+            can_revise: false,
+        };
+
+        adapter
+            .deliver(ApprovalNoticeKind::Request, "discord.ops:98765", &notice)
+            .expect("first delivery starts");
+        policy.lock().unwrap().enabled = true;
+        adapter
+            .deliver(ApprovalNoticeKind::Request, "discord.ops:98765", &notice)
+            .expect("second delivery starts");
+
+        let deadline = std::time::Duration::from_secs(2);
+        tokio::time::timeout(deadline, async {
+            loop {
+                if sent.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both delivery tasks ran within the deadline");
+        let messages = sent.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains(fake_access_key)),
+            "queued sends must resolve the enabled policy at egress rather than retain the policy at deliver() entry"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.content.contains("[REDACTED"))
+        );
+    }
+
+    #[tokio::test]
     async fn deliver_errors_when_the_route_channel_is_not_configured() {
-        let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
+        let adapter = ChannelRouteAdapter::new(
+            HashMap::new(),
+            Handle::current(),
+            test_leak_detection_resolver(),
+        );
         let err = adapter
             .deliver(
                 ApprovalNoticeKind::Request,
@@ -870,7 +1079,11 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_errors_on_a_malformed_route() {
-        let adapter = ChannelRouteAdapter::new(HashMap::new(), Handle::current());
+        let adapter = ChannelRouteAdapter::new(
+            HashMap::new(),
+            Handle::current(),
+            test_leak_detection_resolver(),
+        );
         assert!(
             adapter
                 .deliver(

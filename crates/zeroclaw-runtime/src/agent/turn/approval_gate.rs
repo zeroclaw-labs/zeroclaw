@@ -534,6 +534,7 @@ mod tests {
             channel: None,
             turn_id: "turn-test",
             agent_alias: Some("agent"),
+            parent_agent_alias: None,
         };
         let marker = Arc::new(AtomicBool::new(true));
         let runtime_scope =
@@ -636,6 +637,7 @@ mod tests {
             channel: Some(&channel),
             turn_id: "turn-test",
             agent_alias: Some("agent"),
+            parent_agent_alias: None,
         };
         let marker = Arc::new(AtomicBool::new(true));
         let runtime_scope =

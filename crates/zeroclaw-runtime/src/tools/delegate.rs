@@ -301,8 +301,8 @@ impl DelegateTool {
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
 
-    /// Bounded delegates inherit caller tools but may not mutate durable goal
-    /// lifecycle or open a goal human gate on behalf of their parent.
+    /// Child delegates may not mutate durable goal lifecycle or open a goal
+    /// human gate on behalf of their parent.
     fn is_goal_control_tool(name: &str) -> bool {
         matches!(
             name,
@@ -891,7 +891,7 @@ impl DelegateTool {
             ..
         } = assembled;
         let mut tools = registry.into_inner();
-        tools.retain(|tool| tool.name() != Self::NAME);
+        tools.retain(|tool| tool.name() != Self::NAME && !Self::is_goal_control_tool(tool.name()));
         Ok(IndependentTargetTools {
             tools,
             deferred_section,
@@ -8442,7 +8442,11 @@ mod tests {
         config.risk_profiles.insert(
             "target".to_string(),
             RiskProfileConfig {
-                allowed_tools: vec!["shell".to_string()],
+                allowed_tools: vec![
+                    "shell".to_string(),
+                    "ask_user".to_string(),
+                    "escalate_to_human".to_string(),
+                ],
                 ..RiskProfileConfig::default()
             },
         );
@@ -8505,6 +8509,21 @@ mod tests {
             !tool_names.contains(&"echo_tool"),
             "independent target must not inherit parent-only tools"
         );
+        for control in [
+            "goal_start",
+            "goal_objective",
+            "goal_resume",
+            "goal_pause",
+            "goal_cancel",
+            "goal_status",
+            "ask_user",
+            "escalate_to_human",
+        ] {
+            assert!(
+                !tool_names.contains(&control),
+                "independent target must not receive goal control tool {control}"
+            );
+        }
     }
 
     #[tokio::test]

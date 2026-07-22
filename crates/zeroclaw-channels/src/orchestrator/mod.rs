@@ -108,7 +108,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
@@ -4966,16 +4965,9 @@ fn channel_outbound_protected_spans(
     content: &str,
     content_format: OutboundContentFormat,
 ) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    // A file URI is a file reference even when punctuation inside it looks
-    // like query syntax; protect it for every outbound text format.
-    if content
-        .as_bytes()
-        .windows(b"file:".len())
-        .any(|window| window.eq_ignore_ascii_case(b"file:"))
-    {
-        collect_raw_file_uri_spans(content, &mut spans);
-    }
+    // A file URI is a generic content reference even when punctuation inside
+    // it looks like query syntax; protect it for every outbound text format.
+    let mut spans = zeroclaw_runtime::security::leak_detector::outbound_file_uri_spans(content);
     match content_format {
         OutboundContentFormat::Markdown => {
             if content.contains("](")
@@ -5095,66 +5087,6 @@ fn decode_markdown_entity(raw: &str, amp_idx: usize) -> Option<(char, usize)> {
         _ => return None,
     };
     Some((decoded, entity_end))
-}
-
-fn collect_raw_file_uri_spans(content: &str, spans: &mut Vec<Range<usize>>) {
-    let mut token_start = None;
-
-    for (idx, ch) in content.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(start) = token_start.take() {
-                collect_file_uri_token_span(content, start, idx, spans);
-            }
-        } else {
-            token_start.get_or_insert(idx);
-        }
-    }
-
-    if let Some(start) = token_start {
-        collect_file_uri_token_span(content, start, content.len(), spans);
-    }
-}
-
-fn collect_file_uri_token_span(
-    content: &str,
-    token_start: usize,
-    token_end: usize,
-    spans: &mut Vec<Range<usize>>,
-) {
-    let token = &content[token_start..token_end];
-    let trimmed_start = token
-        .char_indices()
-        .find(|(_, ch)| !matches!(ch, '<' | '(' | '[' | '{' | '"' | '\''))
-        .map_or(token.len(), |(idx, _)| idx);
-    let trimmed_end = token
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| {
-            !matches!(
-                ch,
-                '>' | ')' | ']' | '}' | '"' | '\'' | '.' | ',' | ';' | ':'
-            )
-        })
-        .map_or(trimmed_start, |(idx, ch)| idx + ch.len_utf8());
-
-    if trimmed_start >= trimmed_end {
-        return;
-    }
-
-    let trimmed = &token[trimmed_start..trimmed_end];
-    let Some(scheme_offset) = trimmed
-        .as_bytes()
-        .windows(b"file:".len())
-        .position(|window| window.eq_ignore_ascii_case(b"file:"))
-    else {
-        return;
-    };
-    let uri_start = trimmed_start + scheme_offset;
-    let candidate = &token[uri_start..trimmed_end];
-
-    if Url::parse(candidate).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("file")) {
-        spans.push(token_start + uri_start..token_start + trimmed_end);
-    }
 }
 
 /// Shown when the agent turn completes but no visible text remains after sanitization.
@@ -8901,9 +8833,19 @@ fn unique_channel_handles(
     unique
 }
 
-async fn finalize_gate_prompts(channels: &[Arc<dyn Channel>], reference: &str, outcome: &str) {
+async fn finalize_gate_prompts(
+    channels: &[Arc<dyn Channel>],
+    reference: &str,
+    outcome: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) {
+    // Gate finalization is a separate human-visible egress path. The outcome
+    // is assembled from inbound channel identity and broker state after the
+    // original prompt was rendered, so scan this final transformed text too.
+    let outcome =
+        redact_channel_outbound_leaks(outcome, leak_detection, OutboundContentFormat::PlainText);
     for channel in channels {
-        if let Err(e) = channel.finalize_gate_prompt(reference, outcome).await {
+        if let Err(e) = channel.finalize_gate_prompt(reference, &outcome).await {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -9100,6 +9042,7 @@ async fn dispatch_channel_sop_gate(
             &reference,
             "\u{1f501} This prompt was superseded by a newer draft \u{2014} \
              answer the latest prompt instead.",
+            &config.security.leak_detection,
         )
         .await;
         // Consumed for both forms: it named a real parked gate, just an old
@@ -9126,6 +9069,7 @@ async fn dispatch_channel_sop_gate(
                     &reference,
                     "\u{23f0} The approval window for this gate has passed \
                      (the run already resolved or finished).",
+                    &config.security.leak_detection,
                 )
                 .await;
                 true
@@ -9237,7 +9181,13 @@ async fn dispatch_channel_sop_gate(
                 format!("{run_id}#{ref_rev}")
             };
             if let Some(text) = final_text {
-                finalize_gate_prompts(gate_prompt_channels, &finalize_reference, &text).await;
+                finalize_gate_prompts(
+                    gate_prompt_channels,
+                    &finalize_reference,
+                    &text,
+                    &config.security.leak_detection,
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -32838,6 +32788,30 @@ Done."#;
             assert_eq!(finalized[0].0, run_id);
             assert!(finalized[0].1.contains("Approved"));
         }
+    }
+
+    #[tokio::test]
+    async fn sop_gate_finalization_redacts_credential_shaped_outcome_before_delivery() {
+        // This is AWS's documented example access-key shape, not a credential.
+        let fake_access_key = "AKIAIOSFODNN7EXAMPLE";
+        let channel = Arc::new(RecordingChannel::default());
+        let channels: Vec<Arc<dyn Channel>> = vec![channel.clone()];
+
+        finalize_gate_prompts(
+            &channels,
+            "run-42",
+            &format!("Approved by <@{fake_access_key}> — run resumed."),
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        )
+        .await;
+
+        let finalized = channel.finalized_gate_prompts.lock().await;
+        assert_eq!(finalized.len(), 1);
+        assert!(
+            !finalized[0].1.contains(fake_access_key),
+            "finalized prompt must not expose credential-shaped outcome content"
+        );
+        assert!(finalized[0].1.contains("[REDACTED"));
     }
 
     #[tokio::test]
