@@ -21,6 +21,7 @@ pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
+pub mod api_voice;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -42,7 +43,6 @@ pub mod sse;
 pub mod static_files;
 pub mod tls;
 pub mod version;
-#[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
 pub mod ws;
 pub mod ws_approval;
@@ -1671,10 +1671,11 @@ pub async fn run_gateway(
         )
         .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
         .route("/api/config/catalog", get(api_sections::handle_catalog))
-        .route(
-            "/api/config/catalog/models",
-            get(api_sections::handle_catalog_models),
-        )
+        // Note: `/api/config/catalog/models` is registered on the long-running
+        // router below — it fetches the model_provider's live model list
+        // (native /models endpoint, or the models.dev/OpenRouter public
+        // catalog) and can exceed the 30s gateway-wide default on a slow
+        // network or credential check.
         .route("/api/config/status", get(api_sections::handle_section_status))
         .route(
             "/api/config/agent-options",
@@ -1698,14 +1699,11 @@ pub async fn run_gateway(
             "/api/quickstart/fields",
             post(api_quickstart::handle_fields),
         )
-        .route(
-            "/api/quickstart/validate",
-            post(api_quickstart::handle_validate),
-        )
-        .route(
-            "/api/quickstart/apply",
-            post(api_quickstart::handle_apply),
-        )
+        // Note: `/api/quickstart/validate` and `/api/quickstart/apply` are
+        // registered on the long-running router below, alongside
+        // `/api/config/catalog/models` — `apply` persists config to disk and
+        // both share the wizard's model-provider setup flow, so they get the
+        // same timeout headroom rather than a 30s cutoff mid-setup.
         .route(
             "/api/quickstart/dismiss",
             post(api_quickstart::handle_dismiss),
@@ -1908,19 +1906,60 @@ pub async fn run_gateway(
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
     // synchronous agent turn inline. Layers attached here travel with the
     // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        // Quickstart's model-provider setup flow: `catalog/models` fetches a
+        // live model list (native /models endpoint or the models.dev /
+        // OpenRouter public catalog), and `validate`/`apply` persist the
+        // resulting config to disk — all three can outrun the 30s
+        // gateway-wide default on a slow network or filesystem.
+        .route(
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route(
+            "/api/quickstart/apply",
+            post(api_quickstart::handle_apply),
+        );
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    // Voice transcription accepts audio payloads far beyond the 64 KiB
+    // gateway default, and local Whisper on a long clip can exceed the 30s
+    // request timeout — so it gets its own sub-router with a larger body
+    // limit and the long-running timeout.
+    let voice_router: Router = Router::new()
+        .route(
+            "/api/voice/transcribe",
+            post(api_voice::handle_voice_transcribe),
+        )
+        // Auth from headers BEFORE the body is buffered/parsed, so an
+        // unauthenticated client can't make the gateway ingest 28 MB.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api_voice::require_auth_middleware,
+        ))
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(
+            api_voice::MAX_TRANSCRIBE_BODY_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
+        ));
+
+    let inner = inner.merge(long_running_router).merge(voice_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"

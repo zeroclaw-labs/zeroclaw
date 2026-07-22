@@ -421,7 +421,7 @@ function AppContent() {
 }
 
 // Redirects fresh installs (no agents yet, Quickstart never completed)
-// from `/` to `/quickstart`. The daemon always writes a default
+// from `/` to `/welcome`. The daemon always writes a default
 // config.toml on init, so file existence isn't the right signal —
 // we ask the gateway via /api/quickstart/state which reports
 // quickstart_completed plus the live agents list.
@@ -441,7 +441,9 @@ function FreshInstallRedirect() {
     void getQuickstartState()
       .then((state) => {
         if (!state.quickstart_completed && state.agents.length === 0) {
-          navigate("/quickstart", { replace: true });
+          // Fresh installs land on the Welcome experience (which hands off
+          // to Quickstart itself); all other targets are left untouched.
+          navigate("/welcome", { replace: true });
         }
       })
       .catch(() => {

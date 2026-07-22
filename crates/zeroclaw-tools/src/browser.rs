@@ -1,5 +1,6 @@
 //! Browser automation tool with pluggable backends.
 
+use crate::browserbase;
 use crate::helpers::domain_guard;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -67,6 +68,8 @@ pub struct BrowserTool {
     #[allow(dead_code)]
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    browserbase_config: browserbase::BrowserbaseConfig,
+    browserbase_session: tokio::sync::Mutex<Option<browserbase::BrowserbaseSession>>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -76,6 +79,7 @@ enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    Browserbase,
     Auto,
 }
 
@@ -84,6 +88,7 @@ enum ResolvedBackend {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    Browserbase,
 }
 
 impl BrowserBackendKind {
@@ -93,9 +98,10 @@ impl BrowserBackendKind {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
+            "browserbase" => Ok(Self::Browserbase),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', 'browserbase', or 'auto'"
             ),
         }
     }
@@ -105,6 +111,7 @@ impl BrowserBackendKind {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
             Self::ComputerUse => "computer_use",
+            Self::Browserbase => "browserbase",
             Self::Auto => "auto",
         }
     }
@@ -246,9 +253,21 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            browserbase_config: browserbase::BrowserbaseConfig::default(),
+            browserbase_session: tokio::sync::Mutex::new(None),
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         })
+    }
+
+    /// Attach Browserbase configuration (API key, project id, region, TTL,
+    /// keep-alive, persistent context) to this tool. Additive so existing
+    /// callers of `new`/`new_with_backend` keep working unchanged; only
+    /// needed when `browser.backend = "browserbase"`.
+    #[must_use]
+    pub fn with_browserbase_config(mut self, config: browserbase::BrowserbaseConfig) -> Self {
+        self.browserbase_config = config;
+        self
     }
 
     /// Check if agent-browser CLI is available
@@ -394,6 +413,19 @@ impl BrowserTool {
                     );
                 }
                 Ok(ResolvedBackend::ComputerUse)
+            }
+            BrowserBackendKind::Browserbase => {
+                if self.browserbase_config.api_key.as_deref().unwrap_or("").trim().is_empty() {
+                    anyhow::bail!(
+                        "browser.backend='browserbase' requires browser.browserbase.api_key to be set"
+                    );
+                }
+                if self.browserbase_config.project_id.as_deref().unwrap_or("").trim().is_empty() {
+                    anyhow::bail!(
+                        "browser.backend='browserbase' requires browser.browserbase.project_id to be set"
+                    );
+                }
+                Ok(ResolvedBackend::Browserbase)
             }
             BrowserBackendKind::Auto => {
                 if Self::rust_native_compiled() && self.rust_native_available() {
@@ -725,6 +757,12 @@ impl BrowserTool {
     ) -> anyhow::Result<ToolResult> {
         #[cfg(feature = "browser-native")]
         {
+            // SSRF/domain-guard parity with the other backends: navigation
+            // targets must pass the same validation agent_browser and
+            // browserbase apply before any session is touched.
+            if let BrowserAction::Open { url } = &action {
+                self.validate_url(url)?;
+            }
             let mut state = self.native_state.lock().await;
 
             let first_attempt = state
@@ -970,9 +1008,204 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::Browserbase => self.execute_browserbase_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
+        }
+    }
+
+    /// Acquire (creating or replacing a stale session as needed) the cached
+    /// Browserbase session and hand back a locked guard through which it
+    /// can be driven. One session is cached per `BrowserTool` instance
+    /// (in practice one per agent, since `BrowserTool` is constructed per
+    /// agent) — reused across calls while healthy, replaced once idle past
+    /// `session_ttl_secs` (unless `keep_alive` is set).
+    async fn ensure_browserbase_session(
+        &self,
+    ) -> anyhow::Result<tokio::sync::MutexGuard<'_, Option<browserbase::BrowserbaseSession>>> {
+        let mut guard = self.browserbase_session.lock().await;
+
+        let stale = guard.as_ref().is_some_and(|session| {
+            session.is_stale(
+                Duration::from_secs(self.browserbase_config.session_ttl_secs),
+                self.browserbase_config.keep_alive,
+            )
+        });
+
+        if guard.is_none() || stale {
+            if let Some(old) = guard.take()
+                && let Err(err) = old.release().await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    &format!("browser: failed to release stale Browserbase session: {err}")
+                );
+            }
+
+            let client = Arc::new(browserbase::BrowserbaseClient::new(
+                self.browserbase_config.clone(),
+            ));
+            let session = client.open_session().await?;
+            *guard = Some(session);
+        }
+
+        Ok(guard)
+    }
+
+    /// Execute a browser action against the Browserbase managed-browser
+    /// backend. Supports the actions the CDP primitives above are enough
+    /// to implement (open/navigate, screenshot, click, fill, type,
+    /// text/title/url extraction, close); everything else returns a clear
+    /// "unavailable for backend" error rather than silently no-op-ing.
+    async fn execute_browserbase_action(&self, action: BrowserAction) -> anyhow::Result<ToolResult> {
+        if let BrowserAction::Close = action {
+            let mut guard = self.browserbase_session.lock().await;
+            if let Some(session) = guard.take() {
+                session.release().await?;
+            }
+            return Ok(ToolResult {
+                success: true,
+                output: json!({"backend": "browserbase", "action": "close", "closed": true})
+                    .to_string()
+                    .into(),
+                error: None,
+            });
+        }
+
+        if !is_browserbase_supported_action(&action) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(unavailable_action_for_backend_error(
+                    browser_action_name(&action),
+                    ResolvedBackend::Browserbase,
+                )),
+            });
+        }
+
+        if let BrowserAction::Open { ref url } = action {
+            self.validate_url(url)?;
+        }
+
+        let mut guard = self.ensure_browserbase_session().await?;
+        let session = guard
+            .as_mut()
+            .expect("ensure_browserbase_session always populates the guard");
+
+        match action {
+            BrowserAction::Open { url } => {
+                session.navigate(&url).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({"backend": "browserbase", "action": "open", "url": url})
+                        .to_string()
+                        .into(),
+                    error: None,
+                })
+            }
+            BrowserAction::Screenshot { path, full_page } => {
+                let data = session.screenshot_base64().await?;
+                let mut payload = json!({
+                    "backend": "browserbase",
+                    "action": "screenshot",
+                    "full_page": full_page,
+                });
+                if let Some(path_str) = path {
+                    let bytes = browserbase::decode_screenshot_base64(&data)?;
+                    tokio::fs::write(&path_str, &bytes)
+                        .await
+                        .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
+                    payload["path"] = Value::String(path_str);
+                } else {
+                    payload["png_base64"] = Value::String(data);
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: payload.to_string().into(),
+                    error: None,
+                })
+            }
+            BrowserAction::Click { selector } => {
+                session.click(&selector).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({"backend": "browserbase", "action": "click", "selector": selector})
+                        .to_string()
+                        .into(),
+                    error: None,
+                })
+            }
+            BrowserAction::Fill { selector, value } => {
+                session.fill(&selector, &value).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({"backend": "browserbase", "action": "fill", "selector": selector})
+                        .to_string()
+                        .into(),
+                    error: None,
+                })
+            }
+            BrowserAction::Type { selector, text } => {
+                session.type_into(&selector, &text).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "backend": "browserbase",
+                        "action": "type",
+                        "selector": selector,
+                        "typed": text.len(),
+                    })
+                    .to_string()
+                    .into(),
+                    error: None,
+                })
+            }
+            BrowserAction::GetText { selector } => {
+                let text = session.get_text(&selector).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "backend": "browserbase",
+                        "action": "get_text",
+                        "selector": selector,
+                        "text": text,
+                    })
+                    .to_string()
+                    .into(),
+                    error: None,
+                })
+            }
+            BrowserAction::GetTitle => {
+                let title = session.get_title().await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({"backend": "browserbase", "action": "get_title", "title": title})
+                        .to_string()
+                        .into(),
+                    error: None,
+                })
+            }
+            BrowserAction::GetUrl => {
+                let url = session.get_url().await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({"backend": "browserbase", "action": "get_url", "url": url})
+                        .to_string()
+                        .into(),
+                    error: None,
+                })
+            }
+            other => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(unavailable_action_for_backend_error(
+                    browser_action_name(&other),
+                    ResolvedBackend::Browserbase,
+                )),
+            }),
         }
     }
 
@@ -1006,7 +1239,7 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         concat!(
-            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). ",
+            "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use, browserbase). ",
             "Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, ",
             "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
             "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
@@ -2252,11 +2485,55 @@ fn is_computer_use_only_action(action: &str) -> bool {
     )
 }
 
+/// Actions the Browserbase backend can drive with the CDP primitives it
+/// implements (`Target.*`, `Page.navigate`/`captureScreenshot`,
+/// `Runtime.evaluate`, `Input.dispatch{Mouse,Key}Event`). Checked *before*
+/// touching the cached session so an unsupported action never triggers a
+/// session create/network round-trip.
+fn is_browserbase_supported_action(action: &BrowserAction) -> bool {
+    matches!(
+        action,
+        BrowserAction::Open { .. }
+            | BrowserAction::Screenshot { .. }
+            | BrowserAction::Click { .. }
+            | BrowserAction::Fill { .. }
+            | BrowserAction::Type { .. }
+            | BrowserAction::GetText { .. }
+            | BrowserAction::GetTitle
+            | BrowserAction::GetUrl
+            | BrowserAction::Close
+    )
+}
+
 fn backend_name(backend: ResolvedBackend) -> &'static str {
     match backend {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+        ResolvedBackend::Browserbase => "browserbase",
+    }
+}
+
+/// Name of a `BrowserAction` variant, for error messages about actions a
+/// given backend does not implement.
+fn browser_action_name(action: &BrowserAction) -> &'static str {
+    match action {
+        BrowserAction::Open { .. } => "open",
+        BrowserAction::Snapshot { .. } => "snapshot",
+        BrowserAction::Click { .. } => "click",
+        BrowserAction::Fill { .. } => "fill",
+        BrowserAction::Type { .. } => "type",
+        BrowserAction::GetText { .. } => "get_text",
+        BrowserAction::GetTitle => "get_title",
+        BrowserAction::GetUrl => "get_url",
+        BrowserAction::Screenshot { .. } => "screenshot",
+        BrowserAction::Wait { .. } => "wait",
+        BrowserAction::Press { .. } => "press",
+        BrowserAction::Hover { .. } => "hover",
+        BrowserAction::Scroll { .. } => "scroll",
+        BrowserAction::IsVisible { .. } => "is_visible",
+        BrowserAction::Close => "close",
+        BrowserAction::Find { .. } => "find",
     }
 }
 
@@ -2379,11 +2656,211 @@ mod tests {
             BrowserBackendKind::parse("auto").unwrap(),
             BrowserBackendKind::Auto
         );
+        assert_eq!(
+            BrowserBackendKind::parse("browserbase").unwrap(),
+            BrowserBackendKind::Browserbase
+        );
     }
 
     #[test]
     fn browser_backend_parser_rejects_unknown_values() {
         assert!(BrowserBackendKind::parse("playwright").is_err());
+    }
+
+    #[test]
+    fn browser_tool_accepts_browserbase_backend_config() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "browserbase".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            tool.configured_backend().unwrap(),
+            BrowserBackendKind::Browserbase
+        );
+    }
+
+    #[tokio::test]
+    async fn browserbase_backend_resolution_requires_api_key_and_project_id() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "browserbase".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let err = tool.resolve_backend().await.unwrap_err().to_string();
+        assert!(err.contains("browser.browserbase.api_key"), "{err}");
+
+        let tool = tool.with_browserbase_config(browserbase::BrowserbaseConfig {
+            api_key: Some("bb-key".into()),
+            ..browserbase::BrowserbaseConfig::default()
+        });
+        let err = tool.resolve_backend().await.unwrap_err().to_string();
+        assert!(err.contains("browser.browserbase.project_id"), "{err}");
+
+        let tool = tool.with_browserbase_config(browserbase::BrowserbaseConfig {
+            api_key: Some("bb-key".into()),
+            project_id: Some("proj-1".into()),
+            ..browserbase::BrowserbaseConfig::default()
+        });
+        assert_eq!(
+            tool.resolve_backend().await.unwrap(),
+            ResolvedBackend::Browserbase
+        );
+    }
+
+    #[test]
+    fn browser_action_name_covers_all_variants() {
+        assert_eq!(browser_action_name(&BrowserAction::Close), "close");
+        assert_eq!(
+            browser_action_name(&BrowserAction::GetTitle),
+            "get_title"
+        );
+        assert_eq!(browser_action_name(&BrowserAction::GetUrl), "get_url");
+        assert_eq!(
+            browser_action_name(&BrowserAction::Hover {
+                selector: "sel".into()
+            }),
+            "hover"
+        );
+        assert_eq!(
+            browser_action_name(&BrowserAction::Press { key: "Enter".into() }),
+            "press"
+        );
+        assert_eq!(
+            browser_action_name(&BrowserAction::Scroll {
+                direction: "down".into(),
+                pixels: None
+            }),
+            "scroll"
+        );
+        assert_eq!(
+            browser_action_name(&BrowserAction::IsVisible {
+                selector: "sel".into()
+            }),
+            "is_visible"
+        );
+        assert_eq!(
+            browser_action_name(&BrowserAction::Find {
+                by: "role".into(),
+                value: "button".into(),
+                action: "click".into(),
+                fill_value: None,
+            }),
+            "find"
+        );
+        assert_eq!(
+            browser_action_name(&BrowserAction::Wait {
+                selector: None,
+                ms: Some(1),
+                text: None,
+            }),
+            "wait"
+        );
+        assert_eq!(
+            browser_action_name(&BrowserAction::Snapshot {
+                interactive_only: true,
+                compact: true,
+                depth: None,
+            }),
+            "snapshot"
+        );
+    }
+
+    #[test]
+    fn unavailable_action_error_covers_browserbase_backend() {
+        assert_eq!(
+            unavailable_action_for_backend_error("hover", ResolvedBackend::Browserbase),
+            "Action 'hover' is unavailable for backend 'browserbase'"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_browserbase_action_rejects_unsupported_action_with_clear_error() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "browserbase".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            Vec::new(),
+        )
+        .unwrap()
+        .with_browserbase_config(browserbase::BrowserbaseConfig {
+            api_key: Some("bb-key".into()),
+            project_id: Some("proj-1".into()),
+            ..browserbase::BrowserbaseConfig::default()
+        });
+
+        let result = tool
+            .execute_browserbase_action(BrowserAction::Hover {
+                selector: "#btn".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Action 'hover' is unavailable for backend 'browserbase'")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_browserbase_action_rejects_disallowed_url_before_creating_a_session() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "browserbase".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            Vec::new(),
+        )
+        .unwrap()
+        .with_browserbase_config(browserbase::BrowserbaseConfig {
+            api_key: Some("bb-key".into()),
+            project_id: Some("proj-1".into()),
+            ..browserbase::BrowserbaseConfig::default()
+        });
+
+        // Host not in allowed_domains — must be rejected by validate_url
+        // before any Browserbase session is created (SSRF guard applies
+        // to the browserbase backend exactly like the others).
+        let err = tool
+            .execute_browserbase_action(BrowserAction::Open {
+                url: "https://not-allowed.example.org".into(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in browser.allowed_domains"), "{err}");
     }
 
     #[test]

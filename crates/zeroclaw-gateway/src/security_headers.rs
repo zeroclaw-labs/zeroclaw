@@ -24,9 +24,11 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("cross-origin-opener-policy", "same-origin"),
     ("cross-origin-resource-policy", "same-origin"),
     ("x-permitted-cross-domain-policies", "none"),
+    // The Face voice/vision experience needs mic, camera, and screen capture
+    // for the same-origin dashboard; everything else stays denied.
     (
         "permissions-policy",
-        "geolocation=(), microphone=(), camera=()",
+        "geolocation=(), microphone=(self), camera=(self), display-capture=(self)",
     ),
 ];
 

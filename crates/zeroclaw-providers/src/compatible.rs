@@ -18,6 +18,14 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Timeout for the live `/models` listing request in
+/// [`OpenAiCompatibleModelProvider::list_models_with_pricing`]. Deliberately
+/// independent of `timeout_secs` (default 120s, and configurable higher for
+/// long chat completions) — a model listing is a cheap metadata call that
+/// callers such as the Quickstart wizard wait on synchronously, so it fails
+/// fast with a clear message rather than hanging.
+const MODEL_LIST_REQUEST_TIMEOUT_SECS: u64 = 15;
+
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
@@ -2522,28 +2530,54 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
-            let response = self
-                .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
-                .send()
-                .await
-                .map_err(|e| {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model_provider": &self.name,
-                                "url": &url,
-                                "phase": "model_list_request",
-                                "error": super::format_error_chain(&e),
-                            })),
-                        "compatible: model list request failed"
-                    );
-                    anyhow::Error::msg(format!(
-                        "{} model list request failed: {url}: {e}",
-                        self.name
-                    ))
-                })?;
+            // Bounded independently of `self.timeout_secs` (default 120s,
+            // and callers can raise it further for long chat completions).
+            // A model listing is a cheap metadata call the Quickstart wizard
+            // waits on synchronously, so it gets its own short timeout with a
+            // clear message instead of hanging until the outer HTTP client
+            // (or the gateway's request timeout) cuts it off silently.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(MODEL_LIST_REQUEST_TIMEOUT_SECS),
+                self.apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
+                    .send(),
+            )
+            .await
+            .map_err(|_| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "url": &url,
+                            "phase": "model_list_request",
+                            "timeout_secs": MODEL_LIST_REQUEST_TIMEOUT_SECS,
+                        })),
+                    "compatible: model list request timed out"
+                );
+                anyhow::Error::msg(format!(
+                    "{} model list request to {url} timed out after {MODEL_LIST_REQUEST_TIMEOUT_SECS}s — the provider may be slow or unreachable; try again or check its status",
+                    self.name
+                ))
+            })?
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "url": &url,
+                            "phase": "model_list_request",
+                            "error": super::format_error_chain(&e),
+                        })),
+                    "compatible: model list request failed"
+                );
+                anyhow::Error::msg(format!(
+                    "{} model list request failed: {url}: {e}",
+                    self.name
+                ))
+            })?;
             if !response.status().is_success() {
                 let status = response.status();
                 anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);

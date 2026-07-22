@@ -4,7 +4,7 @@ import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, type ColorTheme
 // ── Types (was ThemeContextDef.ts) ───────────────────────────────────────────
 
 export type ThemeMode = 'system' | 'dark' | 'light' | 'oled';
-export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue';
+export type AccentColor = 'ember' | 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue';
 export type UiFont = 'system' | 'inter' | 'segoe' | 'sf';
 export type MonoFont = 'jetbrains' | 'fira' | 'cascadia' | 'system-mono';
 
@@ -111,9 +111,12 @@ interface StoredTheme {
   monoFontSize: number;
 }
 
+// New installs default to the Ember terracotta accent; existing installs keep
+// whatever accent they already persisted (loadStored only falls back to
+// DEFAULTS when nothing valid is stored).
 const DEFAULTS: StoredTheme = {
   theme: 'dark',
-  accent: 'cyan',
+  accent: 'ember',
   colorTheme: 'operator-dark',
   uiFont: 'system',
   monoFont: 'jetbrains',
@@ -122,7 +125,7 @@ const DEFAULTS: StoredTheme = {
 };
 
 const validThemes: ThemeMode[] = ['dark', 'light', 'oled', 'system'];
-const validAccents: AccentColor[] = ['cyan', 'violet', 'emerald', 'amber', 'rose', 'blue'];
+const validAccents: AccentColor[] = ['ember', 'cyan', 'violet', 'emerald', 'amber', 'rose', 'blue'];
 
 function migrateThemeToColorTheme(themeMode: ThemeMode): ColorThemeId {
   switch (themeMode) {
@@ -162,6 +165,11 @@ function loadStored(): StoredTheme {
 // ── Provider ─────────────────────────────────────────────────────────────────
 
 const accents: Record<AccentColor, Record<string, string>> = {
+  // Anthropic terracotta — pairs with the Ember theme and OLED black surfaces.
+  ember: {
+    '--pc-accent': '#D97757', '--pc-accent-light': '#E89B7D',
+    '--pc-accent-dim': 'rgba(217,119,87,0.3)', '--pc-accent-glow': 'rgba(217,119,87,0.1)', '--pc-accent-rgb': '217,119,87',
+  },
   cyan: {
     '--pc-accent': '#22d3ee', '--pc-accent-light': '#67e8f9',
     '--pc-accent-dim': 'rgba(34,211,238,0.3)', '--pc-accent-glow': 'rgba(34,211,238,0.1)', '--pc-accent-rgb': '34,211,238',

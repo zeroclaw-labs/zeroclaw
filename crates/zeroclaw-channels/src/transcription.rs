@@ -1057,6 +1057,15 @@ impl TranscriptionManager {
         self
     }
 
+    /// The resolved agent `transcription_provider` alias. Empty when the
+    /// bound agent has no transcription preference; callers that want an
+    /// install-wide fallback can pick from [`available_providers`].
+    ///
+    /// [`available_providers`]: Self::available_providers
+    pub fn agent_provider_alias(&self) -> &str {
+        &self.agent_transcription_provider
+    }
+
     /// Transcribe audio using the runtime-active agent's resolved
     /// `transcription_provider`. Fails loud when the agent has no
     /// transcription_provider configured — there is no global default.

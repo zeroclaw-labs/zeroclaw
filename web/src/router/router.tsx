@@ -4,6 +4,10 @@ import Layout from '../components/layout/Layout';
 import {
   AcpConsole,
   AgentChat,
+  ClawdLab,
+  Face,
+  SoulStudio,
+  Welcome,
   AgentWorkspaceExplorer,
   AgentsList,
   Canvas,
@@ -38,6 +42,10 @@ function RouteFallback() {
 export const Router = () => (
   <Suspense fallback={<RouteFallback />}>
     <Routes>
+      {/* Fullscreen experiences — no dashboard chrome */}
+      <Route path="/face" element={<Face />} />
+      <Route path="/face/:alias" element={<Face />} />
+      <Route path="/welcome" element={<Welcome />} />
       <Route element={<Layout />}>
         <Route path="/" element={<Dashboard />} />
         <Route path="/agent" element={<Navigate to="/agents" replace />} />
@@ -66,6 +74,9 @@ export const Router = () => (
         <Route path="/canvas" element={<Canvas />} />
         <Route path="/acp-console" element={<AcpConsole />} />
         <Route path="/quickstart" element={<Quickstart />} />
+        <Route path="/soul" element={<SoulStudio />} />
+        <Route path="/soul/:alias" element={<SoulStudio />} />
+        <Route path="/clawd-lab" element={<ClawdLab />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

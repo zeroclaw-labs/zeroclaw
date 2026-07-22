@@ -13,6 +13,17 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 
 ## What's New
 
+### Companion Experience (Face, Voice & Soul)
+- The dashboard gains a fullscreen **Face** (`/face`): the Clawd mascot on black with a procedural animation rig (60+ actions, emotions, blink/breath/gaze layers), push-to-talk and continuous listening, streaming captions, and camera/screen vision capture that rides along with speech.
+- The gateway voice-duplex protocol is now a real pipeline: `speech_end` frames start agent turns whose streamed reply is sentence-chunked and synthesized eagerly (ordered `tts_chunk` frames, bounded-concurrency TTS), `barge_in` cancels the turn and audio, and `POST /api/voice/transcribe` exposes the configured STT provider to browser mics. `gateway-voice-duplex` is now a default gateway feature.
+- ElevenLabs TTS defaults to `eleven_flash_v2_5` when no model is configured and supports `optimize_streaming_latency`.
+- New **/welcome** enterprise setup wizard (brain provider with full live model catalogs incl. OpenRouter, ElevenLabs voice, STT, extras, soul seed, rituals) and **/soul** Soul Studio (guided identity authoring with live SOUL.md/IDENTITY.md preview, plus raw editors with conflict resolution).
+- A one-click nightly **dreaming** cron summarizes the day and classifies the people the agent spoke with into a single dated Core memory.
+- Dashboard: Face/Soul navigation, companion hero band, Ember (black/terracotta/ivory) theme, `/clawd-lab` animation workbench. The gateway `Permissions-Policy` header now self-allows microphone, camera, and display capture so the dashboard can hear and see.
+- **Streaming voice v2**: persistent ElevenLabs multi-context streaming TTS over one WebSocket per session (raw `pcm_16000`, one context per sentence, prewarmed on `speech_end`, transparent HTTP fallback); inline `[emotion]`/`[gesture:…]` control tags parsed out of the reply stream into audio-locked `mascot_cue` frames; playback-aware adaptive VAD (EMA noise floor, barge-in threshold scales with output level); anti-click gain ramps; debounced captions; adaptive mascot frame-rate governor.
+- **Voice characters**: selectable synthetic voices (Droid/Vox/Core/Human) via a client-side ring-mod DSP chain, chosen in the wizard or cycled live with `R`; playback-aware VAD recalibrated to real mic-RMS units (the ported formula made barge-in unreachable — fixed with unit-tested thresholds, `npm run test:voice`), instant 30ms soft-duck on possible speech onset, wizard **Awakening** step (soul written + first model turn + first words), re-run-friendly wizard (keeps saved keys), stuck-turn watchdog, and a derived (never event-latched) frame-governor pause so the mascot can't freeze after display sleep.
+- **Browserbase** is now a first-class browser backend (`browser.backend = "browserbase"`, `[browser.browserbase]` config, wizard support): cloud Chromium sessions over CDP with persistent contexts, session reuse, guaranteed release, and the same SSRF domain guard as other backends (which the native WebDriver backend now also enforces on navigation).
+
 ### SOP & Procedural Memory
 - A daemon SOP maintenance tick now drives live procedures, executing real steps, enforcing step scope/mode/routing/schemas at the engine boundary, and consuming CAS run claims (#8391, #8399, #8416, #8420, #8430, #8493, #8502, #8506).
 - Cron, filesystem, and calendar no-show triggers wire into the maintenance tick (#8400, #8461, #8419).

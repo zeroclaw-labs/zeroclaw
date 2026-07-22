@@ -23,6 +23,7 @@ import {
   MemoryStick,
   Brain,
   Search,
+  Mic,
   Monitor,
   ArrowRight,
 } from "lucide-react";
@@ -2976,6 +2977,10 @@ function AgentsSection() {
       ? null
       : (agents?.find((a) => a.alias === selectedAlias) ?? null);
 
+  // First agent after the enabled-first sort — the "companion" the hero
+  // band greets. undefined until agents load or when none are configured.
+  const companion = sortedAgents?.[0];
+
   return (
     <section className="space-y-6">
       <PageHeader
@@ -2994,6 +2999,51 @@ function AgentsSection() {
           </Link>
         }
       />
+
+      {/* Companion hero — slim band linking to the Face (voice) and Soul
+          experiences. Rendered only once at least one agent exists; the
+          enabled-first sort makes the first agent the natural companion. */}
+      {companion && (
+        <div
+          className="rounded-2xl border p-4 flex flex-wrap items-center justify-between gap-3"
+          style={{
+            background: "var(--pc-bg-surface)",
+            borderColor: "var(--pc-border)",
+          }}
+        >
+          <div className="min-w-0">
+            <div
+              className="text-base font-semibold truncate"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {companion.alias}
+            </div>
+            <div className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+              {companion.enabled
+                ? `${t("dash.hero.online")} · ${companion.modelProvider || t("dash.hero.ready")}`
+                : t("dash.hero.paused")}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Link
+              to="/face"
+              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-opacity hover:opacity-90"
+              style={{ background: "var(--pc-accent)", color: "var(--pc-bg-base)" }}
+            >
+              <Mic className="h-4 w-4" />
+              {t("dash.hero.talk")}
+            </Link>
+            <Link
+              to="/soul"
+              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium border transition-colors hover:bg-[var(--pc-hover)]"
+              style={{ borderColor: "var(--pc-border-strong)", color: "var(--pc-text-primary)" }}
+            >
+              <Heart className="h-4 w-4" style={{ color: "var(--pc-accent)" }} />
+              {t("dash.hero.soul")}
+            </Link>
+          </div>
+        </div>
+      )}
 
       {sortedAgents && sortedAgents.length > 0 && (
         <DashboardMetrics agents={sortedAgents} />

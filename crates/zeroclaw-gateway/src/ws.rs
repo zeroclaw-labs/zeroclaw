@@ -187,6 +187,116 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+/// Whether voice-duplex frames (`speech_end`, `barge_in`) are recognized
+/// on this build. Compiled in by default via the `gateway-voice-duplex`
+/// feature; with the feature off those frames fall through to the
+/// unsupported-type error and turns never run in voice mode.
+const VOICE_DUPLEX_ENABLED: bool = cfg!(feature = "gateway-voice-duplex");
+
+/// A parsed client frame that starts an agent turn.
+struct TurnRequest {
+    /// Message content, with `[IMAGE:<uri>] ` markers already prepended
+    /// for any attached images.
+    content: String,
+    /// Voice turn: streamed assistant text is additionally synthesized to
+    /// `tts_chunk` frames.
+    voice: bool,
+}
+
+/// Build a turn request from a client frame. `Ok(None)` when the frame is
+/// not a turn-starting type; `Err(frame)` carries a ready-to-send error
+/// frame for validation failures.
+fn turn_request_from_frame(
+    parsed: &serde_json::Value,
+) -> Result<Option<TurnRequest>, serde_json::Value> {
+    let msg_type = parsed["type"].as_str().unwrap_or("");
+    let (content_field, empty_message, empty_code, voice) = match msg_type {
+        "message" => (
+            "content",
+            "Message content cannot be empty",
+            "EMPTY_CONTENT",
+            false,
+        ),
+        "speech_end" if VOICE_DUPLEX_ENABLED => (
+            "transcript",
+            "speech_end transcript cannot be empty",
+            "EMPTY_TRANSCRIPT",
+            true,
+        ),
+        _ => return Ok(None),
+    };
+    let content = parsed[content_field].as_str().unwrap_or("").to_string();
+    if content.is_empty() {
+        return Err(serde_json::json!({
+            "type": "error",
+            "message": empty_message,
+            "code": empty_code,
+        }));
+    }
+    let images: Vec<String> = match parsed.get("images") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(entries)) => {
+            let mut images = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let Some(uri) = entry.as_str() else {
+                    return Err(serde_json::json!({
+                        "type": "error",
+                        "message": "images entries must be data-URI strings",
+                        "code": "INVALID_IMAGE",
+                    }));
+                };
+                images.push(uri.to_string());
+            }
+            images
+        }
+        Some(_) => {
+            return Err(serde_json::json!({
+                "type": "error",
+                "message": "images must be an array of data-URI strings",
+                "code": "INVALID_IMAGE",
+            }));
+        }
+    };
+    match crate::voice_duplex::prepend_image_markers(&content, &images) {
+        Ok(content) => Ok(Some(TurnRequest { content, voice })),
+        Err(message) => Err(serde_json::json!({
+            "type": "error",
+            "message": message,
+            "code": "INVALID_IMAGE",
+        })),
+    }
+}
+
+/// On a `speech_end` frame, kick off an idempotent connect of the session's
+/// streaming TTS socket, concurrent with the agent turn dispatch. A no-op
+/// for non-voice frames or when the agent has no streaming provider. The
+/// connect is idempotent and mutex-guarded, so a prewarm racing a
+/// barge-in/disconnect never opens a second socket: if the turn cancels
+/// before use, the connected socket simply stays ready for the next turn (or
+/// idles out server-side and is lazily reconnected).
+fn maybe_prewarm_tts(
+    parsed: &serde_json::Value,
+    stream_session: Option<&zeroclaw_channels::tts::ElevenLabsStreamSession>,
+) {
+    if !VOICE_DUPLEX_ENABLED || parsed["type"].as_str() != Some("speech_end") {
+        return;
+    }
+    let Some(session) = stream_session.cloned() else {
+        return;
+    };
+    zeroclaw_spawn::spawn!(async move {
+        if let Err(e) = session.ensure_connected().await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                "voice TTS prewarm connect failed; turn will fall back to HTTP synthesis"
+            );
+        }
+    });
+}
+
 async fn resolve_ws_memory_handle(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -532,12 +642,26 @@ async fn handle_socket(
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
+    // Persistent ElevenLabs streaming TTS socket for this chat session,
+    // when the agent's TTS provider is an ElevenLabs family provider.
+    // `None` for every other provider (which keep the per-sentence HTTP
+    // synthesis path). Cloned into the prewarm task and each turn so they
+    // share one socket. Kept alive across turns; connected lazily.
+    let stream_session = if VOICE_DUPLEX_ENABLED {
+        zeroclaw_channels::tts::ElevenLabsStreamConfig::from_config_for_agent(&config, &agent_alias)
+            .map(zeroclaw_channels::tts::ElevenLabsStreamSession::with_default_connector)
+    } else {
+        None
+    };
+
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
-            if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if !content.is_empty() {
+            // Prewarm the streaming socket concurrently with turn dispatch so
+            // first-audio latency isn't paid on the first sentence.
+            maybe_prewarm_tts(&parsed, stream_session.as_ref());
+            match turn_request_from_frame(&parsed) {
+                Ok(Some(turn)) => {
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -550,7 +674,7 @@ async fn handle_socket(
                             return;
                         }
                     };
-                    process_chat_message(
+                    let mut replay = process_chat_message(
                         &state,
                         &mut agent,
                         &mut sender,
@@ -558,22 +682,54 @@ async fn handle_socket(
                         &mut approval_event_rx,
                         &pending_approvals,
                         &ws_memory,
-                        &content,
+                        &turn.content,
+                        turn.voice,
                         &session_key,
                         &session_id,
                         auth_subject.as_deref(),
+                        stream_session.as_ref(),
                     )
                     .await;
+                    // A frame stashed during the TTS drain is the user's next
+                    // turn — run it now, under the same session guard.
+                    while let Some(text) = replay.take() {
+                        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            break;
+                        };
+                        let Ok(Some(turn)) = turn_request_from_frame(&parsed) else {
+                            break;
+                        };
+                        replay = process_chat_message(
+                            &state,
+                            &mut agent,
+                            &mut sender,
+                            &mut receiver,
+                            &mut approval_event_rx,
+                            &pending_approvals,
+                            &ws_memory,
+                            &turn.content,
+                            turn.voice,
+                            &session_key,
+                            &session_id,
+                            auth_subject.as_deref(),
+                            stream_session.as_ref(),
+                        )
+                        .await;
+                    }
                 }
-            } else {
-                let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": format!(
-                        "Unsupported message type \"{unknown_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
-                    )
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                Ok(None) => {
+                    let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": format!(
+                            "Unsupported message type \"{unknown_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                        )
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                }
+                Err(frame) => {
+                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                }
             }
         } else {
             let err = serde_json::json!({
@@ -615,19 +771,18 @@ async fn handle_socket(
 
                 let msg_type = parsed["type"].as_str().unwrap_or("");
 
-                // ── Voice duplex event dispatch (gated by feature flag + runtime config) ──
-                #[cfg(feature = "gateway-voice-duplex")]
-                {
-                    // Multi-instance shape: presence in the map = enabled.
-                    let duplex_enabled = !state.config.read().channels.voice_duplex.is_empty();
-                    if duplex_enabled {
-                        if let Some(voice_event) = crate::voice_duplex::try_parse_voice_event(&msg) {
-                            if let Some(error_frame) = crate::voice_duplex::handle_voice_event(voice_event) {
-                                let _ = sender.send(Message::Text(error_frame.to_string().into())).await;
-                            }
-                            continue;
-                        }
-                    }
+                // ── Voice duplex: barge_in outside a running turn ──
+                // Turns are driven inside `process_chat_message`, so on
+                // this path nothing is running; acknowledge with
+                // `tts_cancel` so the client resets its audio pipeline.
+                if VOICE_DUPLEX_ENABLED && msg_type == "barge_in" {
+                    let frame = serde_json::json!({ "type": "tts_cancel" });
+                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    continue;
+                }
+                if VOICE_DUPLEX_ENABLED && msg_type == "speech_start" {
+                    // Informational only — capture happens client-side.
+                    continue;
                 }
 
                 // ── approval_response (operator answered a tool prompt) ──
@@ -672,28 +827,28 @@ async fn handle_socket(
                     continue;
                 }
 
-                if msg_type != "message" {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": format!(
-                            "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
-                        ),
-                        "code": "UNKNOWN_MESSAGE_TYPE"
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
+                // Prewarm the streaming TTS socket concurrently with turn
+                // dispatch so first-audio latency isn't paid per turn.
+                maybe_prewarm_tts(&parsed, stream_session.as_ref());
 
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if content.is_empty() {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": "Message content cannot be empty",
-                        "code": "EMPTY_CONTENT"
-                    });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
+                let turn = match turn_request_from_frame(&parsed) {
+                    Ok(Some(turn)) => turn,
+                    Ok(None) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": format!(
+                                "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                            ),
+                            "code": "UNKNOWN_MESSAGE_TYPE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                    Err(frame) => {
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        continue;
+                    }
+                };
 
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
@@ -709,7 +864,7 @@ async fn handle_socket(
                     }
                 };
 
-                process_chat_message(
+                let mut replay = process_chat_message(
                     &state,
                     &mut agent,
                     &mut sender,
@@ -717,12 +872,40 @@ async fn handle_socket(
                     &mut approval_event_rx,
                     &pending_approvals,
                     &ws_memory,
-                    &content,
+                    &turn.content,
+                    turn.voice,
                     &session_key,
                     &session_id,
-                        auth_subject.as_deref(),
+                    auth_subject.as_deref(),
+                    stream_session.as_ref(),
                 )
                 .await;
+                // A frame stashed during the TTS drain is the user's next
+                // turn — run it now, under the same session guard.
+                while let Some(text) = replay.take() {
+                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        break;
+                    };
+                    let Ok(Some(turn)) = turn_request_from_frame(&parsed) else {
+                        break;
+                    };
+                    replay = process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &mut receiver,
+                        &mut approval_event_rx,
+                        &pending_approvals,
+                        &ws_memory,
+                        &turn.content,
+                        turn.voice,
+                        &session_key,
+                        &session_id,
+                        auth_subject.as_deref(),
+                        stream_session.as_ref(),
+                    )
+                    .await;
+                }
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -914,12 +1097,21 @@ async fn process_chat_message(
     pending_approvals: &PendingApprovals,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
+    // Voice turn: tee streamed assistant text into the sentence chunker and
+    // emit ordered `tts_chunk` frames alongside the normal chunk stream.
+    voice: bool,
     session_key: &str,
     session_id: &str,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
-) {
+    // Persistent ElevenLabs streaming TTS socket for this session, when the
+    // agent's provider is ElevenLabs and it is healthy. Voice turns feed
+    // sentence units into it; otherwise the per-sentence HTTP path is used.
+    stream_session: Option<&zeroclaw_channels::tts::ElevenLabsStreamSession>,
+    // Returns a raw client frame (message/speech_end) that arrived during the
+    // post-turn TTS drain; the caller must replay it as the next turn.
+) -> Option<String> {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
@@ -979,6 +1171,157 @@ async fn process_chat_message(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
+    // ── Voice turn TTS pipeline ──────────────────────────────────
+    // Resolve the agent's TTS binding and spawn an ordered synthesis
+    // worker: sentence units flow in via `tts_unit_tx`, up to
+    // `TTS_MAX_IN_FLIGHT` synthesize concurrently, and `tts_chunk`
+    // frames come back via `tts_frame_rx` strictly in sentence order
+    // (`buffered` preserves input order). First-audio latency: the first
+    // sentence starts synthesizing as soon as its boundary streams in.
+    let tts_binding = if voice {
+        let cfg = state.config.read();
+        crate::voice_duplex::TtsForward::resolve(&cfg, &turn_alias)
+    } else {
+        None
+    };
+    // The unit channel is deliberately UNBOUNDED: the Chunk arm below sends
+    // into it from inside the forward select loop, where an awaited send
+    // would stop the frame-drain arm from being polled — with a bounded
+    // channel a single long delta (> capacity sentences) deadlocks the
+    // whole turn (unit send waits on worker, worker waits on frame drain).
+    // Memory stays bounded by the turn's accumulated text.
+    let mut tts_unit_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, String)>> = None;
+    let mut tts_frame_rx: Option<tokio::sync::mpsc::Receiver<serde_json::Value>> = None;
+
+    // Prefer the persistent streaming path when the agent's TTS provider is
+    // ElevenLabs AND the session socket is healthy; every other provider (or
+    // an unhealthy socket after a prior failure) transparently uses the
+    // per-sentence HTTP path. A streaming failure never kills the turn — it
+    // mutes the rest of this turn's audio (captions are unaffected) and flips
+    // the session health flag so the next turn falls back to HTTP.
+    let use_streaming = tts_binding
+        .as_ref()
+        .is_some_and(|b| b.provider_alias.starts_with("elevenlabs."))
+        && stream_session
+            .is_some_and(zeroclaw_channels::tts::ElevenLabsStreamSession::is_healthy);
+
+    let tts_synth_handle = if let (true, Some(session)) = (use_streaming, stream_session) {
+        let (unit_tx, unit_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String)>();
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(16);
+        tts_unit_tx = Some(unit_tx);
+        tts_frame_rx = Some(frame_rx);
+        let session = session.clone();
+        let context_id = turn_id.clone();
+        let cancel = cancel_token.clone();
+        Some(zeroclaw_spawn::spawn!(async move {
+            let (audio_tx, mut audio_rx) =
+                tokio::sync::mpsc::channel::<(u64, zeroclaw_channels::tts::StreamAudioChunk)>(16);
+            let run = session.run_turn(&context_id, unit_rx, audio_tx, cancel);
+            // Each decoded PCM payload becomes one `tts_chunk` frame with a
+            // running per-frame seq (strictly increasing in emission order,
+            // per the wire contract's ordering guarantee) PLUS the sentence
+            // unit it voices (`unit_seq`) — run_turn synthesizes one
+            // ElevenLabs context per unit, so attribution is exact and
+            // mascot_cue frames (keyed by unit seq) can fire audio-locked.
+            let pump = async {
+                let mut seq: u64 = 0;
+                while let Some((unit_seq, chunk)) = audio_rx.recv().await {
+                    use base64::Engine as _;
+                    let frame = serde_json::json!({
+                        "type": "tts_chunk",
+                        "audio_b64":
+                            base64::engine::general_purpose::STANDARD.encode(&chunk.audio),
+                        "format": "pcm_16000",
+                        "seq": seq,
+                        "unit_seq": unit_seq,
+                    });
+                    if frame_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                    seq += 1;
+                }
+            };
+            let (run_result, ()) = tokio::join!(run, pump);
+            if let Err(e) = run_result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                    "streaming TTS turn failed; audio muted (captions unaffected), next turn uses HTTP"
+                );
+            }
+        }))
+    } else {
+        tts_binding.map(|binding| {
+            let (unit_tx, unit_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String)>();
+            let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(16);
+            tts_unit_tx = Some(unit_tx);
+            tts_frame_rx = Some(frame_rx);
+            let manager = Arc::clone(&binding.manager);
+            let provider_alias = binding.provider_alias.clone();
+            let tts_voice = binding.voice.clone();
+            let format = binding.format.clone();
+            zeroclaw_spawn::spawn!(async move {
+                use futures_util::StreamExt as _;
+                let mut ordered = tokio_stream::wrappers::UnboundedReceiverStream::new(unit_rx)
+                    .map(move |(seq, text): (u64, String)| {
+                        let manager = Arc::clone(&manager);
+                        let provider_alias = provider_alias.clone();
+                        let tts_voice = tts_voice.clone();
+                        async move {
+                            let result = manager
+                                .synthesize_with_provider(&text, &provider_alias, &tts_voice)
+                                .await;
+                            (seq, result)
+                        }
+                    })
+                    .buffered(crate::voice_duplex::TTS_MAX_IN_FLIGHT);
+                while let Some((seq, result)) = ordered.next().await {
+                    match result {
+                        Ok(audio) => {
+                            use base64::Engine as _;
+                            let frame = serde_json::json!({
+                                "type": "tts_chunk",
+                                "audio_b64":
+                                    base64::engine::general_purpose::STANDARD.encode(&audio),
+                                "format": format,
+                                "seq": seq,
+                                // HTTP path: one frame per sentence unit, so
+                                // the frame seq IS the unit seq.
+                                "unit_seq": seq,
+                            });
+                            if frame_tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            // Fail fast: a downed provider would otherwise cost a
+                            // full HTTP timeout PER remaining unit, delaying the
+                            // turn's `done` frame by minutes. The client always
+                            // has the full text captions; mute the rest of this
+                            // turn's audio instead.
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "seq": seq,
+                                    "error": format!("{e:#}"),
+                                })),
+                                "voice TTS unit synthesis failed; muting rest of turn"
+                            );
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+    };
+
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
     let turn_fut = async {
@@ -1030,6 +1373,18 @@ async fn process_chat_message(
 
     let forward_fut = async {
         let mut cancel_drained = false;
+        // On voice turns the router strips inline mascot control tags from the
+        // caption + TTS text, splits into sentence units, and attributes each
+        // cue to its following unit's seq. `None` for non-voice turns.
+        let mut voice_router = if voice {
+            Some(crate::voice_duplex::VoiceTurnRouter::new())
+        } else {
+            None
+        };
+        // A client message/speech_end that arrives during the post-turn TTS
+        // drain is the user's NEXT turn — stash it for the caller to replay
+        // instead of silently swallowing it.
+        let mut stashed_frame: Option<String> = None;
         loop {
             tokio::select! {
                 biased;
@@ -1037,6 +1392,16 @@ async fn process_chat_message(
                     let drained: Vec<_> = pending_approvals.lock().drain().collect();
                     drop(drained);
                     cancel_drained = true;
+                    // Voice: drop pending TTS units and queued audio, and
+                    // tell the client to flush its audio pipeline. Covers
+                    // both `barge_in` and POST /api/sessions/{id}/abort —
+                    // they cancel the same token.
+                    if voice {
+                        tts_unit_tx = None;
+                        tts_frame_rx = None;
+                        let frame = serde_json::json!({ "type": "tts_cancel" });
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
                     // Fall through; the agent loop will now wake from the
                     // approval await, see the cancel token, and propagate
                     // a ToolLoopCancelled error which closes event_rx and
@@ -1093,8 +1458,19 @@ async fn process_chat_message(
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
                             }
                         }
-                        Some("message") => {
-                            let content = parsed["content"].as_str().unwrap_or("").to_string();
+                        Some("barge_in") if VOICE_DUPLEX_ENABLED => {
+                            // Same mechanism as POST /api/sessions/{id}/abort:
+                            // cancel the session token. The cancel arm above
+                            // drops pending TTS and emits `tts_cancel`.
+                            cancel_token.cancel();
+                        }
+                        Some(kind @ ("message" | "speech_end"))
+                            if kind == "message" || VOICE_DUPLEX_ENABLED =>
+                        {
+                            // Mid-turn text (or a voice utterance) steers the
+                            // running turn.
+                            let field = if kind == "message" { "content" } else { "transcript" };
+                            let content = parsed[field].as_str().unwrap_or("").to_string();
                             if content.is_empty() {
                                 let err = serde_json::json!({
                                     "type": "error",
@@ -1145,6 +1521,21 @@ async fn process_chat_message(
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
+                // ── Ordered TTS audio for voice turns ─────────────
+                tts_frame = async {
+                    match tts_frame_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match tts_frame {
+                        Some(frame) => {
+                            let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        }
+                        // Synthesis worker finished; stop polling the arm.
+                        None => tts_frame_rx = None,
+                    }
+                }
                     event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
@@ -1165,7 +1556,46 @@ async fn process_chat_message(
                         }
                         TurnEvent::Chunk { ref delta } => {
                             accumulated_text.push_str(delta);
-                            serde_json::json!({ "type": "chunk", "content": delta })
+                            // Voice: strip inline control tags, emit mascot
+                            // cues, feed TTS units, and caption the STRIPPED
+                            // text. Non-voice turns caption the raw delta.
+                            if let Some(router) = voice_router.as_mut() {
+                                let routed = router.push(delta);
+                                for cue in &routed.cues {
+                                    let frame = serde_json::json!({
+                                        "type": "mascot_cue",
+                                        "seq": cue.seq,
+                                        "emotion": cue.emotion,
+                                        "gesture": cue.gesture,
+                                    });
+                                    let _ = sender
+                                        .send(Message::Text(frame.to_string().into()))
+                                        .await;
+                                }
+                                if tts_unit_tx.is_some() {
+                                    for (seq, unit) in routed.units {
+                                        // Unbounded send never blocks the select
+                                        // loop; failure means the worker exited
+                                        // (fail-fast / muted rest of turn).
+                                        let send_failed = match tts_unit_tx.as_ref() {
+                                            Some(tx) => tx.send((seq, unit)).is_err(),
+                                            None => true,
+                                        };
+                                        if send_failed {
+                                            tts_unit_tx = None;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Suppress an empty caption frame (text held
+                                // back inside an unresolved bracket).
+                                if routed.caption.is_empty() {
+                                    continue;
+                                }
+                                serde_json::json!({ "type": "chunk", "content": routed.caption })
+                            } else {
+                                serde_json::json!({ "type": "chunk", "content": delta })
+                            }
                         }
                         TurnEvent::Thinking { delta } => {
                             serde_json::json!({ "type": "thinking", "content": delta })
@@ -1202,9 +1632,104 @@ async fn process_chat_message(
                 }
             }
         }
+
+        // ── Voice: flush the sentence remainder and drain queued audio ──
+        // The assistant text stream is complete; emit any tail caption/cues
+        // and the final (possibly short) unit, then forward remaining
+        // synthesized frames in order. Barge-in / abort / client-gone still
+        // stop the drain.
+        if let Some(router) = voice_router.as_mut() {
+            let routed = router.flush();
+            for cue in &routed.cues {
+                let frame = serde_json::json!({
+                    "type": "mascot_cue",
+                    "seq": cue.seq,
+                    "emotion": cue.emotion,
+                    "gesture": cue.gesture,
+                });
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+            if !routed.caption.is_empty() {
+                let frame = serde_json::json!({ "type": "chunk", "content": routed.caption });
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+            if let Some(unit_tx) = tts_unit_tx.take() {
+                for (seq, unit) in routed.units {
+                    let _ = unit_tx.send((seq, unit));
+                }
+                // Dropping the sender lets the synthesis worker finish the
+                // remaining units and close the frame channel.
+            }
+        }
+        if let Some(mut frame_rx) = tts_frame_rx.take() {
+            // Safety deadline: if a TTS backend never closes its stream
+            // (e.g. a provider that fails to send a final marker), the
+            // drain must not delay the `done` frame indefinitely.
+            let drain_deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+            tokio::pin!(drain_deadline);
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        let frame = serde_json::json!({ "type": "tts_cancel" });
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        break;
+                    }
+                    _ = &mut drain_deadline => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            "voice TTS drain exceeded 30s; abandoning remaining audio"
+                        );
+                        break;
+                    }
+                    client_msg = receiver.next() => {
+                        match client_msg {
+                            Some(Ok(Message::Text(text))) => {
+                                let frame_type = serde_json::from_str::<serde_json::Value>(&text)
+                                    .ok()
+                                    .and_then(|v| v["type"].as_str().map(str::to_owned));
+                                match frame_type.as_deref() {
+                                    Some("barge_in") => cancel_token.cancel(),
+                                    // The user's next utterance/message: stop
+                                    // the tail audio (they're talking over
+                                    // it) and hand the frame back to the
+                                    // caller to run as the next turn.
+                                    Some("speech_end") | Some("message") => {
+                                        let cancel = serde_json::json!({ "type": "tts_cancel" });
+                                        let _ = sender
+                                            .send(Message::Text(cancel.to_string().into()))
+                                            .await;
+                                        stashed_frame = Some(text.to_string());
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                                cancel_token.cancel();
+                            }
+                            _ => {}
+                        }
+                    }
+                    frame = frame_rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
+                }
+            }
+        }
+        stashed_frame
     };
 
-    let (result, ()) = tokio::join!(turn_fut, forward_fut);
+    let (result, stashed_frame) = tokio::join!(turn_fut, forward_fut);
+
+    // Stop any in-flight TTS synthesis. A completed voice turn's worker has
+    // already exited, so this is a no-op there; a cancelled turn's worker
+    // may still hold an HTTP request in flight.
+    if let Some(handle) = tts_synth_handle {
+        handle.abort();
+    }
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
@@ -1305,7 +1830,7 @@ async fn process_chat_message(
             "gateway_ws_turn"
         );
 
-        return;
+        return stashed_frame;
     }
 
     match result {
@@ -1480,6 +2005,8 @@ async fn process_chat_message(
             );
         }
     }
+
+    stashed_frame
 }
 
 #[cfg(test)]

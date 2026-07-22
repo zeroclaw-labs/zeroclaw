@@ -263,7 +263,13 @@ export interface WsMessage {
     | "cron_result"
     | "approval_request"
     | "history_trimmed"
-    | "aborted";
+    | "aborted"
+    // Voice duplex frames (server → client). See gateway voice_duplex.rs.
+    | "tts_chunk"
+    | "tts_cancel"
+    | "transcript"
+    // Mascot control-tag cue (server → client). See voice_duplex.rs / ws.rs.
+    | "mascot_cue";
   content?: string;
   full_response?: string;
   name?: string;
@@ -291,6 +297,20 @@ export interface WsMessage {
   input_tokens?: number;
   output_tokens?: number;
   last_input_tokens?: number;
+  // Voice duplex fields (present on "tts_chunk" / "transcript" frames).
+  audio_b64?: string;
+  format?: string;
+  text?: string;
+  /** Sentence index within the current voice turn, for ordered playback. */
+  seq?: number;
+  /** Sentence-unit index of a tts_chunk (streaming path emits several
+   * frames per unit; HTTP path has unit_seq === seq). */
+  unit_seq?: number;
+  // Mascot cue fields (present on "mascot_cue" frames). `seq` above gives
+  // the sentence-unit index the cue applies to (fires when that seq starts
+  // playing, not on receipt).
+  emotion?: string | null;
+  gesture?: string | null;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";

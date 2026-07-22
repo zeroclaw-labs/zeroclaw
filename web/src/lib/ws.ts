@@ -136,6 +136,17 @@ export class WebSocketClient {
     );
   }
 
+  /**
+   * Send an arbitrary JSON frame. Used by the voice/face experience for the
+   * voice-duplex protocol (speech_end, barge_in, ...) and image-bearing
+   * messages. Silently no-ops when the socket is closed — voice frames are
+   * ephemeral and the caller drives reconnection state from onClose.
+   */
+  sendRaw(frame: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify(frame));
+  }
+
   /** Close the connection without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;

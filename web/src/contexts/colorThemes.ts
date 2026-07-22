@@ -3,6 +3,7 @@ import themesData from './themes.json';
 export type ColorThemeId =
   | 'operator-dark' | 'operator-light'
   | 'default-dark' | 'default-light' | 'oled-black'
+  | 'ember'
   | 'icy-blue'
   | 'nord-dark' | 'nord-light'
   | 'dracula' | 'monokai'

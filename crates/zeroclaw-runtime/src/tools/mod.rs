@@ -794,6 +794,18 @@ pub fn all_tools_with_runtime(
             browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
+                // Thread the Browserbase cloud-browser credentials so
+                // `browser.backend = "browserbase"` is usable end to end.
+                let tool = tool.with_browserbase_config(
+                    zeroclaw_tools::browserbase::BrowserbaseConfig {
+                        api_key: browser_config.browserbase.api_key.clone(),
+                        project_id: browser_config.browserbase.project_id.clone(),
+                        region: browser_config.browserbase.region.clone(),
+                        session_ttl_secs: browser_config.browserbase.session_ttl_secs,
+                        keep_alive: browser_config.browserbase.keep_alive,
+                        context_id: browser_config.browserbase.context_id.clone(),
+                    },
+                );
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
             }
             Err(e) => {

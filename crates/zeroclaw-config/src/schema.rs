@@ -5181,6 +5181,11 @@ pub struct TtsProviderConfig {
     pub stability: Option<f64>,
     /// Similarity boost for elevenlabs (0.0-1.0; default `0.5`).
     pub similarity_boost: Option<f64>,
+    /// ElevenLabs streaming-latency optimization level (0-4). Sent as the
+    /// `optimize_streaming_latency` query parameter; higher values trade
+    /// audio quality for lower time-to-first-audio. Unset keeps the
+    /// provider default.
+    pub optimize_streaming_latency: Option<u32>,
     /// Language code for google (e.g. `en-US`).
     pub language_code: Option<String>,
     /// Path to backend binary (edge-tts subprocess; piper local server).
@@ -7272,6 +7277,60 @@ impl Default for BrowserComputerUseConfig {
     }
 }
 
+/// Browserbase managed-browser configuration (`[browser.browserbase]` section).
+///
+/// Browserbase (<https://www.browserbase.com>) hosts the Chromium session
+/// remotely and hands back a CDP WebSocket endpoint; select it with
+/// `browser.backend = "browserbase"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "browser.browserbase"]
+pub struct BrowserbaseConfig {
+    /// Browserbase API key, sent as the `X-BB-API-Key` header
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Browserbase project id new sessions are created under
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Region for new Browserbase sessions
+    #[serde(default = "default_browserbase_region")]
+    pub region: String,
+    /// Session TTL in seconds, passed as Browserbase's session `timeout`
+    #[serde(default = "default_browserbase_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Keep the session alive across turns instead of releasing it once idle
+    #[serde(default)]
+    pub keep_alive: bool,
+    /// Optional persistent Browserbase context id (cookies/storage reused
+    /// across sessions) forwarded as `browserSettings.context`
+    #[serde(default)]
+    pub context_id: Option<String>,
+}
+
+fn default_browserbase_region() -> String {
+    "us-west-2".into()
+}
+
+fn default_browserbase_session_ttl_secs() -> u64 {
+    900
+}
+
+impl Default for BrowserbaseConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            project_id: None,
+            region: default_browserbase_region(),
+            session_ttl_secs: default_browserbase_session_ttl_secs(),
+            keep_alive: false,
+            context_id: None,
+        }
+    }
+}
+
 /// Browser automation configuration (`[browser]` section).
 ///
 /// Controls the `browser_open` tool and browser automation backends.
@@ -7294,7 +7353,7 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
-    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
+    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "browserbase" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
     /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
@@ -7313,6 +7372,10 @@ pub struct BrowserConfig {
     #[serde(default)]
     #[nested]
     pub computer_use: BrowserComputerUseConfig,
+    /// Browserbase managed-browser configuration (used when backend = "browserbase")
+    #[serde(default)]
+    #[nested]
+    pub browserbase: BrowserbaseConfig,
     /// Private/internal hosts allowed to bypass SSRF protection.
     /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
     /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
@@ -7349,6 +7412,7 @@ impl Default for BrowserConfig {
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
+            browserbase: BrowserbaseConfig::default(),
             allowed_private_hosts: vec![],
         }
     }
@@ -26900,6 +26964,14 @@ default_temperature = 0.7
                 max_coordinate_x: Some(3840),
                 max_coordinate_y: Some(2160),
             },
+            browserbase: BrowserbaseConfig {
+                api_key: Some("bb-test-key".into()),
+                project_id: Some("proj-123".into()),
+                region: "us-east-1".into(),
+                session_ttl_secs: 600,
+                keep_alive: true,
+                context_id: Some("ctx-abc".into()),
+            },
             allowed_private_hosts: vec![],
         };
         let toml_str = toml::to_string(&b).unwrap();
@@ -26925,6 +26997,30 @@ default_temperature = 0.7
         assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
         assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
         assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
+        assert_eq!(parsed.browserbase.api_key.as_deref(), Some("bb-test-key"));
+        assert_eq!(parsed.browserbase.project_id.as_deref(), Some("proj-123"));
+        assert_eq!(parsed.browserbase.region, "us-east-1");
+        assert_eq!(parsed.browserbase.session_ttl_secs, 600);
+        assert!(parsed.browserbase.keep_alive);
+        assert_eq!(parsed.browserbase.context_id.as_deref(), Some("ctx-abc"));
+    }
+
+    #[test]
+    async fn browserbase_config_defaults() {
+        let config = BrowserbaseConfig::default();
+        assert!(config.api_key.is_none());
+        assert!(config.project_id.is_none());
+        assert_eq!(config.region, "us-west-2");
+        assert_eq!(config.session_ttl_secs, 900);
+        assert!(!config.keep_alive);
+        assert!(config.context_id.is_none());
+    }
+
+    #[test]
+    async fn browser_config_default_includes_browserbase_defaults() {
+        let config = BrowserConfig::default();
+        assert_eq!(config.browserbase.region, "us-west-2");
+        assert_eq!(config.browserbase.session_ttl_secs, 900);
     }
 
     #[test]

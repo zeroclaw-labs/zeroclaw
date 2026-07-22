@@ -14,6 +14,15 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
 /// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly).
 ///
+/// The default (DuckDuckGo) route has a keyless, non-scraped fallback:
+/// DuckDuckGo's HTML front end is increasingly bot-walled on data-center/CI
+/// IPs, so when the HTML scrape fails or comes back empty, the tool
+/// automatically retries via DuckDuckGo's Instant Answer JSON API before
+/// giving up — see `search_duckduckgo_with_fallback`. This keeps a fresh,
+/// no-API-key install able to search out of the box even when the scrape is
+/// blocked; the fallback's output always carries a provenance note and its
+/// coverage is narrower (topic summaries, not full web results).
+///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
@@ -172,8 +181,186 @@ impl WebSearchTool {
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
-        self.search_duckduckgo_at("https://html.duckduckgo.com/html/", query)
+        self.search_duckduckgo_with_fallback(
+            "https://html.duckduckgo.com/html/",
+            "https://api.duckduckgo.com/",
+            query,
+        )
+        .await
+    }
+
+    /// DuckDuckGo route entry point: tries the HTML scrape first, and — only
+    /// when that scrape fails outright or comes back empty — falls back to
+    /// DuckDuckGo's Instant Answer API. The Instant Answer endpoint is a
+    /// plain JSON API (not a scraped browser page), so it is not subject to
+    /// the anti-bot challenge that increasingly blocks `html.duckduckgo.com`
+    /// from data-center/CI IPs (see `duckduckgo_block_message`) — this makes
+    /// it a genuinely independent keyless path for the default, no-API-key
+    /// install rather than a second scrape of the same gate. It only covers
+    /// topics with a summary/definition/disambiguation list, not general web
+    /// results, so it is used purely as a fallback, never as the primary
+    /// route, and its output always carries a provenance note.
+    ///
+    /// Parameterized on both endpoint URLs so request-flow tests can target
+    /// local mock servers. Production calls always go through
+    /// [`Self::search_duckduckgo`].
+    async fn search_duckduckgo_with_fallback(
+        &self,
+        html_endpoint_url: &str,
+        instant_answer_endpoint_url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let primary = self.search_duckduckgo_at(html_endpoint_url, query).await;
+        let primary_is_empty = matches!(&primary, Ok(s) if s.starts_with("No results found for:"));
+        if primary.is_ok() && !primary_is_empty {
+            return primary;
+        }
+
+        match self
+            .search_duckduckgo_instant_answer_at(instant_answer_endpoint_url, query)
             .await
+        {
+            Ok(Some(fallback_result)) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "web_search: DuckDuckGo HTML scrape failed or was empty; used the keyless \
+                     Instant Answer fallback"
+                );
+                Ok(fallback_result)
+            }
+            // Fallback had nothing usable (or itself failed) — surface the
+            // original scrape outcome, which carries the more actionable
+            // error/hint for this query.
+            _ => primary,
+        }
+    }
+
+    /// Query DuckDuckGo's Instant Answer API and format a usable result.
+    /// Returns `Ok(None)` when the API responded but had nothing usable for
+    /// this query (empty abstract/definition/answer and no related topics) —
+    /// this is common for ordinary web-search-shaped queries, since the
+    /// Instant Answer API only covers topics with a knowledge-panel-style
+    /// entry. Non-2xx responses are treated the same way (`Ok(None)`) rather
+    /// than as a hard error, since this is only ever consulted as a
+    /// best-effort fallback.
+    async fn search_duckduckgo_instant_answer_at(
+        &self,
+        endpoint_url: &str,
+        query: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let encoded_query = urlencoding::encode(query);
+        let url = format!(
+            "{}?q={}&format=json&no_html=1&no_redirect=1",
+            endpoint_url, encoded_query
+        );
+
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+
+        let response = client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        Ok(self.format_duckduckgo_instant_answer(&json, query))
+    }
+
+    /// Format a DuckDuckGo Instant Answer JSON body into the same
+    /// numbered-list shape the other providers use, prefixed with a
+    /// provenance note explaining this is a keyless fallback with narrower
+    /// coverage than a full web search. Returns `None` when the body has no
+    /// abstract, definition, direct answer, or related-topic entries.
+    fn format_duckduckgo_instant_answer(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> Option<String> {
+        let get_str = |key: &str| {
+            json.get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        };
+
+        let heading = get_str("Heading");
+        let answer = get_str("Answer");
+        let abstract_text = get_str("AbstractText");
+        let abstract_url = get_str("AbstractURL");
+        let definition = get_str("Definition");
+        let definition_url = get_str("DefinitionURL");
+
+        let mut lines = Vec::new();
+        let mut count = 0usize;
+
+        if let Some(answer) = answer {
+            count += 1;
+            lines.push(format!("{}. {}", count, heading.unwrap_or("Answer")));
+            lines.push(format!("   {}", answer));
+        } else if let Some(abstract_text) = abstract_text {
+            count += 1;
+            lines.push(format!("{}. {}", count, heading.unwrap_or(query)));
+            if let Some(url) = abstract_url {
+                lines.push(format!("   {}", url));
+            }
+            lines.push(format!("   {}", abstract_text));
+        } else if let Some(definition) = definition {
+            count += 1;
+            lines.push(format!("{}. {}", count, heading.unwrap_or(query)));
+            if let Some(url) = definition_url {
+                lines.push(format!("   {}", url));
+            }
+            lines.push(format!("   {}", definition));
+        }
+
+        if let Some(related) = json.get("RelatedTopics").and_then(|v| v.as_array()) {
+            for topic in related {
+                if count >= self.max_results {
+                    break;
+                }
+                // Category-grouping entries carry a nested `Topics` array
+                // instead of `Text`/`FirstURL` — skip those, only flat
+                // disambiguation entries are usable here.
+                let Some(text) = topic
+                    .get("Text")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                count += 1;
+                lines.push(format!("{}. {}", count, text));
+                if let Some(url) = topic
+                    .get("FirstURL")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    lines.push(format!("   {}", url));
+                }
+            }
+        }
+
+        if count == 0 {
+            return None;
+        }
+
+        let mut output = vec![format!(
+            "Search results for: {query} (via DuckDuckGo Instant Answer — keyless fallback \
+             used because live web search was blocked or empty; this covers topic summaries \
+             only, not full web results. Configure Brave, Tavily, Jina, Bocha, or SearXNG in \
+             [web_search] for full web search.)"
+        )];
+        output.extend(lines);
+        Some(output.join("\n"))
     }
 
     /// Inner DuckDuckGo request implementation, parameterized on the endpoint URL
@@ -1501,6 +1688,302 @@ mod tests {
             .expect("normal empty result HTML should still parse");
 
         assert!(result.contains("No results found"));
+    }
+
+    // ── DuckDuckGo Instant Answer keyless fallback ──────────────────────
+
+    #[test]
+    fn test_format_instant_answer_uses_abstract() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "Heading": "Rust (programming language)",
+            "AbstractText": "Rust is a general-purpose programming language.",
+            "AbstractURL": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            "Answer": "",
+            "Definition": "",
+            "RelatedTopics": []
+        });
+        let result = tool
+            .format_duckduckgo_instant_answer(&json, "rust programming language")
+            .expect("non-empty abstract must format to Some");
+
+        assert!(result.contains("Instant Answer"));
+        assert!(result.contains("keyless fallback"));
+        assert!(result.contains("Rust (programming language)"));
+        assert!(result.contains("https://en.wikipedia.org/wiki/Rust_(programming_language)"));
+        assert!(result.contains("Rust is a general-purpose programming language."));
+    }
+
+    #[test]
+    fn test_format_instant_answer_uses_direct_answer_over_abstract() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "Heading": "",
+            "Answer": "42",
+            "AnswerType": "calc",
+            "AbstractText": "should not be used",
+            "RelatedTopics": []
+        });
+        let result = tool
+            .format_duckduckgo_instant_answer(&json, "6*7")
+            .expect("direct answer must format to Some");
+
+        assert!(result.contains("42"));
+        assert!(!result.contains("should not be used"));
+    }
+
+    #[test]
+    fn test_format_instant_answer_falls_back_to_definition() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "Heading": "Serendipity",
+            "Answer": "",
+            "AbstractText": "",
+            "Definition": "The occurrence of events by chance in a happy way.",
+            "DefinitionURL": "https://www.merriam-webster.com/dictionary/serendipity",
+            "RelatedTopics": []
+        });
+        let result = tool
+            .format_duckduckgo_instant_answer(&json, "serendipity")
+            .expect("definition must format to Some");
+
+        assert!(result.contains("The occurrence of events by chance in a happy way."));
+        assert!(result.contains("merriam-webster.com"));
+    }
+
+    #[test]
+    fn test_format_instant_answer_uses_disambiguation_related_topics() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "Heading": "Python",
+            "Answer": "",
+            "AbstractText": "",
+            "Definition": "",
+            "RelatedTopics": [
+                {
+                    "Text": "Python (programming language) A high-level language",
+                    "FirstURL": "https://duckduckgo.com/Python_(programming_language)"
+                },
+                {
+                    // Category-grouping entry: no Text/FirstURL, only nested Topics.
+                    "Name": "People",
+                    "Topics": []
+                },
+                {
+                    "Text": "Monty Python A British comedy troupe",
+                    "FirstURL": "https://duckduckgo.com/Monty_Python"
+                }
+            ]
+        });
+        let result = tool
+            .format_duckduckgo_instant_answer(&json, "python")
+            .expect("disambiguation topics must format to Some");
+
+        assert!(result.contains("Python (programming language)"));
+        assert!(result.contains("Monty Python"));
+        assert!(result.contains("https://duckduckgo.com/Python_(programming_language)"));
+        // The category-grouping entry must be skipped, not rendered as an
+        // empty numbered line.
+        assert!(!result.contains("1. \n"));
+    }
+
+    #[test]
+    fn test_format_instant_answer_respects_max_results() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 1, 15);
+        let json = serde_json::json!({
+            "RelatedTopics": [
+                {"Text": "First topic", "FirstURL": "https://example.com/1"},
+                {"Text": "Second topic", "FirstURL": "https://example.com/2"}
+            ]
+        });
+        let result = tool
+            .format_duckduckgo_instant_answer(&json, "test")
+            .expect("at least one topic must format to Some");
+
+        assert!(result.contains("First topic"));
+        assert!(!result.contains("Second topic"));
+    }
+
+    #[test]
+    fn test_format_instant_answer_returns_none_when_empty() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "Heading": "",
+            "Answer": "",
+            "AbstractText": "",
+            "Definition": "",
+            "RelatedTopics": [],
+            "Results": []
+        });
+        assert!(
+            tool.format_duckduckgo_instant_answer(&json, "asdkjhaskjdh")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_instant_answer_at_returns_none_on_non_success_status() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let result = tool
+            .search_duckduckgo_instant_answer_at(&server.uri(), "test")
+            .await
+            .expect("non-success status must not be a hard error");
+
+        assert!(
+            result.is_none(),
+            "non-success Instant Answer response must yield None, not a formatted result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_used_when_primary_scrape_is_blocked() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let html_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&html_server)
+            .await;
+
+        let ia_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Heading": "Rust (programming language)",
+                "AbstractText": "Rust is a systems programming language.",
+                "AbstractURL": "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                "RelatedTopics": []
+            })))
+            .mount(&ia_server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let result = tool
+            .search_duckduckgo_with_fallback(
+                &format!("{}/html/", html_server.uri()),
+                &ia_server.uri(),
+                "rust programming language",
+            )
+            .await
+            .expect("blocked primary scrape with a usable fallback must still succeed");
+
+        assert!(result.contains("Instant Answer"));
+        assert!(result.contains("Rust is a systems programming language."));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_used_when_primary_scrape_returns_no_results() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let html_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<html>No results here</html>"),
+            )
+            .mount(&html_server)
+            .await;
+
+        let ia_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Answer": "42",
+                "RelatedTopics": []
+            })))
+            .mount(&ia_server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let result = tool
+            .search_duckduckgo_with_fallback(
+                &format!("{}/html/", html_server.uri()),
+                &ia_server.uri(),
+                "6*7",
+            )
+            .await
+            .expect("empty primary result with a usable fallback must still succeed");
+
+        assert!(result.contains("42"));
+    }
+
+    #[tokio::test]
+    async fn test_original_block_error_surfaces_when_fallback_also_empty() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let html_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&html_server)
+            .await;
+
+        let ia_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "RelatedTopics": []
+            })))
+            .mount(&ia_server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let err = tool
+            .search_duckduckgo_with_fallback(
+                &format!("{}/html/", html_server.uri()),
+                &ia_server.uri(),
+                "test",
+            )
+            .await
+            .expect_err("blocked primary with an empty fallback must still surface an error");
+
+        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_not_consulted_when_primary_scrape_succeeds() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let html_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a class="result__a" href="https://example.com">Example Title</a>"#,
+            ))
+            .mount(&html_server)
+            .await;
+
+        // Fallback endpoint deliberately points at an address nothing is
+        // listening on. If `search_duckduckgo_with_fallback` is well-behaved
+        // it must short-circuit on the successful primary result and never
+        // attempt this request; if it regressed to always consulting the
+        // fallback, this connection failure would surface as an error.
+        let unreachable_endpoint = "http://127.0.0.1:1";
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let result = tool
+            .search_duckduckgo_with_fallback(
+                &format!("{}/html/", html_server.uri()),
+                unreachable_endpoint,
+                "test",
+            )
+            .await
+            .expect("successful primary result must be returned without consulting fallback");
+
+        assert!(result.contains("Example Title"));
     }
 
     #[test]

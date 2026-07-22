@@ -5,6 +5,7 @@ import {
   ArrowDownToLine,
   Bot,
   Clock,
+  Heart,
   LayoutDashboard,
   ListChecks,
   MessageSquare,
@@ -12,6 +13,7 @@ import {
   Puzzle,
   Settings,
   Smartphone,
+  Smile,
   Sparkles,
   Stethoscope,
   Terminal,
@@ -48,7 +50,13 @@ const navGroups: NavGroup[] = [
   },
   {
     headingKey: 'nav.group.chat',
-    items: [{ to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' }],
+    items: [
+      { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
+      // Face is a fullscreen voice experience but still an in-app route —
+      // NavLink keeps it in the same tab like every other entry.
+      { to: '/face', icon: Smile, labelKey: 'nav.face' },
+      { to: '/soul', icon: Heart, labelKey: 'nav.soul' },
+    ],
   },
   {
     headingKey: 'nav.group.configure',

@@ -48,7 +48,7 @@ schemars = { version = "1.2", optional = true }
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal", "process"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["sync"] }
 tokio-util = { version = "0.7", default-features = false }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -88,7 +88,7 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 
 [features]
-default = ["schema-export", "a2a"]
+default = ["schema-export", "a2a", "gateway-voice-duplex"]
 # A2A (Agent2Agent) discovery surface: well-known catalog card + per-alias
 # agent cards. Default-on; the runtime surface stays default-closed via
 # [a2a.server] enabled = false. Pure-serde cards on the existing axum stack,
@@ -106,6 +106,10 @@ channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+# Voice duplex frames on /ws/chat (speech_end/barge_in in, tts_chunk/
+# tts_cancel out). Default-on; voice turns activate whenever the agent (or
+# install) has a TTS provider configured — no [channels.voice_duplex] entry
+# required.
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated
 # JSON Schema body and the serde-side schemars derives transitively. Defaults
