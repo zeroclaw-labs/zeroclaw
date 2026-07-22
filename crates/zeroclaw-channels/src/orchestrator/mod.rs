@@ -27734,8 +27734,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
+    async fn assert_e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
         Box::pin(async {
             let channel_impl = Arc::new(RecordingChannel::default());
             let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -27900,8 +27899,14 @@ This is an example JSON object for profile settings."#;
         .await;
     }
 
-    #[tokio::test]
-    async fn e2e_failed_non_retryable_turn_does_not_poison_follow_up_text_turn() {
+    #[test]
+    fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_e2e_failed_vision_turn_does_not_poison_follow_up_text_turn())
+        });
+    }
+
+    async fn assert_e2e_failed_non_retryable_turn_does_not_poison_follow_up_text_turn() {
         Box::pin(async {
             let channel_impl = Arc::new(RecordingChannel::default());
             let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -28066,6 +28071,13 @@ This is an example JSON object for profile settings."#;
             );
         })
         .await;
+    }
+
+    #[test]
+    fn e2e_failed_non_retryable_turn_does_not_poison_follow_up_text_turn() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_e2e_failed_non_retryable_turn_does_not_poison_follow_up_text_turn())
+        });
     }
 
     #[test]
