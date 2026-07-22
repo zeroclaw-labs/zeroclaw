@@ -97,6 +97,7 @@ macro_rules! impl_host {
                     PluginAction::Save => Action::Save,
                     PluginAction::Migrate => Action::Migrate,
                     PluginAction::Validate => Action::Validate,
+                    PluginAction::MemoryAudit => Action::MemoryAudit,
                     PluginAction::Note => Action::Note,
                 };
                 let outcome = match event.outcome {
@@ -159,6 +160,82 @@ impl bindings::channel::zeroclaw::plugin::inbound::Host for PluginState {
 mod tests {
     use super::*;
     use crate::PluginCapability;
+
+    const LOGGING_WIT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../wit/v0/logging.wit"
+    ));
+
+    #[test]
+    fn wit_plugin_actions_cover_log_action_taxonomy() {
+        let (_, after_enum) = LOGGING_WIT
+            .split_once("enum plugin-action {")
+            .expect("logging WIT must define plugin-action");
+        let (action_body, _) = after_enum
+            .split_once('}')
+            .expect("plugin-action must have a closing brace");
+
+        macro_rules! assert_actions {
+            ($( $variant:ident => $wit_name:literal ),+ $(,)?) => {
+                fn wit_name(action: Action) -> &'static str {
+                    match action {
+                        $(Action::$variant => $wit_name),+
+                    }
+                }
+
+                $(
+                    let name = wit_name(Action::$variant);
+                    assert!(
+                        action_body
+                            .lines()
+                            .any(|line| line.trim() == concat!($wit_name, ",")),
+                        "plugin-action is missing {name}"
+                    );
+                )+
+            };
+        }
+
+        assert_actions!(
+            Start => "start",
+            Complete => "complete",
+            Fail => "fail",
+            Cancel => "cancel",
+            Skip => "skip",
+            Timeout => "timeout",
+            Retry => "retry",
+            Inbound => "inbound",
+            Outbound => "outbound",
+            Send => "send",
+            Receive => "receive",
+            Connect => "connect",
+            Disconnect => "disconnect",
+            Reconnect => "reconnect",
+            Spawn => "spawn",
+            Kill => "kill",
+            Tick => "tick",
+            Trigger => "trigger",
+            Schedule => "schedule",
+            Approve => "approve",
+            Reject => "reject",
+            Defer => "defer",
+            Read => "read",
+            Write => "write",
+            Delete => "delete",
+            List => "list-action",
+            Query => "query",
+            Invoke => "invoke",
+            Dispatch => "dispatch",
+            Resolve => "resolve",
+            Register => "register",
+            Unregister => "unregister",
+            Load => "load",
+            Save => "save",
+            Migrate => "migrate",
+            Validate => "validate",
+            MemoryAudit => "memory-audit",
+            Note => "note",
+        );
+    }
 
     #[test]
     fn host_log_attributes_are_issued_from_the_instance_identity() {
