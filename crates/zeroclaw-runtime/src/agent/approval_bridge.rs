@@ -168,11 +168,41 @@ impl Channel for AskUserApprovalBridge {
             {
                 return Ok(None);
             }
+        }
+
+        // ── Cross-channel HITL route ───────────────────────────────────────
+        // A configured `ApprovalRoute` redirects this gate to a DISTINCT
+        // approver channel rather than the originating fan-out. The approver is
+        // asked alone, bounded by `timeout_secs`; any non-decisive outcome is
+        // resolved by `on_no_approver` — fail-closed `Deny` by default, or fall
+        // through to the caller's trusted fallback on explicit
+        // `InheritOriginator`.
+        //
+        // Goal records bind the task to a durable origin so that fallback can
+        // prove its identity. They do not replace the configured approval
+        // policy: a configured distinct approver still decides first. This
+        // keeps durable task attribution separate from operator routing while
+        // an unavailable route remains fail-closed by its policy.
+        if let Some(route) = &self.route {
+            match resolve_routed_approval(&self.handles, route, recipient, request).await {
+                RoutedApproval::Decided { response, decider } => {
+                    return Ok(Some(AttributedApprovalResponse {
+                        response,
+                        decided_by: decider,
+                    }));
+                }
+                RoutedApproval::Fallthrough => {
+                    // explicit InheritOriginator → originating fan-out below
+                }
+            }
+        }
+
+        if let GoalApprovalBindingState::Bound(binding) = &goal_binding {
             let handle = self
                 .handles
                 .read()
-                .get_key_value(binding.channel.as_str())
-                .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+                .get(binding.channel.as_str())
+                .map(|channel| (binding.channel.clone(), Arc::clone(channel)));
             let Some((name, channel)) = handle else {
                 return Ok(None);
             };
@@ -189,26 +219,6 @@ impl Channel for AskUserApprovalBridge {
                         decided_by: Some(name),
                     })
                 });
-        }
-
-        // ── Cross-channel HITL route ───────────────────────────────────────
-        // A configured `ApprovalRoute` redirects this gate to a DISTINCT
-        // approver channel rather than the originating fan-out. The approver is
-        // asked alone, bounded by `timeout_secs`; any non-decisive outcome is
-        // resolved by `on_no_approver` — fail-closed `Deny` by default, or fall
-        // through to the originating fan-out on explicit `InheritOriginator`.
-        if let Some(route) = &self.route {
-            match resolve_routed_approval(&self.handles, route, recipient, request).await {
-                RoutedApproval::Decided { response, decider } => {
-                    return Ok(Some(AttributedApprovalResponse {
-                        response,
-                        decided_by: decider,
-                    }));
-                }
-                RoutedApproval::Fallthrough => {
-                    // explicit InheritOriginator → originating fan-out below
-                }
-            }
         }
 
         let channels: Vec<(String, Arc<dyn Channel>)> = self
@@ -449,6 +459,109 @@ mod tests {
             observed_principal.lock().unwrap().as_deref(),
             Some("@owner:example.test"),
             "Matrix approval matching must receive the authenticated transport-native sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_binding_honors_configured_approver_before_durable_fallback() {
+        use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+        let durable_calls = Arc::new(std::sync::Mutex::new(None));
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![
+                approver("configured-approver", "inbound-recipient"),
+                Arc::new(PrincipalCapturingApprover {
+                    observed_principal: Arc::clone(&durable_calls),
+                }),
+            ]),
+            Some(ApprovalRoute {
+                approver_channel: "configured-approver".into(),
+                on_no_approver: OnNoApprover::Deny,
+                timeout_secs: 1,
+            }),
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "matrix".into(),
+            recipient: "!room:example.test".into(),
+            canonical_principal: "6:matrix|5:owner".into(),
+            transport_principal: "@owner:example.test".into(),
+        }));
+
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decided.decided_by.as_deref(), Some("configured-approver"));
+        assert!(durable_calls.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_configured_goal_approver_denies_without_durable_fallback() {
+        use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+        let durable_calls = Arc::new(std::sync::Mutex::new(None));
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![Arc::new(PrincipalCapturingApprover {
+                observed_principal: Arc::clone(&durable_calls),
+            })]),
+            Some(ApprovalRoute {
+                approver_channel: "unregistered-approver".into(),
+                on_no_approver: OnNoApprover::Deny,
+                timeout_secs: 1,
+            }),
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "matrix".into(),
+            recipient: "!room:example.test".into(),
+            canonical_principal: "6:matrix|5:owner".into(),
+            transport_principal: "@owner:example.test".into(),
+        }));
+
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+        assert!(decided.decided_by.is_none());
+        assert!(durable_calls.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn inheriting_configured_goal_route_uses_durable_fallback() {
+        use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+        let durable_calls = Arc::new(std::sync::Mutex::new(None));
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![Arc::new(PrincipalCapturingApprover {
+                observed_principal: Arc::clone(&durable_calls),
+            })]),
+            Some(ApprovalRoute {
+                approver_channel: "unregistered-approver".into(),
+                on_no_approver: OnNoApprover::InheritOriginator,
+                timeout_secs: 1,
+            }),
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "matrix".into(),
+            recipient: "!room:example.test".into(),
+            canonical_principal: "6:matrix|5:owner".into(),
+            transport_principal: "@owner:example.test".into(),
+        }));
+
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decided.decided_by.as_deref(), Some("matrix"));
+        assert_eq!(
+            durable_calls.lock().unwrap().as_deref(),
+            Some("@owner:example.test")
         );
     }
 
