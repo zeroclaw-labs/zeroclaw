@@ -436,7 +436,7 @@ pub struct QuickstartState {
     pub channels: Vec<String>,
     #[serde(default)]
     pub unassigned_channels: Vec<String>,
-    /// `<storage_type>.<alias>` refs.
+    /// `<storage_type>.<alias>` refs for authoritative stores.
     pub storage: Vec<String>,
     pub model_provider_types: Vec<QuickstartTypeOption>,
     pub channel_types: Vec<QuickstartTypeOption>,
@@ -547,33 +547,24 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
     }
 }
 
-/// Snake-case wire keys for every `MemoryBackendKind` variant. Exhaustive
-/// match probe catches missing variants at compile time; serde produces
-/// the wire key so there's no parallel mapping.
+/// Snake-case wire keys for selectable authoritative backends.
 fn memory_kind_keys() -> Vec<String> {
     use zeroclaw_config::multi_agent::MemoryBackendKind as M;
-    [
-        M::Sqlite,
-        M::Markdown,
-        M::Postgres,
-        M::Qdrant,
-        M::Lucid,
-        M::None,
-    ]
-    .into_iter()
-    .map(|k| {
-        // Exhaustiveness guard: adding a new variant forces this match to fail
-        // to compile until the contributor decides whether the new backend
-        // belongs in the quickstart picker.
-        match k {
-            M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::Lucid | M::None => (),
-        }
-        serde_json::to_value(k)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default()
-    })
-    .collect()
+    [M::Sqlite, M::Markdown, M::Postgres, M::Qdrant, M::None]
+        .into_iter()
+        .map(|k| {
+            // Exhaustiveness guard: adding a new variant forces this match to fail
+            // to compile until the contributor decides whether the new backend
+            // belongs in the quickstart picker.
+            match k {
+                M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::None => (),
+            }
+            serde_json::to_value(k)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn build_channel_type_options(

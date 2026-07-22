@@ -296,6 +296,13 @@ pub struct Config {
     #[nested]
     pub storage: StorageConfig,
 
+    /// Optional memory enrichment connector catalog (`[memory_enrichment]`).
+    /// SQLite remains authoritative; entries here only configure connector
+    /// protocol details selected by `memory.enricher` or an agent override.
+    #[serde(default)]
+    #[nested]
+    pub memory_enrichment: MemoryEnrichmentConfig,
+
     /// Tunnel configuration for exposing the gateway publicly (`[tunnel]`).
     #[serde(default)]
     #[nested]
@@ -4434,17 +4441,13 @@ impl Config {
             })
     }
 
-    /// Resolve the active storage backend for the memory subsystem.
+    /// Resolve one dotted storage reference against the canonical storage maps.
     ///
-    /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
-    /// `Config.storage.<backend>.<alias>`. Bare backend names are interpreted
-    /// as `<backend>.default` for back-compat.
-    ///
-    /// Returns `ActiveStorage::None` when no backend is configured, when the
-    /// backend is `"none"`, or when the dotted alias does not resolve to a
-    /// configured entry.
-    pub fn resolve_active_storage(&self) -> ActiveStorage<'_> {
-        let backend = self.memory.backend.trim();
+    /// Bare backend names are interpreted as `<backend>.default` for back-compat.
+    /// Returns [`ActiveStorage::None`] when the reference is empty, names `none`,
+    /// or does not resolve to a configured entry.
+    pub fn resolve_storage_ref(&self, backend: &str) -> ActiveStorage<'_> {
+        let backend = backend.trim();
         if backend.is_empty() || backend.eq_ignore_ascii_case("none") {
             return ActiveStorage::None;
         }
@@ -4474,14 +4477,183 @@ impl Config {
                 .get(alias)
                 .map(ActiveStorage::Markdown)
                 .unwrap_or(ActiveStorage::None),
-            "lucid" => self
-                .storage
-                .lucid
-                .get(alias)
-                .map(ActiveStorage::Lucid)
-                .unwrap_or(ActiveStorage::None),
             _ => ActiveStorage::None,
         }
+    }
+
+    /// Resolve the install-wide memory storage selected by [`MemoryConfig`].
+    pub fn resolve_active_storage(&self) -> ActiveStorage<'_> {
+        self.resolve_storage_ref(&self.memory.backend)
+    }
+
+    /// Resolve one memory-enricher reference against the canonical connector catalog.
+    pub fn resolve_enricher_ref(&self, enricher: &str) -> ActiveMemoryEnricher<'_> {
+        let enricher = enricher.trim();
+        if enricher.is_empty() || enricher.eq_ignore_ascii_case("none") {
+            return ActiveMemoryEnricher::None;
+        }
+        let (kind, alias) = enricher.split_once('.').unwrap_or((enricher, "default"));
+        match kind {
+            "lucid" => self
+                .memory_enrichment
+                .lucid
+                .get(alias)
+                .map(ActiveMemoryEnricher::Lucid)
+                .unwrap_or(ActiveMemoryEnricher::None),
+            _ => ActiveMemoryEnricher::None,
+        }
+    }
+
+    /// Return the install-wide effective memory-enricher reference.
+    pub fn memory_enricher_ref(&self) -> Option<String> {
+        self.memory.enricher.as_deref().and_then(|enricher| {
+            let enricher = enricher.trim();
+            (!enricher.is_empty() && !enricher.eq_ignore_ascii_case("none"))
+                .then(|| enricher.to_string())
+        })
+    }
+
+    /// Resolve the install-wide effective memory enricher.
+    pub fn resolve_active_enricher(&self) -> ActiveMemoryEnricher<'_> {
+        self.memory_enricher_ref()
+            .as_deref()
+            .map_or(ActiveMemoryEnricher::None, |reference| {
+                self.resolve_enricher_ref(reference)
+            })
+    }
+
+    /// Human-readable effective memory composition derived from the canonical
+    /// selectors, for example `sqlite` or `sqlite+lucid`.
+    #[must_use]
+    pub fn effective_memory_label(&self) -> String {
+        let backend = self.memory.backend.trim();
+        let backend_kind = backend.split_once('.').map_or(backend, |(kind, _)| kind);
+        let storage_kind = if backend_kind.is_empty() {
+            "none"
+        } else {
+            backend_kind
+        };
+        self.memory_enricher_ref().map_or_else(
+            || storage_kind.to_string(),
+            |enricher| {
+                let kind = enricher
+                    .split_once('.')
+                    .map_or(enricher.as_str(), |(kind, _)| kind);
+                format!("{storage_kind}+{kind}")
+            },
+        )
+    }
+
+    /// Return the effective storage reference for one configured agent.
+    ///
+    /// The agent's typed backend is authoritative. When the install-wide
+    /// [`MemoryConfig::backend`] selects the same backend kind, its alias is
+    /// reused. Otherwise `default` is preferred, a sole configured instance is
+    /// unambiguous, multiple non-default instances are rejected, and an empty
+    /// storage map keeps the legacy bare backend defaults. Markdown remains
+    /// per-agent and `none` has no storage alias.
+    pub fn memory_backend_ref_for_agent(&self, agent_alias: &str) -> Result<String> {
+        use crate::multi_agent::MemoryBackendKind;
+
+        let agent = self
+            .agents
+            .get(agent_alias)
+            .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+        let backend = agent.memory.backend;
+        let kind = backend.as_str();
+
+        match backend {
+            MemoryBackendKind::None => return Ok("none".to_string()),
+            MemoryBackendKind::Markdown => return Ok(format!("markdown.{agent_alias}")),
+            _ => {}
+        }
+
+        let global = self.memory.backend.trim();
+        let global_parts = global.split_once('.');
+        let (global_kind, global_alias) = global_parts.unwrap_or((global, "default"));
+        if global_kind.eq_ignore_ascii_case(kind) && !global_alias.trim().is_empty() {
+            return Ok(if global_parts.is_none() {
+                kind.to_string()
+            } else {
+                format!("{kind}.{}", global_alias.trim())
+            });
+        }
+
+        let aliases: Vec<&str> = match backend {
+            MemoryBackendKind::Sqlite => self.storage.sqlite.keys().map(String::as_str).collect(),
+            MemoryBackendKind::Postgres => {
+                self.storage.postgres.keys().map(String::as_str).collect()
+            }
+            MemoryBackendKind::Qdrant => self.storage.qdrant.keys().map(String::as_str).collect(),
+            MemoryBackendKind::None | MemoryBackendKind::Markdown => {
+                unreachable!()
+            }
+        };
+        if aliases.is_empty() {
+            return Ok(kind.to_string());
+        }
+        if aliases.contains(&"default") {
+            return Ok(format!("{kind}.default"));
+        }
+        if let [alias] = aliases.as_slice() {
+            return Ok(format!("{kind}.{alias}"));
+        }
+
+        let mut aliases = aliases;
+        aliases.sort_unstable();
+        anyhow::bail!(
+            "agents.{agent_alias}.memory.backend selects {kind}, but multiple \
+             storage.{kind} aliases are configured without a default: {}; set \
+             memory.backend to the intended {kind}.<alias> or add storage.{kind}.default",
+            aliases.join(", ")
+        )
+    }
+
+    /// Return the effective enrichment reference for one configured agent.
+    ///
+    /// `Some("none")` on the agent explicitly disables inheritance. An omitted
+    /// agent value inherits the install-wide selector — but only when the
+    /// agent's typed backend can actually enrich (SQLite). An agent that
+    /// merely inherits `[memory].enricher` over a non-SQLite backend resolves
+    /// to `None` (enrichment silently off) instead of failing validation and
+    /// the factory on `agents.<alias>.memory.enricher` — a field the operator
+    /// never set. An *explicit* per-agent enricher is always returned, so
+    /// validation still rejects it over a non-enrichable backend.
+    pub fn memory_enricher_ref_for_agent(&self, agent_alias: &str) -> Result<Option<String>> {
+        let agent = self
+            .agents
+            .get(agent_alias)
+            .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+
+        if let Some(enricher) = agent.memory.enricher.as_deref() {
+            let enricher = enricher.trim();
+            return Ok(
+                (!enricher.is_empty() && !enricher.eq_ignore_ascii_case("none"))
+                    .then(|| enricher.to_string()),
+            );
+        }
+
+        if !matches!(
+            agent.memory.backend,
+            crate::multi_agent::MemoryBackendKind::Sqlite
+        ) {
+            return Ok(None);
+        }
+
+        Ok(self.memory_enricher_ref())
+    }
+
+    /// Resolve one configured agent's effective memory enricher.
+    pub fn resolve_enricher_for_agent(
+        &self,
+        agent_alias: &str,
+    ) -> Result<ActiveMemoryEnricher<'_>> {
+        Ok(self
+            .memory_enricher_ref_for_agent(agent_alias)?
+            .as_deref()
+            .map_or(ActiveMemoryEnricher::None, |reference| {
+                self.resolve_enricher_ref(reference)
+            }))
     }
 }
 
@@ -4501,8 +4673,6 @@ pub enum ActiveStorage<'a> {
     Qdrant(&'a QdrantStorageConfig),
     /// Markdown directory storage instance.
     Markdown(&'a MarkdownStorageConfig),
-    /// Lucid CLI sync instance.
-    Lucid(&'a LucidStorageConfig),
 }
 
 impl ActiveStorage<'_> {
@@ -4515,7 +4685,26 @@ impl ActiveStorage<'_> {
             ActiveStorage::Postgres(_) => "postgres",
             ActiveStorage::Qdrant(_) => "qdrant",
             ActiveStorage::Markdown(_) => "markdown",
-            ActiveStorage::Lucid(_) => "lucid",
+        }
+    }
+}
+
+/// Resolved optional memory-enrichment connector.
+#[derive(Debug, Clone, Copy)]
+pub enum ActiveMemoryEnricher<'a> {
+    /// No connector configured, or a reference that did not resolve.
+    None,
+    /// Lucid CLI connector settings.
+    Lucid(&'a LucidEnrichmentConfig),
+}
+
+impl ActiveMemoryEnricher<'_> {
+    /// Connector kind; `"none"` when absent or unresolved.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Lucid(_) => "lucid",
         }
     }
 }
@@ -10226,10 +10415,22 @@ pub struct StorageConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub markdown: HashMap<String, MarkdownStorageConfig>,
-    /// Lucid CLI sync instances (`[storage.lucid.<alias>]`).
+}
+
+/// Memory enrichment connector catalog (`[memory_enrichment]`).
+///
+/// This is deliberately separate from [`StorageConfig`]: connector entries
+/// augment an authoritative SQLite store and never own durable memory. Shared
+/// fallback, scoping, merge, cooldown, and cleanup policy lives in the memory
+/// crate's enrichment wrapper, not in these protocol settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory_enrichment"]
+pub struct MemoryEnrichmentConfig {
+    /// Lucid CLI connector instances (`[memory_enrichment.lucid.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
-    pub lucid: HashMap<String, LucidStorageConfig>,
+    pub lucid: HashMap<String, LucidEnrichmentConfig>,
 }
 
 /// SQLite storage backend (`[storage.sqlite.<alias>]`).
@@ -10331,14 +10532,25 @@ pub struct MarkdownStorageConfig {
     pub directory: Option<String>,
 }
 
-/// Lucid CLI sync backend (`[storage.lucid.<alias>]`).
+/// Single source of truth for the Lucid deadline rule's wording. Cited by
+/// both `Config::validate` and the connector's defensive check in
+/// `zeroclaw-memory` so the two layers cannot drift apart.
+pub const LUCID_DEADLINE_RULE: &str = "must be greater than 0 when configured";
+
+/// Lucid CLI memory-enrichment connector.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage_lucid"]
+#[prefix = "memory_enrichment_lucid"]
 #[serde(default)]
-pub struct LucidStorageConfig {
+pub struct LucidEnrichmentConfig {
     /// Optional path to the lucid-memory binary.
     pub binary_path: Option<String>,
+    /// Maximum milliseconds allowed for a Lucid context/recall command.
+    /// Defaults to 500 when omitted and must be greater than zero when set.
+    pub recall_timeout_ms: Option<u64>,
+    /// Maximum milliseconds allowed for a Lucid store command.
+    /// Defaults to 800 when omitted and must be greater than zero when set.
+    pub store_timeout_ms: Option<u64>,
 }
 
 fn default_storage_schema() -> String {
@@ -10385,6 +10597,13 @@ pub struct MemoryConfig {
     /// disable persistence entirely.
     #[serde(default = "default_memory_backend")]
     pub backend: String,
+    /// Optional memory-enricher reference (`<kind>.<alias>`) under `[memory_enrichment]`.
+    ///
+    /// For example, `"lucid.default"`. A bare `"lucid"` uses Lucid defaults;
+    /// `"none"` or omission disables enrichment. Enrichment currently requires
+    /// an authoritative SQLite backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enricher: Option<String>,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
     pub auto_save: bool,
@@ -10884,6 +11103,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: "sqlite".into(),
+            enricher: None,
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             consolidation_extract_facts: false,
@@ -17321,6 +17541,7 @@ impl Default for Config {
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
+            memory_enrichment: MemoryEnrichmentConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
@@ -19020,12 +19241,77 @@ impl Config {
             .collect()
     }
 
+    fn validate_memory_enricher_ref(
+        &self,
+        reference: &str,
+        authoritative_kind: &str,
+        path: &str,
+    ) -> Result<()> {
+        let reference = reference.trim();
+        if reference.is_empty() || reference.eq_ignore_ascii_case("none") {
+            return Ok(());
+        }
+        if !authoritative_kind.eq_ignore_ascii_case("sqlite") {
+            anyhow::bail!(
+                "{path} = {reference:?} requires an authoritative SQLite backend; \
+                 {authoritative_kind:?} remains the selected durable store"
+            );
+        }
+
+        let (kind, alias) = reference
+            .split_once('.')
+            .map_or((reference, "default"), |(kind, alias)| {
+                (kind.trim(), alias.trim())
+            });
+        if kind.is_empty() || alias.is_empty() || alias.contains('.') {
+            anyhow::bail!(
+                "{path} = {reference:?} must be `none`, `lucid`, or a \
+                 `<connector>.<alias>` reference"
+            );
+        }
+        match kind {
+            // Bare Lucid deliberately remains zero-config. A dotted reference
+            // opts into typed settings and must resolve.
+            "lucid" if !reference.contains('.') => Ok(()),
+            "lucid" if self.memory_enrichment.lucid.contains_key(alias) => Ok(()),
+            "lucid" => anyhow::bail!(
+                "{path} = {reference:?} does not resolve to \
+                 [memory_enrichment.lucid.{alias}]"
+            ),
+            _ => anyhow::bail!(
+                "{path} = {reference:?} uses unknown memory enricher {kind:?}; \
+                 expected lucid or none"
+            ),
+        }
+    }
+
+    fn validate_lucid_enrichment_deadlines(
+        alias: &str,
+        config: &LucidEnrichmentConfig,
+        root: &str,
+    ) -> Result<()> {
+        for (field, value) in [
+            ("recall_timeout_ms", config.recall_timeout_ms),
+            ("store_timeout_ms", config.store_timeout_ms),
+        ] {
+            if value == Some(0) {
+                anyhow::bail!("{root}.{alias}.{field} {LUCID_DEADLINE_RULE}");
+            }
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        let backend = self.memory.backend.trim();
+        let authoritative_kind = backend.split_once('.').map_or(backend, |(kind, _)| kind);
+        if let Some(reference) = self.memory_enricher_ref() {
+            self.validate_memory_enricher_ref(&reference, authoritative_kind, "memory.enricher")?;
+        }
 
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
@@ -19053,6 +19339,10 @@ impl Config {
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
                 );
             }
+        }
+
+        for (alias, lucid) in &self.memory_enrichment.lucid {
+            Self::validate_lucid_enrichment_deadlines(alias, lucid, "memory_enrichment.lucid")?;
         }
 
         // Reply-pacing bounds — both `reply_min_interval_secs` and
@@ -20411,6 +20701,14 @@ impl Config {
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
                     );
                 }
+            }
+
+            if let Some(reference) = self.memory_enricher_ref_for_agent(alias)? {
+                self.validate_memory_enricher_ref(
+                    &reference,
+                    agent.memory.backend.as_str(),
+                    &format!("agents.{alias}.memory.enricher"),
+                )?;
             }
 
             // workspace.read_memory_from: every alias must exist as a
@@ -22472,7 +22770,6 @@ max_height = 8
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;
-    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -22483,13 +22780,13 @@ max_height = 8
     use tokio::sync::MutexGuard;
     use tokio::test;
 
-    #[cfg(unix)]
+    // Portable env mutation guard: used by both Unix-only permission tests and
+    // cross-platform runtime-config-resolution tests.
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
-    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -22506,7 +22803,6 @@ max_height = 8
         }
     }
 
-    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().
@@ -24071,7 +24367,8 @@ auto_save = true
         assert!(storage.postgres.is_empty());
         assert!(storage.qdrant.is_empty());
         assert!(storage.markdown.is_empty());
-        assert!(storage.lucid.is_empty());
+        let enrichment = MemoryEnrichmentConfig::default();
+        assert!(enrichment.lucid.is_empty());
     }
 
     #[test]
@@ -24100,6 +24397,57 @@ auto_save = true
         assert_eq!(pg.vector_dimensions, 1536);
         assert_eq!(pg.schema, "public");
         assert_eq!(pg.table, "memories");
+    }
+
+    #[test]
+    async fn enrichment_lucid_alias_options_round_trip() {
+        let toml = r#"
+            [lucid.pi]
+            binary_path = "/opt/lucid/bin/lucid"
+            recall_timeout_ms = 2500
+            store_timeout_ms = 3000
+        "#;
+        let parsed: MemoryEnrichmentConfig = toml::from_str(toml).unwrap();
+        let lucid = parsed.lucid.get("pi").expect("alias present");
+        assert_eq!(lucid.binary_path.as_deref(), Some("/opt/lucid/bin/lucid"));
+        assert_eq!(lucid.recall_timeout_ms, Some(2500));
+        assert_eq!(lucid.store_timeout_ms, Some(3000));
+
+        let defaults: LucidEnrichmentConfig = toml::from_str("").unwrap();
+        assert!(defaults.binary_path.is_none());
+        assert!(defaults.recall_timeout_ms.is_none());
+        assert!(defaults.store_timeout_ms.is_none());
+    }
+
+    #[test]
+    async fn validate_rejects_zero_lucid_command_deadlines() {
+        for (field, config) in [
+            (
+                "recall_timeout_ms",
+                LucidEnrichmentConfig {
+                    recall_timeout_ms: Some(0),
+                    ..LucidEnrichmentConfig::default()
+                },
+            ),
+            (
+                "store_timeout_ms",
+                LucidEnrichmentConfig {
+                    store_timeout_ms: Some(0),
+                    ..LucidEnrichmentConfig::default()
+                },
+            ),
+        ] {
+            let mut root = Config::default();
+            root.memory_enrichment
+                .lucid
+                .insert("pi".to_string(), config);
+            let error = root.validate().expect_err("zero deadline must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("memory_enrichment.lucid.pi.{field}"))
+            );
+        }
     }
 
     #[test]
@@ -24390,6 +24738,7 @@ auto_save = true
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
+            memory_enrichment: MemoryEnrichmentConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
@@ -25196,6 +25545,7 @@ default_temperature = 0.7
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
+            memory_enrichment: MemoryEnrichmentConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
@@ -33658,6 +34008,202 @@ allowed_users = []
     }
 
     #[test]
+    async fn global_memory_enricher_resolves_from_canonical_catalog() {
+        let mut config = Config::default();
+        config.memory.backend = "sqlite".to_string();
+        config.memory.enricher = Some("lucid.pi".to_string());
+        config
+            .memory_enrichment
+            .lucid
+            .insert("pi".to_string(), LucidEnrichmentConfig::default());
+
+        assert!(matches!(
+            config.resolve_active_enricher(),
+            ActiveMemoryEnricher::Lucid(_)
+        ));
+        assert_eq!(config.effective_memory_label(), "sqlite+lucid");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn agent_memory_enricher_inherits_and_explicit_none_disables() {
+        let mut config = multi_agent_test_config();
+        config.memory.enricher = Some("lucid.local".to_string());
+        config
+            .memory_enrichment
+            .lucid
+            .insert("local".to_string(), LucidEnrichmentConfig::default());
+
+        assert_eq!(
+            config.memory_enricher_ref_for_agent("alpha").unwrap(),
+            Some("lucid.local".to_string())
+        );
+        config.agents.get_mut("alpha").unwrap().memory.enricher = Some("none".to_string());
+        assert_eq!(config.memory_enricher_ref_for_agent("alpha").unwrap(), None);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn validation_rejects_enrichment_over_non_sqlite_storage() {
+        let mut config = Config::default();
+        config.memory.backend = "postgres.work".to_string();
+        config.memory.enricher = Some("lucid".to_string());
+
+        let error = config
+            .validate()
+            .expect_err("enrichment must not hide a non-SQLite authoritative store");
+        assert!(error.to_string().contains("authoritative SQLite backend"));
+        assert!(error.to_string().contains("postgres"));
+    }
+
+    #[test]
+    async fn legacy_lucid_backend_normalizes_to_sqlite_with_lucid_enricher() {
+        // Pre-enrichment configs selected the hybrid SQLite + Lucid CLI
+        // backend via `memory.backend = "lucid"`. The load-time compat pass
+        // must keep SQLite authoritative and imply the Lucid enricher instead
+        // of silently falling back to markdown (losing brain.db).
+        for backend in ["lucid", "lucid.local"] {
+            let raw = format!("schema_version = 3\n\n[memory]\nbackend = \"{backend}\"\n");
+            let config =
+                crate::migration::migrate_to_current(&raw).expect("legacy lucid value loads");
+            assert_eq!(config.memory.backend, "sqlite", "backend={backend}");
+            assert_eq!(config.memory.enricher.as_deref(), Some("lucid"));
+            assert_eq!(config.effective_memory_label(), "sqlite+lucid");
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    async fn legacy_per_agent_lucid_backend_deserializes_and_resolves() {
+        // The typed per-agent enum has no `lucid` variant; the compat pass
+        // must rewrite the legacy value before serde or upgraded installs
+        // hard-fail with an unknown-variant error.
+        let raw = r#"schema_version = 3
+
+[providers.models.ollama.default]
+
+[risk_profiles.shared]
+
+[agents.helper]
+model_provider = "ollama.default"
+risk_profile = "shared"
+
+[agents.helper.memory]
+backend = "lucid"
+"#;
+        let config =
+            crate::migration::migrate_to_current(raw).expect("legacy per-agent value loads");
+        let agent = &config.agents["helper"];
+        assert_eq!(
+            agent.memory.backend,
+            crate::multi_agent::MemoryBackendKind::Sqlite
+        );
+        assert_eq!(agent.memory.enricher.as_deref(), Some("lucid"));
+        assert_eq!(
+            config.memory_enricher_ref_for_agent("helper").unwrap(),
+            Some("lucid".to_string())
+        );
+    }
+
+    #[test]
+    async fn explicit_enricher_none_beats_legacy_lucid_implication() {
+        let raw = r#"schema_version = 3
+
+[memory]
+backend = "lucid"
+enricher = "none"
+"#;
+        let config = crate::migration::migrate_to_current(raw).expect("explicit none loads");
+        assert_eq!(config.memory.backend, "sqlite");
+        assert_eq!(config.memory.enricher.as_deref(), Some("none"));
+        assert_eq!(config.memory_enricher_ref(), None);
+        assert_eq!(config.effective_memory_label(), "sqlite");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn legacy_lucid_backend_with_canonical_enricher_is_rejected() {
+        // RFC compatibility rule: the removed legacy backend and the
+        // canonical enricher surface must not select Lucid together — it is
+        // ambiguous which selection carries the connector settings.
+        let global = r#"schema_version = 3
+
+[memory]
+backend = "lucid"
+enricher = "lucid.pi"
+
+[memory_enrichment.lucid.pi]
+binary_path = "/opt/lucid/bin/lucid"
+"#;
+        let error = crate::migration::migrate_to_current(global)
+            .expect_err("legacy + canonical together must be rejected");
+        let msg = format!("{error:#}");
+        assert!(msg.contains("memory.backend = \"lucid\""), "got: {msg}");
+        assert!(msg.contains("memory.enricher"), "got: {msg}");
+
+        let per_agent = r#"schema_version = 3
+
+[providers.models.ollama.default]
+
+[risk_profiles.shared]
+
+[agents.helper]
+model_provider = "ollama.default"
+risk_profile = "shared"
+
+[agents.helper.memory]
+backend = "lucid"
+enricher = "lucid"
+"#;
+        let error = crate::migration::migrate_to_current(per_agent)
+            .expect_err("per-agent legacy + canonical together must be rejected");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("agents.helper.memory.backend = \"lucid\""),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn inherited_global_enricher_skips_non_enrichable_agent_backend() {
+        // An agent that merely inherits [memory].enricher over a backend that
+        // cannot enrich must resolve to no enricher (silently off) instead of
+        // failing validation at agents.<alias>.memory.enricher — a field the
+        // operator never set.
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "sqlite".to_string();
+        config.memory.enricher = Some("lucid".to_string());
+
+        for backend in [
+            crate::multi_agent::MemoryBackendKind::Markdown,
+            crate::multi_agent::MemoryBackendKind::None,
+        ] {
+            config.agents.get_mut("alpha").unwrap().memory.backend = backend;
+            assert_eq!(
+                config.memory_enricher_ref_for_agent("alpha").unwrap(),
+                None,
+                "backend={backend:?}"
+            );
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    async fn explicit_agent_enricher_over_non_enrichable_backend_still_fails() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha.memory.enricher = Some("lucid".to_string());
+
+        let error = config
+            .validate()
+            .expect_err("explicit enricher over markdown must fail");
+        let msg = error.to_string();
+        assert!(msg.contains("agents.alpha.memory.enricher"), "got: {msg}");
+        assert!(msg.contains("authoritative SQLite backend"), "got: {msg}");
+    }
+
+    #[test]
     async fn validate_rejects_workspace_access_self_reference() {
         let mut config = multi_agent_test_config();
         let alpha = config.agents.get_mut("alpha").unwrap();
@@ -33725,6 +34271,7 @@ allowed_users = []
             risk_profile: "default".into(),
             memory: crate::multi_agent::AgentMemoryConfig {
                 backend: crate::multi_agent::MemoryBackendKind::Postgres,
+                enricher: None,
             },
             ..AliasedAgentConfig::default()
         };
@@ -33774,6 +34321,7 @@ allowed_users = []
             risk_profile: "default".into(),
             memory: crate::multi_agent::AgentMemoryConfig {
                 backend: crate::multi_agent::MemoryBackendKind::Markdown,
+                enricher: None,
             },
             ..AliasedAgentConfig::default()
         };

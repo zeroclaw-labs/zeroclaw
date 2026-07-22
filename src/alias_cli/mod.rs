@@ -436,6 +436,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
                 &config.memory,
                 &config.embedding_routes,
                 config.resolve_active_storage(),
+                config.resolve_active_enricher(),
                 &config.data_dir,
                 None,
                 Some(&config.providers.models),

@@ -2289,6 +2289,7 @@ mod sop_step_reassembly_tests {
                     risk_profile: profile.into(),
                     memory: AgentMemoryConfig {
                         backend: MemoryBackendKind::Markdown,
+                        enricher: None,
                     },
                     ..AliasedAgentConfig::default()
                 },
@@ -2367,6 +2368,7 @@ mod sop_step_reassembly_tests {
                 risk_profile: "restricted".into(),
                 memory: AgentMemoryConfig {
                     backend: MemoryBackendKind::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },

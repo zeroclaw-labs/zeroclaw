@@ -18,6 +18,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+mod enriched;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -33,6 +34,7 @@ pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+mod recall_window;
 pub mod redact;
 pub mod rerank;
 pub mod response_cache;
@@ -40,6 +42,8 @@ pub mod retrieval;
 pub mod scanned;
 pub mod snapshot;
 pub mod sqlite;
+#[cfg(all(test, unix))]
+pub(crate) mod test_support;
 pub mod threat;
 pub mod traits;
 pub mod vector;
@@ -54,7 +58,7 @@ pub use backend::{
 };
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
-pub use lucid::LucidMemory;
+pub use lucid::LucidEnrichedMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
@@ -79,10 +83,38 @@ pub use traits::{
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{
-    ActiveStorage, EmbeddingRouteConfig, MemoryConfig, MemoryPolicyConfig, PostgresStorageConfig,
+    ActiveMemoryEnricher, ActiveStorage, EmbeddingRouteConfig, LucidEnrichmentConfig, MemoryConfig,
+    MemoryPolicyConfig, PostgresStorageConfig,
 };
+
+use enriched::{EnrichedMemory, EnrichmentPolicy};
+use lucid::LucidConnector;
+
+const DEFAULT_ENRICHMENT_LOCAL_HIT_THRESHOLD: usize = 3;
+const DEFAULT_ENRICHMENT_FAILURE_COOLDOWN_MS: u64 = 15_000;
+
+fn build_lucid_enriched_memory(
+    workspace_dir: &Path,
+    local: SqliteMemory,
+    config: Option<&LucidEnrichmentConfig>,
+) -> anyhow::Result<LucidEnrichedMemory> {
+    let connector = config.map_or_else(
+        || Ok(LucidConnector::new(workspace_dir)),
+        |config| LucidConnector::from_config(workspace_dir, config),
+    )?;
+    Ok(EnrichedMemory::from_parts(
+        "lucid",
+        local,
+        connector,
+        EnrichmentPolicy::new(
+            DEFAULT_ENRICHMENT_LOCAL_HIT_THRESHOLD,
+            Duration::from_millis(DEFAULT_ENRICHMENT_FAILURE_COOLDOWN_MS),
+        ),
+    ))
+}
 
 #[cfg(feature = "memory-postgres")]
 fn build_postgres_memory(
@@ -156,17 +188,10 @@ where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
 {
     match classify_memory_backend(backend_name) {
+        // Lucid is no longer a storage backend; it is an optional enricher
+        // layered on SQLite via create_memory_with_storage_and_routes.
         MemoryBackendKind::Sqlite => {
             wrap_scanned_and_audit(sqlite_builder()?, policy, workspace_dir, audit_enabled)
-        }
-        MemoryBackendKind::Lucid => {
-            let local = sqlite_builder()?;
-            wrap_scanned_and_audit(
-                LucidMemory::new("lucid", workspace_dir, local),
-                policy,
-                workspace_dir,
-                audit_enabled,
-            )
         }
         MemoryBackendKind::Postgres => {
             anyhow::bail!(
@@ -463,6 +488,7 @@ pub fn create_memory(
         config,
         &[],
         ActiveStorage::None,
+        ActiveMemoryEnricher::None,
         workspace_dir,
         api_key,
         None,
@@ -473,12 +499,25 @@ pub fn create_memory_with_storage_and_routes(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     active_storage: ActiveStorage<'_>,
+    active_enricher: ActiveMemoryEnricher<'_>,
     workspace_dir: &Path,
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
+    let requested_enricher = config
+        .enricher
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+        .map(str::to_string);
+    if requested_enricher.is_some() && !matches!(backend_kind, MemoryBackendKind::Sqlite) {
+        anyhow::bail!(
+            "memory enrichment requires an authoritative SQLite backend; '{}' is configured",
+            config.backend.trim()
+        );
+    }
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
@@ -495,10 +534,7 @@ pub fn create_memory_with_storage_and_routes(
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
         && config.snapshot_on_hygiene
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && memory_backend_profile(&backend_name).sqlite_based
         && let Err(e) = snapshot::export_snapshot(workspace_dir)
     {
         ::zeroclaw_log::record!(
@@ -513,10 +549,7 @@ pub fn create_memory_with_storage_and_routes(
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && memory_backend_profile(&backend_name).sqlite_based
         && snapshot::should_hydrate(workspace_dir)
     {
         ::zeroclaw_log::record!(
@@ -654,6 +687,42 @@ pub fn create_memory_with_storage_and_routes(
         {
             return build_postgres_memory(pg_cfg);
         }
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Sqlite)
+        && let Some(enricher_ref) = requested_enricher.as_deref()
+    {
+        let local = build_sqlite_memory(
+            config,
+            sqlite_open_timeout_secs,
+            workspace_dir,
+            &resolved_embedding,
+        )?;
+        let enricher_kind = backend_kind_from_dotted(enricher_ref);
+        return match enricher_kind.as_str() {
+            "lucid" => {
+                match active_enricher {
+                    ActiveMemoryEnricher::Lucid(lucid) => Ok(Box::new(
+                        build_lucid_enriched_memory(workspace_dir, local, Some(lucid))?,
+                    )),
+                    ActiveMemoryEnricher::None if !enricher_ref.contains('.') => Ok(Box::new(
+                        build_lucid_enriched_memory(workspace_dir, local, None)?,
+                    )),
+                    ActiveMemoryEnricher::None => anyhow::bail!(
+                        "memory enricher '{enricher_ref}' requires a matching \
+                     `[memory_enrichment.lucid.<alias>]` entry"
+                    ),
+                }
+            }
+            _ => anyhow::bail!("unknown memory enricher '{enricher_ref}'; expected lucid or none"),
+        };
+    }
+
+    if !matches!(active_enricher, ActiveMemoryEnricher::None) {
+        anyhow::bail!(
+            "memory connector config '{}' was supplied without a matching memory.enricher reference",
+            active_enricher.kind()
+        );
     }
 
     create_memory_with_builders(
@@ -807,7 +876,7 @@ pub fn create_memory_for_migration(
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
+            "memory backend 'none' disables persistence; choose sqlite or markdown before migration"
         );
     }
 
@@ -963,10 +1032,16 @@ pub async fn create_memory_for_agent(
         )?));
     }
 
+    let backend_ref = config.memory_backend_ref_for_agent(agent_alias)?;
+    let enricher_ref = config.memory_enricher_ref_for_agent(agent_alias)?;
+    let mut memory_config = config.memory.clone();
+    memory_config.backend.clone_from(&backend_ref);
+    memory_config.enricher.clone_from(&enricher_ref);
     let inner = create_memory_with_storage_and_routes(
-        &config.memory,
+        &memory_config,
         &config.embedding_routes,
-        config.resolve_active_storage(),
+        config.resolve_storage_ref(&backend_ref),
+        config.resolve_enricher_for_agent(agent_alias)?,
         &config.data_dir,
         api_key,
         Some(&config.providers.models),
@@ -1024,6 +1099,57 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+    #[cfg(unix)]
+    use zeroclaw_config::schema::{Config, LucidEnrichmentConfig};
+
+    #[cfg(unix)]
+    fn write_timed_lucid_script(
+        directory: &Path,
+        invocations: &Path,
+        completions: &Path,
+        context_pid: &Path,
+    ) -> String {
+        let context_fifo = directory.join("timed-lucid-context.fifo");
+        test_support::write_lucid_script(
+            directory,
+            "timed-lucid.sh",
+            &format!(
+                r#"printf '%s\n' "${{1:-}}" >> "{invocations}""#,
+                invocations = invocations.display()
+            ),
+            &format!(
+                r#"  printf 'store\n' >> "{completions}"
+  echo '{{"success":true,"id":"configured_store"}}'
+  exit 0"#,
+                completions = completions.display()
+            ),
+            // Block on a fifo until killed, so the recall deadline fires.
+            &format!(
+                r#"  rm -f "{fifo}"
+  mkfifo "{fifo}"
+  printf '%s\n' "$$" > "{pid}"
+  read -r _value < "{fifo}""#,
+                fifo = context_fifo.display(),
+                pid = context_pid.display()
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_recording_lucid_script(directory: &Path, invocations: &Path) -> String {
+        test_support::write_lucid_script(
+            directory,
+            "recording-lucid.sh",
+            &format!(
+                r#"printf '%s\n' "${{1:-}}" >> "{invocations}""#,
+                invocations = invocations.display()
+            ),
+            r#"  echo '{"success":true,"id":"configured_store"}'
+  exit 0"#,
+            r#"  echo '<lucid-context></lucid-context>'
+  exit 0"#,
+        )
+    }
 
     #[test]
     fn factory_sqlite() {
@@ -1056,11 +1182,13 @@ mod tests {
             .push(AgentAlias::new("beta"));
         alpha.memory = AgentMemoryConfig {
             backend: MemoryBackendKind::Markdown,
+            enricher: None,
         };
         let mut beta = AliasedAgentConfig::default();
         beta.workspace.path = Some(beta_dir.clone());
         beta.memory = AgentMemoryConfig {
             backend: MemoryBackendKind::Markdown,
+            enricher: None,
         };
         config.agents.insert("alpha".into(), alpha);
         config.agents.insert("beta".into(), beta);
@@ -1417,6 +1545,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1480,6 +1609,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1517,6 +1647,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::None,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1564,6 +1695,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1598,6 +1730,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Sqlite,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1657,15 +1790,154 @@ mod tests {
         assert_eq!(mem.name(), "markdown");
     }
 
-    #[test]
-    fn factory_lucid() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn factory_lucid_applies_configured_binary_and_command_deadlines() {
         let tmp = TempDir::new().unwrap();
+        let invocations = tmp.path().join("invocations.log");
+        let completions = tmp.path().join("completions.log");
+        let context_pid = tmp.path().join("context.pid");
+        let storage = LucidEnrichmentConfig {
+            binary_path: Some(write_timed_lucid_script(
+                tmp.path(),
+                &invocations,
+                &completions,
+                &context_pid,
+            )),
+            recall_timeout_ms: Some(5_000),
+            store_timeout_ms: Some(5_000),
+        };
         let cfg = MemoryConfig {
-            backend: "lucid".into(),
+            backend: "sqlite".to_string(),
+            enricher: Some("lucid.pi".to_string()),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "lucid");
+        let memory = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::None,
+            ActiveMemoryEnricher::Lucid(&storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        memory
+            .store(
+                "local_probe",
+                "authoritative local row",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(memory.get("local_probe").await.unwrap().is_some());
+
+        let recall_started = std::time::Instant::now();
+        let recalled = memory
+            .recall("remoteprobe", 5, None, None, None)
+            .await
+            .unwrap();
+        let recall_elapsed = recall_started.elapsed();
+        assert!(
+            recall_elapsed >= std::time::Duration::from_secs(4),
+            "typed recall deadline was not applied: {recall_elapsed:?}"
+        );
+        assert!(
+            recalled
+                .iter()
+                .all(|entry| !entry.content.contains("remoteprobe")),
+            "configured recall deadline must preserve local fallback"
+        );
+
+        let invoked = tokio::fs::read_to_string(&invocations)
+            .await
+            .unwrap_or_default();
+        assert_eq!(invoked.lines().collect::<Vec<_>>(), ["store", "context"]);
+        assert_eq!(
+            tokio::fs::read_to_string(&completions).await.unwrap(),
+            "store\n"
+        );
+
+        let pid = tokio::fs::read_to_string(&context_pid)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut process_still_exists = true;
+        for _ in 0..100 {
+            process_still_exists = std::process::Command::new("/bin/kill")
+                .args(["-0", pid.as_str()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !process_still_exists {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_still_exists,
+            "timed-out Lucid process {pid} survived"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_lucid_enricher_keeps_sqlite_authoritative() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let invocations = tmp.path().join("agent-invocations.log");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            memory: MemoryConfig {
+                backend: "sqlite.default".to_string(),
+                ..MemoryConfig::default()
+            },
+            ..Config::default()
+        };
+        config.memory_enrichment.lucid.insert(
+            "pi".to_string(),
+            LucidEnrichmentConfig {
+                binary_path: Some(write_recording_lucid_script(tmp.path(), &invocations)),
+                recall_timeout_ms: Some(5_000),
+                store_timeout_ms: Some(5_000),
+            },
+        );
+        config.agents.insert(
+            "pi400".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Sqlite,
+                    enricher: Some("lucid.pi".to_string()),
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let memory = create_memory_for_agent(&config, "pi400", None)
+            .await
+            .unwrap();
+        assert_eq!(memory.name(), "lucid");
+        memory
+            .store(
+                "agent_probe",
+                "SQLite stays authoritative",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let invoked = tokio::fs::read_to_string(&invocations).await.unwrap();
+        assert_eq!(invoked.lines().collect::<Vec<_>>(), ["store"]);
+        let local = memory.get("agent_probe").await.unwrap().unwrap();
+        assert_eq!(local.content, "SQLite stays authoritative");
+        assert!(local.agent_id.is_some());
     }
 
     #[test]
@@ -1696,6 +1968,7 @@ mod tests {
             &cfg,
             &[],
             ActiveStorage::Postgres(&storage),
+            ActiveMemoryEnricher::None,
             tmp.path(),
             None,
             None,
@@ -1757,13 +2030,6 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "markdown");
-    }
-
-    #[test]
-    fn migration_factory_lucid() {
-        let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
-        assert_eq!(mem.name(), "lucid");
     }
 
     #[test]
