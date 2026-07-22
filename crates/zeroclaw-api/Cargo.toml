@@ -12,6 +12,7 @@ async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std", "rc"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+schemars = { version = "1.2", optional = true }
 strum = "0.28"
 strum_macros = "0.28"
 thiserror = "2.0"
@@ -22,3 +23,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 [dev-dependencies]
 parking_lot = "0.12"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = ["schema-export"]
+schema-export = ["dep:schemars"]
