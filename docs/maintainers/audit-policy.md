@@ -83,9 +83,10 @@ Live, deny+audit (both files):
 
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
-lockfile — remove from `audit.toml` only once the crate is dropped
-from `Cargo.lock` entirely, e.g. via `cargo update` or a dependency
-bump):
+lockfile — remove from `audit.toml` only once the crate is either
+dropped from `Cargo.lock` entirely, e.g. via `cargo update` or a
+dependency bump, or every locked version of it is patched/unaffected
+per the advisory):
 
 - **`rustls-webpki` (4 entries, `RUSTSEC-2026-0049`, `-0098`, `-0099`,
   `-0104`)**: 0.102.x copy is in `Cargo.lock` but not in the resolved
@@ -186,6 +187,13 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-07-22: Tightened the "Live, audit-only" intro to state the
+  complete removal criterion (crate absent from `Cargo.lock`, *or*
+  every locked version patched/unaffected) instead of only the
+  crate-absent half. Removed an inaccurate `.cargo/audit.toml` header
+  claim that the 20 lockfile-stale entries each have a replacement
+  "already landed or in flight" — they are simply audit-only and
+  tracked in #8519.
 - 2026-07-21: Corrected the `rand` rationale: `Cargo.lock` still
   resolves `rand` 0.8.6, 0.9.4, and 0.10.1, so the crate was never
   absent from the lockfile. The ignore is removed from both files

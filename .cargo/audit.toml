@@ -18,8 +18,8 @@ ignore = [
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic; same as above
 
     # ── Still present in Cargo.lock though no longer in cargo-deny's resolved
-    # graph (removed from deny.toml in this same PR); each entry has a
-    # replacement path already landed or in flight, tracking #8519. ──
+    # graph (removed from deny.toml in this same PR); audit-only, tracked in
+    # #8519. ──
     "RUSTSEC-2024-0429",  # glib VariantStrIter unsoundness; GTK3 stack in Cargo.lock but not resolved graph
     "RUSTSEC-2024-0411",  # gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
     "RUSTSEC-2024-0412",  # gdk unmaintained gtk-rs GTK3 bindings; tracking #8519
