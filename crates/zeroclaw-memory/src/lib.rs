@@ -1182,11 +1182,13 @@ mod tests {
             .push(AgentAlias::new("beta"));
         alpha.memory = AgentMemoryConfig {
             backend: MemoryBackendKind::Markdown,
+            enricher: None,
         };
         let mut beta = AliasedAgentConfig::default();
         beta.workspace.path = Some(beta_dir.clone());
         beta.memory = AgentMemoryConfig {
             backend: MemoryBackendKind::Markdown,
+            enricher: None,
         };
         config.agents.insert("alpha".into(), alpha);
         config.agents.insert("beta".into(), beta);
@@ -1543,6 +1545,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1606,6 +1609,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1643,6 +1647,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::None,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1690,6 +1695,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Markdown,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },
@@ -1724,6 +1730,7 @@ mod tests {
             AliasedAgentConfig {
                 memory: AgentMemoryConfig {
                     backend: ConfigBackend::Sqlite,
+                    enricher: None,
                 },
                 ..AliasedAgentConfig::default()
             },

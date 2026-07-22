@@ -135,6 +135,7 @@ fn reindex_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
         &config.memory,
         &config.embedding_routes,
         config.resolve_active_storage(),
+        config.resolve_active_enricher(),
         &config.data_dir,
         None,
         Some(&config.providers.models),
