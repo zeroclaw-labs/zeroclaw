@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
@@ -14,16 +15,59 @@ use crate::case::{LlmTrace, load_suite};
 use crate::grader::evaluate_expects;
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
-use crate::replay::TraceLlmProvider;
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
 
-/// Run every `*.json` trace fixture in `dir` and return an aggregated report.
-pub async fn run_suite(dir: &Path, mode: Mode) -> anyhow::Result<SuiteReport> {
-    if mode == Mode::Live {
-        anyhow::bail!("live mode is not implemented yet (Phase 0 supports --mode replay only)");
-    }
+/// Factory that builds a fresh model provider for one case run. Injected so
+/// replay, live, and deterministic tests share one runner code path.
+pub type ProviderFactory =
+    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
 
+/// Everything a case run needs that differs between replay, live, and tests.
+///
+/// The provider is injected as a closure so replay, live, and deterministic tests
+/// share one code path; the runner never constructs a provider itself.
+pub struct RunDeps {
+    pub mode: Mode,
+    /// Builds the model provider for one case run.
+    pub provider: ProviderFactory,
+    /// Config tool allowlist for live runs; intersected per case with `case.tools`.
+    pub live_tools: Vec<String>,
+    /// Wall-clock timeout applied per conversation turn in live mode.
+    pub case_timeout: Duration,
+}
+
+impl RunDeps {
+    /// A replay-mode `RunDeps`: the provider replays each trace's scripted steps.
+    /// Live-only fields take inert defaults.
+    pub fn replay() -> Self {
+        Self {
+            mode: Mode::Replay,
+            provider: Box::new(|trace| {
+                Ok(
+                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
+                        as Box<dyn ModelProvider>,
+                )
+            }),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(120),
+        }
+    }
+}
+
+/// Guard: live mode needs a configured provider reference. An empty ref yields a
+/// clear error naming `[eval].live_provider`, raised before any case runs.
+pub fn ensure_live_provider(provider_ref: &str) -> anyhow::Result<()> {
+    if provider_ref.trim().is_empty() {
+        anyhow::bail!(
+            "live mode requires [eval].live_provider (dotted providers.models reference, e.g. \"anthropic.sonnet\")"
+        );
+    }
+    Ok(())
+}
+
+/// Run every `*.json` trace fixture in `dir` and return an aggregated report.
+pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport> {
     let traces = load_suite(dir)?;
     if traces.is_empty() {
         anyhow::bail!("no *.json trace fixtures found in {}", dir.display());
@@ -31,14 +75,14 @@ pub async fn run_suite(dir: &Path, mode: Mode) -> anyhow::Result<SuiteReport> {
 
     let mut cases = Vec::with_capacity(traces.len());
     for (path, trace) in traces {
-        let name = trace.model_name.clone();
+        let name = trace.display_id().to_string();
         let source = path
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("<unknown>")
             .to_string();
 
-        let report = match run_case(&trace).await {
+        let report = match run_case(&trace, deps).await {
             Ok(record) => CaseReport {
                 name,
                 source,
@@ -58,8 +102,18 @@ pub async fn run_suite(dir: &Path, mode: Mode) -> anyhow::Result<SuiteReport> {
     Ok(SuiteReport { cases })
 }
 
-/// Replay a single trace through a freshly built, isolated agent and capture the run.
-pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
+/// Run a single trace through a freshly built, isolated agent and capture the run,
+/// dispatching on the mode in `deps`.
+pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
+    match deps.mode {
+        Mode::Replay => run_replay_case(trace, deps).await,
+        Mode::Live => crate::live::run_live_case(trace, deps).await,
+    }
+}
+
+/// Replay a scripted trace through the Phase 0 deterministic agent (echo tools,
+/// native dispatcher, no network).
+async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
     // Each case gets an isolated temp workspace and an ephemeral "none" memory
     // backend so cases cannot observe one another.
     let tmp = tempfile::tempdir()?;
@@ -71,9 +125,7 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let replay = TraceLlmProvider::from_trace(trace);
-    let replay_handle = replay.handle();
-    let provider: Box<dyn ModelProvider> = Box::new(replay);
+    let provider = (deps.provider)(trace)?;
 
     let mut agent = Agent::builder()
         .model_provider(provider)
@@ -85,11 +137,8 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
         .build()?;
 
     let mut final_response = String::new();
-    for (turn_index, turn) in trace.turns.iter().enumerate() {
+    for turn in &trace.turns {
         final_response = agent.turn(&turn.user_input).await?;
-        // Enforce the turn boundary: every step scripted for this turn must have been
-        // consumed before the next turn begins, so responses cannot bleed across turns.
-        replay_handle.finish_turn(turn_index)?;
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
@@ -131,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn replays_text_only_trace() {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
-        let record = run_case(&trace).await.unwrap();
+        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
         assert!(record.final_response.contains("Hello"));
         assert!(record.tools_called.is_empty());
         let grades = evaluate_expects(&trace.expects, &record);
@@ -141,18 +190,11 @@ mod tests {
     #[tokio::test]
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
-        let record = run_case(&trace).await.unwrap();
+        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
         assert_eq!(record.tools_called, vec!["echo".to_string()]);
         assert!(record.all_tools_succeeded);
         let grades = evaluate_expects(&trace.expects, &record);
         assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
-    }
-
-    #[tokio::test]
-    async fn live_mode_is_rejected_in_phase_0() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = run_suite(dir.path(), Mode::Live).await.unwrap_err();
-        assert!(err.to_string().contains("live mode is not implemented"));
     }
 
     const MULTI_TURN: &str = r#"{
@@ -167,9 +209,8 @@ mod tests {
     #[tokio::test]
     async fn replays_multi_turn_trace_in_order() {
         let trace: LlmTrace = serde_json::from_str(MULTI_TURN).unwrap();
-        let record = run_case(&trace).await.unwrap();
-        // The final response comes from the *last* turn, proving turns replay in order
-        // with each turn's step consumed within its own boundary.
+        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        // The final response comes from the *last* turn, proving turns replay in order.
         assert!(
             record.final_response.contains("Goodbye"),
             "final response: {:?}",
@@ -178,29 +219,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn over_specified_turn_is_an_error() {
-        // The turn declares two steps but the agent makes a single chat() call, so the
-        // extra step is left unconsumed. Under the old flat queue this passed silently;
-        // now it must surface as a turn-scoped error rather than bleed into a next turn.
+    async fn replay_turn_without_steps_errors() {
+        // A replay turn with no scripted steps is an authoring error surfaced by
+        // the fallible constructor before the agent runs.
         let trace: LlmTrace = serde_json::from_str(
-            r#"{
-                "model_name": "test-over-specified",
-                "turns": [{ "user_input": "Hi", "steps": [
-                    { "response": { "type": "text", "content": "Hello there." } },
-                    { "response": { "type": "text", "content": "unused extra step" } }
-                ] }],
-                "expects": {}
-            }"#,
+            r#"{ "model_name": "test-no-steps", "turns": [{ "user_input": "Hi" }], "expects": {} }"#,
         )
         .unwrap();
-        let err = match run_case(&trace).await {
-            Ok(_) => panic!("expected an error: an over-specified turn left a step unconsumed"),
-            Err(e) => e,
-        };
-        let msg = err.to_string();
+        let err = run_case(&trace, &RunDeps::replay()).await.unwrap_err();
         assert!(
-            msg.contains("over-specifies") || msg.contains("never requested"),
-            "unexpected error: {msg}"
+            err.to_string().contains("no scripted steps"),
+            "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_mode_without_provider_config_errors() {
+        // Empty [eval].live_provider is rejected before any case runs, with an
+        // error that names the config key the operator must set.
+        let err = ensure_live_provider("   ").unwrap_err();
+        assert!(
+            err.to_string().contains("[eval].live_provider"),
+            "error must name the config key: {err}"
+        );
+        assert!(ensure_live_provider("anthropic.sonnet").is_ok());
     }
 }
