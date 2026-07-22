@@ -59,17 +59,23 @@ such as cloud CLI credentials. Values are read from the ZeroClaw process
 environment at spawn time and are not stored in provider config. The default
 list is empty. Keep it narrow because every listed secret is exposed to Grok
 and any tools enabled for that alias. Provider-owned `XAI_*` and `GROK_*` names
-are rejected; use `grok login` for authentication and `extra_args` for policy.
+are rejected; use `grok login` for authentication. Grok's discovered user and
+project configuration, together with alias `extra_args`, owns Grok tool policy.
 
 The default argv adds `--no-auto-update`, `--sandbox strict`,
-`--permission-mode dontAsk`, and `--tools ""`. The ACP client also cancels
-every permission request. To grant Grok tools or relax sandbox/permission
-policy, set the corresponding flag in `extra_args`; doing so is an explicit
-per-alias operator opt-in. Transport, prompt, model, session, cwd, and update
-flags remain provider-owned and are rejected in `extra_args`. Positional and
-short arguments are also rejected. Known value-taking options accept either
-`["--flag", "value"]` or `--flag=value`; unknown option shapes require the
-inline form so they cannot consume the trailing ACP command.
+`--permission-mode dontAsk`, and `--tools ""`. The ACP client also cancels every
+permission request. Grok evaluates permission rules discovered from its user
+and project configuration before asking the ACP client. Those files are
+therefore trusted operator policy: an `allow` rule may pre-authorize a tool,
+and project MCP servers, plugins, or hooks may add capabilities. Use a
+dedicated, reviewed `working_directory` for channel agents. Operators can also
+grant tools or relax sandbox/permission policy with alias `extra_args`; both
+surfaces are explicit opt-ins to a wider subprocess boundary. Transport,
+prompt, model, session, cwd, and update flags remain provider-owned and are
+rejected in `extra_args`. Positional and short arguments are also rejected.
+Known value-taking options accept either `["--flag", "value"]` or
+`--flag=value`; unknown option shapes require the inline form so they cannot
+consume the trailing ACP command.
 
 ACP stdout frames, aggregate stdout, assistant text, and stderr processing are
 bounded while the child is running. Stderr is drained but its content is never
@@ -79,8 +85,11 @@ one-shot request, including success, timeout, cancellation, and protocol error.
 #### Recommended pattern: default channel chatbot
 
 Use a **dedicated provider alias** for the messaging agent (for example
-`agents.default`). The default alias has no Grok built-in tools. Use a separate
-alias with explicit `extra_args` for an operator-approved coding/ops agent.
+`agents.default`). The default alias grants no Grok built-in tools. Grok still
+loads its normal user and project configuration, so use a dedicated workspace
+whose permission rules, MCP servers, plugins, and hooks have been reviewed for
+the channel trust boundary. Use a separate alias and workspace for an
+operator-approved coding/ops agent.
 
 **Reply-intent precheck (classifier):** ZeroClaw runs a short REPLY /
 `NO_REPLY[*]` classification before the full agent loop. Prefer a **stable
@@ -93,7 +102,7 @@ channel message (“staying silent” / “no Slack reply”). Empty
 CLI channel bots. ACP channels skip the classifier entirely.
 
 ```toml
-# Full answers: ACP, strict sandbox, dontAsk, and no built-in tools
+# Full answers: ACP, strict sandbox, no built-in tools, reviewed Grok config
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 binary_path = "/home/you/.grok/bin/grok"
@@ -127,13 +136,14 @@ model_provider = "grok_cli.ops"
 | Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
 | Full answer | `model_provider` → `grok_cli.default` | Grok Build ACP; prompt only on stdin |
 | OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
-| App permissions | Default `dontAsk` + empty tool set | Deny unapproved actions before execution |
+| App permissions | Empty built-in tool set + ACP permission rejection | Discovered Grok permission rules remain operator-owned and may pre-authorize configured tools |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 | Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |
 
-Keep channel-facing aliases at the defaults. Permission/sandbox/tool flags in
-`extra_args` are intended only for aliases where an operator has explicitly
-accepted the wider trust boundary.
+Keep channel-facing aliases at the defaults and give them dedicated, reviewed
+workspaces. Permission rules, MCP servers, plugins, and hooks discovered by
+Grok, along with permission/sandbox/tool flags in `extra_args`, are trusted
+operator policy and can widen the subprocess boundary.
 
 #### Grok CLI OS sandbox (how to use it from ZeroClaw)
 
@@ -149,11 +159,12 @@ Set `--sandbox=<profile>` in that provider alias's `extra_args` to choose a
 different profile; ambient Grok config or `GROK_SANDBOX` cannot silently relax
 the provider-owned default.
 
-Project `.grok/config.toml` can hold MCP / plugins / **`[permission]`**, but it
-does **not** select the active sandbox profile by itself. Profile **names** and
-custom profile **bodies** can live in project
-`<workspace>/.grok/sandbox.toml`; pass `--sandbox=<name>` through `extra_args`
-to turn that profile on.
+Project `.grok/config.toml` can hold MCP / plugins / **`[permission]`**. Grok
+loads that file as trusted operator policy; matching allow rules may authorize
+tools without an ACP permission request. It does **not** select the active
+sandbox profile by itself. Profile **names** and custom profile **bodies** can
+live in project `<workspace>/.grok/sandbox.toml`; pass
+`--sandbox=<name>` through `extra_args` to turn that profile on.
 
 **Built-in profiles** (from Grok’s sandbox docs):
 
@@ -189,8 +200,10 @@ extra_args = ["--sandbox=channel-bot"]
 ```
 
 **Per-agent sandbox:** use **separate provider aliases** with different,
-explicit `extra_args`. Keep channel aliases on the strict/no-tools default and
-point each agent at the matching `model_provider` alias.
+explicit `extra_args` and dedicated working directories. Keep channel aliases
+on the strict/no-built-in-tools default, review the Grok configuration
+discovered for each workspace, and point each agent at the matching
+`model_provider` alias.
 
 ### Azure OpenAI: slot `azure`
 
