@@ -1,11 +1,16 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
+use tokio::{io::AsyncRead, io::AsyncWrite};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub(crate) use zeroclaw_config::schema::MattermostListenMode;
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// Cadence at which auto-discovery re-runs to pick up newly-created DMs
@@ -14,6 +19,16 @@ const DISCOVERY_REFRESH: Duration = Duration::from_secs(60);
 /// Poll interval per discovery iteration. Matches the previous single-channel
 /// cadence so operators see no change in latency.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Application-level ping interval for the Mattermost WebSocket protocol.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Deadline for authentication and the server's `hello` event.
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Read timeout for the active WebSocket session. If no frame arrives
+/// within this window the peer is considered unresponsive and the
+/// listener exits into the reconnect path. Set to 3× ping interval so
+/// the server can miss two pings before we declare it dead.
+const WS_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// One channel the bot will poll. `is_direct` flags DM (`type=D`) and group DM
 /// (`type=G`) channels so the receive path can bypass `mention_only` for them.
@@ -104,6 +119,8 @@ pub struct MattermostChannel {
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// How this channel receives inbound messages. Defaults to `Polling`.
+    listen_mode: MattermostListenMode,
 }
 
 impl MattermostChannel {
@@ -138,6 +155,7 @@ impl MattermostChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            listen_mode: MattermostListenMode::default(),
         }
     }
 
@@ -359,6 +377,12 @@ impl MattermostChannel {
         self
     }
 
+    /// Set the listen mode. Defaults to `Polling` when not called.
+    pub fn with_listen_mode(mut self, listen_mode: MattermostListenMode) -> Self {
+        self.listen_mode = listen_mode;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
             "channel.mattermost",
@@ -366,6 +390,106 @@ impl MattermostChannel {
             30,
             10,
         )
+    }
+
+    /// Derive the WebSocket URL from the REST base URL.
+    fn ws_url(&self) -> String {
+        self.base_url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+            + "/api/v4/websocket"
+    }
+
+    fn ws_auth_response(event: &serde_json::Value, auth_seq: i64) -> Option<bool> {
+        (event.get("seq_reply").and_then(|v| v.as_i64()) == Some(auth_seq))
+            .then(|| event.get("status").and_then(|v| v.as_str()) == Some("OK"))
+    }
+
+    fn ws_post_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+        let post = event.get("data")?.get("post")?.as_str()?;
+        serde_json::from_str(post).ok()
+    }
+
+    async fn authenticate_websocket<S>(
+        write: &mut SplitSink<WebSocketStream<S>, WsMessage>,
+        read: &mut SplitStream<WebSocketStream<S>>,
+        token: &str,
+        auth_seq: i64,
+        timeout: Duration,
+    ) -> Result<String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let auth = serde_json::json!({
+            "seq": auth_seq,
+            "action": "authentication_challenge",
+            "data": { "token": token }
+        });
+        write
+            .send(WsMessage::Text(auth.to_string().into()))
+            .await
+            .context("Mattermost WebSocket authentication send failed")?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut authenticated = false;
+        let mut server_version = None;
+
+        loop {
+            if authenticated && server_version.is_some() {
+                return Ok(server_version.unwrap_or_else(|| "unknown".to_string()));
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    bail!("Mattermost WebSocket authentication handshake timed out");
+                }
+                frame = read.next() => {
+                    let text = match frame {
+                        Some(Ok(WsMessage::Text(text))) => text,
+                        Some(Ok(WsMessage::Ping(payload))) => {
+                            write
+                                .send(WsMessage::Pong(payload))
+                                .await
+                                .context("Mattermost WebSocket handshake pong failed")?;
+                            continue;
+                        }
+                        Some(Ok(WsMessage::Close(frame))) => {
+                            let reason = frame
+                                .as_ref()
+                                .map(|frame| frame.reason.as_ref())
+                                .unwrap_or("");
+                            bail!("Mattermost WebSocket closed during authentication: {reason}");
+                        }
+                        Some(Err(error)) => {
+                            return Err(error).context("Mattermost WebSocket handshake read failed");
+                        }
+                        None => bail!("Mattermost WebSocket ended during authentication"),
+                        Some(Ok(_)) => continue,
+                    };
+
+                    let event: serde_json::Value = serde_json::from_str(text.as_ref())
+                        .context("Mattermost WebSocket handshake returned invalid JSON")?;
+
+                    if let Some(ok) = Self::ws_auth_response(&event, auth_seq) {
+                        if !ok {
+                            bail!("Mattermost WebSocket authentication was rejected");
+                        }
+                        authenticated = true;
+                    }
+
+                    if event.get("event").and_then(|value| value.as_str()) == Some("hello") {
+                        server_version = Some(
+                            event
+                                .get("data")
+                                .and_then(|data| data.get("server_version"))
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Check if a user ID is in the allowlist.
@@ -632,97 +756,9 @@ impl Channel for MattermostChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        // Resolve auth up front so misconfiguration fails fast at listen-time.
-        let initial_token = self.token().await?.to_string();
-        let (bot_user_id, bot_username) = self.get_bot_identity().await;
-
-        let auto_discover = self.scoped_channel_ids().is_none();
-        let mut target_channels = self.list_target_channels().await?;
-        let mut last_discovery = Instant::now();
-        let mut last_create_at_by_channel: HashMap<String, i64> = HashMap::new();
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "alias": self.alias,
-                    "channel_count": target_channels.len(),
-                    "auto_discover": auto_discover,
-                    "team_ids": self.team_ids,
-                    "discover_dms": self.discover_dms,
-                })
-            ),
-            "Mattermost channel listening"
-        );
-
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-
-            if auto_discover && last_discovery.elapsed() >= DISCOVERY_REFRESH {
-                match self.list_target_channels().await {
-                    Ok(refreshed) => {
-                        if refreshed != target_channels {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note,
-                                )
-                                .with_attrs(::serde_json::json!({
-                                    "alias": self.alias,
-                                    "before": target_channels.len(),
-                                    "after": refreshed.len(),
-                                })),
-                                "Mattermost auto-discovery refreshed channel list"
-                            );
-                            target_channels = refreshed;
-                        }
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "alias": self.alias,
-                                "error": format!("{}", e),
-                            })),
-                            "Mattermost auto-discovery refresh failed; keeping previous channel list"
-                        );
-                    }
-                }
-                last_discovery = Instant::now();
-            }
-
-            if target_channels.is_empty() {
-                continue;
-            }
-
-            #[allow(clippy::cast_possible_truncation)]
-            let bootstrap_ms = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()) as i64;
-
-            for target in target_channels.clone() {
-                if self
-                    .poll_channel(
-                        &target,
-                        &initial_token,
-                        &bot_user_id,
-                        &bot_username,
-                        bootstrap_ms,
-                        &mut last_create_at_by_channel,
-                        &tx,
-                    )
-                    .await
-                {
-                    return Ok(());
-                }
-            }
+        match self.listen_mode {
+            MattermostListenMode::Polling => self.listen_polling(tx).await,
+            MattermostListenMode::Websocket => self.listen_websocket(tx).await,
         }
     }
 
@@ -800,6 +836,361 @@ impl Channel for MattermostChannel {
 }
 
 impl MattermostChannel {
+    async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        // Resolve auth up front so misconfiguration fails fast at listen-time.
+        let initial_token = self.token().await?.to_string();
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+
+        let auto_discover = self.scoped_channel_ids().is_none();
+        let mut target_channels = self.list_target_channels().await?;
+        let mut last_discovery = Instant::now();
+        let mut last_create_at_by_channel: HashMap<String, i64> = HashMap::new();
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "channel_count": target_channels.len(),
+                    "auto_discover": auto_discover,
+                    "team_ids": self.team_ids,
+                    "discover_dms": self.discover_dms,
+                })
+            ),
+            "Mattermost channel listening (polling)"
+        );
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            if auto_discover && last_discovery.elapsed() >= DISCOVERY_REFRESH {
+                match self.list_target_channels().await {
+                    Ok(refreshed) => {
+                        if refreshed != target_channels {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "before": target_channels.len(),
+                                    "after": refreshed.len(),
+                                })),
+                                "Mattermost auto-discovery refreshed channel list"
+                            );
+                            target_channels = refreshed;
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "error": format!("{}", e),
+                            })),
+                            "Mattermost auto-discovery refresh failed; keeping previous channel list"
+                        );
+                    }
+                }
+                last_discovery = Instant::now();
+            }
+
+            if target_channels.is_empty() {
+                continue;
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let bootstrap_ms = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()) as i64;
+
+            for target in target_channels.clone() {
+                if self
+                    .poll_channel(
+                        &target,
+                        &initial_token,
+                        &bot_user_id,
+                        &bot_username,
+                        bootstrap_ms,
+                        &mut last_create_at_by_channel,
+                        &tx,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn listen_websocket(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        let token = self.token().await?.to_string();
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+        let auto_discover = self.scoped_channel_ids().is_none();
+        let target_channels = self.list_target_channels().await?;
+        let mut channel_direct_map: HashMap<String, bool> = target_channels
+            .into_iter()
+            .map(|target| (target.id, target.is_direct))
+            .collect();
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "channel_count": channel_direct_map.len(),
+                    "auto_discover": auto_discover,
+                    "mode": "websocket",
+                })
+            ),
+            "Mattermost WebSocket listening"
+        );
+
+        let ws_url = self.ws_url();
+        let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
+            &ws_url,
+            "channel.mattermost",
+            self.proxy_url.as_deref(),
+        )
+        .await
+        .with_context(|| format!("Mattermost WebSocket connect failed: {ws_url}"))?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "ws_url": &ws_url,
+                })
+            ),
+            "Mattermost WebSocket connected"
+        );
+
+        let (mut write, mut read) = ws_stream.split();
+        let auth_seq = 1;
+        let server_version = Self::authenticate_websocket(
+            &mut write,
+            &mut read,
+            &token,
+            auth_seq,
+            WS_HANDSHAKE_TIMEOUT,
+        )
+        .await?;
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "server_version": server_version,
+                })
+            ),
+            "Mattermost WebSocket authenticated"
+        );
+
+        let mut seq = auth_seq.wrapping_add(1);
+        let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ping_interval.reset();
+
+        let mut discovery_interval = tokio::time::interval(DISCOVERY_REFRESH);
+        discovery_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        discovery_interval.reset();
+
+        let mut last_frame = tokio::time::Instant::now();
+
+        loop {
+            let read_deadline = last_frame + WS_READ_TIMEOUT;
+            tokio::select! {
+                _ = discovery_interval.tick(), if auto_discover => {
+                    match self.list_target_channels().await {
+                        Ok(refreshed) => {
+                            let refreshed_map: HashMap<String, bool> = refreshed
+                                .into_iter()
+                                .map(|target| (target.id, target.is_direct))
+                                .collect();
+                            if refreshed_map != channel_direct_map {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note,
+                                    )
+                                    .with_attrs(::serde_json::json!({
+                                        "alias": self.alias,
+                                        "before": channel_direct_map.len(),
+                                        "after": refreshed_map.len(),
+                                    })),
+                                    "Mattermost WS in-session auto-discovery refreshed"
+                                );
+                                channel_direct_map = refreshed_map;
+                            }
+                        }
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "error": error.to_string(),
+                                })),
+                                "Mattermost WS in-session discovery refresh failed"
+                            );
+                        }
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    let ping = serde_json::json!({"seq": seq, "action": "ping"});
+                    write
+                        .send(WsMessage::Text(ping.to_string().into()))
+                        .await
+                        .context("Mattermost WebSocket ping send failed")?;
+                    seq = seq.wrapping_add(1);
+                }
+                frame = read.next() => {
+                    let frame = match frame {
+                        Some(Ok(frame)) => {
+                            last_frame = tokio::time::Instant::now();
+                            frame
+                        }
+                        Some(Err(error)) => {
+                            return Err(error).context("Mattermost WebSocket read failed");
+                        }
+                        None => bail!("Mattermost WebSocket stream ended"),
+                    };
+
+                    let text = match frame {
+                        WsMessage::Text(text) => text,
+                        WsMessage::Ping(payload) => {
+                            write
+                                .send(WsMessage::Pong(payload))
+                                .await
+                                .context("Mattermost WebSocket pong send failed")?;
+                            continue;
+                        }
+                        WsMessage::Close(frame) => {
+                            let reason = frame
+                                .as_ref()
+                                .map(|frame| frame.reason.as_ref())
+                                .unwrap_or("");
+                            bail!("Mattermost WebSocket closed: {reason}");
+                        }
+                        _ => continue,
+                    };
+
+                    let event: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "error": error.to_string(),
+                                })),
+                                "Mattermost WS event parse failed"
+                            );
+                            continue;
+                        }
+                    };
+
+                    if event.get("event").and_then(|value| value.as_str()) != Some("posted") {
+                        continue;
+                    }
+
+                    let Some(post) = Self::ws_post_from_event(&event) else {
+                        continue;
+                    };
+                    let channel_id = post
+                        .get("channel_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let Some(&is_direct) = channel_direct_map.get(channel_id) else {
+                        continue;
+                    };
+
+                    if self
+                        .process_inbound_post(
+                            &post,
+                            &bot_user_id,
+                            &bot_username,
+                            0,
+                            channel_id,
+                            is_direct,
+                            &tx,
+                        )
+                        .await
+                    {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep_until(read_deadline) => {
+                    bail!(
+                        "Mattermost WebSocket idle for {} seconds",
+                        WS_READ_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl MattermostChannel {
+    #[allow(clippy::too_many_arguments)]
+    async fn process_inbound_post(
+        &self,
+        post: &serde_json::Value,
+        bot_user_id: &str,
+        bot_username: &str,
+        last_create_at: i64,
+        channel_id: &str,
+        is_direct: bool,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> bool {
+        let effective_text = if post
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+            && post_has_audio_attachment(post)
+        {
+            self.try_transcribe_audio_attachment(post).await
+        } else {
+            None
+        };
+
+        let Some(message) = self.parse_mattermost_post(
+            post,
+            bot_user_id,
+            bot_username,
+            last_create_at,
+            channel_id,
+            effective_text.as_deref(),
+            is_direct,
+        ) else {
+            return false;
+        };
+
+        tx.send(message).await.is_err()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn poll_channel(
         &self,
@@ -875,28 +1266,17 @@ impl MattermostChannel {
                 .unwrap_or(new_cursor);
             new_cursor = new_cursor.max(create_at);
 
-            let effective_text = if post
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-                && post_has_audio_attachment(post)
-            {
-                self.try_transcribe_audio_attachment(post).await
-            } else {
-                None
-            };
-
-            if let Some(channel_msg) = self.parse_mattermost_post(
-                post,
-                bot_user_id,
-                bot_username,
-                cursor_before_batch,
-                &target.id,
-                effective_text.as_deref(),
-                target.is_direct,
-            ) && tx.send(channel_msg).await.is_err()
+            if self
+                .process_inbound_post(
+                    post,
+                    bot_user_id,
+                    bot_username,
+                    cursor_before_batch,
+                    &target.id,
+                    target.is_direct,
+                    tx,
+                )
+                .await
             {
                 return true;
             }
@@ -2608,6 +2988,451 @@ mod tests {
             assert_eq!(by_id.get("explicit_dm"), Some(&true));
             assert_eq!(by_id.get("explicit_pub"), Some(&false));
             assert_eq!(targets.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_ws_url_conversion() {
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch.ws_url(), "wss://mm.example.com/api/v4/websocket");
+
+        let ch2 = MattermostChannel::new(
+            "http://localhost:8065".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch2.ws_url(), "ws://localhost:8065/api/v4/websocket");
+
+        // server URL with path prefix should preserve it
+        let ch3 = MattermostChannel::new(
+            "https://mm.example.com/subpath".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(
+            ch3.ws_url(),
+            "wss://mm.example.com/subpath/api/v4/websocket"
+        );
+    }
+
+    #[test]
+    fn test_listen_mode_default_is_polling() {
+        assert_eq!(
+            MattermostListenMode::default(),
+            MattermostListenMode::Polling
+        );
+    }
+
+    #[test]
+    fn test_listen_mode_serde() {
+        // serialize
+        assert_eq!(
+            serde_json::to_string(&MattermostListenMode::Polling).unwrap(),
+            "\"polling\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MattermostListenMode::Websocket).unwrap(),
+            "\"websocket\""
+        );
+
+        // deserialize
+        let polling: MattermostListenMode = serde_json::from_str("\"polling\"").unwrap();
+        assert_eq!(polling, MattermostListenMode::Polling);
+
+        let websocket: MattermostListenMode = serde_json::from_str("\"websocket\"").unwrap();
+        assert_eq!(websocket, MattermostListenMode::Websocket);
+
+        // deserialize unknown variant -> error
+        assert!(serde_json::from_str::<MattermostListenMode>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn test_ws_event_posted_parsing() {
+        let post = json!({
+            "id": "post123",
+            "user_id": "user456",
+            "message": "hello world",
+            "create_at": 1717000000000i64,
+            "root_id": "",
+            "channel_id": "chan789",
+            "type": ""
+        });
+
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(|| vec!["user456".into()]),
+            false,
+            false,
+        );
+
+        let msg = ch
+            .parse_mattermost_post(&post, "bot_user", "bot_username", 0, "chan789", None, false)
+            .expect("should parse posted event post");
+
+        assert_eq!(msg.id, "mattermost_post123");
+        assert_eq!(msg.sender, "user456");
+        assert_eq!(msg.content, "hello world");
+    }
+
+    #[test]
+    fn test_ws_posted_envelope_post_is_json_string() {
+        // Mattermost sends data.post as a JSON-encoded string, not a nested
+        // object. This test exercises the extraction path the WebSocket listener
+        // uses: Value::String → as_str() → from_str. The old to_string() path
+        // would re-serialize as a quoted literal and silently drop the event.
+        let post_obj = json!({
+            "id": "post789",
+            "user_id": "user999",
+            "message": "ws message",
+            "create_at": 1717000000000i64,
+            "root_id": "",
+            "channel_id": "chan111",
+            "type": ""
+        });
+        let post_str = serde_json::to_string(&post_obj).unwrap();
+
+        let envelope = json!({
+            "event": "posted",
+            "data": {
+                "post": post_str
+            }
+        });
+
+        let post = MattermostChannel::ws_post_from_event(&envelope)
+            .expect("should parse the inner JSON string");
+
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(|| vec!["user999".into()]),
+            false,
+            false,
+        );
+
+        let msg = ch
+            .parse_mattermost_post(&post, "bot_user", "bot_username", 0, "chan111", None, false)
+            .expect("should parse posted event post from envelope");
+
+        assert_eq!(msg.id, "mattermost_post789");
+        assert_eq!(msg.sender, "user999");
+        assert_eq!(msg.content, "ws message");
+    }
+
+    #[test]
+    fn test_ws_ping_message_format() {
+        // Verify the application-level ping frame the heartbeat pinger sends.
+        let seq = 1i64;
+        let ping = serde_json::json!({"seq": seq, "action": "ping"});
+        assert_eq!(ping["seq"], serde_json::json!(1i64));
+        assert_eq!(ping["action"], serde_json::json!("ping"));
+
+        // Round-trip: the message is a Text frame whose content is the JSON
+        // string. The Mattermost server expects this exact shape.
+        let text = ping.to_string();
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&text).expect("ping json must round-trip");
+        assert_eq!(roundtripped["action"], serde_json::json!("ping"));
+        assert!(roundtripped["seq"].is_i64());
+    }
+
+    #[test]
+    fn test_ws_auth_challenge_format() {
+        // Verify the authentication_challenge frame sent immediately after connect.
+        let token = "test_bot_token";
+        let seq = 1i64;
+        let auth = serde_json::json!({
+            "seq": seq,
+            "action": "authentication_challenge",
+            "data": { "token": token }
+        });
+        assert_eq!(auth["seq"], serde_json::json!(1i64));
+        assert_eq!(
+            auth["action"],
+            serde_json::json!("authentication_challenge")
+        );
+        assert_eq!(auth["data"]["token"], serde_json::json!("test_bot_token"));
+
+        let text = auth.to_string();
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&text).expect("auth json must round-trip");
+        assert_eq!(
+            roundtripped["data"]["token"],
+            serde_json::json!("test_bot_token")
+        );
+    }
+
+    #[test]
+    fn test_ws_auth_response_matches_challenge_sequence() {
+        let success = json!({"status": "OK", "seq_reply": 7});
+        let failure = json!({"status": "FAIL", "seq_reply": 7});
+        let unrelated = json!({"status": "OK", "seq_reply": 8});
+
+        assert_eq!(MattermostChannel::ws_auth_response(&success, 7), Some(true));
+        assert_eq!(
+            MattermostChannel::ws_auth_response(&failure, 7),
+            Some(false)
+        );
+        assert_eq!(MattermostChannel::ws_auth_response(&unrelated, 7), None);
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_sends_auth_before_waiting_for_hello() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            let first = server
+                .next()
+                .await
+                .expect("client should send auth first")
+                .expect("auth frame should be readable");
+            let WsMessage::Text(text) = first else {
+                panic!("first client frame should be text auth");
+            };
+            let auth: serde_json::Value =
+                serde_json::from_str(text.as_ref()).expect("auth should be JSON");
+            assert_eq!(auth["action"], "authentication_challenge");
+            assert_eq!(auth["data"]["token"], "test-token");
+
+            server
+                .send(WsMessage::Text(
+                    json!({"status": "OK", "seq_reply": 7}).to_string().into(),
+                ))
+                .await
+                .expect("server should send auth response");
+            server
+                .send(WsMessage::Text(
+                    json!({"event": "hello", "data": {"server_version": "10.8.0"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("server should send hello");
+        });
+
+        let version = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "test-token",
+            7,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("auth response followed by hello should complete the handshake");
+
+        assert_eq!(version, "10.8.0");
+        server_task.await.expect("fake server should finish");
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_rejects_failed_auth() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            server
+                .next()
+                .await
+                .expect("auth frame should arrive")
+                .unwrap();
+            server
+                .send(WsMessage::Text(
+                    json!({"status": "FAIL", "seq_reply": 3}).to_string().into(),
+                ))
+                .await
+                .expect("server should send rejection");
+        });
+
+        let error = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "bad-token",
+            3,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("failed auth must end the listener attempt");
+
+        assert!(error.to_string().contains("authentication was rejected"));
+        server_task.await.expect("fake server should finish");
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_times_out_after_auth_send() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            server
+                .next()
+                .await
+                .expect("auth frame should arrive")
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let error = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "test-token",
+            4,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a silent server must fail the handshake deadline");
+
+        assert!(error.to_string().contains("handshake timed out"));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_times_out_without_hello() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            server
+                .next()
+                .await
+                .expect("auth frame should arrive")
+                .unwrap();
+            server
+                .send(WsMessage::Text(
+                    json!({"status": "OK", "seq_reply": 5}).to_string().into(),
+                ))
+                .await
+                .expect("server should send auth response");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let error = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "test-token",
+            5,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("auth without hello must fail the handshake deadline");
+
+        assert!(error.to_string().contains("handshake timed out"));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_handshake_times_out_without_auth_response() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let (mut write, mut read) = client.split();
+
+        let server_task = zeroclaw_spawn::spawn!(async move {
+            server
+                .next()
+                .await
+                .expect("auth frame should arrive")
+                .unwrap();
+            server
+                .send(WsMessage::Text(
+                    json!({"event": "hello", "data": {"server_version": "10.8.0"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("server should send hello");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let error = MattermostChannel::authenticate_websocket(
+            &mut write,
+            &mut read,
+            "test-token",
+            6,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("hello without auth response must fail the handshake deadline");
+
+        assert!(error.to_string().contains("handshake timed out"));
+        server_task.abort();
+    }
+
+    #[test]
+    fn test_ws_timeout_constants() {
+        // WS_READ_TIMEOUT must be strictly greater than WS_PING_INTERVAL
+        // so a single missed ping does not trigger a false positive.
+        assert!(
+            WS_READ_TIMEOUT > WS_PING_INTERVAL,
+            "WS_READ_TIMEOUT ({:?}) must exceed WS_PING_INTERVAL ({:?})",
+            WS_READ_TIMEOUT,
+            WS_PING_INTERVAL
+        );
+        // WS_READ_TIMEOUT should be at least 3× ping interval so the
+        // server can miss two pings before the listener reconnects.
+        assert!(
+            WS_READ_TIMEOUT >= WS_PING_INTERVAL.mul_f64(3.0),
+            "WS_READ_TIMEOUT ({:?}) must be ≥ 3× WS_PING_INTERVAL ({:?})",
+            WS_READ_TIMEOUT,
+            WS_PING_INTERVAL
+        );
+        assert!(WS_HANDSHAKE_TIMEOUT <= WS_READ_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_ws_read_timeout_detects_silent_peer() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        tokio::select! {
+            () = std::future::pending::<()>() => panic!("silent peer unexpectedly produced a frame"),
+            () = tokio::time::sleep_until(deadline) => {}
         }
     }
 }

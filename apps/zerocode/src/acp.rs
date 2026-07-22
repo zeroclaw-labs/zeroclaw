@@ -93,6 +93,10 @@ impl Acp {
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
     }
+
+    pub(crate) fn current_cwd(&self) -> Option<&str> {
+        self.inner.current_cwd()
+    }
 }
 
 impl crate::widgets::HelpContext for Acp {

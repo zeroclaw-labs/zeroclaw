@@ -54,5 +54,11 @@ pub trait SopCapability: Send + Sync {
 
     fn describe(&self) -> CapabilityInfo;
 
+    /// Whether this capability may read only authored `with` configuration,
+    /// never a complete piped event payload as its configuration plane.
+    fn requires_authored_input(&self) -> bool {
+        false
+    }
+
     fn execute(&self, ctx: CapabilityContext, input: Value) -> Result<CapabilityResult>;
 }

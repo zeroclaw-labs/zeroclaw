@@ -192,25 +192,14 @@ The translated `.po` catalogues are not in this repo's main tree. They live in t
 
 The Rust crate dev loop never needs the submodule. Only docs builds and the docs-deploy / release jobs require it; those checkouts pass `submodules: recursive`. Everything else stays submodule-free.
 
-Per release, `scripts/release/refresh-translations.sh` tags the submodule as `v{version}`, checks out that tag, and stages the main-repository gitlink. `bump-version.sh` deliberately leaves translation pinning to that helper. `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
+Per release, `scripts/release/refresh-translations.sh` publishes changed catalogues to the submodule's `main` branch, tags that commit as `v{version}`, checks out the tag, and stages the main-repository gitlink. `bump-version.sh` deliberately leaves translation pinning to that helper. `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
 
 ## Release translation workflow
 
-During a release, after `./scripts/release/bump-version.sh` has set the version in `Cargo.toml`, refresh the catalogues and cut the matching submodule tag. This is one command: it reads the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and stages the main-repo gitlink pinned to that tag. No `git -C` by hand, no version typed into git commands. It initialises the submodule if needed.
-
-<div class="os-tabs-src">
-
-#### sh
-
-```sh
-./scripts/release/refresh-translations.sh    # version from Cargo.toml
-```
-
-</div>
-
-Run it after `bump-version.sh` so the version it reads is the release version. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` only when the catalogues are already current and separately checked; that flag skips both sync and `cargo mdbook check`. Pass an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
-
-The model used is whatever is configured under `providers.models.<kind>.<alias>` for the selected alias.
+The release-time refresh, validation, tagging, push, and gitlink-pin procedure
+is part of [Step 2 in the Release Runbook](release-runbook.md#refresh-and-pin-translations).
+This page documents the translation system; use the runbook as the operational
+source of truth when preparing a release.
 
 ## Model quality notes
 
