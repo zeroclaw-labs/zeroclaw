@@ -174,12 +174,18 @@ impl Db2SessionBackend {
         // single ODBC `SQLExecDirect` roundtrip the way PostgreSQL /
         // SQLite / MySQL do, so we MUST split them anyway.
         let statements: &[&str] = &[
+            // content is VARCHAR (not CLOB): CLOB retrieval needs
+            // piecemeal SQLGetData, which the columnar bulk-fetch path
+            // below does not do -- reading a CLOB through a plain Text
+            // buffer silently comes back empty. VARCHAR up to
+            // CONTENT_BUF_LEN binds and reads correctly through that
+            // same columnar path.
             "CREATE TABLE sessions ( \
                  id          BIGINT       NOT NULL GENERATED ALWAYS AS IDENTITY \
                                               (START WITH 1 INCREMENT BY 1), \
                  session_key VARCHAR(512) NOT NULL, \
                  role        VARCHAR(64)  NOT NULL, \
-                 content     CLOB         NOT NULL, \
+                 content     VARCHAR(4096) NOT NULL, \
                  created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT TIMESTAMP, \
                  PRIMARY KEY (id) \
              )",
@@ -552,8 +558,13 @@ impl SessionBackend for Db2SessionBackend {
                                    (session_key, created_at, last_activity, message_count) \
                                    VALUES (?, ?, ?, 1)";
         let insert_metadata_p_0 = key.into_parameter();
-        let insert_metadata_p_1 = now_str.into_parameter();
-        let insert_metadata_params = (&insert_metadata_p_0, &insert_metadata_p_1);
+        let insert_metadata_p_1 = now_str.clone().into_parameter();
+        let insert_metadata_p_2 = now_str.into_parameter();
+        let insert_metadata_params = (
+            &insert_metadata_p_0,
+            &insert_metadata_p_1,
+            &insert_metadata_p_2,
+        );
         match conn.execute(insert_metadata_sql, insert_metadata_params) {
             Ok(_) => {}
             Err(error) => match sql_state_of(&error).as_deref() {
