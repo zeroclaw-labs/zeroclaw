@@ -52,6 +52,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify published image exists
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+        run: |
+          set -euo pipefail
+          error_log="$(mktemp)"
+          trap 'rm -f "$error_log"' EXIT
+          if docker manifest inspect "$IMAGE_REF" >/dev/null 2>"$error_log"; then
+            exit 0
+          fi
+          cat "$error_log" >&2
+          if grep -Eiq 'manifest unknown|no such manifest|not found' "$error_log"; then
+            echo "::error title=Published image missing::Expected published image $IMAGE_REF. Check the Docker Publish release job before retrying this scan."
+          else
+            echo "::error title=Image inspection failed::Could not inspect $IMAGE_REF. Check GHCR authentication and availability before retrying this scan."
+          fi
+          exit 1
+
       - name: Scan ${{ matrix.stem }} with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -71,29 +89,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  upload-sarif:
-    name: Upload SARIF (${{ matrix.stem }})
-    if: github.repository == 'zeroclaw-labs/zeroclaw'
-    needs: [scan]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - stem: dist
-          - stem: default-features
-
-    steps:
-      - name: Download Trivy SARIF artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: trivy-results-${{ matrix.stem }}
-
       - name: Upload Trivy SARIF to GitHub Security tab
+        if: always() && hashFiles('trivy-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
         with:
           sarif_file: trivy-results.sarif

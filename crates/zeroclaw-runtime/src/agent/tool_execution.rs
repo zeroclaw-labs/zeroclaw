@@ -1,8 +1,4 @@
 //! Tool execution helpers extracted from `loop_`.
-//!
-//! Contains the functions responsible for invoking tools (single, parallel,
-//! sequential) and the decision logic for choosing between parallel and
-//! sequential execution.
 
 use anyhow::Result;
 use std::time::{Duration, Instant};
@@ -73,6 +69,7 @@ fn unavailable_tool_outcome(
         result: Some(scrub_credentials(&reason)),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(meta.turn_id.to_string()),
     });
     ToolExecutionOutcome {
@@ -117,12 +114,6 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
-    // Serialize arguments once and carry the full JSON into both observer
-    // events. Previously the start event received a 300-char summary and the
-    // completion event received no arguments at all, which made tool spans
-    // opaque in OTel backends (see upstream issue #5980 — "Otel Traces Should
-    // Include More Details About Why A Tool Call Failed"). Size is bounded
-    // downstream by the tracing exporter, so we don't need to clip here.
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -131,6 +122,7 @@ pub(crate) async fn execute_one_tool(
         arguments: Some(full_args.clone()),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(meta.turn_id.to_string()),
     });
     let start = Instant::now();
@@ -189,6 +181,7 @@ pub(crate) async fn execute_one_tool(
             result: Some(scrub_credentials(&reason)),
             channel: Some(meta.channel_name.to_string()),
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
+            parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
             turn_id: Some(meta.turn_id.to_string()),
         });
         return Ok(ToolExecutionOutcome {
@@ -244,13 +237,6 @@ pub(crate) async fn execute_one_tool(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // Emit the pending ToolCall at the moment of dispatch, before the tool
-    // future runs and potentially blocks. ACP/WS clients render this as the
-    // live "running" card; without a pre-execution emit a long-running tool
-    // leaves the turn visibly idle with no card until its result lands. The
-    // terminal ToolResult below reuses this id to close the card. Serial
-    // dispatch emits one pending per call in turn; parallel emits all pendings
-    // as the futures spin up together.
     if let Some(tx) = event_tx {
         let _ = tx
             .send(TurnEvent::ToolCall {
@@ -331,6 +317,7 @@ pub(crate) async fn execute_one_tool(
                         result: Some(scrub_credentials(normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
@@ -352,6 +339,7 @@ pub(crate) async fn execute_one_tool(
                         result: Some(scrub_credentials(&reason)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
@@ -390,6 +378,7 @@ pub(crate) async fn execute_one_tool(
                     result: Some(scrub_credentials(&reason)),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                    parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                     turn_id: Some(meta.turn_id.to_string()),
                 });
                 Ok(ToolExecutionOutcome {
@@ -404,11 +393,6 @@ pub(crate) async fn execute_one_tool(
         }
     };
 
-    // Emit the terminal ToolResult immediately after this call completes so
-    // serial dispatch interleaves call->result per tool; the pending was
-    // emitted before execution. Reuses the pending id to close the same card.
-    // Cancelled-in-flight calls return early above and are closed by the turn
-    // layer instead.
     if let Some(tx) = event_tx
         && let Ok(out) = &outcome
     {
@@ -465,11 +449,6 @@ pub fn should_execute_tools_in_parallel(
 
 // ── Parallel execution ───────────────────────────────────────────────────
 
-/// Concurrent batch executor. Returns one slot per call: `Some` when the call
-/// completed and already emitted its terminal `ToolResult`, `None` when that
-/// future was cancelled in flight. Collapsing the mixed set to one `Err` would
-/// drop completed siblings and let cleanup emit a second terminal update for an
-/// already-closed `tool_call_id`. Non-cancellation errors still abort.
 pub(crate) async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     dispatch: ToolDispatchContext<'_>,
@@ -510,11 +489,6 @@ pub(crate) async fn execute_tools_parallel(
 
 // ── Sequential execution ─────────────────────────────────────────────────
 
-/// Cancellation contract: a cancel mid-batch stops dispatch and returns `Ok`
-/// with one slot per call — `Some` for completed calls (a strict prefix), `None`
-/// for the cut-short tail. Never an error. The token is checked before each call
-/// so a tool that fires the token never lets a later call start, and a cancel
-/// that interrupts a running tool leaves that call's slot `None`.
 pub(crate) async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     dispatch: ToolDispatchContext<'_>,
@@ -621,14 +595,6 @@ mod tests {
         }
     }
 
-    /// Regression: execute_one_tool must recover a poisoned
-    /// ActivatedToolSet mutex and still resolve the activated tool
-    /// instead of panicking.
-    ///
-    /// Before the fix, the code used `.lock().unwrap()`, which panics
-    /// on a poisoned mutex. The recovery path (`into_inner()`) allows
-    /// the turn to proceed with the last valid state of the activated
-    /// tool set.
     #[tokio::test]
     async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -654,6 +620,7 @@ mod tests {
         // execute_one_tool must recover the poisoned lock and resolve
         // the activated tool without panicking.
         let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -707,6 +674,7 @@ mod tests {
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
         let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -738,26 +706,6 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
-    // Pinned regression for the `tool_search` branch of
-    // `should_execute_tools_in_parallel` (issue #7686, parent tracker #7685).
-    //
-    // `tool_search` activates deferred MCP tools into `ActivatedToolSet`. The
-    // production comment on lines 345–348 explains why this branch exists:
-    // running `tool_search` in parallel with the tools it activates can race
-    // the lookup before activation completes. This branch forces serial
-    // execution.
-    //
-    // PR #8040 covered the `tool_search` serial branch (3 tests below).
-    // PR #8222 — rebased onto #8040 — adds the approval-required branch
-    // (3 tests) and the parallel-when-allowed control (3 tests), sharing
-    // these imports and the `parsed_tool_call` helper so the two PRs can
-    // land in either order without E0252 duplicate-import collisions.
-    //
-    // Pre-existing tests in `loop_.rs` cover the single-call,
-    // approval-required, and parallel control paths but leave the
-    // `tool_search` branch untested. A future refactor that removes the
-    // branch as "seems redundant because we hold a mutex" would silently
-    // regress this contract — these tests pin it.
     use super::should_execute_tools_in_parallel;
     use crate::agent::loop_::ParsedToolCall;
     use crate::approval::ApprovalManager;
@@ -781,7 +729,7 @@ mod tests {
         }
     }
 
-    // --- tool_search branch (#8040) ---
+    // --- tool_search branch---
 
     #[test]
     fn tool_search_in_batch_forces_serial() {
@@ -818,15 +766,6 @@ mod tests {
 
     #[test]
     fn non_search_non_approval_batch_remains_parallel_eligible() {
-        // Control case (issue #7686 acceptance criterion #4): a batch that
-        // contains neither `tool_search` nor any approval-gated tool must
-        // remain parallel-eligible. This pins the default-true return so a
-        // future refactor that turns the policy helper into a defensive
-        // always-serial function is caught here, not at a much later
-        // integration test. Issue #7686 only requires the inverse direction
-        // (tool_search ⇒ serial); this test makes the "default still works"
-        // half of the contract explicit in `tool_execution.rs` itself rather
-        // than relying solely on the pre-existing control test in `loop_.rs`.
         let calls = vec![
             parsed_tool_call("file_read"),
             parsed_tool_call("memory_recall"),
@@ -838,14 +777,10 @@ mod tests {
         );
     }
 
-    // --- approval-required + control branches (#8222) ---
+    // --- approval-required + control branches---
 
     #[test]
     fn approval_required_batch_forces_sequential() {
-        // A batch containing `shell` (always_ask in supervised) must stay
-        // sequential so the caller can enforce the prompt/deny policy
-        // uniformly. Without this, an approval-gated call could race with a
-        // non-approval sibling and produce inconsistent state.
         let mgr = ApprovalManager::for_non_interactive(&supervised_risk_profile());
         let batch = vec![
             parsed_tool_call("file_read"),

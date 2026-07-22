@@ -1,11 +1,4 @@
 //! TG3: Channel Message Identity & Routing Tests
-//!
-//! Prevents: Pattern 3 — Channel message routing & identity bugs (17% of user bugs).
-//! Issues: #496, #483, #620, #415, #503
-//!
-//! Tests that ChannelMessage fields are used consistently and that the
-//! SendMessage → Channel trait contract preserves correct identity semantics.
-//! Verifies sender/reply_target field contracts to prevent field swaps.
 
 use async_trait::async_trait;
 use zeroclaw::channels::{Channel, ChannelMessage, SendMessage};
@@ -70,7 +63,7 @@ fn channel_message_reply_target_distinct_from_sender() {
 
 #[test]
 fn channel_message_fields_not_swapped() {
-    // Guards against #496 (Telegram) and #483 (Discord) field swap bugs
+    // Guards against(Telegram) and(Discord) field swap bugs
     let msg = ChannelMessage {
         id: "msg_42".into(),
         sender: "sender_value".into(),
