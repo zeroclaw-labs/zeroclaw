@@ -1393,23 +1393,40 @@ fn typed_hailo_factory_rejects_unsupported_shared_options() {
 
 #[test]
 fn production_factory_rejects_hailo_vision_override() {
+    let options = ModelProviderRuntimeOptions {
+        vision: Some(true),
+        ..Default::default()
+    };
+
+    let direct_error = HailoOllamaModelProviderConfig::default()
+        .create_provider("hailo_ollama", None, None, &options)
+        .err()
+        .expect("text-only Hailo family factory must reject vision=true");
+    assert!(
+        direct_error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .is_some(),
+        "family factory must return a typed capability error: {direct_error:?}"
+    );
+
     let error = match zeroclaw_providers::create_model_provider_with_options(
         "hailo_ollama",
         None,
-        &ModelProviderRuntimeOptions {
-            vision: Some(true),
-            ..Default::default()
-        },
+        &options,
     ) {
         Ok(_) => panic!("text-only Hailo must reject vision=true"),
         Err(error) => error,
-    }
-    .to_string();
+    };
 
     assert!(
-        error.contains("vision"),
+        error.to_string().contains("vision"),
         "vision missing from error: {error}"
     );
+    let capability = error
+        .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+        .expect("vision override rejection must remain a typed capability error");
+    assert_eq!(capability.model_provider, "default");
+    assert_eq!(capability.capability, "vision");
 }
 
 #[tokio::test]
