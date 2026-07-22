@@ -8,6 +8,29 @@ pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
+// ── Multi-database session backend series (PR 2 of N) ─────────────────
+//
+// PR 2 of the resubmission series (foundation, then MySQL/MariaDB,
+// then Postgres, then Db2, then Oracle) lands the MySQL + MariaDB
+// driver implementations on top of the factory / `spawn_blocking`
+// plumbing from PR 1 (`feat/session-backend-foundation`, merged as
+// the series root).
+//
+// Both `backend-mysql` and `backend-mariadb` enable the same
+// `mysql` crate (MySQL and MariaDB speak the same wire protocol
+// and accept the same SQL for every operation we issue), so the
+// actual `SessionBackend` impl lives once in `session_mysql_shared`
+// and the two per-engine modules in `session_mysql.rs` /
+// `session_mariadb.rs` are thin newtype wrappers. The shared
+// module is `pub(crate)` because callers go through the wrappers
+// — the `Engine` enum is a private implementation detail
+// that an operator should never see.
+#[cfg(feature = "backend-mariadb")]
+pub mod session_mariadb;
+#[cfg(feature = "backend-mysql")]
+pub mod session_mysql;
+#[cfg(any(feature = "backend-mysql", feature = "backend-mariadb"))]
+pub(crate) mod session_mysql_shared;
 pub mod stall_watchdog;
 
 use std::net::SocketAddr;
@@ -67,8 +90,38 @@ pub fn make_session_backend(
         "postgres" => Err(uncompiled_backend_error("postgres")),
         #[cfg(not(feature = "backend-mysql"))]
         "mysql" => Err(uncompiled_backend_error("mysql")),
+        #[cfg(feature = "backend-mysql")]
+        "mysql" => {
+            // PR 2 of the multi-database session backend series
+            // (builds on PR 1 = `feat/session-backend-foundation`).
+            // The MySQL backend reads `ZEROCLAW_channels__mysql_url`
+            // (the canonical config-override env var documented on
+            // `ChannelsConfig.mysql_url`) and falls back to
+            // `ZEROCLAW_TEST_MYSQL_URL` for the live-DB integration
+            // tests. Pool size comes from
+            // `ZEROCLAW_channels__pool_size`.
+            let backend = session_mysql::MySqlSessionBackend::new(
+                workspace_dir,
+                crate::session_mysql_shared::read_pool_size(),
+            )?;
+            Ok(Arc::new(backend))
+        }
         #[cfg(not(feature = "backend-mariadb"))]
         "mariadb" => Err(uncompiled_backend_error("mariadb")),
+        #[cfg(feature = "backend-mariadb")]
+        "mariadb" => {
+            // Mirror of the MySQL arm above — distinct module so an
+            // operator selecting `session_backend = "mariadb"` sees a
+            // distinct error message in logs (vs
+            // `session_backend = "mysql"`). Reads
+            // `ZEROCLAW_channels__mariadb_url` then falls back to
+            // `ZEROCLAW_TEST_MARIADB_URL`.
+            let backend = session_mariadb::MariaDbSessionBackend::new(
+                workspace_dir,
+                crate::session_mysql_shared::read_pool_size(),
+            )?;
+            Ok(Arc::new(backend))
+        }
         #[cfg(not(feature = "backend-oracle"))]
         "oracle" => Err(uncompiled_backend_error("oracle")),
         #[cfg(not(feature = "backend-db2"))]
@@ -272,11 +325,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "backend-mysql"))]
     fn make_session_backend_mysql_fail_fast_when_feature_disabled() {
         assert_fail_fast_uncompiled("mysql");
     }
 
     #[test]
+    #[cfg(not(feature = "backend-mariadb"))]
     fn make_session_backend_mariadb_fail_fast_when_feature_disabled() {
         assert_fail_fast_uncompiled("mariadb");
     }

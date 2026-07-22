@@ -20,23 +20,54 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 
 [features]
-# ── Multi-database session backend series (PR 1 of N) ─────────────
+# ── Multi-database session backend series ─────────────────────────
 #
 # Each backend has its own Cargo feature on this crate. The
-# follow-up PR for that backend flips its feature to a real
-# dependency (`dep:postgres`, `dep:mysql`, …) and replaces the
-# matching `#[cfg(not(feature = "backend-<name>"))]` fail-fast arm
-# in `make_session_backend` with a real ctor. Until that PR lands,
-# enabling the feature is a no-op — the dispatcher's fail-fast arm
-# is the only thing the feature gates today, and the ctor it
-# eventually wraps does not exist yet, so we keep them as empty
-# optional features here to stay cargo-clean and avoid
-# `unexpected_cfgs` lint warnings.
+# follow-up PR for a given backend flips its feature from an empty
+# placeholder (kept cargo-clean during the foundation PR) into a
+# real `dep:`-style optional dependency and replaces the matching
+# `#[cfg(not(feature = "backend-<name>"))]` fail-fast arm in
+# `make_session_backend` with a real `#[cfg(feature =
+# "backend-<name>")]` ctor. Backends still pending: postgres,
+# oracle, db2 — each lands in its own follow-up PR.
+#
+# MySQL and MariaDB speak the same wire protocol and accept the
+# same SQL for the operations we use (CREATE TABLE / INSERT /
+# SELECT … WHERE … / MATCH … AGAINST …), so the `backend-mysql`
+# and `backend-mariadb` features both pull in the same `mysql`
+# crate. We deliberately do NOT pull in `r2d2_mysql` — the
+# `mysql` crate ships its own connection pool (`mysql::Pool`),
+# and adding a second pooler would just be double-pooling for
+# no benefit. `mysql` is built with `default-features = false`
+# to skip the upstream CLI / bigdecimal / native-tls helpers we
+# don't need for session persistence, and `chrono` is enabled so
+# the row-decoding path matches `SessionMetadata`'s
+# `DateTime<Utc>` typing without manual re-formatting.
+#
+# The two features remain independently toggleable so an
+# operator can ship a binary that supports MySQL but not
+# MariaDB (or vice versa), even though the two implementations
+# live in the same workspace and share most of their underlying
+# crate graph.
 backend-postgres = []
-backend-mysql = []
-backend-mariadb = []
+backend-mysql = ["dep:mysql"]
+backend-mariadb = ["dep:mysql"]
 backend-oracle = []
 backend-db2 = []
+
+[dependencies.mysql]
+version = "25"
+# `default-features = false` skips the upstream CLI /
+# bigdecimal / native-tls / time helpers we don't need for
+# session persistence. We re-enable `chrono` (for
+# NaiveDateTime <-> DateTime<Utc> decoding parity with
+# `SessionMetadata`) and `minimal` (which forces the
+# `flate2/zlib` backend that `mysql_common`'s compression
+# helpers require — without a flate2 backend the workspace
+# fails to resolve with "You need to choose a zlib backend").
+default-features = false
+features = ["chrono", "minimal"]
+optional = true
 
 [dev-dependencies]
 tempfile = "3.26"
