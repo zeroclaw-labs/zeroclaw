@@ -181,7 +181,7 @@ fn default_agent_alias(config: &zeroclaw_config::schema::Config) -> String {
 }
 
 /// Resolve a per-request memory handle for the HTTP streaming path, mirroring
-/// the WebSocket `resolve_ws_memory_handle` (ws.rs:246-265). Returns `None`
+/// the WebSocket agent memory handle resolution. Returns `None`
 /// when the agent's `memory.backend` is `None`; otherwise constructs a memory
 /// handle via `zeroclaw_memory::create_memory_for_agent`. On error the caller
 /// degrades to `None` (consolidation disabled) but the turn still proceeds.
@@ -229,6 +229,18 @@ fn agent_alias_from_model(
         }
     }
 
+    // Silently route unrecognized model names (e.g. "gpt-4") to default
+    // agent for standard-client compatibility.
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "request_model": model,
+                "resolved_alias": default,
+            })
+        ),
+        "chat completions: unrecognized model resolved to default agent"
+    );
     Ok(default)
 }
 
@@ -610,6 +622,27 @@ pub async fn handle_chat_completions(
         &session_id,
     )));
 
+    // Reject HTTP requests when an active WebSocket connection holds this
+    // session. The WebSocket agent owns the structured in-memory transcript
+    // for the connection lifetime; concurrent HTTP access would create a
+    // diverging backend transcript.
+    {
+        let tokens = state.cancel_tokens.lock().unwrap();
+        if tokens.contains_key(&session_key) {
+            return add_session_key_header(
+                add_request_id_header(
+                    error_response(
+                        StatusCode::CONFLICT,
+                        "cross_transport_session_in_use",
+                        "This session is currently owned by an active WebSocket connection. Disconnect the WebSocket or use a different session key.",
+                    ),
+                    &request_id,
+                ),
+                &session_id,
+            );
+        }
+    }
+
     // Acquire the per-session queue BEFORE any backend access so concurrent
     // requests sharing the same session are serialized across the complete
     // lifecycle: alias check → history load → turn execution → persistence.
@@ -751,7 +784,7 @@ pub async fn handle_chat_completions(
     }
 
     // Resolve a per-request memory handle for consolidation, mirroring the
-    // WS per-connection `resolve_ws_memory_handle` path (ws.rs:246-265).
+    // WS per-connection memory handle path.
     // On failure we degrade to `None` (consolidation disabled) but the turn
     // still proceeds — same graceful-degradation contract as WS. Both the
     // streaming and blocking paths go through `run_gateway_turn`, which owns
@@ -1444,6 +1477,7 @@ fn parse_tool_choice(value: &Option<serde_json::Value>) -> ToolChoiceMode {
                     "auto" => ToolChoiceMode::Auto,
                     "none" => ToolChoiceMode::None,
                     "required" => ToolChoiceMode::Required,
+                    // Guarded by validate_request; defense-in-depth fallback.
                     _ => ToolChoiceMode::Auto,
                 }
             } else if let Some(obj) = v.as_object() {
@@ -2330,13 +2364,10 @@ mod tests {
         );
     }
 
-    // ── Blocking 2 regression: set_session_agent_alias write failure ──
-    //
-    // When the session backend's `set_session_agent_alias` call fails (e.g.
-    // disk full, permission denied), the handler must return
-    // INTERNAL_SERVER_ERROR (500) — fail-closed, matching the WebSocket path
-    // (ws.rs:425-432). This test verifies the error_response helper that the
-    // handler uses at lines 737-748.
+    // Ownership write failure returns 500 before model execution.
+    // If the backend cannot persist the session→agent binding, the handler
+    // must abort fail-closed — the agent must not execute without a recorded
+    // owner.
 
     #[test]
     fn set_session_agent_alias_write_error_response_is_500() {

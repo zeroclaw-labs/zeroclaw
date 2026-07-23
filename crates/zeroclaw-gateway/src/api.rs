@@ -1593,14 +1593,15 @@ pub async fn handle_api_health(
 struct SessionKeyResolutionError {
     id: String,
     gw_candidate: String,
-    bare_candidate: String,
+    ch_candidate: String,
 }
 
 /// Resolve a session key from a caller-supplied ID by consulting the backend.
 ///
 /// Strategy (in order):
-/// 1. `gw_` prefix → already a full gateway key (identity after sanitize).
-/// 2. Probe both `gw_{sanitize(id)}` and `{sanitize(id)}` bare.
+/// 1. `gw_` prefix → full gateway key (identity after sanitize).
+/// 2. `ch:` prefix → channel key (identity — strip prefix, lookup bare).
+/// 3. Probe both `gw_{sanitize(id)}` and `{sanitize(id)}` bare.
 ///    - Both exist → `Err(SessionKeyResolutionError)` — ambiguous.
 ///    - Only `gw_` exists → return `gw_` form.
 ///    - Only bare exists → return bare form (channel key).
@@ -1609,9 +1610,15 @@ fn resolve_session_key(
     id: &str,
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
 ) -> Result<String, SessionKeyResolutionError> {
+    // Step 1: gw_ prefix → full gateway key (identity after sanitize).
     if id.starts_with("gw_") {
         return Ok(zeroclaw_api::session_keys::sanitize_session_key(id));
     }
+    // Step 2: ch: prefix → channel key (identity — strip, lookup bare).
+    if let Some(bare) = id.strip_prefix("ch:") {
+        return Ok(zeroclaw_api::session_keys::sanitize_session_key(bare));
+    }
+    // Step 3: probe both gw_{sanitize(id)} and {sanitize(id)}.
     let bare = zeroclaw_api::session_keys::sanitize_session_key(id);
     let gw_key = format!("gw_{}", bare);
     let gw_exists = backend.session_exists(&gw_key);
@@ -1620,7 +1627,7 @@ fn resolve_session_key(
         (true, true) => Err(SessionKeyResolutionError {
             id: id.to_string(),
             gw_candidate: gw_key,
-            bare_candidate: bare,
+            ch_candidate: format!("ch:{}", bare),
         }),
         (true, false) => Ok(gw_key),
         (false, true) => Ok(bare),
@@ -1665,19 +1672,25 @@ pub async fn handle_api_sessions_list(
                     .and_then(|c| config.agent_for_channel(c))
                     .map(str::to_string)
             });
-            // Drop the gw_ prefix for display; channel keys stay as-is so
-            // the frontend can show the channel context inline.
+            // Drop the gw_ / ch: prefix for display.
             let session_id = meta
                 .key
                 .strip_prefix("gw_")
+                .or_else(|| meta.key.strip_prefix("ch:"))
                 .map(str::to_string)
                 .unwrap_or_else(|| meta.key.clone());
+            // Ensure every key has an addressable prefix: gw_ for gateway,
+            // ch: for channel-driven sessions.
+            let session_key = if meta.key.starts_with("gw_") {
+                meta.key.clone()
+            } else {
+                format!("ch:{}", meta.key)
+            };
             let mut entry = serde_json::json!({
-                // Display form: `gw_` stripped for gateway sessions, full
-                // composite for channel-driven sessions.
+                // Display form: prefix stripped for all session types.
                 "session_id": session_id,
-                // Full DB key for API operations (delete, messages, abort).
-                "session_key": meta.key.clone(),
+                // Full key with namespace prefix for API operations.
+                "session_key": session_key,
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
@@ -1723,9 +1736,9 @@ pub async fn handle_api_session_messages(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "ambiguous_session_key",
-                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
-                    "candidates": [e.gw_candidate, e.bare_candidate],
-                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
                 })),
             ).into_response();
         }
@@ -1784,9 +1797,9 @@ pub async fn handle_api_session_message_post(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "ambiguous_session_key",
-                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
-                    "candidates": [e.gw_candidate, e.bare_candidate],
-                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
                 })),
             ).into_response();
         }
@@ -1879,9 +1892,9 @@ pub async fn handle_api_session_delete(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "ambiguous_session_key",
-                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
-                    "candidates": [e.gw_candidate, e.bare_candidate],
-                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
                 })),
             ).into_response();
         }
@@ -1974,9 +1987,9 @@ pub async fn handle_api_session_rename(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "ambiguous_session_key",
-                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
-                    "candidates": [e.gw_candidate, e.bare_candidate],
-                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
                 })),
             ).into_response();
         }
@@ -2061,9 +2074,9 @@ pub async fn handle_api_session_state(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "ambiguous_session_key",
-                    "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
-                    "candidates": [e.gw_candidate, e.bare_candidate],
-                    "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
                 })),
             ).into_response();
         }
@@ -2114,9 +2127,9 @@ pub async fn handle_api_session_abort(
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({
                         "error": "ambiguous_session_key",
-                        "error_description": format!("The session identifier '{}' resolves to multiple sessions. Use the full storage key (with 'gw_' prefix) to disambiguate.", e.id),
-                        "candidates": [e.gw_candidate, e.bare_candidate],
-                        "hint": "Use the 'session_key' field from GET /api/sessions responses instead of 'session_id'."
+                        "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                        "candidates": [e.gw_candidate, e.ch_candidate],
+                        "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
                     })),
                 ).into_response();
             }
@@ -4863,6 +4876,58 @@ pub(crate) mod tests {
             resolve_session_key("my session", backend).unwrap(),
             "gw_my_session"
         );
+    }
+
+    #[test]
+    fn resolve_session_key_ch_prefix_selects_channel_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // ch: prefix → identity path → strip prefix, return bare key.
+        store
+            .append("discord_clamps_user123", &ChatMessage::user("hi"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("ch:discord_clamps_user123", backend).unwrap(),
+            "discord_clamps_user123"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_ch_prefix_selects_channel_even_when_gw_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Both gw_X and X exist — ch:X must select X, not fall into ambiguity.
+        store
+            .append("gw_discord_clamps_user123", &ChatMessage::user("gw"))
+            .unwrap();
+        store
+            .append("discord_clamps_user123", &ChatMessage::user("ch"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("ch:discord_clamps_user123", backend).unwrap(),
+            "discord_clamps_user123"
+        );
+        // gw_ prefix still selects the gateway record.
+        assert_eq!(
+            resolve_session_key("gw_discord_clamps_user123", backend).unwrap(),
+            "gw_discord_clamps_user123"
+        );
+        // Bare key is still ambiguous.
+        assert!(resolve_session_key("discord_clamps_user123", backend).is_err());
+    }
+
+    #[test]
+    fn resolve_session_key_ambiguous_error_includes_ch_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        store.append("gw_test", &ChatMessage::user("gw")).unwrap();
+        store.append("test", &ChatMessage::user("ch")).unwrap();
+        let err = resolve_session_key("test", backend).unwrap_err();
+        assert_eq!(err.gw_candidate, "gw_test");
+        assert_eq!(err.ch_candidate, "ch:test");
     }
 
     // ── DELETE handler session_queue serialization tests ─────────────

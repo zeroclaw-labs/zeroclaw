@@ -655,15 +655,6 @@ async fn handle_socket(
                         }
                     };
 
-                    // Rehydrate the agent's history from the backend's authoritative transcript
-                    // so this turn sees messages appended by concurrent HTTP requests on the
-                    // same session key.
-                    if let Some(ref backend) = state.session_backend {
-                        let fresh = backend.load(&session_key);
-                        agent.clear_history();
-                        agent.seed_history(&fresh);
-                    }
-
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -822,15 +813,6 @@ async fn handle_socket(
                         continue;
                     }
                 };
-
-                // Rehydrate the agent's history from the backend's authoritative transcript
-                // so this turn sees messages appended by concurrent HTTP requests on the
-                // same session key.
-                if let Some(ref backend) = state.session_backend {
-                    let fresh = backend.load(&session_key);
-                    agent.clear_history();
-                    agent.seed_history(&fresh);
-                }
 
                 process_chat_message(
                     &state,
@@ -1104,7 +1086,7 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
 
     // WS owns a steering channel so the client can inject mid-turn messages.
-    let (_steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
     // The transport-specific forward loop: drain `event_rx` and map TurnEvents
     // to WS frames, multiplexed with the cancel token, inbound client frames,
@@ -1233,7 +1215,7 @@ async fn process_chat_message(
                                 let _ = sender_fwd.send(Message::Text(err.to_string().into())).await;
                                 continue;
                             }
-                            match _steering_tx.try_send(content) {
+                            match steering_tx.try_send(content) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     let err = serde_json::json!({

@@ -267,8 +267,10 @@ where
                 persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
             }
 
-            // Fire-and-forget memory consolidation via MemoryStrategy
+            // Fire-and-forget memory consolidation via MemoryStrategy.
             // Route through MemoryStrategy, not direct call.
+            // TODO: use agent's provider/model/temperature (per-request) instead
+            // of AppState globals. Agent fields are private — needs a getter.
             if state.auto_save {
                 if let Some(mem) = ws_memory.clone() {
                     let model_provider = state.model_provider.clone();
