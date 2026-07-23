@@ -11583,7 +11583,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 /// today at the app layer for file tools (`file_write`, `file_edit`, `git_operations`, and
 /// `PathGuardedTool` read paths) via `SecurityPolicy`, regardless of which OS sandbox backend
 /// (if any) is active. They are NOT enforced against arbitrary shell/script child-process I/O
-/// until per-backend OS sandbox wiring lands (tracked per RFC #6996 Phase 2 as follow-up PRs,
+/// until per-backend OS sandbox wiring lands (tracked per RFC 6996 Phase 2 as follow-up PRs,
 /// one per backend). `allowed_domains`, `denied_domains`, `allow_unix_sockets`, and
 /// `bubblewrap_args` are accepted and carried through the resolved policy but are fully inert
 /// — no enforcement surface consumes them yet.

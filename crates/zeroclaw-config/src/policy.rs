@@ -341,6 +341,12 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
         "/proc".into(),
         "/sys".into(),
         "/var".into(),
+        // Modern Linux distros symlink `/var/run` -> `/run` (systemd compat),
+        // so canonicalizing a probe under the old path resolves away the
+        // `/var` prefix entirely and would otherwise bypass this list.
+        // `/run` holds equally sensitive runtime state (control sockets,
+        // secrets mounts, per-user runtime dirs), so it needs its own entry.
+        "/run".into(),
         "/tmp".into(),
         "~/.ssh".into(),
         "~/.gnupg".into(),
@@ -4500,12 +4506,28 @@ mod tests {
             !p.is_resolved_path_allowed(&canonicalize_best_effort(Path::new("/etc/passwd"))),
             "forbidden paths must be blocked even when workspace_only=false"
         );
+
+        // Second forbidden entry, exercised via a fabricated directory rather
+        // than a real-world path like `/var/run/docker.sock`: on modern Linux,
+        // `/var/run` is itself a symlink to `/run` (systemd compat), so
+        // canonicalizing that probe resolves away the `/var` prefix before
+        // this check ever sees it, regardless of enforcement. A synthetic
+        // root with no OS-defined symlink keeps this test meaningful across
+        // platforms.
+        let forbidden_root = std::env::temp_dir().join("zeroclaw_test_forbidden_root");
+        let _ = std::fs::create_dir_all(&forbidden_root);
+        let canonical_forbidden_root = forbidden_root
+            .canonicalize()
+            .unwrap_or_else(|_| forbidden_root.clone());
+        let p2 = SecurityPolicy {
+            forbidden_paths: vec![canonical_forbidden_root.to_string_lossy().into_owned()],
+            ..p.clone()
+        };
         assert!(
-            !p.is_resolved_path_allowed(&canonicalize_best_effort(Path::new(
-                "/var/run/docker.sock"
-            ))),
-            "forbidden /var must be blocked even when workspace_only=false"
+            !p2.is_resolved_path_allowed(&canonical_forbidden_root.join("nested/secret")),
+            "forbidden entry must block nested nonexistent paths beneath it"
         );
+        let _ = std::fs::remove_dir_all(&forbidden_root);
 
         let _ = std::fs::remove_dir_all(&workspace);
     }

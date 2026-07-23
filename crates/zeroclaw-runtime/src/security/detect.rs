@@ -294,7 +294,7 @@ pub fn create_sandbox(
 /// carries at least one denial — file-tool enforcement (`SecurityPolicy`,
 /// `zeroclaw-config`) still applies in that case, but arbitrary shell/script
 /// child-process I/O does not honor these lists until per-backend OS sandbox
-/// wiring lands (RFC #6996 Phase 2). Pure predicate, split out from
+/// wiring lands (RFC 6996 Phase 2). Pure predicate, split out from
 /// [`warn_if_denials_unenforced`] so it is unit-testable without a logging
 /// harness.
 #[must_use]
@@ -649,7 +649,7 @@ mod tests {
     // Withhold-and-document scope decision: `deny_write`/`deny_read` are
     // enforced today for file tools only (`SecurityPolicy` in
     // `zeroclaw-config`), never for arbitrary shell/script child-process I/O,
-    // until per-backend OS sandbox wiring lands (RFC #6996 Phase 2, one PR
+    // until per-backend OS sandbox wiring lands (RFC 6996 Phase 2, one PR
     // per backend — Bubblewrap/Landlock/Seatbelt). `sandbox_denials_unenforced`
     // is the pure predicate `warn_if_denials_unenforced` gates on; there is no
     // log-capture harness in this crate, so these tests exercise the
