@@ -94,7 +94,7 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 ### Cross-Platform Build (`cross-platform-build-manual.yml`)
 
-Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
+Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
