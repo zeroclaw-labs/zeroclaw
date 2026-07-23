@@ -119,4 +119,27 @@ mod tests {
         assert!(is_non_global_v4(Ipv4Addr::new(100, 64, 0, 1)));
         assert!(is_non_global_v4(Ipv4Addr::new(240, 0, 0, 1)));
     }
+
+    #[test]
+    fn dot_local_and_dot_localhost_subdomains_are_private() {
+        // mDNS .local names must be blocked (RFC 6762)
+        assert!(is_private_or_local_host("mydevice.local"));
+        assert!(is_private_or_local_host("printer.local"));
+        // *.localhost subdomains must be blocked (RFC 2606)
+        assert!(is_private_or_local_host("foo.localhost"));
+        assert!(is_private_or_local_host("app.localhost"));
+        // Public domain that merely ends in "local" as a substring must not match
+        assert!(!is_private_or_local_host("notlocal.com"));
+    }
+
+    #[test]
+    fn rfc5737_documentation_and_rfc2544_benchmarking_ranges_are_private() {
+        // RFC 5737 TEST-NET-1/2/3 documentation ranges
+        assert!(is_non_global_v4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(is_non_global_v4(Ipv4Addr::new(198, 51, 100, 1)));
+        assert!(is_non_global_v4(Ipv4Addr::new(203, 0, 113, 1)));
+        // RFC 2544 benchmarking range (198.18.0.0/15)
+        assert!(is_non_global_v4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(is_non_global_v4(Ipv4Addr::new(198, 19, 255, 255)));
+    }
 }
