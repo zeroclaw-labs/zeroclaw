@@ -1705,9 +1705,8 @@ impl RpcDispatcher {
         let attribution_agent_alias = agent_alias.clone();
         let attribution_model_provider = model_provider.clone();
         let attribution_model = model.clone();
-        // Config and agent handles for per-event window resolution.
+        // Config for per-event window resolution.
         let config = self.ctx.config.clone();
-        let agent_handle = agent.clone();
         // Cost-tracking context for this turn. Built from the daemon-scoped
         // tracker + the live pricing map and stamped with the agent alias so
         // `execute_turn` can persist token usage and attribute spend. `None`
@@ -1739,7 +1738,6 @@ impl RpcDispatcher {
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
                 let config = config.clone();
-                let agent_handle = agent_handle.clone();
                 async move {
                     if let (
                         Some(store),
@@ -1758,20 +1756,14 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    // Resolve model_context_window per event from the live provider.
-                    // Single source: agent.attribution_fields().1 (live provider name).
-                    // Covers: no-switch, session/configure, and in-turn model_switch.
-                    let model_ctx_window = if let TurnEvent::Usage { .. } = &event {
-                        let live_provider = {
-                            let guard = agent_handle.lock().await;
-                            let (_, model_provider, _) = guard.attribution_fields();
-                            model_provider
-                        };
-                        if live_provider.is_empty() {
+                    // Resolve model_context_window per event from the embedded provider_ref.
+                    // No lock acquisition - uses the live provider that served the turn.
+                    let model_ctx_window = if let TurnEvent::Usage { provider_ref, .. } = &event {
+                        if provider_ref.is_empty() {
                             None
                         } else {
                             let cfg = config.read();
-                            crate::agent::resolve_live_model_context_window(&cfg, &live_provider)
+                            crate::agent::resolve_live_model_context_window(&cfg, provider_ref)
                         }
                     } else {
                         None
@@ -6547,6 +6539,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            provider_ref: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(32_000), None).unwrap();
         let v = parse(&json);
@@ -6571,6 +6564,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            provider_ref: String::new(),
         };
         let json =
             notification_for_turn_event("s1", &event, Some(800_000), Some(1_000_000)).unwrap();
@@ -6693,6 +6687,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            provider_ref: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(max_ctx), None).unwrap();
         let v = parse(&json);
@@ -6753,6 +6748,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            provider_ref: String::new(),
         };
         let json =
             notification_for_turn_event("s1", &event, Some(max_ctx), Some(model_ctx)).unwrap();
@@ -6825,6 +6821,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
+            provider_ref: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, max_ctx, model_ctx_window).unwrap();
         let v = parse(&json);
@@ -6967,6 +6964,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
+            provider_ref: String::new(),
         };
         let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
         let json =
@@ -6987,6 +6985,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
+            provider_ref: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
@@ -7005,6 +7004,7 @@ mod tests {
             cached_input_tokens: Some(15_000),
             output_tokens: Some(200),
             cost_usd: None,
+            provider_ref: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(200_000), None).unwrap();
         let v = parse(&json);
@@ -7024,6 +7024,7 @@ mod tests {
             cached_input_tokens: Some(80_000),
             output_tokens: Some(100),
             cost_usd: None,
+            provider_ref: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(100_000), None).unwrap();
         let v = parse(&json);

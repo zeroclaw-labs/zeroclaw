@@ -168,6 +168,7 @@ pub(crate) async fn interpret_chat_response(
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_usd: call_cost_usd,
+                provider_ref: ctx.provider_name.to_string(),
             })
             .await;
     }

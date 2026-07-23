@@ -1052,6 +1052,10 @@ async fn process_chat_message(
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
+    // Track the most recent provider that served usage events (for done-frame
+    // context_window resolution and provider label).
+    let mut last_provider_ref: Option<String> = None;
+
     // Track the most recent absolute provider-reported prompt size
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
@@ -1182,7 +1186,9 @@ async fn process_chat_message(
                             cached_input_tokens: _,
                             output_tokens,
                             cost_usd: _,
+                            provider_ref,
                         } => {
+                            last_provider_ref = Some(provider_ref.clone());
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
@@ -1397,16 +1403,25 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
-            // Build the done-frame JSON. Re-read the live provider to capture any
-            // in-turn model_switch so the done-frame reflects the provider
-            // that actually served the final response.
-            let model_context_window = {
+            // Build the done-frame JSON. Use the last provider_ref from usage events
+            // for accurate context_window resolution (accounts for vision routing
+            // and mid-turn provider switches). Fall back to re-reading attribution
+            // fields when no usage events were emitted.
+            let (model_context_window, provider_ref_label) = if let Some(ref provider_ref) = last_provider_ref {
+                let cfg = state.config.read();
+                let window = zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_ref);
+                // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
+                let label = provider_ref.split('.').last().unwrap_or(provider_ref);
+                (window, label.to_string())
+            } else {
                 let (_, live_provider, _) = agent.attribution_fields();
                 if live_provider.is_empty() {
-                    None
+                    (None, provider_label.clone())
                 } else {
                     let cfg = state.config.read();
-                    zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, &live_provider)
+                    let window = zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, &live_provider);
+                    let label = live_provider.split('.').last().unwrap_or(&live_provider);
+                    (window, label.to_string())
                 }
             };
             let done = build_done_frame_json(
@@ -1416,7 +1431,7 @@ async fn process_chat_message(
                 total_tokens,
                 cost_usd,
                 &turn_model,
-                &provider_label,
+                &provider_ref_label,
                 max_context_tokens,
                 model_context_window,
                 last_input_tokens,
@@ -1431,7 +1446,7 @@ async fn process_chat_message(
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
-                "model_provider": provider_label,
+                "model_provider": provider_ref_label,
                 "model": turn_model,
             }));
 
@@ -1443,7 +1458,7 @@ async fn process_chat_message(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": provider_label,
+                        "model_provider": provider_ref_label,
                         "model": turn_model,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
