@@ -552,7 +552,7 @@ impl RpcDispatcher {
     /// config wholesale: a write landed on `ctx.config` while this method
     /// awaits disk I/O would otherwise be overwritten by the stale snapshot
     /// on write-back, silently erasing an in-memory change that was never
-    /// given a chance to be saved (#9284).
+    /// given a chance to be saved.
     async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
         debug_assert!(
             self.ctx.config_write_lock.try_lock().is_err(),
@@ -9316,7 +9316,7 @@ mod tests {
         );
     }
 
-    // ── config_write_lock races (#9284) ─────────────────────────
+    // ── config_write_lock races ─────────────────────────────────
 
     fn make_two_provider_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         let mut cfg = zeroclaw_config::schema::Config {
@@ -9349,7 +9349,7 @@ mod tests {
         }
     }
 
-    /// Regression for #9284: `flush_config` used to clone the live config,
+    /// Regression test: `flush_config` used to clone the live config,
     /// await `save_dirty()` on the clone, then swap the clone back over the
     /// live config wholesale. A write landed on `ctx.config` while that save
     /// was in flight was silently erased by the swap even though it was
