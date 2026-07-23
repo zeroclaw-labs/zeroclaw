@@ -298,7 +298,13 @@ impl AzureOpenAiModelProvider {
     /// Return the configured `reasoning_effort` when the model accepts it
     /// (GPT-5.x / o-series), otherwise `None`.  Mirrors the compatible
     /// provider's `reasoning_effort_for_model` so Azure parity is maintained.
-    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+    /// Azure OpenAI is a Chat Completions-compatible wire, so it rejects
+    /// `reasoning_effort` on tool-bearing requests the same way; `has_tools`
+    /// short-circuits to `None` before the model-name gating below.
+    fn reasoning_effort_for_model(&self, model: &str, has_tools: bool) -> Option<String> {
+        if has_tools {
+            return None;
+        }
         let effort = self.reasoning_effort.as_ref()?;
         let id = model
             .rsplit('/')
@@ -512,7 +518,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let request = ChatRequest {
             messages,
             temperature,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.reasoning_effort_for_model(model, false),
             max_completion_tokens: None,
         };
 
@@ -566,6 +572,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(request.messages),
             temperature,
@@ -576,7 +583,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.reasoning_effort_for_model(model, has_tools),
             max_completion_tokens: None,
         };
 
@@ -649,6 +656,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             )
         };
 
+        let has_tools = native_tools.as_ref().is_some_and(|t| !t.is_empty());
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(messages),
             temperature,
@@ -657,7 +665,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.reasoning_effort_for_model(model, has_tools),
             max_completion_tokens: None,
         };
 
@@ -795,6 +803,36 @@ mod tests {
             .deployment_name("deployment")
             .build();
         assert!(p.credential.is_none());
+    }
+
+    // Regression for #9016: Azure OpenAI mirrors the Chat Completions
+    // provider's rejection of `reasoning_effort` on tool-bearing requests.
+    // `has_tools=true` must omit the field even for a model that otherwise
+    // qualifies; `has_tools=false` must keep behaving as before.
+    #[test]
+    fn reasoning_effort_for_model_omits_field_when_tools_present() {
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+
+        assert_eq!(
+            p.reasoning_effort_for_model("gpt-5", false),
+            Some("high".to_string()),
+            "no-tools path must keep reasoning_effort for a matching model"
+        );
+        assert_eq!(
+            p.reasoning_effort_for_model("gpt-5", true),
+            None,
+            "has_tools=true must omit reasoning_effort even for a matching model"
+        );
+        assert_eq!(
+            p.reasoning_effort_for_model("o1-preview", true),
+            None,
+            "has_tools=true must omit reasoning_effort even for a matching model"
+        );
     }
 
     #[test]

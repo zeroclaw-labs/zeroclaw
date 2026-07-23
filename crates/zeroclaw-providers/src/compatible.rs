@@ -883,7 +883,14 @@ impl OpenAiCompatibleModelProvider {
         self.merge_system_into_user || Self::model_requires_system_merge(model)
     }
 
-    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+    fn reasoning_effort_for_model(&self, model: &str, has_tools: bool) -> Option<String> {
+        // This provider is always the Chat Completions wire (the Responses wire
+        // lives in openai.rs); Chat Completions rejects `reasoning_effort` on
+        // tool-bearing requests with an HTTP 400, so omit it whenever tools are
+        // present, before the model-name gating below.
+        if has_tools {
+            return None;
+        }
         let effort = self.reasoning_effort.as_ref()?;
         let id = model
             .rsplit('/')
@@ -2053,7 +2060,7 @@ impl OpenAiCompatibleModelProvider {
             // Non-streaming path; `usage` is on the final response body, not
             // gated on `stream_options.include_usage`.
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.reasoning_effort_for_model(model, has_tool_entries),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
@@ -2655,7 +2662,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.reasoning_effort_for_model(model, false),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -2744,7 +2751,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.reasoning_effort_for_model(model, false),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -2946,6 +2953,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         "native_tool_calling": self.native_tool_calling,
                         "tools_count": tools_count,
                         "tool_choice": native_request.tool_choice.as_deref(),
+                        "reasoning_effort_omitted": tools_count > 0 && self.reasoning_effort.is_some(),
                     })),
                 "compatible provider request prepared"
             );
@@ -3073,6 +3081,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             "native_tool_calling": provider.native_tool_calling,
                             "tools_count": tools_count,
                             "tool_choice": tools.as_ref().map(|_| "auto"),
+                            "reasoning_effort_omitted": tools_count > 0 && provider.reasoning_effort.is_some(),
                         })),
                     "compatible streaming provider request prepared"
                 );
@@ -3083,7 +3092,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     model: model.clone(),
                     messages: provider.convert_messages_for_native(&effective_messages, !merge),
                     temperature,
-                    reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    reasoning_effort: provider.reasoning_effort_for_model(&model, true),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(true)
                     } else {
@@ -3120,7 +3129,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     model: model.clone(),
                     messages,
                     temperature,
-                    reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    reasoning_effort: provider.reasoning_effort_for_model(&model, false),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(false)
                     } else {
@@ -3279,7 +3288,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 stream_options: options_enabled.then_some(StreamOptionsBody {
                     include_usage: true,
                 }),
-                reasoning_effort: provider.reasoning_effort_for_model(&model),
+                reasoning_effort: provider.reasoning_effort_for_model(&model, false),
                 tool_stream: None,
                 tools: None,
                 tool_choice: None,
@@ -3397,7 +3406,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 stream_options: options_enabled.then_some(StreamOptionsBody {
                     include_usage: true,
                 }),
-                reasoning_effort: provider.reasoning_effort_for_model(&model),
+                reasoning_effort: provider.reasoning_effort_for_model(&model, false),
                 tool_stream: None,
                 tools: None,
                 tool_choice: None,
@@ -3610,6 +3619,58 @@ mod tests {
             value.get("tool_choice").and_then(serde_json::Value::as_str),
             Some("auto"),
             "tool_choice must be 'auto' when tools are present; got: {value}"
+        );
+    }
+
+    // Regression for #9016: OpenAI's Chat Completions API (this provider's
+    // only wire) rejects `reasoning_effort` on tool-bearing requests with an
+    // HTTP 400. The field must be omitted whenever tools are present, even
+    // for models that otherwise qualify for reasoning_effort.
+    #[test]
+    fn build_native_tool_chat_request_omits_reasoning_effort_when_tools_present() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "description": "", "parameters": {} }
+        })];
+
+        let req = p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "reasoning_effort must be omitted on tool-bearing Chat Completions requests; got: {value}"
+        );
+    }
+
+    // Regression guard: the no-tools path must keep sending reasoning_effort
+    // for models that qualify, so the tool-bearing fix above doesn't
+    // regress the common case.
+    #[test]
+    fn build_native_tool_chat_request_keeps_reasoning_effort_when_no_tools() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "reasoning_effort must be present when no tools are sent; got: {value}"
         );
     }
 
@@ -4771,51 +4832,70 @@ mod tests {
             .build();
 
         assert_eq!(
-            model_provider.reasoning_effort_for_model("o1-preview"),
+            model_provider.reasoning_effort_for_model("o1-preview", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("openai/o3-mini"),
+            model_provider.reasoning_effort_for_model("openai/o3-mini", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("o4-mini"),
+            model_provider.reasoning_effort_for_model("o4-mini", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("gpt-5"),
+            model_provider.reasoning_effort_for_model("gpt-5", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            model_provider.reasoning_effort_for_model("gpt-5.3-codex", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("openai/gpt-5"),
+            model_provider.reasoning_effort_for_model("openai/gpt-5", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("gpt-5-chat-latest"),
+            model_provider.reasoning_effort_for_model("gpt-5-chat-latest", false),
             None,
             "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("gpt-5.1-chat-latest"),
+            model_provider.reasoning_effort_for_model("gpt-5.1-chat-latest", false),
             None,
             "gpt-5*-chat-latest are non-reasoning chat-router models and must not receive reasoning_effort",
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("gpt-4-codex"),
+            model_provider.reasoning_effort_for_model("gpt-4-codex", false),
             Some("high".to_string())
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("llama-3-codex"),
+            model_provider.reasoning_effort_for_model("llama-3-codex", false),
             None,
             "generic codex-like model names must not receive OpenAI-only reasoning_effort",
         );
         assert_eq!(
-            model_provider.reasoning_effort_for_model("llama-3.3-70b"),
+            model_provider.reasoning_effort_for_model("llama-3.3-70b", false),
             None
+        );
+
+        // Chat Completions rejects `reasoning_effort` on tool-bearing requests,
+        // regardless of how strongly the model name matches the reasoning-model
+        // gating above.
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("o1-preview", true),
+            None,
+            "has_tools=true must omit reasoning_effort even for a matching reasoning model"
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5", true),
+            None,
+            "has_tools=true must omit reasoning_effort even for a matching reasoning model"
+        );
+        assert_eq!(
+            model_provider.reasoning_effort_for_model("gpt-5.3-codex", true),
+            None,
+            "has_tools=true must omit reasoning_effort even for a matching reasoning model"
         );
     }
 
