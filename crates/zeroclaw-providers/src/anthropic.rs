@@ -17,6 +17,9 @@ const TEMPERATURE_DEFAULT: f64 = 1.0;
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
 const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+use crate::safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, record_safeguard_fallback,
+};
 use crate::stream_guard::AbortOnDrop;
 
 pub struct AnthropicModelProvider {
@@ -215,6 +218,11 @@ struct NativeChatResponse {
     stop_reason: Option<String>,
     #[serde(default)]
     stop_details: Option<NativeStopDetails>,
+    /// Model that actually served this turn. On a server-side-fallback
+    /// response this may differ from the requested model — the primary signal
+    /// read by [`AnthropicModelProvider::detect_server_fallback`].
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// `stop_details` on a refusal response. `explanation` is deliberately not
@@ -268,6 +276,21 @@ struct AnthropicUsage {
     /// Disjoint from `cache_read_input_tokens` and `input_tokens`.
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
+    /// Per-attempt breakdown on a server-side-fallback response. Absent on a
+    /// normal turn; read by [`AnthropicModelProvider::detect_server_fallback`]
+    /// to tell whether a fallback attempt actually served the turn.
+    #[serde(default)]
+    iterations: Option<Vec<AnthropicUsageIteration>>,
+}
+
+/// One attempt inside a server-side-fallback response. Tolerant by design:
+/// unknown `type` values and extra fields mean "not a fallback attempt".
+#[derive(Debug, Deserialize)]
+struct AnthropicUsageIteration {
+    /// Attempt type (JSON `type`); `fallback_message` marks the attempt that
+    /// a server-side fallback model served. Any other/absent value is ignored.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -950,6 +973,71 @@ impl AnthropicModelProvider {
         })
     }
 
+    /// Detect a server-side fallback: Anthropic declined the requested model
+    /// and served the turn with one of the opt-in `fallbacks` targets. Must run
+    /// AFTER `check_refusal` passes (a whole-chain refusal is a refusal, not a
+    /// fallback success) and BEFORE `parse_native_response` consumes the
+    /// response.
+    ///
+    /// Detection keys only on `usage.iterations` (a `fallback_message` attempt
+    /// ran) plus the top-level `model` (who actually served) — never on the
+    /// `fallback` content block, which sticky-routed turns omit. Records at most
+    /// one `ServerSide` notice, and only when the served model is present AND
+    /// differs from the requested one, so a notice never names the requested
+    /// model as its own rescue. The notice's `category` is always `None`: the
+    /// serving response carries no refusal category.
+    fn detect_server_fallback(response: &NativeChatResponse, requested_model: &str) {
+        let fallback_ran = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.iterations.as_ref())
+            .is_some_and(|iterations| {
+                iterations
+                    .iter()
+                    .any(|iteration| iteration.kind.as_deref() == Some("fallback_message"))
+            });
+        if !fallback_ran {
+            return;
+        }
+
+        match response.model.as_deref() {
+            Some(served) if served != requested_model => {
+                record_safeguard_fallback(SafeguardFallbackNotice {
+                    kind: SafeguardFallbackKind::ServerSide,
+                    requested_model: requested_model.to_string(),
+                    served_model: served.to_string(),
+                    category: None,
+                });
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_attrs(::serde_json::json!({
+                            "requested_model": requested_model,
+                            "served_model": served,
+                        })),
+                    "anthropic server-side fallback: turn served by a fallback model"
+                );
+            }
+            _ => {
+                // A fallback attempt ran but the served model is absent or
+                // self-referential (== requested). Record no notice — it would
+                // name the requested model as its own rescue — but still log so
+                // ops see that a fallback ran.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_attrs(::serde_json::json!({
+                            "requested_model": requested_model,
+                            "served_model": response.model,
+                        })),
+                    "anthropic server-side fallback ran but served model is absent or self-referential"
+                );
+            }
+        }
+    }
+
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
@@ -1415,6 +1503,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         Self::check_refusal(&chat_response, model)?;
+        Self::detect_server_fallback(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response);
         parsed.text.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -1529,6 +1618,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let native_response: NativeChatResponse = response.json().await?;
         Self::check_refusal(&native_response, model)?;
+        Self::detect_server_fallback(&native_response, model);
         Ok(Self::parse_native_response(native_response))
     }
 
@@ -1914,6 +2004,7 @@ impl ::zeroclaw_api::attribution::Attributable for AnthropicModelProvider {
 mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+    use crate::safeguard_notice::{scope_safeguard_fallback, take_last_safeguard_fallback};
 
     fn fake_anthropic_sse() -> &'static [u8] {
         b"event: message_start\n\
@@ -4185,6 +4276,205 @@ data: {\"type\":\"message_stop\"}\n\n";
             msg.contains("anthropic refusal"),
             "unexpected error message: {msg}"
         );
+    }
+
+    // ----- Server-side fallback detection (§4) -------------------------
+
+    #[tokio::test]
+    async fn served_by_fallback_records_server_side_notice() {
+        // Anthropic declined `claude-fable-5` and served the turn with the
+        // opt-in fallback `claude-opus-4-8`. The response also carries a
+        // `{"type":"fallback",...}` content block, which `parse_native_response`
+        // must skip (unknown block types fall through its `_ => {}` arm).
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {
+                    "type": "fallback",
+                    "from": {"type": "model", "model": "claude-fable-5"},
+                    "to": {"type": "model", "model": "claude-opus-4-8"}
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "message"}, {"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            // Unknown `fallback` content block is skipped; only text survives.
+            assert_eq!(
+                result.expect("a server-rescued turn still returns Ok"),
+                "hi"
+            );
+
+            let notice = take_last_safeguard_fallback()
+                .expect("a server-side fallback must record a notice");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ServerSide);
+            assert_eq!(notice.requested_model, "claude-fable-5");
+            assert_eq!(notice.served_model, "claude-opus-4-8");
+            assert_eq!(notice.category, None);
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "at most one safeguard notice per call"
+            );
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sticky_turn_without_fallback_block_still_detected() {
+        // Sticky routing: subsequent turns carry `fallback_message` in
+        // `usage.iterations` but omit the `fallback` content block. Detection
+        // keys on iterations + top-level model, never the content block.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            assert_eq!(result.expect("sticky fallback turn still returns Ok"), "hi");
+
+            let notice = take_last_safeguard_fallback()
+                .expect("a sticky fallback turn must still record a notice");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ServerSide);
+            assert_eq!(notice.requested_model, "claude-fable-5");
+            assert_eq!(notice.served_model, "claude-opus-4-8");
+            assert_eq!(notice.category, None);
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn whole_chain_refusal_is_still_a_refusal() {
+        // A `fallback_message` iteration may be present while the final
+        // `stop_reason` is still `refusal` — the whole chain refused. That is a
+        // refusal (typed error), never a fallback success: `check_refusal` runs
+        // first and errors before `detect_server_fallback` is reached.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 0,
+                "iterations": [{"type": "message"}, {"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            let err = result.expect_err("a whole-chain refusal must surface as an error");
+            err.downcast_ref::<AnthropicRefusalError>()
+                .expect("error must downcast to AnthropicRefusalError");
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "a refusal must NOT record a server-side fallback notice"
+            );
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn iterations_absent_or_unknown_types_mean_no_fallback() {
+        // Absent, empty, and unknown-`type` iterations all mean "no fallback
+        // ran" — tolerant parsing, no notice, no error. `model` differs from
+        // the requested one to prove it is the iterations (not the model) that
+        // gate detection.
+        let usage_variants = vec![
+            serde_json::json!({"input_tokens": 10, "output_tokens": 5}),
+            serde_json::json!({"input_tokens": 10, "output_tokens": 5, "iterations": []}),
+            serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "weird"}]
+            }),
+        ];
+        for usage in usage_variants {
+            let body = serde_json::json!({
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": usage,
+            });
+            let (addr, server) = spawn_messages_server(body).await;
+            let provider = refusal_test_provider(addr);
+
+            scope_safeguard_fallback(async {
+                let result = provider
+                    .chat_with_system(None, "hello", "claude-fable-5", None)
+                    .await;
+                assert_eq!(result.expect("no fallback ran → Ok"), "hi");
+                assert!(
+                    take_last_safeguard_fallback().is_none(),
+                    "absent/empty/unknown iterations must record no notice"
+                );
+            })
+            .await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn served_model_equal_to_requested_records_no_notice() {
+        // A fallback attempt ran, but the served model equals the requested one
+        // (self-referential / malformed). Record no notice — it must never name
+        // the requested model as its own rescue — while the call still succeeds.
+        let body = serde_json::json!({
+            "model": "claude-fable-5",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            assert_eq!(
+                result.expect("self-referential served model still Ok"),
+                "hi"
+            );
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "served == requested must record no notice"
+            );
+        })
+        .await;
+        server.abort();
     }
 
     #[tokio::test]
