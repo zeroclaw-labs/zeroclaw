@@ -1133,13 +1133,14 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    // Resolve the shell output format: declarative jobs read from config
-    // (the canonical source), imperative jobs use the stored field.
-    let output_format: &CronShellOutputFormat = config
-        .cron
-        .get(&job.id)
-        .map(|decl| &decl.shell_output_format)
-        .unwrap_or(&job.shell_output_format);
+    // `job.shell_output_format` is already the canonical value by the time
+    // it reaches here: due_jobs()/all_overdue_jobs() resolve declarative jobs
+    // from config and leave imperative jobs on their stored field (see
+    // resolve_declarative_shell_output_format in store.rs). Re-deriving it
+    // here from `config.cron.get(&job.id)` without checking `job.source`
+    // would let an unrelated same-ID declarative config entry silently
+    // override an imperative job's stored format.
+    let output_format = &job.shell_output_format;
 
     let child = match build_cron_shell_command(&job.command, &config.data_dir) {
         Ok(mut cmd) => match cmd.spawn() {
@@ -1466,20 +1467,12 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     async fn run_job_command_raw_output_success() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        // Insert a config-declared job with raw output format.
-        config.cron.insert(
-            "test-raw-job".into(),
-            zeroclaw_config::schema::CronJobDecl {
-                command: Some("echo raw-format-ok".into()),
-                shell_output_format: CronShellOutputFormat::Raw,
-                ..Default::default()
-            },
-        );
-        // The job id must match the config key for the format to be resolved.
+        let config = test_config(&tmp).await;
+        // The store layer resolves shell_output_format before handing the job
+        // to the scheduler (see resolve_declarative_shell_output_format), so
+        // the job's own field is already canonical by the time it gets here.
         let mut job = test_job("echo raw-format-ok");
-        job.id = "test-raw-job".into();
-        job.source = "declarative".into();
+        job.shell_output_format = CronShellOutputFormat::Raw;
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
@@ -1493,20 +1486,11 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     async fn run_job_command_raw_output_success_drops_stderr() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
+        let config = test_config(&tmp).await;
         // A zero-exit command that still writes to stderr (e.g. a tool's
         // progress/warning chatter) must not leak into raw-mode output.
-        config.cron.insert(
-            "test-raw-stderr".into(),
-            zeroclaw_config::schema::CronJobDecl {
-                command: Some("echo raw-stdout-ok; echo raw-stderr-noise >&2".into()),
-                shell_output_format: CronShellOutputFormat::Raw,
-                ..Default::default()
-            },
-        );
         let mut job = test_job("echo raw-stdout-ok; echo raw-stderr-noise >&2");
-        job.id = "test-raw-stderr".into();
-        job.source = "declarative".into();
+        job.shell_output_format = CronShellOutputFormat::Raw;
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
@@ -1521,18 +1505,9 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     async fn run_job_command_raw_output_failure_still_uses_wrapped() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.cron.insert(
-            "test-raw-fail".into(),
-            zeroclaw_config::schema::CronJobDecl {
-                command: Some("ls definitely_missing_file_raw_test".into()),
-                shell_output_format: CronShellOutputFormat::Raw,
-                ..Default::default()
-            },
-        );
+        let config = test_config(&tmp).await;
         let mut job = test_job("ls definitely_missing_file_raw_test");
-        job.id = "test-raw-fail".into();
-        job.source = "declarative".into();
+        job.shell_output_format = CronShellOutputFormat::Raw;
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
@@ -1541,6 +1516,37 @@ mod tests {
         // so operators can diagnose the failure.
         assert!(output.contains("status=exit status:"));
         assert!(output.contains("definitely_missing_file_raw_test"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_imperative_job_ignores_same_id_declarative_config_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // An unrelated declarative config entry happens to share the
+        // imperative job's ID and asks for raw output. Execution must go by
+        // the job's own (already-resolved) field, not re-derive from config
+        // by ID match, or the imperative job's stored format gets silently
+        // overridden.
+        config.cron.insert(
+            "test-job".into(),
+            zeroclaw_config::schema::CronJobDecl {
+                command: Some("echo collision-ok".into()),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..Default::default()
+            },
+        );
+        let mut job = test_job("echo collision-ok");
+        job.source = "imperative".into();
+        job.shell_output_format = CronShellOutputFormat::Wrapped;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(
+            output.contains("status="),
+            "imperative job's own Wrapped format must win over a same-ID declarative config entry: {output}"
+        );
     }
 
     #[tokio::test]
