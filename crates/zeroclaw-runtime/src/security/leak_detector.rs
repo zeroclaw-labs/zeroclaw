@@ -196,6 +196,28 @@ impl LeakDetector {
                     Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(),
                     "GitHub PAT",
                 ),
+                // Slack
+                (
+                    Regex::new(r"xox[baprs]-[0-9A-Za-z-]{10,}").unwrap(),
+                    "Slack token",
+                ),
+                (
+                    Regex::new(r"xapp-[0-9A-Za-z-]{10,}").unwrap(),
+                    "Slack app-level token",
+                ),
+                (
+                    Regex::new(r"xwfp-[0-9A-Za-z-]{10,}").unwrap(),
+                    "Slack workflow token",
+                ),
+                (
+                    // Rotation family: refresh tokens (`xoxe-…`) and rotated
+                    // access tokens (`xoxe.xoxb-…`, `xoxe.xoxp-…`). The base
+                    // `xox[baprs]-` class excludes `e`, and matching only the
+                    // inner `xoxb-`/`xoxp-` would leave the `xoxe.` prefix
+                    // unredacted, so cover the whole token explicitly.
+                    Regex::new(r"xoxe[.-][0-9A-Za-z.-]{10,}").unwrap(),
+                    "Slack refresh/rotated token",
+                ),
                 // Generic
                 (
                     Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
@@ -1286,6 +1308,79 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(!redacted.contains("123456:ABC-def_GHI"));
             }
             LeakResult::Clean => panic!("Should detect Telegram bot token"),
+        }
+    }
+
+    #[test]
+    fn detects_slack_tokens() {
+        // High-entropy scanning is disabled so each case proves the *specific*
+        // Slack pattern redacts the token, not the entropy fallback (which a
+        // user may turn off while these credential patterns stay enabled).
+        // `absent` is the substring that must not survive redaction: for the
+        // rotated `xoxe.` forms it is the leading `xoxe` prefix, proving the
+        // whole token is redacted rather than only the inner `xoxb-`/`xoxp-`.
+        let config = LeakDetectionConfig {
+            high_entropy_tokens: false,
+            ..Default::default()
+        };
+        let detector = LeakDetector::with_config(&config);
+
+        // (label, content, substring that must be gone from the output)
+        // Placeholder token bodies are all-`x`: they satisfy the detector
+        // patterns without resembling real credentials, so secret-scanning
+        // push protection does not flag this test as a leaked token.
+        let cases = [
+            (
+                "bot",
+                "SLACK_BOT_TOKEN=xoxb-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xoxb-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "user",
+                "xoxp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xoxp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "app-level",
+                "xapp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xapp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "workflow",
+                "xwfp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xwfp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "refresh",
+                "xoxe-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xoxe-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ),
+            (
+                "rotated bot",
+                "xoxe.xoxb-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xoxe",
+            ),
+            (
+                "rotated user",
+                "xoxe.xoxp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "xoxe",
+            ),
+        ];
+
+        for (label, content, absent) in cases {
+            match detector.scan(content) {
+                LeakResult::Detected { patterns, redacted } => {
+                    assert!(
+                        patterns.iter().any(|p| p.contains("Slack")),
+                        "{label}: expected a Slack pattern, got {patterns:?}"
+                    );
+                    assert!(
+                        !redacted.contains(absent),
+                        "{label}: `{absent}` survived redaction in `{redacted}`"
+                    );
+                }
+                LeakResult::Clean => panic!("{label}: Slack token not detected"),
+            }
         }
     }
 
