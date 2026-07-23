@@ -7,7 +7,7 @@ use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -88,6 +88,12 @@ pub(crate) async fn emit_tool_result(
             id: id.to_string(),
             name: name.to_string(),
             output: scrub_credentials(&outcome.output),
+            // Project the tool's structured output into typed artifact metadata
+            // when it declared a delivered file, so channels never parse `output`.
+            artifact: outcome
+                .output_data
+                .as_ref()
+                .and_then(ToolArtifact::from_delivered_data),
         })
         .await;
 }

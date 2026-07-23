@@ -1173,7 +1173,9 @@ async fn process_chat_message(
                         TurnEvent::ToolCall { id, name, args } => {
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
-                        TurnEvent::ToolResult { id, name, output } => {
+                        TurnEvent::ToolResult {
+                            id, name, output, ..
+                        } => {
                             serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                         }
                         TurnEvent::ApprovalRequest {
