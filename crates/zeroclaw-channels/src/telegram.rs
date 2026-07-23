@@ -67,6 +67,11 @@ struct MultiDraftState {
     /// partial failure this is advanced to the count of chunks that
     /// succeeded, so the next flush resumes instead of re-sending them.
     delivered_chunks: usize,
+    /// Concatenation of the first `delivered_chunks` chunk partitions from
+    /// the attempt that produced them. Re-validated against the current
+    /// split on the next flush before trusting `delivered_chunks` as a skip
+    /// count, since tag-rewriting can change what the earlier chunks are.
+    delivered_prefix: String,
 }
 
 impl MultiDraftState {
@@ -78,6 +83,7 @@ impl MultiDraftState {
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_sent_at: None,
             delivered_chunks: 0,
+            delivered_prefix: String::new(),
         }
     }
 }
@@ -910,6 +916,7 @@ impl TelegramChannel {
             else {
                 draft.sent_text = current;
                 draft.delivered_chunks = 0;
+                draft.delivered_prefix = String::new();
                 return Ok(());
             };
             let thread_id = draft.thread_id.clone().or(parsed_thread);
@@ -926,6 +933,7 @@ impl TelegramChannel {
             if let Some(draft) = drafts.get_mut(&key) {
                 draft.sent_text = current;
                 draft.delivered_chunks = 0;
+                draft.delivered_prefix = String::new();
             }
             return Ok(());
         }
@@ -934,7 +942,14 @@ impl TelegramChannel {
 
         let skip = {
             let drafts = self.multi_message_drafts.lock();
-            drafts.get(&key).map(|d| d.delivered_chunks).unwrap_or(0)
+            let d = drafts.get(&key);
+            let delivered = d.map(|d| d.delivered_chunks).unwrap_or(0);
+            let prefix = d.map(|d| d.delivered_prefix.clone()).unwrap_or_default();
+            let chunks = split_message_for_telegram(cleaned);
+            let ok = delivered > 0
+                && chunks.len() >= delivered
+                && chunks[..delivered].concat() == prefix;
+            if ok { delivered } else { 0 }
         };
         match self
             .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
@@ -946,13 +961,21 @@ impl TelegramChannel {
                     draft.sent_text = current;
                     draft.last_sent_at = Some(std::time::Instant::now());
                     draft.delivered_chunks = 0;
+                    draft.delivered_prefix = String::new();
                 }
             }
             Err(e) => {
                 {
                     let mut drafts = self.multi_message_drafts.lock();
                     if let Some(draft) = drafts.get_mut(&key) {
+                        let chunks = split_message_for_telegram(cleaned);
                         draft.delivered_chunks = e.delivered;
+                        draft.delivered_prefix = chunks
+                            .iter()
+                            .take(e.delivered)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .concat();
                     }
                 }
                 ::zeroclaw_log::record!(
@@ -5321,6 +5344,113 @@ mod tests {
             resume_requests,
             total - 1,
             "chunk 0 must not be re-sent on resume"
+        );
+    }
+
+    /// Regression: the delivered-chunk skip count from a prior partial
+    /// failure must not be trusted blindly. If the stored `delivered_prefix`
+    /// no longer matches the first `delivered_chunks` partitions of the
+    /// current split (e.g. tag-rewriting changed earlier text), `flush_unsent`
+    /// must fall back to a full resend rather than skip stale chunks.
+    #[tokio::test]
+    async fn flush_unsent_resends_full_message_when_delivered_prefix_mismatches() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+
+        let recipient = "100:7";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let big = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH * 3);
+        let chunks = split_message_for_telegram(&big);
+        assert!(chunks.len() >= 2, "test message must span multiple chunks");
+
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut state = MultiDraftState::new(Some("7".into()));
+            state.latest_visible = big.clone();
+            // Simulate a prior partial failure that recorded 1 delivered
+            // chunk, but whose stored prefix no longer matches chunk 0 of
+            // the current split (as would happen after a tag-rewrite).
+            state.delivered_chunks = 1;
+            state.delivered_prefix = "ZZZZ this does not match chunk 0".to_string();
+            drafts.insert(
+                TelegramChannel::multi_draft_key(recipient, &draft_id),
+                state,
+            );
+        }
+
+        ch.flush_unsent(recipient, &draft_id).await.unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            chunks.len(),
+            "a stale/mismatched delivered_prefix must force every chunk \
+             (including chunk 0) to be resent, not just the unsent suffix"
+        );
+    }
+
+    /// Companion to the mismatch case above: when `delivered_prefix` DOES
+    /// match the current split's first `delivered_chunks` partitions, the
+    /// already-delivered chunk must still be skipped on resume.
+    #[tokio::test]
+    async fn flush_unsent_skips_delivered_chunk_when_prefix_matches() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+
+        let recipient = "100:7";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let big = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH * 3);
+        let chunks = split_message_for_telegram(&big);
+        assert!(chunks.len() >= 2, "test message must span multiple chunks");
+
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut state = MultiDraftState::new(Some("7".into()));
+            state.latest_visible = big.clone();
+            state.delivered_chunks = 1;
+            state.delivered_prefix = chunks[..1].concat();
+            drafts.insert(
+                TelegramChannel::multi_draft_key(recipient, &draft_id),
+                state,
+            );
+        }
+
+        ch.flush_unsent(recipient, &draft_id).await.unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            chunks.len() - 1,
+            "a validated delivered_prefix must still let the already-sent \
+             chunk be skipped on resume"
         );
     }
 
