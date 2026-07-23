@@ -1509,6 +1509,7 @@ mod tests {
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
         message: &str,
         job_id: &str,
+        matches: impl Fn(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -1526,7 +1527,9 @@ mod tests {
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| id == job_id) =>
                 {
-                    return value;
+                    if matches(&value) {
+                        return value;
+                    }
                 }
                 Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
@@ -1931,7 +1934,7 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
 
-        let value = recv_log_event(&mut rx, "Removed cron job", &job.id).await;
+        let value = recv_log_event(&mut rx, "Removed cron job", &job.id, |_| true).await;
         assert_eq!(value["event"]["category"], "cron");
         assert_eq!(value["event"]["action"], "delete");
         assert_eq!(value["event"]["outcome"], "success");

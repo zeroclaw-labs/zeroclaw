@@ -605,6 +605,10 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
+        if self.dispatch_inbound_response(line) {
+            return;
+        }
+
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
@@ -800,6 +804,31 @@ impl RpcDispatcher {
             Ok(v) => self.send_result(id, v).await,
             Err(e) => self.send_error(id, e.code, &e.message).await,
         }
+    }
+
+    fn dispatch_inbound_response(&self, line: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        if !value.is_object()
+            || value.get("method").is_some()
+            || (value.get("result").is_none() && value.get("error").is_none())
+        {
+            return false;
+        }
+        let Some(id) = value.get("id") else {
+            return false;
+        };
+        let id_str = id
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| id.to_string());
+        let result = value.get("result").cloned();
+        let error: Option<JsonRpcError> = value
+            .get("error")
+            .and_then(|e| serde_json::from_value(e.clone()).ok());
+        self.rpc.dispatch_response(&id_str, result, error);
+        true
     }
 
     // ── Core handlers ────────────────────────────────────────────
@@ -6031,6 +6060,19 @@ mod tests {
         RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
     }
 
+    fn make_response_frame_test_dispatcher() -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>)
+    {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (
+            RpcDispatcher::new(ctx, tx, "test-peer-response:pid=1".into()),
+            rx,
+        )
+    }
+
     #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
@@ -6052,6 +6094,86 @@ mod tests {
     fn doctor_run_method_is_registered() {
         assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
         assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_standard_response_frames_to_pending_outbound_request() {
+        let (mut dispatcher, mut write_rx) = make_response_frame_test_dispatcher();
+        let rpc = Arc::clone(&dispatcher.rpc);
+
+        let pending = zeroclaw_spawn::spawn!(async move {
+            rpc.request("client/ping", json!({"ping": true})).await
+        });
+
+        let outbound = tokio::time::timeout(std::time::Duration::from_secs(1), write_rx.recv())
+            .await
+            .expect("outbound request should be written")
+            .expect("writer channel should stay open");
+        let outbound_frame: Value = serde_json::from_str(&outbound).unwrap();
+        assert_eq!(outbound_frame["method"], "client/ping");
+        let id = outbound_frame["id"].clone();
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"ok": true}
+                })
+                .to_string(),
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("standard response frame should release pending outbound request")
+            .expect("outbound request task should not panic")
+            .expect("response should be successful");
+        assert_eq!(result, json!({"ok": true}));
+        assert!(matches!(
+            write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_standard_error_frames_to_pending_outbound_request() {
+        let (mut dispatcher, mut write_rx) = make_response_frame_test_dispatcher();
+        let rpc = Arc::clone(&dispatcher.rpc);
+
+        let pending =
+            zeroclaw_spawn::spawn!(async move { rpc.request("client/fail", json!({})).await });
+
+        let outbound = tokio::time::timeout(std::time::Duration::from_secs(1), write_rx.recv())
+            .await
+            .expect("outbound request should be written")
+            .expect("writer channel should stay open");
+        let outbound_frame: Value = serde_json::from_str(&outbound).unwrap();
+        assert_eq!(outbound_frame["method"], "client/fail");
+        let id = outbound_frame["id"].clone();
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32603, "message": "client failed"}
+                })
+                .to_string(),
+            )
+            .await;
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("standard error frame should release pending outbound request")
+            .expect("outbound request task should not panic")
+            .expect_err("response should be an error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert_eq!(err.message, "client failed");
+        assert!(matches!(
+            write_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
