@@ -1,8 +1,7 @@
-// Pure completion/turn-stream reducer extracted from AgentContext's WebSocket
-// handler so the `done`/`message` classification is testable without mounting
-// React. The handler holds the same fields in refs and delegates the decision
-// here; see AgentContext.tsx. Behavior mirrors the handler exactly — this file
-// makes no DOM/i18n/UUID side effects, it only classifies.
+// Pure completion/turn-stream reducer used by AgentContext's WebSocket handler
+// so the production lifecycle is testable without mounting React. This file
+// makes no DOM/i18n/UUID side effects; it owns only per-turn stream state and
+// completion classification.
 
 /** Accumulated per-turn streaming state the reducer folds frames into. */
 export interface TurnStreamState {
@@ -27,9 +26,9 @@ export function initialTurnStreamState(): TurnStreamState {
   };
 }
 
-/** The reducer-relevant subset of the gateway's WebSocket frames. The handler
- *  maps a `WsMessage` to one of these before folding; frames the completion
- *  decision does not depend on (tool_result, approval, etc.) are not modeled. */
+/** Events that affect the current turn's accumulated stream state. The handler
+ *  maps gateway frames and local lifecycle boundaries to these before folding;
+ *  events the completion decision does not depend on are not modeled. */
 export type TurnStreamFrame =
   | { type: 'thinking'; content?: string }
   | { type: 'chunk'; content?: string }
@@ -38,7 +37,10 @@ export type TurnStreamFrame =
   // observability telemetry frame is not a real tool call and must not flip
   // `hadToolCall` (issue #7151).
   | { type: 'tool_call'; hasName: boolean }
-  | { type: 'done' | 'message'; full_response?: string; content?: string };
+  | { type: 'done' | 'message'; full_response?: string; content?: string }
+  // Every terminal/non-completion boundary resets the same canonical state.
+  // `turn_start` is emitted locally after a new message is sent.
+  | { type: 'turn_start' | 'aborted' | 'error' | 'reset' };
 
 /** What the handler should do with the finished turn. `commit` renders an
  *  assistant bubble (possibly empty content when reasoning is present);
@@ -118,5 +120,10 @@ export function reduceTurnFrame(
       // Turn is over: hand back fresh state so the next turn starts clean.
       return { state: initialTurnStreamState(), completion };
     }
+    case 'turn_start':
+    case 'aborted':
+    case 'error':
+    case 'reset':
+      return { state: initialTurnStreamState(), completion: null };
   }
 }

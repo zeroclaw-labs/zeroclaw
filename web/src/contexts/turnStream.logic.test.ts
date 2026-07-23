@@ -153,6 +153,21 @@ test('empty second turn diagnoses instead of inheriting turn 1 tool call', () =>
   ]);
 });
 
+test('error then new turn discards thinking captured before the error', () => {
+  // Regression sequence from review: the first turn snapshots reasoning, then
+  // fails. Starting a new turn must not let that stale reasoning turn an empty
+  // completion into a reasoning-only assistant message.
+  const { state, completions } = runFrames([
+    { type: 'thinking', content: 'stale reasoning' },
+    { type: 'chunk_reset' },
+    { type: 'error' },
+    { type: 'turn_start' },
+    { type: 'done', full_response: '' },
+  ]);
+  assert.deepEqual(completions, [{ kind: 'diagnostic' }]);
+  assert.deepEqual(state, initialTurnStreamState());
+});
+
 // ── classifyCompletion fallback chain (full_response ?? content ?? pending) ──
 
 test('classifyCompletion falls back to frame content then pending stream', () => {

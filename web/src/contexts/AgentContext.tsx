@@ -7,7 +7,12 @@ import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSessio
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
-import { classifyCompletion } from '@/contexts/turnStream.logic';
+import {
+  initialTurnStreamState,
+  reduceTurnFrame,
+  type TurnStreamFrame,
+  type TurnStreamState,
+} from '@/contexts/turnStream.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -131,14 +136,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
-  const pendingContentRef = useRef('');
-  const pendingThinkingRef = useRef('');
-  const capturedThinkingRef = useRef('');
-  // Set when any `tool_call` frame arrives during the current turn. Lets the
-  // done/message handler tell "empty completion with tool calls" (normal — the
-  // tool cards are the visible record) from "empty completion with nothing at
-  // all" (needs a no-output diagnostic). Mirrors zerocode's turn_had_tool_calls.
-  const turnHadToolCallRef = useRef(false);
+  // Canonical per-turn stream state. Every production transition that mutates
+  // it goes through reduceTurnFrame, which is exercised directly by the
+  // frame-sequence regression suite.
+  const turnStreamStateRef = useRef<TurnStreamState>(initialTurnStreamState());
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
@@ -215,6 +216,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => clearTimeout(id);
   }, [pendingApproval]);
 
+  const foldTurnStream = useCallback((frame: TurnStreamFrame) => {
+    const result = reduceTurnFrame(turnStreamStateRef.current, frame);
+    turnStreamStateRef.current = result.state;
+    return result;
+  }, []);
+
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
@@ -222,43 +229,36 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       case 'connected':
         break;
 
-      case 'thinking':
+      case 'thinking': {
         setTyping(true);
-        pendingThinkingRef.current += msg.content ?? '';
-        setStreamingThinking(pendingThinkingRef.current);
+        const { state } = foldTurnStream({ type: 'thinking', content: msg.content });
+        setStreamingThinking(state.pendingThinking);
         break;
+      }
 
-      case 'chunk':
+      case 'chunk': {
         setTyping(true);
-        pendingContentRef.current += msg.content ?? '';
-        setStreamingContent(pendingContentRef.current);
+        const { state } = foldTurnStream({ type: 'chunk', content: msg.content });
+        setStreamingContent(state.pendingContent);
         break;
+      }
 
       case 'chunk_reset':
         // Server signals that the authoritative done message follows.
         // Snapshot thinking before clearing display state.
-        capturedThinkingRef.current = pendingThinkingRef.current;
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
+        foldTurnStream({ type: 'chunk_reset' });
         setStreamingContent('');
         setStreamingThinking('');
         break;
 
       case 'message':
       case 'done': {
-        // Classify the finished turn with the pure reducer so the reasoning-only
-        // / empty / tool-only decision is unit-tested (turnStream.logic.ts). The
-        // four refs below are this turn's accumulated stream state.
-        const outcome = classifyCompletion(
-          {
-            pendingContent: pendingContentRef.current,
-            pendingThinking: pendingThinkingRef.current,
-            capturedThinking: capturedThinkingRef.current,
-            hadToolCall: turnHadToolCallRef.current,
-          },
-          { full_response: msg.full_response, content: msg.content },
-        );
-        if (outcome.kind === 'commit') {
+        const { completion: outcome } = foldTurnStream({
+          type: msg.type,
+          full_response: msg.full_response,
+          content: msg.content,
+        });
+        if (outcome?.kind === 'commit') {
           // `commit` includes reasoning-only turns: empty content but present
           // thinking, so the turn renders instead of vanishing silently.
           localMessageMutationVersionRef.current += 1;
@@ -273,7 +273,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               timestamp: new Date(),
             },
           ]);
-        } else if (outcome.kind === 'diagnostic') {
+        } else if (outcome?.kind === 'diagnostic') {
           // Clean completion with nothing at all — surface a one-off notice so
           // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
           // fallback (#8779). `skip` (empty + tool calls ran) renders nothing.
@@ -302,10 +302,6 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
             setContextInputTokens(msg.input_tokens);
           }
         }
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
-        capturedThinkingRef.current = '';
-        turnHadToolCallRef.current = false;
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
@@ -313,6 +309,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_call': {
+        const { state } = foldTurnStream({
+          type: 'tool_call',
+          hasName: Boolean(msg.name),
+        });
         // Defense in depth (issue #7151): the chat WebSocket shares a broadcast
         // bus with observability telemetry, whose `tool_call` frames have a
         // different shape (`tool`/`duration_ms`/`success`) and carry no `name`.
@@ -323,13 +323,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         if (!msg.name) {
           break;
         }
-        turnHadToolCallRef.current = true;
         const toolName = msg.name;
         const toolArgs = msg.args;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const argsKey = JSON.stringify(toolArgs ?? {});
-          if (pendingContentRef.current) {
+          if (state.pendingContent) {
             const isDuplicate = prev.some(
               (m) => m.toolCall
                 && m.toolCall.output === undefined
@@ -449,10 +448,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // Gateway sends this after a cancelled turn; the parked approval (if
         // any) is no longer valid because its request_id belongs to the old
         // turn. Clear so the banner does not linger across the abort.
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
-        capturedThinkingRef.current = '';
-        turnHadToolCallRef.current = false;
+        foldTurnStream({ type: 'aborted' });
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
@@ -478,14 +474,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
         setTyping(false);
-        pendingContentRef.current = '';
-        pendingThinkingRef.current = '';
+        foldTurnStream({ type: 'error' });
         setStreamingContent('');
         setStreamingThinking('');
         setPendingApproval(null);
         break;
     }
-  }, []);
+  }, [foldTurnStream]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: WebSocketClient) => {
@@ -636,9 +631,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     try {
       wsRef.current.sendMessage(content);
       setTyping(true);
-      pendingContentRef.current = '';
-      pendingThinkingRef.current = '';
-      turnHadToolCallRef.current = false;
+      foldTurnStream({ type: 'turn_start' });
       localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,
@@ -653,7 +646,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     } catch {
       setError(t('agent.send_error'));
     }
-  }, []);
+  }, [foldTurnStream]);
 
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
@@ -715,9 +708,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       // Abort any in-flight streaming before rebuilding the connection.
-      pendingContentRef.current = '';
-      pendingThinkingRef.current = '';
-      capturedThinkingRef.current = '';
+      foldTurnStream({ type: 'reset' });
       setStreamingContent('');
       setStreamingThinking('');
       setTyping(false);
@@ -767,7 +758,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -780,9 +771,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // so it can't repopulate the just-cleared view.
     localMessageMutationVersionRef.current += 1;
     setMessages([]);
-    pendingContentRef.current = '';
-    pendingThinkingRef.current = '';
-    capturedThinkingRef.current = '';
+    foldTurnStream({ type: 'reset' });
     setStreamingContent('');
     setStreamingThinking('');
     setTyping(false);
@@ -830,7 +819,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         ws.connect();
       }
     })();
-  }, [agentAlias, attachSocketCallbacks]);
+  }, [agentAlias, attachSocketCallbacks, foldTurnStream]);
 
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
