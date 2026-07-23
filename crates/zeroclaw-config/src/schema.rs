@@ -21865,13 +21865,21 @@ fn lookup_table_in_doc<'a>(
     Some(cursor)
 }
 
+/// `TableLike` rather than `Table` for the traversal cursor — same reason
+/// as `lookup_table_in_doc` above: a map-key section may live inside a
+/// hand-edited inline table (`openai = { "gpt-4.1" = { ... } }`), which
+/// parses as `Item::Value(Value::InlineTable)`. `as_table_mut()` returns
+/// `None` for that shape, so a `Table`-only cursor would silently return
+/// without removing anything — `save_dirty` reports success while the key
+/// stays on disk. `as_table_like_mut()` descends into both `Table` and
+/// `InlineTable`, and `TableLike::remove` deletes from either.
 fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
     let Some((last, parents)) = segs.split_last() else {
         return;
     };
-    let mut cursor: &mut toml_edit::Table = root;
+    let mut cursor: &mut dyn toml_edit::TableLike = root;
     for seg in parents {
-        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
+        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_like_mut()) {
             Some(t) => t,
             None => return,
         };
@@ -21879,16 +21887,20 @@ fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
     cursor.remove(last);
 }
 
+/// Same `TableLike` traversal as `delete_path_in_doc`, for the same
+/// reason: a write into a key that already lives inside a hand-edited
+/// inline table must land in that inline table rather than silently
+/// no-op-ing because the cursor only understood standard `Table` nodes.
 fn set_path_in_doc(root: &mut toml_edit::Table, segs: &[&str], value: &toml::Value) {
     let Some((last, parents)) = segs.split_last() else {
         return;
     };
-    let mut cursor: &mut toml_edit::Table = root;
+    let mut cursor: &mut dyn toml_edit::TableLike = root;
     for seg in parents {
         if !cursor.contains_key(seg) {
             cursor.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
         }
-        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
+        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_like_mut()) {
             Some(t) => t,
             None => return,
         };
@@ -29533,13 +29545,12 @@ group_policy = "disabled"
     /// ZeroClaw never writes inline tables but loads hand-edited ones
     /// fine, so a map-key section shaped `openai = { "gpt-4.1" = { ... } }`
     /// parses as `Item::Value(Value::InlineTable)` — invisible to a
-    /// `Table`-only doc walk. The doc-side key lookup must go through
-    /// `TableLike` or a delete of such a key (gone from memory, inline-only
-    /// on disk) trips the unresolvable-key bail and aborts the whole
-    /// `save_dirty` batch — a hard regression from the previous worst
-    /// case of a silent partial no-op. (Actually pruning the inline entry
-    /// is out of scope: `delete_path_in_doc` shares the file-wide
-    /// Table-only walk convention.)
+    /// `Table`-only doc walk. Both halves must go through `TableLike`:
+    /// resolving the key (read side) so the batch doesn't abort, and
+    /// actually removing it from the inline table (write side) so the
+    /// deletion isn't reported as successful while the key survives on
+    /// disk — a mutable traversal that only understood `Table` would
+    /// resolve the key, then silently return without deleting anything.
     #[test]
     async fn save_dirty_resolves_map_key_from_inline_table_on_disk() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -29566,9 +29577,97 @@ group_policy = "disabled"
         );
 
         let written = std::fs::read_to_string(&config_path).unwrap();
-        written
+        let doc = written
             .parse::<toml_edit::DocumentMut>()
             .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+
+        // The delete must actually take effect on disk, not just resolve
+        // and then no-op: reporting `Ok(())` while the key survives is
+        // the silent-persistence failure this section of `save_dirty`
+        // exists to eliminate.
+        assert!(
+            !written.contains("gpt-4.1"),
+            "deleted key must not remain anywhere in the rewritten file; got:\n{written}"
+        );
+        let openai_item = doc
+            .get("cost")
+            .and_then(|i| i.get("rates"))
+            .and_then(|i| i.get("providers"))
+            .and_then(|i| i.get("models"))
+            .and_then(|i| i.get("openai"))
+            .expect("openai entry must survive the delete of its only sub-key");
+        let openai_table = openai_item.as_table_like().expect(
+            "openai entry must still be table-like (Table or InlineTable) after the delete",
+        );
+        assert!(
+            !openai_table.contains_key("gpt-4.1"),
+            "gpt-4.1 must be removed from the on-disk openai inline table; got:\n{written}"
+        );
+    }
+
+    /// Write half of the inline-table fix: a value living inside a
+    /// hand-edited inline table must be updated in place, not just
+    /// resolved-and-ignored. Same doc shape as
+    /// `save_dirty_resolves_map_key_from_inline_table_on_disk`, but the
+    /// key stays in memory with a changed value instead of being dropped.
+    #[test]
+    async fn save_dirty_persists_write_into_inline_table_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [cost.rates.providers.models]\n\
+             openai = {{ \"gpt-4.1\" = {{ input_per_mtok = 1.0 }} }}\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        config
+            .set_prop_persistent(
+                "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "9.9",
+            )
+            .expect("set_prop_persistent must route through the dotted resource key");
+
+        config.save_dirty().await.expect(
+            "a write into a key resolved through an on-disk inline table must not abort the save",
+        );
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let doc = written
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+
+        assert!(
+            written.contains("9.9"),
+            "save_dirty must write the new input_per_mtok into the inline table; got:\n{written}"
+        );
+        let rates_item = doc
+            .get("cost")
+            .and_then(|i| i.get("rates"))
+            .and_then(|i| i.get("providers"))
+            .and_then(|i| i.get("models"))
+            .and_then(|i| i.get("openai"))
+            .and_then(|i| i.get("gpt-4.1"))
+            .and_then(|i| i.get("input_per_mtok"))
+            .expect("input_per_mtok must survive as a leaf inside the on-disk inline table");
+        assert_eq!(
+            rates_item.as_float(),
+            Some(9.9),
+            "the on-disk inline-table leaf must reflect the written value; got:\n{written}"
+        );
     }
 
     /// Loud-failure guard: a dirty path that resolves to a
