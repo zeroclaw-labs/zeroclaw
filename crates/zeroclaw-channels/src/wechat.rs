@@ -7,7 +7,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::paths::{normalize_lexical, resolve_under};
@@ -522,64 +522,6 @@ fn build_base_info() -> serde_json::Value {
     serde_json::json!({
         "channel_version": env!("CARGO_PKG_VERSION")
     })
-}
-
-static CODE_BLOCK_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap());
-static IMAGE_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
-static LINK_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
-static HEADING_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap());
-static BLOCKQUOTE_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^>\s?").unwrap());
-static BULLET_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap());
-static EMPHASIS_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap());
-static TABLE_SEPARATOR_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap());
-static TABLE_ROW_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^\|(.+)\|$").unwrap());
-
-fn markdown_to_plain_text(text: &str) -> String {
-    let mut result = CODE_BLOCK_RE.replace_all(text, "$1").into_owned();
-    result = IMAGE_RE.replace_all(&result, "").into_owned();
-    result = LINK_RE.replace_all(&result, "$1").into_owned();
-
-    let mut lines = Vec::new();
-    for line in result.lines() {
-        if TABLE_SEPARATOR_RE.is_match(line) {
-            continue;
-        }
-
-        if let Some(captures) = TABLE_ROW_RE.captures(line) {
-            let inner = captures.get(1).map(|value| value.as_str()).unwrap_or("");
-            lines.push(
-                inner
-                    .split('|')
-                    .map(str::trim)
-                    .filter(|cell| !cell.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("  "),
-            );
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-
-    result = lines.join("\n");
-    result = HEADING_RE.replace_all(&result, "").into_owned();
-    result = BLOCKQUOTE_RE.replace_all(&result, "").into_owned();
-    result = BULLET_RE.replace_all(&result, "").into_owned();
-    result = EMPHASIS_RE.replace_all(&result, "").into_owned();
-
-    while result.contains("\n\n\n") {
-        result = result.replace("\n\n\n", "\n\n");
-    }
-
-    result.trim().to_string()
 }
 
 fn render_login_qr(code: &str) -> anyhow::Result<String> {
@@ -1942,7 +1884,7 @@ impl WeChatChannel {
             to,
             vec![serde_json::json!({
                 "type": ITEM_TYPE_TEXT,
-                "text_item": { "text": markdown_to_plain_text(text) }
+                "text_item": { "text": text }
             })],
             context_token,
         )
@@ -3058,15 +3000,6 @@ mod tests {
         let spec = WeChatChannel::find_inbound_attachment(&items, "123").unwrap();
         assert_eq!(spec.kind, WeChatAttachmentKind::Image);
         assert_eq!(spec.encrypted_query_param, "direct");
-    }
-
-    #[test]
-    fn markdown_to_plain_text_strips_common_formatting() {
-        let input = "# Title\n**bold** [link](https://example.com)\n\n```rust\nlet x = 1;\n```";
-        assert_eq!(
-            markdown_to_plain_text(input),
-            "Title\nbold link\n\nlet x = 1;"
-        );
     }
 
     #[test]
