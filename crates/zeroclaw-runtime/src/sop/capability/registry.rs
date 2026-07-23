@@ -48,13 +48,22 @@ impl SopCapabilityRegistry {
                     sop.name, step.number
                 )
             })?;
-            if !self.contains(id) {
-                bail!(
+            let capability = self.capabilities.get(id).with_context(|| {
+                format!(
                     "SOP '{}' step {} references unknown capability '{}'",
-                    sop.name,
-                    step.number,
-                    id
-                );
+                    sop.name, step.number, id
+                )
+            })?;
+            if capability.requires_authored_input() {
+                let authored = authored_capability_input(capability.as_ref(), step)?;
+                if let Some(schema) = capability.describe().input_schema.as_ref() {
+                    schema::validate_value(schema, &authored).with_context(|| {
+                        format!(
+                            "SOP '{}' step {} capability '{id}' authored input is invalid",
+                            sop.name, step.number
+                        )
+                    })?;
+                }
             }
         }
         Ok(())
@@ -74,7 +83,18 @@ impl SopCapabilityRegistry {
             .get(id)
             .with_context(|| format!("unknown SOP capability '{id}'"))?;
         let info = capability.describe();
-        let input = step.capability_call_input(piped_input);
+        let input = if capability.requires_authored_input() {
+            let mut authored = authored_capability_input(capability.as_ref(), step)?;
+            // The authored object is the trusted configuration plane. The piped
+            // value is always data, even when the author included an `input` key.
+            authored
+                .as_object_mut()
+                .expect("authored capability input was validated as an object")
+                .insert("input".to_string(), piped_input);
+            authored
+        } else {
+            step.capability_call_input(piped_input)
+        };
 
         if let Some(schema) = info.input_schema.as_ref() {
             schema::validate_value(schema, &input)
@@ -90,6 +110,22 @@ impl SopCapabilityRegistry {
         }
         Ok(result)
     }
+}
+
+fn authored_capability_input(capability: &dyn SopCapability, step: &SopStep) -> Result<Value> {
+    let configured = step.capability_input.clone().with_context(|| {
+        format!(
+            "capability '{}' requires authored `with` configuration",
+            capability.id()
+        )
+    })?;
+    if !configured.is_object() {
+        bail!(
+            "capability '{}' requires authored `with` configuration to be an object",
+            capability.id()
+        );
+    }
+    Ok(configured)
 }
 
 impl std::fmt::Debug for SopCapabilityRegistry {

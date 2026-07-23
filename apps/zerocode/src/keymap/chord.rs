@@ -7,6 +7,11 @@ use std::str::FromStr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+/// A single keystroke pattern.
+///
+/// On darwin, most `CONTROL` chords are translated to `SUPER` at match time.
+/// Terminal-owned chords such as Ctrl+C, Ctrl+G, and Ctrl+K stay literal so
+/// host shortcuts do not shadow ZeroCode actions.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Chord {
     pub code: KeyCode,
@@ -237,7 +242,7 @@ fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
 fn is_host_reserved_chord(code: &KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char('c' | 'C' | 'n' | 'N' | 's' | 'S') | KeyCode::F(1)
+        KeyCode::Char('c' | 'C' | 'g' | 'G' | 'k' | 'K' | 'n' | 'N' | 's' | 'S') | KeyCode::F(1)
     )
 }
 
@@ -362,8 +367,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_chord_matches_super_event_on_darwin() {
-        let chord = Chord::ctrl('k');
-        let event = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SUPER);
+        let chord = Chord::ctrl('x');
+        let event = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SUPER);
         assert!(chord.matches(&event));
     }
 
@@ -380,11 +385,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn session_chords_stay_terminal_safe_ctrl_on_darwin() {
-        // Host-reserved session chords must retain literal Control
+    fn terminal_safe_chords_stay_literal_ctrl_on_darwin() {
+        // Terminal-owned chords must retain literal Control
         // matching (not the host-reserved Command event) and display
         // with the literal word "Ctrl" plus a separator on darwin.
-        for c in ['n', 's'] {
+        for c in ['n', 's', 'g', 'k'] {
             let chord = Chord::ctrl(c);
             let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             let cmd = KeyEvent::new(KeyCode::Char(c), KeyModifiers::SUPER);
@@ -415,7 +420,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn display_ctrl_on_darwin() {
-        assert_eq!(Chord::ctrl('k').display(), "⌘k");
+        assert_eq!(Chord::ctrl('x').display(), "⌘x");
     }
 
     #[test]

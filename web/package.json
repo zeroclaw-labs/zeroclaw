@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc -b && vite build",
     "dev": "vite",
-    "test": "node --experimental-strip-types --test src/pages/quickstart/runtime-selection.test.ts src/pages/acp-console/thought-stream.test.ts"
+    "test": "node --experimental-strip-types --test src/pages/quickstart/runtime-selection.test.ts src/pages/acp-console/thought-stream.test.ts",
+    "test:permissions": "jiti src/components/ToolPermissionGrid.logic.test.ts && jiti src/lib/toolCatalog.logic.test.ts && jiti src/components/ToolCatalogWarningPanel.test.ts"
   },
   "browserslist": [
     "chrome >= 111",
@@ -42,6 +43,7 @@
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",
     "@vitejs/plugin-react": "^6.0.2",
+    "jiti": "^2.7.0",
     "openapi-typescript": "^7.13.0",
     "rollup": "^4.59.0",
     "tailwindcss": "^4.0.0",

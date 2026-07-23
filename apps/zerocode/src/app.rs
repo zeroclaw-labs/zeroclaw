@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
@@ -10,10 +10,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use tokio::sync::mpsc;
 
 use crate::acp;
 use crate::chat;
-use crate::client::{ConnectionState, RpcClient};
+use crate::client::{ConnectionState, RpcClient, StatusResult};
 use crate::config;
 use crate::config_manager;
 use crate::dashboard;
@@ -54,6 +55,7 @@ enum QuickstartChatDrain {
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
+const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Mode bar entries. Shared between drawing and click detection.
 /// SOP authoring is not exposed from any build: the web dashboard ships as the
@@ -83,6 +85,91 @@ enum Mode {
     Quickstart,
     #[allow(dead_code)]
     Sop,
+}
+
+#[derive(Default)]
+struct ChromeStatus {
+    status: Option<StatusResult>,
+    health: Option<serde_json::Value>,
+    last_poll: Option<Instant>,
+    refresh_in_flight: bool,
+    refresh_rx: Option<mpsc::UnboundedReceiver<ChromeStatusSnapshot>>,
+}
+
+struct ChromeStatusSnapshot {
+    status: Option<StatusResult>,
+    health: Option<serde_json::Value>,
+}
+
+impl ChromeStatus {
+    fn tick(&mut self, rpc: &Arc<RpcClient>) {
+        self.drain_completed_refresh();
+        let due = self
+            .last_poll
+            .map(|t| t.elapsed() >= CHROME_STATUS_POLL_INTERVAL)
+            .unwrap_or(true);
+        if due && !self.refresh_in_flight {
+            self.start_poll(rpc);
+        }
+    }
+
+    fn start_poll(&mut self, rpc: &Arc<RpcClient>) {
+        self.last_poll = Some(Instant::now());
+        self.refresh_in_flight = true;
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.refresh_rx = Some(rx);
+        let rpc = Arc::clone(rpc);
+        tokio::spawn(async move {
+            let status = rpc.status().await.ok();
+            let health = rpc.health().await.ok();
+            let _ = tx.send(ChromeStatusSnapshot { status, health });
+        });
+    }
+
+    fn drain_completed_refresh(&mut self) {
+        let Some(rx) = self.refresh_rx.as_mut() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(snapshot) => {
+                if let Some(status) = snapshot.status {
+                    self.status = Some(status);
+                }
+                if let Some(health) = snapshot.health {
+                    self.health = Some(health);
+                }
+                self.refresh_in_flight = false;
+                self.refresh_rx = None;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.refresh_in_flight = false;
+                self.refresh_rx = None;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.status = None;
+        self.health = None;
+        self.last_poll = None;
+        self.refresh_in_flight = false;
+        self.refresh_rx = None;
+    }
+
+    fn summary_line(&self) -> Option<Line<'static>> {
+        let status = self.status.as_ref()?;
+        let mut text = format!(
+            " v{} {}:{}",
+            status.server_version,
+            crate::i18n::t("zc-chrome-summary-sessions"),
+            status.active_sessions
+        );
+        text.push_str(&process_stats_summary(self.health.as_ref()));
+        text.push(' ');
+        Some(Line::from(Span::styled(text, theme::dim_style())))
+    }
 }
 
 impl Mode {
@@ -269,10 +356,18 @@ pub async fn run(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
     )?;
+    let mut chrome_status = ChromeStatus::default();
+    chrome_status.tick(&rpc);
 
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+        if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+            chrome_status.clear();
+        } else {
+            chrome_status.tick(&rpc);
+        }
+        let chrome_summary = chrome_status.summary_line();
         doctor_pane.poll_refresh().await;
         if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
             doctor_pane.refresh_if_inactive();
@@ -325,11 +420,18 @@ pub async fn run(
                 .split(frame.area());
 
             bar_area = chunks[0];
-            draw_mode_bar(frame, chunks[0], mode);
+            draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
             content_area = chunks[1];
 
             match mode {
-                Mode::Dashboard => dashboard_pane.draw(frame, chunks[1]),
+                Mode::Dashboard => dashboard_pane.draw(
+                    frame,
+                    chunks[1],
+                    chrome_status.status.as_ref(),
+                    chrome_status.health.as_ref(),
+                    acp_pane.current_cwd(),
+                    chat_pane.current_cwd(),
+                ),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
                 Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
@@ -373,29 +475,7 @@ pub async fn run(
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
-                use crate::keymap::RebindableActions;
-                let chord_keys = |chords: Vec<crate::keymap::Chord>| -> Vec<String> {
-                    chords.iter().map(crate::keymap::Chord::display).collect()
-                };
-                let mut node = HelpNode::entries(vec![
-                    HelpEntry::new(
-                        [
-                            chord_keys(crate::keymap::GlobalAction::PaneNavLeft.resolved()),
-                            chord_keys(crate::keymap::GlobalAction::PaneNavRight.resolved()),
-                        ]
-                        .concat(),
-                        crate::i18n::t("zc-app-help-cycle-mode"),
-                    ),
-                    HelpEntry::new(
-                        chord_keys(crate::keymap::GlobalAction::ReloadDaemon.resolved()),
-                        crate::i18n::t("zc-app-help-reload"),
-                    ),
-                    HelpEntry::new(
-                        chord_keys(crate::keymap::GlobalAction::Quit.resolved()),
-                        crate::i18n::t("zc-app-help-quit"),
-                    ),
-                    HelpEntry::spacer(),
-                ]);
+                let mut node = HelpNode::entries(global_help_entries());
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
@@ -472,6 +552,8 @@ pub async fn run(
                                 logs_pane = panes.5;
                                 quickstart = panes.6;
                                 sop_pane = panes.7;
+                                chrome_status.clear();
+                                chrome_status.tick(&rpc);
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -636,9 +718,8 @@ pub async fn run(
                     continue;
                 }
 
-                let help_bypasses_text_input = crate::keymap::help_bypasses_text_input(&key);
                 if global == Some(GlobalAction::Help)
-                    && (!in_text_input || help_bypasses_text_input)
+                    && (!in_text_input || crate::keymap::help_bypasses_text_input(&key))
                 {
                     show_help = true;
                     continue;
@@ -662,6 +743,15 @@ pub async fn run(
                 };
                 if quit {
                     break;
+                }
+                match mode {
+                    Mode::Acp if acp_pane.take_help_request() => {
+                        show_help = true;
+                    }
+                    Mode::Chat if chat_pane.take_help_request() => {
+                        show_help = true;
+                    }
+                    _ => {}
                 }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
                     switch_mode(
@@ -790,6 +880,30 @@ pub async fn run(
     Ok(())
 }
 
+fn global_help_entries() -> Vec<HelpEntry> {
+    use crate::keymap::{GlobalAction, action_key_labels};
+
+    let cycle_keys = action_key_labels(GlobalAction::PaneNavLeft)
+        .into_iter()
+        .chain(action_key_labels(GlobalAction::PaneNavRight));
+    vec![
+        HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(
+            action_key_labels(GlobalAction::Help),
+            crate::i18n::t("zc-app-help-help"),
+        ),
+        HelpEntry::new(
+            action_key_labels(GlobalAction::ReloadDaemon),
+            crate::i18n::t("zc-app-help-reload"),
+        ),
+        HelpEntry::new(
+            action_key_labels(GlobalAction::Quit),
+            crate::i18n::t("zc-app-help-quit"),
+        ),
+        HelpEntry::spacer(),
+    ]
+}
+
 fn resolve_agent_overrides(
     config_dir: &std::path::Path,
 ) -> std::collections::HashMap<String, theme::Theme> {
@@ -807,7 +921,12 @@ fn resolve_agent_overrides(
 
 // ── Mode bar ─────────────────────────────────────────────────────
 
-fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
+fn draw_mode_bar(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    active: Mode,
+    chrome_summary: Option<&Line<'static>>,
+) {
     use ratatui::widgets::Tabs;
 
     let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
@@ -828,7 +947,19 @@ fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
         .highlight_style(theme::selected_style().add_modifier(Modifier::BOLD))
         .divider("│")
         .padding("", "");
-    frame.render_widget(tabs, area);
+
+    if let Some(summary) = chrome_summary {
+        let summary_w = summary.width() as u16;
+        let right_w = summary_w.min(area.width);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(right_w)])
+            .split(area);
+        frame.render_widget(tabs, chunks[0]);
+        frame.render_widget(Paragraph::new(summary.clone()), chunks[1]);
+    } else {
+        frame.render_widget(tabs, area);
+    }
 }
 
 // ── Status bar ───────────────────────────────────────────────────
@@ -921,6 +1052,52 @@ fn draw_status_bar(
     };
     if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
+    }
+}
+
+fn process_stats_summary(health: Option<&serde_json::Value>) -> String {
+    let cpu_label = crate::i18n::t("zc-chrome-summary-cpu");
+    let loading_label = crate::i18n::t("zc-chrome-summary-loading");
+    let Some(h) = health else {
+        return format!(" {cpu_label}:{loading_label}");
+    };
+    let Some(process) = h.get("process") else {
+        return format!(" {cpu_label}:{loading_label}");
+    };
+    let mut parts = Vec::new();
+    if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
+        && rss > 0
+    {
+        let total = process
+            .get("system_ram_total_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let rss_str = format_bytes(rss);
+        let ram_label = crate::i18n::t("zc-chrome-summary-ram");
+        if total > 0 {
+            let pct = (rss as f64 / total as f64) * 100.0;
+            parts.push(format!(" {ram_label}:{rss_str}({pct:.0}%)"));
+        } else {
+            parts.push(format!(" {ram_label}:{rss_str}"));
+        }
+    }
+    if let Some(cpu) = process.get("cpu_percent").and_then(|v| v.as_f64()) {
+        parts.push(format!(" {cpu_label}:{cpu:.1}%"));
+    } else {
+        parts.push(format!(" {cpu_label}:{loading_label}"));
+    }
+    parts.join("")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1}G", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1}M", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -1257,6 +1434,92 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_process_summary_shows_cpu_loading_without_health() {
+        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let loading = crate::i18n::t("zc-chrome-summary-loading");
+
+        assert_eq!(process_stats_summary(None), format!(" {cpu}:{loading}"));
+    }
+
+    #[test]
+    fn chrome_process_summary_shows_ram_and_cpu_values() {
+        let ram = crate::i18n::t("zc-chrome-summary-ram");
+        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let health = serde_json::json!({
+            "process": {
+                "rss_bytes": 1_048_576_u64,
+                "system_ram_total_bytes": 4_194_304_u64,
+                "cpu_percent": 12.345_f64
+            }
+        });
+
+        assert_eq!(
+            process_stats_summary(Some(&health)),
+            format!(" {ram}:1.0M(25%) {cpu}:12.3%")
+        );
+    }
+
+    #[test]
+    fn chrome_process_summary_keeps_cpu_loading_until_sample_exists() {
+        let ram = crate::i18n::t("zc-chrome-summary-ram");
+        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let loading = crate::i18n::t("zc-chrome-summary-loading");
+        let health = serde_json::json!({
+            "process": {
+                "rss_bytes": 1_048_576_u64,
+                "system_ram_total_bytes": 4_194_304_u64
+            }
+        });
+
+        assert_eq!(
+            process_stats_summary(Some(&health)),
+            format!(" {ram}:1.0M(25%) {cpu}:{loading}")
+        );
+    }
+
+    #[tokio::test]
+    async fn chrome_status_tick_starts_refresh_without_waiting_for_rpc_response() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chrome_status = ChromeStatus::default();
+
+        let start = Instant::now();
+        chrome_status.tick(&rpc);
+
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "tick must not wait for the status response"
+        );
+        assert!(
+            chrome_status.refresh_in_flight,
+            "tick should record that the background refresh is still pending"
+        );
+
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("status refresh should send a request")
+            .expect("request channel should stay open");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::STATUS);
+    }
+
+    #[test]
+    fn global_help_entries_include_live_help_binding() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let entries = global_help_entries();
+        let help = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-app-help-help"))
+            .expect("global Help section should include its own opening binding");
+        let expected = action_key_labels(GlobalAction::Help);
+
+        assert_eq!(help.keys, expected);
+    }
 
     #[test]
     fn quickstart_chat_handoff_consumes_immediate_target() {

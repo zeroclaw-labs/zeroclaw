@@ -29,7 +29,6 @@ console = "0.16"
 cron = "0.15"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
-flate2 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 glob = "0.3"
 hex = "0.4"
@@ -78,7 +77,6 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 zeroclaw-macros.workspace = true
 
 # Optional deps
