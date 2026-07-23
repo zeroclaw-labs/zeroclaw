@@ -121,8 +121,7 @@ pub async fn migrate_openclaw_memory(
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    let backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
-    zeroclaw_memory::create_memory_for_migration(&backend, &config.data_dir)
+    zeroclaw_memory::create_memory_for_migration(config)
 }
 
 /// Memory handle for the post-import `--reindex` pass, with the configured

@@ -30,6 +30,7 @@ zc-app-quit-explainer = The TUI closes. The daemon keeps running; reconnect anyt
 zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
+zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
