@@ -1100,6 +1100,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn standard_fetch_decompresses_gzip_encoded_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // gzip.compress(b"ZEROCLAW_DECOMPRESSED_OK " * 8) — 200-byte payload,
+        // above FIRECRAWL_MIN_BODY_LEN, served with Content-Encoding: gzip.
+        const GZIP_BODY: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 139, 114, 13, 242, 119, 246, 113, 12, 143, 119, 113,
+            117, 246, 247, 13, 8, 114, 13, 14, 118, 117, 137, 247, 247, 86, 136, 26, 90, 18, 0, 16,
+            218, 143, 230, 200, 0, 0, 0,
+        ];
+        let expected = "ZEROCLAW_DECOMPRESSED_OK ".repeat(8);
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    // text/plain keeps the body verbatim (no html2text pass),
+                    // so we can assert the exact decompressed bytes.
+                    .insert_header("content-type", "text/plain")
+                    .set_body_raw(GZIP_BODY.to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
+            vec![],
+            0,
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        )
+        .unwrap();
+
+        // Call standard_fetch directly so wiremock on 127.0.0.1 is reachable
+        // past the SSRF guard. A default client has reqwest's transparent
+        // gzip decoder enabled via the crate's "gzip" feature.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let result = tool.standard_fetch(&client, &url).await;
+
+        assert!(
+            result.success,
+            "gzip fetch must succeed, got error={:?}",
+            result.error
+        );
+        assert_eq!(
+            result.output, expected,
+            "Content-Encoding: gzip body must be transparently decompressed"
+        );
+    }
+
     #[test]
     fn truncate_over_limit() {
         let tool = WebFetchTool::new(

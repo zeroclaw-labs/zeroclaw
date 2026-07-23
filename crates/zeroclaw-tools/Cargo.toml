@@ -29,7 +29,7 @@ nanohtml2text = "0.2"
 parking_lot = "0.12"
 probe-rs = { version = "0.31", optional = true }
 regex = "1.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream", "gzip", "brotli", "deflate"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
