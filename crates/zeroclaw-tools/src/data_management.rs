@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Workspace data lifecycle tool: retention status, time-based purge, and
 /// storage statistics.
@@ -32,7 +32,8 @@ impl DataManagementTool {
                 "cutoff": cutoff.to_rfc3339(),
                 "affected_files": count,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -51,7 +52,8 @@ impl DataManagementTool {
                 "bytes_freed": bytes,
                 "bytes_freed_human": format_bytes(bytes),
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -66,7 +68,8 @@ impl DataManagementTool {
                 "total_size_human": format_bytes(total_bytes),
                 "subdirectories": breakdown,
             })
-            .to_string(),
+            .to_string()
+            .into(),
             error: None,
         })
     }
@@ -106,7 +109,7 @@ impl Tool for DataManagementTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'command' parameter".into()),
                 });
             }
@@ -124,7 +127,7 @@ impl Tool for DataManagementTool {
             "stats" => self.cmd_stats().await,
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown command: {other}")),
             }),
         }

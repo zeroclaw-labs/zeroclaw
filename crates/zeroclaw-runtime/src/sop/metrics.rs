@@ -32,12 +32,13 @@ struct MetricCounters {
     steps_skipped: u64,
     human_approvals: u64,
     timeout_auto_approvals: u64,
+    /// EPIC G: deterministic `kind = capability` steps executed via the registry.
+    capability_executed: u64,
 }
 
 // ── RunSnapshot ────────────────────────────────────────────────
 
 /// Lightweight snapshot of a terminal run for windowed metric computation.
-///
 /// Stores **event-level counts** (not booleans) so windowed and all-time
 /// metrics are semantically consistent: both count approval events, not runs.
 #[derive(Debug, Clone)]
@@ -76,7 +77,6 @@ struct CollectorState {
 // ── SopMetricsCollector ────────────────────────────────────────
 
 /// Thread-safe SOP metrics aggregator.
-///
 /// Bridges raw SOP audit events into queryable metrics for gate evaluation,
 /// health endpoints, and diagnostics.
 pub struct SopMetricsCollector {
@@ -112,7 +112,6 @@ impl SopMetricsCollector {
     // ── Push methods (sync, write lock) ────────────────────────
 
     /// Record a terminal run (Completed/Failed/Cancelled).
-    ///
     /// Call after `audit.log_run_complete()`.
     pub fn record_run_complete(&self, run: &SopRun) {
         let Ok(mut state) = self.inner.write() else {
@@ -152,7 +151,6 @@ impl SopMetricsCollector {
     }
 
     /// Record a human approval event.
-    ///
     /// Call after the gate resolves (the append-only ledger row is written inside
     /// `engine.resolve_gate`).
     pub fn record_approval(&self, sop_name: &str, run_id: &str) {
@@ -180,8 +178,27 @@ impl SopMetricsCollector {
         entry.1 += 1;
     }
 
+    /// EPIC G: record a deterministic capability step execution (global + per-SOP).
+    pub fn record_capability_executed(&self, sop_name: &str) {
+        let Ok(mut state) = self.inner.write() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_capability_executed"
+            );
+            return;
+        };
+        state.global.counters.capability_executed += 1;
+        state
+            .per_sop
+            .entry(sop_name.to_string())
+            .or_default()
+            .counters
+            .capability_executed += 1;
+    }
+
     /// Record a timeout auto-approval event.
-    ///
     /// Call after the timeout action resolves the gate (the `system`-attributed
     /// `gate_resolved` ledger row is written inside `engine.resolve_gate`).
     pub fn record_timeout_auto_approve(&self, sop_name: &str, run_id: &str) {
@@ -211,22 +228,6 @@ impl SopMetricsCollector {
 
     // ── Warm-start (async) ─────────────────────────────────────
 
-    /// Rebuild collector state after a restart from the durable persistence
-    /// layers.
-    ///
-    /// Terminal run records come from the `Memory` run audit
-    /// (`MemoryCategory::Custom("sop")`, `sop_run_*` snapshots). The approval and
-    /// timeout-auto-approval counters come from the append-only gate ledger in the
-    /// run-store (EPIC C's `gate_resolved` rows), NOT the retired
-    /// `sop_approval_*` / `sop_timeout_approve_*` Memory keys: a `gate_resolved`
-    /// row with `decision == "approve"` is a human approval unless its
-    /// `source == "system"`, which marks a timeout auto-approval.
-    ///
-    /// For approvals whose run_id does **not** match a terminal run (the gate
-    /// cleared but the run is still live), populates `pending_approvals` /
-    /// `pending_timeout_approvals` so that if the run completes via live push
-    /// after restart, approval flags are correctly propagated to the
-    /// `RunSnapshot`. Falls back to an empty collector on failure.
     pub async fn rebuild_from_persistence(
         memory: &dyn Memory,
         store: &dyn super::store::SopRunStore,
@@ -275,8 +276,16 @@ impl SopMetricsCollector {
                 continue;
             };
             for ev in &events {
+                // An `amend` IS an approval (of the operator's text) — the live
+                // path meters it via `record_approval_metric` exactly like a
+                // plain approve, so the rebuild must count it too or the
+                // counters drift across a restart. Denials, escalations, and
+                // revises (the gate stays open) are not approvals.
                 if ev.kind != "gate_resolved"
-                    || ev.payload.get("decision").and_then(|d| d.as_str()) != Some("approve")
+                    || !matches!(
+                        ev.payload.get("decision").and_then(|d| d.as_str()),
+                        Some("approve") | Some("amend")
+                    )
                 {
                     continue;
                 }
@@ -347,16 +356,6 @@ impl SopMetricsCollector {
 
     // ── Internal metric API ────────────────────────────────────
 
-    /// Resolve a metric name to its current value.
-    ///
-    /// Format: `sop.<metric>` (global) or `sop.<sop_name>.<metric>` (per-SOP).
-    /// Per-SOP resolution uses longest-match-first to prevent shorter SOP
-    /// names from shadowing longer ones.
-    ///
-    /// **Known edge case**: If a SOP name exactly matches a metric suffix
-    /// (e.g., SOP named `"runs_completed"`), `sop.runs_completed` resolves
-    /// to the **global** metric. Per-SOP metrics for such a SOP are only
-    /// reachable via the full path `sop.runs_completed.runs_completed`.
     pub fn get_metric_value(&self, name: &str) -> Option<serde_json::Value> {
         let Ok(state) = self.inner.read() else {
             return None;
@@ -399,7 +398,6 @@ impl SopMetricsCollector {
     // ── Diagnostics ────────────────────────────────────────────
 
     /// Resolve a metric with an explicit time window (from `Criterion.window_seconds`).
-    ///
     /// The `name` is the base metric name (e.g. `"sop.completion_rate"`).
     /// The `window` is the Duration from the evaluator.
     pub fn get_metric_value_windowed(
@@ -604,6 +602,7 @@ fn resolve_from_counters(c: &MetricCounters, metric: &str) -> Option<serde_json:
         "runs_completed" => Some(json!(c.runs_completed)),
         "runs_failed" => Some(json!(c.runs_failed)),
         "runs_cancelled" => Some(json!(c.runs_cancelled)),
+        "capability_executed" => Some(json!(c.capability_executed)),
         "deviation_rate" => {
             if c.steps_executed == 0 {
                 Some(json!(0.0))
@@ -717,16 +716,20 @@ mod tests {
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         }
     }
 
     fn make_step(number: u32, status: SopStepStatus) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: number,
             status,
             output: format!("Step {number}"),
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:01:00Z".into()),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -1287,6 +1290,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1399,6 +1404,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
 

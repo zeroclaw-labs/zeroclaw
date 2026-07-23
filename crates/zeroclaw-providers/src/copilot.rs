@@ -1,15 +1,4 @@
 //! GitHub Copilot model_provider with OAuth device-flow authentication.
-//!
-//! Authenticates via GitHub's device code flow (same as VS Code Copilot),
-//! then exchanges the OAuth token for short-lived Copilot API keys.
-//! Tokens are cached to disk and auto-refreshed.
-//!
-//! **Note:** This uses VS Code's OAuth client ID (`Iv1.b507a08c87ecfe98`) and
-//! editor headers. This is the same approach used by LiteLLM, Codex CLI,
-//! and other third-party Copilot integrations. The Copilot token endpoint is
-//! private; there is no public OAuth scope or app registration for it.
-//! GitHub could change or revoke this at any time, which would break all
-//! third-party integrations simultaneously.
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -183,11 +172,6 @@ struct ResponseMessage {
 
 // ── ModelProvider ─────────────────────────────────────────────────────
 
-/// GitHub Copilot model_provider with automatic OAuth and token refresh.
-///
-/// On first use, prompts the user to visit github.com/login/device.
-/// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
-/// automatically.
 pub struct CopilotModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -198,8 +182,41 @@ pub struct CopilotModelProvider {
     token_dir: PathBuf,
 }
 
+/// Typed builder for [`CopilotModelProvider`].
+///
+/// Only `alias` is required. The GitHub token is optional at build time;
+/// when unset, the provider will run the device-flow OAuth prompt on
+/// first use.
+#[must_use]
+pub struct CopilotBuilder {
+    alias: String,
+    github_token: Option<String>,
+}
+
+impl CopilotBuilder {
+    /// Set an explicit GitHub OAuth token. Empty strings are treated
+    /// as missing.
+    pub fn github_token(mut self, token: Option<&str>) -> Self {
+        self.github_token = token.filter(|t| !t.is_empty()).map(String::from);
+        self
+    }
+
+    pub fn build(self) -> CopilotModelProvider {
+        CopilotModelProvider::new_impl(self.alias, self.github_token)
+    }
+}
+
 impl CopilotModelProvider {
-    pub fn new(alias: &str, github_token: Option<&str>) -> Self {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`CopilotBuilder`].
+    pub fn builder(alias: &str) -> CopilotBuilder {
+        CopilotBuilder {
+            alias: alias.to_string(),
+            github_token: None,
+        }
+    }
+
+    fn new_impl(alias: String, github_token: Option<String>) -> Self {
         let token_dir = directories::ProjectDirs::from("", "", "zeroclaw")
             .map(|dir| dir.config_dir().join("copilot"))
             .unwrap_or_else(|| {
@@ -243,10 +260,8 @@ impl CopilotModelProvider {
         }
 
         Self {
-            alias: alias.to_string(),
-            github_token: github_token
-                .filter(|token| !token.is_empty())
-                .map(String::from),
+            alias,
+            github_token,
             refresh_lock: Arc::new(Mutex::new(None)),
             token_dir,
         }
@@ -323,13 +338,19 @@ impl CopilotModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tool_call| NativeToolCall {
-                            id: Some(tool_call.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tool_call.name,
-                                arguments: tool_call.arguments,
-                            },
+                        .map(|tool_call| {
+                            let name = tool_call.name;
+                            NativeToolCall {
+                                id: Some(tool_call.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tool_call.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
 
@@ -771,25 +792,33 @@ mod tests {
 
     #[test]
     fn new_without_token() {
-        let model_provider = CopilotModelProvider::new("test", None);
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
         assert!(model_provider.github_token.is_none());
     }
 
     #[test]
     fn new_with_token() {
-        let model_provider = CopilotModelProvider::new("test", Some("ghp_test"));
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(Some("ghp_test"))
+            .build();
         assert_eq!(model_provider.github_token.as_deref(), Some("ghp_test"));
     }
 
     #[test]
     fn empty_token_treated_as_none() {
-        let model_provider = CopilotModelProvider::new("test", Some(""));
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(Some(""))
+            .build();
         assert!(model_provider.github_token.is_none());
     }
 
     #[tokio::test]
     async fn cache_starts_empty() {
-        let model_provider = CopilotModelProvider::new("test", None);
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
         let cached = model_provider.refresh_lock.lock().await;
         assert!(cached.is_none());
     }
@@ -818,7 +847,9 @@ mod tests {
 
     #[test]
     fn supports_native_tools() {
-        let model_provider = CopilotModelProvider::new("test", None);
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
         assert!(model_provider.supports_native_tools());
     }
 
@@ -872,5 +903,43 @@ mod tests {
 
         let result = CopilotModelProvider::to_api_content("assistant", "sure").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
+    }
+
+    #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // Pins that the copilot `convert_messages` call site of
+        // `sanitize_tool_arguments` is wired in. The helper contract itself is
+        // covered in `compatible::tests::sanitize_tool_arguments_*`.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
+                .into(),
+        }];
+
+        let api_messages = CopilotModelProvider::convert_messages(&messages);
+        assert_eq!(api_messages.len(), 1);
+        let tool_calls = api_messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let api_messages = CopilotModelProvider::convert_messages(&messages);
+        let tool_calls = api_messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
     }
 }

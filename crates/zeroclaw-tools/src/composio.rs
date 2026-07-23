@@ -1,11 +1,3 @@
-// Composio Tool ModelProvider — optional managed tool surface with 1000+ OAuth integrations.
-//
-// When enabled, ZeroClaw can execute actions on Gmail, Notion, GitHub, Slack, etc.
-// through Composio's API without storing raw OAuth tokens locally.
-//
-// This is opt-in. Users who prefer sovereign/local-only mode skip this entirely.
-// The Composio API key is stored in the encrypted secret store.
-
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -15,7 +7,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -60,7 +52,6 @@ impl ComposioTool {
     }
 
     /// List available Composio apps/actions for the authenticated user.
-    ///
     /// Uses the v3 endpoint.
     pub async fn list_actions(
         &self,
@@ -177,11 +168,6 @@ impl ComposioTool {
         let accounts = self
             .list_connected_accounts(Some(&app), Some(&entity))
             .await?;
-        // The API returns accounts ordered by updated_at DESC, so the first
-        // usable account is the most recently active one.  We always pick it
-        // rather than giving up when multiple accounts exist — giving up was
-        // the root cause of the "cannot find connected account" loop reported
-        // in issue #959.
         let Some(first) = accounts.into_iter().find(|acct| acct.is_usable()) else {
             return Ok(None);
         };
@@ -191,7 +177,6 @@ impl ComposioTool {
     }
 
     /// Execute a Composio action/tool with given parameters.
-    ///
     /// Uses the v3 endpoint.
     pub async fn execute_action(
         &self,
@@ -366,11 +351,6 @@ impl ComposioTool {
             "version": COMPOSIO_TOOL_VERSION_LATEST,
         });
 
-        // The v3 execute endpoint accepts either structured `arguments` or a
-        // natural-language `text` description (mutually exclusive).  Prefer
-        // `text` when the caller provides it so Composio's NLP resolves the
-        // correct parameters — this is the primary fix for the "keeps guessing
-        // and failing" issue reported by the community.
         if let Some(nl_text) = text {
             body["text"] = json!(nl_text);
         } else {
@@ -426,7 +406,6 @@ impl ComposioTool {
     }
 
     /// Get the OAuth connection URL for a specific app/toolkit or auth config.
-    ///
     /// Uses the v3 endpoint.
     pub async fn get_connection_url(
         &self,
@@ -500,7 +479,6 @@ impl ComposioTool {
     }
 
     /// Fetch full metadata for a single tool by slug, including input/output parameter schemas.
-    ///
     /// Calls `GET /api/v3/tools/{tool_slug}` which returns the detailed schema
     /// the LLM needs to construct correct `params` for `execute`.
     async fn get_tool_schema(&self, tool_slug: &str) -> anyhow::Result<serde_json::Value> {
@@ -682,13 +660,13 @@ impl Tool for ComposioTool {
                         );
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to list actions: {e}")),
                     }),
                 }
@@ -707,7 +685,7 @@ impl Tool for ComposioTool {
                                 success: true,
                                 output: format!(
                                     "No connected accounts found{app_hint} for entity '{entity_id}'. Run action='connect' first."
-                                ),
+                                ).into(),
                                 error: None,
                             });
                         }
@@ -732,13 +710,13 @@ impl Tool for ComposioTool {
                         );
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to list connected accounts: {e}")),
                     }),
                 }
@@ -751,7 +729,7 @@ impl Tool for ComposioTool {
                 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -790,7 +768,7 @@ impl Tool for ComposioTool {
                             .unwrap_or_else(|_| format!("{result:?}"));
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
@@ -805,7 +783,7 @@ impl Tool for ComposioTool {
                             .unwrap_or_default();
                         Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Action execution failed: {e}{schema_hint}")),
                         })
                     }
@@ -819,7 +797,7 @@ impl Tool for ComposioTool {
                 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -853,13 +831,13 @@ impl Tool for ComposioTool {
                         }
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to get connection URL: {e}")),
                     }),
                 }
@@ -867,7 +845,7 @@ impl Tool for ComposioTool {
 
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{action}'. Use 'list', 'list_accounts', 'execute', or 'connect'."
                 )),
@@ -1117,7 +1095,6 @@ fn extract_api_error_message(body: &str) -> Option<String> {
 }
 
 /// Build a compact hint string showing parameter key names from an `input_parameters` JSON Schema.
-///
 /// Used in the `list` output so the LLM can see what keys each action expects
 /// without dumping the full schema.
 fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
@@ -1151,7 +1128,6 @@ fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
 }
 
 /// Build a human-readable schema hint from a full tool schema response.
-///
 /// Used in execute error messages so the LLM can see the expected parameter
 /// names and types to self-correct on the next attempt.
 fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
@@ -1797,7 +1773,7 @@ mod tests {
 
     #[test]
     fn resolve_picks_first_usable_when_multiple_accounts_exist() {
-        // Regression test for issue #959: previously returned None when
+        // Regression test for previously returned None when
         // multiple accounts existed, causing the LLM to loop on the OAuth URL.
         let accounts = vec![
             ComposioConnectedAccount {

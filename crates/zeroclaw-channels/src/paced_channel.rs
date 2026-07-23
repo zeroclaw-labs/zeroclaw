@@ -1,24 +1,4 @@
 //! Per-(channel, peer) outbound pacing wrapper.
-//!
-//! Wraps a `dyn Channel` so consecutive `send` calls to the same recipient
-//! honour a configured floor on cadence. Drafts and progress updates are
-//! NOT paced — they are streaming UX events where slowing down would
-//! visibly degrade the live response. Only the final `send` (the wire-
-//! level outbound message) and `finalize_draft` enter the queue.
-//!
-//! `min_interval_secs == 0` returns the inner channel unchanged so the
-//! pacing path has zero overhead for the default config.
-//!
-//! When the floor is active the wrapper holds a bounded FIFO queue
-//! per recipient. A send that arrives while the floor still has time
-//! left enqueues. A worker task drains the queue at the floor rate.
-//! When the queue is full the newest send is dropped and a `WARN` is
-//! emitted carrying enough attribution to diagnose the source without
-//! leaking message body. `PACING_RECIPIENT_CAP` bounds the number of
-//! distinct recipient rows retained via idle-state LRU eviction — only
-//! rows with no queued work and no running worker are eligible, so the
-//! cap is a target for idle state, not an unconditional hard bound on a
-//! pathological all-active burst.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -34,12 +14,6 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
-/// The outbound operation a queued slot will perform when its turn through
-/// the pacing floor arrives. Both `send` and `finalize_draft` are paced, but
-/// they dispatch to different inner-channel methods — normalizing both to a
-/// plain `send` would route a draft finalization (an edit of an existing
-/// message identified by `message_id`) through `send`, creating a new message
-/// and leaving the draft stale on channels that support drafts.
 enum PacedOp {
     /// A final outbound message. Dispatches to `inner.send`.
     Send(SendMessage),
@@ -106,12 +80,6 @@ struct RecipientState {
     /// `true` while a worker task owns this recipient's queue. Prevents
     /// spawning a second worker for the same recipient.
     worker_running: bool,
-    /// `true` while an immediate-path dispatch for this recipient is awaiting
-    /// the inner channel's wire call. Set under the lock before the immediate
-    /// dispatch is released and cleared under the lock when it returns. A send
-    /// that arrives while this is set enqueues instead of taking a second
-    /// immediate path, so a single slow inner send cannot put two wire calls
-    /// in flight to the same recipient and undercut the floor.
     in_flight: bool,
     /// Sequence counter so the LRU eviction picks the least-recently-touched
     /// recipient when the cap is hit.
@@ -149,11 +117,6 @@ impl RecipientMap {
         self.touch_counter
     }
 
-    /// Evict the least-recently-touched idle recipient when the cap is
-    /// reached. Only rows with no queue, no running worker, and no in-flight
-    /// dispatch are eligible, so an active recipient is never discarded out
-    /// from under its worker or a pending immediate send. If every row is
-    /// active the cap is exceeded until one becomes idle.
     fn evict_if_over_cap(&mut self) {
         if self.inner.len() < PACING_RECIPIENT_CAP {
             return;
@@ -206,21 +169,9 @@ impl PacedChannel {
         })
     }
 
-    /// Enqueue or immediately dispatch a paced operation. Returns the inner
-    /// channel's result (immediate path) or the worker's result awaited on a
-    /// oneshot (queued path). Drops the newest op with a `WARN` when the queue
-    /// is full and returns `Ok(())` — overflow is intentional behaviour, not an
-    /// error the agent loop should retry.
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
         let recipient_key = op.recipient().to_string();
 
-        // `decision` is built under the lock and consumed after release.
-        // Three shapes share the same outcome carrier so the post-lock
-        // section can use plain `if let` instead of branching on an enum.
-        //
-        // - `(Some(op), None, false)`  — immediate dispatch via inner channel
-        // - `(None, Some(rx), spawn)` — enqueued; await result; maybe spawn worker
-        // - `(None, None, false)` — overflow drop; return Ok
         let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
             let mut map = self.recipients.lock().await;
             map.evict_if_over_cap();
@@ -436,11 +387,6 @@ impl Channel for PacedChannel {
         text: &str,
         suppress_voice: bool,
     ) -> Result<()> {
-        // Finalise is the terminal write to the draft — route it through the
-        // same pacing queue as `send` so a burst of streamed replies respects
-        // the floor and the overflow contract. The op preserves its identity
-        // so the worker dispatches to `inner.finalize_draft` (editing the
-        // existing draft) rather than `inner.send` (posting a new message).
         self.paced_dispatch(PacedOp::FinalizeDraft {
             recipient: recipient.to_string(),
             message_id: message_id.to_string(),
@@ -914,10 +860,6 @@ mod tests {
         }
     }
 
-    /// A slow inner send must not let a second concurrent send to the same
-    /// recipient take a second immediate path. The `in_flight` marker forces
-    /// the racing send to enqueue, so only one wire call is ever in flight to
-    /// a recipient at a time even when the inner send outlasts the floor.
     #[tokio::test]
     async fn slow_immediate_send_forces_concurrent_send_to_enqueue() {
         let gated = Arc::new(GatedChannel {

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::mcp_client::McpRegistry;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Generic MCP prompt access tool. Routes through `McpRegistry`.
 pub struct McpPromptsTool {
@@ -21,14 +21,14 @@ impl McpPromptsTool {
     fn ok(output: String) -> ToolResult {
         ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         }
     }
     fn fail(msg: impl Into<String>) -> ToolResult {
         ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(msg.into()),
         }
     }

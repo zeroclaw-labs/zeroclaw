@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::sop::types::{SopRunAction, SopStepResult, SopStepStatus};
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Report a step result and advance an SOP run to the next step.
 pub struct SopAdvanceTool {
@@ -110,7 +110,7 @@ impl Tool for SopAdvanceTool {
             other => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Invalid status '{other}'. Must be: completed, failed, or skipped"
                     )),
@@ -153,6 +153,10 @@ impl Tool for SopAdvanceTool {
                 output: output.to_string(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                // Agent-reported advance of the current inline step; the tool
+                // has no resolved alias context of its own.
+                effective_agent: None,
+                tool_calls: Vec::new(),
             };
             let step_result_clone = step_result.clone();
 
@@ -260,13 +264,13 @@ impl Tool for SopAdvanceTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output: result_output,
+                    output: result_output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to advance step: {e}")),
             }),
         }
@@ -317,6 +321,9 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         }
     }
 

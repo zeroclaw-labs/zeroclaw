@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -167,7 +167,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -195,7 +195,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
             Err(msg) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 });
             }
@@ -258,17 +258,6 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
 
         let recipient_id = recipient.unwrap_or_default();
 
-        // Try the channel's native interactive path first. Channels that don't
-        // override request_choice / request_multi_choice (i.e. everything except
-        // ACP today) return Ok(None) from the default trait impl, and we fall
-        // through to the existing formatted-text path below.
-        //
-        // Note on output shape: this interactive branch returns a JSON-encoded
-        // `ToolResult.output` string (keys: question, answer|answers, channel);
-        // the fallback path below returns a human-readable confirmation string.
-        // The union is documented in `description()` and tracked for unification
-        // (ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation)
-        // (Future Extensions: typed ToolResult.output).
         let interactive_timeout =
             std::time::Duration::from_secs(duration_minutes.saturating_mul(60));
 
@@ -285,7 +274,8 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                             "answers": answers,
                             "channel": channel_name,
                         })
-                        .to_string(),
+                        .to_string()
+                        .into(),
                         error: None,
                     });
                 }
@@ -293,7 +283,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Interactive poll failed: {e}")),
                     });
                 }
@@ -311,7 +301,8 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                             "answer": answer,
                             "channel": channel_name,
                         })
-                        .to_string(),
+                        .to_string()
+                        .into(),
                         error: None,
                     });
                 }
@@ -319,18 +310,13 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Interactive poll failed: {e}")),
                     });
                 }
             }
         }
 
-        // Fallback: formatted text + emoji reactions (existing behaviour).
-        // For channels with native poll support, we still send a formatted message.
-        // The Channel trait does not expose a create_poll method, so all channels
-        // receive a text-formatted poll. Native Telegram/Discord poll APIs would
-        // require a trait extension; for now we note the intent in the output.
         let is_native = supports_native_poll(&channel_name);
 
         let poll_text = format_text_poll(&question, &options, duration_minutes, multi_select);
@@ -339,7 +325,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send poll to channel '{channel_name}': {e}"
                 )),
@@ -360,7 +346,8 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                  Options: {}\n\
                  Duration: {duration_minutes} min | Multi-select: {multi_select}",
                 options.join(", ")
-            ),
+            )
+            .into(),
             error: None,
         })
     }

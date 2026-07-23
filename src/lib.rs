@@ -280,12 +280,22 @@ Adds a Telegram username (without the '@' prefix) or numeric user \
 ID to the channel allowlist so the agent will respond to messages \
 from that identity.
 
+Use --alias to target a non-default Telegram channel — it must match \
+the alias in the channels.telegram.<alias> section the agent uses. \
+Without it the identity is bound to the `default` alias and a \
+non-default agent will keep asking for approval.
+
 Examples:
   zeroclaw channel bind-telegram zeroclaw_user
-  zeroclaw channel bind-telegram 123456789")]
+  zeroclaw channel bind-telegram 123456789
+  zeroclaw channel bind-telegram 123456789 --alias alerts")]
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
+        /// Telegram channel alias to bind to (the <alias> in
+        /// channels.telegram.<alias>). Defaults to `default`.
+        #[arg(long, default_value = "default")]
+        alias: String,
     },
     /// Send a message to a configured channel
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -507,6 +517,9 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// Remove an installed skill
     Remove {
@@ -578,6 +591,10 @@ pub enum MigrateCommands {
         /// Validate and preview migration without writing any data
         #[arg(long)]
         dry_run: bool,
+
+        /// Rebuild backend indexes after importing entries
+        #[arg(long)]
+        reindex: bool,
     },
 }
 
@@ -615,6 +632,10 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -641,6 +662,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -666,6 +690,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -692,6 +719,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -733,6 +763,9 @@ Examples:
         /// Replace the agent job allowlist with the specified tool names (repeatable)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
     },
     /// Pause a scheduled task
     Pause {
@@ -931,4 +964,30 @@ pub enum SopCommands {
     },
     /// List SOP runs currently waiting for approval (talks to the running daemon)
     Pending,
+    /// Render an SOP's node graph as text
+    Graph {
+        /// Name of the SOP to render
+        name: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = SopGraphFormat::Outline)]
+        format: SopGraphFormat,
+    },
+    /// Delete an SOP definition from disk
+    Delete {
+        /// Name of the SOP to delete
+        name: String,
+    },
+}
+
+/// Text output format for `sop graph`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum SopGraphFormat {
+    /// One line per node with its outbound flow edges.
+    Outline,
+    /// `from -> to [role]` adjacency, one edge per line.
+    Adjacency,
+    /// Pretty-printed JSON of the whole projection.
+    Json,
 }
