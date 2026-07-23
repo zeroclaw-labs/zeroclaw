@@ -3903,7 +3903,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         let betas: Vec<_> = headers.get_all("anthropic-beta").iter().collect();
         assert_eq!(betas.len(), 1, "expected exactly one anthropic-beta header");
-        assert_eq!(betas[0].to_str().unwrap(), "server-side-fallback-2026-06-01");
+        assert_eq!(
+            betas[0].to_str().unwrap(),
+            "server-side-fallback-2026-06-01"
+        );
     }
 
     #[tokio::test]
