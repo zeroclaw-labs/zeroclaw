@@ -78,19 +78,23 @@ rejected. Grok's discovered user and project configuration, together with alias
 `extra_args`, owns Grok tool policy.
 
 The default argv adds `--no-auto-update`, `--sandbox strict`,
-`--permission-mode dontAsk`, and `--tools ""`. The ACP client also cancels every
-permission request. Grok evaluates permission rules discovered from its user
-and project configuration before asking the ACP client. Those files are
-therefore trusted operator policy: an `allow` rule may pre-authorize a tool,
-and project MCP servers, plugins, or hooks may add capabilities. Use a
-dedicated, reviewed `working_directory` for channel agents. Operators can also
-grant tools or relax sandbox/permission policy with alias `extra_args`; both
-surfaces are explicit opt-ins to a wider subprocess boundary. Transport,
-prompt, model, session, cwd, and update flags remain provider-owned and are
-rejected in `extra_args`. Positional and short arguments are also rejected.
-Known value-taking options accept either `["--flag", "value"]` or
-`--flag=value`; unknown option shapes require the inline form so they cannot
-consume the trailing ACP command.
+`--permission-mode dontAsk`, and `--tools ""`. The ACP client never approves a
+permission request. When the request supplies a `reject_once` option, the
+client selects that option instead of cancelling the complete agent turn;
+otherwise it cancels the request. The requested tool still fails closed,
+while Grok can consume the rejection and produce a final answer or retry with
+an operation its policy allows. Grok evaluates permission rules discovered from
+its user and project configuration before asking the ACP client. Those files
+are therefore trusted operator policy: an `allow` rule may pre-authorize a tool,
+and project MCP servers, plugins, or hooks may add capabilities. Use a dedicated,
+reviewed `working_directory` for channel agents. Operators can also grant tools
+or relax sandbox/permission policy with alias `extra_args`; both surfaces are
+explicit opt-ins to a wider subprocess boundary. Transport, prompt, model,
+session, cwd, and update flags remain provider-owned and are rejected in
+`extra_args`. Positional and short arguments are also rejected. Known
+value-taking options accept either `["--flag", "value"]` or `--flag=value`;
+unknown option shapes require the inline form so they cannot consume the
+trailing ACP command.
 
 ACP stdout frames, aggregate stdout, assistant text, and stderr processing are
 bounded while the child is running. Stderr is drained but its content is never

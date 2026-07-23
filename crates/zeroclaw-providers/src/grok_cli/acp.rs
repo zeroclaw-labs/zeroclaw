@@ -3,8 +3,9 @@
 //! The wire sequence follows Grok Build's documented example:
 //! initialize → authenticate → session/new → session/prompt. Assistant text
 //! arrives in `session/update` notifications. Every input frame and aggregate
-//! byte count is bounded before allocation grows, and server permission
-//! requests are always cancelled.
+//! byte count is bounded before allocation grows. Server permission requests
+//! select reject-once when offered so the tool fails closed without cancelling
+//! the complete agent turn.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -321,10 +322,11 @@ where
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    if method.contains("permission") {
+    if method == "session/request_permission" || method.ends_with("/session/request_permission") {
+        let outcome = permission_rejection_outcome(message);
         let response = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
-            result: Some(json!({ "outcome": { "outcome": "cancelled" } })),
+            result: Some(json!({ "outcome": outcome })),
             error: None,
             id,
         };
@@ -342,6 +344,21 @@ where
         id,
     };
     write_line(stdin, &response, "unsupported server request response").await
+}
+
+fn permission_rejection_outcome(message: &Value) -> Value {
+    if let Some(option_id) = message
+        .pointer("/params/options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| option.get("kind").and_then(Value::as_str) == Some("reject_once"))
+        .and_then(|option| option.get("optionId"))
+        .and_then(Value::as_str)
+    {
+        return json!({ "outcome": "selected", "optionId": option_id });
+    }
+    json!({ "outcome": "cancelled" })
 }
 
 async fn settle_trailing_output<W, R>(
@@ -513,7 +530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_requests_are_always_cancelled() {
+    async fn permission_requests_select_the_request_reject_once_option() {
         let (mut client, mut peer) = duplex(4096);
         let request = json!({
             "jsonrpc": "2.0",
@@ -538,10 +555,29 @@ mod tests {
         let response: Value = serde_json::from_str(encoded.trim()).expect("valid response");
         assert_eq!(
             response.pointer("/result/outcome/outcome"),
-            Some(&Value::String("cancelled".to_string()))
+            Some(&Value::String("selected".to_string()))
         );
-        assert!(response.pointer("/result/outcome/optionId").is_none());
+        assert_eq!(
+            response.pointer("/result/outcome/optionId"),
+            Some(&Value::String("deny".to_string()))
+        );
         assert!(!encoded.contains("allow"));
+    }
+
+    #[test]
+    fn permission_requests_cancel_without_a_reject_once_option() {
+        let request = json!({
+            "params": {
+                "options": [
+                    { "optionId": "allow", "kind": "allow_once" },
+                    { "optionId": "always", "kind": "allow_always" }
+                ]
+            }
+        });
+        assert_eq!(
+            permission_rejection_outcome(&request),
+            json!({ "outcome": "cancelled" })
+        );
     }
 
     #[tokio::test]

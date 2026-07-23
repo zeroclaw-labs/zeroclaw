@@ -30,7 +30,7 @@
 //!   plus explicit per-alias `env_passthrough` names;
 //! - defaults to `--sandbox strict`, `--permission-mode dontAsk`, and an empty
 //!   built-in tool set;
-//! - cancels every ACP permission request rather than approving it;
+//! - rejects ACP permission requests without cancelling the complete turn;
 //! - bounds ACP frames, aggregate stdout, assistant output, and stderr;
 //! - kills the child process tree on success, failure, timeout, or cancellation;
 //! - never includes child stderr or raw ACP frames in public errors or logs.
@@ -1241,6 +1241,94 @@ mod tests {
                 "live Grok ACP response must contain {marker}: {reply}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed and authenticated Grok Build CLI"]
+    async fn live_grok_acp_waits_for_native_tool_completion() {
+        let temp = TempDir::new().expect("live Grok cwd");
+        let model_provider = provider(
+            None,
+            temp.path(),
+            vec![
+                "--tools=run_terminal_cmd".to_string(),
+                "--allow=Bash(printf *)".to_string(),
+            ],
+            Some(120),
+        );
+        let reply = model_provider
+            .invoke_acp(
+                "Use the shell tool to run `printf ACP_TOOL_EXEC_OK`. After the tool succeeds, output the token ACP_TOOL_FINAL_OK.",
+                DEFAULT_MODEL_MARKER,
+            )
+            .await
+            .expect("live Grok ACP tool response");
+        eprintln!("tool: {reply}");
+        assert!(reply.contains("ACP_TOOL_FINAL_OK"), "reply: {reply}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed and authenticated Grok Build CLI"]
+    async fn live_grok_acp_recovers_after_rejecting_prompted_complex_shell() {
+        let temp = TempDir::new().expect("live Grok cwd");
+        let marker = temp.path().join("permission-marker");
+        let model_provider = provider(
+            None,
+            temp.path(),
+            vec![
+                "--sandbox=workspace".to_string(),
+                "--tools=run_terminal_cmd".to_string(),
+                "--permission-mode=bypassPermissions".to_string(),
+                "--deny=Bash(false *)".to_string(),
+            ],
+            Some(120),
+        );
+        let reply = model_provider
+            .invoke_acp(
+                "First use the shell tool to run exactly `for value in ACP_PERMISSION_EXEC_OK; do printf '%s' \"$value\" > permission-marker; done`. If that tool call is rejected, retry with the simple command `printf ACP_PERMISSION_EXEC_OK > permission-marker`. After the marker is written, output the token ACP_PERMISSION_FINAL_OK.",
+                DEFAULT_MODEL_MARKER,
+            )
+            .await
+            .expect("live Grok ACP rejection recovery response");
+        eprintln!("permission: {reply}");
+        assert!(reply.contains("ACP_PERMISSION_FINAL_OK"), "reply: {reply}");
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("tool marker"),
+            "ACP_PERMISSION_EXEC_OK"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed and authenticated Grok Build CLI"]
+    async fn live_grok_acp_rejects_denied_tool_without_cancelling_turn() {
+        let temp = TempDir::new().expect("live Grok cwd");
+        let marker = temp.path().join("denied-marker");
+        let grok_config_dir = temp.path().join(".grok");
+        std::fs::create_dir(&grok_config_dir).expect("Grok config directory");
+        std::fs::write(
+            grok_config_dir.join("config.toml"),
+            "[permission]\ndeny = [\"Bash(printf *)\"]\n",
+        )
+        .expect("Grok deny config");
+        let model_provider = provider(
+            None,
+            temp.path(),
+            vec![
+                "--tools=run_terminal_cmd".to_string(),
+                "--permission-mode=bypassPermissions".to_string(),
+            ],
+            Some(120),
+        );
+        let reply = model_provider
+            .invoke_acp(
+                "Attempt to use the shell tool to run exactly `printf ACP_DENY_EXEC_BAD > denied-marker`. Whether the tool is denied or succeeds, output the token ACP_DENY_FINAL_OK.",
+                DEFAULT_MODEL_MARKER,
+            )
+            .await
+            .expect("live Grok ACP rejected-tool response");
+        eprintln!("deny: {reply}");
+        assert!(reply.contains("ACP_DENY_FINAL_OK"), "reply: {reply}");
+        assert!(!marker.exists(), "deny rule must prevent the tool write");
     }
 
     #[cfg(unix)]
