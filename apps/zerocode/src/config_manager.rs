@@ -153,6 +153,15 @@ enum ConfigSection {
 
 const CONFIG_SECTIONS: [ConfigSection; 2] = [ConfigSection::Zeroclaw, ConfigSection::Zerocode];
 
+/// Display placeholder the daemon emits for an unset `Option` field,
+/// mirroring `zeroclaw_config::traits::UNSET_DISPLAY`. zerocode talks to
+/// the daemon over RPC and mirrors config types on the wire rather than
+/// depending on `zeroclaw-config`, so the sentinel is duplicated here.
+/// It is a *display* value, never a real default — seeding the edit
+/// buffer with it would let the literal `<unset>` be edited/saved as if
+/// it were the field's value.
+const UNSET_DISPLAY: &str = "<unset>";
+
 impl ConfigSection {
     fn label(self) -> &'static str {
         match self {
@@ -2992,7 +3001,8 @@ impl App {
             .value
             .as_ref()
             .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .map(str::to_string)
+            .filter(|v| v != UNSET_DISPLAY);
         let variants = self.fields[idx].enum_variants.clone();
 
         match kind {
@@ -4918,6 +4928,53 @@ mod tests {
         assert!(
             matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
             "Left on the leftmost alias tab walks out to the type list like Back"
+        );
+    }
+
+    /// Builds the wire shape the daemon emits for an unset `Option` field:
+    /// `value = Some(JSON string "<unset>")`, the display sentinel — never a
+    /// real default (see `zeroclaw_config::traits::ConfigFieldEntry::from_prop_field`).
+    fn unset_field(kind: PropKind) -> ConfigFieldEntry {
+        ConfigFieldEntry {
+            path: "unset.field".into(),
+            category: String::new(),
+            kind,
+            type_hint: String::new(),
+            value: Some(serde_json::Value::String(UNSET_DISPLAY.into())),
+            populated: false,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: None,
+            tab: ConfigTab::None,
+            alias_source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_edit_seeds_unset_field_empty() {
+        // Regression for #8648: opening an unset field for edit must NOT
+        // seed the buffer with the `<unset>` display sentinel. Before the
+        // fix the scalar branch copied it verbatim, so typing appended
+        // after it (e.g. `<unset>aaa`) and saving could persist the
+        // placeholder.
+        let mut mgr = test_manager();
+
+        // Scalar (default) branch.
+        mgr.fields = vec![unset_field(PropKind::String)];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "",
+            "scalar unset field must start with an empty edit buffer"
+        );
+
+        // StringArray branch.
+        mgr.fields = vec![unset_field(PropKind::StringArray)];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "",
+            "StringArray unset field must start with an empty edit buffer"
         );
     }
 }
