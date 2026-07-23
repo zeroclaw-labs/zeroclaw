@@ -19,6 +19,20 @@ const PERSIST_CALLS: &[&str] = &[
 /// Evidence that a file isolates its config writes.
 const ISOLATION_MARKERS: &[&str] = &["config_path", "ZEROCLAW_CONFIG_DIR", "set_var(\"HOME\""];
 
+/// True if `path` sits under a `tests` directory component of this crate
+/// (e.g. `tests/foo.rs`, `crates/x/tests/y.rs`). Classification is done by
+/// path component, not by the rendered separator: `Path::display()` uses
+/// backslashes on Windows, so a `contains("/tests/")` check on the rendered
+/// string silently never matches there. Panics on paths outside the crate
+/// root — every caller walks from `CARGO_MANIFEST_DIR`, and a check on the
+/// absolute path could misclassify a checkout under a `tests` directory.
+fn is_integration_test(path: &Path) -> bool {
+    let rel = path
+        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+        .expect("path must be under CARGO_MANIFEST_DIR");
+    rel.components().any(|c| c.as_os_str() == "tests")
+}
+
 #[test]
 fn tests_that_persist_config_isolate_the_path() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
@@ -54,9 +68,7 @@ fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
         let Ok(src) = fs::read_to_string(&path) else {
             continue;
         };
-        let display = path.display().to_string();
-        let is_integration_test = display.contains("/tests/");
-        let region = if is_integration_test {
+        let region = if is_integration_test(&path) {
             Some((0usize, src.as_str()))
         } else {
             src.find("#[cfg(test)]").map(|start| (start, &src[start..]))
@@ -67,6 +79,7 @@ fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
         if ISOLATION_MARKERS.iter().any(|m| region_src.contains(m)) {
             continue;
         }
+        let display = path.display().to_string();
         let base_line = src[..region_start].lines().count();
         for (offset, line) in region_src.lines().enumerate() {
             if line.contains("// SOT:") {
@@ -82,4 +95,36 @@ fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Regression coverage for `is_integration_test`: classification must be
+/// separator-independent, so every path here is built from single
+/// components via `join` (never from a string with embedded `/` or `\`)
+/// to make sure the check can't accidentally pass by matching on a
+/// hardcoded separator.
+#[test]
+fn is_integration_test_matches_tests_component_regardless_of_separator() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let component_built = manifest_dir.join("tests").join("component").join("foo.rs");
+    assert!(is_integration_test(&component_built));
+
+    let crate_tests = manifest_dir
+        .join("crates")
+        .join("zeroclaw-config")
+        .join("tests")
+        .join("x.rs");
+    assert!(is_integration_test(&crate_tests));
+
+    let crate_src = manifest_dir
+        .join("crates")
+        .join("zeroclaw-config")
+        .join("src")
+        .join("schema.rs");
+    assert!(!is_integration_test(&crate_src));
+
+    // `tests.rs` is a file name, not a `tests` directory component — must
+    // not match on substring.
+    let tests_named_file = manifest_dir.join("src").join("tests.rs");
+    assert!(!is_integration_test(&tests_named_file));
 }
