@@ -209,9 +209,13 @@ pub fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
 /// Format an MCP `tools/call` result for the model.
 ///
 /// When `content` contains any `type: "resource"` item with `blob`, materialize
-/// each blob under `{workspace}/uploads/`, and return provenance text (non-blob
-/// content) plus Document/IMAGE markers — never the raw base64. Results without
-/// resource blobs keep the existing pretty-printed JSON shape.
+/// each blob under `{workspace}/uploads/` and return the full result as JSON with
+/// only the binary payloads redacted: a resource `blob` is replaced by a
+/// Document/IMAGE `materialized` marker, and image/audio `data` by a concise
+/// marker — never raw base64. Every non-binary field (text, `resource_link`,
+/// unknown content types, per-item `annotations`, and top-level
+/// `structuredContent`/`_meta`/`isError`) is preserved verbatim. Results without a
+/// resource blob keep the existing pretty-printed JSON shape.
 pub fn format_mcp_tool_result_for_model(
     result: &serde_json::Value,
     workspace_dir: &Path,
@@ -224,72 +228,81 @@ pub fn format_mcp_tool_result_for_model(
         return Ok(serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()));
     }
 
-    let mut parts: Vec<String> = Vec::new();
-    if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
-        parts.push("[tool reported an error]".to_string());
-    }
-    for item in content {
-        let typ = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match typ {
-            "text" => {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str())
-                    && !text.is_empty()
-                {
-                    parts.push(text.to_string());
-                }
-            }
+    // Preserve the entire result and redact ONLY binary payloads. This keeps the
+    // machine-readable provenance the model (and downstream tooling) may rely on:
+    // structuredContent, _meta, per-item annotations, isError, text, resource_link,
+    // and unknown content types all survive; only base64 blob/data are removed.
+    let mut redacted = result.clone();
+    let Some(items) = redacted.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return Ok(serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string()));
+    };
+    for item in items.iter_mut() {
+        let typ = item
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        match typ.as_str() {
             "resource" => {
-                let Some(res) = item.get("resource") else {
+                let Some(blob) = item
+                    .get("resource")
+                    .and_then(|r| r.get("blob"))
+                    .and_then(|b| b.as_str())
+                    .map(str::to_string)
+                else {
                     continue;
                 };
-                if let Some(blob) = res.get("blob").and_then(|b| b.as_str()) {
-                    if let Some(text) = res.get("text").and_then(|v| v.as_str())
-                        && !text.is_empty()
-                    {
-                        parts.push(text.to_string());
-                    }
-                    let uri = res.get("uri").and_then(|v| v.as_str());
-                    let mime = res.get("mimeType").and_then(|v| v.as_str());
-                    // Degrade per-item: a single malformed/oversized blob must not
-                    // discard sibling text or other valid blobs.
-                    match materialize_resource_blob(workspace_dir, uri, mime, blob) {
-                        Ok(materialized) => parts.push(materialized.marker),
-                        Err(e) => parts.push(format!("[attachment unavailable: {e}]")),
-                    }
-                } else if let Some(text) = res.get("text").and_then(|v| v.as_str())
-                    && !text.is_empty()
-                {
-                    parts.push(text.to_string());
+                let uri = item
+                    .get("resource")
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let mime = item
+                    .get("resource")
+                    .and_then(|r| r.get("mimeType"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                // Degrade per-item: one malformed/oversized blob must not fail the
+                // whole result or leak base64.
+                let marker = match materialize_resource_blob(
+                    workspace_dir,
+                    uri.as_deref(),
+                    mime.as_deref(),
+                    &blob,
+                ) {
+                    Ok(materialized) => materialized.marker,
+                    Err(e) => format!("[attachment unavailable: {e}]"),
+                };
+                if let Some(res) = item.get_mut("resource").and_then(|r| r.as_object_mut()) {
+                    res.remove("blob");
+                    res.insert(
+                        "materialized".to_string(),
+                        serde_json::Value::String(marker),
+                    );
                 }
             }
-            "resource_link" => {
-                // Reference-only content: never has a blob. Emit a small marker;
-                // never embed base64.
-                let uri = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("link");
-                parts.push(format!("[link: {name} — {uri}]"));
-            }
             "image" | "audio" => {
-                // Base64 lives in a `data` field; emit a concise marker so we never
-                // dump the raw payload into model-visible text.
                 let mime = item
                     .get("mimeType")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream");
-                parts.push(format!("[{typ} attachment: {mime}]"));
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                if let Some(obj) = item.as_object_mut()
+                    && obj.remove("data").is_some()
+                {
+                    obj.insert(
+                        "materialized".to_string(),
+                        serde_json::Value::String(format!("[{typ} attachment: {mime}]")),
+                    );
+                }
             }
             _ => {
-                // Leave unknown content types out of the rewritten surface so we
-                // never dump sibling base64 payloads alongside materialized blobs.
+                // text, resource_link and unknown content types carry through verbatim.
             }
         }
     }
 
-    if parts.is_empty() {
-        Ok(String::new())
-    } else {
-        Ok(parts.join("\n\n"))
-    }
+    Ok(serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string()))
 }
 
 fn filename_from_uri(uri: Option<&str>) -> String {
@@ -532,7 +545,7 @@ mod tests {
             }]
         });
         let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
-        assert!(out.starts_with("[IMAGE:"));
+        assert!(out.contains("[IMAGE:"));
         assert!(!out.contains(&b64));
     }
 
@@ -592,8 +605,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_intake_resource_link_yields_link_marker() {
-        // resource_link (no blob) is rendered as a reference marker with its uri.
+    fn mcp_intake_preserves_resource_link() {
+        // resource_link (no blob) is preserved verbatim alongside a redacted blob.
         let dir = tempdir().unwrap();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
         let result = json!({
@@ -614,7 +627,9 @@ mod tests {
             ]
         });
         let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
-        assert!(out.contains("[link: The Spec — https://example.com/spec]"));
+        assert!(out.contains("resource_link"));
+        assert!(out.contains("The Spec"));
+        assert!(out.contains("https://example.com/spec"));
         assert!(!out.contains(&b64));
     }
 
@@ -653,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_intake_iserror_yields_error_marker() {
+    fn mcp_intake_preserves_iserror_and_text() {
         let dir = tempdir().unwrap();
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
         let result = json!({
@@ -671,8 +686,57 @@ mod tests {
             ]
         });
         let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
-        assert!(out.contains("[tool reported an error]"));
+        // The error flag is preserved as structured data, not flattened to prose.
+        assert!(out.contains("isError"));
         assert!(out.contains("boom"));
+        assert!(!out.contains(&b64));
+    }
+
+    #[test]
+    fn mcp_intake_preserves_structured_content_meta_and_annotations() {
+        // Core MCP#1 property: everything non-binary survives; only the blob is
+        // redacted. structuredContent/_meta/annotations must not be silently dropped.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"%PDF");
+        let result = json!({
+            "structuredContent": { "rows": 3, "status": "ok" },
+            "_meta": { "trace": "abc123" },
+            "content": [
+                { "type": "text", "text": "summary", "annotations": { "audience": ["user"] } },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(&result, dir.path()).unwrap();
+        assert!(
+            out.contains("structuredContent"),
+            "structuredContent dropped: {out}"
+        );
+        assert!(out.contains("\"rows\""));
+        assert!(
+            out.contains("_meta") && out.contains("abc123"),
+            "_meta dropped: {out}"
+        );
+        assert!(
+            out.contains("annotations") && out.contains("audience"),
+            "annotations dropped: {out}"
+        );
+        assert!(out.contains("summary"));
+        // Binary blob is materialized to disk and never leaked as base64.
+        assert!(out.contains("[Document: report.pdf]"));
+        assert!(!out.contains(&b64), "base64 leaked: {out}");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("uploads"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]
