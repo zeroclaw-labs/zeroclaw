@@ -2600,6 +2600,20 @@ impl Chat {
             _ => false,
         }
     }
+
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        match &self.phase {
+            ChatPhase::Active(state) => {
+                !state.model_picker.is_open()
+                    && state.pending_elicitation().is_none()
+                    && state.pending_approval().is_none()
+                    && matches!(state.session_overlay, SessionOverlay::None)
+                    && !state.in_browse_mode()
+                    && state.input_bar.claims_pane_navigation(key)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl crate::widgets::HelpContext for Chat {
