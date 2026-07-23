@@ -2312,6 +2312,29 @@ mod tests {
     }
 
     #[test]
+    fn removing_file_attachment_preserves_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("user-file.png");
+        std::fs::write(&path, b"x").expect("write user file");
+        let mut bar = InputBarState::new();
+        bar.add_attachment(PendingAttachment {
+            path: path.clone(),
+            mime_type: "image/png".into(),
+            filename: "user-file.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(
+            path.exists(),
+            "removal must not delete a user-selected file"
+        );
+    }
+
+    #[test]
     fn slash_attachments_opens_indexed_manager() {
         let mut bar = InputBarState::new();
         bar.add_attachment(test_attachment("one.png"));
