@@ -214,6 +214,10 @@ const LARK_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum file size we will download and present as text (512 KiB).
 const LARK_FILE_MAX_BYTES: usize = 512 * 1024;
 
+/// Maximum file size we will download and save into the channel workspace
+/// (inbound files that are neither inline-able images nor text, e.g. PDFs).
+const LARK_ATTACHMENT_SAVE_MAX_BYTES: usize = 20 * 1024 * 1024;
+
 /// Image MIME types we support for inline base64 encoding.
 const LARK_SUPPORTED_IMAGE_MIMES: &[&str] = &[
     "image/png",
@@ -1730,7 +1734,7 @@ impl LarkChannel {
         }
 
         if let Some(cl) = resp.content_length()
-            && cl > LARK_FILE_MAX_BYTES as u64
+            && cl > LARK_ATTACHMENT_SAVE_MAX_BYTES as u64
         {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1740,7 +1744,7 @@ impl LarkChannel {
                 "file too large for : bytes exceeds limit"
             );
             return Some(format!(
-                "[ATTACHMENT:{file_name} | size={cl} bytes | too large to inline]"
+                "[ATTACHMENT:{file_name} | size={cl} bytes | too large to save]"
             ));
         }
 
@@ -1805,10 +1809,73 @@ impl LarkChannel {
             return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
         }
 
-        Some(format!(
-            "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
-            bytes.len()
-        ))
+        // Oversized bodies without a Content-Length header are caught here.
+        if bytes.len() > LARK_ATTACHMENT_SAVE_MAX_BYTES {
+            return Some(format!(
+                "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes | too large to save]",
+                bytes.len()
+            ));
+        }
+
+        // Binary, non-inlineable file (e.g. PDF): save into the channel
+        // workspace so the agent can access it with file tools.
+        match self.save_attachment_to_workspace(file_name, &bytes).await {
+            Some(local_path) => Some(format!(
+                "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes | saved: {}]",
+                bytes.len(),
+                local_path.display()
+            )),
+            None => Some(format!(
+                "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
+                bytes.len()
+            )),
+        }
+    }
+
+    /// Save a non-inlineable inbound attachment (e.g. PDF) under
+    /// `<workspace>/lark_files/` so the agent can reach it with file tools.
+    /// Returns the local path, or `None` when the channel has no workspace or
+    /// the write fails — callers fall back to a metadata-only marker.
+    async fn save_attachment_to_workspace(
+        &self,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Option<std::path::PathBuf> {
+        let Some(workspace) = self.workspace_dir.as_ref() else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "lark: inbound attachment not saved (channel has no workspace_dir)"
+            );
+            return None;
+        };
+        let file_name = lark_sanitize_attachment_filename(file_name)?;
+        let save_dir = workspace.join("lark_files");
+        if let Err(err) = tokio::fs::create_dir_all(&save_dir).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "lark: failed to create attachment dir"
+            );
+            return None;
+        }
+        let local_path = save_dir.join(&file_name);
+        if let Err(err) = tokio::fs::write(&local_path, bytes).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                &format!(
+                    "lark: failed to save attachment to {}",
+                    local_path.display()
+                )
+            );
+            return None;
+        }
+        Some(local_path)
     }
 
     async fn fetch_bot_open_id_with_token(
@@ -3652,6 +3719,20 @@ fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<St
 }
 
 /// Check if a filename looks like a text file based on extension.
+/// Strip any path components from an inbound attachment filename so a
+/// sender-controlled name cannot escape the save directory (mirrors the
+/// WeChat channel's sanitizer).
+fn lark_sanitize_attachment_filename(file_name: &str) -> Option<String> {
+    let cleaned = Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .trim();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
 fn lark_is_text_filename(name: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(
@@ -5039,6 +5120,25 @@ mod tests {
 
         // No info at all should return None
         assert_eq!(lark_detect_image_mime(None, &unknown), None);
+    }
+
+    #[test]
+    fn lark_sanitize_attachment_filename_strips_path_components() {
+        assert_eq!(
+            lark_sanitize_attachment_filename("order.pdf"),
+            Some("order.pdf".to_string())
+        );
+        assert_eq!(
+            lark_sanitize_attachment_filename("../../etc/passwd"),
+            Some("passwd".to_string())
+        );
+        assert_eq!(
+            lark_sanitize_attachment_filename("/tmp/evil.sh"),
+            Some("evil.sh".to_string())
+        );
+        assert_eq!(lark_sanitize_attachment_filename(""), None);
+        assert_eq!(lark_sanitize_attachment_filename(".."), None);
+        assert_eq!(lark_sanitize_attachment_filename("."), None);
     }
 
     #[test]
