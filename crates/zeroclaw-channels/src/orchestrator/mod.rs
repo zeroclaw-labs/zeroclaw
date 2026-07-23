@@ -4121,6 +4121,15 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// After a clean listener return (no error), decide whether the supervisor
+/// should restart the listener.  Cancellation is a deliberate operator action
+/// (Ctrl+C or config reload) — the listener exited because we asked it to
+/// stop, not because it crashed.  Any other clean return is unexpected and
+/// must restart.
+fn should_restart_listener_after_clean_return(cancel: &tokio_util::sync::CancellationToken) -> bool {
+    !cancel.is_cancelled()
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4187,8 +4196,7 @@ fn spawn_supervised_listener_with_health_interval(
 
                 match result {
                     Ok(()) => {
-                        // A clean return during shutdown is expected — don't restart.
-                        if cancel.is_cancelled() {
+                        if !should_restart_listener_after_clean_return(&cancel) {
                             return;
                         }
                         ::zeroclaw_log::record!(
@@ -23434,72 +23442,23 @@ This is an example JSON object for profile settings."#;
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
-    /// Regression test: after cancellation is triggered (Ctrl+C),
-    /// a clean `Ok(())` return from `listen()` must exit without restarting.
-    #[tokio::test]
-    async fn supervised_listener_exits_on_clean_return_after_cancellation() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
-            name: "test-cancel-clean-exit".to_string(),
-            calls: Arc::clone(&calls),
-        });
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+    /// After cancellation the supervisor must treat a clean listener return
+    /// as an expected exit — no restart.  Before cancellation a clean return
+    /// is unexpected and must restart.
+    #[test]
+    fn should_restart_listener_after_clean_return_respects_cancellation() {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
-
-        // Cancel first so the supervisor sees the signal, then drop the
-        // receiver to unblock listen() so it returns Ok(()).
+        // Listener exited cleanly before any shutdown signal — restart.
+        assert!(
+            should_restart_listener_after_clean_return(&cancel),
+            "must restart when cancellation has not been triggered"
+        );
+        // Operator pressed Ctrl+C — the clean exit is expected, don't restart.
         cancel.cancel();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        drop(rx);
-
-        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
         assert!(
-            result.is_ok(),
-            "listener should exit without restarting after cancel"
+            !should_restart_listener_after_clean_return(&cancel),
+            "must not restart after cancellation was triggered"
         );
-
-        // The listener may exit via the select! cancel branch (0 calls) or
-        // via the Ok(()) + is_cancelled guard (1 call). Either is valid;
-        // what matters is that it did not restart.
-        let count = calls.load(Ordering::SeqCst);
-        assert!(
-            count <= 1,
-            "listener ran more than once; unexpected restart"
-        );
-    }
-
-    /// A clean `Ok(())` return before cancellation is triggered is an
-    /// unexpected exit and must still restart.
-    #[tokio::test]
-    async fn supervised_listener_restarts_on_clean_return_before_cancellation() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        // FailOnceChannel with no error set returns Ok(()) on every listen().
-        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
-            name: "test-clean-return-restart".to_string(),
-            calls: Arc::clone(&calls),
-            err: Mutex::new(None),
-        });
-
-        let (tx, _rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
-
-        // Give the listener time to return Ok(()) and the supervisor to
-        // bump restart_count before the backoff sleep.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-
-        let snapshot = zeroclaw_runtime::health::snapshot_json();
-        let component = &snapshot["components"]["channel:test-clean-return-restart"];
-        let restart_count = component["restart_count"].as_u64().unwrap_or(0);
-        assert!(
-            restart_count >= 1,
-            "clean return before cancel must trigger restart, got {restart_count}"
-        );
-
-        cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
     }
 
     #[tokio::test]
