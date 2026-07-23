@@ -18,7 +18,7 @@ max_tool_result_chars = 50000
 max_context_tokens = 32000
 
 [agent.context_compression]
-enabled = true
+enabled = false
 tool_result_retrim_chars = 2000
 
 [memory]
