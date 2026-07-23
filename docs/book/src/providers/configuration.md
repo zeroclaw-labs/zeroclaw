@@ -250,7 +250,9 @@ recover it two ways:
   `claude-opus-4-8`.
 
 Either way the delivered reply carries a short footer naming the requested and
-served models, so the switch is visible to the user.
+served models, so the switch is visible to the user. In the web dashboard chat
+the same switch surfaces as an inline notice just before the answer, showing
+only the requested and served model names.
 
 Streaming has a limit: a refusal that arrives after streamed output has begun
 keeps the existing interrupted-reply behavior; fallback applies only to refusals

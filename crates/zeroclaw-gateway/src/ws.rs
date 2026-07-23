@@ -869,6 +869,30 @@ fn history_trimmed_ws_frame(
     })
 }
 
+/// Build the display-only `safeguard_fallback` WS frame from a drained
+/// [`zeroclaw_providers::SafeguardFallbackNotice`], or `None` when no notice
+/// was recorded this turn (so "no notice → no frame" is enforced here).
+///
+/// Privacy contract: only the requested/served model names and the fallback
+/// layer (`server`/`client`) cross the wire. The classifier `category` (and any
+/// refusal explanation) are logs-only and MUST NEVER reach the browser — this
+/// helper deliberately never reads `notice.category`.
+fn safeguard_fallback_ws_frame(
+    notice: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
+) -> Option<serde_json::Value> {
+    let notice = notice?;
+    let fallback_kind = match notice.kind {
+        zeroclaw_providers::SafeguardFallbackKind::ServerSide => "server",
+        zeroclaw_providers::SafeguardFallbackKind::ClientSide => "client",
+    };
+    Some(serde_json::json!({
+        "type": "safeguard_fallback",
+        "fallback_kind": fallback_kind,
+        "requested_model": notice.requested_model,
+        "served_model": notice.served_model,
+    }))
+}
+
 fn needs_onboarding_ws_error(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<serde_json::Value> {
@@ -981,7 +1005,16 @@ async fn process_chat_message(
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    let turn_fut = async {
+    // Enclose the whole tool-loop call in a safeguard-fallback scope so the
+    // record calls buried in provider code (client-side reliability retry via
+    // `fallback_models`, or Anthropic server-side fallback) are visible, then
+    // drain the at-most-one notice inside the scope after the loop returns.
+    // `Box::pin` keeps this large turn future on the heap: without boxing,
+    // adding the `TaskLocalFuture` scope layer overflows the debug-build stack
+    // when it is polled (the same lesson the channel orchestrator learned).
+    // The drained notice is display-only — surfaced as a standalone WS frame
+    // below and never written into the persisted transcript.
+    let turn_fut = zeroclaw_providers::scope_safeguard_fallback(Box::pin(async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
@@ -992,7 +1025,7 @@ async fn process_chat_message(
             model = %turn_model,
             channel = "wss",
         );
-        zeroclaw_runtime::agent::loop_::scope_session_key(
+        let result = zeroclaw_runtime::agent::loop_::scope_session_key(
             Some(session_key_owned.clone()),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
                 turn_usage.clone(),
@@ -1009,8 +1042,10 @@ async fn process_chat_message(
                 ),
             ),
         )
-        .await
-    };
+        .await;
+        let safeguard_notice = zeroclaw_providers::take_last_safeguard_fallback();
+        (result, safeguard_notice)
+    }));
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket. Track streamed chunks so we
@@ -1204,7 +1239,7 @@ async fn process_chat_message(
         }
     };
 
-    let (result, ()) = tokio::join!(turn_fut, forward_fut);
+    let ((result, safeguard_notice), ()) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
@@ -1368,6 +1403,17 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
+            // Surface an at-most-one safety-safeguard downgrade notice just
+            // before the terminal `done` frame, so the web chat shows the
+            // silent model switch the same way the messaging channels append a
+            // footer. Display-only: emitted as its own frame, never added to
+            // `outcome.new_messages`, so it is not persisted into the session
+            // transcript. Privacy: only the model names cross the wire — the
+            // classifier `category` (and any refusal explanation) never do.
+            if let Some(frame) = safeguard_fallback_ws_frame(safeguard_notice.as_ref()) {
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": outcome.response,
@@ -1500,6 +1546,60 @@ mod tests {
                 "reason": "message limit",
             })
         );
+    }
+
+    #[test]
+    fn safeguard_fallback_frame_carries_models_and_kind_without_category() {
+        use zeroclaw_providers::{SafeguardFallbackKind, SafeguardFallbackNotice};
+        // A client-side notice with a non-empty classifier category — the
+        // category must be dropped on the way to the browser.
+        let notice = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ClientSide,
+            requested_model: "claude-fable-5".to_string(),
+            served_model: "claude-opus-4-8".to_string(),
+            category: Some("classifier-token".to_string()),
+        };
+
+        let frame = safeguard_fallback_ws_frame(Some(&notice))
+            .expect("a recorded notice must produce a WS frame");
+
+        assert_eq!(frame["type"], "safeguard_fallback");
+        assert_eq!(frame["fallback_kind"], "client");
+        assert_eq!(frame["requested_model"], "claude-fable-5");
+        assert_eq!(frame["served_model"], "claude-opus-4-8");
+        // Privacy contract: the classifier category (and any refusal
+        // explanation) must NEVER cross the wire to the browser.
+        assert!(
+            frame.get("category").is_none(),
+            "category key must not be serialized into the frame: {frame}"
+        );
+        assert!(
+            !frame.to_string().contains("classifier-token"),
+            "category value leaked into the safeguard frame: {frame}"
+        );
+    }
+
+    #[test]
+    fn safeguard_fallback_frame_maps_server_side_kind() {
+        use zeroclaw_providers::{SafeguardFallbackKind, SafeguardFallbackNotice};
+        let notice = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ServerSide,
+            requested_model: "claude-fable-5".to_string(),
+            served_model: "claude-opus-4-8".to_string(),
+            category: None,
+        };
+
+        let frame = safeguard_fallback_ws_frame(Some(&notice))
+            .expect("a recorded notice must produce a WS frame");
+
+        assert_eq!(frame["fallback_kind"], "server");
+        assert_eq!(frame["type"], "safeguard_fallback");
+    }
+
+    #[test]
+    fn no_safeguard_notice_yields_no_frame() {
+        // No notice drained this turn → no `safeguard_fallback` frame is sent.
+        assert!(safeguard_fallback_ws_frame(None).is_none());
     }
 
     #[test]

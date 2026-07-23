@@ -263,6 +263,7 @@ export interface WsMessage {
     | "cron_result"
     | "approval_request"
     | "history_trimmed"
+    | "safeguard_fallback"
     | "aborted";
   content?: string;
   full_response?: string;
@@ -286,6 +287,14 @@ export interface WsMessage {
   dropped_messages?: number;
   kept_turns?: number;
   reason?: string;
+  // Safety-safeguard fallback notice (server → client), present only on
+  // "safeguard_fallback" frames. Display-only: the gateway sends just the
+  // model names and which layer switched (`server`/`client`) — never the
+  // classifier category or refusal explanation. See #9262-#9268 (provider
+  // plumbing) plus the gateway/web surfacing built on top of it.
+  requested_model?: string;
+  served_model?: string;
+  fallback_kind?: "server" | "client";
   // Context window info (present on "done" frames). See #7311.
   max_context_tokens?: number;
   input_tokens?: number;

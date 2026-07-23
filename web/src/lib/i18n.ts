@@ -1444,6 +1444,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.error_prefix': '[Error]',
     'agent.history_trimmed': 'Earlier conversation history was trimmed: {reason} ({dropped} messages dropped; {kept} turns kept).',
     'agent.history_trimmed_unknown_reason': 'history limit exceeded',
+    'agent.safeguard_fallback_client': '🛡️ Safety safeguards flagged this request — switched to {served} (requested {requested}).',
+    'agent.safeguard_fallback_server': '🛡️ Safety safeguards flagged this request — Anthropic served the response with {served} (requested {requested}).',
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',
     'agent.copy_message': 'Copy message',

@@ -399,6 +399,36 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         break;
       }
 
+      case 'safeguard_fallback': {
+        // Display-only safety-safeguard downgrade notice. Mirrors
+        // `history_trimmed`: rendered as an ephemeral warning bubble that is
+        // never persisted to localStorage or the backend transcript. Privacy:
+        // the gateway sends only model names and which layer switched — no
+        // classifier category or refusal explanation reaches the browser.
+        const served = msg.served_model ?? '';
+        const requested = msg.requested_model ?? '';
+        if (!served || !requested) break;
+        const key = msg.fallback_kind === 'server'
+          ? 'agent.safeguard_fallback_server'
+          : 'agent.safeguard_fallback_client';
+        const content = t(key)
+          .replace('{requested}', requested)
+          .replace('{served}', served);
+        localMessageMutationVersionRef.current += 1;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: generateUUID(),
+            role: 'agent' as const,
+            content,
+            timestamp: new Date(),
+            ephemeral: true,
+            notice: true,
+          },
+        ]);
+        break;
+      }
+
       case 'approval_request': {
         // Supervised-mode tool consent prompt. Backend parks on a oneshot
         // until we send `approval_response`; if the socket closes or the
