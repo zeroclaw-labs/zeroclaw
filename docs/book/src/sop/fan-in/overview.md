@@ -23,8 +23,8 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 
 | Concern | Mechanism |
 |---|---|
-| **Webhook authentication** | Gateway pairing bearer authentication plus optional `X-Webhook-Secret`; `/sop/*` and `/webhook` share the same rate limiter |
-| **Webhook replay protection** | Optional `X-Idempotency-Key`, with separate namespaces for `/sop/*` and `/webhook` |
+| **Webhook authentication** | Gateway pairing bearer authentication plus optional `X-Webhook-Secret`; `/sop/*` and `/webhook` share the same rate limiter. Starting a SOP run fails closed: at least one of pairing or the webhook secret must be configured and satisfied, or dispatch is rejected, even when both are unset (the default open-container configuration) |
+| **Webhook replay protection** | Optional `X-Idempotency-Key`, namespaced per SOP path as well as separately between `/sop/*` and `/webhook` |
 | **MQTT transport** | `mqtts://` with `use_tls = true` for TLS transport |
 | **Filesystem roots** | Broad roots (`/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, `/tmp`) rejected at config validation unless `allow_broad_roots`; include/exclude globs scope events |
 | **Filesystem symlinks** | Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks = true` opts in but still requires the canonical target to resolve inside a watched root |

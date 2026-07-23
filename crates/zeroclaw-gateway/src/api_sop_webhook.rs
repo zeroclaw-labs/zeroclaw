@@ -7,7 +7,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
 
-use super::{AppState, WebhookJsonResponse, authorize_webhook_request, check_webhook_idempotency};
+use super::{
+    AppState, WebhookJsonResponse, authorize_webhook_request, check_webhook_idempotency,
+    require_sop_dispatch_credentials,
+};
 use zeroclaw_runtime::sop::dispatch::{DispatchResult, dispatch_untrusted_fan_in};
 use zeroclaw_runtime::sop::{SopEvent, SopTriggerSource};
 
@@ -181,7 +184,18 @@ pub async fn handle_sop_webhook(
         Err(response) => return response.into_response(),
     }
 
-    if let Some(response) = check_webhook_idempotency(&state, &headers, Some("sop")) {
+    if let Err(response) = require_sop_dispatch_credentials(&state) {
+        return response.into_response();
+    }
+
+    // Namespace idempotency by the specific SOP path, not just the shared
+    // `/sop/*` family — otherwise the same caller key sent to two different
+    // SOP paths (e.g. `/sop/deploy` then `/sop/rollback`) would wrongly
+    // suppress the second one as a duplicate of the first.
+    let idempotency_namespace = format!("sop:{path}");
+    if let Some(response) =
+        check_webhook_idempotency(&state, &headers, Some(&idempotency_namespace))
+    {
         return response.into_response();
     }
 
