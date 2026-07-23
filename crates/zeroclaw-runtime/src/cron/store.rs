@@ -947,10 +947,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let uses_memory: Option<i64> = row.get(19)?;
     let agent_alias: Option<String> = row.get(20)?;
     let shell_output_format_raw: Option<String> = row.get(21)?;
-    let shell_output_format = shell_output_format_raw
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<CronShellOutputFormat>(&format!("\"{s}\"")).ok())
-        .unwrap_or_default();
+    let shell_output_format = decode_shell_output_format(shell_output_format_raw.as_deref())
+        .map_err(sql_conversion_error)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -1029,6 +1027,18 @@ fn encode_allowed_tools(allowed_tools: Option<&Vec<String>>) -> Result<Option<St
         .map(serde_json::to_string)
         .transpose()
         .context("Failed to serialize cron allowed_tools")
+}
+
+fn decode_shell_output_format(raw: Option<&str>) -> Result<CronShellOutputFormat> {
+    let Some(raw) = raw else {
+        return Ok(CronShellOutputFormat::default());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(CronShellOutputFormat::default());
+    }
+    serde_json::from_str(&format!("\"{trimmed}\""))
+        .with_context(|| format!("Unknown cron shell_output_format value: {trimmed}"))
 }
 
 fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
@@ -2240,6 +2250,37 @@ mod tests {
         .unwrap();
 
         assert!(get_job(&config, "job-type-invalid").is_err());
+    }
+
+    #[test]
+    fn shell_output_format_from_sql_rejects_invalid_value() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run, shell_output_format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    "shell-output-format-invalid",
+                    "*/5 * * * *",
+                    "echo ok",
+                    Option::<String>::None,
+                    "shell",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                    "raw2",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            get_job(&config, "shell-output-format-invalid").is_err(),
+            "an unparseable persisted shell_output_format must surface an error, not silently become Wrapped"
+        );
     }
 
     #[test]
