@@ -67,6 +67,10 @@ impl ModelPinnedProvider {
             inner: None,
         }
     }
+
+    pub(crate) fn pinned_model(&self) -> &str {
+        &self.pinned_model
+    }
 }
 
 #[async_trait]

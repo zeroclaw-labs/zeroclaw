@@ -937,16 +937,6 @@ async fn recovered_goal_requeue_authority(
         .clone()
 }
 
-#[cfg(test)]
-fn in_flight_worker_is_bound_to_goal(state: &InFlightSenderTaskState, task_id: &str) -> bool {
-    state
-        .goal_task_id
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-        == Some(task_id)
-}
-
 fn in_flight_worker_goal_task_id(state: &InFlightSenderTaskState) -> Option<String> {
     let mut current = Some(state);
     while let Some(candidate) = current {
@@ -956,21 +946,6 @@ fn in_flight_worker_goal_task_id(state: &InFlightSenderTaskState) -> Option<Stri
         current = candidate.predecessor.as_deref();
     }
     None
-}
-
-#[cfg(test)]
-#[test]
-fn in_flight_worker_binding_requires_the_exact_goal_task() {
-    let state = InFlightSenderTaskState {
-        task_id: 1,
-        cancellation: CancellationToken::new(),
-        completion: Arc::new(InFlightTaskCompletion::new()),
-        goal_task_id: Arc::new(std::sync::Mutex::new(Some("goal-a".into()))),
-        predecessor: None,
-    };
-
-    assert!(in_flight_worker_is_bound_to_goal(&state, "goal-a"));
-    assert!(!in_flight_worker_is_bound_to_goal(&state, "goal-b"));
 }
 
 #[cfg(test)]
@@ -7942,20 +7917,8 @@ async fn complete_pre_registered_in_flight(
                 .completion
                 .wait_released_or_cancelled(&cancellation)
                 .await
+                || registration.state.cancellation.is_cancelled()
             {
-                requeue_abandoned_recovered_continuation(
-                    msg,
-                    recovered_task_id,
-                    &registration.state.completion,
-                    live_tx,
-                    requeue_generations,
-                    pending_by_scope,
-                )
-                .await;
-                registration.mark_done();
-                return InFlightPreRegistration::Abandoned;
-            }
-            if registration.state.cancellation.is_cancelled() {
                 requeue_abandoned_recovered_continuation(
                     msg,
                     recovered_task_id,
@@ -25952,6 +25915,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             false,
+            zeroclaw_runtime::agent::TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("test-agent"),
+                turn_id: "test-turn",
+                channel_name: "test-channel",
+            },
         )
         .await
     }

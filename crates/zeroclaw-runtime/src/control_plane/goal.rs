@@ -2131,7 +2131,7 @@ pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<
     let Some(cp) = control_plane() else {
         return Ok(false);
     };
-    latest_active_resolved_goal(cp.store.as_ref(), cp.goal_store.as_ref(), ctx)
+    resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx)
         .await
         .map(|goal| goal.is_some_and(|goal| goal.is_running()))
 }
@@ -2806,31 +2806,6 @@ async fn resolve_goal(
 /// approval transitions cannot be redirected by another goal in the same
 /// agent/route/principal context.
 async fn resolved_goal_for_context(
-    store: &dyn TaskRegistry,
-    goal_store: &dyn GoalTaskRegistry,
-    ctx: &GoalAdmissionContext,
-) -> Result<Option<TaskGoal>> {
-    if let Some(task_id) = ctx.goal_task_id.clone() {
-        return resolve_goal(store, goal_store, ctx, Some(task_id))
-            .await
-            .map(Some);
-    }
-    let Some(task) = goal_store
-        .latest_active_goal_for_context(
-            &ctx.agent_alias,
-            ctx.originator_route.as_deref(),
-            ctx.principal_id.as_deref(),
-        )
-        .await
-        .with_context(|| msg("goal-command-error-active-goal-lookup-failed", &[]))?
-    else {
-        return Ok(None);
-    };
-    ensure_goal_visible(&task, ctx)?;
-    load_goal_extension(goal_store, task).await.map(Some)
-}
-
-async fn latest_active_resolved_goal(
     store: &dyn TaskRegistry,
     goal_store: &dyn GoalTaskRegistry,
     ctx: &GoalAdmissionContext,

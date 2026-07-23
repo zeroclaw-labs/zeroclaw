@@ -4093,12 +4093,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // SOP loading is gated on `[sop] sops_dir`: unset disables all
                 // SOP runtime behavior, matching the documented rollback path.
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory(
-                            &current_config.memory,
-                            &current_config.data_dir,
-                            None,
-                        )?);
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
+                    );
                     let sop_adapters =
                         build_sop_adapters(&current_config, Arc::clone(&leak_detection_resolver));
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
@@ -4866,12 +4863,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     approval_route_leak_detection_resolver(Arc::clone(&live_config));
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory(
-                            &current_config.memory,
-                            &current_config.data_dir,
-                            None,
-                        )?);
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
+                    );
                     let sop_adapters = build_sop_adapters(&current_config, leak_detection_resolver);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
