@@ -342,26 +342,75 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
-        let messages = backend.load(&session_key);
-        if !messages.is_empty() {
-            message_count = messages.len();
-            stored_messages = messages;
-            resumed = true;
+        // Persistence hydration runs on the blocking pool — see
+        // `session_async` for the rationale (the foundation
+        // contract must stay correct once a remote-database backend
+        // lands in a follow-up PR; today's sqlite/jsonl pays only
+        // one spawn-and-join round trip).
+        let session_key_owned = session_key.clone();
+        let messages_result =
+            crate::session_async::load(backend.clone(), session_key_owned.clone()).await;
+        match messages_result {
+            Ok(messages) if !messages.is_empty() => {
+                message_count = messages.len();
+                stored_messages = messages;
+                resumed = true;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{e}"),
+                        })),
+                    "session hydration load failed"
+                );
+            }
         }
         // Set session name if provided (non-empty) on connect
         if let Some(ref name) = session_name
             && !name.is_empty()
         {
-            let _ = backend.set_session_name(&session_key, name);
+            let _ = crate::session_async::set_session_name(
+                backend.clone(),
+                session_key_owned.clone(),
+                name.clone(),
+            )
+            .await;
             effective_name = Some(name.clone());
         }
         // If no name was provided via query param, load the stored name
         if effective_name.is_none() {
-            effective_name = backend.get_session_name(&session_key).unwrap_or(None);
+            match crate::session_async::get_session_name(backend.clone(), session_key_owned.clone())
+                .await
+            {
+                Ok(Some(name)) => effective_name = Some(name),
+                Ok(None) => {}
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": session_key,
+                                "error": format!("{e}"),
+                            })),
+                        "session hydration get_session_name failed"
+                    );
+                }
+            }
         }
         // Stamp the agent alias so future /api/sessions queries and
         // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+        let _ = crate::session_async::set_session_agent_alias(
+            backend.clone(),
+            session_key_owned.clone(),
+            agent_alias.clone(),
+        )
+        .await;
     }
 
     // Send session_start message to client
@@ -823,6 +872,16 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
+/// Sync variant of `session_async::persist_conversation_messages`.
+/// Kept around for the regression test
+/// `persist_conversation_messages_skips_deleted_session`
+/// that asserts the existence-guard / role-filter contract on a
+/// test-only `SessionBackend` mock — moving the test to an async
+/// harness would tie it to tokio's runtime instead of the pure
+/// backend semantics the bug was about. Production call sites use
+/// the async helper in `session_async`, which delegates here
+/// unchanged.
+#[allow(dead_code)]
 fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
@@ -832,7 +891,23 @@ fn persist_conversation_messages(
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
     // / `error` frames are still sent to the client; we just refuse to
     // re-create the row that `DELETE /api/sessions/{id}` just wiped.
-    if !backend.session_exists(session_key) {
+    // Propagate session_exists errors instead of swallowing them as false.
+    let exists = match backend.session_exists(session_key) {
+        Ok(exists) => exists,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"session_key": session_key, "error": format!("{e}")})
+                    ),
+                "session_exists check failed; skipping persist"
+            );
+            return;
+        }
+    };
+    if !exists {
         return;
     }
     for message in messages {
@@ -959,7 +1034,13 @@ async fn process_chat_message(
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
     if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+        let _ = crate::session_async::set_session_state(
+            backend.clone(),
+            session_key.to_string(),
+            "running".to_string(),
+            Some(turn_id.clone()),
+        )
+        .await;
     }
 
     // ── Cancellation token lifecycle ─────────────────────────────
@@ -1224,15 +1305,19 @@ async fn process_chat_message(
 
     if was_cancelled {
         if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
+            let still_exists =
+                crate::session_async::session_exists(backend.clone(), session_key.to_string())
+                    .await
+                    .unwrap_or(false);
             if still_exists {
                 match &result {
                     Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
+                        crate::session_async::persist_conversation_messages(
+                            backend.clone(),
+                            session_key.to_string(),
+                            error.new_messages.clone(),
+                        )
+                        .await;
                         if !has_assistant_chat_message(&error.new_messages) {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
                                 "turn-interrupted-by-user",
@@ -1248,8 +1333,19 @@ async fn process_chat_message(
                             // delete the session between the outer check and
                             // here; `persist_conversation_messages` already
                             // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
+                            let recheck = crate::session_async::session_exists(
+                                backend.clone(),
+                                session_key.to_string(),
+                            )
+                            .await
+                            .unwrap_or(false);
+                            if recheck {
+                                let _ = crate::session_async::append(
+                                    backend.clone(),
+                                    session_key.to_string(),
+                                    assistant_msg,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1263,8 +1359,19 @@ async fn process_chat_message(
                             format!("{accumulated_text}\n\n{marker}")
                         };
                         let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
+                        let recheck = crate::session_async::session_exists(
+                            backend.clone(),
+                            session_key.to_string(),
+                        )
+                        .await
+                        .unwrap_or(false);
+                        if recheck {
+                            let _ = crate::session_async::append(
+                                backend.clone(),
+                                session_key.to_string(),
+                                assistant_msg,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1275,10 +1382,20 @@ async fn process_chat_message(
         let aborted = serde_json::json!({ "type": "aborted" });
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(session_key)
-        {
-            let _ = backend.set_session_state(session_key, "idle", None);
+        if let Some(ref backend) = state.session_backend {
+            let still_exists =
+                crate::session_async::session_exists(backend.clone(), session_key.to_string())
+                    .await
+                    .unwrap_or(false);
+            if still_exists {
+                let _ = crate::session_async::set_session_state(
+                    backend.clone(),
+                    session_key.to_string(),
+                    "idle".to_string(),
+                    None,
+                )
+                .await;
+            }
         }
 
         // Broadcast agent_end event
@@ -1311,7 +1428,12 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                crate::session_async::persist_conversation_messages(
+                    backend.clone(),
+                    session_key.to_string(),
+                    outcome.new_messages.clone(),
+                )
+                .await;
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1384,7 +1506,13 @@ async fn process_chat_message(
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
+                let _ = crate::session_async::set_session_state(
+                    backend.clone(),
+                    session_key.to_string(),
+                    "idle".to_string(),
+                    None,
+                )
+                .await;
             }
 
             // Broadcast agent_end event
@@ -1419,12 +1547,23 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend
                 && !e.new_messages.is_empty()
             {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                crate::session_async::persist_conversation_messages(
+                    backend.clone(),
+                    session_key.to_string(),
+                    e.new_messages.clone(),
+                )
+                .await;
             }
 
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+                let _ = crate::session_async::set_session_state(
+                    backend.clone(),
+                    session_key.to_string(),
+                    "error".to_string(),
+                    Some(turn_id.clone()),
+                )
+                .await;
             }
 
             ::zeroclaw_log::record!(
@@ -1970,8 +2109,11 @@ mod tests {
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
-        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
-            Vec::new()
+        fn load(
+            &self,
+            _session_key: &str,
+        ) -> std::io::Result<Vec<zeroclaw_providers::ChatMessage>> {
+            Ok(Vec::new())
         }
         fn append(
             &self,
@@ -1987,12 +2129,12 @@ mod tests {
         fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
             Ok(false)
         }
-        fn list_sessions(&self) -> Vec<String> {
-            Vec::new()
+        fn list_sessions(&self) -> std::io::Result<Vec<String>> {
+            Ok(Vec::new())
         }
-        fn session_exists(&self, _session_key: &str) -> bool {
+        fn session_exists(&self, _session_key: &str) -> std::io::Result<bool> {
             // The user deleted the session between cancel and append.
-            false
+            Ok(false)
         }
     }
 

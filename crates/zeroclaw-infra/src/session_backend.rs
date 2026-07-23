@@ -68,20 +68,21 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
-    /// Load all messages for a session. Returns empty vec if session doesn't exist.
-    fn load(&self, session_key: &str) -> Vec<ChatMessage>;
+    /// Load all messages for a session. Returns an error if the backend fails.
+    fn load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>>;
 
     /// Same as `load`, but each row carries its persisted `created_at`
-    /// when the backend has one. Default impl falls back to `load`
-    /// without timestamps so non-SQLite backends keep working.
-    fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
-        self.load(session_key)
-            .into_iter()
-            .map(|message| TimestampedMessage {
-                message,
-                created_at: None,
-            })
-            .collect()
+    /// when the backend has one.
+    fn load_with_timestamps(&self, session_key: &str) -> std::io::Result<Vec<TimestampedMessage>> {
+        self.load(session_key).map(|messages| {
+            messages
+                .into_iter()
+                .map(|message| TimestampedMessage {
+                    message,
+                    created_at: None,
+                })
+                .collect()
+        })
     }
 
     /// Append a single message to a session.
@@ -99,29 +100,33 @@ pub trait SessionBackend: Send + Sync {
         }
     }
 
-    /// List all session keys.
-    fn list_sessions(&self) -> Vec<String>;
+    /// List all session keys. Returns an error if the backend fails.
+    fn list_sessions(&self) -> std::io::Result<Vec<String>>;
 
-    /// List sessions with metadata.
-    fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-        // Default: construct metadata from messages (backends can override for efficiency)
-        self.list_sessions()
-            .into_iter()
-            .map(|key| {
-                let messages = self.load(&key);
-                SessionMetadata {
-                    key,
-                    name: None,
-                    created_at: Utc::now(),
-                    last_activity: Utc::now(),
-                    message_count: messages.len(),
-                    agent_alias: None,
-                    channel_id: None,
-                    room_id: None,
-                    sender_id: None,
-                }
-            })
-            .collect()
+    /// List sessions with metadata. Returns an error if the backend fails.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation returns `Err` to force backend authors to provide
+    /// a batch-loaded implementation. The previous O(N) sequential call pattern
+    /// would block the executor thread for an unacceptable duration with many sessions,
+    /// potentially causing thread pool exhaustion.
+    ///
+    /// Implementations MUST override this method with a single batch query that fetches
+    /// all metadata without per-session lookups. PostgreSQL and SQLite backends do this
+    /// with a single `SELECT` from `session_metadata`.
+    ///
+    /// # Recursion Warning
+    ///
+    /// Implementations of `get_session_metadata` must NOT call `list_sessions_with_metadata`,
+    /// as this will cause infinite recursion. The separation is enforced by requiring
+    /// explicit batch implementations rather than providing a default that could be misused.
+    fn list_sessions_with_metadata(&self) -> std::io::Result<Vec<SessionMetadata>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "list_sessions_with_metadata must be implemented by the backend with a batch query; \
+             the default O(N) sequential implementation is disabled to prevent thread pool exhaustion",
+        ))
     }
 
     /// Compact a session file (remove duplicates/corruption). No-op by default.
@@ -134,9 +139,9 @@ pub trait SessionBackend: Send + Sync {
         Ok(0)
     }
 
-    /// Search sessions by keyword. Default returns empty (backends with FTS override).
-    fn search(&self, _query: &SessionQuery) -> Vec<SessionMetadata> {
-        Vec::new()
+    /// Search sessions by keyword. Returns an error if the backend fails.
+    fn search(&self, _query: &SessionQuery) -> std::io::Result<Vec<SessionMetadata>> {
+        Ok(Vec::new())
     }
 
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
@@ -164,8 +169,11 @@ pub trait SessionBackend: Send + Sync {
         Ok(0)
     }
 
-    fn session_exists(&self, session_key: &str) -> bool {
-        self.get_session_metadata(session_key).is_some()
+    fn session_exists(&self, session_key: &str) -> std::io::Result<bool> {
+        match self.get_session_metadata(session_key) {
+            Ok(opt) => Ok(opt.is_some()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Set or update the human-readable name for a session.
@@ -202,22 +210,33 @@ pub trait SessionBackend: Send + Sync {
         Ok(())
     }
 
-    fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
-        let messages = self.load(session_key);
-        if messages.is_empty() {
-            return None;
-        }
-        Some(SessionMetadata {
-            key: session_key.to_string(),
-            name: self.get_session_name(session_key).ok().flatten(),
-            created_at: Utc::now(),
-            last_activity: Utc::now(),
-            message_count: messages.len(),
-            agent_alias: None,
-            channel_id: None,
-            room_id: None,
-            sender_id: None,
-        })
+    /// Get metadata for a specific session by key.
+    ///
+    /// # Performance Contract
+    ///
+    /// This method MUST complete in O(1) or O(log N) time. It is used for
+    /// lightweight probes (existence checks, ownership validation, health
+    /// probes) and must not block the executor thread.
+    ///
+    /// # Implementation Requirements
+    ///
+    /// - **DO NOT** call `self.load(session_key)` — loading all messages is O(N)
+    ///   and violates the performance contract.
+    /// - **DO** query only the metadata table (or equivalent) with a key-based
+    ///   lookup. PostgreSQL and SQLite backends do this with a single `SELECT`
+    ///   from `session_metadata WHERE session_key = $1`.
+    ///
+    /// The default implementation returns `Err(Unsupported)` to enforce that
+    /// backend authors provide a proper O(1) implementation. The previous
+    /// implementation that called `self.load()` was a recursion hazard and
+    /// violated the performance contract.
+    fn get_session_metadata(&self, _session_key: &str) -> std::io::Result<Option<SessionMetadata>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "get_session_metadata must be implemented by the backend with an O(1) \
+             metadata-only query; the default implementation that calls self.load() \
+             is disabled to prevent recursion and performance violations",
+        ))
     }
 
     /// Set the session state (e.g. "idle", "running", "error").
@@ -236,14 +255,15 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
-    /// List sessions currently in "running" state.
-    fn list_running_sessions(&self) -> Vec<SessionMetadata> {
-        Vec::new()
+    /// List sessions currently in "running" state. Returns an error if the backend fails.
+    fn list_running_sessions(&self) -> std::io::Result<Vec<SessionMetadata>> {
+        Ok(Vec::new())
     }
 
     /// List sessions stuck in "running" state longer than `threshold_secs`.
-    fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
-        Vec::new()
+    /// Returns an error if the backend fails.
+    fn list_stuck_sessions(&self, _threshold_secs: u64) -> std::io::Result<Vec<SessionMetadata>> {
+        Ok(Vec::new())
     }
 }
 

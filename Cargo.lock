@@ -7667,6 +7667,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r2d2"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
+dependencies = [
+ "log",
+ "parking_lot",
+ "scheduled-thread-pool",
+]
+
+[[package]]
+name = "r2d2_postgres"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efd4b47636dbca581cd057e2f27a5d39be741ea4f85fd3c29e415c55f71c7595"
+dependencies = [
+ "postgres",
+ "r2d2",
+]
+
+[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8460,7 +8481,7 @@ dependencies = [
  "rustls-webpki 0.103.13",
  "security-framework 3.7.0",
  "security-framework-sys",
- "webpki-root-certs",
+ "webpki-root-certs 1.0.7",
  "windows-sys 0.61.2",
 ]
 
@@ -8539,6 +8560,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "scheduled-thread-pool"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
@@ -10034,6 +10064,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
+name = "tls_codec"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0de2e01245e2bb89d6f05801c564fa27624dbd7b1846859876c7dad82e90bf6b"
+dependencies = [
+ "tls_codec_derive",
+ "zeroize",
+]
+
+[[package]]
+name = "tls_codec_derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d2e76690929402faae40aebdda620a2c0e25dd6d3b9afe48867dfd95991f4bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "tokio"
 version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10095,6 +10146,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-postgres-rustls"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27d684bad428a0f2481f42241f821db42c54e2dc81d8c00db8536c506b0a0144"
+dependencies = [
+ "const-oid 0.9.6",
+ "ring",
+ "rustls",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "x509-cert",
 ]
 
 [[package]]
@@ -11786,6 +11852,15 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c7f0ef91146ebfb530314f5f1d24528d7f0767efbfd31dce919275413e393e"
+dependencies = [
+ "webpki-root-certs 1.0.7",
+]
+
+[[package]]
+name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
@@ -12826,6 +12901,7 @@ dependencies = [
  "const-oid 0.9.6",
  "der",
  "spki",
+ "tls_codec",
 ]
 
 [[package]]
@@ -13289,11 +13365,19 @@ dependencies = [
  "chrono",
  "parking_lot",
  "portable-atomic",
+ "postgres",
+ "r2d2",
+ "r2d2_postgres",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "url",
+ "webpki-root-certs 0.26.11",
  "zeroclaw-api",
  "zeroclaw-log",
  "zeroclaw-spawn",
