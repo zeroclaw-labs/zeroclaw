@@ -3,6 +3,10 @@
     clippy::useless_format,
     clippy::manual_inspect
 )]
+// Raised for the Send auto-trait proof depth of the cron scheduler's
+// `tokio::time::timeout` wrapper around the pinned `agent::run` future, which
+// overflows the default limit only under `cfg(test)`.
+#![recursion_limit = "256"]
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;
