@@ -1125,7 +1125,10 @@ pub async fn run_gateway(
                 alias.clone(),
                 Arc::new(NextcloudTalkChannel::new(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    // One canonical bot secret: an explicit `bot_token`
+                    // wins, else fall back to `webhook_secret` (Nextcloud
+                    // issues one secret per bot for both directions).
+                    nc.bot_token.clone().or_else(|| nc.webhook_secret.clone()),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias.clone(),
                     peer_resolver,
@@ -6416,7 +6419,7 @@ mod tests {
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             String::new(),
             alias,
             peer_resolver,
@@ -6563,7 +6566,7 @@ mod tests {
 
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             String::new(),
             "default",
             Arc::new(|| vec!["*".to_string()]),

@@ -2550,7 +2550,7 @@ pub(crate) mod tests {
             zeroclaw_config::schema::NextcloudTalkConfig {
                 enabled: true,
                 base_url: "https://cloud.example.com".to_string(),
-                app_token: "test-token".to_string(),
+                app_token: None,
                 ..Default::default()
             },
         );

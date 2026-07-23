@@ -7288,7 +7288,7 @@ fn build_channel_by_id(
             Ok(Arc::new(
                 NextcloudTalkChannel::new_with_proxy(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    nc.bot_token.clone().or_else(|| nc.webhook_secret.clone()),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias,
                     peer_resolver,
@@ -8569,7 +8569,7 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
-                nc.app_token.clone(),
+                nc.bot_token.clone().or_else(|| nc.webhook_secret.clone()),
                 nc.bot_name.clone().unwrap_or_default(),
                 alias.clone(),
                 peer_resolver,

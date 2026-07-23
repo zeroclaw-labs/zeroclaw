@@ -10,15 +10,16 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 
 - Receives inbound Talk events via `POST /nextcloud-talk/<alias>` on the gateway (bare `/nextcloud-talk` still works as a deprecated fallback)
 - Verifies webhook signatures (HMAC-SHA256) when a secret is configured
-- Sends replies back to Talk rooms via the Nextcloud OCS API
+- Sends replies back to Talk rooms via the signed Nextcloud Talk Bot API
 
 ## Prerequisites
 
 - **Nextcloud server** with the Talk app enabled (v17 or later recommended)
-- **Bot account** in Talk settings, give it a display name (e.g. `zeroclaw-bot`)
-- **Bot app token** from the Talk admin UI for OCS API bearer auth (used for outbound replies)
-- **Webhook secret** from the Talk admin UI if you want signature verification (strongly recommended)
+- **Bot registered** in Talk's bot admin settings, give it a display name (e.g. `zeroclaw-bot`)
+- **Bot secret** from that registration. Nextcloud issues one shared secret per bot, used both to verify inbound webhook signatures and to sign outbound bot-API replies. Set it as `webhook_secret` (canonical); `bot_token` exists only if your deployment genuinely needs a different secret for outbound sends
 - **Publicly-reachable gateway**: see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
+
+Sending fails closed (no request is sent) if neither `bot_token` nor `webhook_secret` is configured; misconfiguration never produces an unsigned or invalid-signature request on the wire.
 
 ## Configuration
 
@@ -29,6 +30,8 @@ The channel is read from the `default` alias. Set it through any config surface:
 {{#config-where channels nextcloud_talk}}
 
 `webhook_secret` can also be supplied at runtime via the generic env override {{#env-var-name channels.nextcloud_talk.default.webhook_secret}}, useful for rotating it without editing the config.
+
+`app_token` is deprecated and unused (replies no longer go through OCS bearer auth); it's only still accepted so old configs that set it don't fail to parse.
 
 ## Gateway endpoint
 
@@ -104,7 +107,7 @@ Nextcloud Talk does not support message edits via the Bot API, so streaming draf
 ## Self-hosting notes
 
 - TLS: terminate at your reverse proxy; webhook signature verification works over HTTP-to-container loopback
-- The OCS API is authenticated via Bearer token: use the bot app token from the Talk admin UI
+- Outbound replies authenticate via the Bot API's HMAC signature (`webhook_secret`/`bot_token`), not a bearer token; there is no separate OCS bearer credential to manage
 - Rate limits are Nextcloud-server dependent; the default bot doesn't run into them in normal conversation cadences
 - Per-channel proxy: set `proxy_url` to override the global `[proxy]` setting for Nextcloud Talk only (`http://`, `https://`, `socks5://`, `socks5h://`)
 

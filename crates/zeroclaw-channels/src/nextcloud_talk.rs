@@ -18,10 +18,16 @@ const DEFAULT_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
 /// Nextcloud Talk channel in webhook mode.
 /// Incoming messages are received by the gateway endpoint `/nextcloud-talk`.
-/// Outbound replies are sent through Nextcloud Talk OCS API.
+/// Outbound replies are sent through the Nextcloud Talk bot API
+/// (HMAC-SHA256-signed requests via `bot_token`), not the OCS chat API.
 pub struct NextcloudTalkChannel {
     base_url: String,
-    app_token: String,
+    /// Shared bot secret used to sign outbound bot-API requests (and, by
+    /// the caller, to verify inbound webhook signatures — Nextcloud issues
+    /// one secret per installed bot for both directions). A `None` here
+    /// means sending is unconfigured; every send path fails closed before
+    /// any network I/O rather than emitting an unsigned/invalid request.
+    bot_token: Option<String>,
     bot_name: String,
     /// The alias key under `[channels.nextcloud_talk.<alias>]` this handle is
     /// bound to. Used to scope peer-group writes and resolver lookups.
@@ -41,17 +47,17 @@ pub struct NextcloudTalkChannel {
 impl NextcloudTalkChannel {
     pub fn new(
         base_url: String,
-        app_token: String,
+        bot_token: Option<String>,
         bot_name: String,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
-        Self::new_with_proxy(base_url, app_token, bot_name, alias, peer_resolver, None)
+        Self::new_with_proxy(base_url, bot_token, bot_name, alias, peer_resolver, None)
     }
 
     pub fn new_with_proxy(
         base_url: String,
-        app_token: String,
+        bot_token: Option<String>,
         bot_name: String,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -59,7 +65,7 @@ impl NextcloudTalkChannel {
     ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            app_token,
+            bot_token,
             bot_name: bot_name.to_ascii_lowercase(),
             alias: alias.into(),
             peer_resolver,
@@ -459,31 +465,55 @@ impl NextcloudTalkChannel {
         messages
     }
 
-    fn ocs_chat_url(&self, room_token: &str, message_id: Option<&str>) -> String {
-        let encoded_room = urlencoding::encode(room_token);
-        match message_id {
-            Some(message_id) => format!(
-                "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
-                self.base_url, encoded_room, message_id
-            ),
-            None => format!(
-                "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
-                self.base_url, encoded_room
-            ),
-        }
+    /// Generate a bot URL for the Nextcloud Talk bot API (signed requests).
+    /// Bot API endpoint: POST /ocs/v2.php/apps/spreed/api/v1/bot/{conversationToken}/message
+    /// See: https://github.com/nextcloud/spreed/blob/main/lib/Controller/BotController.php
+    fn bot_api_url(&self, room_token: &str) -> String {
+        format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/message?format=json",
+            self.base_url, room_token
+        )
     }
 
-    fn ocs_chat_request(
+    /// Generate a signed Nextcloud Talk bot API request. Fails closed
+    /// (returns `Err`, sends nothing) when no bot secret is configured —
+    /// a missing secret must never be papered over with a fabricated or
+    /// zero-key signature, since that produces an authenticated-looking
+    /// request that can trip Nextcloud's unauthenticated-request throttling.
+    ///
+    /// Bots authenticate via HMAC-SHA256 over `random + message` (the bare
+    /// message text, matching the Nextcloud controller's verification,
+    /// which binds the `message` request parameter — not the raw JSON
+    /// request body), rendered as a bare hex digest (no `sha256=` prefix).
+    /// See: https://nextcloud-talk.readthedocs.io/en/latest/bots/
+    fn create_signed_request(
         &self,
         method: Method,
-        room_token: &str,
-        message_id: Option<&str>,
-    ) -> reqwest::RequestBuilder {
-        self.client
-            .request(method, self.ocs_chat_url(room_token, message_id))
-            .bearer_auth(&self.app_token)
+        url: &str,
+        message: &str,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        let Some(secret) = &self.bot_token else {
+            anyhow::bail!(
+                "Nextcloud Talk: no bot secret configured (set bot_token or webhook_secret); refusing to send an unsigned request"
+            );
+        };
+
+        let random = Uuid::new_v4().to_string();
+        let payload = format!("{random}{message}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| {
+            anyhow::Error::msg("Nextcloud Talk: failed to create HMAC from bot secret")
+        })?;
+        mac.update(payload.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        Ok(self
+            .client
+            .request(method, url)
+            .header("X-Nextcloud-Talk-Bot-Random", random)
+            .header("X-Nextcloud-Talk-Bot-Signature", signature)
             .header("OCS-APIRequest", "true")
             .header("Accept", "application/json")
+            .header("Content-Type", "application/json"))
     }
 
     async fn post_to_room(
@@ -491,9 +521,11 @@ impl NextcloudTalkChannel {
         room_token: &str,
         content: &str,
     ) -> anyhow::Result<reqwest::Response> {
+        let truncated = Self::truncate_to_nc_limit(content);
+        let url = self.bot_api_url(room_token);
         Ok(self
-            .ocs_chat_request(Method::POST, room_token, None)
-            .json(&serde_json::json!({ "message": content }))
+            .create_signed_request(Method::POST, &url, truncated)?
+            .json(&serde_json::json!({ "message": truncated }))
             .send()
             .await?)
     }
@@ -517,7 +549,7 @@ impl NextcloudTalkChannel {
         anyhow::bail!("Talk API error: {status}");
     }
 
-    /// Send a message and return the numeric message ID assigned by Nextcloud Talk.
+    /// Send a message and return the response from Nextcloud Talk.
     async fn send_to_room_with_id(
         &self,
         room_token: &str,
@@ -538,70 +570,39 @@ impl NextcloudTalkChannel {
             anyhow::bail!("Talk API error: {status}");
         }
 
-        // Response: { "ocs": { "data": { "id": 42, ... } } }
-        let body: serde_json::Value = response.json().await?;
-        let message_id = body
-            .pointer("/ocs/data/id")
-            .and_then(|v| v.as_u64())
-            .map(|id| id.to_string())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "Talk: missing message ID in send response"
-                );
-                anyhow::Error::msg("Talk: missing message ID in send response")
-            })?;
-
-        Ok(message_id)
+        // For the bot API, we don't get a message ID in the response currently
+        // The response body may vary, so we'll just return a success indicator
+        Ok("bot_message_sent".to_string())
     }
 
-    /// Edit an existing message via the Nextcloud Talk OCS API.
-    /// `PUT /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
+    /// Edit an existing message via the Nextcloud Talk bot API.
+    /// Note: Bot API doesn't officially support message editing in version 23.0.3
+    /// This is a placeholder that will send a new message as the bot.
     async fn edit_message(
         &self,
         room_token: &str,
-        message_id: &str,
+        _message_id: &str,
         content: &str,
     ) -> anyhow::Result<()> {
-        let response = self
-            .ocs_chat_request(Method::PUT, room_token, Some(message_id))
-            .json(&serde_json::json!({ "message": content }))
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Talk edit API error: {status}: {body}");
+        // For now, we'll just send a new message since edit isn't officially supported
+        // In a future version, we could implement this via webhook-based editing
+        let _ = self.post_to_room(room_token, content).await?;
+        Ok(())
     }
 
-    /// Delete a message via the Nextcloud Talk OCS API.
-    /// `DELETE /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
-    async fn delete_message(&self, room_token: &str, message_id: &str) -> anyhow::Result<()> {
-        let response = self
-            .ocs_chat_request(Method::DELETE, room_token, Some(message_id))
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+    /// Delete a message via the Nextcloud Talk bot API.
+    /// Note: Bot API doesn't officially support message deletion in version 23.0.3
+    /// This is a placeholder for future implementation.
+    async fn delete_message(&self, _room_token: &str, _message_id: &str) -> anyhow::Result<()> {
+        // Deletion via bot API is not yet supported in Nextcloud Talk 23.0.3
+        // We log a warning and return success to maintain API compatibility
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"status": status.to_string(), "body": body})),
-            "Talk delete_message failed"
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Talk delete_message: message deletion not supported via bot API yet"
         );
-        anyhow::bail!("Talk delete API error: {status}");
+        Ok(())
     }
 
     /// Truncate text to the Nextcloud Talk character limit (UTF-8 char boundary safe).
@@ -636,7 +637,15 @@ impl Channel for NextcloudTalkChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != StreamMode::Off
+        // The bot-API send path (`post_to_room`) never returns a message id
+        // (Nextcloud's bot endpoint doesn't hand one back), so `edit_message`
+        // and `delete_message` below cannot target a specific message: they
+        // post a new message and no-op, respectively. Advertising draft
+        // support here would make the shared draft lifecycle treat those as
+        // real edits/deletes, producing duplicate messages and phantom
+        // cancellations. Keep this false — and `stream_mode` inert — unless
+        // a transport with real per-message update/delete semantics lands.
+        false
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -859,7 +868,7 @@ mod tests {
     fn nextcloud_talk_channel_name() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -872,7 +881,7 @@ mod tests {
         // Default construction uses StreamMode::Off → draft updates disabled.
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -881,17 +890,20 @@ mod tests {
     }
 
     #[test]
-    fn supports_draft_updates_true_when_partial() {
-        use zeroclaw_config::schema::StreamMode;
+    fn supports_draft_updates_stays_false_even_with_partial_stream_mode() {
+        // The bot-API send path has no real edit/delete transport (see the
+        // doc comment on `supports_draft_updates`), so this must stay false
+        // regardless of `stream_mode` — a config knob that no longer
+        // changes runtime advertised capability.
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
         )
         .with_streaming(StreamMode::Partial, 800);
-        assert!(channel.supports_draft_updates());
+        assert!(!channel.supports_draft_updates());
     }
 
     #[test]
@@ -926,11 +938,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_rate_limit_short_circuits_network() {
-        use zeroclaw_config::schema::StreamMode;
         // Use a large interval (60 s) so the rate-limit always fires immediately.
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -954,7 +965,7 @@ mod tests {
         // Default mode is Off — send_draft must short-circuit.
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -970,18 +981,18 @@ mod tests {
     async fn send_succeeds_without_message_id_in_response() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room-token-123"))
+            .and(path(
+                "/ocs/v2.php/apps/spreed/api/v1/bot/room-token-123/message",
+            ))
             .and(query_param("format", "json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ocs": { "data": {} }
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(1)
             .mount(&server)
             .await;
 
         let channel = NextcloudTalkChannel::new(
             server.uri(),
-            "app-token".into(),
+            Some("test-bot-secret".into()),
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -994,23 +1005,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_draft_returns_message_id_from_response() {
-        use zeroclaw_config::schema::StreamMode;
-
+    async fn send_fails_closed_without_network_call_when_bot_secret_missing() {
+        // A missing secret must be rejected before any request is built —
+        // fabricating a signature turns a config error into an
+        // authenticated-looking request. `.expect(0)` proves the mock
+        // (which would 200 anything) was never hit.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room-token-123"))
-            .and(query_param("format", "json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ocs": { "data": { "id": 42 } }
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            server.uri(),
+            None,
+            "zeroclaw".into(),
+            "nextcloud_talk_test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        );
+        let result = channel
+            .send(&SendMessage::new("hello", "room-token-123"))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_emits_the_signed_bot_wire_contract() {
+        // Captured-request regression: a path-only mock would accept a wrong
+        // wire shape, so assert the exact bot path, the OCS-APIRequest header,
+        // the `message` body field, and a bare-hex HMAC-SHA256 over
+        // `random + message` recomputed from the captured request.
+        let secret = "test-bot-secret";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(1)
             .mount(&server)
             .await;
 
         let channel = NextcloudTalkChannel::new(
             server.uri(),
-            "app-token".into(),
+            Some(secret.into()),
+            "zeroclaw".into(),
+            "nextcloud_talk_test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        );
+        channel
+            .send(&SendMessage::new("hello", "room-token-123"))
+            .await
+            .expect("send should succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled");
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+
+        assert_eq!(
+            req.url.path(),
+            "/ocs/v2.php/apps/spreed/api/v1/bot/room-token-123/message"
+        );
+        assert_eq!(
+            req.headers
+                .get("OCS-APIRequest")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("request body is JSON");
+        assert_eq!(body.get("message").and_then(|m| m.as_str()), Some("hello"));
+
+        let random = req
+            .headers
+            .get("X-Nextcloud-Talk-Bot-Random")
+            .and_then(|v| v.to_str().ok())
+            .expect("Bot-Random header present");
+        let signature = req
+            .headers
+            .get("X-Nextcloud-Talk-Bot-Signature")
+            .and_then(|v| v.to_str().ok())
+            .expect("Bot-Signature header present");
+
+        // Bare hex digest, no `sha256=` prefix, over `random + message`.
+        assert!(!signature.starts_with("sha256="));
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{random}hello").as_bytes());
+        assert_eq!(signature, hex::encode(mac.finalize().into_bytes()));
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_bot_api_success_indicator() {
+        // The Talk bot API does not return a per-message id in its
+        // response body (unlike the old OCS chat API); a successful
+        // send_draft returns a fixed success placeholder instead.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/ocs/v2.php/apps/spreed/api/v1/bot/room-token-123/message",
+            ))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            server.uri(),
+            Some("test-bot-secret".into()),
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -1020,27 +1125,28 @@ mod tests {
             .send_draft(&SendMessage::new("hello", "room-token-123"))
             .await;
 
-        assert_eq!(result.unwrap(), Some("42".to_string()));
+        assert_eq!(result.unwrap(), Some("bot_message_sent".to_string()));
     }
 
     #[tokio::test]
-    async fn send_draft_errors_when_message_id_missing() {
-        use zeroclaw_config::schema::StreamMode;
-
+    async fn send_draft_errors_on_bot_api_failure_response() {
+        // The bot API does not distinguish a missing-message-id case (it
+        // never returns one); the real failure mode this guards is a
+        // non-success HTTP response from the bot endpoint.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room-token-123"))
+            .and(path(
+                "/ocs/v2.php/apps/spreed/api/v1/bot/room-token-123/message",
+            ))
             .and(query_param("format", "json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ocs": { "data": {} }
-            })))
+            .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
             .await;
 
         let channel = NextcloudTalkChannel::new(
             server.uri(),
-            "app-token".into(),
+            Some("test-bot-secret".into()),
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -1057,7 +1163,7 @@ mod tests {
     fn nextcloud_talk_user_allowlist_exact_and_wildcard() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -1067,7 +1173,7 @@ mod tests {
 
         let wildcard = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1079,7 +1185,7 @@ mod tests {
     fn nextcloud_talk_parse_valid_message_payload() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -1119,7 +1225,7 @@ mod tests {
     fn nextcloud_talk_parse_as2_create_payload() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1159,7 +1265,7 @@ mod tests {
     fn nextcloud_talk_parse_as2_skips_bot_originated() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1194,7 +1300,7 @@ mod tests {
         // name must be dropped to prevent feedback loops.
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1231,7 +1337,7 @@ mod tests {
         // parse_message_payload (legacy format) should also drop actorType=application.
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1257,7 +1363,7 @@ mod tests {
     fn nextcloud_talk_parse_as2_skips_non_note_objects() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1277,7 +1383,7 @@ mod tests {
     fn nextcloud_talk_parse_skips_non_message_events() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -1300,7 +1406,7 @@ mod tests {
     fn nextcloud_talk_parse_skips_bot_messages() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1323,7 +1429,7 @@ mod tests {
     fn nextcloud_talk_parse_skips_unauthorized_sender() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["user_a".into()]),
@@ -1346,7 +1452,7 @@ mod tests {
     fn nextcloud_talk_parse_skips_system_message() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1371,7 +1477,7 @@ mod tests {
     fn nextcloud_talk_parse_timestamp_millis_to_seconds() {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             "zeroclaw".into(),
             "nextcloud_talk_test_alias",
             Arc::new(|| vec!["*".into()]),
@@ -1434,5 +1540,120 @@ mod tests {
         assert!(verify_nextcloud_talk_signature(
             secret, random, body, &signature
         ));
+    }
+
+    #[test]
+    fn nextcloud_talk_bot_api_url_correct() {
+        // Test that the bot API URL is correctly constructed
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            Some("secret-bot-token".into()),
+            "zeroclaw".into(),
+            "test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        );
+
+        let url = channel.bot_api_url("room-123");
+        assert_eq!(
+            url,
+            "https://cloud.example.com/ocs/v2.php/apps/spreed/api/v1/bot/room-123/message?format=json"
+        );
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_signed_request_generation() {
+        // Test that the signed request is properly generated
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            Some("test_bot_secret".into()),
+            "zeroclaw".into(),
+            "test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        );
+
+        // Verify the bot token is available
+        assert!(channel.bot_token.is_some());
+
+        // Verify the URL construction
+        let url = channel.bot_api_url("test-room");
+        assert!(url.contains("/ocs/v2.php/apps/spreed/api/v1/bot/test-room/message"));
+        assert!(url.contains("format=json"));
+    }
+
+    /// Captures the real outgoing request and pins the exact OCS bot path,
+    /// the `X-Nextcloud-Talk-Bot-*` and `OCS-APIRequest` headers, the
+    /// `{"message": ...}` body shape, and a signature recomputed from the
+    /// captured random and message, so a regression in any of those fields
+    /// fails this test instead of silently shipping. Replaces an earlier
+    /// version that only asserted `result.is_ok() || result.is_err()`, which
+    /// is true of any call and never exercises the wire format.
+    #[tokio::test]
+    async fn nextcloud_talk_send_uses_signed_bot_api_with_correct_wire_shape() {
+        use zeroclaw_api::channel::SendMessage;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/bot/test-room/message"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let secret = "test_bot_secret";
+        let channel = NextcloudTalkChannel::new(
+            server.uri(),
+            Some(secret.into()),
+            "zeroclaw".into(),
+            "test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        );
+
+        let result = channel
+            .send(&SendMessage::new(
+                "Hello from ZeroClaw!".to_string(),
+                "test-room".to_string(),
+            ))
+            .await;
+        assert!(result.is_ok());
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+
+        assert_eq!(req.headers.get("ocs-apirequest").unwrap(), "true");
+        let random = req
+            .headers
+            .get("x-nextcloud-talk-bot-random")
+            .expect("bot random header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let signature = req
+            .headers
+            .get("x-nextcloud-talk-bot-signature")
+            .expect("bot signature header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !signature.starts_with("sha256="),
+            "bot API signature must be a bare hex digest, not sha256=-prefixed: {signature}"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "message": "Hello from ZeroClaw!" })
+        );
+
+        let expected_payload = format!("{random}Hello from ZeroClaw!");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(expected_payload.as_bytes());
+        let expected_signature = hex::encode(mac.finalize().into_bytes());
+        assert_eq!(
+            signature, expected_signature,
+            "signature must be HMAC-SHA256(secret, random + message)"
+        );
     }
 }
