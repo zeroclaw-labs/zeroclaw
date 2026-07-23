@@ -28198,7 +28198,7 @@ audit = "should-be-a-table-not-a-string"
         // Regression: `doctor` was blind to degraded_sections even though
         // load_or_init already populates it correctly. A [channels.telegram]
         // alias with a type-corrupt `bot_token` (not merely missing - see
-        // #9236, where a missing bot_token must survive salvage instead of
+        // the scenario where a missing bot_token must survive salvage instead of
         // being dropped) must be pruned (not fatal) and its path recorded on
         // `degraded_sections` so downstream diagnostics (zeroclaw-runtime's
         // check_degraded_sections) can name it.
@@ -28253,7 +28253,7 @@ bot_token = 42
 
     #[test]
     async fn load_or_init_keeps_partial_channel_alias_out_of_degraded_sections() {
-        // #9236 end-to-end companion to the salvage-layer tests: through the
+        // End-to-end companion to the salvage-layer tests: through the
         // real load_or_init entry point, a partial (tokenless) telegram alias
         // must load intact and must NOT be reported on degraded_sections.
         // Disabled so Config::validate() stays quiet about the missing token.
@@ -32905,7 +32905,7 @@ model = "gpt-4o"
 
     #[test]
     async fn telegram_alias_create_survives_incremental_save() {
-        // Regression for #9236: create_map_key seeds TelegramConfig::default()
+        // Regression test: create_map_key seeds TelegramConfig::default()
         // (bot_token = ""), save_dirty's prune_empty_leaves then strips the
         // empty bot_token from the written TOML, and on reload the alias
         // must still deserialize (bot_token now has #[serde(default)])
@@ -32943,8 +32943,8 @@ model = "gpt-4o"
 
     #[test]
     async fn discord_alias_create_survives_incremental_save() {
-        // Discord twin of telegram_alias_create_survives_incremental_save
-        // (#9236): DiscordConfig.bot_token has the same serde default.
+        // Discord twin of telegram_alias_create_survives_incremental_save:
+        // DiscordConfig.bot_token has the same serde default.
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 

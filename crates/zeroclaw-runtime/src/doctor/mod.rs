@@ -1118,7 +1118,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Enabled bot channels with no token: a partial alias survives the
-    // resilient load (`bot_token` has a serde default, #9236), so it never
+    // resilient load (`bot_token` has a serde default), so it never
     // reaches `degraded_sections` — doctor must name the unset field here
     // or the operator only finds out when the channel fails to start.
     for (alias, tg) in &cc.telegram {
@@ -2032,7 +2032,7 @@ mod tests {
 
     #[test]
     fn config_validation_warns_enabled_tokenless_bot_channels() {
-        // #9236: a partial (tokenless) alias survives the resilient load and
+        // A partial (tokenless) alias survives the resilient load and
         // never reaches degraded_sections, so doctor must flag the unset
         // bot_token itself when the alias is enabled.
         let mut config = Config::default();

@@ -2875,7 +2875,7 @@ mod tests {
     #[test]
     fn discord_channel_fields_reject_unusable_bot_token_values() {
         // Discord twin of telegram_channel_fields_reject_unusable_bot_token_values:
-        // the quickstart arm calls DiscordConfig::validate_bot_token (#9236).
+        // the quickstart arm calls DiscordConfig::validate_bot_token.
         for value in [
             None,
             Some(""),
