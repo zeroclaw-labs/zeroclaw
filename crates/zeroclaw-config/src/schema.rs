@@ -47,6 +47,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.whatsapp",
     "tool.browser",
     "tool.composio",
+    "tool.homeassistant",
     "tool.http_request",
     "tool.pushover",
     "tool.web_search",
@@ -544,6 +545,12 @@ pub struct Config {
     #[nested]
     #[group = "Integrations"]
     pub jira: JiraConfig,
+
+    /// Home Assistant integration configuration (`[homeassistant]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub homeassistant: HomeAssistantConfig,
 
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
@@ -17015,6 +17022,60 @@ impl Default for NotionConfig {
     }
 }
 
+/// Home Assistant integration configuration (`[homeassistant]`).
+///
+/// When `enabled = true`, registers the `homeassistant` tool which talks to a
+/// Home Assistant instance over its native REST API (NOT the MCP server
+/// integration). It can list entities, read one entity's state, and call a
+/// service. `url` is the HA origin (e.g. `http://192.0.2.10:8123`); `token`
+/// is a long-lived access token. Both may be supplied via env (`HASS_URL` /
+/// `HASS_TOKEN`) so no secret is committed to `config.toml`.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_domains`: `[]` (empty — deny by default). `call_service` is
+///   blocked for every domain until the operator opts in. Add the service
+///   domains you trust (e.g. `["light", "switch", "scene"]`) to unlock them.
+///   Read actions (`list_entities`, `get_state`) ignore this allowlist.
+///
+/// ## Auth
+/// Generate a long-lived access token from the HA UI under
+/// *Profile → Security → Long-lived access tokens*, then set it here or via
+/// `HASS_TOKEN`. Prefer HTTPS (or another trusted local transport, e.g. a
+/// WireGuard/Tailscale tunnel) for `url` — the token is sent as a bearer
+/// credential on every request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "homeassistant"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Home Assistant",
+    description = "Home automation hub",
+    status_field = "enabled"
+)]
+pub struct HomeAssistantConfig {
+    /// Enable the `homeassistant` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HA base URL (origin), e.g. `http://192.0.2.10:8123`.
+    /// Falls back to the `HASS_URL` env var when empty.
+    #[serde(default)]
+    pub url: String,
+    /// Long-lived access token. Falls back to `HASS_TOKEN` env var when empty.
+    /// Stored encrypted at rest.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: String,
+    /// Service domains `call_service` is permitted to invoke (e.g. `light`,
+    /// `switch`, `scene`). Empty (the default) blocks every `call_service`
+    /// call — deny by default. Read actions (`list_entities`, `get_state`)
+    /// are unaffected. Mirrors `JiraConfig::allowed_actions`.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+}
+
 /// Jira integration configuration (`[jira]`).
 ///
 /// When `enabled = true`, registers the `jira` tool which can get tickets,
@@ -17426,6 +17487,7 @@ impl Default for Config {
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            homeassistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -18138,6 +18200,7 @@ impl Config {
         vec![
             self.browser.integration_descriptor(),
             self.google_workspace.integration_descriptor(),
+            self.homeassistant.integration_descriptor(),
             crate::config::IntegrationDescriptor {
                 display_name: "Cron",
                 description: "Scheduled tasks",
@@ -20189,6 +20252,42 @@ impl Config {
                         "jira.allowed_actions contains unknown action: '{}'. \
                          Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket",
                         action
+                    );
+                }
+            }
+        }
+
+        // Home Assistant
+        if self.homeassistant.enabled {
+            if self.homeassistant.url.trim().is_empty()
+                && std::env::var("HASS_URL")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "homeassistant.url must be set (or HASS_URL env var) when homeassistant.enabled = true"
+                );
+            }
+            if self.homeassistant.token.trim().is_empty()
+                && std::env::var("HASS_TOKEN")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "homeassistant.token must be set (or HASS_TOKEN env var) when homeassistant.enabled = true"
+                );
+            }
+            for domain in &self.homeassistant.allowed_domains {
+                let valid = !domain.is_empty()
+                    && domain
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if !valid {
+                    anyhow::bail!(
+                        "homeassistant.allowed_domains contains an invalid domain: '{domain}'. \
+                         Expected a lowercase slug matching [a-z0-9_]+ (e.g. light, switch, scene)"
                     );
                 }
             }
@@ -24525,6 +24624,7 @@ auto_save = true
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            homeassistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -25397,6 +25497,7 @@ default_temperature = 0.7
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            homeassistant: HomeAssistantConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -28464,6 +28565,100 @@ runtime_profile = "default"
                 "published Jira action {action:?} should validate"
             );
         }
+    }
+
+    // ── Home Assistant ────────────────────────────────────────────────────
+
+    #[test]
+    async fn validate_rejects_homeassistant_enabled_without_url() {
+        let mut config = Config::default();
+        config.homeassistant.enabled = true;
+        config.homeassistant.token = "token".into();
+
+        let err = config
+            .validate()
+            .expect_err("homeassistant.url must not be empty when enabled")
+            .to_string();
+        assert!(err.contains("homeassistant.url"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_rejects_homeassistant_enabled_without_token() {
+        let mut config = Config::default();
+        config.homeassistant.enabled = true;
+        config.homeassistant.url = "http://192.0.2.10:8123".into();
+
+        let err = config
+            .validate()
+            .expect_err("homeassistant.token must not be empty when enabled")
+            .to_string();
+        assert!(err.contains("homeassistant.token"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_accepts_homeassistant_enabled_with_url_and_token() {
+        let mut config = Config::default();
+        config.homeassistant.enabled = true;
+        config.homeassistant.url = "http://192.0.2.10:8123".into();
+        config.homeassistant.token = "token".into();
+        config.homeassistant.allowed_domains = vec!["light".into(), "switch".into()];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_accepts_homeassistant_empty_allowed_domains_deny_by_default() {
+        let mut config = Config::default();
+        config.homeassistant.enabled = true;
+        config.homeassistant.url = "http://192.0.2.10:8123".into();
+        config.homeassistant.token = "token".into();
+        // Empty allowed_domains is the deny-by-default posture, not an error.
+        assert!(config.homeassistant.allowed_domains.is_empty());
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_rejects_homeassistant_invalid_allowed_domain() {
+        for domain in ["../../etc", "Light", "light switch", ""] {
+            let mut config = Config::default();
+            config.homeassistant.enabled = true;
+            config.homeassistant.url = "http://192.0.2.10:8123".into();
+            config.homeassistant.token = "token".into();
+            config.homeassistant.allowed_domains = vec![domain.into()];
+
+            let err = config
+                .validate()
+                .expect_err("invalid homeassistant.allowed_domains entry should be rejected")
+                .to_string();
+            assert!(
+                err.contains("homeassistant.allowed_domains"),
+                "expected allowed_domains error for {domain:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_homeassistant_url_and_token_from_env() {
+        // HASS_URL / HASS_TOKEN env fallback must satisfy validation even
+        // when the config fields themselves are empty (mirrors Jira's
+        // JIRA_API_TOKEN fallback).
+        // SAFETY: test runs single-threaded per #[test] harness convention
+        // used elsewhere in this module for env-var mutation.
+        unsafe {
+            std::env::set_var("HASS_URL", "http://192.0.2.10:8123");
+            std::env::set_var("HASS_TOKEN", "token-from-env");
+        }
+        let mut config = Config::default();
+        config.homeassistant.enabled = true;
+
+        let result = config.validate();
+
+        unsafe {
+            std::env::remove_var("HASS_URL");
+            std::env::remove_var("HASS_TOKEN");
+        }
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
