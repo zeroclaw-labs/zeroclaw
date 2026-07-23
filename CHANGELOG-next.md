@@ -93,6 +93,7 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 ## Breaking Changes
 
 - **Rust toolchain floor**: the workspace MSRV is now Rust 1.96.1, with CI, containers, and documentation aligned to that version (#8801).
+- **Removed the built-in ClawHub skill-install source** (`zeroclaw skills install clawhub:<slug>` and `clawhub.ai` URLs). Install skills from a local path, a Git URL (optionally `<git-url> --skill <name>` to select one skill from a catalog repo), or a registry name instead. SkillForge's default discovery sources no longer include the never-implemented `clawhub` source (#8638).
 
 ## Contributors
 

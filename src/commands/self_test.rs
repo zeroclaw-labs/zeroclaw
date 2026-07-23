@@ -393,7 +393,7 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
+    let mem = match crate::memory::create_memory_from_config(config, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };
@@ -533,8 +533,57 @@ mod tests {
     #[cfg(feature = "gateway")]
     use super::{build_websocket_probe_url, resolve_gateway_bearer_token};
     use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
-    #[cfg(feature = "gateway")]
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+    #[cfg(any(feature = "gateway", unix))]
     use zeroclaw_config::schema::Config;
+    #[cfg(unix)]
+    use zeroclaw_config::schema::LucidStorageConfig;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_roundtrip_uses_selected_lucid_alias() {
+        let tmp = TempDir::new().unwrap();
+        let calls_path = tmp.path().join("self-test-lucid.log");
+        let script_path = tmp.path().join("selected-lucid.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{}"
+if [ "${{1:-}}" = "context" ]; then
+  printf '<lucid-context>\n</lucid-context>\n'
+fi
+"#,
+            calls_path.display()
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "lucid.selected".into();
+        config.storage.lucid.insert(
+            "selected".into(),
+            LucidStorageConfig {
+                binary_path: Some(script_path.display().to_string()),
+                recall_timeout_ms: Some(500),
+                store_timeout_ms: Some(500),
+            },
+        );
+
+        let result = super::check_memory_roundtrip(&config).await;
+
+        assert!(result.passed, "memory self-test failed: {}", result.detail);
+        let calls = fs::read_to_string(&calls_path)
+            .expect("the selected Lucid executable must be invoked by self-test");
+        assert!(calls.contains("store __selftest_probe__: selftest_ok"));
+    }
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {

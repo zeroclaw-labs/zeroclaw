@@ -22,6 +22,14 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
+/// Max wait for the next streaming body read before the connection is treated
+/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
+/// long-running responses mid-stream), so without a per-read bound a connection
+/// that goes silent after the headers park `bytes_stream().next().await` forever
+/// and the turn hangs on "working". `read_timeout` caps the gap between reads and
+/// converts a silent stall into a retryable stream error.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
@@ -1128,7 +1136,9 @@ impl OpenAiResponsesModelProvider {
 
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(STREAM_IDLE_TIMEOUT);
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }

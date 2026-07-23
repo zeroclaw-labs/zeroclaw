@@ -18,6 +18,14 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Max wait for the next streaming body read before the connection is treated
+/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
+/// long-running responses mid-stream), so without a per-read bound a connection
+/// that goes silent after the headers park the body stream forever and the turn
+/// hangs on "working". `read_timeout` caps the gap between reads and converts a
+/// silent stall into a retryable stream error.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
@@ -732,9 +740,10 @@ impl OpenAiCompatibleModelProvider {
         )
     }
 
-    /// HTTP client for streaming SSE connections — connect timeout only, no total timeout.
-    /// reqwest's total timeout kills long-running streams mid-response; streaming paths must
-    /// use this client instead of http_client().
+    /// HTTP client for streaming SSE connections — no overall timeout (reqwest's
+    /// total timeout kills long-running streams mid-response), but a `read_timeout`
+    /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
+    /// of hanging forever. Streaming paths must use this client instead of http_client().
     fn streaming_http_client(&self) -> Client {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
@@ -772,6 +781,7 @@ impl OpenAiCompatibleModelProvider {
 
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(STREAM_IDLE_TIMEOUT)
                 .default_headers(headers);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
@@ -792,7 +802,9 @@ impl OpenAiCompatibleModelProvider {
             });
         }
 
-        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(STREAM_IDLE_TIMEOUT);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {

@@ -201,6 +201,9 @@ pub enum ObserverEvent {
         /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`, `"none"`).
         backend: String,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A memory store (write) operation has completed.
     ///
@@ -217,6 +220,9 @@ pub enum ObserverEvent {
         backend: String,
         duration: Duration,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A memory audit/operator action was recorded on the audit trail.
     ///
@@ -243,6 +249,9 @@ pub enum ObserverEvent {
         duration: Duration,
         num_chunks: usize,
         num_boards: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -523,18 +532,27 @@ mod tests {
             num_entries: 3,
             backend: "sqlite".into(),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let store = ObserverEvent::MemoryStore {
             category: "conversation".into(),
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let rag = ObserverEvent::RagRetrieve {
             query_summary: None,
             duration: Duration::from_millis(120),
             num_chunks: 5,
             num_boards: 2,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let audit = ObserverEvent::MemoryAudit {
             action: "store".into(),
@@ -543,7 +561,12 @@ mod tests {
             success: true,
         };
 
-        assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
+        match recall.clone() {
+            ObserverEvent::MemoryRecall { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            other => panic!("clone changed variant: {other:?}"),
+        }
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
         assert!(matches!(audit.clone(), ObserverEvent::MemoryAudit { .. }));
