@@ -105,6 +105,10 @@ zc-input-attach-error = Attach error: { $error }
 zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
+zc-input-attachment-manager-title = Pending attachments ({ $count })
+zc-input-attachment-manager-hint = { $navigate } select · { $remove } remove · { $close } close · /detach N
+zc-input-help-attachment-remove = Remove attachment
+zc-input-help-attachment-detach = Remove by index
 zc-input-clipboard-error = Clipboard error: { $error }
 
 zc-queue-empty = Nothing to send.
