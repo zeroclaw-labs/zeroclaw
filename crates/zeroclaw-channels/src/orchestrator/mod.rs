@@ -4122,11 +4122,13 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
 }
 
 /// After a clean listener return (no error), decide whether the supervisor
-/// should restart the listener.  Cancellation is a deliberate operator action
+/// should restart the listener. Cancellation is a deliberate operator action
 /// (Ctrl+C or config reload) — the listener exited because we asked it to
-/// stop, not because it crashed.  Any other clean return is unexpected and
+/// stop, not because it crashed. Any other clean return is unexpected and
 /// must restart.
-fn should_restart_listener_after_clean_return(cancel: &tokio_util::sync::CancellationToken) -> bool {
+fn should_restart_listener_after_clean_return(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
     !cancel.is_cancelled()
 }
 
