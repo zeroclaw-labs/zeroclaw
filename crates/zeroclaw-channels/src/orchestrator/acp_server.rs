@@ -2176,17 +2176,23 @@ fn deliver_file_tool_result_content(
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
+    // The typed `uri` is a content hash the tool computed over the same file. Recompute
+    // it from the bytes we just read and require an exact match: if the file was swapped
+    // between the tool's validation and this read, the hash differs and we fall back to
+    // text-only rather than embedding unexpected content. This binds the embedded bytes
+    // to what `deliver_file` actually vetted.
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let expected_uri = zeroclaw_runtime::tools::attachment_deliver_uri(
+        &acp_embedded::content_hash_name(&bytes, ext),
+    );
+    if artifact.uri != expected_uri {
+        return None;
+    }
     let blob = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-    let filename = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    // Prefer the uri the tool emitted; else derive from the filename.
-    let uri = if artifact.uri.is_empty() {
-        zeroclaw_runtime::tools::attachment_deliver_uri(filename)
-    } else {
-        artifact.uri.clone()
-    };
+    let uri = artifact.uri.clone();
     let mime_type = artifact.mime.clone();
     Some(serde_json::json!([
         {
@@ -3582,6 +3588,92 @@ mod tests {
     }
 
     #[test]
+    fn acp_smoke_transcript_initialize_inbound_blob_outbound_delivery() {
+        // Scripted end-to-end smoke against the real in-process handlers:
+        // initialize -> inbound resource blob -> outbound deliver_file. Proves no
+        // base64 enters the prompt or the model output and that bytes stay in the
+        // workspace, keyed by content hash.
+        let ws = tempfile::tempdir().unwrap();
+
+        // Phase 1 — initialize: ACP v1 shape, embeddedContext advertised.
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let init = server
+            .handle_initialize(&serde_json::json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": { "name": "smoke-client", "version": "1.0.0" }
+            }))
+            .unwrap();
+        assert_eq!(init["protocolVersion"], 1);
+        assert_eq!(
+            init["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+            true
+        );
+
+        // Phase 2 — inbound blob: client sends a resource+blob prompt; it is
+        // materialized under the workspace and the prompt text carries only a marker.
+        let inbound = b"%PDF-inbound-doc";
+        let inbound_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, inbound);
+        let prompt_params = serde_json::json!({
+            "prompt": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///docs/in.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": inbound_b64,
+                }
+            }]
+        });
+        let materialized = AcpServer::materialize_prompt(&prompt_params, Some(ws.path())).unwrap();
+        assert!(materialized.contains("[Document: in.pdf]"));
+        assert!(
+            !materialized.contains(&inbound_b64),
+            "base64 must not appear in the prompt text"
+        );
+        let inbound_files: Vec<_> = std::fs::read_dir(ws.path().join("uploads"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(inbound_files.len(), 1);
+        assert_eq!(std::fs::read(inbound_files[0].path()).unwrap(), inbound);
+
+        // Phase 3 — outbound delivery: deliver_file yields a typed artifact; the ACP
+        // notification embeds the file as a resource blob keyed by its content hash.
+        let out_path = ws.path().join("out.pdf");
+        std::fs::write(&out_path, b"%PDF-outbound-doc").unwrap();
+        let event = TurnEvent::ToolResult {
+            id: "tc-deliver".into(),
+            name: "deliver_file".into(),
+            output: "Delivered out.pdf".into(),
+            artifact: Some(deliver_artifact(&out_path, "application/pdf", "", "")),
+        };
+        let n = notification_for_turn_event("smoke-session", &event).unwrap();
+        let content = n.params["update"]["content"].as_array().unwrap();
+        let resource = content
+            .iter()
+            .find_map(|c| c.pointer("/content/resource"))
+            .expect("outbound resource");
+        let expected_uri = zeroclaw_runtime::tools::attachment_deliver_uri(
+            &acp_embedded::content_hash_name(b"%PDF-outbound-doc", "pdf"),
+        );
+        assert_eq!(resource["uri"], expected_uri);
+        let blob = resource["blob"].as_str().unwrap();
+        assert!(!blob.is_empty());
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob).unwrap(),
+            b"%PDF-outbound-doc"
+        );
+        // The model-facing rawOutput never carries the base64 payload.
+        assert!(
+            !n.params["update"]["rawOutput"]
+                .as_str()
+                .unwrap()
+                .contains(blob)
+        );
+    }
+
+    #[test]
     fn materialize_prompt_writes_blob_and_returns_marker() {
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"pdf-bytes";
@@ -3941,9 +4033,23 @@ mod tests {
         uri: &str,
         title: &str,
     ) -> ToolArtifact {
+        // Empty `uri` means "use the real content-hash uri the tool would emit",
+        // so the ACP-side hash verification passes for the file's actual bytes.
+        let uri = if uri.is_empty() {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            zeroclaw_runtime::tools::attachment_deliver_uri(&acp_embedded::content_hash_name(
+                &bytes, ext,
+            ))
+        } else {
+            uri.to_string()
+        };
         ToolArtifact {
             path: path.to_string_lossy().into_owned(),
-            uri: uri.to_string(),
+            uri,
             filename: path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -3953,6 +4059,32 @@ mod tests {
             mime: mime.to_string(),
             size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         }
+    }
+
+    #[test]
+    fn deliver_file_tool_result_drops_blob_when_file_is_swapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.pdf");
+        std::fs::write(&path, b"%PDF").unwrap();
+        // Artifact carries the content-hash uri for the ORIGINAL bytes.
+        let artifact = deliver_artifact(&path, "application/pdf", "", "");
+        // Swap the file's content after deliver_file validated it (TOCTOU).
+        std::fs::write(&path, b"SWAPPED-DIFFERENT-CONTENT").unwrap();
+        let event = TurnEvent::ToolResult {
+            id: "tc1".into(),
+            name: "deliver_file".into(),
+            output: "Delivered x.pdf".into(),
+            artifact: Some(artifact),
+        };
+        let n = notification_for_turn_event("s1", &event).unwrap();
+        let content = n.params["update"]["content"].as_array().unwrap();
+        // Hash mismatch => no resource blob embedded; text-only fallback.
+        assert!(
+            content
+                .iter()
+                .all(|c| c.pointer("/content/type").and_then(|v| v.as_str()) != Some("resource")),
+            "swapped content must not be embedded"
+        );
     }
 
     #[test]
@@ -4030,18 +4162,21 @@ mod tests {
     }
 
     #[test]
-    fn deliver_file_resource_uri_uses_artifact_uri() {
+    fn deliver_file_resource_uri_is_the_content_hash() {
         let dir = tempfile::tempdir().unwrap();
+        // Filename looks hash-like on purpose; the resource uri must still be the
+        // opaque content hash, never the filename stem.
         let path = dir.path().join("a1b2c3d4e5f6.pdf");
         std::fs::write(&path, b"%PDF").unwrap();
-        // The artifact uri may differ from the path basename; resource.uri follows it.
-        let uri = "attachment://deliver/other-name.pdf";
+        let expected = zeroclaw_runtime::tools::attachment_deliver_uri(
+            &acp_embedded::content_hash_name(b"%PDF", "pdf"),
+        );
 
         let event = TurnEvent::ToolResult {
             id: "tc1".into(),
             name: "deliver_file".into(),
             output: "Delivered a1b2c3d4e5f6.pdf (4 bytes)".into(),
-            artifact: Some(deliver_artifact(&path, "application/pdf", uri, "")),
+            artifact: Some(deliver_artifact(&path, "application/pdf", "", "")),
         };
         let n = notification_for_turn_event("s1", &event).unwrap();
         let update = &n.params["update"];
@@ -4050,7 +4185,8 @@ mod tests {
             .iter()
             .find_map(|c| c.pointer("/content/resource/uri").and_then(|v| v.as_str()))
             .expect("resource uri");
-        assert_eq!(resource_uri, uri);
+        assert_eq!(resource_uri, expected);
+        assert!(!resource_uri.contains("a1b2c3d4e5f6"));
         // No ACP protocol extension for pretty names:
         assert!(
             content
@@ -4062,12 +4198,13 @@ mod tests {
     }
 
     #[test]
-    fn deliver_file_resource_uri_uses_shared_helper_when_artifact_uri_absent() {
-        // Empty artifact uri: derive it from the filename via the shared helper.
+    fn deliver_file_resource_uri_uses_shared_content_hash_helper() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.pdf");
         std::fs::write(&path, b"%PDF").unwrap();
-        let expected = zeroclaw_runtime::tools::attachment_deliver_uri("x.pdf");
+        let expected = zeroclaw_runtime::tools::attachment_deliver_uri(
+            &acp_embedded::content_hash_name(b"%PDF", "pdf"),
+        );
 
         let event = TurnEvent::ToolResult {
             id: "tc1".into(),

@@ -31,6 +31,24 @@ impl std::fmt::Display for EmbeddedResourceError {
 
 impl std::error::Error for EmbeddedResourceError {}
 
+/// `<sha16>` (or `<sha16>.<ext>`) given the full lowercase hex SHA-256 digest.
+fn hash16_name(hex: &str, ext: &str) -> String {
+    if ext.is_empty() {
+        hex[..16].to_string()
+    } else {
+        format!("{}.{ext}", &hex[..16])
+    }
+}
+
+/// Content-addressed identity `<sha16>` / `<sha16>.<ext>` derived from raw bytes
+/// (first 16 hex chars of their SHA-256). Shared by blob materialization and
+/// outbound delivery URIs so both use the same opaque, URI-safe, collision-
+/// resistant name — the identity depends on content, never on a caller-supplied
+/// filename, so same-name files never collide and reserved characters can't leak.
+pub fn content_hash_name(bytes: &[u8], ext: &str) -> String {
+    hash16_name(&format!("{:x}", Sha256::digest(bytes)), ext)
+}
+
 /// Decode `blob_b64`, enforce size limits, write under `{workspace}/uploads/`,
 /// and return a prompt marker (`[Document: …]` or `[IMAGE:…]`).
 pub fn materialize_resource_blob(
@@ -63,11 +81,7 @@ pub fn materialize_resource_blob(
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
-    let storage_name = if ext.is_empty() {
-        hex[..16].to_string()
-    } else {
-        format!("{}.{ext}", &hex[..16])
-    };
+    let storage_name = hash16_name(&hex, &ext);
 
     // Resolve the workspace to a symlink-free base so containment checks below are
     // meaningful. The blob producer (MCP server / ACP client) controls the bytes and

@@ -3,7 +3,8 @@
 //! share one helper without `zeroclaw-tools` depending on this crate.
 
 pub use zeroclaw_tools::embedded_resource::{
-    EmbeddedResourceError, MAX_EMBEDDED_FILE_BYTES, MaterializedResource, materialize_resource_blob,
+    EmbeddedResourceError, MAX_EMBEDDED_FILE_BYTES, MaterializedResource, content_hash_name,
+    materialize_resource_blob,
 };
 
 #[cfg(test)]

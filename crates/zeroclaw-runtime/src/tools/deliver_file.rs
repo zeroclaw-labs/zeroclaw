@@ -3,16 +3,18 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_tools::embedded_resource::content_hash_name;
 
 pub const MAX_DELIVER_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// ACP / model citation URI for an outbound delivered file.
 ///
-/// Source of truth for the `attachment://deliver/<basename>` string — ACP must
-/// reuse this helper (or the `uri` carried on the tool's [`ToolArtifact`]), not a
-/// second formatter.
-pub fn attachment_deliver_uri(basename: &str) -> String {
-    format!("attachment://deliver/{basename}")
+/// Source of truth for the `attachment://deliver/<id>` string, where `<id>` is
+/// the opaque content hash from [`content_hash_name`] — never a caller-supplied
+/// filename. ACP must reuse this helper (or the `uri` carried on the tool's
+/// [`ToolArtifact`]), not a second formatter.
+pub fn attachment_deliver_uri(id: &str) -> String {
+    format!("attachment://deliver/{id}")
 }
 
 /// Sanitize a caller-supplied `deliver_file` display title. Strips control
@@ -82,7 +84,7 @@ impl Tool for DeliverFileTool {
         "Deliver a file from the workspace to the ACP client as an embedded binary resource \
          (PDF, DOCX, images, etc.). Use when the user should download or preview the file. \
          Path must stay inside the workspace. On success the result includes `uri` \
-         (`attachment://deliver/<basename>`) — cite that exact uri in widgets/`[N]`; \
+         (`attachment://deliver/<content-hash>`) — cite that exact uri in widgets/`[N]`; \
          do not invent prefixes. Pass an optional `title` (any prose) as the client's \
          chat label for the file; it defaults to the filename. Do not invent ACP \
          filename fields."
@@ -192,14 +194,19 @@ impl Tool for DeliverFileTool {
             });
         }
 
-        // Ensure the file is readable (ACP will re-read for the blob).
-        if let Err(e) = tokio::fs::read(&resolved_path).await {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Failed to read file: {e}")),
-            });
-        }
+        // Read once here for hashing; ACP re-reads and verifies this content hash
+        // before embedding, so a swap between validation and the ACP read is
+        // detected (hash mismatch) rather than trusted.
+        let content = match tokio::fs::read(&resolved_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to read file: {e}")),
+                });
+            }
+        };
 
         let filename = resolved_path
             .file_name()
@@ -212,7 +219,13 @@ impl Tool for DeliverFileTool {
         );
         let abs_path = resolved_path.to_string_lossy().to_string();
         let bytes = meta.len();
-        let uri = attachment_deliver_uri(&filename);
+        // Opaque, content-addressed citation id derived from the bytes, not the
+        // filename: same-name files never collide and the id is always URI-safe.
+        let ext = resolved_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        let uri = attachment_deliver_uri(&content_hash_name(&content, ext));
 
         // Optional caller-supplied chat label; defaults to the filename. Control
         // chars are stripped for clean display. The label travels structurally in
@@ -278,7 +291,14 @@ mod tests {
         assert!(data["path"].as_str().unwrap().contains("a.pdf"));
         assert_eq!(data["filename"], "a.pdf");
         assert_eq!(data["bytes"], 8);
-        assert_eq!(data["uri"], "attachment://deliver/a.pdf");
+        // URI is the opaque content hash of the bytes, not the filename.
+        assert_eq!(
+            data["uri"].as_str().unwrap(),
+            format!(
+                "attachment://deliver/{}",
+                content_hash_name(b"%PDF-1.4", "pdf")
+            )
+        );
         let text = result.output.as_str();
         assert!(text.contains("Delivered a.pdf"));
         // Metadata is structural now: no machine trailer in the model-facing text.
@@ -386,10 +406,45 @@ mod tests {
             .unwrap();
         assert!(result.success);
         let data = result.output.data().expect("structured data");
+        // The uri is content-derived, so the (hash-looking) filename stem does not
+        // leak into it.
         assert_eq!(
             data["uri"].as_str().unwrap(),
-            "attachment://deliver/a1b2c3d4e5f6.pdf"
+            format!(
+                "attachment://deliver/{}",
+                content_hash_name(b"%PDF-1.4", "pdf")
+            )
         );
+    }
+
+    #[tokio::test]
+    async fn uri_is_content_addressed_not_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same content, different filenames -> identical opaque uri (no collision
+        // on same basename, no dependence on the caller-supplied name).
+        std::fs::write(dir.path().join("one.bin"), b"same-bytes").unwrap();
+        std::fs::write(dir.path().join("two.bin"), b"same-bytes").unwrap();
+        // Same basename, different content -> different uri.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("one.bin"), b"other-bytes").unwrap();
+        let tool = test_tool(dir.path().to_path_buf());
+
+        let uri = |args: Value| {
+            let tool = &tool;
+            async move {
+                tool.execute(args).await.unwrap().output.data().unwrap()["uri"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let a = uri(json!({"path": "one.bin"})).await;
+        let b = uri(json!({"path": "two.bin"})).await;
+        let c = uri(json!({"path": "sub/one.bin"})).await;
+        assert_eq!(a, b, "same content must yield the same uri");
+        assert_ne!(a, c, "different content must yield a different uri");
+        assert!(!a.contains("one.bin") && !a.contains("two.bin"));
     }
 
     #[tokio::test]
