@@ -85,6 +85,7 @@ mod tests {
 
     fn tool_call_event(tool: &str, success: bool) -> ObserverEvent {
         ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: tool.to_string(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -99,6 +100,7 @@ mod tests {
 
     fn llm_event(input: u64, output: u64) -> ObserverEvent {
         ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: String::new(),
             model: String::new(),
             duration: Duration::from_millis(50),

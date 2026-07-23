@@ -385,6 +385,7 @@ mod tests {
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "done".into(),
@@ -394,6 +395,8 @@ mod tests {
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         collector.record_run_complete(&run);
 
@@ -423,6 +426,7 @@ mod tests {
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Failed,
                 output: "fail".into(),
@@ -432,6 +436,8 @@ mod tests {
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         collector.record_run_complete(&run);
 

@@ -440,6 +440,20 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         ProviderCapabilities::default()
     }
 
+    /// Query the effective capabilities for the model that will be dispatched.
+    ///
+    /// Most providers have one capability set for every model and inherit this
+    /// default. Composite providers override it when the model selects a route
+    /// or when failover can reach children with different capabilities.
+    fn capabilities_for_model(&self, _model: &str) -> ProviderCapabilities {
+        let mut capabilities = self.capabilities();
+        // Preserve compatibility with providers that historically overrode the
+        // convenience accessor instead of capabilities(). Composite overrides
+        // should still make the model-aware value authoritative.
+        capabilities.vision = self.supports_vision();
+        capabilities
+    }
+
     /// Family-preferred temperature default. Override per family. Documented
     /// for introspection only; never use to convert `None` into a wire value.
     fn default_temperature(&self) -> f64 {
@@ -691,6 +705,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         self.as_ref().capabilities()
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+        self.as_ref().capabilities_for_model(model)
     }
 
     fn default_max_tokens(&self) -> u32 {

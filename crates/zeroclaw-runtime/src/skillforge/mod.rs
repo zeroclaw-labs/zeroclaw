@@ -39,7 +39,7 @@ fn default_auto_integrate() -> bool {
     true
 }
 fn default_sources() -> Vec<String> {
-    vec!["github".into(), "clawhub".into()]
+    vec!["github".into()]
 }
 fn default_scan_interval() -> u64 {
     24
@@ -137,7 +137,22 @@ impl SkillForge {
         let mut candidates: Vec<ScoutResult> = Vec::new();
 
         for src in &self.config.sources {
-            let source: ScoutSource = src.parse().unwrap(); // Infallible
+            let source: ScoutSource = match src.parse() {
+                Ok(source) => source,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "source": src,
+                                "error": error,
+                            })),
+                        "Unknown scout source — skipping"
+                    );
+                    continue;
+                }
+            };
             match source {
                 ScoutSource::GitHub => {
                     let scout = GitHubScout::new(self.config.github_token.clone());
@@ -168,7 +183,7 @@ impl SkillForge {
                         }
                     }
                 }
-                ScoutSource::ClawHub | ScoutSource::HuggingFace => {
+                ScoutSource::HuggingFace => {
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -260,6 +275,22 @@ mod tests {
         assert_eq!(report.auto_integrated, 0);
     }
 
+    #[tokio::test]
+    async fn removed_scout_source_is_skipped_instead_of_falling_back_to_github() {
+        let cfg = SkillForgeConfig {
+            enabled: true,
+            sources: vec!["clawhub".into()],
+            ..Default::default()
+        };
+        let forge = SkillForge::new(cfg);
+
+        let report = forge.forge().await.unwrap();
+
+        assert_eq!(report.discovered, 0);
+        assert_eq!(report.evaluated, 0);
+        assert_eq!(report.auto_integrated, 0);
+    }
+
     #[test]
     fn default_config_values() {
         let cfg = SkillForgeConfig::default();
@@ -267,6 +298,6 @@ mod tests {
         assert!(cfg.auto_integrate);
         assert_eq!(cfg.scan_interval_hours, 24);
         assert!((cfg.min_score - 0.7).abs() < f64::EPSILON);
-        assert_eq!(cfg.sources, vec!["github", "clawhub"]);
+        assert_eq!(cfg.sources, vec!["github"]);
     }
 }

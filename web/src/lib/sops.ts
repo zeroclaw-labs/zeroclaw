@@ -15,7 +15,10 @@ export const sopPriorities = enumMembers('SopPriority') as readonly SopPriority[
 export const sopExecutionModes = enumMembers('SopExecutionMode') as readonly SopExecutionMode[];
 export const sopStepKinds = enumMembers('SopStepKind') as readonly SopStepKind[];
 
-export type Sop = Schemas['Sop'];
+type ServerDefaultedSopFields = 'admission_policy' | 'max_pending_approvals';
+
+export type Sop = Omit<Schemas['Sop'], ServerDefaultedSopFields> &
+  Partial<Pick<Schemas['Sop'], ServerDefaultedSopFields>>;
 export type SopStep = Schemas['SopStep'];
 export type SopTrigger = Schemas['SopTrigger'];
 export type SopPriority = Schemas['SopPriority'];

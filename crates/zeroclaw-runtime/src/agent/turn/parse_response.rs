@@ -30,11 +30,15 @@ pub(crate) fn build_native_assistant_history(
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
+            let mut call = serde_json::Map::from_iter([
+                ("id".to_string(), serde_json::json!(tc.id)),
+                ("name".to_string(), serde_json::json!(tc.name)),
+                ("arguments".to_string(), serde_json::json!(tc.arguments)),
+            ]);
+            if let Some(extra_content) = &tc.extra_content {
+                call.insert("extra_content".to_string(), extra_content.clone());
+            }
+            serde_json::Value::Object(call)
         })
         .collect();
 
@@ -140,6 +144,7 @@ pub(crate) async fn interpret_chat_response(
         output_tokens: resp_output_tokens,
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
         // Credential-scrubbed prompt/completion content for OTel GenAI export;
         // `None` unless the `observability-otel` feature is active.
@@ -306,7 +311,32 @@ pub(crate) async fn interpret_chat_response(
 
 #[cfg(test)]
 mod tests {
-    use super::unforwarded_narration;
+    use super::{build_native_assistant_history, unforwarded_narration};
+    use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn native_assistant_history_preserves_tool_call_extra_content() {
+        let history = build_native_assistant_history(
+            "",
+            &[ToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig_1"
+                    }
+                })),
+            }],
+            None,
+        );
+
+        let value = serde_json::from_str::<serde_json::Value>(&history).unwrap();
+        assert_eq!(
+            value["tool_calls"][0]["extra_content"],
+            serde_json::json!({"google": {"thought_signature": "sig_1"}})
+        );
+    }
 
     #[test]
     fn returns_suffix_when_streamed_text_is_a_prefix() {
@@ -428,6 +458,7 @@ mod cost_usd_regression_tests {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let ctx = TurnCtx {
+            parent_agent_alias: None,
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,

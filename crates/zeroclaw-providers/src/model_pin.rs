@@ -12,13 +12,64 @@ pub struct ModelPinnedProvider {
     inner: Box<dyn ModelProvider>,
 }
 
-impl ModelPinnedProvider {
-    pub fn new(alias: &str, pinned_model: &str, inner: Box<dyn ModelProvider>) -> Self {
-        Self {
-            alias: alias.to_string(),
-            pinned_model: pinned_model.to_string(),
-            inner,
+/// Typed builder for [`ModelPinnedProvider`].
+///
+/// `alias` is the only positional argument. Both `pinned_model` and
+/// `inner` are semantically required at `build()` time; they moved off
+/// `new(...)` because two adjacent `&str` positional args (`alias` and
+/// `pinned_model`) had a real swap-risk surface — silently pinning the
+/// wrong provider to the wrong model.
+#[must_use]
+pub struct ModelPinnedProviderBuilder {
+    alias: String,
+    pinned_model: Option<String>,
+    inner: Option<Box<dyn ModelProvider>>,
+}
+
+impl ModelPinnedProviderBuilder {
+    /// The model ID every request to this provider is rewritten to.
+    /// Required.
+    pub fn pinned_model(mut self, model: &str) -> Self {
+        self.pinned_model = Some(model.to_string());
+        self
+    }
+
+    /// The inner provider whose model this pin overrides. Required.
+    pub fn inner(mut self, inner: Box<dyn ModelProvider>) -> Self {
+        self.inner = Some(inner);
+        self
+    }
+
+    /// # Panics
+    /// Panics if [`Self::pinned_model`] or [`Self::inner`] was not
+    /// called — neither has a sensible default.
+    pub fn build(self) -> ModelPinnedProvider {
+        ModelPinnedProvider {
+            alias: self.alias,
+            pinned_model: self
+                .pinned_model
+                .expect("ModelPinnedProviderBuilder: pinned_model() is required"),
+            inner: self
+                .inner
+                .expect("ModelPinnedProviderBuilder: inner() is required"),
         }
+    }
+}
+
+impl ModelPinnedProvider {
+    /// Entry point. Only `alias` is taken positionally; the required
+    /// `pinned_model` and `inner` provider both go through labelled
+    /// chain methods so call sites cannot silently swap them.
+    pub fn builder(alias: &str) -> ModelPinnedProviderBuilder {
+        ModelPinnedProviderBuilder {
+            alias: alias.to_string(),
+            pinned_model: None,
+            inner: None,
+        }
+    }
+
+    pub(crate) fn pinned_model(&self) -> &str {
+        &self.pinned_model
     }
 }
 
@@ -26,6 +77,10 @@ impl ModelPinnedProvider {
 impl ModelProvider for ModelPinnedProvider {
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         self.inner.capabilities()
+    }
+
+    fn capabilities_for_model(&self, _model: &str) -> super::traits::ProviderCapabilities {
+        self.inner.capabilities_for_model(&self.pinned_model)
     }
 
     fn default_temperature(&self) -> f64 {

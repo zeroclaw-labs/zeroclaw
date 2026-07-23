@@ -117,6 +117,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
     }
     Some(Arc::new(parking_lot::RwLock::new(map)))
 }
+use crate::agent::TurnMeta;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -302,7 +303,15 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
-pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+/// Append a pre-rendered pinned-MCP-resources section onto the system-prompt
+/// MCP accumulator (`deferred_section`).
+///
+/// This MUST be called *after* the `deferred_loading` branch, which reassigns
+/// `deferred_section` with `=` (via `build_deferred_tools_section_filtered`)
+/// and would otherwise clobber any earlier-pushed pinned content. Centralizing
+/// the append keeps both `run()` and `process_message()` consistent and pins
+/// the ordering invariant in one testable place. No-op for an empty section.
+pub fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
     if pinned_section.is_empty() {
         return;
     }
@@ -480,7 +489,7 @@ where
     TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
 }
 
-fn compute_excluded_mcp_tools(
+pub(crate) fn compute_excluded_mcp_tools(
     tools_registry: &[Box<dyn Tool>],
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
@@ -591,7 +600,7 @@ pub(crate) fn capture_llm_messages(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_system_prompt_for_turn(
+pub(crate) fn build_system_prompt_for_turn(
     agent_workspace: &std::path::Path,
     model_name: &str,
     tool_descs: &[(&str, &str)],
@@ -705,6 +714,7 @@ fn build_hardware_context(
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
+    turn: TurnMeta<'_>,
 ) -> String {
     if rag.is_empty() || boards.is_empty() {
         return String::new();
@@ -726,6 +736,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
+        channel: Some(turn.channel_name.to_string()),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: Some(turn.turn_id.to_string()),
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -760,9 +773,12 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// `(channel, agent_alias, turn_id)` correlation triple that observer
 /// consumers (Prometheus, OTel, the gateway `/api/events` stream) rely on for
 /// per-agent attribution. `None` opts out for callers without a resolved
-/// alias (tests, benches).
+/// alias (tests, benches). `turn_id` follows the same pattern: `Some` reuses
+/// a caller-minted id so pre-turn events (the `process_message` RAG
+/// retrieval) join the bracket; `None` self-mints.
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
+    config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -788,8 +804,82 @@ pub async fn agent_turn(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    turn_id: Option<&str>,
 ) -> Result<String> {
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    agent_turn_with_sop_reassembly(
+        config,
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        approval,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        strict_tool_parsing,
+        parallel_tools,
+        max_tool_result_chars,
+        context_token_budget,
+        channel,
+        origin,
+        memory,
+        agent_alias,
+        turn_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn agent_turn_with_sop_reassembly(
+    config: Option<&zeroclaw_config::schema::Config>,
+    model_provider: &dyn ModelProvider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    silent: bool,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    max_tool_iterations: usize,
+    approval: Option<&ApprovalManager>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    strict_tool_parsing: bool,
+    parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    channel: Option<&dyn Channel>,
+    origin: TurnOrigin,
+    memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
+    agent_alias: Option<&str>,
+    turn_id: Option<&str>,
+    sop_reassembly: Option<SopStepReassembly<'_>>,
+) -> Result<String> {
+    let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+    #[cfg(test)]
+    if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+        .lock()
+        .expect("agent-turn reassembly test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(sop_reassembly.is_some());
+    }
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
     // messages) surface turn lifecycle events to observers — mirroring the
@@ -805,6 +895,7 @@ pub async fn agent_turn(
         Some(turn_id.clone()),
     );
     let result = run_tool_call_loop(ToolLoop {
+        sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -818,6 +909,7 @@ pub async fn agent_turn(
                 silent,
                 approval,
                 multimodal_config,
+                config,
                 hooks: None,
                 activated_tools,
                 model_switch_callback,
@@ -853,6 +945,7 @@ pub async fn agent_turn(
         memory,
         ingress: IngressContext::from_origin(origin),
         agent_alias,
+        parent_agent_alias: None,
         turn_id: &turn_id,
     })
     .await;
@@ -896,8 +989,9 @@ pub(crate) use super::turn::{
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
     PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, ToolLoop, ToolLoopCancelled,
+    drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop,
+    scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1034,6 +1128,14 @@ type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
 #[cfg(test)]
 static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
     LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+
+#[cfg(test)]
+static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
+    Mutex<Option<AgentTurnSopReassemblyTestHook>>,
+> = LazyLock::new(|| Mutex::new(None));
 
 fn api_key_and_uri_for_provider(
     config: &zeroclaw_config::schema::Config,
@@ -1199,8 +1301,12 @@ pub async fn run(
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -1336,12 +1442,20 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options = match agent_provider_resolved.as_ref() {
+        let agent_runtime_options = match agent_provider_resolved.as_ref() {
             Some((ty, alias, _)) => {
                 zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
             }
             None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
         };
+        // Resolve every alias-owned option, including vision, through the shared
+        // provider-ref resolver. This keeps a --provider override isolated from
+        // the agent alias without a second capability-specific lookup.
+        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &provider_name,
+            &agent_runtime_options,
+        );
 
         // Resolve api_key and uri from the actual provider being constructed.
         // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
@@ -1705,6 +1819,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: Some(agent_alias.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 });
             }
 
@@ -1716,7 +1833,19 @@ pub async fn run(
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| {
-                    build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
+                    build_hardware_context(
+                        r,
+                        &*observer,
+                        &effective_msg,
+                        &board_names,
+                        rag_limit,
+                        TurnMeta {
+                            parent_agent_alias: None,
+                            agent_alias: Some(agent_alias),
+                            turn_id: &turn_id,
+                            channel_name,
+                        },
+                    )
                 })
                 .unwrap_or_default();
             let context = hw_context;
@@ -1787,6 +1916,7 @@ pub async fn run(
                                         silent: false,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
+                                        config: Some(&config),
                                         hooks: None,
                                         activated_tools: activated_handle.as_ref(),
                                         model_switch_callback: Some(model_switch_callback.clone()),
@@ -1826,14 +1956,18 @@ pub async fn run(
                                     query: effective_msg.clone(),
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
-                                    cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                        min_relevance_score: config.memory.min_relevance_score,
-                                        ..Default::default()
-                                    },
+                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                        &config.memory,
+                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                    ),
                                 }),
                                 ingress: IngressContext::from_origin(origin),
                                 agent_alias: Some(agent_alias),
+                                parent_agent_alias: None,
                                 turn_id: &turn_id,
+                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                    config: &config,
+                                }),
                             }),
                         ),
                     )
@@ -1991,6 +2125,7 @@ pub async fn run(
                     .scope(
                         cost_tracking_context.clone(),
                         crate::skills::review::maybe_run_skill_review(
+                            Some(&config),
                             review_workspace,
                             review_config,
                             config.skills.allow_scripts,
@@ -2210,6 +2345,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
+                        channel: Some(channel_name.to_string()),
+                        agent_alias: Some(agent_alias.to_string()),
+                        turn_id: Some(turn_id.clone()),
                     });
                 }
 
@@ -2227,6 +2365,12 @@ pub async fn run(
                             &effective_input,
                             &board_names,
                             rag_limit,
+                            TurnMeta {
+                                parent_agent_alias: None,
+                                agent_alias: Some(agent_alias),
+                                turn_id: &turn_id,
+                                channel_name,
+                            },
                         )
                     })
                     .unwrap_or_default();
@@ -2324,6 +2468,7 @@ pub async fn run(
                                             silent: true,
                                             approval: approval_manager.as_ref(),
                                             multimodal_config: &config.multimodal,
+                                            config: Some(&config),
                                             hooks: None,
                                             activated_tools: activated_handle.as_ref(),
                                             model_switch_callback: Some(
@@ -2369,14 +2514,18 @@ pub async fn run(
                                         query: effective_input.clone(),
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                                            min_relevance_score: config.memory.min_relevance_score,
-                                            ..Default::default()
-                                        },
+                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                            &config.memory,
+                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                        ),
                                     }),
                                     ingress: IngressContext::from_origin(origin),
                                     agent_alias: Some(agent_alias),
+                                    parent_agent_alias: None,
                                     turn_id: &turn_id,
+                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                        config: &config,
+                                    }),
                                 }),
                             ),
                         )
@@ -2773,8 +2922,12 @@ pub async fn process_message(
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -3107,11 +3260,28 @@ pub async fn process_message(
         // origin (agent::memory_inject); recall is scoped to this entry's
         // session_id. Hardware RAG stays site-built; the engine prepends the
         // memory block above it.
+        // Pre-mint the turn id so the pre-turn RAG retrieval and the
+        // agent_turn bracket share one correlation id. The RAG span stays a
+        // root span (it runs before AgentStart) but carries the matching
+        // zeroclaw.turn_id attribute; nesting it is a tracked follow-up.
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| {
-                build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
+                build_hardware_context(
+                    r,
+                    &*observer,
+                    effective_msg_ref,
+                    &board_names,
+                    rag_limit,
+                    TurnMeta {
+                        parent_agent_alias: None,
+                        agent_alias: Some(agent_alias),
+                        turn_id: &turn_id,
+                        channel_name: "daemon",
+                    },
+                )
             })
             .unwrap_or_default();
         let context = hw_context;
@@ -3151,7 +3321,8 @@ pub async fn process_message(
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
-                agent_turn(
+                agent_turn_with_sop_reassembly(
+                    Some(&config),
                     model_provider.as_ref(),
                     &mut history,
                     &tools_registry,
@@ -3183,12 +3354,14 @@ pub async fn process_message(
                         query: effective_message.clone(),
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
-                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
-                            min_relevance_score: config.memory.min_relevance_score,
-                            ..Default::default()
-                        },
+                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                            &config.memory,
+                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                        ),
                     }),
                     Some(agent_alias),
+                    Some(&turn_id),
+                    Some(SopStepReassembly { config: &config }),
                 ),
             )
             .await
@@ -3206,6 +3379,7 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
@@ -3714,7 +3888,8 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3756,7 +3931,8 @@ mod tests {
             .unwrap()
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3804,7 +3980,8 @@ mod tests {
         })
         .join();
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3837,7 +4014,8 @@ mod tests {
         let observer = NoopObserver;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -3891,7 +4069,8 @@ mod tests {
         };
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
+            parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
             channel_name: "test",
@@ -4899,6 +5078,8 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -4911,6 +5092,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -4973,6 +5155,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -4985,6 +5169,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5054,6 +5239,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5066,6 +5253,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5140,6 +5328,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5152,6 +5342,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5211,6 +5402,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5223,6 +5416,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5285,6 +5479,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5297,6 +5493,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5360,6 +5557,8 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5372,6 +5571,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5422,6 +5622,8 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -5434,6 +5636,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 3,
                     hooks: None,
                     excluded_tools: &[],
@@ -5605,6 +5808,8 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -5617,6 +5822,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 3,
                     hooks: None,
                     excluded_tools: &[],
@@ -5727,6 +5933,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5739,6 +5947,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5801,6 +6010,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5813,6 +6024,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -5874,6 +6086,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -5886,6 +6100,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &multimodal,
+                config: None,
                 max_tool_iterations: 3,
                 hooks: None,
                 excluded_tools: &[],
@@ -6033,6 +6248,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6045,6 +6262,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6171,6 +6389,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6183,6 +6403,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -6329,6 +6550,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6341,6 +6564,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -6444,6 +6668,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6456,6 +6682,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6614,6 +6841,8 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
         let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6626,6 +6855,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6720,6 +6950,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6732,6 +6964,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6810,6 +7043,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6822,6 +7057,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6892,6 +7128,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6904,6 +7142,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -6982,6 +7221,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6994,6 +7235,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7075,6 +7317,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7087,6 +7331,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7173,6 +7418,8 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7185,6 +7432,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7268,6 +7516,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7280,6 +7530,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7363,6 +7614,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7375,6 +7628,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7463,6 +7717,8 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7475,6 +7731,7 @@ mod tests {
                 silent: true,
                 approval: Some(&approval_mgr),
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7553,6 +7810,8 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7565,6 +7824,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7647,6 +7907,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7659,6 +7921,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7743,6 +8006,8 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7755,6 +8020,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7825,6 +8091,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7837,6 +8105,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7911,6 +8180,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -7923,6 +8194,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -7992,6 +8264,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8004,6 +8278,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8071,6 +8346,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8083,6 +8360,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8153,6 +8431,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8165,6 +8445,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 6,
                 hooks: None,
                 excluded_tools: &[],
@@ -8232,6 +8513,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8244,6 +8527,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8310,6 +8594,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8322,6 +8608,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8380,6 +8667,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8392,6 +8681,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8451,6 +8741,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8463,6 +8755,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8522,6 +8815,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8534,6 +8829,7 @@ mod tests {
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8595,6 +8891,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8607,6 +8905,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8673,6 +8972,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8685,6 +8986,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8763,6 +9065,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8775,6 +9079,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8836,6 +9141,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8848,6 +9155,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8912,6 +9220,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8924,6 +9234,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -8986,6 +9297,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -8998,6 +9311,7 @@ Done."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9061,6 +9375,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9073,6 +9389,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9193,6 +9510,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9205,6 +9524,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9276,6 +9596,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9288,6 +9610,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9363,6 +9686,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9375,6 +9700,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9473,6 +9799,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9485,6 +9813,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9588,6 +9917,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9600,6 +9931,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -9677,6 +10009,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9689,6 +10023,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -9777,6 +10112,8 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -9789,6 +10126,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10657,6 +10995,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10669,6 +11009,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10759,6 +11100,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10771,6 +11114,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10860,6 +11204,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10872,6 +11218,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -10961,6 +11308,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10973,6 +11322,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 5,
                 hooks: None,
                 excluded_tools: &[],
@@ -11117,6 +11467,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
@@ -11129,6 +11481,7 @@ This is an example, not an invocation."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -11227,6 +11580,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11252,6 +11606,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11298,6 +11653,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11323,6 +11679,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11426,6 +11783,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let _result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11451,6 +11809,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -11505,6 +11864,7 @@ This is an example, not an invocation."#;
             let observer = NoopObserver;
 
             let _result = agent_turn(
+                None,
                 &model_provider,
                 &mut history,
                 &tools_registry,
@@ -11530,6 +11890,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -13433,6 +13794,8 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13445,6 +13808,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 4,
                 hooks: None,
                 excluded_tools: &[],
@@ -13608,6 +13972,8 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -13620,6 +13986,7 @@ Let me check the result."#;
                         silent: true,
                         approval: None,
                         multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
                         max_tool_iterations: 2,
                         hooks: None,
                         excluded_tools: &[],
@@ -13682,6 +14049,8 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13694,6 +14063,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 2,
                 hooks: None,
                 excluded_tools: &[],
@@ -13795,6 +14165,8 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -13807,6 +14179,7 @@ Let me check the result."#;
                         silent: true,
                         approval: None,
                         multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
                         max_tool_iterations: 2,
                         hooks: None,
                         excluded_tools: &[],
@@ -13874,6 +14247,8 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13886,6 +14261,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 2,
                 hooks: None,
                 excluded_tools: &[],
@@ -13960,6 +14336,8 @@ Let me check the result."#;
         ];
 
         let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13972,6 +14350,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 1,
                 hooks: None,
                 excluded_tools: &[],
@@ -14108,6 +14487,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 crate::skills::review::maybe_run_skill_review(
+                    None,
                     workspace.path().to_path_buf(),
                     review_config,
                     false,
@@ -14192,6 +14572,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 crate::skills::review::maybe_run_skill_review(
+                    None,
                     workspace.path().to_path_buf(),
                     review_config,
                     false,
@@ -14874,6 +15255,75 @@ Let me check the result."#;
     }
 
     #[tokio::test]
+    async fn process_message_provides_sop_reassembly_to_agent_turn() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("process-message-reassembly-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "process-message-reassembly-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen_for_hook = Arc::clone(&seen);
+        {
+            let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+                .lock()
+                .expect("agent-turn reassembly test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |has_reassembly| {
+                seen_for_hook
+                    .lock()
+                    .expect("seen lock should not be poisoned")
+                    .push(has_reassembly);
+            }));
+        }
+
+        let result = super::process_message(
+            config,
+            "process-message-reassembly-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
+
+        {
+            let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
+                .lock()
+                .expect("agent-turn reassembly test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = seen.lock().expect("seen lock should not be poisoned");
+        assert!(
+            seen.iter().any(|has_reassembly| *has_reassembly),
+            "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
+             observed {seen:?}; process_message result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
         let config = zeroclaw_config::schema::Config::default();
         let security = Arc::new(TestPolicy {
@@ -15102,6 +15552,8 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -15114,6 +15566,7 @@ Let me check the result."#;
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
                 max_tool_iterations: 10,
                 hooks: None,
                 excluded_tools: &[],
@@ -15177,6 +15630,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = agent_turn(
+            None,
             &model_provider,
             &mut history,
             &tools_registry,
@@ -15202,6 +15656,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("agent_turn should complete");
@@ -15228,6 +15683,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = agent_turn(
+            None, // config: configless test
             &model_provider,
             &mut history,
             &tools_registry,
@@ -15253,6 +15709,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("turn should succeed");
@@ -15282,6 +15739,120 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// When the caller pre-mints a turn id (`process_message` does, so its
+    /// pre-turn RAG retrieval correlates with the turn), `agent_turn` must
+    /// bracket the turn with that id instead of minting its own.
+    #[tokio::test]
+    async fn agent_turn_uses_the_pre_minted_turn_id_on_its_bracket() {
+        // Harness mirrors agent_turn_brackets_turn_with_agent_start_and_agent_end.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = agent_turn(
+            None, // config
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            capturing.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false, // parallel_tools
+            0,     // max_tool_result_chars: disabled for test
+            0,     // context_token_budget: disabled for test
+            None,  // channel
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+            Some("pre-minted-turn"),
+        )
+        .await
+        .expect("turn should succeed");
+        assert_eq!(result, "done");
+
+        let events = capturing.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .expect("agent_turn must emit AgentStart")
+        {
+            ObserverEvent::AgentStart { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("pre-minted-turn"));
+            }
+            _ => unreachable!(),
+        }
+
+        // The bracket and the inner engine events must also agree on the
+        // full (channel, agent_alias, turn_id) triple with the pre-minted id.
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `build_hardware_context` must forward the caller's TurnMeta onto the
+    /// RagRetrieve event it emits. Prior review flagged that RagRetrieve
+    /// correlation had no executing assertion anywhere.
+    #[test]
+    fn build_hardware_context_forwards_turn_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("datasheets");
+        std::fs::create_dir_all(&base).unwrap();
+        let content = r#"# Test Board
+## Pin Aliases
+red_led: 13
+## GPIO
+Pin 13: LED
+"#;
+        std::fs::write(base.join("test-board.md"), content).unwrap();
+        let rag = crate::rag::HardwareRag::load(tmp.path(), "datasheets").unwrap();
+        let boards = vec!["test-board".to_string()];
+        let observer = CapturingObserver::default();
+
+        let _ = build_hardware_context(
+            &rag,
+            &observer,
+            "led",
+            &boards,
+            5,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("coder"),
+                turn_id: "turn-7",
+                channel_name: "daemon",
+            },
+        );
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::RagRetrieve { .. }))
+            .expect("build_hardware_context must emit RagRetrieve")
+        {
+            ObserverEvent::RagRetrieve {
+                turn_id,
+                channel,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-7"));
+                assert_eq!(channel.as_deref(), Some("daemon"));
+                assert_eq!(agent_alias.as_deref(), Some("coder"));
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// `read_capped_line` returns a full line and [`CappedLine::Line`]
