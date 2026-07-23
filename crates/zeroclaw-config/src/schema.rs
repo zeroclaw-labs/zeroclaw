@@ -20663,7 +20663,25 @@ impl Config {
     /// produce. Returns `false` in every other case (created, already existed, or
     /// the path is not a map-keyed entry). The bool is advisory; statement-callers
     /// that do not distinguish the reserved case may ignore it.
+    ///
+    /// When it newly creates the alias, it also guarantees no phantom is left
+    /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
+    /// field), the just-created alias is rolled back before returning.
     pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
+        self.ensure_map_key_for_path_tracked(path).0
+    }
+
+    /// [`Self::ensure_map_key_for_path`] variant that also reports what it
+    /// created. The bool is the same reserved-`default` refusal signal; the
+    /// second element is `Some((section, alias))` only when THIS call newly
+    /// created the alias and the path probe kept it. Callers whose follow-up
+    /// write can still fail after that probe (e.g. value coercion or a
+    /// set-prop parse error) use it to roll the alias back via
+    /// `delete_map_key` instead of leaving a phantom entry.
+    pub fn ensure_map_key_for_path_tracked(
+        &mut self,
+        path: &str,
+    ) -> (bool, Option<(&'static str, String)>) {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
@@ -20679,17 +20697,17 @@ impl Config {
             }
         }
         let Some(section) = best else {
-            return false;
+            return (false, None);
         };
         let rest = &path[section.len() + 1..];
         let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
-            return false;
+            return (false, None);
         };
         if self
             .get_map_keys(section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
-            return false;
+            return (false, None);
         }
         // Never auto-vivify the reserved `default` agent from a set-prop path: a
         // prop write under a nonexistent `agents.default` must not materialize the
@@ -20713,10 +20731,20 @@ impl Config {
                     })),
                 "refused to auto-create the reserved `default` agent from a set-prop path"
             );
-            return true;
+            return (true, None);
         }
-        let _ = self.create_map_key(section, alias);
-        false
+        // Roll back on the same `Ok(true)` == "newly created" signal the CLI
+        // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
+        // this on the earlier `get_map_keys` pre-check, or a bogus tail field
+        // on an already-existing alias would delete a legitimate config entry.
+        if matches!(self.create_map_key(section, alias), Ok(true)) {
+            if self.get_prop(path).is_err() {
+                let _ = self.delete_map_key(section, alias);
+                return (false, None);
+            }
+            return (false, Some((section, alias.to_string())));
+        }
+        (false, None)
     }
 
     pub fn clear_dirty(&mut self) {
@@ -32438,6 +32466,47 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         config.ensure_map_key_for_path("gateway.port");
         config.ensure_map_key_for_path("locale");
         assert!(config.set_prop("gateway.port", "8080").is_ok());
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_rolls_back_alias_when_tail_field_unknown() {
+        let mut config = Config::default();
+        let path = "providers.models.anthropic.default.not_a_real_field";
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "precondition: alias must not exist yet"
+        );
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "the just-created alias must be rolled back when the tail field can't resolve"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_keeps_preexisting_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("seed a pre-existing alias");
+
+        let refused =
+            config.ensure_map_key_for_path("providers.models.anthropic.default.not_a_real_field");
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| keys.iter().any(|k| k == "default")),
+            "a pre-existing alias must never be deleted for a typo'd tail field"
+        );
     }
 
     #[test]
