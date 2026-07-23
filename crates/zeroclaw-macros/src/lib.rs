@@ -606,6 +606,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // `crate::config::is_unknown_property_error`).
                     let double_map_set_gate = build_set_prop_delegation_gate(
                         quote! { inner.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
                         quote! { continue; },
                     );
                     nested_set_prop.push(quote! {
@@ -1140,6 +1141,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // `crate::config::is_unknown_property_error`.
                 let option_set_gate = build_set_prop_delegation_gate(
                     quote! { inner.set_prop(name, value_str) },
+                    quote! { name },
                     quote! {},
                 );
                 nested_set_prop.push(quote! {
@@ -1686,6 +1688,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // `crate::config::is_unknown_property_error`.
                     let flatten_set_gate = build_set_prop_delegation_gate(
                         quote! { self.#field_ident.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
                         quote! {},
                     );
                     nested_set_prop.push(quote! {
@@ -2630,13 +2633,20 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
 /// mine": the site-specific `on_unknown` tokens run so the next candidate —
 /// a sibling field, the generic leaf fallback, or the next dotted-key split —
 /// still gets its chance.
+///
+/// `attempted_name` must be the exact `&str` expression for the property
+/// name passed into `call`'s nested `set_prop` — `is_unknown_property_error`
+/// compares against that exact name so a value error whose message merely
+/// starts with "Unknown property" isn't mistaken for the fall-through
+/// marker.
 fn build_set_prop_delegation_gate(
     call: proc_macro2::TokenStream,
+    attempted_name: proc_macro2::TokenStream,
     on_unknown: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
         match #call {
-            Err(e) if crate::config::is_unknown_property_error(&e) => { #on_unknown }
+            Err(e) if crate::config::is_unknown_property_error(&e, #attempted_name) => { #on_unknown }
             other => return other,
         }
     }
