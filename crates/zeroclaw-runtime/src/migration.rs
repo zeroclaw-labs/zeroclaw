@@ -27,6 +27,7 @@ pub async fn migrate_openclaw_memory(
     config: &Config,
     source_workspace: Option<PathBuf>,
     dry_run: bool,
+    reindex: bool,
 ) -> Result<()> {
     let source_workspace = resolve_openclaw_workspace(source_workspace)?;
     if !source_workspace.exists() {
@@ -60,6 +61,9 @@ pub async fn migrate_openclaw_memory(
         println!("    - from sqlite:   {}", stats.from_sqlite);
         println!("    - from markdown: {}", stats.from_markdown);
         println!();
+        if reindex {
+            println!("Reindex requested: indexes would be rebuilt after import.");
+        }
         println!("Run without --dry-run to import these entries.");
         return Ok(());
     }
@@ -101,12 +105,39 @@ pub async fn migrate_openclaw_memory(
     println!("  Renamed conflicts:{}", stats.renamed_conflicts);
     println!("  Source sqlite rows:{}", stats.from_sqlite);
     println!("  Source markdown:   {}", stats.from_markdown);
+    if reindex {
+        // The import above deliberately goes through a NoopEmbedding-backed
+        // handle for speed, so reindex through a second handle with the
+        // configured embedder wired in - the same construction `zeroclaw
+        // memory reindex` uses - otherwise the backfill could never compute
+        // an embedding regardless of the operator's embedding config.
+        drop(memory);
+        let reindex_memory = reindex_memory_backend(config)?;
+        let reembedded = reindex_memory.reindex().await?;
+        println!("  Reindexed:         yes ({reembedded} embeddings backfilled; FTS rebuilt)");
+    }
 
     Ok(())
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    zeroclaw_memory::create_memory_for_migration(&config.memory.backend, &config.data_dir)
+    zeroclaw_memory::create_memory_for_migration(config)
+}
+
+/// Memory handle for the post-import `--reindex` pass, with the configured
+/// embedder resolved and wired in. Mirrors `zeroclaw memory reindex`
+/// (`create_memory_with_embedder` in the CLI): same storage resolution, same
+/// embedding-route handling, so `migrate openclaw --reindex` is equivalent to
+/// running the standalone reindex command right after the import.
+fn reindex_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
+    zeroclaw_memory::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        config.resolve_active_storage(),
+        &config.data_dir,
+        None,
+        Some(&config.providers.models),
+    )
 }
 
 fn collect_source_entries(
@@ -500,7 +531,7 @@ mod tests {
         .unwrap();
 
         let config = test_config(target.path());
-        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false)
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, false)
             .await
             .unwrap();
 
@@ -530,12 +561,44 @@ mod tests {
         .unwrap();
 
         let config = test_config(target.path());
-        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), true)
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), true, false)
             .await
             .unwrap();
 
         let target_mem = SqliteMemory::new("test", target.path()).unwrap();
         assert_eq!(target_mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_reindex_uses_same_dotted_sqlite_backend_as_import() {
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let source_db_dir = source.path().join("memory");
+        fs::create_dir_all(&source_db_dir).unwrap();
+
+        let source_db = source_db_dir.join("brain.db");
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute_batch("CREATE TABLE memories (key TEXT, content TEXT, category TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memories (key, content, category) VALUES (?1, ?2, ?3)",
+            params!["reindex_key", "reindex searchable content", "core"],
+        )
+        .unwrap();
+
+        let mut config = test_config(target.path());
+        config.memory.backend = "sqlite.default".to_string();
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, true)
+            .await
+            .unwrap();
+
+        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
+        let results = target_mem
+            .recall("searchable", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "reindex_key");
     }
 
     #[test]

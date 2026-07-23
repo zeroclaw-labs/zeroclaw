@@ -115,4 +115,4 @@ User-facing text and English-only logging rules remain in root `AGENTS.md`. The 
 - [Testing](./testing.md)
 - [Architecture overview](../architecture/overview.md)
 - [Superseding pull requests](../maintainers/superseding.md)
-- [Audit policy](../../../maintainers/audit-policy.md)
+- [Audit policy](https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/maintainers/audit-policy.md)
