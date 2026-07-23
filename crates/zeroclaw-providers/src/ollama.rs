@@ -174,39 +174,6 @@ impl OllamaModelProvider {
         }
     }
 
-    pub fn new(alias: &str, base_url: Option<&str>, api_key: Option<&str>) -> Self {
-        Self::new_with_reasoning(alias, base_url, api_key, None)
-    }
-
-    pub fn new_with_reasoning(
-        alias: &str,
-        base_url: Option<&str>,
-        api_key: Option<&str>,
-        reasoning_enabled: Option<bool>,
-    ) -> Self {
-        let api_key = api_key.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
-
-        Self {
-            alias: alias.to_string(),
-            base_url: Self::normalize_base_url(base_url.unwrap_or(BASE_URL)),
-            api_key,
-            reasoning_enabled,
-            tuning: OllamaTuning::default(),
-        }
-    }
-
-    /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
-    /// `temperature_override`) on this provider. Returns `self` for
-    /// chained construction.
-    #[must_use]
-    pub fn with_tuning(mut self, tuning: OllamaTuning) -> Self {
-        self.tuning = tuning;
-        self
-    }
-
     #[cfg(test)]
     pub(crate) fn tuning(&self) -> OllamaTuning {
         self.tuning

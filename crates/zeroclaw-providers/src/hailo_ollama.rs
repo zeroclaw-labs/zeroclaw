@@ -1126,6 +1126,11 @@ impl HailoOllamaModelProvider {
     }
 
     fn response_text(response: &ApiChatResponse) -> anyhow::Result<String> {
+        // Hailo advertises no extended-thinking capability. The native
+        // service can nevertheless place its only non-empty output in the
+        // optional `thinking` field, so this compatibility fallback is
+        // deliberately returned as ordinary text and not reported as
+        // `reasoning_content`.
         let content = Self::strip_think_tags(&response.message.content);
         if !content.trim().is_empty() {
             return Ok(content);
