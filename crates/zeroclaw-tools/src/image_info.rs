@@ -298,6 +298,12 @@ mod tests {
         relative
     }
 
+    async fn expected_marker_path(path: &Path) -> String {
+        let canonical = tokio::fs::canonicalize(path).await.unwrap();
+        let display = canonical.display().to_string();
+        ImageInfoTool::strip_windows_verbatim_prefix(&display).into_owned()
+    }
+
     /// Wraps `ImageInfoTool` with the production `PathGuardedTool` +
     /// `RateLimitedTool` stack, mirroring the registration in
     /// `zeroclaw-runtime::tools::mod`.  Use this in tests that exercise
@@ -552,11 +558,9 @@ mod tests {
         assert!(!result.output.contains("data:"));
         // The output carries an absolute-path [IMAGE:] marker so the
         // multimodal pipeline can inline the image for vision models.
-        let canonical = tokio::fs::canonicalize(&png_path).await.unwrap();
+        let marker_path = expected_marker_path(&png_path).await;
         assert!(
-            result
-                .output
-                .contains(&format!("[IMAGE:{}]", canonical.display())),
+            result.output.contains(&format!("[IMAGE:{marker_path}]")),
             "expected absolute-path image marker, got: {}",
             result.output
         );
@@ -644,16 +648,14 @@ mod tests {
         // emitted as an absolute-path [IMAGE:] marker. Before the fix the tool
         // echoed the relative input, which the marker promoter (anchored on a
         // leading `/`) silently dropped, so the image never reached the model.
-        let canonical = tokio::fs::canonicalize(&png_path).await.unwrap();
+        let marker_path = expected_marker_path(&png_path).await;
         assert!(
-            result
-                .output
-                .contains(&format!("[IMAGE:{}]", canonical.display())),
+            result.output.contains(&format!("[IMAGE:{marker_path}]")),
             "expected absolute-path image marker, got: {}",
             result.output
         );
         assert!(
-            canonical.is_absolute(),
+            Path::new(&marker_path).is_absolute(),
             "marker path must be absolute so the multimodal pipeline can load it"
         );
     }
@@ -759,11 +761,9 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        let canonical = tokio::fs::canonicalize(&png_path).await.unwrap();
+        let marker_path = expected_marker_path(&png_path).await;
         assert!(
-            result
-                .output
-                .contains(&format!("[IMAGE:{}]", canonical.display())),
+            result.output.contains(&format!("[IMAGE:{marker_path}]")),
             "expected absolute-path image marker, got: {}",
             result.output
         );

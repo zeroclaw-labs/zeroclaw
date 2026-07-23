@@ -17,6 +17,12 @@ pub(super) fn register(registry: &mut SopCapabilityRegistry) {
     registry.register(GitStatusCapability);
     registry.register(GitDiffCapability);
     registry.register(NotifyChannelCapability);
+    // Injected-adapter capabilities, registered here as FAIL-CLOSED placeholders
+    // (adapter = None) so SOPs referencing them pass load-time validation
+    // everywhere; `build_sop_engine` re-registers them with real adapters when
+    // the daemon supplies one (a later `register` for the same id overwrites).
+    registry.register(super::forge_comment::ForgeCommentCapability::new(None));
+    registry.register(super::llm_generate::LlmGenerateCapability::new(None));
 }
 
 struct NoopCapability;

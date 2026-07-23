@@ -117,6 +117,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
     }
     Some(Arc::new(parking_lot::RwLock::new(map)))
 }
+use crate::agent::TurnMeta;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -691,6 +692,7 @@ fn build_hardware_context(
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
+    turn: TurnMeta<'_>,
 ) -> String {
     if rag.is_empty() || boards.is_empty() {
         return String::new();
@@ -712,6 +714,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
+        channel: Some(turn.channel_name.to_string()),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: Some(turn.turn_id.to_string()),
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -746,7 +751,9 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// `(channel, agent_alias, turn_id)` correlation triple that observer
 /// consumers (Prometheus, OTel, the gateway `/api/events` stream) rely on for
 /// per-agent attribution. `None` opts out for callers without a resolved
-/// alias (tests, benches).
+/// alias (tests, benches). `turn_id` follows the same pattern: `Some` reuses
+/// a caller-minted id so pre-turn events (the `process_message` RAG
+/// retrieval) join the bracket; `None` self-mints.
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     config: Option<&zeroclaw_config::schema::Config>,
@@ -775,6 +782,7 @@ pub async fn agent_turn(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    turn_id: Option<&str>,
 ) -> Result<String> {
     agent_turn_with_sop_reassembly(
         config,
@@ -803,6 +811,7 @@ pub async fn agent_turn(
         origin,
         memory,
         agent_alias,
+        turn_id,
         None,
     )
     .await
@@ -836,9 +845,10 @@ async fn agent_turn_with_sop_reassembly(
     origin: TurnOrigin,
     memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
     agent_alias: Option<&str>,
+    turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     #[cfg(test)]
     if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
         .lock()
@@ -1269,8 +1279,12 @@ pub async fn run(
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -1781,6 +1795,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: Some(agent_alias.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 });
             }
 
@@ -1792,7 +1809,19 @@ pub async fn run(
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| {
-                    build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
+                    build_hardware_context(
+                        r,
+                        &*observer,
+                        &effective_msg,
+                        &board_names,
+                        rag_limit,
+                        TurnMeta {
+                            parent_agent_alias: None,
+                            agent_alias: Some(agent_alias),
+                            turn_id: &turn_id,
+                            channel_name,
+                        },
+                    )
                 })
                 .unwrap_or_default();
             let context = hw_context;
@@ -2290,6 +2319,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
+                        channel: Some(channel_name.to_string()),
+                        agent_alias: Some(agent_alias.to_string()),
+                        turn_id: Some(turn_id.clone()),
                     });
                 }
 
@@ -2307,6 +2339,12 @@ pub async fn run(
                             &effective_input,
                             &board_names,
                             rag_limit,
+                            TurnMeta {
+                                parent_agent_alias: None,
+                                agent_alias: Some(agent_alias),
+                                turn_id: &turn_id,
+                                channel_name,
+                            },
                         )
                     })
                     .unwrap_or_default();
@@ -2854,8 +2892,12 @@ pub async fn process_message(
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) =
-                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem, None);
+            let (engine, audit) = crate::sop::build_sop_engine(
+                config.sop.clone(),
+                &config.data_dir,
+                sop_mem,
+                Default::default(),
+            );
             (Some(engine), Some(audit))
         } else {
             (None, None)
@@ -3188,11 +3230,28 @@ pub async fn process_message(
         // origin (agent::memory_inject); recall is scoped to this entry's
         // session_id. Hardware RAG stays site-built; the engine prepends the
         // memory block above it.
+        // Pre-mint the turn id so the pre-turn RAG retrieval and the
+        // agent_turn bracket share one correlation id. The RAG span stays a
+        // root span (it runs before AgentStart) but carries the matching
+        // zeroclaw.turn_id attribute; nesting it is a tracked follow-up.
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| {
-                build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
+                build_hardware_context(
+                    r,
+                    &*observer,
+                    effective_msg_ref,
+                    &board_names,
+                    rag_limit,
+                    TurnMeta {
+                        parent_agent_alias: None,
+                        agent_alias: Some(agent_alias),
+                        turn_id: &turn_id,
+                        channel_name: "daemon",
+                    },
+                )
             })
             .unwrap_or_default();
         let context = hw_context;
@@ -3271,6 +3330,7 @@ pub async fn process_message(
                         ),
                     }),
                     Some(agent_alias),
+                    Some(&turn_id),
                     Some(SopStepReassembly { config: &config }),
                 ),
             )
@@ -3798,7 +3858,7 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3842,7 +3902,7 @@ mod tests {
             .unwrap()
             .activate("docker-mcp__extract_text".into(), activated_tool);
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3892,7 +3952,7 @@ mod tests {
         })
         .join();
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3927,7 +3987,7 @@ mod tests {
         let observer = NoopObserver;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -3983,7 +4043,7 @@ mod tests {
         };
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
-        let meta = crate::agent::turn::context::TurnMeta {
+        let meta = TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
             turn_id: "test-turn-id",
@@ -11521,6 +11581,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11593,6 +11654,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11722,6 +11784,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -11802,6 +11865,7 @@ This is an example, not an invocation."#;
                 TurnOrigin::SubTurn,
                 None,
                 None, // agent_alias: not under test here
+                None, // turn_id: self-minted
             )
             .await
             .expect("agent_turn should complete");
@@ -15567,6 +15631,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("agent_turn should complete");
@@ -15619,6 +15684,7 @@ Let me check the result."#;
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
+            None, // turn_id: self-minted
         )
         .await
         .expect("turn should succeed");
@@ -15648,6 +15714,120 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// When the caller pre-mints a turn id (`process_message` does, so its
+    /// pre-turn RAG retrieval correlates with the turn), `agent_turn` must
+    /// bracket the turn with that id instead of minting its own.
+    #[tokio::test]
+    async fn agent_turn_uses_the_pre_minted_turn_id_on_its_bracket() {
+        // Harness mirrors agent_turn_brackets_turn_with_agent_start_and_agent_end.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = agent_turn(
+            None, // config
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            capturing.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false, // parallel_tools
+            0,     // max_tool_result_chars: disabled for test
+            0,     // context_token_budget: disabled for test
+            None,  // channel
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+            Some("pre-minted-turn"),
+        )
+        .await
+        .expect("turn should succeed");
+        assert_eq!(result, "done");
+
+        let events = capturing.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .expect("agent_turn must emit AgentStart")
+        {
+            ObserverEvent::AgentStart { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("pre-minted-turn"));
+            }
+            _ => unreachable!(),
+        }
+
+        // The bracket and the inner engine events must also agree on the
+        // full (channel, agent_alias, turn_id) triple with the pre-minted id.
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `build_hardware_context` must forward the caller's TurnMeta onto the
+    /// RagRetrieve event it emits. Prior review flagged that RagRetrieve
+    /// correlation had no executing assertion anywhere.
+    #[test]
+    fn build_hardware_context_forwards_turn_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("datasheets");
+        std::fs::create_dir_all(&base).unwrap();
+        let content = r#"# Test Board
+## Pin Aliases
+red_led: 13
+## GPIO
+Pin 13: LED
+"#;
+        std::fs::write(base.join("test-board.md"), content).unwrap();
+        let rag = crate::rag::HardwareRag::load(tmp.path(), "datasheets").unwrap();
+        let boards = vec!["test-board".to_string()];
+        let observer = CapturingObserver::default();
+
+        let _ = build_hardware_context(
+            &rag,
+            &observer,
+            "led",
+            &boards,
+            5,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("coder"),
+                turn_id: "turn-7",
+                channel_name: "daemon",
+            },
+        );
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::RagRetrieve { .. }))
+            .expect("build_hardware_context must emit RagRetrieve")
+        {
+            ObserverEvent::RagRetrieve {
+                turn_id,
+                channel,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-7"));
+                assert_eq!(channel.as_deref(), Some("daemon"));
+                assert_eq!(agent_alias.as_deref(), Some("coder"));
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// `read_capped_line` returns a full line and [`CappedLine::Line`]

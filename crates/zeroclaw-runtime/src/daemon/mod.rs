@@ -499,14 +499,7 @@ pub async fn run(
         {
             None
         } else {
-            match zeroclaw_memory::create_memory_with_storage_and_routes(
-                &config.memory,
-                &config.embedding_routes,
-                config.resolve_active_storage(),
-                &config.data_dir,
-                None,
-                Some(&config.providers.models),
-            ) {
+            match zeroclaw_memory::create_memory_from_config(&config, None) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {
                     ::zeroclaw_log::record!(
@@ -1579,15 +1572,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         };
 
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
-            zeroclaw_memory::create_memory_with_storage_and_routes(
-                &config.memory,
-                &config.embedding_routes,
-                config.resolve_active_storage(),
-                &config.data_dir,
+            zeroclaw_memory::create_memory_from_config(
+                &config,
                 config
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
-                Some(&config.providers.models),
             )
             .ok();
 
@@ -2098,6 +2087,7 @@ fn has_supervised_channels(config: &Config) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zeroclaw_config::schema::MattermostListenMode;
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -2498,6 +2488,7 @@ mod tests {
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
                 proxy_url: None,
+                listen_mode: MattermostListenMode::default(),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,

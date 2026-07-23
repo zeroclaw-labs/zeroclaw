@@ -4,21 +4,8 @@ ZeroClaw has two independent translation layers — app strings (Mozilla Fluent 
 docs (gettext `.po`). Both are filled locally via a configured AI provider before opening
 a PR; translation is never a CI operation.
 
-Full contributor workflow: [`docs/book/src/maintainers/docs-and-translations.md`](docs/book/src/maintainers/docs-and-translations.md)
-
-Quick reference:
-
-```
-# Fill docs translations (extract → merge → AI-fill)
-cargo mdbook sync --provider <name>
-
-# Fill app strings
-cargo fluent fill --provider <name>
-
-# Check coverage
-cargo mdbook stats
-cargo fluent stats
-```
-
-Ollama is the canonical local provider. See the full docs page for provider configuration,
-batch size tuning, failure log inspection, and the self-healing startup repair pass.
+Use [Docs & Translations](docs/book/src/maintainers/docs-and-translations.md) for
+the contributor workflow, provider configuration, coverage checks, batch tuning,
+and failure handling. During a release, follow the
+[Release Runbook](docs/book/src/maintainers/release-runbook.md#refresh-and-pin-translations)
+for the ordered refresh, validation, publication, and pinning steps.

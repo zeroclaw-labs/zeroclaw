@@ -797,6 +797,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         PersistedRun::new(r, last_progress.to_string(), SopTriggerSource::Manual)
     }

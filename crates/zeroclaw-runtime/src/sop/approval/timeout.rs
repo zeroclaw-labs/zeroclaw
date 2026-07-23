@@ -97,19 +97,21 @@ fn log_audit_skip(run_id: &str, action: &str, e: &impl std::fmt::Display) {
     );
 }
 
-/// EPIC G (Phase 10): deliver a timeout escalation notice to the second route named
-/// by the waiting step's approval policy, if any. Best-effort - a missing policy,
-/// missing route, or delivery error never affects the (still-open) gate.
+/// EPIC G (Phase 10): deliver a timeout escalation notice to the policy's explicit
+/// escalation route, or re-surface it to the request route when no distinct route
+/// is configured. Best-effort - a missing policy, missing route, or delivery error
+/// never affects the (still-open) gate.
 fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
-    let (sop_name, step) = match engine.get_run(run_id) {
-        Some(r) => (r.sop_name.clone(), r.current_step),
-        None => return,
+    let Some(run) = engine.get_run(run_id) else {
+        return;
     };
+    let (sop_name, step, revision) = (run.sop_name.clone(), run.current_step, run.revision);
+    let context = crate::sop::engine::step_input_value(run, step);
     let Some(policy_name) = engine.current_step_policy_name(run_id) else {
         return;
     };
     let broker = engine.approval_broker();
-    if let Some(route) = broker.escalation_route(engine.approval_config(), &policy_name) {
+    if let Some(route) = broker.escalation_delivery_route(engine.approval_config(), &policy_name) {
         let span = ::zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
             "zeroclaw_scope",
@@ -117,7 +119,23 @@ fn deliver_escalation_route(engine: &SopEngine, run_id: &str) {
             sop_name = %sop_name,
         );
         let _guard = span.enter();
-        broker.deliver_escalation(&route, run_id, &sop_name, step);
+        broker.deliver_escalation(
+            &route,
+            &super::GateNotice {
+                run_id,
+                sop_name: &sop_name,
+                step,
+                context: &context,
+                gate_prompt: None,
+                // Carry the live revision so an answer to the escalation prompt
+                // references the CURRENT presentation (a stale-rev reference is
+                // refused as superseded). Edit/Revise stay off the escalation
+                // notice — it is a "this gate is stuck" surface, not a review.
+                revision,
+                edit_field: None,
+                can_revise: false,
+            },
+        );
     }
 }
 
@@ -126,6 +144,9 @@ fn system_entry(engine: &SopEngine, run_id: &str, kind: GateEventKind) -> GateLe
     GateLedgerEntry {
         run_id: run_id.to_string(),
         step: engine.run_current_step(run_id),
+        gate_revision: engine.get_run(run_id).map(|run| run.revision),
+        checkpoint_revision: None,
+        decision_identity: None,
         kind,
         decision: None,
         principal: ApprovalPrincipal::system(),
