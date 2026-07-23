@@ -21,7 +21,8 @@ pub mod resolve;
 pub mod timeout;
 
 pub use broker::{
-    ApprovalBroker, ApprovalNoticeKind, ApprovalRouteAdapter, BrokerOutcome, NoopRouteAdapter,
+    ApprovalBroker, ApprovalNoticeKind, ApprovalRouteAdapter, BrokerOutcome, GateNotice,
+    NoopRouteAdapter,
 };
 pub use channel_route::{ApprovalRouteIssue, ChannelRouteAdapter, unresolvable_approval_routes};
 pub use decision::{ApprovalDecision, ResolveOutcome};

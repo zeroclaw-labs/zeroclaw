@@ -113,13 +113,21 @@ fn outcome_response(outcome: &ResolveOutcome) -> (StatusCode, &'static str) {
     match outcome {
         ResolveOutcome::Resumed(_) => (StatusCode::OK, "resumed"),
         ResolveOutcome::Denied => (StatusCode::OK, "denied"),
+        ResolveOutcome::Revised => (StatusCode::OK, "revised"),
         ResolveOutcome::AlreadyResolved => (StatusCode::OK, "already_resolved"),
         ResolveOutcome::NotWaiting => (StatusCode::NOT_FOUND, "not_waiting"),
         ResolveOutcome::RejectedSelfApproval => (StatusCode::FORBIDDEN, "rejected_self_approval"),
+        // Approved, but re-admitting would exceed the concurrency caps: temporary
+        // backpressure, retry once a slot frees (the gate stays waiting).
+        ResolveOutcome::DeferredAtCapacity => {
+            (StatusCode::SERVICE_UNAVAILABLE, "deferred_at_capacity")
+        }
     }
 }
 
-/// GET /admin/sop/pending - list the runs currently `WaitingApproval`.
+/// GET /admin/sop/pending - list the runs parked on a human: `WaitingApproval`
+/// gates AND deterministic `PausedCheckpoint` runs (both are resolved by the same
+/// approve/deny chokepoint), distinguished by the `kind` field.
 pub async fn handle_sop_pending(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -132,7 +140,12 @@ pub async fn handle_sop_pending(
     let pending: Vec<serde_json::Value> = guard
         .active_runs()
         .values()
-        .filter(|r| r.status == SopRunStatus::WaitingApproval)
+        .filter(|r| {
+            matches!(
+                r.status,
+                SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+            )
+        })
         .map(|r| {
             serde_json::json!({
                 "run_id": r.run_id,
@@ -140,6 +153,11 @@ pub async fn handle_sop_pending(
                 "step": r.current_step,
                 "total_steps": r.total_steps,
                 "waiting_since": r.waiting_since,
+                "kind": if r.status == SopRunStatus::PausedCheckpoint {
+                    "checkpoint"
+                } else {
+                    "approval"
+                },
             })
         })
         .collect();
@@ -198,22 +216,13 @@ fn resolve(
                 )
             })?
     };
-    // A resumed action still needs an executor on this headless surface: an
-    // approval-gate resume yields an ExecuteStep no agent turn will drive.
-    // (Deterministic checkpoints drive their capability tail inside
-    // resolve_via_broker already; the driver no-ops on their terminal actions.)
-    if let zeroclaw_runtime::sop::approval::BrokerOutcome::Resolved(ResolveOutcome::Resumed(
-        action,
-    )) = &outcome
-    {
-        let config = state.config.read().clone();
-        zeroclaw_runtime::sop::spawn_headless_run_driver(
-            config,
-            std::sync::Arc::clone(engine),
-            state.sop_audit.clone(),
-            action.as_ref().clone(),
-        );
-    }
+    let config = state.config.read();
+    zeroclaw_runtime::sop::drive_resumed_broker_action(
+        &config,
+        std::sync::Arc::clone(engine),
+        state.sop_audit.clone(),
+        &outcome,
+    );
     let (code, label) = broker_outcome_response(&outcome);
     Ok((
         code,
@@ -243,6 +252,10 @@ fn broker_outcome_response(outcome: &BrokerOutcome) -> (StatusCode, String) {
         BrokerOutcome::PolicyMissing { name } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("policy_missing ('{name}')"),
+        ),
+        BrokerOutcome::PolicyUnavailable { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("policy_unavailable ({reason})"),
         ),
     }
 }
