@@ -51,6 +51,7 @@
     "vite": "^8.0.16"
   },
   "overrides": {
-    "js-yaml": "^4.2.0"
+    "@redocly/openapi-core": "1.34.7",
+    "js-yaml": "^4.3.0"
   }
 }
