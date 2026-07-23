@@ -18011,6 +18011,40 @@ struct ExtraNestedModelProviderTable {
     nested: String,
 }
 
+/// Classification of a `peer_groups.<name>.channel` reference against the
+/// configured `[channels.*]` blocks. This is the single source of truth for
+/// resolving a raw `channel` string — `Config::validate()` consumes it for
+/// its hard-error checks, and `Config::collect_peer_groups_warnings`
+/// consumes it for the non-fatal dangling-alias warning. Do not duplicate
+/// this resolution logic elsewhere; classify the ref once and match on the
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerGroupChannelRef {
+    /// Empty or whitespace-only `channel` value.
+    Empty,
+    /// A bare channel type with no dotted alias (e.g. `"discord"`), which
+    /// authorizes every alias of that type.
+    BareType {
+        channel_type: String,
+        /// Whether `[channels.<channel_type>.*]` has at least one entry.
+        configured: bool,
+    },
+    /// A dotted `type.alias` reference (e.g. `"discord.work"`).
+    Dotted {
+        channel_type: String,
+        alias: String,
+        /// Whether `[channels.<channel_type>.*]` is configured at all.
+        type_configured: bool,
+        /// Whether `alias` is among the configured aliases for
+        /// `channel_type`. Always `false` when `type_configured` is `false`.
+        exists: bool,
+        /// The configured aliases for `channel_type` (empty when the type
+        /// itself is unconfigured), sorted lexicographically so consumers
+        /// that pick between candidates are deterministic.
+        known_aliases: Vec<String>,
+    },
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -18691,6 +18725,7 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_peer_groups_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
@@ -19084,6 +19119,112 @@ impl Config {
             .chain(rows("signal", &c.signal))
             .chain(rows("whatsapp", &c.whatsapp))
             .collect()
+    }
+
+    /// Classify a raw `peer_groups.<name>.channel` value against the
+    /// configured `[channels.*]` blocks. See [`PeerGroupChannelRef`] for the
+    /// meaning of each variant; this is the only place that resolves the
+    /// channel-type/alias lookup for peer groups, via the same canonical
+    /// `get_map_keys` enumeration every other typed-ref check uses (`None` =
+    /// the channel type has no configured block at all; `Some(keys)` = the
+    /// list of configured aliases for that type).
+    fn classify_peer_group_channel_ref(&self, raw: &str) -> PeerGroupChannelRef {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return PeerGroupChannelRef::Empty;
+        }
+        // `get_map_keys` stores section names using the raw field ident
+        // (snake); look up the channel type verbatim.
+        let (channel_type, alias) = match trimmed.split_once('.') {
+            Some((ty, al)) => (ty, Some(al)),
+            None => (trimmed, None),
+        };
+        let channel_aliases = self.get_map_keys(&format!("channels.{channel_type}"));
+        match alias {
+            None => PeerGroupChannelRef::BareType {
+                channel_type: channel_type.to_string(),
+                configured: channel_aliases.is_some(),
+            },
+            Some(alias) => {
+                let type_configured = channel_aliases.is_some();
+                let exists = channel_aliases
+                    .as_ref()
+                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
+                // `get_map_keys` iterates a HashMap-backed section, so its
+                // order is randomized per process; sort here (the canonical
+                // resolution point) so downstream consumers — notably the
+                // did-you-mean tie-break in `collect_peer_groups_warnings`
+                // — are deterministic across runs.
+                let mut known_aliases = channel_aliases.unwrap_or_default();
+                known_aliases.sort();
+                PeerGroupChannelRef::Dotted {
+                    channel_type: channel_type.to_string(),
+                    alias: alias.to_string(),
+                    type_configured,
+                    exists,
+                    known_aliases,
+                }
+            }
+        }
+    }
+
+    /// Surface a `peer_groups.<name>.channel` dotted reference that does not
+    /// resolve to any configured `[channels.<type>.<alias>]` block —
+    /// typically a typo (`telegram.alert` vs. configured `telegram.alerts`)
+    /// that silently authorizes nobody instead of failing loudly. This is a
+    /// non-fatal companion to the `DanglingReference` hard error
+    /// `Config::validate()` already raises for the exact same condition (see
+    /// `classify_peer_group_channel_ref`): it exists so config-load tracing,
+    /// `channel doctor`, and the gateway config surface can flag the
+    /// misconfiguration even when a caller chooses to log-and-continue past
+    /// a failed `validate()` instead of refusing to boot.
+    ///
+    /// Bare type-wide refs (`channel = "discord"`) are an explicit non-goal:
+    /// they intentionally authorize every alias of that type, so there is no
+    /// "did you mean" ambiguity, and an unconfigured bare type is already a
+    /// hard error at `validate()`.
+    fn collect_peer_groups_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut group_names: Vec<&String> = self.peer_groups.keys().collect();
+        group_names.sort();
+        for group_name in group_names {
+            let group_channel = self.peer_groups[group_name].channel.trim();
+            let PeerGroupChannelRef::Dotted {
+                channel_type,
+                alias,
+                type_configured,
+                exists,
+                known_aliases,
+            } = self.classify_peer_group_channel_ref(group_channel)
+            else {
+                continue;
+            };
+            if type_configured && exists {
+                continue;
+            }
+
+            let suggestion = if type_configured {
+                crate::validation_warnings::closest_match(&alias, &known_aliases)
+                    .map(|closest| format!("; did you mean \"{channel_type}.{closest}\"?"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let reason = if type_configured {
+                format!("[channels.{channel_type}.{alias}] is not configured")
+            } else {
+                format!("no [channels.{channel_type}.*] block is configured")
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "peer_group_channel_dangling",
+                format!(
+                    "peer_groups.{group_name}.channel = {group_channel:?} but {reason}{suggestion}"
+                ),
+                format!("peer_groups.{group_name}.channel"),
+            ));
+        }
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -20554,37 +20695,55 @@ impl Config {
         for group_name in peer_group_names {
             let group = &self.peer_groups[group_name];
             let group_channel = group.channel.trim();
-            if group_channel.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
-                );
-            }
-            // `get_map_keys` stores section names using the raw field ident
-            // (snake); look up the channel type verbatim.
+            // The channel ref is resolved once by the shared classifier; its
+            // bound fields feed the error messages below. The split_once
+            // locals exist only for the member-ref loop further down, which
+            // is out of scope for the classifier.
             let (group_channel_type, group_channel_alias) = match group_channel.split_once('.') {
                 Some((ty, al)) => (ty, Some(al)),
                 None => (group_channel, None),
             };
-            let channel_aliases = self.get_map_keys(&format!("channels.{group_channel_type}"));
-            if channel_aliases.is_none() {
-                validation_bail!(
-                    DanglingReference,
-                    format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{group_channel_type}.*] block is configured",
-                );
-            }
-            if let Some(alias) = group_channel_alias {
-                let exists = channel_aliases
-                    .as_ref()
-                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
-                if !exists {
+            match self.classify_peer_group_channel_ref(group_channel) {
+                PeerGroupChannelRef::Empty => {
                     validation_bail!(
-                        DanglingReference,
+                        RequiredFieldEmpty,
                         format!("peer_groups.{group_name}.channel"),
-                        "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{group_channel_type}.{alias}] is not configured",
+                        "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
                     );
+                }
+                PeerGroupChannelRef::BareType {
+                    channel_type,
+                    configured,
+                } => {
+                    if !configured {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
+                        );
+                    }
+                }
+                PeerGroupChannelRef::Dotted {
+                    channel_type,
+                    alias,
+                    type_configured,
+                    exists,
+                    ..
+                } => {
+                    if !type_configured {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
+                        );
+                    }
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("peer_groups.{group_name}.channel"),
+                            "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
+                        );
+                    }
                 }
             }
             for (i, member) in group.agents.iter().enumerate() {
@@ -34077,6 +34236,247 @@ allowed_users = []
         config
             .validate()
             .expect("two-member same-channel peer group must validate cleanly");
+    }
+
+    const PEER_GROUP_CHANNEL_DANGLING_WARNING: &str = "peer_group_channel_dangling";
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_dangling_alias_with_suggestion() {
+        let mut config = multi_agent_test_config();
+        // A second configured telegram alias close enough to the typo below
+        // to be a plausible "did you mean" suggestion.
+        config
+            .channels
+            .telegram
+            .insert("alerts".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.alert".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        let warning = &warnings[0];
+        assert_eq!(warning.path, "peer_groups.team_chat.channel");
+        assert!(
+            warning.message.contains("team_chat"),
+            "message should name the offending group: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("telegram.alert"),
+            "message should name the bad ref: {}",
+            warning.message
+        );
+        assert!(
+            warning
+                .message
+                .contains("did you mean \"telegram.alerts\"?"),
+            "message should suggest the near-match configured alias: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_dangling_alias_without_suggestion() {
+        let mut config = multi_agent_test_config();
+        // Only "draft" is configured; "zz" is not a plausible typo of it.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.zz".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "no near-match should mean no suggestion: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_peer_group_suggestion_is_deterministic_on_ties() {
+        let mut config = multi_agent_test_config();
+        // "alerta" and "alerts" are both distance 1 from the typo "alert";
+        // the classifier sorts known_aliases, so the lexicographically first
+        // candidate must win regardless of HashMap iteration order.
+        config
+            .channels
+            .telegram
+            .insert("alerts".to_string(), TelegramConfig::default());
+        config
+            .channels
+            .telegram
+            .insert("alerta".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.alert".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("did you mean \"telegram.alerta\"?"),
+            "equidistant candidates must resolve to the lexicographically first alias: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_peer_group_trailing_dot_ref_warns_without_suggestion() {
+        let mut config = multi_agent_test_config();
+        // A trailing dot leaves an empty alias; that is dangling (warn) but
+        // is not a typo of anything, so no "did you mean" — the distance
+        // floor would otherwise propose an unrelated short alias.
+        config
+            .channels
+            .telegram
+            .insert("ab".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "an empty alias must never produce a suggestion: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_channel_type_unconfigured() {
+        let mut config = multi_agent_test_config();
+        // "foobar" is not a channel type the schema knows at all, so
+        // `get_map_keys("channels.foobar")` is `None` and the classifier
+        // reports the type itself as unconfigured. (A recognized type with
+        // zero aliases — e.g. bare `discord` here — returns `Some(vec![])`
+        // and takes the alias-not-found branch instead; see the next test.)
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "foobar.ops".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].message.contains("foobar.ops"),
+            "message should name the bad ref: {}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("no [channels.foobar.*] block is configured"),
+            "message should use the type-unconfigured reason: {}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "an unconfigured type has no aliases to suggest: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_peer_group_known_type_with_no_aliases() {
+        let mut config = multi_agent_test_config();
+        // "discord" IS a recognized schema channel type, so even with zero
+        // configured aliases `get_map_keys("channels.discord")` returns
+        // `Some(vec![])` — the classifier reports the type as configured
+        // and the warning takes the alias-not-found reason.
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "discord.ops".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let warnings = warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("[channels.discord.ops] is not configured"),
+            "message should use the alias-not-found reason: {}",
+            warnings[0].message
+        );
+        assert!(
+            !warnings[0].message.contains("did you mean"),
+            "zero configured aliases means nothing to suggest: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_valid_peer_group_dotted_channel() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.draft".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        assert!(
+            warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
+            "a valid dotted alias must not warn"
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_for_bare_type_peer_group_channel() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram".into(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        assert!(
+            warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
+            "a bare type-wide ref must never warn, even though it authorizes every alias"
+        );
     }
 
     #[test]
