@@ -37,7 +37,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use dialoguer::{Password, Select};
+use dialoguer::Select;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
@@ -136,6 +136,32 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     #[cfg(not(feature = "agent-runtime"))]
     {
         fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
+/// Interactive secret prompt with pre-submit feedback.
+///
+/// The value stays hidden, but the prompt shows a bounded mask once the input
+/// buffer becomes non-empty.
+#[cfg(feature = "agent-runtime")]
+fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(ta(
+            "cli-secret-needs-tty",
+            &[],
+            "Secret input requires a terminal on stdin and stderr."
+        ));
+    }
+
+    let value = cli_input::SecretInput::new()
+        .with_prompt(prompt_text)
+        .interact()?;
+    if allow_empty || !value.trim().is_empty() {
+        Ok(value)
+    } else {
+        bail!(ta("cli-secret-empty", &[], "Value cannot be empty."))
     }
 }
 
@@ -1235,7 +1261,7 @@ async fn run_quickstart_cli(
     api_key: Option<String>,
     agent: Option<String>,
 ) -> anyhow::Result<()> {
-    use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
+    use dialoguer::{Confirm, Editor, FuzzySelect, Input};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
         RISK_PRESETS, SelectorChoice,
@@ -2521,29 +2547,27 @@ fn prompt_for_field(
     desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
     seed: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    use dialoguer::{FuzzySelect, Input, Password};
+    use dialoguer::{FuzzySelect, Input};
     use zeroclaw_config::traits::PropKind;
     if !desc.help.is_empty() {
         println!("  {}", desc.help);
     }
     let prompt = desc.label.clone();
     if desc.is_secret {
-        // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
-        // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
-        // Map that to `Ok(None)` so the caller treats it as "user backed
-        // out" instead of bubbling a confusing IO-error message.
-        match Password::new()
-            .with_prompt(prompt.clone())
-            .allow_empty_password(true)
-            .interact()
-        {
-            Ok(pw) => return Ok(Some(pw)),
+        match secret_prompt(&prompt, true) {
+            Ok(pw) => {
+                if !pw.is_empty() {
+                    eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                }
+                return Ok(Some(pw));
+            }
             Err(e) => {
-                let io: std::io::Error = e.into();
-                if io.kind() == std::io::ErrorKind::Interrupted {
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+                {
                     return Ok(None);
                 }
-                return Err(io.into());
+                return Err(e);
             }
         }
     }
@@ -2574,7 +2598,7 @@ fn prompt_for_field(
         // field's true type (e.g. a bool) and rejects.
         input = input.default(d.to_string());
     }
-    // Same Ctrl+C-as-cancel mapping as the Password branch above.
+    // Same Ctrl+C-as-cancel mapping as the secret prompt branch above.
     match input.interact_text() {
         Ok(v) => Ok(Some(v)),
         Err(e) => {
@@ -5380,10 +5404,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = dialoguer::Password::new()
-                        .with_prompt(format!("Enter value for {path}"))
-                        .interact()?;
-                    let secret_value = secret_value.trim().to_string();
+                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
+                        .trim()
+                        .to_string();
+                    if !secret_value.is_empty() {
+                        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+                    }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -6300,10 +6326,10 @@ fn handle_estop_command(
                     );
                 }
                 if otp_code.is_none() {
-                    let entered = Password::new()
-                        .with_prompt("Enter OTP code")
-                        .allow_empty_password(false)
-                        .interact()?;
+                    let entered = secret_prompt("Enter OTP code", false)?;
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -7016,10 +7042,10 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
-    let input = Password::new()
-        .with_prompt(prompt)
-        .allow_empty_password(false)
-        .interact()?;
+    let input = secret_prompt(prompt, false)?;
+    if !input.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
     Ok(input.trim().to_string())
 }
 
