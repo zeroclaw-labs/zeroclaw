@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::{ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -29,6 +29,24 @@ impl ResolvedModelAccess<'_> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        // This one-shot seam does NOT run `prepare_messages_for_provider` (the
+        // main iteration path does that upstream), so a tool-result
+        // `[AUDIO:/path]` in the history — e.g. the max-iteration graceful
+        // summary sends the accumulated history verbatim — would otherwise
+        // reach the provider as a raw filesystem path and be hallucinated
+        // over. Strip loadable audio markers here so every direct
+        // `run_model_query` caller is covered. Borrows untouched when clean.
+        let ChatRequest {
+            messages,
+            tools,
+            thinking,
+        } = request;
+        let sanitized = multimodal::sanitize_audio_markers(messages);
+        let request = ChatRequest {
+            messages: &sanitized,
+            tools,
+            thinking,
+        };
         let resp = ProviderDispatch::from_ref(self.model_provider)
             .chat(request, self.model, self.temperature)
             .await?;

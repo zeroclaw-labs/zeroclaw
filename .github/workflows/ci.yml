@@ -78,6 +78,8 @@ jobs:
             sed 's/^/  /' "$gitlinks"
             exit 1
           fi
+      - name: Test translation release submodule handling
+        run: scripts/release/refresh-translations.test.sh
 
   # ── Post-format required quality gate ─────────────────────────────────────
 

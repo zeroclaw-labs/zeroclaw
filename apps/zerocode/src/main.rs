@@ -168,6 +168,12 @@ fn format_startup_error(err: &anyhow::Error) -> String {
             ],
         );
     }
+    if let Some(timeout) = err.downcast_ref::<client::DaemonInitializeTimeout>() {
+        return i18n::t_args(
+            "zc-error-daemon-initialize-timeout",
+            &[("seconds", &timeout.timeout_seconds().to_string())],
+        );
+    }
     format!("{err:#}")
 }
 
@@ -318,7 +324,7 @@ async fn run() -> anyhow::Result<()> {
         ConnectTarget::LocalSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
                 Ok(c) => c,
-                Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
+                Err(e) if is_terminal_connection_error(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
                     spawn_ephemeral_daemon(&config_dir, socket)?;
@@ -466,7 +472,7 @@ async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::
         }
         match client::RpcClient::connect(socket, None, None).await {
             Ok(c) => return Ok(c),
-            Err(e) if is_daemon_version_mismatch(&e) => return Err(e),
+            Err(e) if is_terminal_connection_error(&e) => return Err(e),
             Err(_) => tokio::time::sleep(DAEMON_CONNECT_INTERVAL).await,
         }
     }
@@ -475,6 +481,13 @@ async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::
 fn is_daemon_version_mismatch(err: &anyhow::Error) -> bool {
     err.downcast_ref::<client::DaemonVersionMismatch>()
         .is_some()
+}
+
+fn is_terminal_connection_error(err: &anyhow::Error) -> bool {
+    is_daemon_version_mismatch(err)
+        || err
+            .downcast_ref::<client::DaemonInitializeTimeout>()
+            .is_some()
 }
 
 #[cfg(test)]
@@ -557,6 +570,15 @@ mod connection_tests {
             resolve_wss_target(None, false, &cfg),
             Some(("wss://h:1".to_string(), false))
         );
+    }
+
+    #[test]
+    fn initialize_timeout_is_a_terminal_connection_error() {
+        let err = anyhow::Error::new(client::DaemonInitializeTimeout::new(Duration::from_secs(
+            10,
+        )));
+
+        assert!(is_terminal_connection_error(&err));
     }
 }
 

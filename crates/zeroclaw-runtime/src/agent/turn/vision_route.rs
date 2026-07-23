@@ -227,6 +227,34 @@ mod tests {
         );
     }
 
+    /// A tool-result `[AUDIO:...]` marker on the non-degrade path must be
+    /// stripped before dispatch so a raw filesystem path never reaches the
+    /// provider as literal text (the silent-hallucination failure mode). This
+    /// exercises the real turn-loop prep entrypoint, not just the provider-layer
+    /// helper, so it covers the degrade/non-degrade branch selection.
+    #[tokio::test]
+    async fn prepare_iteration_strips_tool_result_audio_marker() {
+        let history = vec![
+            ChatMessage::user("what do you hear in the clip?"),
+            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
+            .await
+            .unwrap();
+        let joined = prepared
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("/tmp/clip.wav"),
+            "audio path leaked to the provider payload: {joined}"
+        );
+        assert!(joined.contains("[media attachment]"));
+    }
+
     #[tokio::test]
     async fn prepare_fails_closed_when_no_user_turn_survives() {
         let cfg = MultimodalConfig::default();

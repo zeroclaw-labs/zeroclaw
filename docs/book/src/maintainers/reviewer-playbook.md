@@ -88,6 +88,21 @@ hazards, or tradeoffs that the type system and tests cannot express. They
 should explain intent, not restate the nearby control flow or become a second
 contract.
 
+#### Typed dispatch for shared key spaces
+
+For shared key spaces such as wire method names, compiled channel type keys,
+provider slots, or frontend/backend registry keys, apply this rule by resolving
+raw strings at the API or config boundary. Downstream code should dispatch
+through an enum, macro-generated table, trait/factory registry, or another
+canonical owner. Do not add parallel string `match` arms, hand-typed dispatch
+tables, or duplicate lists that must be kept in sync by reviewer memory.
+
+This does not ban string constants at API boundaries. It prevents a second
+dispatch surface where adding a new variant can compile while silently skipping
+one consumer. Good examples are the RPC `Method` registry for wire method names
+and `CHANNEL_COMPILE_SPECS` for channel compile keys, where one canonical owner
+drives downstream coverage.
+
 ### Deep-review checklist (high-risk only)
 
 For `risk:high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.

@@ -20,6 +20,7 @@ use std::sync::{OnceLock, RwLock};
 use tokio::fs::File;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_macros::Configurable;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
@@ -3766,7 +3767,7 @@ impl AliasedAgentConfig {
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
         self.enabled
-            && !self.model_provider.is_empty()
+            && !self.model_provider.trim().is_empty()
             && !self.risk_profile.trim().is_empty()
             && !self.runtime_profile.trim().is_empty()
     }
@@ -5530,7 +5531,7 @@ impl TranscriptionEndpoint for LocalWhisperTranscriptionEndpoint {
 /// Local / self-hosted Whisper-compatible transcription endpoint. Skips the
 /// shared `TranscriptionProviderConfig` base because it uses a bearer-token
 /// scheme and a per-instance URL rather than a vendor API key.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.transcription.local_whisper"]
 pub struct LocalWhisperTranscriptionProviderConfig {
@@ -5553,6 +5554,34 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// Request timeout in seconds.
     #[serde(default = "default_local_whisper_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+// `#[derive(Default)]` would leave `max_audio_bytes = 0` and `timeout_secs = 0`
+// (Rust's `usize`/`u64` defaults), even though those fields have serde defaults
+// pointing at `default_local_whisper_max_audio_bytes` /
+// `default_local_whisper_timeout_secs`. `#[serde(default = ...)]` only fires for
+// *deserialization* — Rust's `Default::default()` bypasses it.
+//
+// Without this manual impl, the `Configurable` macro-generated
+// `create_map_key(...)` path inserts `LocalWhisperTranscriptionProviderConfig::default()`
+// for any newly scaffolded `[providers.transcription.local_whisper.<alias>]`
+// entry. The `Configurable` macro exposes `HashMap<String, T>` sections through
+// `map_key_sections()` / `create_map_key()`, and the generated create path
+// inserts `<T as Default>::default()` for new map entries — leaving
+// `max_audio_bytes = 0`, `timeout_secs = 0`. `LocalWhisperProvider::from_typed_config`
+// bridges those fields into `LocalWhisperProvider::from_config`, which still
+// rejects zero for both fields. Defaults here mirror `LocalWhisperConfig` so
+// scaffolded entries load without operator intervention.
+impl Default for LocalWhisperTranscriptionProviderConfig {
+    fn default() -> Self {
+        Self {
+            uri: String::new(),
+            bearer_token: None,
+            language: None,
+            max_audio_bytes: default_local_whisper_max_audio_bytes(),
+            timeout_secs: default_local_whisper_timeout_secs(),
+        }
+    }
 }
 
 /// Determines when a `ToolFilterGroup` is active.
@@ -5676,7 +5705,7 @@ pub struct GoogleSttConfig {
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
 ///
 /// Configures a self-hosted STT endpoint. Can be on localhost, a private network host, or any reachable URL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.local_whisper"]
 pub struct LocalWhisperConfig {
@@ -5707,6 +5736,28 @@ fn default_local_whisper_max_audio_bytes() -> usize {
 
 fn default_local_whisper_timeout_secs() -> u64 {
     300
+}
+
+// `#[derive(Default)]` would leave `max_audio_bytes = 0` and `timeout_secs = 0`
+// (Rust's `usize`/`u64` defaults), even though those fields have serde defaults
+// pointing at the helpers above. `#[serde(default = ...)]` only fires for
+// *deserialization* — Rust's `Default::default()` bypasses it. Without this
+// manual impl, `Config::init_defaults` materializes
+// `transcription.local_whisper = Some(LocalWhisperConfig { max_audio_bytes: 0,
+// timeout_secs: 0, .. })`; `LocalWhisperProvider::from_config` then rejects it
+// at load (`max_audio_bytes must be greater than zero`), the failure poisons
+// the parent `[transcription]` block's deserialization, and the daemon logs
+// `dropped_config: transcription` while running with `transcription.enabled =
+// false` regardless of operator intent.
+impl Default for LocalWhisperConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            bearer_token: None,
+            max_audio_bytes: default_local_whisper_max_audio_bytes(),
+            timeout_secs: default_local_whisper_timeout_secs(),
+        }
+    }
 }
 
 /// HMAC tool execution receipt configuration, per agent
@@ -10336,8 +10387,24 @@ pub struct MarkdownStorageConfig {
 #[prefix = "storage_lucid"]
 #[serde(default)]
 pub struct LucidStorageConfig {
-    /// Optional path to the lucid-memory binary.
+    /// Optional path to the lucid-memory binary. When unset, the bare `lucid`
+    /// executable is resolved on `PATH`. A blank or whitespace-only value is
+    /// rejected at config validation and remains invalid if startup continues,
+    /// so an invalid explicit selector never falls through to `PATH`.
     pub binary_path: Option<String>,
+    /// Recall (context) timeout override, in milliseconds. Lucid CLI cold
+    /// starts (loading the local embedding model) can exceed 1.5s on ARM
+    /// hosts; raise this if recalls still time out on your hardware.
+    /// Unset falls back to the built-in default (3000ms). `0` is rejected
+    /// at config validation; because startup warns and continues after
+    /// validation errors, a `0` that reaches the runtime is treated as
+    /// unset and falls back to the default.
+    pub recall_timeout_ms: Option<u64>,
+    /// Store timeout override, in milliseconds. Same cold-start
+    /// consideration as `recall_timeout_ms`. Unset falls back to the
+    /// built-in default (3000ms); `0` is rejected at validation and, if
+    /// startup continues after the warning, is likewise treated as unset.
+    pub store_timeout_ms: Option<u64>,
 }
 
 fn default_storage_schema() -> String {
@@ -10484,12 +10551,31 @@ pub struct MemoryConfig {
     /// call today, so those names have no effect (kept for forward compat).
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
-    /// Enable LLM reranking when candidate count exceeds threshold.
+    /// Candidate pool multiplier over the final recall limit before blend/rerank trimming.
+    /// Values must be in 1..=20; runtime also enforces a bounded candidate pool.
+    #[serde(default = "default_candidate_multiplier")]
+    pub candidate_multiplier: usize,
+    /// Enable the recall rerank stage: blend retrieval score with importance
+    /// and recency, collapse near-duplicate entries, then trim back to the
+    /// recall limit. The advanced strategy below runs when the candidate
+    /// count reaches `rerank_threshold`.
     #[serde(default)]
     pub rerank_enabled: bool,
-    /// Minimum candidate count to trigger reranking.
+    /// Minimum candidate count to trigger the advanced rerank strategy.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
+    /// Advanced rerank strategy. Valid: "none", "mmr".
+    #[serde(default = "default_rerank_strategy")]
+    pub rerank_strategy: String,
+    /// MMR relevance-vs-diversity weight, where 1.0 means relevance-only.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f64,
+    /// Importance weight used by the recall blend.
+    #[serde(default = "default_importance_weight")]
+    pub importance_weight: f64,
+    /// Recency weight used by the recall blend.
+    #[serde(default = "default_recency_weight")]
+    pub recency_weight: f64,
     /// Reserved (0.0-1.0): the FTS score above which recall would skip the
     /// vector stage. Inert until the backend exposes distinct FTS and vector
     /// operations; recall is a single hybrid call today, so this has no effect.
@@ -10652,8 +10738,49 @@ fn default_retrieval_stages() -> Vec<String> {
 fn default_rerank_threshold() -> usize {
     5
 }
+
+/// Largest allowed multiplier for the bounded query-time rerank candidate pool.
+pub const MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER: usize = 20;
+
+fn default_candidate_multiplier() -> usize {
+    4
+}
+fn default_rerank_strategy() -> String {
+    "none".into()
+}
+fn default_mmr_lambda() -> f64 {
+    0.7
+}
+fn default_importance_weight() -> f64 {
+    0.2
+}
+fn default_recency_weight() -> f64 {
+    0.1
+}
 fn default_fts_early_return_score() -> f64 {
     0.85
+}
+
+fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
+    if !(1..=MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER).contains(&memory.candidate_multiplier) {
+        anyhow::bail!(
+            "memory.candidate_multiplier must be in 1..={MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER} (got {})",
+            memory.candidate_multiplier
+        );
+    }
+
+    for (path, value) in [
+        ("memory.min_relevance_score", memory.min_relevance_score),
+        ("memory.mmr_lambda", memory.mmr_lambda),
+        ("memory.importance_weight", memory.importance_weight),
+        ("memory.recency_weight", memory.recency_weight),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            anyhow::bail!("{path} must be a finite number in 0.0..=1.0 (got {value})");
+        }
+    }
+
+    Ok(())
 }
 fn default_namespace() -> String {
     "default".into()
@@ -10850,8 +10977,13 @@ impl Default for MemoryConfig {
             snapshot_on_hygiene: false,
             auto_hydrate: true,
             retrieval_stages: default_retrieval_stages(),
+            candidate_multiplier: default_candidate_multiplier(),
             rerank_enabled: false,
             rerank_threshold: default_rerank_threshold(),
+            rerank_strategy: default_rerank_strategy(),
+            mmr_lambda: default_mmr_lambda(),
+            importance_weight: default_importance_weight(),
+            recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
@@ -13824,6 +13956,21 @@ fn resolve_slack_token(configured: Option<&str>, kind: &str) -> Option<String> {
     None
 }
 
+/// How the Mattermost channel receives inbound messages.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum MattermostListenMode {
+    /// Poll REST API every 3 seconds. The default — all existing configs
+    /// continue to work without changes.
+    #[default]
+    Polling,
+    /// Connect to `/api/v4/websocket` for near-real-time event delivery.
+    Websocket,
+}
+
 /// Mattermost bot channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13905,6 +14052,13 @@ pub struct MattermostConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
+
+    /// Listen mode: `"polling"` (REST API every 3s, default) or `"websocket"`
+    /// (persistent WebSocket connection to `/api/v4/websocket` for near-real-time
+    /// event delivery). WebSocket mode reduces server load and delivers events
+    /// faster but requires a WebSocket-capable Mattermost server (v4.0+).
+    #[serde(default)]
+    pub listen_mode: MattermostListenMode,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -17402,6 +17556,34 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
     (data_config_dir.clone(), data_config_dir.join("data"))
 }
 
+pub async fn classify_runtime_config_kind(config_path: &Path) -> RuntimeConfigKind {
+    if path_is_under(config_path, &std::env::temp_dir()) {
+        return RuntimeConfigKind::Temporary;
+    }
+
+    let Ok((default_config_dir, default_data_dir)) = default_config_and_data_dirs() else {
+        return RuntimeConfigKind::Custom;
+    };
+    let Ok((resolved_config_dir, _data_dir, source)) =
+        resolve_runtime_config_dirs(&default_config_dir, &default_data_dir).await
+    else {
+        return RuntimeConfigKind::Custom;
+    };
+
+    if !paths_equal_lexically(config_path, &resolved_config_dir.join("config.toml")) {
+        return RuntimeConfigKind::Custom;
+    }
+
+    match source {
+        ConfigResolutionSource::DefaultConfigDir | ConfigResolutionSource::HomebrewConfigDir => {
+            RuntimeConfigKind::Default
+        }
+        ConfigResolutionSource::EnvConfigDir
+        | ConfigResolutionSource::EnvDataDir
+        | ConfigResolutionSource::EnvWorkspaceLegacy => RuntimeConfigKind::Custom,
+    }
+}
+
 /// Resolve the current runtime config/data directories.
 ///
 /// This mirrors the same precedence used by `Config::load_or_init()`:
@@ -17465,6 +17647,17 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    path.components()
+        .zip(root.components())
+        .all(|(a, b)| a == b)
+        && path.components().count() >= root.components().count()
+}
+
+fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
+    a.components().eq(b.components())
 }
 
 /// Returns the legacy plugin directories that still hold installed plugins not
@@ -18898,6 +19091,8 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        validate_memory_rerank_config(&self.memory)?;
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -18922,6 +19117,37 @@ impl Config {
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
+                );
+            }
+        }
+
+        let mut lucid_aliases: Vec<&String> = self.storage.lucid.keys().collect();
+        lucid_aliases.sort();
+        for alias in lucid_aliases {
+            let lucid = &self.storage.lucid[alias];
+            if lucid
+                .binary_path
+                .as_ref()
+                .is_some_and(|path| path.trim().is_empty())
+            {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("storage.lucid.{alias}.binary_path"),
+                    "storage.lucid.{alias}.binary_path must not be empty"
+                );
+            }
+            if matches!(lucid.recall_timeout_ms, Some(0)) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("storage.lucid.{alias}.recall_timeout_ms"),
+                    "storage.lucid.{alias}.recall_timeout_ms must be greater than 0"
+                );
+            }
+            if matches!(lucid.store_timeout_ms, Some(0)) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("storage.lucid.{alias}.store_timeout_ms"),
+                    "storage.lucid.{alias}.store_timeout_ms must be greater than 0"
                 );
             }
         }
@@ -21777,9 +22003,11 @@ pub enum ApprovalTimeoutAction {
 pub struct SopApprovalConfig {
     /// Named approver groups: `group name -> members`. A member is matched against
     /// the transport-derived (channel-authenticated) `ApprovalPrincipal` identity.
-    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:alice`,
+    /// A member may be source-qualified (`<source>:<identity>`, e.g. `http:ZeroClawOperator`,
     /// `ws:<subject>`, `agent:<alias>`) to grant rights on one transport only, or a
-    /// bare identity (`alice`) to grant from any source. A future auth system adds a
+    /// bare identity (`alice`) to grant from any non-channel source. Channel members
+    /// must include the channel namespace (`channel:<channel-key>:<sender>`) so sender
+    /// ids from different channel aliases cannot collide. A future auth system adds a
     /// second resolver alongside this one; it does not replace channel identities.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     #[nested]
@@ -21814,7 +22042,7 @@ pub struct ApprovalPolicyConfig {
     #[serde(default)]
     pub quorum: u32,
     /// Channel to deliver the INITIAL approval request to when a run parks at a
-    /// gate this policy governs, formatted `channel[:recipient]` (e.g.
+    /// gate this policy governs, formatted `channel:recipient` (e.g.
     /// `discord.ops:123456789012345678`). The `channel` names a configured channel
     /// (the `<channel>.<alias>` / bare-`<channel>` key from the channel map); the
     /// `recipient` is that channel's addressee (a Discord channel id, a chat id,
@@ -22002,6 +22230,74 @@ max_height = 8
         .expect("legacy filter_builtins key must not break deserialization");
         assert!(matches!(group.mode, super::ToolFilterGroupMode::Always));
         assert_eq!(group.tools, vec!["filesystem__*".to_string()]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_config_rerank_stage_defaults() {
+        // An empty [memory] block resolves the rerank-stage keys to their
+        // inert defaults (stage off, "none" strategy).
+        let cfg: super::MemoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.rerank_enabled);
+        assert_eq!(cfg.candidate_multiplier, 4);
+        assert_eq!(cfg.rerank_threshold, 5);
+        assert_eq!(cfg.rerank_strategy, "none");
+        assert!((cfg.mmr_lambda - 0.7).abs() < f64::EPSILON);
+        assert!((cfg.importance_weight - 0.2).abs() < f64::EPSILON);
+        assert!((cfg.recency_weight - 0.1).abs() < f64::EPSILON);
+
+        // The Default impl agrees with the serde defaults.
+        let def = super::MemoryConfig::default();
+        assert_eq!(def.candidate_multiplier, cfg.candidate_multiplier);
+        assert_eq!(def.rerank_strategy, cfg.rerank_strategy);
+        assert!((def.mmr_lambda - cfg.mmr_lambda).abs() < f64::EPSILON);
+        assert!((def.importance_weight - cfg.importance_weight).abs() < f64::EPSILON);
+        assert!((def.recency_weight - cfg.recency_weight).abs() < f64::EPSILON);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_rejects_invalid_memory_rerank_values() {
+        // A NaN in any of the blend/floor floats must be rejected outright: it
+        // survives `clamp` and would silently drop valid memories downstream.
+        let reject_nan = |field: &str| {
+            let mut config = super::Config::default();
+            match field {
+                "memory.min_relevance_score" => config.memory.min_relevance_score = f64::NAN,
+                "memory.mmr_lambda" => config.memory.mmr_lambda = f64::NAN,
+                "memory.importance_weight" => config.memory.importance_weight = f64::NAN,
+                "memory.recency_weight" => config.memory.recency_weight = f64::NAN,
+                other => panic!("unhandled field {other}"),
+            }
+            let err = config
+                .validate()
+                .expect_err("non-finite value must fail validation");
+            assert!(
+                err.to_string().contains(field),
+                "expected {field}, got {err}"
+            );
+        };
+        reject_nan("memory.min_relevance_score");
+        reject_nan("memory.mmr_lambda");
+        reject_nan("memory.importance_weight");
+        reject_nan("memory.recency_weight");
+
+        for multiplier in [0, super::MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER + 1] {
+            let mut config = super::Config::default();
+            config.memory.candidate_multiplier = multiplier;
+            let err = config
+                .validate()
+                .expect_err("out-of-range multiplier must fail validation");
+            assert!(
+                err.to_string().contains("memory.candidate_multiplier"),
+                "unexpected error: {err}"
+            );
+        }
+
+        let mut config = super::Config::default();
+        config.memory.mmr_lambda = 1.1;
+        let err = config
+            .validate()
+            .expect_err("out-of-range MMR lambda must fail validation");
+        assert!(err.to_string().contains("memory.mmr_lambda"));
     }
 
     #[::core::prelude::v1::test]
@@ -24560,6 +24856,71 @@ connect_timeout_secs = 12
         assert_eq!(pg.schema, "public");
         assert_eq!(pg.table, "memories");
         assert_eq!(pg.connect_timeout_secs, Some(12));
+    }
+
+    #[test]
+    async fn storage_lucid_timeout_overrides_deserialize() {
+        let raw = r#"
+default_temperature = 0.7
+
+[storage.lucid.default]
+binary_path = "/opt/lucid/bin/lucid"
+recall_timeout_ms = 5000
+store_timeout_ms = 4000
+"#;
+
+        let parsed = parse_test_config(raw);
+        let lucid = parsed
+            .storage
+            .lucid
+            .get("default")
+            .expect("lucid.default present");
+        assert_eq!(lucid.binary_path.as_deref(), Some("/opt/lucid/bin/lucid"));
+        assert_eq!(lucid.recall_timeout_ms, Some(5000));
+        assert_eq!(lucid.store_timeout_ms, Some(4000));
+    }
+
+    #[test]
+    async fn validate_rejects_zero_lucid_timeouts_with_alias_qualified_paths() {
+        for field in ["recall_timeout_ms", "store_timeout_ms"] {
+            let raw = format!(
+                r#"
+default_temperature = 0.7
+
+[storage.lucid.edge_arm]
+{field} = 0
+"#
+            );
+            let parsed = parse_test_config(&raw);
+            let error = parsed
+                .validate()
+                .expect_err("zero Lucid timeout must fail validation");
+            let expected_path = format!("storage.lucid.edge_arm.{field}");
+            assert!(
+                error.to_string().contains(&expected_path),
+                "validation error must name {expected_path}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_blank_lucid_binary_with_alias_qualified_path() {
+        let raw = r#"
+default_temperature = 0.7
+
+[storage.lucid.edge_arm]
+binary_path = "   "
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("blank Lucid binary path must fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("storage.lucid.edge_arm.binary_path"),
+            "validation error must name the alias-qualified binary path: {error:#}"
+        );
     }
 
     #[test]
@@ -27294,6 +27655,39 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn classify_runtime_config_kind_uses_runtime_resolution_source() {
+        let _env_guard = env_override_lock().await;
+        let fake_home =
+            PathBuf::from("/non-temp-zeroclaw-test-home").join(uuid::Uuid::new_v4().to_string());
+        let explicit_config_dir = fake_home.join("explicit-config");
+
+        let _home_guard = EnvValueGuard::set("HOME", &fake_home);
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        assert_eq!(
+            classify_runtime_config_kind(&fake_home.join(".zeroclaw").join("config.toml")).await,
+            RuntimeConfigKind::Default
+        );
+
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
+        assert_eq!(
+            classify_runtime_config_kind(&explicit_config_dir.join("config.toml")).await,
+            RuntimeConfigKind::Custom
+        );
+    }
+
+    #[test]
+    async fn classify_runtime_config_kind_reports_temporary_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(
+            classify_runtime_config_kind(&tmp.path().join("config.toml")).await,
+            RuntimeConfigKind::Temporary
+        );
     }
 
     async fn create_homebrew_prefix() -> TempDir {
@@ -35059,5 +35453,27 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
+    }
+
+    #[test]
+    async fn whitespace_only_model_provider_is_not_dispatchable() {
+        // whitespace-only model_provider should not be dispatchable
+        let agent = AliasedAgentConfig {
+            enabled: true,
+            risk_profile: "default".into(),
+            runtime_profile: "default".into(),
+            model_provider: "   ".into(),
+            ..Default::default()
+        };
+        assert!(!agent.is_dispatchable());
+        // non-empty model_provider should be dispatchable
+        let agent = AliasedAgentConfig {
+            enabled: true,
+            risk_profile: "default".into(),
+            runtime_profile: "default".into(),
+            model_provider: "gpt4".into(),
+            ..Default::default()
+        };
+        assert!(agent.is_dispatchable());
     }
 }
