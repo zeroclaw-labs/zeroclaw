@@ -91,10 +91,17 @@ escalation_route = "oncall"
 `[sop.approval.groups.*]` members are approval identities, not account names.
 Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
 `agent:<alias>`) to grant approval rights on one transport only, or bare
-(`alice`) to grant any source carrying that identity. HTTP and WebSocket
+(`ZeroClawOperator`) to grant any source carrying that identity. HTTP and WebSocket
 approval surfaces use the paired-token subject; the current CLI approval path
 (`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
 membership yet.
+
+The paired-token subject is the lowercase SHA-256 hex digest of the bearer
+token. After pairing, copy the digest from the canonical
+`gateway.paired_tokens` entry, or compute it from the bearer token without
+putting that secret in shell history. Rotating a paired token creates a new
+subject, so update every approval-group membership that references the old
+digest as part of the same rotation.
 
 ## 3. `SOP.md` Step Format
 
@@ -190,10 +197,94 @@ Both routes are `channel:recipient`: `channel` is a configured channel's map key
 (`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
 channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
 and never blocks or clears the gate - the approval itself still comes back through
-the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
-approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
-(where channels are configured); leave them unset (or empty) to notify only the
-originating surface, which is the default.
+an authenticated approve/deny surface whose principal can satisfy the policy's
+group and quorum requirements. Routes fire only in the daemon (where channels are
+configured); leave them unset (or empty) to notify only the originating surface,
+which is the default.
+
+Route delivery has no durable retry queue. A daemon exit before the asynchronous
+send completes, or a channel send failure, can lose the notice without changing
+the parked gate. Operators can inspect pending runs with `zeroclaw sop pending`
+and contact an eligible approver through an authenticated approval surface.
+
+Approval groups that grant channel-native approvers must use the channel-qualified
+member form `channel:<channel-key>:<sender>`, for example
+`channel:discord.ops:123456789012345678`. Unscoped members such as `channel:123` or
+bare `123` do not match channel approvals because sender ids can overlap across
+platforms and channel aliases.
+
+### Deterministic checkpoints: approval and resume
+
+A deterministic run paused at a `kind: checkpoint` step is resolved by the SAME
+approve/deny surfaces as an approval gate (`zeroclaw sop pending` lists both,
+distinguished by `kind`). On approve, the engine resumes the run and drives any
+following `kind: capability` steps headlessly to the next pause or completion -
+so a `checkpoint -> capability` tail (e.g. posting an approved draft) executes
+without a live agent turn. On deny, the run is cancelled. Both resolutions are
+recorded in the approval ledger. A checkpoint step may carry `- policy:`; the
+same policy's required-group membership and quorum apply before the checkpoint
+decision resolves. If that policy names `request_route`, the daemon sends the
+out-of-band checkpoint notice there. `escalation_route` remains the timeout route
+for timed approval gates; checkpoint pauses do not currently schedule a
+checkpoint-specific escalation timeout.
+
+Two further checkpoint resolutions let a reviewer shape the draft instead of
+just gating it (both ledger-audited like approve/deny):
+
+- **Edit (amend)** - opt-in via an `- edit: <field>` bullet on the checkpoint:
+  the approver may replace that field of the piped value with their own text
+  before the run resumes (on Discord, an Edit button opens a modal pre-filled
+  with the current value). The checkpoint's recorded output carries the
+  human-approved text; the predecessor step keeps the model's original for the
+  audit trail. The ledger row records `decision: amend`.
+- **Revise** - offered automatically when the checkpoint's predecessor is an
+  `llm.generate` step: the approver sends guidance, the engine re-runs that
+  step with the guidance framed as reviewer feedback (`revision_feedback`,
+  carried in the step's static config plane - the untrusted payload framing is
+  unchanged), replaces the draft, and re-presents the gate. Every gate
+  presentation the run makes carries a unique revision (each revise bumps it,
+  and so does each later checkpoint's first park); prompt references become
+  `<run_id>#<rev>`, and an answer on a superseded prompt - an older draft, or
+  an earlier gate's leftover buttons - is refused. Capped at 3 revisions per
+  gate; a failed re-draft keeps the previous draft parked and answerable. The
+  ledger records `decision: revise` with the guidance as the reason.
+
+### Injected-adapter capabilities
+
+Two `kind: capability` steps perform real side effects through adapters the daemon
+injects at engine build; without a daemon (CLI validation, tests) they fail closed
+with a clear message, like `shell.exec`:
+
+- **`llm.generate`** - one bounded model call as a pipeline step (no tools, no
+  agent loop), on the default agent's resolved model provider. Authored fields in
+  `with:` - `instruction` (required), `system`, `output_key` (default `text`),
+  `echo` (payload fields copied into the output for downstream piping). The piped
+  event payload is delivered inside an explicit untrusted-content frame and is
+  never read as configuration.
+- **`forge.comment`** - posts a comment to a git-forge issue/PR through the git
+  channel's outbound path (provider-agnostic: GitHub / Gitea / Forgejo). Input
+  fields: `repo` (`owner/repo`), `number`, `body`, and optional `channel`
+  (`git.<alias>`; defaults to the single configured git channel).
+
+Together with a checkpoint they form a headless review pipeline:
+
+```md
+1. **Draft** - kind: capability / capability: llm.generate
+   - with: { instruction = "...", output_key = "body", echo = ["repo", "number"] }
+2. **Approve** - kind: checkpoint / policy: triage
+3. **Post** - kind: capability / capability: forge.comment
+```
+
+**Where the adapters are wired.** The real adapters (`llm.generate`'s model
+provider, `forge.comment`'s git channel, and a checkpoint policy's out-of-band
+approval route) are injected only on the **daemon / channel-start** path, which
+is the only path with a configured channel map and model of record. Standalone
+agent runs and CLI SOP execution build the engine without them, so these
+capabilities and routes are **fail-closed** there: `llm.generate` /
+`forge.comment` report a clear "requires an injected adapter" failure rather than
+acting, and a checkpoint's route notice is a log-only no-op. This is the same
+fail-closed model as `shell.exec`; run a pipeline that needs these capabilities
+under the daemon.
 
 ### Step Contract Enforcement
 

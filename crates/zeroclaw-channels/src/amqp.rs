@@ -858,12 +858,45 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         );
     }
 
+    #[tokio::test]
+    async fn sop_only_mixed_started_and_deferred_delivery_starts_none_and_requeues() {
+        let (engine, audit) = sop_handles_with_mixed_admission();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::Sop,
+            Some(Arc::clone(&engine)),
+            Some(audit),
+        )
+        .expect("sop-only channel with handles constructs");
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(1);
+
+        let outcome = ch
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
+            .await;
+
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Deferred,
+            "a mixed ready+deferred SOP-only delivery must requeue as one broker unit"
+        );
+        let eng = engine.lock().unwrap();
+        assert!(
+            eng.run_summaries(Some("amqp-ready")).is_empty(),
+            "the ready sibling must not start before the deferred sibling can share the delivery"
+        );
+        assert_eq!(
+            eng.run_summaries(Some("amqp-full")).len(),
+            1,
+            "the pre-existing full SOP run remains the only run for that SOP"
+        );
+    }
+
     /// Build sop/audit handles with `amqp-sop` already occupying its single exec
     /// slot (`max_concurrent = 1`), so the next matching AMQP delivery is
     /// backpressured and `dispatch_sop_event` returns a `Deferred` result.
     fn sop_handles_at_exec_slot_full() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
         use zeroclaw_runtime::sop::SopStepKind;
-        use zeroclaw_runtime::sop::engine::now_iso8601;
         use zeroclaw_runtime::sop::types::{
             Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopTrigger,
         };
@@ -905,7 +938,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                     source: SopTriggerSource::Amqp,
                     topic: Some("anitya.update".into()),
                     payload: None,
-                    timestamp: now_iso8601(),
+                    timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
                 },
             )
             .expect("first run fills the slot");
@@ -949,6 +982,61 @@ tr7J6RKtO4OsZS/2KoYL8M+o
                 max_pending_approvals: 0,
                 agent: None,
             }]);
+        }
+        (engine, audit)
+    }
+
+    fn sop_handles_with_mixed_admission() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+        use zeroclaw_runtime::sop::SopStepKind;
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+        };
+
+        fn amqp_sop(name: &str) -> Sop {
+            Sop {
+                name: name.into(),
+                description: "test".into(),
+                version: "1.0.0".into(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Auto,
+                triggers: vec![SopTrigger::Amqp {
+                    routing_key: "anitya.update".into(),
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+            }
+        }
+
+        let (engine, audit) = sop_handles();
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.set_sops_for_test(vec![amqp_sop("amqp-ready"), amqp_sop("amqp-full")]);
+            eng.start_run(
+                "amqp-full",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("anitya.update".into()),
+                    payload: None,
+                    timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
+                },
+            )
+            .expect("first run fills amqp-full slot");
         }
         (engine, audit)
     }

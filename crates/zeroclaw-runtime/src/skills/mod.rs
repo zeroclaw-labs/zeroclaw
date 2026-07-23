@@ -2,15 +2,11 @@ pub mod skill_http;
 pub mod skill_tool;
 use anyhow::{Context, Result};
 use directories::UserDirs;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
-
-use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
@@ -41,14 +37,6 @@ pub(crate) use suggestions::render_missing_skill_install_suggestion;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-
-// ─── ClawHub / OpenClaw registry installers ───────────────────────────────
-const CLAWHUB_DOMAIN: &str = "clawhub.ai";
-const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
-const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_SKILL_ZIP_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_SKILL_ZIP_ENTRIES: usize = 500;
-const MAX_SKILL_ZIP_EXPANSION_RATIO: u64 = 10;
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -1899,114 +1887,7 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_clawhub_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
-}
-
-fn parse_clawhub_url(source: &str) -> Option<Url> {
-    let parsed = Url::parse(source).ok()?;
-    match parsed.scheme() {
-        "https" | "http" => {}
-        _ => return None,
-    }
-
-    if !parsed.host_str().is_some_and(is_clawhub_host) {
-        return None;
-    }
-
-    Some(parsed)
-}
-
-pub fn is_clawhub_source(source: &str) -> bool {
-    if source.starts_with("clawhub:") {
-        return true;
-    }
-    parse_clawhub_url(source).is_some()
-}
-
-fn clawhub_download_url(source: &str) -> Result<String> {
-    // Short prefix: clawhub:<slug>
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        if slug.is_empty() || slug.contains('/') {
-            anyhow::bail!(
-                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
-                source
-            );
-        }
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
-    }
-
-    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>
-    if let Some(parsed) = parse_clawhub_url(source) {
-        let path = parsed
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
-
-        if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawHub URL: {source}");
-        }
-
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
-    }
-
-    anyhow::bail!("unrecognised ClawHub source format: {source}")
-}
-
-fn normalize_skill_name(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-fn clawhub_skill_dir_name(source: &str) -> Result<String> {
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        let base = slug.rsplit('/').next().unwrap_or(slug);
-        let name = normalize_skill_name(base);
-        return Ok(if name.is_empty() {
-            "skill".to_string()
-        } else {
-            name
-        });
-    }
-
-    let parsed = parse_clawhub_url(source).ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"source": source})),
-            "skill install rejected: invalid clawhub URL"
-        );
-        anyhow::Error::msg(format!("invalid clawhub URL: {source}"))
-    })?;
-
-    let path = parsed
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    let base = path.last().copied().unwrap_or("skill");
-    let name = normalize_skill_name(base);
-    Ok(if name.is_empty() {
-        "skill".to_string()
-    } else {
-        name
-    })
-}
-
 pub fn is_git_source(source: &str) -> bool {
-    // ClawHub URLs look like https:// but are not git repos
-    if is_clawhub_source(source) {
-        return false;
-    }
     is_git_scheme_source(source, "https://")
         || is_git_scheme_source(source, "http://")
         || is_git_scheme_source(source, "ssh://")
@@ -2229,267 +2110,6 @@ pub fn install_git_skill_source(
     }
 }
 
-/// True when a zip entry path could escape the extraction root (parent
-/// traversal, absolute path, backslash, drive/scheme colon) or is empty.
-fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
-    raw_name.is_empty()
-        || raw_name.contains("..")
-        || raw_name.starts_with('/')
-        || raw_name.contains('\\')
-        || raw_name.contains(':')
-}
-
-fn checked_zip_size_add(total: u64, next: u64, label: &str) -> Result<u64> {
-    total
-        .checked_add(next)
-        .with_context(|| format!("skill zip rejected: {label} size overflow"))
-}
-
-fn append_skill_zip_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: u64) -> Result<()> {
-    let current_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
-    let chunk_len = u64::try_from(chunk.len()).context("skill zip chunk length overflow")?;
-    let next_len = checked_zip_size_add(current_len, chunk_len, "downloaded")?;
-    if next_len > max_bytes {
-        anyhow::bail!("skill zip rejected: too large ({next_len} bytes > {max_bytes})");
-    }
-    bytes.extend_from_slice(chunk);
-    Ok(())
-}
-
-async fn download_skill_zip_bytes(
-    mut response: reqwest::Response,
-    max_bytes: u64,
-) -> Result<Vec<u8>> {
-    if let Some(len) = response.content_length()
-        && len > max_bytes
-    {
-        anyhow::bail!("skill zip rejected: too large ({len} bytes > {max_bytes})");
-    }
-
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("failed to read skill zip response body")?
-    {
-        append_skill_zip_chunk(&mut bytes, &chunk, max_bytes)?;
-    }
-    Ok(bytes)
-}
-
-fn exceeds_skill_zip_ratio(uncompressed_bytes: u64, compressed_bytes: u64) -> bool {
-    compressed_bytes > 0
-        && uncompressed_bytes > compressed_bytes.saturating_mul(MAX_SKILL_ZIP_EXPANSION_RATIO)
-}
-
-fn validate_skill_zip_limits<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    max_bytes: u64,
-) -> Result<u64> {
-    let entry_count = archive.len();
-    if entry_count > MAX_SKILL_ZIP_ENTRIES {
-        anyhow::bail!(
-            "skill zip rejected: too many entries ({} > {})",
-            entry_count,
-            MAX_SKILL_ZIP_ENTRIES
-        );
-    }
-
-    let mut compressed_bytes = 0_u64;
-    let mut uncompressed_bytes = 0_u64;
-    for i in 0..entry_count {
-        let entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
-        if is_unsafe_zip_entry_name(&raw_name) {
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
-        let entry_compressed_bytes = entry.compressed_size();
-        let entry_uncompressed_bytes = entry.size();
-        if entry_uncompressed_bytes > 0 && entry_compressed_bytes == 0 {
-            anyhow::bail!(
-                "skill zip rejected: entry '{}' has invalid compression ratio",
-                raw_name
-            );
-        }
-
-        compressed_bytes =
-            checked_zip_size_add(compressed_bytes, entry_compressed_bytes, "compressed")?;
-        uncompressed_bytes =
-            checked_zip_size_add(uncompressed_bytes, entry_uncompressed_bytes, "uncompressed")?;
-
-        if uncompressed_bytes > max_bytes {
-            anyhow::bail!(
-                "skill zip rejected: extracted size too large ({} bytes > {})",
-                uncompressed_bytes,
-                max_bytes
-            );
-        }
-        if exceeds_skill_zip_ratio(uncompressed_bytes, compressed_bytes) {
-            anyhow::bail!(
-                "skill zip rejected: expansion ratio exceeds {}x",
-                MAX_SKILL_ZIP_EXPANSION_RATIO
-            );
-        }
-    }
-
-    Ok(compressed_bytes)
-}
-
-fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    let archive_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
-    if archive_len > max_bytes {
-        anyhow::bail!(
-            "skill zip rejected: too large ({} bytes > {})",
-            archive_len,
-            max_bytes
-        );
-    }
-
-    let cursor = Cursor::new(bytes);
-    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
-    let compressed_bytes = validate_skill_zip_limits(&mut archive, max_bytes)?;
-
-    std::fs::create_dir_all(dest)?;
-    let result = extract_validated_skill_zip(&mut archive, dest, max_bytes, compressed_bytes);
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(dest);
-    }
-    result
-}
-
-fn copy_zip_entry_bounded<R: Read, W: Write>(
-    entry: &mut R,
-    output: &mut W,
-    extracted_bytes: &mut u64,
-    max_bytes: u64,
-    compressed_bytes: u64,
-) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read_bytes = entry.read(&mut buffer)?;
-        if read_bytes == 0 {
-            return Ok(());
-        }
-
-        let read_bytes = u64::try_from(read_bytes).context("skill zip read length overflow")?;
-        let next_extracted = checked_zip_size_add(*extracted_bytes, read_bytes, "extracted")?;
-        if next_extracted > max_bytes {
-            anyhow::bail!(
-                "skill zip rejected: extracted size too large ({} bytes > {})",
-                next_extracted,
-                max_bytes
-            );
-        }
-        if exceeds_skill_zip_ratio(next_extracted, compressed_bytes) {
-            anyhow::bail!(
-                "skill zip rejected: expansion ratio exceeds {}x",
-                MAX_SKILL_ZIP_EXPANSION_RATIO
-            );
-        }
-
-        let read_len = usize::try_from(read_bytes).context("skill zip write length overflow")?;
-        output.write_all(&buffer[..read_len])?;
-        *extracted_bytes = next_extracted;
-    }
-}
-
-fn extract_validated_skill_zip<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    dest: &Path,
-    max_bytes: u64,
-    compressed_bytes: u64,
-) -> Result<()> {
-    let mut extracted_bytes = 0_u64;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
-        let out_path = dest.join(&raw_name);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-            continue;
-        }
-
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut out_file = std::fs::File::create(&out_path).with_context(|| {
-            format!(
-                "failed to create extracted file: {}",
-                out_path.display().to_string()
-            )
-        })?;
-        copy_zip_entry_bounded(
-            &mut entry,
-            &mut out_file,
-            &mut extracted_bytes,
-            max_bytes,
-            compressed_bytes,
-        )?;
-    }
-
-    Ok(())
-}
-
-pub async fn install_clawhub_skill_source(
-    source: &str,
-    skills_path: &Path,
-    allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
-    let download_url = clawhub_download_url(source)
-        .with_context(|| format!("invalid ClawHub source: {source}"))?;
-    let skill_dir_name = clawhub_skill_dir_name(source)?;
-    let installed_dir = skills_path.join(&skill_dir_name);
-    if installed_dir.exists() {
-        anyhow::bail!(
-            "Destination skill already exists: {}",
-            installed_dir.display()
-        );
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let resp = client
-        .get(&download_url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch zip from {download_url}"))?;
-
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
-    }
-
-    let bytes = download_skill_zip_bytes(resp, MAX_SKILL_ZIP_BYTES).await?;
-    extract_zip_secure(bytes, &installed_dir, MAX_SKILL_ZIP_BYTES)?;
-
-    let has_manifest = installed_dir.join("SKILL.md").exists()
-        || installed_dir.join("SKILL.toml").exists()
-        || installed_dir.join("manifest.toml").exists();
-    if !has_manifest {
-        std::fs::write(
-            installed_dir.join("SKILL.toml"),
-            format!(
-                "[skill]\nname = \"{}\"\ndescription = \"ClawHub installed skill\"\nversion = \"0.1.0\"\n",
-                skill_dir_name
-            ),
-        )?;
-    }
-
-    match enforce_skill_security_audit(&installed_dir, allow_scripts) {
-        Ok(report) => Ok((installed_dir, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&installed_dir);
-            Err(err)
-        }
-    }
-}
-
 // ─── Skills registry resolution ───────────────────────────────────────────────
 
 pub fn is_registry_source(source: &str) -> bool {
@@ -2529,8 +2149,8 @@ pub fn parse_extra_registry_source(source: &str) -> Option<(String, String)> {
     Some((name.to_string(), skill.to_string()))
 }
 
-fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
-    if let Some(parent) = registry_dir.parent() {
+fn clone_skills_repository(target_dir: &Path, repo_url: &str) -> Result<()> {
+    if let Some(parent) = target_dir.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
                 "failed to create registry parent: {}",
@@ -2541,7 +2161,7 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
 
     let output = Command::new("git")
         .args(["clone", "--depth", "1", repo_url])
-        .arg(registry_dir)
+        .arg(target_dir)
         .output()
         .context("failed to run git clone for skills registry")?;
 
@@ -2555,9 +2175,14 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         &format!(
             "cloned skills registry to {}",
-            registry_dir.display().to_string()
+            target_dir.display().to_string()
         )
     );
+    Ok(())
+}
+
+fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
+    clone_skills_repository(registry_dir, repo_url)?;
     mark_skills_registry_synced(registry_dir)?;
     Ok(())
 }
@@ -2658,6 +2283,197 @@ fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// List real directory entries under an already-contained catalog `skills/`
+/// root without following entry symlinks.
+fn list_contained_catalog_skill_names(skills_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(skills_root) else {
+        return vec![];
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Install a single skill by name from a git catalog repository.
+///
+/// Clones `url` into a throwaway directory, resolves `skills/<skill_name>/`
+/// (the same `<repo>/skills/<name>/` layout as the default and extra
+/// registries), and installs it through the shared local-copy path (which
+/// runs the security audit). No archive handling — pure `git clone`.
+pub fn install_git_catalog_skill_source(
+    url: &str,
+    skill_name: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    workspace_dir: &Path,
+) -> Result<(PathBuf, usize)> {
+    if !is_registry_source(skill_name) {
+        anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-invalid-skill-name",
+            &[("skill", skill_name)]
+        ));
+    }
+
+    std::fs::create_dir_all(workspace_dir).with_context(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-catalog-clone-failed",
+            &[("url", url)],
+        )
+    })?;
+    let clone_tempdir = tempfile::Builder::new()
+        .prefix(".skill-catalog-")
+        .tempdir_in(workspace_dir)
+        .with_context(|| {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-clone-failed",
+                &[("url", url)],
+            )
+        })?;
+    let clone_dir = clone_tempdir.path();
+
+    // A transient catalog has no sync lifecycle, so clone it without writing
+    // the persistent registry marker into the untrusted checkout. Besides
+    // avoiding unnecessary state, this prevents a catalog-committed marker
+    // symlink from redirecting that write to an arbitrary host file.
+    clone_skills_repository(clone_dir, url).with_context(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-catalog-clone-failed",
+            &[("url", url)],
+        )
+    })?;
+
+    (|| {
+        // Establish the catalog trust boundary before looking up a selected
+        // name or enumerating available names. A catalog controls `skills/`,
+        // so following it before this check could inspect an arbitrary host
+        // directory even when the requested skill does not exist.
+        let clone_root = clone_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize catalog clone {}",
+                clone_dir.display()
+            )
+        })?;
+        let skills_dir = clone_dir.join("skills");
+        let skills_meta = match std::fs::symlink_metadata(&skills_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog-empty",
+                    &[("skill", skill_name), ("url", url)]
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read metadata for catalog skills root {}",
+                        skills_dir.display()
+                    )
+                });
+            }
+        };
+        if skills_meta.file_type().is_symlink() {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-root-symlink",
+                &[("url", url)]
+            ));
+        }
+        let skills_root = skills_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize catalog skills root {}",
+                skills_dir.display()
+            )
+        })?;
+        if !skills_root.starts_with(&clone_root) {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-root-escapes",
+                &[("url", url)]
+            ));
+        }
+        if !skills_root.is_dir() {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-skill-not-in-catalog-empty",
+                &[("skill", skill_name), ("url", url)]
+            ));
+        }
+
+        let skill_dir = skills_root.join(skill_name);
+        let entry_meta = match std::fs::symlink_metadata(&skill_dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let available = list_contained_catalog_skill_names(&skills_root);
+                if available.is_empty() {
+                    anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                        "cli-skills-install-skill-not-in-catalog-empty",
+                        &[("skill", skill_name), ("url", url)]
+                    ));
+                }
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog",
+                    &[
+                        ("skill", skill_name),
+                        ("url", url),
+                        ("available", &available.join(", ")),
+                    ]
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to read metadata for selected catalog skill {}",
+                        skill_dir.display()
+                    )
+                });
+            }
+        };
+        if entry_meta.file_type().is_symlink() {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-skill-symlink",
+                &[("skill", skill_name), ("url", url)]
+            ));
+        }
+        let selected = skill_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize selected skill {}",
+                skill_dir.display()
+            )
+        })?;
+        if !selected.starts_with(&skills_root) {
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-skill-escapes",
+                &[("skill", skill_name), ("url", url)]
+            ));
+        }
+        if !selected.is_dir() {
+            let available = list_contained_catalog_skill_names(&skills_root);
+            if available.is_empty() {
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog-empty",
+                    &[("skill", skill_name), ("url", url)]
+                ));
+            }
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-skill-not-in-catalog",
+                &[
+                    ("skill", skill_name),
+                    ("url", url),
+                    ("available", &available.join(", ")),
+                ]
+            ));
+        }
+        // i18n-exempt: internal invariant — the clone path is our own ASCII
+        // `.skill-catalog-*` scratch dir, so this only fires on a broken
+        // host filesystem; it is a developer diagnostic, not normal CLI output.
+        let skill_dir_str = selected
+            .to_str()
+            .with_context(|| format!("skill path is not valid UTF-8: {}", selected.display()))?;
+        install_local_skill_source(skill_dir_str, skills_path, allow_scripts)
+    })()
 }
 
 pub fn install_registry_skill_source(
@@ -2878,7 +2694,6 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use std::io::{self, Write};
 
     #[test]
     fn slash_option_kinds_registry_is_walked_from_the_enum() {
@@ -2918,52 +2733,6 @@ mod registry_tests {
         assert!(!SlashOptionKind::String.supports_numeric_bounds());
         assert!(SlashOptionKind::Integer.supports_numeric_bounds());
         assert!(!SlashOptionKind::Integer.supports_length_bounds());
-    }
-
-    struct CountingWriter {
-        written: usize,
-    }
-
-    impl Write for CountingWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.written += buffer.len();
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct ChunkReader {
-        chunks: Vec<Vec<u8>>,
-        index: usize,
-    }
-
-    impl Read for ChunkReader {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let Some(chunk) = self.chunks.get(self.index) else {
-                return Ok(0);
-            };
-            let copied = chunk.len().min(buffer.len());
-            buffer[..copied].copy_from_slice(&chunk[..copied]);
-            self.index += 1;
-            Ok(copied)
-        }
-    }
-
-    fn make_skill_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
-            for (name, body) in entries {
-                writer.start_file(*name, opts).unwrap();
-                writer.write_all(body).unwrap();
-            }
-            writer.finish().unwrap();
-        }
-        buf
     }
 
     #[test]
@@ -3028,8 +2797,8 @@ mod registry_tests {
     }
 
     #[test]
-    fn test_is_registry_source_rejects_clawhub() {
-        assert!(!is_registry_source("clawhub:my-skill"));
+    fn test_is_registry_source_rejects_prefixed() {
+        assert!(!is_registry_source("external:my-skill"));
     }
 
     #[test]
@@ -3068,7 +2837,7 @@ mod registry_tests {
 
     #[test]
     fn test_is_extra_registry_source_rejects_competing_schemes() {
-        assert!(!is_extra_registry_source("clawhub:x"));
+        assert!(!is_extra_registry_source("external:x"));
         assert!(!is_extra_registry_source("https://github.com/o/r"));
         assert!(!is_extra_registry_source("git@github.com:o/r"));
         assert!(!is_extra_registry_source("./local"));
@@ -3083,238 +2852,6 @@ mod registry_tests {
         assert_eq!(parse_extra_registry_source("registry:onlyname"), None);
         assert_eq!(parse_extra_registry_source("registry:a/b/c"), None);
         assert_eq!(parse_extra_registry_source("auto-coder"), None);
-    }
-
-    #[test]
-    fn test_is_unsafe_zip_entry_name() {
-        assert!(is_unsafe_zip_entry_name(""));
-        assert!(is_unsafe_zip_entry_name("../evil.txt"));
-        assert!(is_unsafe_zip_entry_name("a/../b"));
-        assert!(is_unsafe_zip_entry_name("/abs/path"));
-        assert!(is_unsafe_zip_entry_name("dir\\file"));
-        assert!(is_unsafe_zip_entry_name("c:/win"));
-        assert!(!is_unsafe_zip_entry_name("SKILL.md"));
-        assert!(!is_unsafe_zip_entry_name("scripts/run.sh"));
-    }
-
-    #[test]
-    fn test_append_skill_zip_chunk_accepts_within_limit() {
-        let mut bytes = b"abc".to_vec();
-        append_skill_zip_chunk(&mut bytes, b"def", 6).unwrap();
-        assert_eq!(bytes, b"abcdef");
-    }
-
-    #[test]
-    fn test_append_skill_zip_chunk_rejects_oversize() {
-        let mut bytes = b"abc".to_vec();
-        let err = append_skill_zip_chunk(&mut bytes, b"defg", 6)
-            .expect_err("oversize chunk must be rejected");
-        assert!(err.to_string().contains("too large"), "got: {err}");
-        assert_eq!(bytes, b"abc");
-    }
-
-    #[test]
-    fn test_extract_zip_secure_happy_path() {
-        let buf = make_skill_zip(
-            &[("SKILL.md", b"# demo"), ("scripts/run.txt", b"echo hi")],
-            zip::CompressionMethod::Stored,
-        );
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
-            "# demo"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dest.join("scripts/run.txt")).unwrap(),
-            "echo hi"
-        );
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_oversize_archive() {
-        let buf = make_skill_zip(&[("SKILL.md", b"# demo")], zip::CompressionMethod::Stored);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, 1).expect_err("oversize zip must be rejected");
-        assert!(err.to_string().contains("too large"), "got: {err}");
-        assert!(
-            !dest.exists(),
-            "dest must not be created when the zip is rejected for size"
-        );
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_too_many_entries() {
-        let entries: Vec<(String, Vec<u8>)> = (0..=MAX_SKILL_ZIP_ENTRIES)
-            .map(|index| (format!("files/{index}.txt"), b"x".to_vec()))
-            .collect();
-        let entry_refs: Vec<(&str, &[u8])> = entries
-            .iter()
-            .map(|(name, body)| (name.as_str(), body.as_slice()))
-            .collect();
-        let buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
-            .expect_err("zip with too many entries must be rejected");
-        assert!(err.to_string().contains("too many entries"), "got: {err}");
-        assert!(!dest.exists(), "dest must not be created for rejected zip");
-    }
-
-    #[test]
-    fn test_copy_zip_entry_bounded_stops_before_limit_overwrite() {
-        let payload = vec![b'a'; 1024];
-        let mut reader = Cursor::new(payload);
-        let mut writer = CountingWriter { written: 0 };
-        let mut extracted_bytes = 0;
-
-        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
-            .expect_err("bounded copy must reject before writing over the cap");
-
-        assert!(
-            err.to_string().contains("extracted size too large"),
-            "got: {err}"
-        );
-        assert_eq!(writer.written, 0);
-        assert_eq!(extracted_bytes, 0);
-    }
-
-    #[test]
-    fn test_copy_zip_entry_bounded_preserves_prior_valid_write() {
-        let mut reader = ChunkReader {
-            chunks: vec![vec![b'a'; 400], vec![b'b'; 200]],
-            index: 0,
-        };
-        let mut writer = CountingWriter { written: 0 };
-        let mut extracted_bytes = 0;
-
-        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
-            .expect_err("bounded copy must reject the chunk that crosses the cap");
-
-        assert!(
-            err.to_string().contains("extracted size too large"),
-            "got: {err}"
-        );
-        assert_eq!(writer.written, 400);
-        assert_eq!(extracted_bytes, 400);
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_extracted_size_limit() {
-        let payload = vec![b'a'; 1024];
-        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, 500)
-            .expect_err("zip exceeding extracted size limit must be rejected");
-        assert!(
-            err.to_string().contains("extracted size too large"),
-            "got: {err}"
-        );
-        assert!(!dest.exists(), "dest must not be created for rejected zip");
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_expansion_ratio() {
-        let payload = vec![b'a'; 1024];
-        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
-            .expect_err("zip exceeding expansion ratio must be rejected");
-        assert!(err.to_string().contains("expansion ratio"), "got: {err}");
-        assert!(!dest.exists(), "dest must not be created for rejected zip");
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_lying_declared_size() {
-        // 60 MiB payload, but we patch the central directory to claim 1 byte.
-        let payload = vec![b'a'; 60 * 1024 * 1024];
-        let mut buf = make_skill_zip(&[("big.bin", &payload)], zip::CompressionMethod::Stored);
-        patch_zip_central_directory_uncompressed_size(&mut buf, 1);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
-            .expect_err("lying declared size must be rejected during extraction");
-        assert!(
-            err.to_string().contains("too large"),
-            "expected size error, got: {err}"
-        );
-        assert!(
-            !dest.exists(),
-            "dest must not be created when lying declared size is rejected"
-        );
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_multi_entry_lying_declared_size() {
-        const ENTRY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB each
-        const ENTRY_COUNT: usize = 6; // 60 MiB total > 50 MiB cap
-        const LIED_SIZE: u32 = 8 * 1024 * 1024; // 48 MiB declared total < 50 MiB cap
-
-        let mut entries = Vec::new();
-        for i in 0..ENTRY_COUNT {
-            entries.push((format!("big{i}.bin"), vec![b'a'; ENTRY_SIZE]));
-        }
-        let entry_refs: Vec<(&str, &[u8])> = entries
-            .iter()
-            .map(|(name, body)| (name.as_str(), body.as_slice()))
-            .collect();
-        let mut buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
-        patch_all_zip_central_directory_uncompressed_sizes(&mut buf, LIED_SIZE);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
-            .expect_err("multi-entry lying declared sizes must be rejected");
-        assert!(
-            err.to_string().contains("too large"),
-            "expected size error, got: {err}"
-        );
-        assert!(
-            !dest.exists(),
-            "dest must not be created when archive cap is exceeded"
-        );
-    }
-
-    /// Overwrite the uncompressed-size field in the first central-directory
-    /// header of a zip file.
-    fn patch_zip_central_directory_uncompressed_size(zip: &mut [u8], new_size: u32) {
-        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
-            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
-                let start = i + 24;
-                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
-                return;
-            }
-        }
-        panic!("central directory signature not found in test zip");
-    }
-
-    /// Overwrite the uncompressed-size field in every central-directory header
-    /// of a zip file.
-    fn patch_all_zip_central_directory_uncompressed_sizes(zip: &mut [u8], new_size: u32) {
-        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-        let mut patched = 0;
-        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
-            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
-                let start = i + 24;
-                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
-                patched += 1;
-            }
-        }
-        if patched == 0 {
-            panic!("central directory signature not found in test zip");
-        }
     }
 
     #[test]
@@ -3335,6 +2872,479 @@ mod registry_tests {
         )
         .expect_err("unknown registry must error before any git work");
         assert!(err.to_string().contains("nope"), "got: {err}");
+    }
+
+    #[test]
+    fn test_install_git_catalog_rejects_non_bare_skill_name() {
+        // The bare-name guard must reject anything with a path separator before
+        // any network/git work happens (hermetic — no clone is attempted).
+        assert!(!is_registry_source("a/b"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            "https://github.com/example/skills",
+            "a/b",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a slashed --skill name must be rejected before any git work");
+        assert!(err.to_string().contains("bare skill name"), "got: {err}");
+    }
+
+    /// Build a local git repository that acts as a skill catalog: a real commit
+    /// containing `skills/<name>/SKILL.md` for each requested skill. Returns the
+    /// repo path, which doubles as the clone URL for
+    /// `install_git_catalog_skill_source` (git clones local paths directly, so
+    /// the test stays hermetic — no network).
+    fn init_git_skill_catalog(root: &Path, skills: &[&str]) -> std::path::PathBuf {
+        let repo = root.join("catalog");
+        for name in skills {
+            let skill_dir = repo.join("skills").join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: hermetic git-catalog fixture\n---\n\n# {name}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git must be available to build the catalog fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["add", "-A"]);
+        // Pass identity/signing inline so the commit does not depend on the
+        // runner's global git config.
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        repo
+    }
+
+    #[test]
+    fn install_git_catalog_skill_source_installs_selected_skill_through_audit() {
+        // Happy path for the `--skill` replacement: clone a local git catalog,
+        // resolve `skills/<name>/`, and install it through the shared
+        // clone → local-copy → security-audit path. Skipped if git is absent.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill", "other-skill"]);
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (dest, files_scanned) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("happy-path git-catalog install should succeed");
+
+        // Installed at the expected destination, with the catalog's SKILL.md.
+        assert_eq!(dest, skills_path.join("demo-skill"));
+        assert!(
+            dest.join("SKILL.md").is_file(),
+            "the selected skill's SKILL.md must be installed"
+        );
+        // A non-zero scan count proves the security-audit path was entered.
+        assert!(
+            files_scanned >= 1,
+            "install must run through the audit path; files_scanned = {files_scanned}"
+        );
+        // Only the requested skill is installed, not its sibling.
+        assert!(!skills_path.join("other-skill").exists());
+        // The transient clone scratch dir is cleaned up afterwards.
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after install");
+    }
+
+    #[test]
+    fn install_git_catalog_skill_source_reports_missing_skill_after_clone() {
+        // The main post-clone failure mode: the requested skill is not in the
+        // catalog. The error must name it and list what *is* available, and must
+        // not install anything.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["present-skill"]);
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "absent-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a skill missing from the catalog must error after clone");
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(
+            msg.contains("present-skill"),
+            "error should list the available skills; got: {msg}"
+        );
+        // Nothing installed, and the clone scratch dir is cleaned up.
+        assert!(!skills_path.join("absent-skill").exists());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after failure");
+    }
+
+    /// Commit whatever is currently in `repo`'s worktree with a hermetic
+    /// identity, so tests can add symlink entries the fixture builder can't.
+    #[cfg(unix)]
+    fn git_commit_all(repo: &Path, message: &str) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git must be available");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_does_not_follow_registry_sync_marker_symlink() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external_marker = tmp.path().join("external-marker");
+        std::fs::write(&external_marker, "must remain unchanged").unwrap();
+
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill"]);
+        std::os::unix::fs::symlink(&external_marker, catalog.join(SKILLS_REGISTRY_SYNC_MARKER))
+            .unwrap();
+        git_commit_all(&catalog, "add hostile registry sync marker symlink");
+
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (dest, _) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("a catalog marker must not participate in transient clone state");
+
+        assert!(dest.join("SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(&external_marker).unwrap(),
+            "must remain unchanged",
+            "a catalog-controlled marker symlink must not redirect a host write"
+        );
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_skill_source_rejects_symlinked_selected_skill() {
+        // A catalog that commits `skills/<name>` as a symlink pointing outside
+        // the repo must be refused: `is_dir()` follows the link and
+        // `install_local_skill_source` would canonicalize it to the external
+        // target and audit/copy it. The out-of-clone directory here is itself a
+        // *clean* skill, proving the audit passing does not rescue containment.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A valid skill living outside the catalog — the escape target.
+        let outside = tmp.path().join("outside").join("secret-skill");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: secret-skill\ndescription: outside the catalog\n---\n\n# secret\n",
+        )
+        .unwrap();
+
+        let catalog = init_git_skill_catalog(tmp.path(), &["present-skill"]);
+        // Commit an absolute symlink `skills/evil` -> the external skill dir.
+        std::os::unix::fs::symlink(&outside, catalog.join("skills").join("evil")).unwrap();
+        git_commit_all(&catalog, "add escaping symlink");
+
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "evil",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a symlinked catalog entry must be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error should name the symlink; got: {err}"
+        );
+        // Nothing installed — neither the symlink name nor the escape target.
+        assert!(!skills_path.join("evil").exists());
+        assert!(!skills_path.join("secret-skill").exists());
+        // The escape target on disk is untouched.
+        assert!(outside.join("SKILL.md").is_file());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_skill_source_rejects_selection_escaping_via_symlinked_skills_dir() {
+        // Backstop for the case the symlink_metadata check alone misses: the
+        // selected `skills/<name>` is a real directory, but its parent `skills`
+        // is a symlink out of the clone. The final component is not a link, so
+        // only the canonicalize-and-contain check catches the escape.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // External directory that `skills` will point at, holding a clean skill.
+        let external = tmp.path().join("external-skills");
+        let victim = external.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(
+            victim.join("SKILL.md"),
+            "---\nname: victim\ndescription: outside the catalog\n---\n\n# victim\n",
+        )
+        .unwrap();
+
+        // A repo whose entire `skills/` tree is a symlink to `external`.
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&external, catalog.join("skills")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&catalog)
+            .output()
+            .expect("git init");
+        git_commit_all(&catalog, "symlink skills dir out of the repo");
+
+        let skills_path = tmp.path().join("dest-skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "victim",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a selection resolving outside the clone must be rejected");
+        assert!(
+            err.to_string().contains("outside") || err.to_string().contains("symlink"),
+            "error should describe the containment/symlink failure; got: {err}"
+        );
+        assert!(!skills_path.join("victim").exists());
+        assert!(victim.join("SKILL.md").is_file());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_missing_skill_rejects_symlinked_skills_root_before_enumeration() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external-skills");
+        let external_entry = external.join("external-private-name");
+        std::fs::create_dir_all(&external_entry).unwrap();
+        let external_manifest = external_entry.join("SKILL.md");
+        let external_contents =
+            "---\nname: external-private-name\ndescription: outside the catalog\n---\n";
+        std::fs::write(&external_manifest, external_contents).unwrap();
+
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&external, catalog.join("skills")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&catalog)
+            .output()
+            .expect("git init");
+        git_commit_all(&catalog, "symlink skills root out of the repo");
+
+        let skills_path = tmp.path().join("dest-skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "missing-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a symlinked catalog skills root must be rejected before enumeration");
+        let message = err.to_string();
+        assert!(message.contains("symlink"), "got: {message}");
+        assert!(
+            !message.contains("external-private-name"),
+            "external entry names must not be enumerated; got: {message}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&skills_path).unwrap().count(),
+            0,
+            "nothing may be installed after rejecting the catalog root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external_manifest).unwrap(),
+            external_contents,
+            "the external target must remain untouched"
+        );
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
     }
 
     #[test]

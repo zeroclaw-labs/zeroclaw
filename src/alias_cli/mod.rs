@@ -432,15 +432,8 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
         Arc::from(
-            zeroclaw_memory::create_memory_with_storage_and_routes(
-                &config.memory,
-                &config.embedding_routes,
-                config.resolve_active_storage(),
-                &config.data_dir,
-                None,
-                Some(&config.providers.models),
-            )
-            .context("open memory backend for the owned-state cascade")?,
+            zeroclaw_memory::create_memory_from_config(config, None)
+                .context("open memory backend for the owned-state cascade")?,
         )
     };
     let session_backend = if config.gateway.session_persistence {

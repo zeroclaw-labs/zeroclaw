@@ -798,6 +798,7 @@ cli-models-status-none = No hay ningún modelo predeterminado configurado.
 turn-interrupted-by-user = [interrumpido por el usuario]
 turn-cancelled-client-rpc = [turno cancelado mediante el cliente]
 turn-stream-interrupted = [transmisión interrumpida]
+turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) no estaba disponible; esta respuesta fue generada por { $actual_model } ({ $actual_provider }).
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = límite de mensajes del historial superado
@@ -933,3 +934,9 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_wind
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
 cli-doctor-degraded-section = La sección de configuración `{$path}` está mal formada y se restableció a sus valores predeterminados; los valores de esa sección NO están en efecto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
+sop-approval-deferred-at-capacity = No se pudo reanudar la ejecución {$run_id}: los cupos de ejecución están llenos. La aprobación sigue en espera; inténtalo de nuevo cuando se libere un cupo.
+sop-approval-policy-unavailable = La aprobación falló porque el paso de SOP en espera no está disponible: {$reason}. La ejecución sigue en espera.
+sop-rpc-decision-invalid-state = La ejecución {$run_id} no se puede resolver en su estado actual.
+sop-rpc-decision-unauthorized = La identidad RPC no está autorizada para resolver este paso de SOP.
+sop-rpc-policy-missing = La política de aprobación de SOP '{$name}' no está configurada.
+sop-rpc-policy-unavailable = La política del SOP en espera no está disponible: {$reason}.
