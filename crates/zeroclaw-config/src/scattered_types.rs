@@ -276,7 +276,7 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed in #8196; nothing in the
+    /// The runtime context compressor was removed; nothing in the
     /// workspace reads this flag anymore, so setting it to `true` currently
     /// has no effect. Defaults to `false` to match actual runtime behavior;
     /// `Config::collect_warnings` flags an explicit `true` (see
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
     }
 
-    // The runtime context compressor was removed in #8196; nothing reads
+    // The runtime context compressor was removed; nothing reads
     // `context_compression` at runtime anymore, so the default must be
     // `false` (a `true` default would mislead users into thinking the
     // knob does something). See `context_compression_unsupported` in

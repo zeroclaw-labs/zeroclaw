@@ -18934,7 +18934,7 @@ impl Config {
     }
 
     /// Surface every non-default `context_compression` knob as inert: the
-    /// runtime context compressor was removed in #8196 and nothing in the
+    /// runtime context compressor was removed and nothing in the
     /// workspace reads `context_compression` at runtime anymore, so the whole
     /// struct — `enabled`, thresholds, protected counts, summarizer limits,
     /// provider selection, tool-result retrimming — has no effect. Mirrors
@@ -19007,7 +19007,7 @@ impl Config {
                 // this same path is already in `warnings`. When it is, the
                 // more specific diagnostic wins — emitting the generic
                 // "has no effect" inert warning alongside "silently fails at
-                // runtime (#7964)" would be two contradictory statements
+                // runtime" would be two contradictory statements
                 // about the same config line. All other `summary_model`
                 // shapes (single-provider, unshared) still get the inert
                 // warning; no other diagnostic covers them.
@@ -34412,7 +34412,7 @@ allowed_users = []
         );
     }
 
-    // The runtime context compressor was removed in #8196; nothing reads
+    // The runtime context compressor was removed; nothing reads
     // `context_compression` at runtime anymore, so an explicit
     // `enabled = true` on a named runtime profile is inert and must be
     // flagged.
@@ -34447,8 +34447,8 @@ allowed_users = []
     // The legacy pre-V3 `[agent.context_compression]` top-level table is
     // folded into `[runtime_profiles.default]` by the V1/V2→V3 migration
     // (see `schema/v2.rs`), so it must surface the same diagnostic once
-    // migrated — this is the historical form of the surface the plan for
-    // #9278 calls "agent-level".
+    // migrated — this is the historical form of the surface commonly
+    // called "agent-level" configuration.
     #[::core::prelude::v1::test]
     fn collect_warnings_flags_context_compression_enabled_via_legacy_agent_table() {
         let raw = r#"
@@ -34494,8 +34494,8 @@ allowed_users = []
 
     // Every `context_compression` knob is inert, not just `enabled` — tuning
     // fields set to non-default values must each surface their own warning
-    // with a per-field path, even with `enabled` left off (issue #9278
-    // covers the whole struct).
+    // with a per-field path, even with `enabled` left off, since the whole
+    // struct is covered.
     #[tokio::test]
     async fn collect_warnings_flags_context_compression_tuning_fields() {
         let toml = r#"

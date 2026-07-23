@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
 /// - `context_compression_unsupported`: a `runtime_profiles.<alias>.context_compression`
 ///   knob (`enabled = true`, or any other field set to a non-default value)
-///   has no runtime consumer — the context compressor was removed in #8196 —
+///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
