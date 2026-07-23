@@ -4860,7 +4860,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // (e.g. WhatsApp Web) can return Ok(()) without the supervisor
                 // treating it as an unexpected exit and restarting them.
                 let ctrlc_cancel = cancel.clone();
-                let _ctrlc_guard = tokio::spawn(async move {
+                let _ctrlc_guard = ::zeroclaw_spawn::spawn!(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     ctrlc_cancel.cancel();
                 });
