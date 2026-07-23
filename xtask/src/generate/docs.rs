@@ -217,6 +217,105 @@ pub fn render_markdown() -> anyhow::Result<String> {
     render_routes(&spec::install_routes()?)
 }
 
+const WINDOWS_PREBUILT_ZONE: &str = "windows-prebuilt-powershell";
+
+fn windows_begin() -> String {
+    format!(
+        "<!-- >>> generated:{WINDOWS_PREBUILT_ZONE} by `cargo generate installers` - do not edit <<< -->"
+    )
+}
+
+fn windows_end() -> String {
+    format!("<!-- >>> end generated:{WINDOWS_PREBUILT_ZONE} <<< -->")
+}
+
+fn render_windows_prebuilt_block(routes: &[InstallRoute]) -> anyhow::Result<String> {
+    let route = routes
+        .iter()
+        .find(|route| route.id == RouteId::WindowsPrebuilt)
+        .ok_or_else(|| anyhow::Error::msg("missing canonical Windows prebuilt route"))?;
+    let variant = route.variant(Platform::Windows)?;
+    anyhow::ensure!(
+        matches!(variant.invocation, Invocation::ManualPrebuilt)
+            && variant.interaction == Interaction::NonInteractive
+            && variant.branch == BranchPolicy::PrebuiltOnly
+            && matches!(variant.apps, AppPolicy::ArchiveOptional(_))
+            && variant.features == FeaturePolicy::Fixed
+            && variant.rust == RustPolicy::NotRequired
+            && variant.path_effect == PathEffect::CurrentAndFutureShell
+            && variant.handoff == QuickstartHandoff::RunAutomatically,
+        "Windows prebuilt route no longer matches the maintained PowerShell boundary"
+    );
+
+    let quickstart_subcommand = variant
+        .quickstart_command
+        .strip_prefix("zeroclaw ")
+        .filter(|subcommand| !subcommand.is_empty() && !subcommand.contains(char::is_whitespace))
+        .ok_or_else(|| anyhow::Error::msg("Windows Quickstart command must be one subcommand"))?;
+
+    Ok(r#"```powershell
+# Idempotent: re-running this block is a no-op when zeroclaw is already
+# installed at the latest release and on the user PATH. After a release
+# bumps, the version check fails and the install side runs again.
+$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
+$dst = "$env:USERPROFILE\.zeroclaw\bin"
+$exe = "$dst\zeroclaw.exe"
+
+$current = if (Test-Path $exe) {
+    ((& $exe --version 2>$null) | Select-String -Pattern '\d+\.\d+\.\d+').Matches.Value
+} else { '' }
+
+if ($current -ne $ver) {
+    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
+    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+}
+
+$environment = [Environment]
+$userPath = $environment::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $dst) {
+    $environment::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+}
+if (($env:Path -split ';') -notcontains $dst) {
+    $env:Path = "$dst;$env:Path"
+}
+
+& $exe __QUICKSTART_SUBCOMMAND__
+```"#
+        .replace("__QUICKSTART_SUBCOMMAND__", quickstart_subcommand))
+}
+
+pub fn render_windows_guide(_root: &Path, current: &str) -> anyhow::Result<String> {
+    let begin = windows_begin();
+    let end = windows_end();
+    let begin_count = current.match_indices(&begin).count();
+    let end_count = current.match_indices(&end).count();
+    anyhow::ensure!(
+        begin_count == 1 && end_count == 1,
+        "Windows prebuilt guide must contain exactly one generated sentinel pair"
+    );
+    let begin_at = current
+        .find(&begin)
+        .ok_or_else(|| anyhow::Error::msg("missing Windows prebuilt begin sentinel"))?;
+    let after_begin = begin_at + begin.len();
+    let end_at = current
+        .find(&end)
+        .ok_or_else(|| anyhow::Error::msg("missing Windows prebuilt end sentinel"))?;
+    anyhow::ensure!(
+        after_begin < end_at,
+        "Windows prebuilt sentinels are out of order"
+    );
+
+    let mut rendered = String::new();
+    rendered.push_str(&current[..after_begin]);
+    rendered.push('\n');
+    rendered.push_str(&render_windows_prebuilt_block(&spec::install_routes()?)?);
+    rendered.push('\n');
+    rendered.push_str(&current[end_at..]);
+    Ok(rendered)
+}
+
 pub fn render_file(_root: &Path, _current: &str) -> anyhow::Result<String> {
     render_markdown()
 }
@@ -312,6 +411,63 @@ mod tests {
             |variant| variant.interaction = Interaction::Guided,
         );
         assert!(render_routes(&wrong_interaction).is_err());
+    }
+
+    #[test]
+    fn windows_prebuilt_route_rejects_handwritten_guide_drift() {
+        let guide = std::fs::read_to_string(root().join("docs/book/src/setup/windows.md")).unwrap();
+        let mutations = [
+            ("install guard", "if ($current -ne $ver) {", "if ($false) {"),
+            (
+                "archive extraction",
+                "    Expand-Archive -Force -Path \"$env:TEMP\\zeroclaw.zip\" -DestinationPath $dst",
+                "    # archive extraction removed",
+            ),
+            (
+                "persistent PATH",
+                "    $environment::SetEnvironmentVariable('Path', \"$dst;$userPath\", 'User')",
+                "    # persistent PATH update removed",
+            ),
+            (
+                "current PATH",
+                "    $env:Path = \"$dst;$env:Path\"",
+                "    # current PATH update removed",
+            ),
+            (
+                "automatic Quickstart",
+                "& $exe quickstart",
+                "Write-Host 'Run zeroclaw quickstart later'",
+            ),
+        ];
+
+        for (name, current, divergent) in mutations {
+            let mismatch = guide.replacen(current, divergent, 1);
+            assert_ne!(guide, mismatch, "{name} fixture must modify windows.md");
+            assert_eq!(
+                guide,
+                render_windows_guide(&root(), &mismatch).unwrap(),
+                "installer generation must restore Windows {name} drift"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_prebuilt_guide_is_fresh_and_idempotent() {
+        let guide = std::fs::read_to_string(root().join("docs/book/src/setup/windows.md")).unwrap();
+        let once = render_windows_guide(&root(), &guide).unwrap();
+        let twice = render_windows_guide(&root(), &once).unwrap();
+        assert_eq!(
+            guide, once,
+            "checked-in Windows guide must be freshly rendered"
+        );
+        assert_eq!(once, twice, "Windows guide render must be idempotent");
+    }
+
+    #[test]
+    fn windows_prebuilt_guide_rejects_duplicate_sentinels() {
+        let guide = std::fs::read_to_string(root().join("docs/book/src/setup/windows.md")).unwrap();
+        let duplicate = format!("{guide}\n{}\n{}", windows_begin(), windows_end());
+        assert!(render_windows_guide(&root(), &duplicate).is_err());
     }
 
     fn mutate_variant(

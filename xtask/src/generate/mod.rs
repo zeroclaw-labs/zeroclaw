@@ -1,7 +1,7 @@
-//! `cargo generate installers` - render install surfaces (setup.bat,
-//! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
-//! install.sh@HEAD is the behavioral reference. The spec is the single source
-//! of truth; surfaces are derived and drift-checked. Surfaces are registered in
+//! `cargo generate installers` - render install surfaces from canonical route
+//! semantics and deterministic renderer bodies. The spec owns route policy;
+//! renderers own generated surface content; content outside generated zones is
+//! hand-authored. Every tracked surface is registered below and drift-checked.
 
 pub mod container;
 pub mod container_base;
@@ -18,7 +18,7 @@ use spec::Selection as Sel;
 use std::path::{Path, PathBuf};
 
 /// A render: given the workspace root and the file's current content, produce
-/// the regenerated content (splicing only sentinel zones).
+/// either a whole-file rendering or a rendering with sentinel zones spliced.
 type Render = fn(&Path, &str) -> anyhow::Result<String>;
 
 /// One registered surface: a canonical name and the file it owns + how to
@@ -46,6 +46,11 @@ fn registry() -> Vec<Surface> {
             name: "install-docs",
             file: "docs/book/src/_snippets/install.md",
             render: docs::render_file,
+        },
+        Surface {
+            name: "windows-prebuilt-guide",
+            file: "docs/book/src/setup/windows.md",
+            render: docs::render_windows_guide,
         },
         Surface {
             name: "containerfile",

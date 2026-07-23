@@ -14,6 +14,7 @@ Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on y
 
 From a PowerShell prompt:
 
+<!-- >>> generated:windows-prebuilt-powershell by `cargo generate installers` - do not edit <<< -->
 ```powershell
 # Idempotent: re-running this block is a no-op when zeroclaw is already
 # installed at the latest release and on the user PATH. After a release
@@ -44,6 +45,7 @@ if (($env:Path -split ';') -notcontains $dst) {
 
 & $exe quickstart
 ```
+<!-- >>> end generated:windows-prebuilt-powershell <<< -->
 
 For the stable behavior shared by the Windows prebuilt and source routes, see the [canonical installation paths](../getting-started/quickstart.md#install). Release availability and the PowerShell download block remain documented here because they depend on live GitHub assets.
 

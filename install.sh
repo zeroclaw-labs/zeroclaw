@@ -822,8 +822,10 @@ while [ $# -gt 0 ]; do
   --dry-run) DRY_RUN=true ;;
   --no-modify-path) MODIFY_PATH=false ;;
   --skip-quickstart) SKIP_QUICKSTART=true ;;
+  # >>> generated:route-flags by `cargo generate installers` - do not edit <<<
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
+  # >>> end generated:route-flags <<<
   --uninstall) UNINSTALL=true ;;
   -h | --help)
     usage
@@ -869,10 +871,10 @@ fi
 
 # ── Decide: pre-built or source ───────────────────────────────────
 
+  # >>> generated:route-decision by `cargo generate installers` - do not edit <<<
 # --minimal, --features, --apps, --without-gateway, or --preset full imply
-# source. Prebuilt binaries always ship with default features and no apps,
-# so any flag that changes the feature set or selects apps must force a
-# source build.
+# source. Prebuilt archives have fixed feature and app contents, so any flag
+# that changes the feature set or selects apps must force a source build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] || [ -n "$USER_APPS" ] ||
   [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
   INSTALL_MODE="source"
@@ -910,6 +912,7 @@ if [ "$INSTALL_MODE" = "prebuilt" ]; then
     PREBUILT_OK=false
   fi
 fi
+  # >>> end generated:route-decision <<<
 
 [ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
   BIN="$CARGO_HOME/bin/zeroclaw"
@@ -928,12 +931,9 @@ fi
 
 # ── Locate source ─────────────────────────────────────────────────
 
-[ "${PREBUILT_OK:-false}" = true ] && {
-  # Jump past the source build to PATH + quickstart
-  SOURCE_SKIPPED=true
-}
-
-if [ "${SOURCE_SKIPPED:-false}" != true ]; then
+  # >>> generated:source-dispatch-open by `cargo generate installers` - do not edit <<<
+if [ "${PREBUILT_OK:-false}" != true ]; then
+  # >>> end generated:source-dispatch-open <<<
 
   echo
   printf "%s\n" "$(bold "ZeroClaw — source install")"
@@ -968,6 +968,7 @@ if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
   # ── Preflight: Rust ───────────────────────────────────────────────
 
+  # >>> generated:rust-bootstrap by `cargo generate installers` - do not edit <<<
   NEED_RUST=false
   if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     NEED_RUST=true
@@ -993,6 +994,7 @@ if [ "${SOURCE_SKIPPED:-false}" != true ]; then
     fi
     info "Rust $RUST_VERSION (>= $MSRV)"
   fi
+  # >>> end generated:rust-bootstrap <<<
 
   # ── Preflight: 32-bit ARM ────────────────────────────────────────
 
@@ -1058,6 +1060,7 @@ See all available features:
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
   # `--without-gateway`, and any non-interactive run (curl | bash).
+  # >>> generated:feature-picker by `cargo generate installers` - do not edit <<<
   if [ -t 0 ] &&
     [ "$MINIMAL" != true ] &&
     [ -z "$USER_FEATURES" ] &&
@@ -1094,6 +1097,7 @@ See all available features:
       CARGO_FLAGS="$CARGO_FLAGS --features $USER_FEATURES"
     fi
   fi
+  # >>> end generated:feature-picker <<<
 
   # ── Detect existing installs ──────────────────────────────────────
 
@@ -1201,6 +1205,7 @@ See all available features:
   # Resolve the app set: explicit --apps list, "none" to skip, or the
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
+  # >>> generated:app-selection by `cargo generate installers` - do not edit <<<
   if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
     # --full installs every discovered app (an explicit --apps still wins) —
     # except Tauri-based apps (tauri.conf.json present): they need the Tauri
@@ -1252,6 +1257,7 @@ See all available features:
       cargo install --path "$app_path" --locked --force
     fi
   done
+  # >>> end generated:app-selection <<<
 
   # ── Summary ───────────────────────────────────────────────────────
 
@@ -1281,12 +1287,15 @@ See all available features:
     fi
   fi
 
+  # >>> generated:source-dispatch-close by `cargo generate installers` - do not edit <<<
 fi # end source build block
+  # >>> end generated:source-dispatch-close <<<
 
 BIN="$CARGO_HOME/bin/zeroclaw"
 
 # ── PATH setup ────────────────────────────────────────────────────
 
+  # >>> generated:path-handoff by `cargo generate installers` - do not edit <<<
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
@@ -1333,9 +1342,11 @@ else
   # --no-modify-path, or a custom --prefix install we won't auto-edit for.
   print_path_help
 fi
+  # >>> end generated:path-handoff <<<
 
 # ── Quickstart prompt ─────────────────────────────────────────────
 
+  # >>> generated:quickstart-handoff by `cargo generate installers` - do not edit <<<
 if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   # Skip the prompt entirely when the operator already has a configured
   # ZeroClaw — re-installs should not re-prompt.
@@ -1377,6 +1388,7 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
     info "Non-interactive — skipping setup prompt. Run '$QUICKSTART_COMMAND' to configure."
   fi
 fi
+  # >>> end generated:quickstart-handoff <<<
 
 echo
 # Next-step hint, smartest-first: if zerocode (the TUI) was installed, that's
