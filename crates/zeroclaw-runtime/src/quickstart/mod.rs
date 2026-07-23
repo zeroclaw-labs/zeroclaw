@@ -1605,6 +1605,28 @@ fn apply_channels(
                     ));
                     failed = true;
                 }
+                if !failed
+                    && config_channel_type == "discord"
+                    && let Some(discord) = staged.channels.discord.get(alias)
+                    && let Err(err) = discord.validate_bot_token(alias)
+                {
+                    let structured =
+                        zeroclaw_config::api_error::ConfigApiError::from_validation(err);
+                    let terminal = structured
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.rsplit('.').next())
+                        .unwrap_or("credential");
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.{terminal}"),
+                        structured.message,
+                        "cli-quickstart-error-channel-token-required",
+                        &[],
+                    ));
+                    failed = true;
+                }
                 if failed {
                     continue;
                 }
@@ -2839,6 +2861,32 @@ mod tests {
             let fields = value.map_or_else(Vec::new, |value| vec![("bot_token", value)]);
             submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
                 "telegram", "ops", &fields,
+            ))];
+
+            let errors = validate_only(&submission, &cfg).expect_err("token must be rejected");
+            assert!(errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.bot_token"
+                    && error.message.contains("required")
+            }));
+        }
+    }
+
+    #[test]
+    fn discord_channel_fields_reject_unusable_bot_token_values() {
+        // Discord twin of telegram_channel_fields_reject_unusable_bot_token_values:
+        // the quickstart arm calls DiscordConfig::validate_bot_token (#9236).
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
+            let cfg = Config::default();
+            let mut submission = fresh_submission("bot");
+            let fields = value.map_or_else(Vec::new, |value| vec![("bot_token", value)]);
+            submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+                "discord", "ops", &fields,
             ))];
 
             let errors = validate_only(&submission, &cfg).expect_err("token must be rejected");

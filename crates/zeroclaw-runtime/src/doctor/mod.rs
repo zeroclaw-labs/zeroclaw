@@ -1117,6 +1117,31 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
+    // Enabled bot channels with no token: a partial alias survives the
+    // resilient load (`bot_token` has a serde default, #9236), so it never
+    // reaches `degraded_sections` — doctor must name the unset field here
+    // or the operator only finds out when the channel fails to start.
+    for (alias, tg) in &cc.telegram {
+        if tg.enabled && zeroclaw_config::traits::is_unset_display_value(&tg.bot_token) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "channels.telegram.{alias}.bot_token is unset but the channel is enabled — the channel cannot connect until a bot token is set"
+                ),
+            ));
+        }
+    }
+    for (alias, dc) in &cc.discord {
+        if dc.enabled && zeroclaw_config::traits::is_unset_display_value(&dc.bot_token) {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "channels.discord.{alias}.bot_token is unset but the channel is enabled — the channel cannot connect until a bot token is set"
+                ),
+            ));
+        }
+    }
+
     // Delegate agents: model_provider validity (resolved from model_provider alias)
     let mut agent_names: Vec<_> = config.agents.keys().collect();
     agent_names.sort();
@@ -2003,6 +2028,67 @@ mod tests {
             "doctor should surface dangling fallback refs"
         );
         assert_eq!(fallback_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_enabled_tokenless_bot_channels() {
+        // #9236: a partial (tokenless) alias survives the resilient load and
+        // never reaches degraded_sections, so doctor must flag the unset
+        // bot_token itself when the alias is enabled.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        for path in [
+            "channels.telegram.default.bot_token",
+            "channels.discord.default.bot_token",
+        ] {
+            let item = items.iter().find(|i| i.message.contains(path));
+            assert!(
+                item.is_some(),
+                "doctor should flag enabled tokenless alias at {path}, got {:?}",
+                items.iter().map(|i| &i.message).collect::<Vec<_>>()
+            );
+            assert_eq!(item.unwrap().severity, Severity::Warn);
+        }
+    }
+
+    #[test]
+    fn config_validation_ignores_disabled_tokenless_bot_channels() {
+        // A staged (disabled) tokenless alias is a normal intermediate state
+        // — quickstart and `config set` create exactly this — so doctor must
+        // not warn about it.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig::default(),
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig::default(),
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items.iter().any(|i| i.message.contains(".bot_token")),
+            "doctor must not flag disabled tokenless aliases, got {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -9597,6 +9597,32 @@ fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Shared bot-token rule for channel structs whose `bot_token` is required
+/// once the alias is enabled (Telegram, Discord). `field_path` must be the
+/// `channels.<type>.<alias>.bot_token` leaf; the enabled-state message
+/// derives the sibling `.enabled` path from it.
+fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> Result<()> {
+    if token.trim() == crate::traits::UNSET_DISPLAY {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} must not contain the unset display placeholder",
+        );
+    }
+    if enabled && crate::traits::is_unset_display_value(token) {
+        let enabled_path = field_path.strip_suffix("bot_token").map_or_else(
+            || field_path.to_string(),
+            |prefix| format!("{prefix}enabled"),
+        );
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} is required when {enabled_path} = true",
+        );
+    }
+    Ok(())
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -13498,9 +13524,16 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Telegram Bot API token (from @BotFather).
+    /// Telegram Bot API token (from @BotFather). `#[serde(default)]` so a
+    /// config that omits or later has it pruned (e.g. a freshly created
+    /// alias with an empty token, stripped by `prune_empty_leaves` before
+    /// write) still deserializes as an empty string - instead of failing
+    /// with `missing field 'bot_token'` and getting dropped by the resilient
+    /// salvage pass. `validate_bot_token` below still requires a real token
+    /// once `enabled = true`.
     #[secret]
     #[tab(Connection)]
+    #[serde(default)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
     /// Telegram Bot API base URL. Defaults to the official Telegram endpoint;
@@ -13591,21 +13624,11 @@ impl Default for TelegramConfig {
 impl TelegramConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
-        if self.bot_token.trim() == crate::traits::UNSET_DISPLAY {
-            validation_bail!(
-                RequiredFieldEmpty,
-                format!("channels.telegram.{alias}.bot_token"),
-                "channels.telegram.{alias}.bot_token must not contain the unset display placeholder",
-            );
-        }
-        if self.enabled && crate::traits::is_unset_display_value(&self.bot_token) {
-            validation_bail!(
-                RequiredFieldEmpty,
-                format!("channels.telegram.{alias}.bot_token"),
-                "channels.telegram.{alias}.bot_token is required when channels.telegram.{alias}.enabled = true",
-            );
-        }
-        Ok(())
+        validate_required_bot_token(
+            &format!("channels.telegram.{alias}.bot_token"),
+            self.enabled,
+            &self.bot_token,
+        )
     }
 }
 
@@ -13652,9 +13675,14 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Discord bot token (from Discord Developer Portal).
+    /// Discord bot token (from Discord Developer Portal). `#[serde(default)]`
+    /// for the same reason as `TelegramConfig::bot_token`: a missing token
+    /// must deserialize as an empty string instead of salvage-dropping the
+    /// alias; `validate_bot_token` still requires a real token once
+    /// `enabled = true`.
     #[secret]
     #[tab(Connection)]
+    #[serde(default)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
     /// Guild (server) IDs to restrict the bot to. Empty = listen across all
@@ -13776,6 +13804,18 @@ pub struct DiscordConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl DiscordConfig {
+    /// Validate this alias's bot-token placeholder and enabled-state rules.
+    /// Mirrors `TelegramConfig::validate_bot_token`.
+    pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
+        validate_required_bot_token(
+            &format!("channels.discord.{alias}.bot_token"),
+            self.enabled,
+            &self.bot_token,
+        )
+    }
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -19184,6 +19224,10 @@ impl Config {
             )?;
         }
 
+        for (alias, dc) in &self.channels.discord {
+            dc.validate_bot_token(alias)?;
+        }
+
         // Git forge channel: a PAT-backed provider must name its API origin
         // explicitly. There is deliberately no default host - every request
         // carries `access_token` as a bearer credential, so guessing an
@@ -23735,6 +23779,78 @@ api_base_url = "http://127.0.0.1:8081"
             .expect_err("the unset display sentinel must never become persisted config");
     }
 
+    #[test]
+    async fn validate_rejects_enabled_discord_without_bot_token() {
+        let mut config = Config::default();
+        config.channels.discord.insert(
+            "discord".to_string(),
+            DiscordConfig {
+                enabled: true,
+                bot_token: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Discord channel must require a bot token");
+        assert!(
+            err.to_string()
+                .contains("channels.discord.discord.bot_token")
+        );
+    }
+
+    #[test]
+    async fn validate_allows_disabled_discord_without_bot_token() {
+        let mut config = Config::default();
+        config.channels.discord.insert(
+            "discord".to_string(),
+            DiscordConfig {
+                enabled: false,
+                bot_token: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Discord channel may be staged without a bot token");
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_discord_with_unset_display_token() {
+        let mut config = Config::default();
+        config.channels.discord.insert(
+            "discord".to_string(),
+            DiscordConfig {
+                enabled: true,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect_err("enabled Discord channel must reject the display sentinel");
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_discord_with_unset_display_token() {
+        let mut config = Config::default();
+        config.channels.discord.insert(
+            "discord".to_string(),
+            DiscordConfig {
+                enabled: false,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect_err("the unset display sentinel must never become persisted config");
+    }
+
     // Regression (fail closed, both PAT-backed forge providers): a Gitea or
     // Forgejo alias with an access token but no api_base_url must be rejected
     // at config-validation time. The old behavior silently defaulted to
@@ -28081,9 +28197,11 @@ audit = "should-be-a-table-not-a-string"
     async fn load_or_init_assigns_degraded_sections_for_malformed_channel_alias() {
         // Regression: `doctor` was blind to degraded_sections even though
         // load_or_init already populates it correctly. A [channels.telegram]
-        // alias missing the required `bot_token` must be pruned (not fatal)
-        // and its path recorded on `degraded_sections` so downstream
-        // diagnostics (zeroclaw-runtime's check_degraded_sections) can name it.
+        // alias with a type-corrupt `bot_token` (not merely missing - see
+        // #9236, where a missing bot_token must survive salvage instead of
+        // being dropped) must be pruned (not fatal) and its path recorded on
+        // `degraded_sections` so downstream diagnostics (zeroclaw-runtime's
+        // check_degraded_sections) can name it.
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
@@ -28097,6 +28215,7 @@ audit = "should-be-a-table-not-a-string"
 
 [channels.telegram.default]
 enabled = true
+bot_token = 42
 "#,
         )
         .await
@@ -28117,6 +28236,61 @@ enabled = true
                 .any(|s| s == "channels.telegram.default"),
             "load_or_init must surface a dropped [channels.telegram.default] alias on \
              degraded_sections, got {:?}",
+            config.degraded_sections
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn load_or_init_keeps_partial_channel_alias_out_of_degraded_sections() {
+        // #9236 end-to-end companion to the salvage-layer tests: through the
+        // real load_or_init entry point, a partial (tokenless) telegram alias
+        // must load intact and must NOT be reported on degraded_sections.
+        // Disabled so Config::validate() stays quiet about the missing token.
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        fs::write(
+            &config_path,
+            r#"schema_version = 3
+
+[channels.telegram.default]
+enabled = false
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert!(
+            config.channels.telegram.contains_key("default"),
+            "a partial (tokenless) alias must survive load_or_init, got {:?}",
+            config.channels.telegram.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            config.degraded_sections.is_empty(),
+            "a partial (tokenless) alias must not be reported as degraded, got {:?}",
             config.degraded_sections
         );
 
@@ -32726,6 +32900,79 @@ model = "gpt-4o"
                 .and_then(|e| e.wire_api),
             Some(WireApi::Responses),
             "default wire_api must survive save_dirty + reload; got:\n{written}"
+        );
+    }
+
+    #[test]
+    async fn telegram_alias_create_survives_incremental_save() {
+        // Regression for #9236: create_map_key seeds TelegramConfig::default()
+        // (bot_token = ""), save_dirty's prune_empty_leaves then strips the
+        // empty bot_token from the written TOML, and on reload the alias
+        // must still deserialize (bot_token now has #[serde(default)])
+        // instead of being silently salvage-dropped.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed a non-empty on-disk file so the incremental path runs, not
+        // the new-file fallback to full save().
+        std::fs::write(
+            &config_path,
+            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        let created = config
+            .create_map_key("channels.telegram", "myalias")
+            .expect("map-keyed section accepts a new alias");
+        assert!(created);
+        config.mark_dirty("channels.telegram.myalias");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert!(
+            reloaded.channels.telegram.contains_key("myalias"),
+            "created telegram alias must survive save_dirty + reload; got:\n{written}"
+        );
+    }
+
+    #[test]
+    async fn discord_alias_create_survives_incremental_save() {
+        // Discord twin of telegram_alias_create_survives_incremental_save
+        // (#9236): DiscordConfig.bot_token has the same serde default.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed a non-empty on-disk file so the incremental path runs, not
+        // the new-file fallback to full save().
+        std::fs::write(
+            &config_path,
+            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        let created = config
+            .create_map_key("channels.discord", "myalias")
+            .expect("map-keyed section accepts a new alias");
+        assert!(created);
+        config.mark_dirty("channels.discord.myalias");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert!(
+            reloaded.channels.discord.contains_key("myalias"),
+            "created discord alias must survive save_dirty + reload; got:\n{written}"
         );
     }
 
