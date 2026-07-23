@@ -1623,28 +1623,50 @@ mod tests {
     /// visible in some other state, so only genuine reaping empties the output.
     /// Returns `false` if the pid is still present after the timeout.
     ///
-    /// The probe fails closed: `ps` reports "no such process" only by exiting
-    /// non-zero with empty output, so a probe that errors or is unsupported
-    /// panics instead of being read as a successful disappearance. Otherwise a
-    /// broken probe would make every reap assertion below pass vacuously.
+    /// The probe fails closed. "Exited non-zero with no output" is not on its own
+    /// proof of absence — a `ps` that is unsupported, restricted, or mis-invoked
+    /// can look identical — so absence is only believed from a probe already
+    /// demonstrated to work: each call first confirms the probe *can* see a pid
+    /// that is definitely alive (this test process). A probe that cannot do that,
+    /// or that fails in any other way, panics rather than being read as a
+    /// successful disappearance, which would make every reap assertion here pass
+    /// vacuously.
     #[cfg(unix)]
     async fn wait_until_reaped(pid: u32) -> bool {
-        for _ in 0..200 {
+        /// Raw `ps` result for one pid: `Some(state)` when listed, `None` when the
+        /// process table reports no such pid. Anything else panics.
+        fn probe(pid: u32) -> Option<String> {
             let out = std::process::Command::new("ps")
                 .args(["-o", "stat=", "-p", &pid.to_string()])
                 .output()
                 .expect("run ps");
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let stat = stdout.trim();
-            match (out.status.code(), stat.is_empty()) {
+            let stat = stdout.trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = stderr.trim();
+            match (out.status.code(), stat.is_empty(), stderr.is_empty()) {
                 // Listed with a state: still in the process table (running or zombie).
-                (Some(0), false) => {}
-                // Not listed: the pid is gone, so the process was reaped.
-                (Some(1), true) => return true,
+                (Some(0), false, true) => Some(stat),
+                // Not listed, and the probe itself had nothing to complain about.
+                (Some(1), true, true) => None,
                 other => panic!(
-                    "ps probe for pid {pid} is unusable ({other:?}, stdout {stat:?}, stderr {:?})",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    "ps probe for pid {pid} is unusable ({other:?}, stdout {stat:?}, stderr {stderr:?})"
                 ),
+            }
+        }
+
+        let self_pid = std::process::id();
+        for _ in 0..200 {
+            let gone = probe(pid).is_none();
+            // Only trust an absence reported by a probe that is demonstrably able
+            // to report presence.
+            assert!(
+                probe(self_pid).is_some(),
+                "ps probe cannot see this live test process ({self_pid}), so its \
+                 report about pid {pid} proves nothing"
+            );
+            if gone {
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1812,9 +1834,14 @@ mod tests {
             name: "reap-on-close".into(),
             transport: McpTransport::Stdio,
             command: "sh".into(),
+            // The marker path is passed as a positional argument rather than
+            // interpolated into the script, so a `TMPDIR` containing spaces or
+            // shell metacharacters cannot break the test.
             args: vec![
                 "-c".into(),
-                format!("cat >/dev/null; printf eof > {}", marker.display()),
+                "cat >/dev/null; printf eof > \"$1\"".into(),
+                "sh".into(),
+                marker.to_string_lossy().into_owned(),
             ],
             ..Default::default()
         };
