@@ -1529,7 +1529,17 @@ async fn drive_live_sop_actions(
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    model_switch_callback: Option<ModelSwitchCallback>,
+    // The enclosing round's own switch state (`run_tool_call_loop`'s
+    // `model_switch_state`, threaded through by the caller exactly like
+    // every other per-round context value here). Deliberately UNUSED: every
+    // nested step loop this function drives — same-agent or cross-agent —
+    // mints its own fresh switch state at its `ToolLoop` construction site
+    // below instead of inheriting this one, so a step's `model_switch` can
+    // never mutate the enclosing round's shared `Arc`. Kept in the
+    // signature (rather than dropped) so the call site stays symmetric with
+    // its sibling per-round parameters and so tests can pass a distinct
+    // `Arc` here and assert it is untouched after a nested step's switch.
+    _model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
     strict_tool_parsing: bool,
     parallel_tools: bool,
@@ -1810,7 +1820,25 @@ async fn drive_live_sop_actions(
                                             config,
                                             hooks,
                                             activated_tools: eff_activated,
-                                            model_switch_callback: model_switch_callback.clone(),
+                                            // Deliberately NOT the outer round's
+                                            // `model_switch_callback`: every nested
+                                            // step loop — same-agent or cross-agent —
+                                            // gets `None` here, so `run_tool_call_loop`
+                                            // mints a fresh, isolated switch state
+                                            // scoped to just this child call (see its
+                                            // top-of-function fallback). Reusing the
+                                            // parent's shared state let a child's
+                                            // `model_switch` mutate the SAME `Arc` the
+                                            // parent round checks after every
+                                            // iteration, so a cross-agent step's own
+                                            // switch could silently become the
+                                            // parent's. A switch still reaches the
+                                            // caller correctly: it surfaces as this
+                                            // child loop's own `ModelSwitchRequested`
+                                            // error, not via continued access to
+                                            // shared mutable state after the call
+                                            // returns.
+                                            model_switch_callback: None,
                                             receipt_generator,
                                         },
                                         ResolvedRuntimeKnobs {
@@ -2781,6 +2809,11 @@ mod sop_step_reassembly_tests {
         new_messages_out: Option<&mut Vec<ChatMessage>>,
         agent_alias: Option<&str>,
         sop_reassembly: Option<SopStepReassembly<'_>>,
+        // The (would-be) enclosing round's own switch state. Real callers
+        // always pass `None` here (they have no enclosing round); the
+        // isolation regression below passes `Some(parent_arc)` to prove the
+        // nested step loop never touches it.
+        model_switch_callback: Option<ModelSwitchCallback>,
         exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
     ) {
         use crate::sop::executor::QueuedSopAction;
@@ -2808,7 +2841,7 @@ mod sop_step_reassembly_tests {
             &[],
             &[],
             None,
-            None,
+            model_switch_callback,
             &zeroclaw_config::schema::PacingConfig::default(),
             false,
             false,
@@ -2897,6 +2930,7 @@ mod sop_step_reassembly_tests {
             Some(&mut new_out),
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3004,6 +3038,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3079,6 +3114,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3124,6 +3160,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3182,6 +3219,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             Some(handle),
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3226,6 +3264,7 @@ mod sop_step_reassembly_tests {
             None,
             Some("outer"),
             None,
+            None,
             &mut exec_cache,
         )
         .await;
@@ -3243,6 +3282,196 @@ mod sop_step_reassembly_tests {
             step1_result(&engine, &run_id).status,
             crate::sop::types::SopStepStatus::Failed,
             "the no-handle cross-agent step must fail closed"
+        );
+    }
+
+    // ── Model-switch isolation ──────────────────────────────────────────────
+
+    /// The CHILD provider for the model-switch isolation regression: its
+    /// first (and only expected) call emits a tool call that queues a
+    /// pending model switch on whatever task-local switch state is ambient
+    /// when the tool runs — the CHILD's own if isolation holds, the
+    /// PARENT's if the leak regresses.
+    struct ChildSwitchProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ChildSwitchProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ChildSwitchProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ChildSwitchProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "00000000-0000-0000-0000-000000000099".into(),
+                    name: "child_model_switch".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Test tool standing in for the real `model_switch` tool inside the
+    /// CHILD step: queues a pending switch to a provider/model DISTINCT from
+    /// both the parent's and the child's own current binding, via the
+    /// ambient task-local switch state (see `current_model_switch_state`).
+    struct ChildModelSwitchTool;
+
+    ::zeroclaw_api::tool_attribution!(
+        ChildModelSwitchTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ChildModelSwitchTool {
+        fn name(&self) -> &str {
+            "child_model_switch"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a pending model switch from inside a cross-agent SOP step"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = current_model_switch_state()?;
+            *state.lock().expect("switch state lock") =
+                Some(("child-provider".to_string(), "child-model".to_string()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "switch queued".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Regression for the isolation gap: `drive_live_sop_actions` used to
+    /// clone the OUTER round's `model_switch_callback` straight into every
+    /// nested step `ToolLoop`, including cross-agent steps with their own
+    /// transcript/alias/turn id. A child's `model_switch` tool call then
+    /// mutated the SAME shared `Arc` the parent loop checks after every
+    /// iteration, so the CHILD's requested provider/model could silently
+    /// become the PARENT's. This passes a distinct `parent_switch_state`
+    /// `Arc` in — exactly what the real outer `run_tool_call_loop` threads
+    /// down as its own `model_switch_state` — and proves it is completely
+    /// untouched after a cross-agent child step's own `model_switch` fires.
+    #[tokio::test]
+    async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let mut exec_cache = std::collections::HashMap::new();
+        let mut stepper_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        stepper_agent.resolved.max_tool_iterations = 3;
+        // Full autonomy so the test tool call executes directly — approval
+        // gating for an unrecognized tool name is an orthogonal concern this
+        // regression does not exercise.
+        let stepper_risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        exec_cache.insert(
+            "stepper".to_string(),
+            OwnedAgentExecution {
+                model_provider: Box::new(ChildSwitchProvider),
+                provider_name: "child-original-provider".into(),
+                model: "child-original-model".into(),
+                temperature: None,
+                tools_registry: vec![Box::new(ChildModelSwitchTool)],
+                approval: crate::approval::ApprovalManager::for_non_interactive(
+                    &stepper_risk_profile,
+                ),
+                activated_tools: None,
+                agent: stepper_agent,
+                risk_profile: stepper_risk_profile,
+                skills: Vec::new(),
+                mcp_tool_names: std::collections::HashSet::new(),
+                mcp_prompt_section: String::new(),
+            },
+        );
+
+        // The PARENT's own switch state — exactly the `Arc` the real outer
+        // `run_tool_call_loop` creates for its round and hands down to
+        // `drive_live_sop_actions`.
+        let parent_switch_state: ModelSwitchCallback = Arc::new(std::sync::Mutex::new(None));
+
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            Some(Arc::clone(&parent_switch_state)),
+            &mut exec_cache,
+        )
+        .await;
+
+        // The parent's own switch state must be untouched: the child's
+        // `model_switch` tool call must never mutate the SAME `Arc` the
+        // enclosing round would check on its own next iteration. Under the
+        // bug (`drive_live_sop_actions` forwarding its switch-state
+        // parameter straight into the child `ToolLoop`), this would observe
+        // `Some(("child-provider", "child-model"))` instead.
+        assert_eq!(
+            *parent_switch_state
+                .lock()
+                .expect("parent switch state lock"),
+            None,
+            "a cross-agent child step's model_switch must never mutate the parent's own switch state"
+        );
+
+        // The child's own request was still observed — not silently dropped
+        // by the isolation fix: the step is recorded Failed, naming exactly
+        // the child's requested provider/model.
+        let step = step1_result(&engine, &run_id);
+        assert_eq!(
+            step.status,
+            crate::sop::types::SopStepStatus::Failed,
+            "the child's own model_switch must still surface as this step's outcome"
+        );
+        assert!(
+            step.output.contains("child-provider") && step.output.contains("child-model"),
+            "the step failure must name the CHILD's own requested switch: {}",
+            step.output
         );
     }
 }
