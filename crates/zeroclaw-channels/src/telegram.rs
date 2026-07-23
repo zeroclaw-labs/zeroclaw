@@ -928,31 +928,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Flush all in-flight multi-message drafts for `recipient` using buffered narration.
-    async fn flush_pending_multi_message_drafts_for_recipient(
-        &self,
-        recipient: &str,
-    ) -> anyhow::Result<()> {
-        if self.stream_mode != StreamMode::MultiMessage {
-            return Ok(());
-        }
-
-        let pending: Vec<String> = {
-            let drafts = self.multi_message_drafts.lock();
-            drafts
-                .keys()
-                .filter(|key| key.recipient == recipient)
-                .map(|key| key.draft_id.clone())
-                .collect()
-        };
-
-        for draft_id in pending {
-            self.flush_unsent(recipient, &draft_id).await?;
-        }
-
-        Ok(())
-    }
-
     async fn finalize_multi_message_draft(
         &self,
         recipient: &str,
@@ -4439,10 +4414,11 @@ Ensure only one `zeroclaw` process is using this bot token."
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        // Deliver buffered narration before the approval prompt so users see
-        // the agent's pre-tool message first (multi_message turn-boundary mode).
-        self.flush_pending_multi_message_drafts_for_recipient(recipient)
-            .await?;
+        // The runtime emits StreamDelta::FlushBarrier before this approval prompt;
+        // its channel handler flushes ONLY the owning draft (by draft_id) and the
+        // agent loop waits on the ack, so pre-tool narration for this turn is
+        // already delivered. A recipient-wide flush here would also publish other
+        // concurrent turns' incomplete drafts, so it is intentionally omitted.
 
         // Pace the approval prompt after the pre-tool narration: reintroduce
         // the multi_message inter-message gap between the last narration
@@ -5086,6 +5062,63 @@ mod tests {
             ch.multi_message_drafts
                 .lock()
                 .contains_key(&TelegramChannel::multi_draft_key("123", &other_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_flush_is_scoped_to_owning_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+
+        let recipient = "100:7";
+        let a = TelegramChannel::new_multi_message_draft_id();
+        let b = TelegramChannel::new_multi_message_draft_id();
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut sa = MultiDraftState::new(Some("7".into()));
+            sa.latest_visible = "A".into();
+            let mut sb = MultiDraftState::new(Some("7".into()));
+            sb.latest_visible = "B".into();
+            drafts.insert(TelegramChannel::multi_draft_key(recipient, &a), sa);
+            drafts.insert(TelegramChannel::multi_draft_key(recipient, &b), sb);
+        }
+
+        // Flushing the owning draft (the FlushBarrier path, scoped by
+        // draft_id) is the only flush primitive reachable from the approval
+        // path after the fix. It must never advance a sibling draft that
+        // happens to share the same recipient.
+        ch.flush_unsent(recipient, &a).await.unwrap();
+
+        let drafts = ch.multi_message_drafts.lock();
+        assert_eq!(
+            drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &a))
+                .unwrap()
+                .sent_text,
+            "A",
+            "the owning draft should have been flushed"
+        );
+        assert_eq!(
+            drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &b))
+                .unwrap()
+                .sent_text,
+            "",
+            "a scoped flush of draft A must never touch draft B"
         );
     }
 
