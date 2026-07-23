@@ -35,10 +35,7 @@ sys-locale = "0.3"
 
 [package]
 name = "zeroclawlabs"
-# Publishing blocked during microkernel workspace transition — see #5811.
-# All 14 workspace sub-crates are publish = false and therefore unresolvable
-# on crates.io. Flip or remove this once the multi-crate publish topology is
-# designed per RFC #5579.
+# Workspace crates are publish = false during microkernel transition.
 publish = false
 default-run = "zeroclaw"
 version.workspace = true
@@ -141,7 +138,7 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
-# Zip extraction for ClawHub / OpenClaw registry installers
+# Zip extraction (plugin registry, self-update archives)
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
@@ -312,10 +309,10 @@ default-channels = [
     "channel-filesystem",
 ]
 
-# Historical broad channel bundle. Use this for builds that should preserve the
-# pre-#6895 default channel surface.
+# Historical broad channel bundle. Preserves the older default channel surface.
 channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
+    "channel-line",
     "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
@@ -363,7 +360,7 @@ channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-lin
 channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
 channel-mochat = ["zeroclaw-channels/channel-mochat"]
-channel-wechat = ["zeroclaw-channels/channel-wechat"]
+channel-wechat = ["zeroclaw-channels/channel-wechat", "zeroclaw-gateway?/channel-wechat"]
 channel-wecom = ["zeroclaw-channels/channel-wecom"]
 channel-wecom-ws = ["zeroclaw-channels/channel-wecom-ws"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
@@ -375,7 +372,7 @@ channel-line = ["zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`
 # selects Feishu endpoints at runtime.
 channel-feishu = ["channel-lark"]
-whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+whatsapp-web = ["zeroclaw-channels/whatsapp-web", "zeroclaw-gateway?/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 

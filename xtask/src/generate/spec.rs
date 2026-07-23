@@ -2,8 +2,6 @@
 //! spec reproduces it and every surface (install.sh, setup.bat, ...) renders
 //! from it. Dry-run is intrinsic: each step pairs a `narration` (the dry-run
 //! line) with its `action` (the real op), and the rendered script chooses
-//! between them at runtime via its dry-run flag. Nothing is hardcoded in a
-//! surface; values flow from `Cargo.toml` and the resolver.
 
 use std::path::Path;
 
@@ -182,11 +180,6 @@ pub struct Resolved {
     pub cargo_flags: String,
 }
 
-/// Meta/aggregate features that are not user-selectable rows. This bit is not
-/// derivable from the feature graph, so it lives in the canonical registry at
-/// `[package.metadata.zeroclaw] non_row_features` in Cargo.toml. Read from
-/// there via `cargo_metadata`; never shadowed by a literal list here or in any
-/// surface.
 pub fn non_row_features(
     meta: &cargo_metadata::Metadata,
     pkg: &cargo_metadata::Package,
@@ -474,7 +467,7 @@ fn resolve_feature_list_from_package(
 }
 
 /// Resolve a selection and apply the registry-owned compatibility policy for
-/// one build target. Target policy is defined only for the Dist selection.
+/// one build target. Target policy is defined only for distribution selections.
 pub fn resolve_feature_list_for_target(
     manifest_dir: &Path,
     selection: &Selection,
@@ -491,8 +484,8 @@ pub fn resolve_feature_list_for_target(
     };
     anyhow::ensure!(!target.is_empty(), "target must not be empty");
     anyhow::ensure!(
-        matches!(selection, Selection::Dist),
-        "target-specific exclusions are only defined for the dist selection"
+        matches!(selection, Selection::Dist | Selection::DistBroad),
+        "target-specific exclusions are only defined for distribution selections"
     );
 
     let exclusions = dist_target_exclusions(root)?;
@@ -500,7 +493,7 @@ pub fn resolve_feature_list_for_target(
         for feature in excluded {
             anyhow::ensure!(
                 features.iter().any(|candidate| candidate == feature),
-                "dist_target_exclusions.{configured_target} names `{feature}`, which is not in the dist selection"
+                "dist_target_exclusions.{configured_target} names `{feature}`, which is not in the selected distribution"
             );
         }
     }
@@ -598,6 +591,10 @@ pub enum Selection {
     /// registry-owned distribution additions. The set a single-artifact
     /// package manager ships.
     Dist,
+    /// Measurement-only broad distribution: `Dist` plus the canonical
+    /// `channels-full` aggregate. Not offered by installer menus until a
+    /// stable broad artifact lifecycle exists.
+    DistBroad,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
     All,
@@ -613,6 +610,7 @@ impl Selection {
             Selection::Full => "default",
             Selection::Minimal => "minimal",
             Selection::Dist => "dist",
+            Selection::DistBroad => "dist-broad",
             Selection::All => "all",
             Selection::Features(_) => "custom",
         }
@@ -625,21 +623,36 @@ impl Selection {
             Selection::Full => "default feature set",
             Selection::Minimal => "core only, no default features",
             Selection::Dist => "lean standard distribution (recommended)",
+            Selection::DistBroad => "broad-channel distribution measurement build",
             Selection::All => "every feature including hardware and browser",
             Selection::Features(_) => "custom feature selection",
         }
     }
 
-    /// The selections a packaged/menu surface offers, in menu order. Single
-    /// source for "which build modes exist"; surfaces walk this, they do not
-    /// enumerate modes themselves.
-    pub fn menu() -> Vec<Selection> {
+    /// Every named selection accepted by the feature resolver.
+    pub fn named() -> Vec<Selection> {
         vec![
             Selection::Minimal,
             Selection::Dist,
+            Selection::DistBroad,
             Selection::Full,
             Selection::All,
         ]
+    }
+
+    /// The selections a packaged/menu surface offers, in menu order.
+    pub fn menu() -> Vec<Selection> {
+        Self::named()
+            .into_iter()
+            .filter(|selection| !matches!(selection, Selection::DistBroad))
+            .collect()
+    }
+
+    /// Resolve a named build selection without coupling it to installer menus.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::named()
+            .into_iter()
+            .find(|selection| selection.id() == id)
     }
 
     /// Cargo flag string for this selection (wraps `to_feature_list`).
@@ -657,7 +670,7 @@ impl Selection {
         let mut set = match self {
             Selection::Minimal => Vec::new(),
             Selection::Full => ctx.expand("default"),
-            Selection::Dist => {
+            Selection::Dist | Selection::DistBroad => {
                 let mut s = ctx.expand("default");
                 for feature in ctx.dist_extra {
                     anyhow::ensure!(
@@ -665,6 +678,9 @@ impl Selection {
                         "unknown dist_extra_features entry `{feature}` (not in [features])"
                     );
                     s.push(feature.clone());
+                }
+                if matches!(self, Selection::DistBroad) {
+                    s.extend(ctx.expand("channels-full"));
                 }
                 s
             }
@@ -759,11 +775,6 @@ impl FeatureCtx<'_> {
     }
 }
 
-/// The web/dist path EXPRESSION each surface emits - resolved on the END
-/// USER's machine at install time, never baked to the generator host. The
-/// expression mirrors `BaseDirs::data_local_dir` semantics (LOCALAPPDATA on
-/// Windows, XDG_DATA_HOME/.local/share on Linux) so the rendered path matches
-/// the gateway's runtime auto-detect.
 pub fn web_data_dir_expr(platform: Platform) -> &'static str {
     match platform {
         // Unix renderer's else-arm (Linux). The macOS arm is emitted by the
@@ -850,6 +861,52 @@ mod tests {
     }
 
     #[test]
+    fn dist_broad_derives_membership_from_channels_full() {
+        let meta = cargo_metadata::MetadataCommand::new()
+            .manifest_path(root().join("Cargo.toml"))
+            .no_deps()
+            .exec()
+            .unwrap();
+        let pkg = workspace_root_package(&meta).unwrap();
+        let all_features: Vec<String> = pkg.features.keys().cloned().collect();
+        let non_row = non_row_features(&meta, pkg);
+        let dist_extra = dist_extra_features(pkg).unwrap();
+        let container_excluded = container_excluded_features(pkg);
+        let ctx = FeatureCtx {
+            graph: &pkg.features,
+            all: &all_features,
+            non_row: &non_row,
+            dist_extra: &dist_extra,
+            container_excluded: &container_excluded,
+        };
+
+        let mut expected = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        expected.extend(ctx.expand("channels-full"));
+        expected.sort();
+        expected.dedup();
+
+        let broad = resolve_feature_list(&root(), &Selection::DistBroad).unwrap();
+        assert_eq!(broad, expected);
+        assert!(broad.contains(&"channel-slack".to_string()));
+        assert!(!broad.contains(&"hardware".to_string()));
+    }
+
+    #[test]
+    fn dist_broad_is_named_but_not_offered_in_installer_menus() {
+        assert_eq!(Selection::DistBroad.id(), "dist-broad");
+        assert!(matches!(
+            Selection::from_id("dist-broad"),
+            Some(Selection::DistBroad)
+        ));
+        assert!(Selection::from_id("unknown-selection").is_none());
+        assert!(
+            Selection::menu()
+                .iter()
+                .all(|selection| selection.id() != Selection::DistBroad.id())
+        );
+    }
+
+    #[test]
     fn all_is_superset_of_dist() {
         let dist = resolve(&root(), &Selection::Dist).unwrap();
         let all = resolve(&root(), &Selection::All).unwrap();
@@ -919,16 +976,19 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        for (target, excluded) in &exclusions {
-            let resolved =
-                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
-            assert_eq!(resolved.len(), dist.len() - excluded.len());
-            for feature in &dist {
-                assert_eq!(
-                    resolved.contains(feature),
-                    !excluded.contains(feature),
-                    "unexpected resolution for {target}: {feature}"
-                );
+        for selection in [Selection::Dist, Selection::DistBroad] {
+            let unfiltered = resolve_feature_list(&root(), &selection).unwrap();
+            for (target, excluded) in &exclusions {
+                let resolved =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert_eq!(resolved.len(), unfiltered.len() - excluded.len());
+                for feature in &unfiltered {
+                    assert_eq!(
+                        resolved.contains(feature),
+                        !excluded.contains(feature),
+                        "unexpected resolution for {target}: {feature}"
+                    );
+                }
             }
         }
 
@@ -975,25 +1035,60 @@ mod tests {
             .exec()
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
-        for workflow in [
-            ".github/workflows/cross-platform-build-manual.yml",
-            ".github/workflows/release-stable-manual.yml",
-        ] {
-            let contents = std::fs::read_to_string(root().join(workflow)).unwrap();
-            assert!(
-                contents.contains("features --selection dist --target \"${{ matrix.target }}\""),
-                "{workflow} must pass the target triple to the canonical feature resolver"
-            );
-            assert!(
-                !contents.contains("excluded_features"),
-                "{workflow} must not own a parallel target exclusion policy"
-            );
-            for feature in exclusions.values().flatten() {
-                assert!(
-                    !contents.contains(feature),
-                    "{workflow} must not name target-excluded feature {feature}"
-                );
-            }
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
+        assert!(!release.contains("excluded_features"));
+
+        let manual = std::fs::read_to_string(
+            root().join(".github/workflows/cross-platform-build-manual.yml"),
+        )
+        .unwrap();
+        assert!(manual.contains("distribution:"));
+        assert!(
+            manual.contains(
+                "default: dist\n        options:\n          - dist\n          - dist-broad"
+            )
+        );
+        assert!(
+            manual.contains(
+                "timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}"
+            )
+        );
+        assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
+        assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
+        assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert_eq!(
+            manual
+                .matches("if: matrix.target != 'aarch64-linux-android'")
+                .count(),
+            2,
+            "both the ZeroCode build and upload must skip Android"
+        );
+        assert!(!manual.contains("excluded_features"));
+
+        let target_env = manual.find("- name: Configure target environment").unwrap();
+        let release_step = manual.find("- name: Build release").unwrap();
+        let zeroclaw_upload = manual
+            .find("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
+            .unwrap();
+        let companion = manual.find("- name: Build ZeroCode companion").unwrap();
+        assert!(
+            target_env < release_step
+                && release_step < zeroclaw_upload
+                && zeroclaw_upload < companion
+        );
+        assert!(
+            manual[target_env..release_step]
+                .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
+        );
+        assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
+        assert!(!manual[release_step..companion].contains("matrix.linker_env"));
+
+        for feature in exclusions.values().flatten() {
+            assert!(!release.contains(feature));
+            assert!(!manual.contains(feature));
         }
     }
 

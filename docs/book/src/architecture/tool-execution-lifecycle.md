@@ -200,6 +200,8 @@ Memory and payload lifecycle owns durability and privacy boundaries for
 history, files, media, and memory. This page covers the tool-result path that
 feeds those surfaces.
 
+[Background work lifecycle](./background-work-lifecycle.md) owns the longer-lived contract when a tool starts delegated or subagent work. A tool returning a task ID does not make its execution restart-resumable.
+
 ## Reviewer checklist
 
 For tool execution changes, answer these before reviewer sign-off:

@@ -117,11 +117,6 @@ fn configured_backend_selection(
         .unwrap_or(SelectedSandboxBackend::None)
 }
 
-/// Auto-detect the best available sandbox backend.
-///
-/// This is the single priority ladder for automatic sandbox selection. Runtime
-/// construction and status reporting both use it so `security status` cannot
-/// drift from the backend order that agent execution relies on.
 fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> SelectedSandboxBackend {
     let skip_docker = runtime_kind == "native";
     #[cfg(target_os = "linux")]
@@ -286,11 +281,6 @@ pub fn create_sandbox(
     }
 }
 
-/// Auto-detect the best available sandbox.
-///
-/// When `runtime_kind` is `"native"` the caller has explicitly opted out of
-/// container wrapping, so Docker is excluded from consideration even if it is
-/// installed on the host.
 fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir);
     if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
@@ -455,11 +445,6 @@ fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: &s
     }
 }
 
-/// Returns true if the Linux kernel has the memory cgroup controller enabled.
-///
-/// Probes cgroup v2 (`/sys/fs/cgroup/memory.max`), then cgroup v1
-/// (`/sys/fs/cgroup/memory/memory.limit_in_bytes`), then `/proc/cgroups`.
-/// Any read error is treated as "absent" (conservative/safe direction).
 #[cfg(target_os = "linux")]
 pub fn linux_memcg_available() -> bool {
     use std::path::Path;

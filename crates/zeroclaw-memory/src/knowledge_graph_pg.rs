@@ -1,5 +1,4 @@
 //! PostgreSQL-backed knowledge graph with optional vector similarity.
-//!
 //! Feature-gated behind `memory-postgres`. Uses pure SQL with recursive CTEs
 //! rather than requiring the AGE extension.
 
