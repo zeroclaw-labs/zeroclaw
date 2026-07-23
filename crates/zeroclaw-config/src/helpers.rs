@@ -62,6 +62,26 @@ pub fn route_double_hashmap_path<'a>(
     Some((outer_key, inner_key, inner_name))
 }
 
+/// True when `e` is the "Unknown property" marker produced by the
+/// `Configurable` derive's `set_prop`/`get_prop` fallback (and by
+/// `prop_name_to_serde_field` in this module). Namespace-sharing nested
+/// delegation sites (serde-flatten, `Option<T>`, dotted-key candidate
+/// loops) use it to tell "not one of mine — keep trying siblings" apart
+/// from a real value error on a confirmed path (#9285). The same prefix
+/// convention is what downstream consumers branch on
+/// (`config_patch_map_prop_error` in `src/main.rs`, `map_prop_error` in
+/// `zeroclaw-gateway`).
+///
+/// Both constructors build the error via `anyhow::Error::msg(String)`, so
+/// the downcast is the common zero-alloc path; `to_string()` is only a
+/// fallback for wrapped/contextualized errors.
+pub fn is_unknown_property_error(e: &anyhow::Error) -> bool {
+    if let Some(msg) = e.downcast_ref::<String>() {
+        return msg.starts_with("Unknown property");
+    }
+    e.to_string().starts_with("Unknown property")
+}
+
 pub fn route_vec_path<'a, 'k, I>(
     name: &'a str,
     my_prefix: &str,
