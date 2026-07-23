@@ -158,4 +158,24 @@ binary = "noop"
         let m: ToolManifest = toml::from_str(raw).expect("parse failed");
         assert!(m.parameters.is_empty());
     }
+
+    #[test]
+    fn manifest_rejects_missing_required_exec_section() {
+        // `exec` is a required field (non-Option, no `#[serde(default)]`), unlike
+        // the optional `transport` (Option) and `parameters` (serde default).
+        // Omitting the entire `[exec]` section must fail to parse so a malformed
+        // plugin manifest is rejected at load time rather than surfacing later.
+        let raw = r#"
+[tool]
+name        = "no_exec"
+version     = "1.0.0"
+description = "Missing exec section"
+"#;
+        let result: Result<ToolManifest, _> = toml::from_str(raw);
+        let err = result.expect_err("manifest without [exec] must fail to parse");
+        assert!(
+            err.to_string().contains("exec"),
+            "error should mention the missing `exec` field, got: {err}"
+        );
+    }
 }
