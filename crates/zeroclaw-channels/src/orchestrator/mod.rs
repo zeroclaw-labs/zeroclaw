@@ -4121,17 +4121,6 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
-/// After a clean listener return (no error), decide whether the supervisor
-/// should restart the listener. Cancellation is a deliberate operator action
-/// (Ctrl+C or config reload) — the listener exited because we asked it to
-/// stop, not because it crashed. Any other clean return is unexpected and
-/// must restart.
-fn should_restart_listener_after_clean_return(
-    cancel: &tokio_util::sync::CancellationToken,
-) -> bool {
-    !cancel.is_cancelled()
-}
-
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4198,9 +4187,6 @@ fn spawn_supervised_listener_with_health_interval(
 
                 match result {
                     Ok(()) => {
-                        if !should_restart_listener_after_clean_return(&cancel) {
-                            return;
-                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -23442,25 +23428,6 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
-    }
-
-    /// After cancellation the supervisor must treat a clean listener return
-    /// as an expected exit — no restart.  Before cancellation a clean return
-    /// is unexpected and must restart.
-    #[test]
-    fn should_restart_listener_after_clean_return_respects_cancellation() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        // Listener exited cleanly before any shutdown signal — restart.
-        assert!(
-            should_restart_listener_after_clean_return(&cancel),
-            "must restart when cancellation has not been triggered"
-        );
-        // Operator pressed Ctrl+C — the clean exit is expected, don't restart.
-        cancel.cancel();
-        assert!(
-            !should_restart_listener_after_clean_return(&cancel),
-            "must not restart after cancellation was triggered"
-        );
     }
 
     #[tokio::test]
