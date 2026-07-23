@@ -512,6 +512,17 @@ impl SlackChannel {
         Ok(ts)
     }
 
+    fn record_active_assistant_thread(&self, channel_id: &str, thread_ts: Option<&str>) -> bool {
+        let Some(thread_ts) = thread_ts.map(str::trim).filter(|ts| !ts.is_empty()) else {
+            return false;
+        };
+        let Ok(mut map) = self.active_assistant_thread.lock() else {
+            return false;
+        };
+        map.insert(channel_id.to_string(), thread_ts.to_string());
+        true
+    }
+
     /// Set the Assistants API status bar text for a channel's active thread.
     async fn set_assistant_status(&self, channel_id: &str, status: &str) {
         let thread_ts = {
@@ -3604,11 +3615,8 @@ impl SlackChannel {
                             .get("thread_ts")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
-                        if !ch.is_empty()
-                            && !tts.is_empty()
-                            && let Ok(mut map) = self.active_assistant_thread.lock()
-                        {
-                            map.insert(ch.to_string(), tts.to_string());
+                        if !ch.is_empty() {
+                            self.record_active_assistant_thread(ch, Some(tts));
                         }
                     }
                     continue;
@@ -3789,11 +3797,7 @@ impl SlackChannel {
                 };
 
                 // Track thread context so start_typing can set assistant status.
-                if let Some(ref tts) = channel_msg.thread_ts
-                    && let Ok(mut map) = self.active_assistant_thread.lock()
-                {
-                    map.insert(channel_id.clone(), tts.clone());
-                }
+                self.record_active_assistant_thread(&channel_id, channel_msg.thread_ts.as_deref());
 
                 if tx.send(channel_msg).await.is_err() {
                     return Ok(());
@@ -4969,6 +4973,11 @@ impl Channel for SlackChannel {
                             ..Default::default()
                         };
 
+                        self.record_active_assistant_thread(
+                            &channel_id,
+                            channel_msg.thread_ts.as_deref(),
+                        );
+
                         if tx.send(channel_msg).await.is_err() {
                             return Ok(());
                         }
@@ -5071,6 +5080,11 @@ impl Channel for SlackChannel {
 
                         ..Default::default()
                     };
+
+                    self.record_active_assistant_thread(
+                        &thread_channel_id,
+                        channel_msg.thread_ts.as_deref(),
+                    );
 
                     if tx.send(channel_msg).await.is_err() {
                         return Ok(());
@@ -6728,7 +6742,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_thread_tracking() {
+    fn assistant_thread_tracking_records_only_real_threads() {
         let ch = SlackChannel::new(
             "xoxb-fake".into(),
             None,
@@ -6737,24 +6751,14 @@ mod tests {
             Arc::new(Vec::new),
         );
 
-        // Initially empty.
-        {
-            let map = ch.active_assistant_thread.lock().unwrap();
-            assert!(map.is_empty());
-        }
+        assert!(!ch.record_active_assistant_thread("C123", None));
+        assert!(!ch.record_active_assistant_thread("C123", Some("")));
+        assert!(!ch.record_active_assistant_thread("C123", Some("   ")));
+        assert!(ch.record_active_assistant_thread("C123", Some("1741234567.000100")));
 
-        // Simulate storing a thread_ts (as listen_socket_mode would).
-        {
-            let mut map = ch.active_assistant_thread.lock().unwrap();
-            map.insert("C123".to_string(), "1741234567.000100".to_string());
-        }
-
-        // Verify retrieval.
-        {
-            let map = ch.active_assistant_thread.lock().unwrap();
-            assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
-            assert_eq!(map.get("C999"), None);
-        }
+        let map = ch.active_assistant_thread.lock().unwrap();
+        assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
+        assert_eq!(map.get("C999"), None);
     }
 
     #[test]
