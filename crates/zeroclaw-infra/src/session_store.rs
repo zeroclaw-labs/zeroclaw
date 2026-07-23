@@ -109,7 +109,7 @@ impl SessionStore {
     /// Delete a session's JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
-        if !path.exists() {
+        if !path.is_file() {
             return Ok(false);
         }
         std::fs::remove_file(&path)?;
@@ -133,6 +133,9 @@ impl SessionStore {
         entries
             .filter_map(|entry| {
                 let entry = entry.ok()?;
+                if !entry.file_type().ok()?.is_file() {
+                    return None;
+                }
                 let name = entry.file_name().into_string().ok()?;
                 name.strip_suffix(".jsonl").map(String::from)
             })
@@ -197,7 +200,7 @@ impl SessionBackend for SessionStore {
     /// the session is on disk Checking file presence is the same
     /// O(1) `stat` that `delete_session` itself performs.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        self.session_path(session_key).is_file()
     }
 }
 
@@ -299,6 +302,21 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert!(sessions.contains(&"discord_bob".to_string()));
         assert!(sessions.contains(&"telegram_alice".to_string()));
+    }
+
+    #[test]
+    fn list_and_exists_ignore_non_file_jsonl_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        store.append("valid", &ChatMessage::user("hi")).unwrap();
+        std::fs::create_dir(store.session_path("phantom")).unwrap();
+
+        let sessions = store.list_sessions();
+        assert_eq!(sessions, vec!["valid".to_string()]);
+        assert!(store.session_exists("valid"));
+        assert!(!store.session_exists("phantom"));
+        assert!(!store.delete_session("phantom").unwrap());
     }
 
     #[test]
