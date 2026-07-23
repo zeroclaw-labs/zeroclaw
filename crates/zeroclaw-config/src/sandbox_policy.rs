@@ -1,5 +1,180 @@
-use crate::schema::{RiskProfileConfig, SandboxPolicyConfig};
+use crate::schema::{
+    DEFAULT_ALLOW_WRITE, MANDATORY_DENY_WRITE, RiskProfileConfig, SandboxPolicyConfig,
+};
 use std::path::{Path, PathBuf};
+
+/// Post-precedence, pre-path-resolution sandbox inputs: raw operator strings,
+/// after canonical-vs-legacy precedence has been decided but before `~`
+/// expansion / workspace-relative resolution.
+///
+/// This is the single place canonical-over-legacy precedence is decided.
+/// Both `SandboxPolicy::from_risk_profile` (OS-sandbox resolution, this
+/// module) and `SecurityPolicy::from_profiles` (`crate::policy`, app-layer
+/// path guard) build on top of it, so the two enforcement surfaces can never
+/// resolve a mixed legacy/canonical config differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveSandboxInputs {
+    /// `sandbox_policy.deny_read` if `Some`, else legacy `forbidden_paths`.
+    pub deny_read: Vec<String>,
+    /// `sandbox_policy.allow_read` if `Some`, else legacy `allowed_roots`.
+    pub allow_read: Vec<String>,
+    /// See [`Self::from_profile`] for the full `allow_write` precedence rules.
+    pub allow_write: Vec<String>,
+    /// `sandbox_policy.deny_write.unwrap_or_default()` plus the
+    /// [`MANDATORY_DENY_WRITE`] guardrail list when
+    /// `mandatory_deny_write_enabled` is true.
+    pub deny_write: Vec<String>,
+    pub mandatory_deny_write_enabled: bool,
+    pub allowed_domains: Vec<String>,
+    pub denied_domains: Vec<String>,
+    pub allow_unix_sockets: Vec<String>,
+    pub bubblewrap_args: Vec<String>,
+}
+
+impl EffectiveSandboxInputs {
+    /// Resolve canonical-vs-legacy precedence for `profile` against `workspace`.
+    ///
+    /// Precedence (canonical `sandbox_policy` field wins whenever present):
+    /// 1. `deny_read` — `sandbox_policy.deny_read` if `Some` (including
+    ///    explicit `Some(vec![])`), else legacy `forbidden_paths`.
+    /// 2. `allow_read` — `sandbox_policy.allow_read` if `Some`, else legacy
+    ///    `allowed_roots`.
+    /// 3. `allow_write` — `workspace_only = true` always wins (overrides any
+    ///    `allow_write`, `Some` or `None`); otherwise `sandbox_policy.allow_write`
+    ///    if `Some` (exactly, no legacy merge — even if it happens to equal the
+    ///    old default shape); otherwise (`None`) [`DEFAULT_ALLOW_WRITE`] merged
+    ///    with legacy `allowed_roots`.
+    /// 4. `deny_write` — operator value (`sandbox_policy.deny_write.unwrap_or_default()`)
+    ///    plus, when `mandatory_deny_write_enabled`, any [`MANDATORY_DENY_WRITE`]
+    ///    entries missing from it.
+    #[must_use]
+    pub fn from_profile(profile: &RiskProfileConfig, workspace: &Path) -> Self {
+        let sp = &profile.sandbox_policy;
+
+        let deny_read = sp
+            .deny_read
+            .clone()
+            .unwrap_or_else(|| profile.forbidden_paths.clone());
+        let allow_read = sp
+            .allow_read
+            .clone()
+            .unwrap_or_else(|| profile.allowed_roots.clone());
+        let allow_write = resolve_allow_write(sp, profile, workspace);
+        let deny_write = resolve_deny_write(sp);
+
+        Self {
+            deny_read,
+            allow_read,
+            allow_write,
+            deny_write,
+            mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
+            allowed_domains: sp.allowed_domains.clone(),
+            denied_domains: sp.denied_domains.clone(),
+            allow_unix_sockets: sp.allow_unix_sockets.clone(),
+            bubblewrap_args: sp.bubblewrap_args.clone(),
+        }
+    }
+
+    /// Build effective inputs directly from a bare `SandboxPolicyConfig` with
+    /// no profile and no legacy-compat fallback (`None` fields resolve to
+    /// empty, not to some other struct's legacy fields). Used by
+    /// `SandboxPolicy::default()`, which has no `RiskProfileConfig` to fall
+    /// back to.
+    fn from_bare_config(sp: &SandboxPolicyConfig, workspace: &Path) -> Self {
+        let allow_write = if sp.allow_write.is_some() {
+            sp.allow_write.clone().unwrap_or_default()
+        } else {
+            DEFAULT_ALLOW_WRITE
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        };
+        let _ = workspace;
+        Self {
+            deny_read: sp.deny_read.clone().unwrap_or_default(),
+            allow_read: sp.allow_read.clone().unwrap_or_default(),
+            allow_write,
+            deny_write: resolve_deny_write(sp),
+            mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
+            allowed_domains: sp.allowed_domains.clone(),
+            denied_domains: sp.denied_domains.clone(),
+            allow_unix_sockets: sp.allow_unix_sockets.clone(),
+            bubblewrap_args: sp.bubblewrap_args.clone(),
+        }
+    }
+}
+
+fn resolve_deny_write(sp: &SandboxPolicyConfig) -> Vec<String> {
+    let mut deny_write = sp.deny_write.clone().unwrap_or_default();
+    if sp.mandatory_deny_write_enabled {
+        // Deduplication is string-based (pre-resolution). An operator entry like
+        // "/home/user/.bashrc" will not prevent the default ".bashrc" entry from
+        // also being added; both resolve independently. This is intentional — semantic
+        // path equivalence checking is not performed here.
+        let missing: Vec<String> = MANDATORY_DENY_WRITE
+            .iter()
+            .filter(|e| !deny_write.iter().any(|d| d == *e))
+            .map(|e| (*e).to_string())
+            .collect();
+        deny_write.extend(missing);
+    } else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "sandbox_policy: mandatory_deny_write_enabled=false; \
+             default write-deny guardrails (shell configs, git hooks, .env, etc.) \
+             are not enforced for this profile"
+        );
+    }
+    deny_write
+}
+
+/// Resolve `allow_write` with `workspace_only` priority, presence-preserving
+/// canonical precedence, and `allowed_roots` compat fallback.
+///
+/// - `workspace_only = true` always wins and overrides any concurrently set
+///   `allow_write` (`Some` or `None`).
+/// - `allow_write: Some(v)` wins outright — `v` exactly, no legacy merge, even
+///   when `v` happens to be shaped like the old default.
+/// - `allow_write: None` — [`DEFAULT_ALLOW_WRITE`] merged with legacy
+///   `allowed_roots` (dedup, defaults first). The top-level `allowed_roots`
+///   field historically granted extra write access on top of the default
+///   workspace/temp roots, not a replacement of them.
+fn resolve_allow_write(
+    sp: &SandboxPolicyConfig,
+    profile: &RiskProfileConfig,
+    workspace: &Path,
+) -> Vec<String> {
+    if profile.workspace_only {
+        if sp.allow_write.is_some() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "sandbox_policy: workspace_only=true overrides custom allow_write; \
+                 allow_write will be restricted to the workspace root"
+            );
+        }
+        return vec![workspace.to_string_lossy().into_owned()];
+    }
+
+    match &sp.allow_write {
+        Some(v) => v.clone(),
+        None => {
+            let mut merged: Vec<String> = DEFAULT_ALLOW_WRITE
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for root in &profile.allowed_roots {
+                if !merged.contains(root) {
+                    merged.push(root.clone());
+                }
+            }
+            merged
+        }
+    }
+}
 
 /// Resolved OS-level sandbox policy derived from a `RiskProfileConfig`.
 ///
@@ -43,172 +218,40 @@ impl Default for SandboxPolicy {
             }
         };
         let default_sp = SandboxPolicyConfig::default();
-        Self::resolve(&default_sp, &workspace, &default_sp)
+        let effective = EffectiveSandboxInputs::from_bare_config(&default_sp, &workspace);
+        SandboxPolicy::from_effective(&effective, &workspace)
     }
 }
 
 impl SandboxPolicy {
     /// Resolve a `RiskProfileConfig` + workspace into a `SandboxPolicy`.
     ///
-    /// Resolution order (`sandbox_policy` is canonical):
-    /// 1. `deny_read` — `sandbox_policy.deny_read`; falls back to `forbidden_paths`.
-    /// 2. `allow_read` — `sandbox_policy.allow_read`; falls back to `allowed_roots`.
-    /// 3. `allow_write` — `workspace_only = true` always wins (overrides custom
-    ///    `allow_write`); otherwise `sandbox_policy.allow_write` if non-default,
-    ///    then `allowed_roots` merged onto the default write roots, then schema default.
-    /// 4. `deny_write` — when `mandatory_deny_write_enabled`, the default guardrail
-    ///    entries (shell configs, git hooks, `.env`, `.mcp.json`, etc.) are merged
-    ///    in for any entries absent from the operator-supplied list.
+    /// Delegates precedence resolution to [`EffectiveSandboxInputs::from_profile`]
+    /// (the single canonical-vs-legacy precedence function shared with
+    /// `SecurityPolicy::from_profiles`), then path-resolves the result.
+    #[must_use]
     pub fn from_risk_profile(profile: &RiskProfileConfig, workspace: &Path) -> Self {
-        let sp = &profile.sandbox_policy;
-        let default_sp = SandboxPolicyConfig::default();
-
-        let deny_read = resolve_deny_read(sp, profile);
-        let allow_read = resolve_allow_read(sp, profile);
-        let allow_write = resolve_allow_write(sp, profile, workspace, &default_sp);
-
-        let resolved_sp = SandboxPolicyConfig {
-            deny_read,
-            allow_read,
-            allow_write,
-            deny_write: sp.deny_write.clone(),
-            allowed_domains: sp.allowed_domains.clone(),
-            denied_domains: sp.denied_domains.clone(),
-            allow_unix_sockets: sp.allow_unix_sockets.clone(),
-            bubblewrap_args: sp.bubblewrap_args.clone(),
-            mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
-        };
-
-        Self::resolve(&resolved_sp, workspace, &default_sp)
+        let effective = EffectiveSandboxInputs::from_profile(profile, workspace);
+        Self::from_effective(&effective, workspace)
     }
 
-    /// Core resolver: path-expand all fields of a `SandboxPolicyConfig` against
-    /// `workspace` and merge the mandatory deny-write guardrail list when enabled.
-    ///
-    /// `default_sp` is passed in so callers can reuse an already-constructed default
-    /// rather than allocating a second one inside this function.
-    fn resolve(
-        sp: &SandboxPolicyConfig,
-        workspace: &Path,
-        default_sp: &SandboxPolicyConfig,
-    ) -> Self {
-        let mut deny_write = sp.deny_write.clone();
-        if sp.mandatory_deny_write_enabled {
-            // Deduplication is string-based (pre-resolution). An operator entry like
-            // "/home/user/.bashrc" will not prevent the default ".bashrc" entry from
-            // also being added; both resolve independently. This is intentional — semantic
-            // path equivalence checking is not performed here.
-            let missing: Vec<String> = default_sp
-                .deny_write
-                .iter()
-                .filter(|e| !deny_write.contains(e))
-                .cloned()
-                .collect();
-            deny_write.extend(missing);
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "sandbox_policy: mandatory_deny_write_enabled=false; \
-                 default write-deny guardrails (shell configs, git hooks, .env, etc.) \
-                 are not enforced for this profile"
-            );
-        }
-
+    /// Path-resolve already-precedence-decided `EffectiveSandboxInputs`
+    /// against `workspace`. Public so callers that need to re-resolve the
+    /// same raw inputs against a different workspace (e.g. subagent
+    /// workspace rebase) do not have to re-derive precedence.
+    #[must_use]
+    pub fn from_effective(effective: &EffectiveSandboxInputs, workspace: &Path) -> Self {
         Self {
-            deny_read: resolve_paths(&sp.deny_read, workspace),
-            allow_read: resolve_paths(&sp.allow_read, workspace),
-            allow_write: resolve_paths(&sp.allow_write, workspace),
-            deny_write: resolve_paths(&deny_write, workspace),
-            allowed_domains: sp.allowed_domains.clone(),
-            denied_domains: sp.denied_domains.clone(),
-            allow_unix_sockets: resolve_paths(&sp.allow_unix_sockets, workspace),
-            bubblewrap_args: sp.bubblewrap_args.clone(),
-            mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
+            deny_read: resolve_paths(&effective.deny_read, workspace),
+            allow_read: resolve_paths(&effective.allow_read, workspace),
+            allow_write: resolve_paths(&effective.allow_write, workspace),
+            deny_write: resolve_paths(&effective.deny_write, workspace),
+            allowed_domains: effective.allowed_domains.clone(),
+            denied_domains: effective.denied_domains.clone(),
+            allow_unix_sockets: resolve_paths(&effective.allow_unix_sockets, workspace),
+            bubblewrap_args: effective.bubblewrap_args.clone(),
+            mandatory_deny_write_enabled: effective.mandatory_deny_write_enabled,
         }
-    }
-}
-
-// ── per-field compat resolution helpers ─────────────────────────────────────
-
-fn resolve_deny_read(sp: &SandboxPolicyConfig, profile: &RiskProfileConfig) -> Vec<String> {
-    if sp.deny_read.is_empty() {
-        profile.forbidden_paths.clone()
-    } else {
-        sp.deny_read.clone()
-    }
-}
-
-fn resolve_allow_read(sp: &SandboxPolicyConfig, profile: &RiskProfileConfig) -> Vec<String> {
-    if sp.allow_read.is_empty() {
-        profile.allowed_roots.clone()
-    } else {
-        sp.allow_read.clone()
-    }
-}
-
-/// Order-independent check for whether `sp.allow_write` still matches the schema default
-/// (`[".", "/tmp"]`). Exposed so callers outside the resolver (the app-layer path guard in
-/// `SecurityPolicy::from_profiles`) can tell whether an operator explicitly customised
-/// `allow_write` before forwarding it into a different enforcement surface — the default
-/// value exists to satisfy OS-sandbox bind-mount needs (scratch space) and must not be
-/// treated as an app-layer grant when nothing was actually configured.
-pub fn allow_write_is_at_default(
-    sp: &SandboxPolicyConfig,
-    default_sp: &SandboxPolicyConfig,
-) -> bool {
-    let mut actual = sp.allow_write.clone();
-    let mut expected = default_sp.allow_write.clone();
-    actual.sort();
-    expected.sort();
-    actual == expected
-}
-
-/// Resolve `allow_write` with `workspace_only` priority and `allowed_roots` compat fallback.
-///
-/// - `workspace_only = true` always wins and overrides any concurrently set `allow_write`.
-/// - If `allow_write` is at its schema default (order-independent) and top-level
-///   `allowed_roots` is non-empty, `allowed_roots` is MERGED onto the default write roots
-///   (the top-level `allowed_roots` field historically granted extra write access on top of
-///   the default workspace/temp roots, not a replacement of them — replace semantics would
-///   silently revoke default write access and read narrower than the compatibility story
-///   the schema promises). If `allow_write` was explicitly
-///   customised, `allowed_roots` is NOT merged in — the explicit value takes precedence.
-fn resolve_allow_write(
-    sp: &SandboxPolicyConfig,
-    profile: &RiskProfileConfig,
-    workspace: &Path,
-    default_sp: &SandboxPolicyConfig,
-) -> Vec<String> {
-    let at_default_write = allow_write_is_at_default(sp, default_sp);
-
-    if profile.workspace_only {
-        if !at_default_write {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "sandbox_policy: workspace_only=true overrides custom allow_write; \
-                 allow_write will be restricted to the workspace root"
-            );
-        }
-        vec![workspace.to_string_lossy().into_owned()]
-    } else if !at_default_write {
-        // Explicit sandbox_policy.allow_write: allowed_roots is NOT merged in.
-        sp.allow_write.clone()
-    } else if !profile.allowed_roots.is_empty() {
-        // allowed_roots compat fallback: merged onto the default write roots (dedup,
-        // defaults first) rather than replacing them.
-        let mut merged = sp.allow_write.clone();
-        for root in &profile.allowed_roots {
-            if !merged.contains(root) {
-                merged.push(root.clone());
-            }
-        }
-        merged
-    } else {
-        sp.allow_write.clone()
     }
 }
 
@@ -282,7 +325,7 @@ mod tests {
     #[test]
     fn forbidden_paths_compat_maps_to_deny_read() {
         let mut profile = RiskProfileConfig::default();
-        profile.sandbox_policy.deny_read = vec![];
+        profile.sandbox_policy.deny_read = None;
         profile.forbidden_paths = vec!["/secret".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.contains(&PathBuf::from("/secret")));
@@ -291,7 +334,7 @@ mod tests {
     #[test]
     fn sandbox_policy_deny_read_takes_precedence_over_forbidden_paths() {
         let mut profile = RiskProfileConfig::default();
-        profile.sandbox_policy.deny_read = vec!["/explicit".to_string()];
+        profile.sandbox_policy.deny_read = Some(vec!["/explicit".to_string()]);
         profile.forbidden_paths = vec!["/should_be_ignored".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.contains(&PathBuf::from("/explicit")));
@@ -303,15 +346,41 @@ mod tests {
     }
 
     #[test]
-    fn allowed_roots_compat_maps_to_allow_read_and_allow_write_when_at_default() {
+    fn explicit_empty_deny_read_clears_legacy_forbidden_paths() {
+        let mut profile = RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![]);
+        profile.forbidden_paths = vec!["~/.ssh".to_string()];
+        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
+        assert!(
+            policy.deny_read.is_empty(),
+            "explicit empty deny_read must clear legacy forbidden_paths fallback, got: {:?}",
+            policy.deny_read
+        );
+    }
+
+    #[test]
+    fn explicit_empty_allow_read_clears_legacy_allowed_roots() {
+        let mut profile = RiskProfileConfig::default();
+        profile.sandbox_policy.allow_read = Some(vec![]);
+        profile.allowed_roots = vec!["/legacy_read".to_string()];
+        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
+        assert!(
+            policy.allow_read.is_empty(),
+            "explicit empty allow_read must clear legacy allowed_roots fallback, got: {:?}",
+            policy.allow_read
+        );
+    }
+
+    #[test]
+    fn allowed_roots_compat_maps_to_allow_read_and_allow_write_when_omitted() {
         let mut profile = RiskProfileConfig {
             workspace_only: false,
             allowed_roots: vec!["/extra".to_string()],
             ..RiskProfileConfig::default()
         };
-        profile.sandbox_policy.allow_read = vec![];
-        // allow_write at default — allowed_roots compat applies to both fields
-        profile.sandbox_policy.allow_write = SandboxPolicyConfig::default().allow_write;
+        profile.sandbox_policy.allow_read = None;
+        // allow_write omitted — allowed_roots compat applies to both fields
+        profile.sandbox_policy.allow_write = None;
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.allow_read.contains(&PathBuf::from("/extra")));
         assert!(policy.allow_write.contains(&PathBuf::from("/extra")));
@@ -327,8 +396,7 @@ mod tests {
             ..RiskProfileConfig::default()
         };
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
-        let default_write = SandboxPolicyConfig::default().allow_write;
-        for default_entry in &default_write {
+        for default_entry in DEFAULT_ALLOW_WRITE {
             let resolved_default = resolve_path(default_entry, ws());
             assert!(
                 policy.allow_write.contains(&resolved_default),
@@ -345,10 +413,28 @@ mod tests {
             allowed_roots: vec!["/extra".to_string()],
             ..RiskProfileConfig::default()
         };
-        profile.sandbox_policy.allow_write = vec!["/custom".to_string()];
+        profile.sandbox_policy.allow_write = Some(vec!["/custom".to_string()]);
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         // explicit allow_write wins; allowed_roots is not merged in
         assert_eq!(policy.allow_write, vec![PathBuf::from("/custom")]);
+    }
+
+    #[test]
+    fn explicit_default_shaped_allow_write_blocks_legacy_merge() {
+        // allow_write explicitly set to the old default shape must NOT trigger
+        // the allowed_roots compat merge — presence, not shape, decides.
+        let mut profile = RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/legacy".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec![".".to_string(), "/tmp".to_string()]);
+        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
+        assert!(
+            !policy.allow_write.contains(&PathBuf::from("/legacy")),
+            "explicit allow_write must block the allowed_roots legacy merge, got: {:?}",
+            policy.allow_write
+        );
     }
 
     #[test]
@@ -358,7 +444,7 @@ mod tests {
             ..RiskProfileConfig::default()
         };
         // Set a custom allow_write — workspace_only must still win
-        profile.sandbox_policy.allow_write = vec!["/should_be_overridden".to_string()];
+        profile.sandbox_policy.allow_write = Some(vec!["/should_be_overridden".to_string()]);
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert_eq!(policy.allow_write, vec![ws().to_path_buf()]);
     }
@@ -369,35 +455,23 @@ mod tests {
             workspace_only: false,
             ..RiskProfileConfig::default()
         };
-        profile.sandbox_policy.allow_write = vec!["/custom".to_string()];
+        profile.sandbox_policy.allow_write = Some(vec!["/custom".to_string()]);
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert_eq!(policy.allow_write, vec![PathBuf::from("/custom")]);
     }
 
     #[test]
-    fn at_default_write_comparison_is_order_independent() {
-        let mut profile = RiskProfileConfig {
-            workspace_only: false,
-            allowed_roots: vec!["/via_compat".to_string()],
-            ..RiskProfileConfig::default()
-        };
-        // Same elements as default [".", "/tmp"] but reversed order
-        profile.sandbox_policy.allow_write = vec!["/tmp".to_string(), ".".to_string()];
-        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
-        // Still "at default" so allowed_roots compat should apply
-        assert!(policy.allow_write.contains(&PathBuf::from("/via_compat")));
-    }
-
-    #[test]
     fn mandatory_deny_write_merges_only_missing_entries() {
         let mut profile = RiskProfileConfig::default();
-        let default_deny = SandboxPolicyConfig::default().deny_write;
-        let mut extended = default_deny.clone();
+        let mut extended: Vec<String> = MANDATORY_DENY_WRITE
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         extended.push("/extra_blocked".to_string());
-        profile.sandbox_policy.deny_write = extended;
+        profile.sandbox_policy.deny_write = Some(extended);
         profile.sandbox_policy.mandatory_deny_write_enabled = true;
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
-        for entry in &default_deny {
+        for entry in MANDATORY_DENY_WRITE {
             assert!(
                 policy.deny_write.iter().any(|p| p.ends_with(entry)),
                 "missing guardrail: {entry}"
@@ -414,7 +488,7 @@ mod tests {
     #[test]
     fn mandatory_deny_write_disabled_skips_guardrail_merge() {
         let mut profile = RiskProfileConfig::default();
-        profile.sandbox_policy.deny_write = vec!["/only_this".to_string()];
+        profile.sandbox_policy.deny_write = Some(vec!["/only_this".to_string()]);
         profile.sandbox_policy.mandatory_deny_write_enabled = false;
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert_eq!(policy.deny_write, vec![PathBuf::from("/only_this")]);
@@ -423,7 +497,7 @@ mod tests {
     #[test]
     fn relative_paths_resolved_against_workspace() {
         let mut profile = RiskProfileConfig::default();
-        profile.sandbox_policy.deny_read = vec!["relative/dir".to_string()];
+        profile.sandbox_policy.deny_read = Some(vec!["relative/dir".to_string()]);
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.contains(&ws().join("relative/dir")));
     }
@@ -431,14 +505,14 @@ mod tests {
     #[test]
     fn tilde_expanded_in_deny_read() {
         let mut profile = RiskProfileConfig::default();
-        profile.sandbox_policy.deny_read = vec!["~/.ssh".to_string()];
+        profile.sandbox_policy.deny_read = Some(vec!["~/.ssh".to_string()]);
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.iter().all(|p| p.is_absolute()));
     }
 
     #[test]
     fn old_style_and_new_style_produce_equivalent_policy() {
-        // Old-style: forbidden_paths / allowed_roots, sandbox_policy at default.
+        // Old-style: forbidden_paths / allowed_roots, sandbox_policy omitted.
         let old_style = RiskProfileConfig {
             forbidden_paths: vec!["/secret".to_string()],
             allowed_roots: vec!["/extra".to_string()],
@@ -454,14 +528,17 @@ mod tests {
             workspace_only: false,
             ..RiskProfileConfig::default()
         };
-        new_style.sandbox_policy.deny_read = vec!["/secret".to_string()];
-        new_style.sandbox_policy.allow_read = vec!["/extra".to_string()];
+        new_style.sandbox_policy.deny_read = Some(vec!["/secret".to_string()]);
+        new_style.sandbox_policy.allow_read = Some(vec!["/extra".to_string()]);
         // allow_write compat MERGES allowed_roots onto the default write roots (see
         // resolve_allow_write); an explicit allow_write must include the same defaults to
         // reach the same resolved policy as the old-style / compat path.
-        let mut merged_write = SandboxPolicyConfig::default().allow_write;
+        let mut merged_write: Vec<String> = DEFAULT_ALLOW_WRITE
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         merged_write.push("/extra".to_string());
-        new_style.sandbox_policy.allow_write = merged_write;
+        new_style.sandbox_policy.allow_write = Some(merged_write);
 
         let old_policy = SandboxPolicy::from_risk_profile(&old_style, ws());
         let new_policy = SandboxPolicy::from_risk_profile(&new_style, ws());

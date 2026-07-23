@@ -11562,12 +11562,31 @@ fn is_valid_env_var_name(name: &str) -> bool {
 ///    `allowed_roots` TOML alias populates only `allow_read` — not `allow_write`. The
 ///    runtime resolver (mechanism 2) maps the top-level `allowed_roots` to *both* fields.
 ///
-/// 2. **Runtime compat mapping** — when the top-level `RiskProfileConfig.forbidden_paths`,
-///    `allowed_roots`, or `workspace_only` fields are set and `sandbox_policy.allow_write`
-///    is still at its schema default, `SandboxPolicy::from_risk_profile` (in
-///    `zeroclaw-runtime`) maps them into this struct at resolution time. Specifically,
-///    `allowed_roots` maps to both `allow_read` and `allow_write`. New configs should use
-///    `sandbox_policy.*` directly.
+/// 2. **Runtime compat mapping** — the four path-policy fields (`deny_read`, `allow_read`,
+///    `allow_write`, `deny_write`) are `Option<Vec<String>>`, not `Vec<String>`, so
+///    "omitted" and "explicitly empty" are distinguishable. `SandboxPolicy::from_risk_profile`
+///    (`zeroclaw-config::sandbox_policy`) is the single resolver both OS-sandbox and
+///    app-layer (`SecurityPolicy::from_profiles`) enforcement consume:
+///    - `deny_read: None` falls back to the top-level `RiskProfileConfig.forbidden_paths`.
+///    - `allow_read: None` falls back to the top-level `RiskProfileConfig.allowed_roots`.
+///    - `allow_write: None` falls back to [`DEFAULT_ALLOW_WRITE`] merged with the legacy
+///      `allowed_roots` compat field (unless `workspace_only = true`, which always wins).
+///    - `deny_write` always receives the [`MANDATORY_DENY_WRITE`] guardrail merge when
+///      `mandatory_deny_write_enabled` (the default), on top of whatever operator value
+///      (`None` or `Some`) is present.
+///
+///    An explicit `Some(v)` — even one shaped identically to a prior default — always wins
+///    outright over the legacy fallback; only `None` (the field was never written) triggers
+///    compat mapping. New configs should use `sandbox_policy.*` directly.
+///
+/// **Enforcement matrix.** `deny_read`/`allow_read`/`allow_write`/`deny_write` are enforced
+/// today at the app layer for file tools (`file_write`, `file_edit`, `git_operations`, and
+/// `PathGuardedTool` read paths) via `SecurityPolicy`, regardless of which OS sandbox backend
+/// (if any) is active. They are NOT enforced against arbitrary shell/script child-process I/O
+/// until per-backend OS sandbox wiring lands (tracked per RFC #6996 Phase 2 as follow-up PRs,
+/// one per backend). `allowed_domains`, `denied_domains`, `allow_unix_sockets`, and
+/// `bubblewrap_args` are accepted and carried through the resolved policy but are fully inert
+/// — no enforcement surface consumes them yet.
 ///
 /// Filesystem read semantics: deny-then-allow (`allow_read` overrides `deny_read`).
 /// Filesystem write semantics: allow-only (`deny_write` overrides `allow_write`).
@@ -11578,16 +11597,30 @@ fn is_valid_env_var_name(name: &str) -> bool {
 pub struct SandboxPolicyConfig {
     /// Paths denied for read access. `~` is expanded to the user home directory.
     /// Accepts `forbidden_paths` as a compat alias within the `sandbox_policy` table.
-    #[serde(alias = "forbidden_paths")]
-    pub deny_read: Vec<String>,
+    ///
+    /// Presence-preserving: omitted (`None`) falls back to the top-level
+    /// `RiskProfileConfig.forbidden_paths` compat field; an explicit `[]` clears
+    /// that fallback outright; an explicit non-empty value wins outright, even if
+    /// it happens to equal a prior default shape.
+    #[serde(alias = "forbidden_paths", default)]
+    pub deny_read: Option<Vec<String>>,
     /// Paths re-allowed for read within denied regions. Takes precedence over `deny_read`.
     /// Accepts `allowed_roots` as a compat alias within the `sandbox_policy` table.
-    #[serde(alias = "allowed_roots")]
-    pub allow_read: Vec<String>,
+    /// Same `Option` presence semantics as `deny_read` (falls back to
+    /// `RiskProfileConfig.allowed_roots` when omitted).
+    #[serde(alias = "allowed_roots", default)]
+    pub allow_read: Option<Vec<String>>,
     /// Paths allowed for write access. All other paths are denied for writes.
-    pub allow_write: Vec<String>,
+    /// Same `Option` presence semantics as `deny_read`: omitted falls back to
+    /// [`DEFAULT_ALLOW_WRITE`] merged with the legacy `allowed_roots` compat field;
+    /// an explicit value (including one shaped like the default) wins outright.
+    #[serde(default)]
+    pub allow_write: Option<Vec<String>>,
     /// Write exceptions within `allow_write` regions. Takes precedence over `allow_write`.
-    pub deny_write: Vec<String>,
+    /// Same `Option` presence semantics as `deny_read`. `None` still receives the
+    /// [`MANDATORY_DENY_WRITE`] guardrail merge when `mandatory_deny_write_enabled`.
+    #[serde(default)]
+    pub deny_write: Option<Vec<String>>,
     /// Network domains the sandbox may reach via proxy. Accepted and carried into
     /// the resolved policy, but **not yet enforced**: no OS sandbox backend consumes
     /// it yet (`create_sandbox()` does not forward the resolved policy to individual
@@ -11610,28 +11643,40 @@ pub struct SandboxPolicyConfig {
     pub mandatory_deny_write_enabled: bool,
 }
 
+/// Default `allow_write` roots used when `SandboxPolicyConfig.allow_write` is
+/// omitted (`None`): workspace root (`.`, resolved relative to the effective
+/// workspace) plus `/tmp` scratch space for OS-sandbox bind-mount needs.
+pub const DEFAULT_ALLOW_WRITE: &[&str] = &[".", "/tmp"];
+
+/// Default `deny_write` guardrail entries merged into the resolved policy
+/// whenever `mandatory_deny_write_enabled` is `true` (the default), regardless
+/// of whether `deny_write` was configured. Covers shell configs, git hooks,
+/// and other files an agent should never be able to rewrite even with broad
+/// write access.
+pub const MANDATORY_DENY_WRITE: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".gitconfig",
+    ".gitmodules",
+    ".git/hooks/",
+    ".git/config",
+    ".env",
+    ".mcp.json",
+    ".claude/agents/",
+    ".vscode/",
+    ".idea/",
+];
+
 impl Default for SandboxPolicyConfig {
     fn default() -> Self {
         Self {
-            deny_read: vec![],
-            allow_read: vec![],
-            allow_write: vec![".".to_string(), "/tmp".to_string()],
-            deny_write: vec![
-                ".bashrc".to_string(),
-                ".bash_profile".to_string(),
-                ".zshrc".to_string(),
-                ".zprofile".to_string(),
-                ".profile".to_string(),
-                ".gitconfig".to_string(),
-                ".gitmodules".to_string(),
-                ".git/hooks/".to_string(),
-                ".git/config".to_string(),
-                ".env".to_string(),
-                ".mcp.json".to_string(),
-                ".claude/agents/".to_string(),
-                ".vscode/".to_string(),
-                ".idea/".to_string(),
-            ],
+            deny_read: None,
+            allow_read: None,
+            allow_write: None,
+            deny_write: None,
             allowed_domains: vec![],
             denied_domains: vec![],
             allow_unix_sockets: vec![],
@@ -27000,15 +27045,22 @@ default_temperature = 0.7
             p.mandatory_deny_write_enabled,
             "mandatory deny write must be on by default"
         );
+        // allow_write/deny_read/etc default to None (omitted) — presence,
+        // not shape, distinguishes "operator never set this" from "operator
+        // explicitly set it to an empty/default-shaped list". The concrete
+        // default write roots live in `DEFAULT_ALLOW_WRITE`, applied by the
+        // runtime resolver (`sandbox_policy::EffectiveSandboxInputs`) when
+        // `allow_write` is `None`, not baked into the schema default itself.
+        assert!(p.allow_write.is_none());
         assert!(
-            p.allow_write.contains(&".".to_string()),
+            DEFAULT_ALLOW_WRITE.contains(&"."),
             "default allow_write must include workspace"
         );
         assert!(
-            p.allow_write.contains(&"/tmp".to_string()),
+            DEFAULT_ALLOW_WRITE.contains(&"/tmp"),
             "default allow_write must include /tmp"
         );
-        assert!(p.deny_read.is_empty(), "default deny_read must be empty");
+        assert!(p.deny_read.is_none(), "default deny_read must be omitted");
         assert!(
             p.allowed_domains.is_empty(),
             "default allowed_domains must be empty (no network)"
@@ -27025,33 +27077,38 @@ default_temperature = 0.7
         "#;
         let p: SandboxPolicyConfig =
             toml::from_str(toml_in).expect("deserialize SandboxPolicyConfig");
-        assert_eq!(p.deny_read, vec!["~/.ssh"]);
-        assert_eq!(p.allow_write, vec!["."]);
+        assert_eq!(p.deny_read, Some(vec!["~/.ssh".to_string()]));
+        assert_eq!(p.allow_write, Some(vec![".".to_string()]));
         assert_eq!(p.allowed_domains, vec!["api.example.com"]);
         assert!(!p.mandatory_deny_write_enabled);
-        // fields not set must fall back to default
-        assert!(p.allow_read.is_empty());
+        // fields not set in the TOML must fall back to None (omitted), not
+        // an empty Vec — an operator writing `allow_read = []` explicitly is
+        // a materially different config from never mentioning `allow_read`.
+        assert!(p.allow_read.is_none());
         assert!(p.denied_domains.is_empty());
     }
 
     #[test]
     async fn mandatory_deny_write_defaults_flow_through_policy() {
-        let deny_write = &SandboxPolicyConfig::default().deny_write;
+        // The schema-level default no longer bakes the guardrail list in
+        // directly (deny_write is None until resolved); MANDATORY_DENY_WRITE
+        // is the source of truth the runtime resolver merges in.
+        assert!(SandboxPolicyConfig::default().deny_write.is_none());
         assert!(
-            !deny_write.is_empty(),
+            !MANDATORY_DENY_WRITE.is_empty(),
             "default deny_write guardrail list must not be empty"
         );
-        assert!(deny_write.iter().any(|p| p == ".env"), "must block .env");
+        assert!(MANDATORY_DENY_WRITE.contains(&".env"), "must block .env");
         assert!(
-            deny_write.iter().any(|p| p == ".git/hooks/"),
+            MANDATORY_DENY_WRITE.contains(&".git/hooks/"),
             "must block .git/hooks/"
         );
         assert!(
-            deny_write.iter().any(|p| p == ".bashrc"),
+            MANDATORY_DENY_WRITE.contains(&".bashrc"),
             "must block .bashrc"
         );
         assert!(
-            deny_write.iter().any(|p| p == ".mcp.json"),
+            MANDATORY_DENY_WRITE.contains(&".mcp.json"),
             "must block .mcp.json"
         );
     }
@@ -27066,8 +27123,8 @@ default_temperature = 0.7
         "#;
         let p: SandboxPolicyConfig =
             toml::from_str(toml_in).expect("alias keys must deserialize via serde alias");
-        assert_eq!(p.deny_read, vec!["/sensitive"]);
-        assert_eq!(p.allow_read, vec!["/shared"]);
+        assert_eq!(p.deny_read, Some(vec!["/sensitive".to_string()]));
+        assert_eq!(p.allow_read, Some(vec!["/shared".to_string()]));
     }
 
     #[test]

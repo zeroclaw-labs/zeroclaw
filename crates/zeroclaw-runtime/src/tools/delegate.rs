@@ -7209,8 +7209,20 @@ mod tests {
 
         assert_eq!(target_policy.risk_profile_name, "target");
         assert_eq!(target_policy.allowed_commands, vec!["target-only"]);
+        // The "target" risk profile leaves workspace_only at its schema
+        // default (true), which forces write access to the workspace root
+        // regardless of allowed_roots (see
+        // `EffectiveSandboxInputs::from_profile`) — so the legacy
+        // allowed_roots entry lands in the READ-ONLY tier, not the
+        // read+write tier. Checking both is the actual property under test
+        // (the target's own allowed_roots reached the resolved policy at
+        // all), not which specific tier it landed in.
         assert!(
-            target_policy.allowed_roots.contains(&target_extra_root),
+            target_policy
+                .allowed_roots
+                .iter()
+                .chain(target_policy.allowed_roots_read_only.iter())
+                .any(|p| p == &target_extra_root),
             "target policy must retain target allowed_roots"
         );
         assert!(
