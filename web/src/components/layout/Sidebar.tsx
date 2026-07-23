@@ -1,6 +1,7 @@
-import { NavLink, useLocation } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import { findActiveNavPath } from './sidebarNav';
+import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
   ArrowDownToLine,
@@ -104,9 +105,9 @@ function RailNavItem({
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/' || to !== activePath}
+      activePath={activePath}
       onClick={onClick}
       title={text}
       aria-label={text}
@@ -151,7 +152,7 @@ function RailNavItem({
           </span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
@@ -171,9 +172,9 @@ function DrawerNavItem({
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/' || to !== activePath}
+      activePath={activePath}
       onClick={onClick}
       className={({ isActive }) =>
         [
@@ -201,7 +202,7 @@ function DrawerNavItem({
           <span className="whitespace-nowrap">{text}</span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
