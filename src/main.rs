@@ -3307,6 +3307,105 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
+/// Extract the launch command from a ZeroClaw XDG desktop entry. Returns the
+/// first whitespace-delimited token of the `Exec=` line only when the entry
+/// identifies as ZeroClaw's, so an unrelated desktop file is never launched.
+/// Field codes (`%U`, `%F`, …) and surrounding quotes are stripped.
+///
+/// Gated with the `desktop` command's `which` dependency (`agent-runtime`) on
+/// Linux, matching its sole caller and the desktop-entry test.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn zeroclaw_desktop_exec(contents: &str) -> Option<String> {
+    let is_zeroclaw = contents.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        (lower.starts_with("name=") || lower.starts_with("exec=") || lower.starts_with("icon="))
+            && lower.contains("zeroclaw")
+    });
+    if !is_zeroclaw {
+        return None;
+    }
+    let exec_line = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("Exec="))?;
+    let first = exec_line.split_whitespace().next()?.trim_matches('"');
+    if first.is_empty() || first.starts_with('%') {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+/// Discover an installed companion app on Linux that is not on `PATH`, such as
+/// an AppImage registered in the application menu. Reads the `Exec` target from
+/// a ZeroClaw XDG desktop entry, then falls back to scanning common AppImage
+/// install locations. Returns the launchable binary/AppImage path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn find_linux_desktop_app() -> Option<PathBuf> {
+    // Resolve a desktop-entry command to an existing file: an absolute path is
+    // taken as-is, a bare command name is resolved through `PATH`.
+    fn resolve(command: &str) -> Option<PathBuf> {
+        let candidate = Path::new(command);
+        if candidate.is_absolute() {
+            return candidate.is_file().then(|| candidate.to_path_buf());
+        }
+        which::which(command).ok()
+    }
+
+    let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+
+    // 1. Scan XDG application directories for a ZeroClaw desktop entry and
+    //    launch whatever its Exec line points at.
+    let mut app_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = &home {
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        app_dirs.push(data_home.join("applications"));
+    }
+    app_dirs.push(PathBuf::from("/usr/local/share/applications"));
+    app_dirs.push(PathBuf::from("/usr/share/applications"));
+
+    for dir in &app_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(target) = zeroclaw_desktop_exec(&contents).and_then(|cmd| resolve(&cmd)) {
+                return Some(target);
+            }
+        }
+    }
+
+    // 2. Fall back to scanning common AppImage locations for a ZeroClaw image
+    //    that was made executable but never registered on PATH.
+    if let Some(home) = &home {
+        for dir in [home.join("Applications"), home.join(".local/bin")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if name.contains("zeroclaw") && name.ends_with(".appimage") && path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn async_main(command: clap::Command) -> Result<()> {
@@ -4935,7 +5034,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Desktop {
             install: do_install,
         } => {
-            let download_url = "https://www.zeroclawlabs.ai/download";
+            // The marketing download page is not live; point at the GitHub
+            // releases page, which always has the .deb/.AppImage/.dmg assets.
+            let download_url = "https://github.com/zeroclaw-labs/zeroclaw/releases/latest";
 
             if do_install {
                 println!(
@@ -5056,6 +5157,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     && let Ok(path) = which::which("zeroclaw-desktop")
                 {
                     found = Some(path);
+                }
+
+                // 5. Linux: an AppImage registered in the application menu is
+                //    not on PATH and has no fixed binary name, so discover it
+                //    from its desktop entry or common AppImage locations.
+                #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+                if found.is_none() {
+                    found = find_linux_desktop_app();
                 }
 
                 found
@@ -8070,6 +8179,45 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_reads_appimage_from_entry() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/home/user/Applications/ZeroClaw-x86_64.AppImage %U\n\
+             Icon=zeroclaw\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/home/user/Applications/ZeroClaw-x86_64.AppImage")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_ignores_unrelated_entry() {
+        let entry = "[Desktop Entry]\n\
+             Name=Some Other App\n\
+             Exec=/usr/bin/other %F\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_strips_field_codes_and_quotes() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw Companion\n\
+             Exec=\"/opt/zeroclaw/zeroclaw-desktop\" %u\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/opt/zeroclaw/zeroclaw-desktop")
+        );
+        // A bare field code with no real command must not resolve.
+        let bad = "[Desktop Entry]\nName=ZeroClaw\nExec=%U\n";
+        assert_eq!(zeroclaw_desktop_exec(bad), None);
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
