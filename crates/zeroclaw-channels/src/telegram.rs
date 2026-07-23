@@ -5455,8 +5455,15 @@ mod tests {
             .unwrap();
     }
 
+    /// The runtime's `StreamDelta::FlushBarrier` handler flushes the owning
+    /// draft (via `flush_draft_turn`, orchestrator/mod.rs:5225) BEFORE the
+    /// agent loop calls `request_approval`; the narration-before-prompt
+    /// guarantee is now produced by the barrier, not by `request_approval`
+    /// itself. Simulate that barrier flush explicitly with the same
+    /// primitive it calls, then confirm `request_approval` only sends the
+    /// prompt (and no longer re-flushes anything).
     #[tokio::test]
-    async fn request_approval_flushes_narration_before_approval_prompt() {
+    async fn narration_precedes_approval_prompt_via_barrier_flush() {
         use wiremock::matchers::{body_string_contains, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use zeroclaw_api::channel::ChannelApprovalRequest;
@@ -5500,6 +5507,14 @@ mod tests {
             .await
             .unwrap();
 
+        // Simulate the FlushBarrier handler: it calls `flush_draft_turn` on
+        // the owning draft before the agent loop is released to request
+        // approval. This is what delivers the narration send (satisfies the
+        // first mock above).
+        ch.flush_draft_turn("123", &draft_id, "Понял, вызовем калькулятор:")
+            .await
+            .unwrap();
+
         let request = ChannelApprovalRequest {
             tool_name: "calculator".to_string(),
             arguments_summary: "expr=1+1".to_string(),
@@ -5514,11 +5529,19 @@ mod tests {
     }
 
     /// The approval prompt must not arrive glued to the pre-tool narration:
-    /// after flushing the narration, `request_approval` paces by
+    /// after the barrier flushes the narration, `request_approval` paces by
     /// `multi_message_delay_ms` before sending the inline keyboard (restores
     /// the inter-message gap the streaming redesign dropped). Asserts a lower
     /// bound on elapsed time — deterministic because the pacing sleep
     /// guarantees at least the configured delay once narration was just sent.
+    ///
+    /// The narration is delivered here via `flush_draft_turn`, the same
+    /// primitive the `StreamDelta::FlushBarrier` handler calls
+    /// (orchestrator/mod.rs:5225) before releasing the agent loop to request
+    /// approval. That flush (through `flush_unsent`) is also what stamps the
+    /// draft's `last_sent_at`, which is what makes the pacing lower bound
+    /// observable in `request_approval` (`pace_multi_message_send` reads
+    /// `latest_multi_message_send_at`).
     #[tokio::test]
     async fn request_approval_paces_prompt_after_narration() {
         use wiremock::matchers::{method, path_regex};
@@ -5547,6 +5570,12 @@ mod tests {
             .unwrap()
             .expect("draft id");
         ch.update_draft("123", &draft_id, "Понял, вызовем калькулятор:")
+            .await
+            .unwrap();
+
+        // Simulate the barrier flush that now delivers the narration and
+        // sets `last_sent_at`, before `request_approval` paces off of it.
+        ch.flush_draft_turn("123", &draft_id, "Понял, вызовем калькулятор:")
             .await
             .unwrap();
 
