@@ -197,7 +197,7 @@ fn write_blob_atomic(
 }
 
 /// Whether an MCP tools/call content item is a `resource` with a `blob` field.
-pub fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
+pub(crate) fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
     item.get("type").and_then(|t| t.as_str()) == Some("resource")
         && item
             .get("resource")
@@ -216,7 +216,11 @@ pub fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
 /// unknown content types, per-item `annotations`, and top-level
 /// `structuredContent`/`_meta`/`isError`) is preserved verbatim. Results without a
 /// resource blob keep the existing pretty-printed JSON shape.
-pub fn format_mcp_tool_result_for_model(
+///
+/// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
+/// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
+/// surface.
+pub(crate) fn format_mcp_tool_result_for_model(
     result: &serde_json::Value,
     workspace_dir: &Path,
 ) -> Result<String, EmbeddedResourceError> {

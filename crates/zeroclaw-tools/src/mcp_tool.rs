@@ -15,8 +15,9 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// The `prefixed_name` (e.g. `filesystem__read_file`) is what the agent loop
 /// sees. The registry knows how to route it to the correct server.
 ///
-/// `security` is a handle to the live [`SecurityPolicy`] (source of truth for
-/// `workspace_dir`); workspace path is resolved at execute time, not cached.
+/// `security` is the execution-scope [`SecurityPolicy`] snapshot (source of truth
+/// for `workspace_dir`) — an immutable `Arc`, not a reloadable live handle. The
+/// workspace path is resolved from it at execute time, not cached.
 pub struct McpToolWrapper {
     /// Prefixed name: `<server_name>__<tool_name>`.
     prefixed_name: String,

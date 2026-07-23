@@ -39,8 +39,9 @@ impl DeferredMcpToolStub {
 
     /// Materialize this stub into a live [`McpToolWrapper`].
     ///
-    /// `security` is a handle to the live [`SecurityPolicy`] (source of truth
-    /// for workspace path used when materializing MCP `resource`+`blob` results).
+    /// `security` is the execution-scope [`SecurityPolicy`] snapshot (source of
+    /// truth for the workspace path used when materializing MCP `resource`+`blob`
+    /// results) — an immutable `Arc`, not a reloadable live handle.
     pub fn activate(
         &self,
         registry: Arc<McpRegistry>,
