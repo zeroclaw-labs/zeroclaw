@@ -84,6 +84,68 @@ fn truncate_telegram_command_description(raw: &str) -> String {
     truncated
 }
 
+/// Strip scratchpad XML blocks that reasoning models occasionally leak into
+/// their assistant text. Raw `<tool_result>` JSON, `<tool_call>` bodies, and
+/// `<think>` traces are model-internal artifacts and must not appear in
+/// Telegram messages.
+fn strip_assistant_scratchpad(text: &str) -> String {
+    use std::sync::LazyLock;
+    static TOOL_RESULT_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?s)<tool_result\b[^>]*>.*?</tool_result>").unwrap());
+    static TOOL_CALL_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?s)<tool_call\b[^>]*>.*?</tool_call>").unwrap());
+    static THINK_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?s)<think\b[^>]*>.*?</think>").unwrap());
+
+    // Pass 1: strip properly closed XML scratchpad blocks.
+    let pass1 = TOOL_RESULT_RE.replace_all(text, "");
+    let pass1 = TOOL_CALL_RE.replace_all(&pass1, "");
+    let pass1 = THINK_RE.replace_all(&pass1, "").into_owned();
+
+    // Pass 2: strip bare opening tags (no closing tag) followed by JSON-only
+    // lines. Some models emit a `<tool_result>` opening tag followed by a
+    // one-line JSON payload with no closing tag.
+    let lines: Vec<&str> = pass1.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let is_open_tag = trimmed.starts_with("<tool_result")
+            || trimmed.starts_with("<tool_call")
+            || trimmed.starts_with("<think");
+        if !is_open_tag {
+            kept.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        // Skip this opening tag line, then any JSON-looking lines that follow.
+        i += 1;
+        while i < lines.len() {
+            let next_trim = lines[i].trim();
+            if next_trim.is_empty() {
+                i += 1;
+                continue;
+            }
+            if next_trim.starts_with("<tool_result")
+                || next_trim.starts_with("<tool_call")
+                || next_trim.starts_with("<think")
+            {
+                break;
+            }
+            let first = next_trim.chars().next().unwrap_or(' ');
+            let looks_jsonish = matches!(first, '{' | '}' | '[' | ']' | '"' | ',' | ':');
+            if looks_jsonish {
+                i += 1;
+                continue;
+            }
+            // Prose line: stop stripping.
+            break;
+        }
+    }
+
+    kept.join("\n").trim().to_string()
+}
+
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The split budget includes continuation markers and synthetic code fences
@@ -2559,7 +2621,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let chunks = split_message_for_telegram(message);
+        let cleaned = strip_assistant_scratchpad(message);
+        let chunks = split_message_for_telegram(&cleaned);
 
         for (index, chunk) in chunks.iter().enumerate() {
             let text = format_telegram_text_chunk(chunk, index, chunks.len());
@@ -4200,6 +4263,42 @@ Ensure only one `zeroclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_scratchpad_removes_closed_blocks() {
+        let raw = "Before.\n<tool_result name=\"shell\">{\"ok\":true}</tool_result>\nAfter.";
+        assert_eq!(strip_assistant_scratchpad(raw), "Before.\n\nAfter.");
+
+        let raw = "Hi <think>internal reasoning</think>there";
+        assert_eq!(strip_assistant_scratchpad(raw), "Hi there");
+
+        let raw = "<tool_call>{\"name\":\"x\"}</tool_call>Answer";
+        assert_eq!(strip_assistant_scratchpad(raw), "Answer");
+    }
+
+    #[test]
+    fn strip_scratchpad_removes_unclosed_tag_with_json_lines() {
+        let raw = "Result summary:\n<tool_result>\n{\"status\": \"ok\",\n\"items\": [1, 2]\nDone: 2 items imported.";
+        assert_eq!(
+            strip_assistant_scratchpad(raw),
+            "Result summary:\nDone: 2 items imported."
+        );
+    }
+
+    #[test]
+    fn strip_scratchpad_stops_at_prose_after_unclosed_tag() {
+        let raw = "<tool_call>\nplain prose line";
+        assert_eq!(strip_assistant_scratchpad(raw), "plain prose line");
+    }
+
+    #[test]
+    fn strip_scratchpad_leaves_clean_text_untouched() {
+        let raw = "A normal reply.\nWith two lines.";
+        assert_eq!(strip_assistant_scratchpad(raw), raw);
+        // Inline code mentioning the tags is prose, not a leaked block open tag.
+        let raw = "Use the `tool_result` field.";
+        assert_eq!(strip_assistant_scratchpad(raw), raw);
+    }
 
     #[test]
     fn scrub_masks_poll_error_url() {
