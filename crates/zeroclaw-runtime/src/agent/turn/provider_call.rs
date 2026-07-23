@@ -107,7 +107,13 @@ pub(crate) async fn announce_llm_request(
 }
 
 /// Budget enforcement — block if limit exceeded (no-op when not scoped).
-pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
+pub(crate) async fn enforce_tool_loop_budget() -> Result<()> {
+    if let Err(error) = crate::agent::cost::ensure_goal_accounting_preflight() {
+        if let Some(task_id) = crate::agent::cost::current_exact_goal_task_id() {
+            let _ = crate::control_plane::pause_goal_for_accounting_failure(&task_id, &error).await;
+        }
+        return Err(error);
+    }
     if let Some(BudgetCheck::Exceeded {
         current_usd,
         limit_usd,

@@ -37,10 +37,19 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+/// Borrowed tool-resolution inputs for one tool dispatch.
+///
+/// The active tool set can vary per turn, especially for goal mode where
+/// background delegation and admission tools are filtered by policy. This
+/// object keeps the borrowed registries together without cloning or caching
+/// tool availability outside the turn that owns it.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolDispatchContext<'a> {
+    /// Static tools registered for this runtime.
     pub tools_registry: &'a [Box<dyn Tool>],
+    /// Dynamically activated tools for the current session, when enabled.
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    /// Tool names removed from this specific turn before model/tool execution.
     pub excluded_tools: &'a [String],
 }
 
@@ -82,19 +91,42 @@ fn unavailable_tool_outcome(
     }
 }
 
+fn is_goal_admission_tool_call(name: &str) -> bool {
+    matches!(
+        name,
+        crate::tools::GoalStartTool::NAME
+            | crate::tools::GoalObjectiveTool::NAME
+            | crate::tools::GoalResumeTool::NAME
+    )
+}
+
+fn contains_goal_admission_tool_call(tool_calls: &[ParsedToolCall]) -> bool {
+    tool_calls
+        .iter()
+        .any(|call| is_goal_admission_tool_call(&call.name))
+}
+
 // ── Outcome ──────────────────────────────────────────────────────────────
 
+/// Result of executing one model-requested tool call.
+///
+/// This is a transient execution packet. Durable cost attribution is recorded
+/// by the cost tracker, and observer/log rendering decides how much of this
+/// output can be shown to humans after credential scrubbing.
 pub struct ToolExecutionOutcome {
+    /// Tool output returned to the model loop.
     pub output: String,
     /// Structured output when the tool declared one (`ToolOutput::data`).
     /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
     /// `output`.
     pub output_data: Option<serde_json::Value>,
+    /// Whether the tool reported success.
     pub success: bool,
     /// Raw failure text on the data path. Credential scrubbing is a rendering
     /// concern applied at each human-facing surface (observer events,
     /// post-execution log line, CLI progress), never stored pre-scrubbed here.
     pub error_reason: Option<String>,
+    /// Wall-clock execution time for observer/log reporting.
     pub duration: Duration,
     /// Cryptographic HMAC receipt proving this tool actually executed.
     /// Present only when tool receipts are enabled in config.
@@ -352,6 +384,7 @@ pub(crate) async fn execute_one_tool(
                     })
                 }
             }
+            Err(e) if is_tool_loop_cancelled(&e) => Err(e),
             Err(e) => {
                 let duration = start.elapsed();
                 ::zeroclaw_log::record!(
@@ -436,6 +469,13 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
+    if contains_goal_admission_tool_call(tool_calls) {
+        // Goal admission/control tools mutate task-local goal policy after
+        // trusted admission. Keep the whole batch serial and separately marked
+        // so sibling tools cannot race goal state before admission finishes.
+        return false;
+    }
+
     if let Some(mgr) = approval
         && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
@@ -458,33 +498,39 @@ pub(crate) async fn execute_tools_parallel(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<Vec<Option<ToolExecutionOutcome>>> {
-    let futures: Vec<_> = tool_calls
-        .iter()
-        .map(|call| {
-            execute_one_tool(
-                &call.name,
-                call.arguments.clone(),
-                call.tool_call_id.as_deref(),
-                dispatch,
-                meta,
-                observer,
-                cancellation_token,
-                receipt_generator,
-                event_tx,
-            )
-        })
-        .collect();
+    crate::control_plane::scope_goal_start_tool_batch(
+        contains_goal_admission_tool_call(tool_calls),
+        async {
+            let futures: Vec<_> = tool_calls
+                .iter()
+                .map(|call| {
+                    execute_one_tool(
+                        &call.name,
+                        call.arguments.clone(),
+                        call.tool_call_id.as_deref(),
+                        dispatch,
+                        meta,
+                        observer,
+                        cancellation_token,
+                        receipt_generator,
+                        event_tx,
+                    )
+                })
+                .collect();
 
-    let results = futures_util::future::join_all(futures).await;
-    let mut slots = Vec::with_capacity(results.len());
-    for result in results {
-        match result {
-            Ok(outcome) => slots.push(Some(outcome)),
-            Err(e) if is_tool_loop_cancelled(&e) => slots.push(None),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(slots)
+            let results = futures_util::future::join_all(futures).await;
+            let mut slots = Vec::with_capacity(results.len());
+            for result in results {
+                match result {
+                    Ok(outcome) => slots.push(Some(outcome)),
+                    Err(e) if is_tool_loop_cancelled(&e) => slots.push(None),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(slots)
+        },
+    )
+    .await
 }
 
 // ── Sequential execution ─────────────────────────────────────────────────
@@ -498,43 +544,49 @@ pub(crate) async fn execute_tools_sequential(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<Vec<Option<ToolExecutionOutcome>>> {
-    let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
+    crate::control_plane::scope_goal_start_tool_batch(
+        contains_goal_admission_tool_call(tool_calls),
+        async {
+            let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
 
-    for call in tool_calls {
-        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
-            break;
-        }
-        let outcome = match execute_one_tool(
-            &call.name,
-            call.arguments.clone(),
-            call.tool_call_id.as_deref(),
-            dispatch,
-            meta,
-            observer,
-            cancellation_token,
-            receipt_generator,
-            event_tx,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) if is_tool_loop_cancelled(&e) => break,
-            Err(e) => return Err(e),
-        };
-        slots.push(Some(outcome));
-    }
+            for call in tool_calls {
+                if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+                    break;
+                }
+                let outcome = match execute_one_tool(
+                    &call.name,
+                    call.arguments.clone(),
+                    call.tool_call_id.as_deref(),
+                    dispatch,
+                    meta,
+                    observer,
+                    cancellation_token,
+                    receipt_generator,
+                    event_tx,
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) if is_tool_loop_cancelled(&e) => break,
+                    Err(e) => return Err(e),
+                };
+                slots.push(Some(outcome));
+            }
 
-    slots.resize_with(tool_calls.len(), || None);
-    Ok(slots)
+            slots.resize_with(tool_calls.len(), || None);
+            Ok(slots)
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDispatchContext, execute_one_tool};
+    use super::{ToolDispatchContext, execute_one_tool, execute_tools_sequential};
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use zeroclaw_api::tool::Tool;
 
@@ -561,6 +613,61 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "test-counting-tool"
+        }
+    }
+
+    /// Test-only tool that models a goal/human-gate cancellation path.
+    ///
+    /// The fixture has no durable state; it exists to prove that
+    /// `ToolLoopCancelled` is propagated out of the execution wrapper instead of
+    /// being converted into an ordinary tool failure.
+    struct CancellingTool;
+
+    /// Test probe that records whether the enclosing tool batch was marked as
+    /// containing `goal_start` before this tool executed.
+    struct GoalStartBatchProbeTool {
+        observed: Arc<AtomicBool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CancellingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            "cancelling-tool"
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalStartBatchProbeTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            "goal-start-batch-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CancellingTool {
+        fn name(&self) -> &str {
+            "cancelling_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Returns ToolLoopCancelled for cancellation propagation tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Err(crate::agent::turn::ToolLoopCancelled.into())
         }
     }
 
@@ -595,6 +702,131 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Tool for GoalStartBatchProbeTool {
+        fn name(&self) -> &str {
+            "goal_start_batch_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records goal_start batch marker visibility"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.observed.store(
+                crate::control_plane::current_goal_start_tool_batch_requested(),
+                Ordering::SeqCst,
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "observed".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_start_batch_marker_is_visible_before_first_sibling_tool() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let goal_start_invocations = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(GoalStartBatchProbeTool {
+                observed: Arc::clone(&observed),
+            }),
+            Box::new(CountingTool::new(
+                crate::tools::GoalStartTool::NAME,
+                Arc::clone(&goal_start_invocations),
+            )),
+        ];
+        let calls = vec![
+            parsed_tool_call("goal_start_batch_probe"),
+            parsed_tool_call(crate::tools::GoalStartTool::NAME),
+        ];
+        let meta = crate::agent::turn::TurnMeta {
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let results = execute_tools_sequential(
+            &calls,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("sequential execution should succeed");
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "goal_start batch marker must be scoped before any sibling executes"
+        );
+        assert_eq!(goal_start_invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            !crate::control_plane::current_goal_start_tool_batch_requested(),
+            "batch marker must not leak after execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_propagates_tool_loop_cancelled_from_tool() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CancellingTool)];
+        let dispatch = ToolDispatchContext {
+            tools_registry: &tools,
+            activated_tools: None,
+            excluded_tools: &[],
+        };
+        let meta = super::super::turn::TurnMeta {
+            channel_name: "test",
+            agent_alias: Some("agent"),
+            parent_agent_alias: None,
+            turn_id: "turn-1",
+        };
+
+        let result = execute_one_tool(
+            "cancelling_tool",
+            serde_json::json!({}),
+            None,
+            dispatch,
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("tool-level cancellation must propagate out of execute_one_tool"),
+            Err(error) => error,
+        };
+
+        assert!(crate::agent::turn::is_tool_loop_cancelled(&error));
+    }
+
+    /// Regression: execute_one_tool must recover a poisoned
+    /// ActivatedToolSet mutex and still resolve the activated tool
+    /// instead of panicking.
+    ///
+    /// Before the fix, the code used `.lock().unwrap()`, which panics
+    /// on a poisoned mutex. The recovery path (`into_inner()`) allows
+    /// the turn to proceed with the last valid state of the activated
+    /// tool set.
     #[tokio::test]
     async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -761,6 +993,45 @@ mod tests {
         assert!(
             !should_execute_tools_in_parallel(&calls, Some(&approval_mgr)),
             "tool_search in a mixed approval batch must still force sequential execution"
+        );
+    }
+
+    #[test]
+    fn goal_start_in_batch_forces_serial() {
+        let calls = vec![
+            parsed_tool_call("delegate"),
+            parsed_tool_call(crate::tools::GoalStartTool::NAME),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "goal_start batches must serialize so sibling tools cannot race goal admission policy"
+        );
+    }
+
+    #[test]
+    fn goal_resume_in_batch_forces_serial() {
+        let calls = vec![
+            parsed_tool_call("delegate"),
+            parsed_tool_call(crate::tools::GoalResumeTool::NAME),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "goal_resume batches must serialize so sibling tools cannot race goal admission policy"
+        );
+    }
+
+    #[test]
+    fn goal_objective_in_batch_forces_serial() {
+        let calls = vec![
+            parsed_tool_call("delegate"),
+            parsed_tool_call(crate::tools::GoalObjectiveTool::NAME),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "goal_objective batches must serialize so sibling tools cannot race goal state updates"
         );
     }
 

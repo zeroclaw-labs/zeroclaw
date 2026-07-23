@@ -3,10 +3,80 @@
 use regex::Regex;
 use std::ops::Range;
 use std::sync::OnceLock;
+use url::Url;
 use zeroclaw_config::schema::LeakDetectionConfig;
 
 /// Minimum token length considered for high-entropy detection.
 const ENTROPY_TOKEN_MIN_LEN: usize = 24;
+
+/// Return valid `file:` URI ranges in opaque outbound text.
+///
+/// File references are generic content, not a channel-format feature. The
+/// ranges only suppress high-entropy heuristics; deterministic credential
+/// detectors still inspect their contents.
+pub fn outbound_file_uri_spans(content: &str) -> Vec<Range<usize>> {
+    if !content
+        .as_bytes()
+        .windows(b"file:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"file:"))
+    {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut token_start = None;
+    for (index, character) in content.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                collect_file_uri_token_span(content, start, index, &mut spans);
+            }
+        } else {
+            token_start.get_or_insert(index);
+        }
+    }
+    if let Some(start) = token_start {
+        collect_file_uri_token_span(content, start, content.len(), &mut spans);
+    }
+    spans
+}
+
+fn collect_file_uri_token_span(
+    content: &str,
+    token_start: usize,
+    token_end: usize,
+    spans: &mut Vec<Range<usize>>,
+) {
+    let token = &content[token_start..token_end];
+    let start = token
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, '<' | '(' | '[' | '{' | '"' | '\''))
+        .map_or(token.len(), |(index, _)| index);
+    let end = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| {
+            !matches!(
+                ch,
+                '>' | ')' | ']' | '}' | '"' | '\'' | '.' | ',' | ';' | ':'
+            )
+        })
+        .map_or(start, |(index, ch)| index + ch.len_utf8());
+    if start >= end {
+        return;
+    }
+    let trimmed = &token[start..end];
+    let Some(offset) = trimmed
+        .as_bytes()
+        .windows(b"file:".len())
+        .position(|window| window.eq_ignore_ascii_case(b"file:"))
+    else {
+        return;
+    };
+    let uri_start = start + offset;
+    if Url::parse(&token[uri_start..end]).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("file"))
+    {
+        spans.push(token_start + uri_start..token_start + end);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CandidateToken<'a> {

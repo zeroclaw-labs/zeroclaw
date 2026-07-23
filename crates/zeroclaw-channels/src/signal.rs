@@ -32,6 +32,55 @@ struct ReactionTarget {
     timestamp_ms: u64,
 }
 
+/// One outstanding prompt, including an optional identity constraint for a
+/// goal-owned approval. This request-scoped entry is the authoritative record
+/// until the reply, timeout, or send failure removes it.
+struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    expected_principal: Option<String>,
+}
+
+/// Removes an entry if the waiting request is cancelled before its normal
+/// reply/timeout cleanup runs. The pending map is the request's sole
+/// coordination state, so cancellation must release it too.
+struct PendingApprovalCleanup {
+    pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    token: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>, token: String) -> Self {
+        Self {
+            pending_approvals,
+            token,
+            armed: true,
+        }
+    }
+
+    async fn remove_and_disarm(&mut self) {
+        self.pending_approvals.lock().await.remove(&self.token);
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        let token = self.token.clone();
+        zeroclaw_spawn::spawn!(async move {
+            pending_approvals.lock().await.remove(&token);
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct SignalChannel {
     http_url: String,
@@ -50,7 +99,7 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -750,8 +799,12 @@ impl Channel for SignalChannel {
                                                 crate::util::parse_approval_reply(&msg.content)
                                             {
                                                 let mut map = self.pending_approvals.lock().await;
-                                                if let Some(sender) = map.remove(&token) {
-                                                    let _ = sender.send(response);
+                                                if let Some(pending) = take_pending_approval(
+                                                    &mut map,
+                                                    &token,
+                                                    &msg.sender,
+                                                ) {
+                                                    let _ = pending.sender.send(response);
                                                     consumed_as_approval = true;
                                                     continue;
                                                 }
@@ -801,8 +854,10 @@ impl Channel for SignalChannel {
                                     crate::util::parse_approval_reply(&msg.content)
                                 {
                                     let mut map = self.pending_approvals.lock().await;
-                                    if let Some(sender) = map.remove(&token) {
-                                        let _ = sender.send(response);
+                                    if let Some(pending) =
+                                        take_pending_approval(&mut map, &token, &msg.sender)
+                                    {
+                                        let _ = pending.sender.send(response);
                                         continue;
                                     }
                                 }
@@ -895,6 +950,31 @@ impl Channel for SignalChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        self.request_approval_inner(recipient, None, request).await
+    }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
+    }
+}
+
+impl SignalChannel {
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         let token = crate::util::new_approval_token();
         let text = format!(
             "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
@@ -902,26 +982,51 @@ impl Channel for SignalChannel {
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: expected_principal.map(str::to_owned),
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), token.clone());
 
         if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
-            self.pending_approvals.lock().await.remove(&token);
+            cleanup.remove_and_disarm().await;
             return Err(err);
         }
 
-        let response =
-            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => resp,
-                _ => {
-                    self.pending_approvals.lock().await.remove(&token);
-                    ChannelApprovalResponse::Deny
-                }
-            };
-        Ok(Some(response))
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            Ok(Ok(response)) => {
+                // The inbound handler already consumed the pending entry.
+                cleanup.disarm();
+                Ok(Some(response))
+            }
+            _ => {
+                cleanup.remove_and_disarm().await;
+                Ok(crate::util::approval_timeout_response(
+                    expected_principal.is_some(),
+                ))
+            }
+        }
     }
+}
+
+fn take_pending_approval(
+    pending: &mut HashMap<String, PendingApproval>,
+    token: &str,
+    principal: &str,
+) -> Option<PendingApproval> {
+    let entry = pending.get(token)?;
+    if entry
+        .expected_principal
+        .as_deref()
+        .is_some_and(|expected| expected != principal)
+    {
+        return None;
+    }
+    pending.remove(token)
 }
 
 #[cfg(test)]
@@ -1803,15 +1908,58 @@ mod tests {
             ignore_stories,
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: None,
+            },
+        );
         // simulate listen() routing
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Approve).unwrap();
+        let pending = ch.pending_approvals.lock().await.remove("abc123").unwrap();
+        pending
+            .sender
+            .send(ChannelApprovalResponse::Approve)
+            .unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
+    #[test]
+    fn bound_approval_reply_from_another_principal_is_not_consumed() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            "token".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("+15550001111".to_string()),
+            },
+        )]);
+        assert!(take_pending_approval(&mut pending, "token", "+15550002222").is_none());
+        assert!(pending.contains_key("token"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_approval_cleanup_removes_the_pending_entry() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        pending.lock().await.insert(
+            "token".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("+15550001111".to_string()),
+            },
+        );
+        let cleanup = PendingApprovalCleanup::new(Arc::clone(&pending), "token".to_string());
+        drop(cleanup);
+
+        for _ in 0..8 {
+            if pending.lock().await.is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(pending.lock().await.is_empty());
+    }
+
     fn make_reaction_channel() -> SignalChannel {
         SignalChannel::new(
             "http://127.0.0.1:8686".to_string(),

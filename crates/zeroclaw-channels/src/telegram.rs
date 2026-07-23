@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_commands::{CommandExecution, CommandSurface, commands_for_surface};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
@@ -82,6 +83,23 @@ fn truncate_telegram_command_description(raw: &str) -> String {
         .collect();
     truncated.push('…');
     truncated
+}
+
+fn telegram_builtin_command_values() -> Vec<serde_json::Value> {
+    commands_for_surface(CommandSurface::Channel)
+        .filter(|spec| {
+            matches!(
+                spec.execution,
+                CommandExecution::RuntimeCommand | CommandExecution::GoalAdmission
+            )
+        })
+        .map(|spec| {
+            serde_json::json!({
+                "command": spec.name,
+                "description": zeroclaw_runtime::i18n::get_required_cli_string(spec.description_key),
+            })
+        })
+        .collect()
 }
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -571,20 +589,57 @@ pub struct TelegramChannel {
     proxy_url: Option<String>,
     /// Pre-computed tool command specs (name, description) for bot command registration.
     tool_command_specs: Vec<(String, String)>,
-    /// Pending approval requests: callback_data key → oneshot sender.
-    /// `listen()` resolves these when a matching `callback_query` arrives.
-    pending_approvals: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
-            >,
-        >,
-    >,
+    /// Pending approval requests: callback_data key → request-local responder
+    /// constraint and oneshot sender. `listen()` resolves only the matching
+    /// authenticated callback principal for a goal-bound request.
+    pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// Seconds to wait for the operator to tap an inline-keyboard button on a
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+}
+
+struct PendingApproval {
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    expected_principal: Option<String>,
+}
+
+struct PendingApprovalCleanup {
+    pending: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    approval_id: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(
+        pending: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+        approval_id: String,
+    ) -> Self {
+        Self {
+            pending,
+            approval_id,
+            armed: true,
+        }
+    }
+    async fn remove_and_disarm(&mut self) {
+        self.pending.lock().await.remove(&self.approval_id);
+        self.armed = false;
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let pending = Arc::clone(&self.pending);
+            let approval_id = self.approval_id.clone();
+            zeroclaw_spawn::spawn!(async move {
+                pending.lock().await.remove(&approval_id);
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,14 +1045,7 @@ impl TelegramChannel {
     /// Includes built-in runtime commands, user-installed skill commands, and
     /// enabled tool commands from the configuration.
     async fn register_bot_commands(&self) {
-        let mut commands: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
-            serde_json::json!({ "command": "clear",  "description": "Clear this conversation session" }),
-            serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
-            serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
-            serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
-            serde_json::json!({ "command": "config", "description": "Show current configuration" }),
-        ];
+        let mut commands = telegram_builtin_command_values();
 
         // Track registered names to deduplicate across skills and tools.
         let mut used_names: std::collections::HashSet<String> = commands
@@ -3918,11 +3966,16 @@ Ensure only one `zeroclaw` process is using this bot token."
                                 }
                             };
 
-                            if let Some(resp) = response
-                                && let Some(sender) =
-                                    self.pending_approvals.lock().await.remove(approval_id)
-                            {
-                                let _ = sender.send(resp);
+                            let callback_principal = Self::callback_principal(cb);
+                            if let Some(resp) = response {
+                                let mut pending_approvals = self.pending_approvals.lock().await;
+                                if let Some(pending) = take_pending_approval(
+                                    &mut pending_approvals,
+                                    approval_id,
+                                    &callback_principal,
+                                ) {
+                                    let _ = pending.sender.send(resp);
+                                }
                             }
 
                             // Answer the callback query to dismiss the spinner.
@@ -4068,8 +4121,47 @@ Ensure only one `zeroclaw` process is using this bot token."
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
-        use zeroclaw_api::channel::ChannelApprovalResponse;
+        self.request_approval_inner(recipient, None, request).await
+    }
 
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
+    }
+}
+
+impl TelegramChannel {
+    fn callback_principal(callback: &serde_json::Value) -> String {
+        let from = callback.get("from").unwrap_or(&serde_json::Value::Null);
+        let username = from
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty());
+        username
+            .map(str::to_owned)
+            .or_else(|| {
+                from.get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|id| id.to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
         let (chat_id, thread_id) = recipient
             .split_once(':')
@@ -4108,10 +4200,15 @@ Ensure only one `zeroclaw` process is using this bot token."
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(approval_id.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: expected_principal.map(str::to_owned),
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), approval_id.clone());
 
         let resp = self
             .http_client()
@@ -4161,45 +4258,84 @@ Ensure only one `zeroclaw` process is using this bot token."
                     Ok(r) => {
                         let status = r.status();
                         let err = r.text().await.unwrap_or_default();
-                        self.pending_approvals.lock().await.remove(&approval_id);
+                        cleanup.remove_and_disarm().await;
                         anyhow::bail!("Telegram sendMessage (approval) failed ({status}): {err}");
                     }
                     Err(e) => {
-                        self.pending_approvals.lock().await.remove(&approval_id);
+                        cleanup.remove_and_disarm().await;
                         return Err(e.into());
                     }
                 }
             }
             Err(e) => {
-                self.pending_approvals.lock().await.remove(&approval_id);
+                cleanup.remove_and_disarm().await;
                 return Err(e.into());
             }
         };
 
         if !send_ok {
-            self.pending_approvals.lock().await.remove(&approval_id);
+            cleanup.remove_and_disarm().await;
             anyhow::bail!("Telegram sendMessage (approval) failed after fallback");
         }
 
         // Wait for the user to tap a button. Timeout is configurable via
         // `channels.telegram.approval_timeout_secs` (default 120s).
-        let result =
-            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(response)) => Some(response),
-                _ => {
-                    // Timeout or sender dropped — clean up and deny.
-                    self.pending_approvals.lock().await.remove(&approval_id);
-                    Some(ChannelApprovalResponse::Deny)
-                }
-            };
-
-        Ok(result)
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            Ok(Ok(response)) => {
+                cleanup.disarm();
+                Ok(Some(response))
+            }
+            _ => {
+                cleanup.remove_and_disarm().await;
+                Ok(crate::util::approval_timeout_response(
+                    expected_principal.is_some(),
+                ))
+            }
+        }
     }
+}
+
+fn take_pending_approval(
+    pending: &mut std::collections::HashMap<String, PendingApproval>,
+    approval_id: &str,
+    principal: &str,
+) -> Option<PendingApproval> {
+    let entry = pending.get(approval_id)?;
+    if entry
+        .expected_principal
+        .as_deref()
+        .is_some_and(|expected| expected != principal)
+    {
+        return None;
+    }
+    pending.remove(approval_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_approval_cleanup_removes_pending_entry() {
+        let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            "approval".into(),
+            PendingApproval {
+                sender,
+                expected_principal: Some("owner".into()),
+            },
+        );
+        drop(PendingApprovalCleanup::new(
+            Arc::clone(&pending),
+            "approval".into(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            pending.lock().await.is_empty(),
+            "cancelled waiters must not retain tokens"
+        );
+    }
 
     #[test]
     fn scrub_masks_poll_error_url() {
@@ -7602,23 +7738,19 @@ mod tests {
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
     }
 
+    fn expected_bot_commands_body(extra_commands: Vec<serde_json::Value>) -> serde_json::Value {
+        let mut commands = telegram_builtin_command_values();
+        commands.extend(extra_commands);
+        serde_json::json!({ "commands": commands })
+    }
+
     #[tokio::test]
     async fn register_bot_commands_sends_correct_payload() {
         use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",    "description": "Start a new conversation session" },
-                { "command": "clear",  "description": "Clear this conversation session" },
-                { "command": "stop",   "description": "Cancel the current in-flight task" },
-                { "command": "model",  "description": "Show or switch the current model" },
-                { "command": "models", "description": "List available model_providers or switch model_provider" },
-                { "command": "config", "description": "Show current configuration" },
-            ]
-        });
+        let expected_body = expected_bot_commands_body(Vec::new());
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7764,17 +7896,10 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",     "description": "Start a new conversation session" },
-                { "command": "clear",   "description": "Clear this conversation session" },
-                { "command": "stop",    "description": "Cancel the current in-flight task" },
-                { "command": "model",   "description": "Show or switch the current model" },
-                { "command": "models",  "description": "List available model_providers or switch model_provider" },
-                { "command": "config",  "description": "Show current configuration" },
-                { "command": "weather", "description": "Check the weather forecast" },
-            ]
-        });
+        let expected_body = expected_bot_commands_body(vec![serde_json::json!({
+            "command": "weather",
+            "description": "Check the weather forecast",
+        })]);
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7807,17 +7932,10 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",       "description": "Start a new conversation session" },
-                { "command": "clear",     "description": "Clear this conversation session" },
-                { "command": "stop",      "description": "Cancel the current in-flight task" },
-                { "command": "model",     "description": "Show or switch the current model" },
-                { "command": "models",    "description": "List available model_providers or switch model_provider" },
-                { "command": "config",    "description": "Show current configuration" },
-                { "command": "test_tool", "description": "A test tool" },
-            ]
-        });
+        let expected_body = expected_bot_commands_body(vec![serde_json::json!({
+            "command": "test_tool",
+            "description": "A test tool",
+        })]);
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7893,18 +8011,38 @@ mod tests {
         let approval_id = "test-approval-123".to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert(approval_id.clone(), tx);
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: None,
+            },
+        );
 
         // Simulate what listen() does when a callback_query arrives
-        if let Some(sender) = ch.pending_approvals.lock().await.remove(&approval_id) {
-            sender.send(ChannelApprovalResponse::Approve).unwrap();
+        if let Some(pending) = ch.pending_approvals.lock().await.remove(&approval_id) {
+            pending
+                .sender
+                .send(ChannelApprovalResponse::Approve)
+                .unwrap();
         }
 
         let result = rx.await.unwrap();
         assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn bound_callback_from_another_principal_is_not_consumed() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut pending = std::collections::HashMap::from([(
+            "approval".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("operator".to_string()),
+            },
+        )]);
+        assert!(take_pending_approval(&mut pending, "approval", "other").is_none());
+        assert!(pending.contains_key("approval"));
     }
 
     #[test]

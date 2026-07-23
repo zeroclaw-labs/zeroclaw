@@ -251,6 +251,16 @@ impl ApprovalManager {
     /// Only called for interactive (CLI) managers. Non-interactive managers
     /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
+        self.prompt_cli_with_provenance(request).0
+    }
+
+    /// Return the decision plus whether `No` was literal operator input.
+    /// EOF, I/O failure, and malformed input are fail-closed denials but are
+    /// not operator decisions and must not trigger goal denial policy.
+    pub fn prompt_cli_with_provenance(
+        &self,
+        request: &ApprovalRequest,
+    ) -> (ApprovalResponse, bool) {
         prompt_cli_interactive(request)
     }
 }
@@ -259,7 +269,7 @@ impl ApprovalManager {
 
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
-fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+fn prompt_cli_interactive(request: &ApprovalRequest) -> (ApprovalResponse, bool) {
     let summary = summarize_args(&request.arguments);
     eprintln!();
     eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
@@ -268,17 +278,23 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let _ = io::stderr().flush();
 
     let Ok(line) = read_cli_approval_line() else {
-        return ApprovalResponse::No;
+        return (ApprovalResponse::No, false);
     };
 
-    parse_cli_approval_response(&line)
+    parse_cli_approval_response_with_provenance(&line)
 }
 
+#[cfg(test)]
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
+    parse_cli_approval_response_with_provenance(line).0
+}
+
+fn parse_cli_approval_response_with_provenance(line: &str) -> (ApprovalResponse, bool) {
     match line.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => ApprovalResponse::Yes,
-        "a" | "always" => ApprovalResponse::Always,
-        _ => ApprovalResponse::No,
+        "y" | "yes" => (ApprovalResponse::Yes, false),
+        "a" | "always" => (ApprovalResponse::Always, false),
+        "n" | "no" => (ApprovalResponse::No, true),
+        _ => (ApprovalResponse::No, false),
     }
 }
 

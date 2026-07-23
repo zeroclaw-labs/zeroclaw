@@ -62,7 +62,10 @@ impl ChannelSopTopic {
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {
+    /// Stable tool name from the runtime tool registry.
     pub tool_name: String,
+    /// Human-readable argument summary for channels that cannot render a
+    /// structured approval view.
     pub arguments_summary: String,
     /// Raw tool arguments for channels (e.g. ACP) that can render structured
     /// diffs instead of a plain summary string.
@@ -115,12 +118,6 @@ pub struct ChannelGatePrompt {
     pub reference: String,
     /// The presented choices, in order.
     pub choices: Vec<GateChoice>,
-    /// Body a RESOLVED prompt should keep showing (the context, without the
-    /// how-to-answer instructions): on finalize the channel appends the outcome
-    /// line under it, so the record of WHAT was approved survives in place.
-    /// `None` = the outcome replaces the body entirely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_description: Option<String>,
 }
 
 /// The fixed vocabulary of gate-answer tokens, and the single source of truth
@@ -223,13 +220,26 @@ pub enum ChannelConversationScope {
     ReplyTarget,
 }
 
-/// A message received from or sent to a channel
+/// A channel envelope for inbound user text and synthetic runtime messages.
+///
+/// The channel implementation owns platform-native parsing before this point.
+/// Runtime code treats this as the trusted delivery envelope: sender, route,
+/// thread, and scope fields come from the channel, while `content` remains user
+/// or controller text.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
+    /// Channel-native event id, or a synthetic id for controller-generated
+    /// continuation messages.
     pub id: String,
+    /// Channel-native sender identity.
     pub sender: String,
+    /// Channel-native reply target such as room id, channel id, or direct-chat
+    /// target.
     pub reply_target: String,
+    /// User/controller message body. Command parsing and prompt construction
+    /// treat this as untrusted text.
     pub content: String,
+    /// Channel family name such as `matrix`, `telegram`, or `cli`.
     pub channel: String,
     /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`)
     /// when the platform supports multiple bot instances. Session-key
@@ -237,6 +247,7 @@ pub struct ChannelMessage {
     /// distinct session IDs and don't share conversation history. `None`
     /// for channels without an alias concept (webhook, cli).
     pub channel_alias: Option<String>,
+    /// Channel event timestamp in the platform's normalized integer form.
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
@@ -251,6 +262,7 @@ pub struct ChannelMessage {
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
+    /// Email-style subject for transports that use subject-based threading.
     pub subject: Option<String>,
     /// Internal SOP-ingress marker carrying the event topic, set ONLY by the
     /// git/forge channel producer. The orchestrator routes a message into the
@@ -268,11 +280,18 @@ pub struct ChannelMessage {
     pub conversation_scope: ChannelConversationScope,
 }
 
-/// Message to send through a channel
+/// Outbound message request for a channel implementation.
+///
+/// This is delivery intent, not a durable transcript row. Each channel decides
+/// how to map thread ids, subjects, attachments, and voice suppression to its
+/// platform API.
 #[derive(Debug, Clone)]
 pub struct SendMessage {
+    /// Text body to deliver.
     pub content: String,
+    /// Channel-native recipient, room, or reply target.
     pub recipient: String,
+    /// Optional subject for email-like transports.
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
@@ -297,7 +316,9 @@ pub struct SendMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoomVisibility {
+    /// Invite-only or otherwise non-public room/channel visibility.
     Private,
+    /// Publicly discoverable/joinable room/channel visibility.
     Public,
 }
 
@@ -332,14 +353,23 @@ impl FromStr for RoomVisibility {
     }
 }
 
-/// Room creation options shared by channel implementations that support
+/// Room creation request shared by channel implementations that support
 /// creating group conversations.
+///
+/// Unsupported fields are ignored by individual transports; the caller must not
+/// infer that a field was honored unless the channel reports success with
+/// platform-specific details.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomCreationOptions {
+    /// Desired room/channel display name.
     pub name: Option<String>,
+    /// Desired room/channel topic.
     pub topic: Option<String>,
+    /// Channel-native user ids or handles to invite.
     pub invites: Vec<String>,
+    /// Desired room visibility, when supported by the transport.
     pub visibility: Option<RoomVisibility>,
+    /// Desired encryption setting, when supported by the transport.
     pub encryption: Option<bool>,
 }
 
@@ -761,6 +791,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Request approval from one exact authenticated principal.
+    ///
+    /// The default is deliberately fail-closed: adapters that cannot verify
+    /// the responder identity must not approve a goal-bound action merely
+    /// because they can display a prompt.
+    async fn request_approval_for_principal(
+        &self,
+        _recipient: &str,
+        _principal: &str,
+        _request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(None)
+    }
+
     /// Like [`Channel::request_approval`], but also reports which
     /// back-channel produced the decision when this channel fans the request
     /// out. Default delegates to [`Channel::request_approval`] with
@@ -802,9 +846,12 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Mark a previously sent gate prompt as resolved: strip its interactive
-    /// controls and replace the body with `outcome` (e.g. "Approved by @user —
-    /// run resumed"), so a decided gate cannot be clicked again and the
-    /// decision is visible in place. `reference` is the same correlation key
+    /// controls and replace the body with the complete `outcome` payload (e.g.
+    /// "Approved by @user — run resumed"), so a decided gate cannot be clicked
+    /// again and the decision is visible in place. Implementations must not
+    /// append adapter-local prompt text: the generic orchestration layer owns
+    /// final-payload safety and may apply a newer policy than was active when
+    /// the prompt was sent. `reference` is the same correlation key
     /// the prompt was sent with. Best-effort: `Ok(false)` when this channel
     /// has nothing to finalize (no native prompt, or the mapping was lost to a
     /// restart) — the gate state itself is never affected.

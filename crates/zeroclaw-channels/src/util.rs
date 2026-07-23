@@ -23,6 +23,15 @@ pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
 
 pub const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
 
+/// Silence is not an explicit operator denial for a goal-bound approval.
+/// Returning `None` preserves the controller's durable pre-prompt pause;
+/// ordinary channel approvals retain their historical deny-on-timeout result.
+pub fn approval_timeout_response(
+    principal_bound: bool,
+) -> Option<zeroclaw_api::channel::ChannelApprovalResponse> {
+    (!principal_bound).then_some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
+}
+
 pub fn strip_tool_call_tags(message: &str) -> String {
     const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
         "<function_calls>",
@@ -631,5 +640,14 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn bound_approval_timeout_preserves_the_pause() {
+        assert_eq!(super::approval_timeout_response(true), None);
+        assert_eq!(
+            super::approval_timeout_response(false),
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
+        );
     }
 }
