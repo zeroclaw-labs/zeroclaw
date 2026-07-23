@@ -47,6 +47,7 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 - A Bocha AI web-search provider was added, and `browser_open` now allows `http://` URLs and `allowed_private_hosts` opt-in (#8737, #8136, #8171).
 - Cost tracking gains a task-attributed usage ledger, offline pricing catalog, live-gateway price backfill for unpriced models, and cost/org snapshot plus windowed cost/query RPCs (#8686, #8380, #8233, #8482).
 - MCP gains resources-as-context, pinning, named-prompt rendering, and a policy-gated resource/prompt client surface (#8508, #8403).
+- Native Anthropic requests now detect Fable safety-classifier refusals and fall back client- or server-side with a user-visible notice (#9262, #9263, #9265, #9266, #9268).
 
 ### Gateway, Config & Skills
 - The gateway adds default HTTP security response headers and agent-aware `/api/tools` listing with an agent-scoped tool picker (#8829, #8331).

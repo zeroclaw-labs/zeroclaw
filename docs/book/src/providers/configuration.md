@@ -233,6 +233,33 @@ is likewise skipped at runtime and surfaced (`empty_fallback_model` /
 `fallback_model_duplicates_primary`). A bad fallback link degrades gracefully, it
 never prevents the agent from running.
 
+### Anthropic refusals and fallback
+
+Native Anthropic requests can come back as a *refusal*: an HTTP 200 whose
+`stop_reason` is `"refusal"`, emitted by Fable's safety classifiers rather than
+a normal completion. ZeroClaw treats a refusal as a typed error so fallback can
+recover it two ways:
+
+- **Client-side** (`fallback_models`, above): the refusal surfaces as an error,
+  and ZeroClaw advances to the next model or alias just as it does for any other
+  provider failure, so the reply comes from a different model.
+- **Server-side** (`server_fallback_models` on
+  `[providers.models.anthropic.<alias>]`): Anthropic retries the refused request
+  against a listed model on its side, in a single non-streaming call. Entries
+  must name permitted fallback targets, for example mapping `claude-fable-5` to
+  `claude-opus-4-8`.
+
+Either way the delivered reply carries a short footer naming the requested and
+served models, so the switch is visible to the user.
+
+Streaming has a limit: a refusal that arrives after streamed output has begun
+keeps the existing interrupted-reply behavior; fallback applies only to refusals
+detected before output starts.
+
+OpenAI-compatible and Responses wires cannot carry Anthropic's native
+refusal/fallback metadata; route Anthropic models through
+`[providers.models.anthropic.<alias>]` to get this behavior.
+
 ## See also
 
 - [Overview](./overview.md)

@@ -115,8 +115,13 @@ use zeroclaw_config::schema::Config;
 #[cfg(test)]
 use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
 use zeroclaw_memory::{self, Memory};
-use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::reliable::{
+    ProviderFallbackInfo, scope_provider_fallback, take_last_provider_fallback,
+};
+use zeroclaw_providers::{
+    self, ChatMessage, ModelProvider, ProviderDispatch, SafeguardFallbackKind,
+    SafeguardFallbackNotice, scope_safeguard_fallback, take_last_safeguard_fallback,
+};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
@@ -5335,7 +5340,10 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
-    let (llm_result, fallback_info) = scope_provider_fallback(async {
+    // `Box::pin` keeps this large turn future on the heap: nesting it inside the
+    // safeguard scope below adds another `TaskLocalFuture` layer, and without
+    // boxing the combined future overflows the debug-build stack when polled.
+    let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
                 .interruption_scope_id
@@ -5548,9 +5556,12 @@ async fn process_channel_message_body(
             break loop_result;
         };
         let fb = take_last_provider_fallback();
-        (llm_result, fb)
-    })
-    .await;
+        let sg = take_last_safeguard_fallback();
+        (llm_result, fb, sg)
+    }));
+    // Safeguard scope is outermost so both the client-side (reliable.rs) and
+    // server-side (anthropic.rs) record calls deep in the loop are in scope.
+    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
 
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
@@ -5729,14 +5740,36 @@ async fn process_channel_message_body(
             );
 
             // Append a footer when the response was served by a different model_provider family.
-            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
-            if let Some(fb) = fallback_info.as_ref() {
+            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed. A safeguard
+            // (refusal-triggered) notice always wins and is exempt from the same-family gate.
+            let generic_same_family = fallback_info.as_ref().is_some_and(|fb| {
                 let req_base = fb.requested_provider.split(':').next().unwrap_or("");
                 let act_base = fb.actual_provider.split(':').next().unwrap_or("");
-                let same_family = req_base == act_base
+                req_base == act_base
                     || req_base.starts_with(act_base)
-                    || act_base.starts_with(req_base);
-                if !same_family {
+                    || act_base.starts_with(req_base)
+            });
+            match select_response_footer(
+                fallback_info.as_ref(),
+                generic_same_family,
+                safeguard_notice.as_ref(),
+            ) {
+                FooterChoice::Safeguard(notice) => {
+                    let key = if notice.kind == SafeguardFallbackKind::ServerSide {
+                        "channel-runtime-safeguard-footer-server"
+                    } else {
+                        "channel-runtime-safeguard-footer-client"
+                    };
+                    delivered_response.push_str("\n\n---\n");
+                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
+                        key,
+                        &[
+                            ("requested", notice.requested_model.as_str()),
+                            ("served", notice.served_model.as_str()),
+                        ],
+                    ));
+                }
+                FooterChoice::Generic(fb) => {
                     delivered_response.push_str("\n\n---\n");
                     delivered_response.push_str(&channel_runtime_cli_string_with_args(
                         "channel-runtime-fallback-footer",
@@ -5747,6 +5780,7 @@ async fn process_channel_message_body(
                         ],
                     ));
                 }
+                FooterChoice::None => {}
             }
 
             ::zeroclaw_log::record!(
@@ -6234,6 +6268,37 @@ async fn process_channel_message_body(
         let _ = channel
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
+    }
+}
+
+/// Which footer (if any) to append to a delivered response.
+enum FooterChoice<'a> {
+    /// A safeguard (refusal-triggered) fallback notice — always announced.
+    Safeguard(&'a SafeguardFallbackNotice),
+    /// A generic cross-family provider fallback notice.
+    Generic(&'a ProviderFallbackInfo),
+    /// No footer.
+    None,
+}
+
+/// Choose at most one response footer.
+///
+/// A safeguard notice always wins (one footer max) and is exempt from the
+/// generic same-family suppression: a Fable→Opus switch is same-family yet
+/// must still be announced. Otherwise the generic fallback footer is used only
+/// when it crosses model-provider families (`!generic_same_family`). Otherwise
+/// no footer.
+fn select_response_footer<'a>(
+    generic: Option<&'a ProviderFallbackInfo>,
+    generic_same_family: bool,
+    safeguard: Option<&'a SafeguardFallbackNotice>,
+) -> FooterChoice<'a> {
+    if let Some(notice) = safeguard {
+        return FooterChoice::Safeguard(notice);
+    }
+    match generic {
+        Some(fb) if !generic_same_family => FooterChoice::Generic(fb),
+        _ => FooterChoice::None,
     }
 }
 
@@ -11602,6 +11667,58 @@ mod tests {
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    fn sample_generic_fallback() -> ProviderFallbackInfo {
+        ProviderFallbackInfo {
+            requested_provider: "openai".to_string(),
+            requested_model: "gpt-4o".to_string(),
+            actual_provider: "anthropic".to_string(),
+            actual_model: "claude-opus-4-8".to_string(),
+        }
+    }
+
+    fn sample_safeguard_notice() -> SafeguardFallbackNotice {
+        SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ClientSide,
+            requested_model: "claude-fable-5".to_string(),
+            served_model: "claude-opus-4-8".to_string(),
+            category: Some("classifier".to_string()),
+        }
+    }
+
+    #[test]
+    fn safeguard_footer_wins_over_generic() {
+        let generic = sample_generic_fallback();
+        let safeguard = sample_safeguard_notice();
+        let choice = select_response_footer(Some(&generic), false, Some(&safeguard));
+        assert!(matches!(choice, FooterChoice::Safeguard(_)));
+    }
+
+    #[test]
+    fn safeguard_footer_ignores_same_family_suppression() {
+        let safeguard = sample_safeguard_notice();
+        // Same-family suppression (true) must NOT gate the safeguard footer:
+        // a Fable->Opus switch is same-family yet must still be announced.
+        let choice = select_response_footer(None, true, Some(&safeguard));
+        assert!(matches!(choice, FooterChoice::Safeguard(_)));
+    }
+
+    #[test]
+    fn generic_footer_behavior_unchanged_without_safeguard() {
+        let generic = sample_generic_fallback();
+        // Cross-family (same_family=false) -> Generic footer.
+        let crossed = select_response_footer(Some(&generic), false, None);
+        assert!(matches!(crossed, FooterChoice::Generic(_)));
+        // Same-family (same_family=true) -> suppressed, no footer.
+        let suppressed = select_response_footer(Some(&generic), true, None);
+        assert!(matches!(suppressed, FooterChoice::None));
+    }
+
+    #[test]
+    fn no_footers_when_nothing_recorded() {
+        let choice = select_response_footer(None, false, None);
+        assert!(matches!(choice, FooterChoice::None));
+    }
 
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
