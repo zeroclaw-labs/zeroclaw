@@ -49,4 +49,20 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), before, "duplicate tool name across catalog sets");
     }
+
+    #[test]
+    fn tool_names_are_lower_snake_case_identifiers() {
+        for name in BASE_TOOLS.iter().chain(AARDVARK_TOOLS).chain(PROBE_TOOLS) {
+            assert!(!name.is_empty(), "tool name must not be empty");
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "tool name must be lower_snake_case ASCII: {name}"
+            );
+            assert!(
+                !name.starts_with('_') && !name.ends_with('_') && !name.contains("__"),
+                "tool name must not have boundary or repeated underscores: {name}"
+            );
+        }
+    }
 }
