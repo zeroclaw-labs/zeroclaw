@@ -4862,14 +4862,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let ctrlc_cancel = cancel.clone();
                 let _ctrlc_guard = tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
-                    crate::zeroclaw_log::record!(
-                        crate::zeroclaw_log::DEBUG,
-                        crate::zeroclaw_log::Event::new(
-                            module_path!(),
-                            crate::zeroclaw_log::Action::Note,
-                        ),
-                        "Ctrl+C received; cancelling channel lifecycle token",
-                    );
                     ctrlc_cancel.cancel();
                 });
                 let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
