@@ -28,6 +28,26 @@ struct MultiDraftKey {
     draft_id: String,
 }
 
+/// Error from `send_text_chunks` that reports how many physical chunks were
+/// delivered before a chunk failed on both HTML and plain-text send attempts,
+/// so the caller can resume from the first unsent chunk instead of re-sending
+/// everything (which would duplicate the chunks Telegram already accepted).
+#[derive(Debug)]
+struct SendChunksError {
+    delivered: usize,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for SendChunksError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sent {} chunk(s) then failed: {}",
+            self.delivered, self.source
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MultiDraftState {
     /// Sanitized visible text already delivered to Telegram for this draft.
@@ -42,6 +62,11 @@ struct MultiDraftState {
     flush_lock: Arc<tokio::sync::Mutex<()>>,
     /// Completion instant of the last successful send, for inter-message pacing.
     last_sent_at: Option<std::time::Instant>,
+    /// Physical chunks of the current unsent suffix already delivered to
+    /// Telegram. Reset to 0 once a flush fully delivers its suffix; on a
+    /// partial failure this is advanced to the count of chunks that
+    /// succeeded, so the next flush resumes instead of re-sending them.
+    delivered_chunks: usize,
 }
 
 impl MultiDraftState {
@@ -52,6 +77,7 @@ impl MultiDraftState {
             latest_visible: String::new(),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_sent_at: None,
+            delivered_chunks: 0,
         }
     }
 }
@@ -883,6 +909,7 @@ impl TelegramChannel {
                 .map(str::to_string)
             else {
                 draft.sent_text = current;
+                draft.delivered_chunks = 0;
                 return Ok(());
             };
             let thread_id = draft.thread_id.clone().or(parsed_thread);
@@ -898,30 +925,43 @@ impl TelegramChannel {
             let mut drafts = self.multi_message_drafts.lock();
             if let Some(draft) = drafts.get_mut(&key) {
                 draft.sent_text = current;
+                draft.delivered_chunks = 0;
             }
             return Ok(());
         }
 
         self.pace_multi_message_send(last_sent_at).await;
 
-        if let Err(e) = self
-            .send_text_chunks(cleaned, &chat_id, thread_id.as_deref())
+        let skip = {
+            let drafts = self.multi_message_drafts.lock();
+            drafts.get(&key).map(|d| d.delivered_chunks).unwrap_or(0)
+        };
+        match self
+            .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
             .await
         {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Telegram multi-message turn send failed"
-            );
-            return Ok(());
-        }
-
-        {
-            let mut drafts = self.multi_message_drafts.lock();
-            if let Some(draft) = drafts.get_mut(&key) {
-                draft.sent_text = current;
-                draft.last_sent_at = Some(std::time::Instant::now());
+            Ok(_) => {
+                let mut drafts = self.multi_message_drafts.lock();
+                if let Some(draft) = drafts.get_mut(&key) {
+                    draft.sent_text = current;
+                    draft.last_sent_at = Some(std::time::Instant::now());
+                    draft.delivered_chunks = 0;
+                }
+            }
+            Err(e) => {
+                {
+                    let mut drafts = self.multi_message_drafts.lock();
+                    if let Some(draft) = drafts.get_mut(&key) {
+                        draft.delivered_chunks = e.delivered;
+                    }
+                }
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Telegram multi-message turn send failed"
+                );
+                return Ok(());
             }
         }
 
@@ -972,8 +1012,9 @@ impl TelegramChannel {
 
         if !remainder.is_empty() {
             self.pace_multi_message_send(last_sent_at).await;
-            self.send_text_chunks(&remainder, &chat_id, thread_id.as_deref())
-                .await?;
+            self.send_text_chunks(&remainder, &chat_id, thread_id.as_deref(), 0)
+                .await
+                .map_err(|e| e.source)?;
         }
 
         for attachment in &attachments {
@@ -2809,15 +2850,25 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .replace('\'', "&#39;")
     }
 
+    /// Sends `message` as one or more physical Telegram messages, skipping
+    /// the first `skip_chunks` (already delivered by an earlier call). On
+    /// success returns the total chunk count; on a chunk failing both HTML
+    /// and plain-text send attempts, returns how many chunks were delivered
+    /// before the failure so the caller can resume without duplicating them.
     async fn send_text_chunks(
         &self,
         message: &str,
         chat_id: &str,
         thread_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
+            if index < skip_chunks {
+                continue;
+            }
+
             let text = format_telegram_text_chunk(chunk, index, chunks.len());
 
             let mut markdown_body = serde_json::json!({
@@ -2836,7 +2887,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .post(self.api_url("sendMessage"))
                 .json(&markdown_body)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| SendChunksError {
+                    delivered: index,
+                    source: e.into(),
+                })?;
 
             if markdown_resp.status().is_success() {
                 if index < chunks.len() - 1 {
@@ -2869,18 +2924,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .post(self.api_url("sendMessage"))
                 .json(&plain_body)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| SendChunksError {
+                    delivered: index,
+                    source: e.into(),
+                })?;
 
             if !plain_resp.status().is_success() {
                 let plain_status = plain_resp.status();
                 let plain_err = plain_resp.text().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
-                    markdown_status,
-                    markdown_err,
-                    plain_status,
-                    plain_err
-                );
+                return Err(SendChunksError {
+                    delivered: index,
+                    source: anyhow::Error::msg(format!(
+                        "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
+                    )),
+                });
             }
 
             if index < chunks.len() - 1 {
@@ -2888,7 +2946,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
-        Ok(())
+        Ok(chunks.len())
     }
 
     async fn send_media_by_url(
@@ -2988,8 +3046,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     TelegramAttachmentKind::Voice => "Voice",
                 };
                 let fallback_text = format!("{kind_label}: {target}");
-                self.send_text_chunks(&fallback_text, chat_id, thread_id)
-                    .await?;
+                self.send_text_chunks(&fallback_text, chat_id, thread_id, 0)
+                    .await
+                    .map_err(|e| e.source)?;
             }
 
             return Ok(());
@@ -3792,8 +3851,9 @@ impl Channel for TelegramChannel {
 
             // Send text without markers
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
-                    .await?;
+                self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref(), 0)
+                    .await
+                    .map_err(|e| e.source)?;
             }
 
             // Send attachments
@@ -3821,14 +3881,18 @@ impl Channel for TelegramChannel {
 
             // Fall back to chunked send
             return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                .await;
+                .send_text_chunks(text, &chat_id, thread_id.as_deref(), 0)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.source);
         }
 
         let Some(id) = msg_id else {
             return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                .await;
+                .send_text_chunks(text, &chat_id, thread_id.as_deref(), 0)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.source);
         };
 
         // Try editing with HTML formatting
@@ -3896,10 +3960,11 @@ impl Channel for TelegramChannel {
             .await;
 
         match delete_resp {
-            Ok(resp) if resp.status().is_success() => {
-                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-                    .await
-            }
+            Ok(resp) if resp.status().is_success() => self
+                .send_text_chunks(text, &chat_id, thread_id.as_deref(), 0)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.source),
             Ok(resp) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -4000,8 +4065,9 @@ impl Channel for TelegramChannel {
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, chat_id, thread_id)
-                    .await?;
+                self.send_text_chunks(&text_without_markers, chat_id, thread_id, 0)
+                    .await
+                    .map_err(|e| e.source)?;
             }
 
             for attachment in &attachments {
@@ -4017,7 +4083,10 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        self.send_text_chunks(&content, chat_id, thread_id).await
+        self.send_text_chunks(&content, chat_id, thread_id, 0)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.source)
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -5164,6 +5233,94 @@ mod tests {
                 .expect("draft state")
                 .sent_text,
             "Searching the docs..."
+        );
+    }
+
+    /// Regression: a chunk that fails after earlier chunks in the same call
+    /// already succeeded must not cause those earlier chunks to be re-sent on
+    /// resume. `send_text_chunks` reports how many chunks were delivered
+    /// before the failure; the caller passes that count back in as
+    /// `skip_chunks` on the next attempt.
+    #[tokio::test]
+    async fn send_text_chunks_resumes_from_first_unsent_chunk_after_partial_failure() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let big = "x".repeat(9000); // >= 3 chunks
+        let total = split_message_for_telegram(&big).len();
+        assert!(total >= 3, "test message must span at least 3 chunks");
+
+        // First server: the first physical chunk succeeds, everything after
+        // fails (both the HTML and the plain-text retry) with a 500.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(
+                    serde_json::json!({ "ok": false, "description": "send failed" }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+
+        let err = channel
+            .send_text_chunks(&big, "100", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.delivered, 1,
+            "one chunk was accepted before the failure"
+        );
+
+        let first_call_requests = mock_server.received_requests().await.unwrap().len();
+        assert_eq!(
+            first_call_requests, 3,
+            "chunk 0 markdown success (1) + chunk 1 markdown+plain failure (2)"
+        );
+
+        // Resume against a fresh, all-success server: only the chunks not yet
+        // delivered may be sent. If chunk 0 were re-sent, this server would
+        // see `total` requests instead of `total - 1`.
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 2 } }),
+                ),
+            )
+            .mount(&resume_server)
+            .await;
+
+        let channel = channel.with_api_base(resume_server.uri());
+        let sent = channel
+            .send_text_chunks(&big, "100", None, err.delivered)
+            .await
+            .unwrap();
+        assert_eq!(
+            sent, total,
+            "resume must report the full chunk count once complete"
+        );
+
+        let resume_requests = resume_server.received_requests().await.unwrap().len();
+        assert_eq!(
+            resume_requests,
+            total - 1,
+            "chunk 0 must not be re-sent on resume"
         );
     }
 
