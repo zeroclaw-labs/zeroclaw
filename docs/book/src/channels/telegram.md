@@ -75,8 +75,13 @@ channels = ["telegram.home"]
 ```
 
 Replace `primary` with an existing agent that already has a working model
-provider and risk profile. A channel that is enabled but not present in an
-enabled agent's `channels` list is not started.
+provider and risk profile. Once any agent in the config declares a `channels`
+list, a channel that is enabled but not present in an enabled agent's
+`channels` list is not started. If no agent declares any channel bindings,
+ZeroClaw falls back to legacy routing instead: every enabled channel is
+started and served by the resolved default enabled agent. Declare explicit
+bindings as shown above so an unlisted bot is genuinely inactive rather than
+silently running under the default agent.
 
 ## 3. Choose how the first users are authorized
 
@@ -84,9 +89,11 @@ Choose one of the following paths before starting the bot.
 
 ### Pair the first user with a one-time code
 
-For a private first run, leave the resolved peer set empty. In particular,
-there must be no non-empty peer group whose `channel` is either `telegram` or
-`telegram.home`.
+For a private first run, leave the resolved external-peer set empty. In
+particular, no peer group whose `channel` is either `telegram` or
+`telegram.home` may contribute any `external_peers` entries. A matching group
+that carries only other settings while contributing no external peers does not
+affect pairing.
 
 When `TelegramChannel` is constructed with no resolved peers, it creates a
 one-time pairing code and writes it to the foreground output and structured
@@ -108,8 +115,8 @@ Use a type-wide `channel = "telegram"` only when the same identities should be
 accepted by every configured Telegram alias. For the complete schema and
 resolution rules, see [Peer Groups](./peer-groups.md).
 
-Any non-empty resolved peer set disables first-user pairing for that channel
-instance. This includes a wildcard peer group.
+Any non-empty resolved external-peer set disables first-user pairing for that
+channel instance. This includes a wildcard peer group.
 
 > [!CAUTION]
 > `external_peers = ["*"]` accepts every Telegram sender who can reach the bot
