@@ -708,6 +708,7 @@ mod tests {
             .advance_step(
                 &run_id,
                 SopStepResult {
+                    effective_agent: None,
                     step_number: 1,
                     status: SopStepStatus::Completed,
                     output: format!("used {redaction_fixture}"),

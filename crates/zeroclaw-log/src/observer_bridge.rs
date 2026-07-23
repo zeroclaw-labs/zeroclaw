@@ -86,6 +86,13 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
     } else {
         Some(agent_alias)
     };
+    // Parent correlation for nested cross-agent executions (live SOP steps):
+    // recovered from the record's attributes when the emitting loop stamped it.
+    let parent_agent_alias_opt = event
+        .attributes
+        .get("parent_agent_alias")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let turn_id_opt = if turn_id.is_empty() {
         None
     } else {
@@ -139,6 +146,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .unwrap_or_default() as usize,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
@@ -162,6 +170,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             messages: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
@@ -170,6 +179,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             arguments: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "tool_call" | "tool_call_result" => Some(ObserverEvent::ToolCall {
@@ -181,6 +191,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             result: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "memory_audit" => Some(ObserverEvent::MemoryAudit {
@@ -397,6 +408,7 @@ mod tests {
                 messages_count,
                 channel,
                 agent_alias,
+                parent_agent_alias: _,
                 turn_id,
             } => {
                 assert_eq!(model_provider, "anthropic");

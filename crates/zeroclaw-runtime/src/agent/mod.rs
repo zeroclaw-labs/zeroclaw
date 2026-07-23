@@ -23,6 +23,8 @@ pub mod tool_execution;
 pub mod tool_receipts;
 pub(crate) mod turn;
 
+pub use turn::context::TurnMeta;
+
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
