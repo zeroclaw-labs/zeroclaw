@@ -219,7 +219,9 @@ async fn standard_ollama_chat_does_not_force_connection_close() {
             .expect("serve fake Ollama server");
     });
 
-    let provider = OllamaModelProvider::new("standard", Some(&format!("http://{addr}")), None);
+    let provider = OllamaModelProvider::builder("standard")
+        .base_url(Some(&format!("http://{addr}")))
+        .build();
     provider
         .simple_chat("hello", "qwen3:1.7b", Some(0.2))
         .await
@@ -667,7 +669,9 @@ async fn standard_ollama_keeps_default_non_ascii_json_serialization() {
             .expect("serve fake Ollama server");
     });
 
-    let provider = OllamaModelProvider::new("standard", Some(&format!("http://{addr}")), None);
+    let provider = OllamaModelProvider::builder("standard")
+        .base_url(Some(&format!("http://{addr}")))
+        .build();
     let messages = [ChatMessage::user("näyttö ja testi 🧪")];
     provider
         .chat(
