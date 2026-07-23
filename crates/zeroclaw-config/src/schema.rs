@@ -21078,7 +21078,7 @@ fn apply_dirty_path(
     // fragments into bogus segments (`gpt-4`, `1`), the lookup below
     // finds nothing, and the write silently turns into a no-op delete.
     // Longest-match the key against the section's live keys instead —
-    // same precedent as the natural-key branch above. See issue #9240.
+    // same precedent as the natural-key branch above.
     if let Some(section) = find_map_key_section_for_path(dotted) {
         return apply_dirty_map_key_path(root, &section, dotted, full_table, default_table);
     }
@@ -29361,7 +29361,7 @@ group_policy = "disabled"
         );
     }
 
-    /// Issue #9240: `cost.rates.providers.models.<type>` is a
+    /// `cost.rates.providers.models.<type>` is a
     /// `#[resource_key]` `HashMap<String, ModelCostRates>` — its key is a
     /// model id, not an operator-chosen alias, and may contain dots
     /// (`gpt-4.1`). Before the map-key-section branch landed,
@@ -29485,7 +29485,7 @@ group_policy = "disabled"
         );
     }
 
-    /// Issue #9240 delete path: removing a dotted map key in memory
+    /// Delete path: removing a dotted map key in memory
     /// (`delete_map_key`) must still drop the matching on-disk table.
     /// Before this fix the on-disk key was never located because the
     /// dirty path (`<section>.<key>`, no inner suffix) is exactly the
@@ -29536,7 +29536,7 @@ group_policy = "disabled"
     /// `Table`-only doc walk. The doc-side key lookup must go through
     /// `TableLike` or a delete of such a key (gone from memory, inline-only
     /// on disk) trips the unresolvable-key bail and aborts the whole
-    /// `save_dirty` batch — a hard regression from the pre-#9240 worst
+    /// `save_dirty` batch — a hard regression from the previous worst
     /// case of a silent partial no-op. (Actually pruning the inline entry
     /// is out of scope: `delete_path_in_doc` shares the file-wide
     /// Table-only walk convention.)
@@ -29571,7 +29571,7 @@ group_policy = "disabled"
             .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
     }
 
-    /// Issue #9240 loud-failure guard: a dirty path that resolves to a
+    /// Loud-failure guard: a dirty path that resolves to a
     /// map-key section but whose key exists in neither the in-memory
     /// config nor the on-disk doc must fail `save_dirty` instead of
     /// silently no-op-ing (the original bug's symptom — reported success,
