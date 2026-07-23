@@ -27,7 +27,7 @@ use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
-/// Default grace before a same-boot task with a stale/absent heartbeat is timed out.
+/// Default grace before a same-boot task with a parseable stale heartbeat is timed out.
 pub const DEFAULT_MAX_RUNTIME_SECS: i64 = 3600;
 
 /// Summary of the one-shot boot recovery sweep.
@@ -46,7 +46,7 @@ pub struct RecoveryPassReport {
 
 /// Age in seconds of an RFC3339 instant, or `None` if it cannot be parsed. We NEVER
 /// reap on a timestamp we could not read — a corrupt `heartbeat_at` must not kill a
-/// task (review finding #9).
+/// task.
 fn age_secs(ts: &str, now: DateTime<Utc>) -> Option<i64> {
     DateTime::parse_from_rfc3339(ts)
         .ok()
@@ -143,7 +143,8 @@ pub async fn sweep(
             // legitimate reason to terminate is a task that USES heartbeats and has gone
             // silent past the grace window. A task with NO heartbeat is NOT timed out on
             // `started_at` — a legitimately long-running task must not be killed merely
-            // for running a while (review finding #6). Unparseable heartbeat ⇒ skip (#9).
+            // for running a while. An unparseable heartbeat is never grounds
+            // for reaping the task.
             if let Some(beat) = rec.heartbeat_at.as_deref()
                 && age_secs(beat, now).is_some_and(|age| age > max_runtime_secs)
             {
