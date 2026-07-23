@@ -166,11 +166,16 @@ real `GITHUB_TOKEN` to every workflow run:
 
    </div>
 
-   Artifact-producing jobs require `act` v0.2.90 or newer. The helper checks
-   this before starting a job that uses the pinned artifact actions. Older
-   releases cannot serve the protocol used by `actions/upload-artifact` v7 and
-   `actions/download-artifact` v8. If the extension installer does not yet
-   offer a qualifying stable release, use the GitHub-hosted fallback below.
+   Artifact-producing jobs need an `act` artifact-service protocol that
+   `actions/upload-artifact` v7 and `actions/download-artifact` v8 require,
+   and **no currently released version of `act` implements it** (checked
+   through the latest release as of this writing). The helper preflights the
+   installed `act` version before starting a job that uses the pinned
+   artifact actions and fails closed: it will not attempt the job on an
+   unverified version. Until a compatible `act` release ships and is
+   verified against a real artifact round-trip, use the GitHub-hosted
+   fallback below for any artifact-producing or artifact-consuming job; that
+   is the recommended path today, not a rare exception.
 
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
@@ -236,18 +241,24 @@ jobs. All of that is plain `act` underneath; the script just removes
 the flag soup.
 
 Before any artifact-producing or artifact-consuming job starts, the helper
-checks the resolved standalone `act` or `gh act` version. The supported policy
-is `act` v0.2.90 or newer. An older, prerelease, or unparseable version fails
-before the build and points to GitHub-hosted Actions; do not downgrade the
-pinned artifact actions to make a local runner pass.
+checks the resolved standalone `act` or `gh act` version against an internal
+compatibility threshold (`act` >= 0.2.90). That threshold is **not** a
+version to go install; it is the floor a future `act` release must clear,
+and it only moves once a real artifact round-trip has been verified against
+that release. No currently released `act` version meets it, so every
+release fails the preflight before the build starts and points to
+GitHub-hosted Actions; do not downgrade the pinned artifact actions to make
+a local runner pass.
 
 For `--all`, compatibility is checked across the complete selected job set
-before the first job starts. If any selected job needs the artifact service and
-the installed `act` is unsupported, the whole sweep exits without running a
-partial subset. `--all --no-allowlist` follows the same compatibility policy.
+before the first job starts. If any selected job needs the artifact service,
+the sweep fails closed (no currently released `act` clears the threshold) and
+exits without running a partial subset. `--all --no-allowlist` follows the
+same compatibility policy.
 
-When the local artifact preflight blocks a release check, push the exact commit
-to GitHub and use the hosted workflow as the validation fallback. The
+Local artifact preflight failures are expected on every currently released
+`act`, not an occasional hiccup. Push the exact commit to GitHub and use the
+hosted workflow as the validation fallback for artifact-bearing jobs. The
 read-only cross-platform build can be dispatched safely and watched from the
 CLI:
 

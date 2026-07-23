@@ -42,6 +42,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo publish
+  reusable-caller:
+    uses: ./.github/workflows/reusable-artifact.yml
+EOF
+
+cat >"$fixture_root/.github/workflows/reusable-artifact.yml" <<'EOF'
+name: reusable artifact child
+on:
+  workflow_call:
+jobs:
+  child-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: output
+          path: output.txt
 EOF
 
 cat >"$fake_bin/act" <<'EOF'
@@ -74,6 +90,7 @@ if [ "$list" = true ]; then
         '0      web       web       release        release.yml    workflow_dispatch' \
         '0      consumer  consumer  release        release.yml    workflow_dispatch' \
         '0      package   package   release        release.yml    workflow_dispatch' \
+        '0      reusable-caller  reusable-caller  release  release.yml  workflow_dispatch' \
         '1      publish   publish   release        release.yml    workflow_dispatch'
       ;;
     publish)
@@ -181,7 +198,7 @@ expect_log_count() {
 
 run_case 'act version 0.2.89' release-stable-manual:web
 expect_status 'unsupported explicit artifact job' 1
-expect_output 'unsupported policy' 'Supported policy: act >= 0.2.90'
+expect_output 'unsupported policy' 'not yet satisfied by any release'
 expect_output 'hosted fallback' 'Use GitHub-hosted Actions as the fallback'
 expect_log_empty 'unsupported explicit artifact job'
 
@@ -214,6 +231,17 @@ expect_log_empty 'unsupported artifact consumer'
 run_case 'act version 0.2.89' release-stable-manual:publish
 expect_status 'dependency artifact producer is preflighted' 1
 expect_log_empty 'dependency artifact producer is preflighted'
+
+# reusable-caller has no artifact-action step of its own — it only has
+# `uses: ./.github/workflows/reusable-artifact.yml`. The artifact
+# requirement lives in the *called* workflow (reusable-artifact.yml's
+# child-upload job). This exercises job_local_reusable_workflows: the
+# preflight must still catch it and fail before the job starts.
+run_case 'act version 0.2.89' release-stable-manual:reusable-caller
+expect_status 'unsupported local reusable workflow artifact job' 1
+expect_output 'reusable workflow policy' 'not yet satisfied by any release'
+expect_output 'reusable workflow hosted fallback' 'Use GitHub-hosted Actions as the fallback'
+expect_log_empty 'unsupported local reusable workflow artifact job'
 
 run_case 'act version 0.2.89' --all
 expect_status 'unsupported all sweep' 1

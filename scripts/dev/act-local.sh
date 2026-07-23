@@ -45,11 +45,16 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARTIFACT_DIR="${ACT_LOCAL_ARTIFACT_DIR:-/tmp/act-artifacts}"
 ACT_CACHE_DIR="${HOME}/.cache/act"
-# actions/upload-artifact v7 and actions/download-artifact v8 require
-# artifact-service protocol support that is absent from act v0.2.89 and
-# earlier. Keep this policy independent from the pinned action refs: the
-# GitHub-hosted workflow remains canonical and must not be downgraded for a
-# local runner.
+# actions/upload-artifact v7 and actions/download-artifact v8 need an
+# artifact-service protocol that no currently released act version
+# implements (checked through the latest release as of this writing).
+# ACT_ARTIFACT_MIN_VERSION is NOT a version to tell users to install — it is
+# the floor a future act release must clear, and it must only move after an
+# actual artifact round-trip has been verified against that release. Until
+# then every released act version fails the preflight below and the
+# GitHub-hosted workflow is the fallback. Keep this policy independent from
+# the pinned action refs: the GitHub-hosted workflow remains canonical and
+# must not be downgraded for a local runner.
 ACT_ARTIFACT_MIN_VERSION="0.2.90"
 NO_ALLOWLIST=false
 # Resolved at setup time. Prefers a standalone `act` on PATH, falls
@@ -211,11 +216,11 @@ preflight_artifact_service() {
   act_version=$(printf '%s\n' "$version_output" | parse_released_act_version)
 
   if [ -z "$act_version" ]; then
-    die "could not parse the released act version; artifact jobs require act >= ${ACT_ARTIFACT_MIN_VERSION}. Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
+    die "could not parse the released act version; no currently released act version meets the artifact-service compatibility threshold (act >= ${ACT_ARTIFACT_MIN_VERSION}, not yet satisfied by any release). Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
   fi
 
   if ! version_at_least "$act_version" "$ACT_ARTIFACT_MIN_VERSION"; then
-    die "${context} requires the pinned artifact actions, but act ${act_version} has an incompatible artifact service. Supported policy: act >= ${ACT_ARTIFACT_MIN_VERSION}. Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
+    die "${context} requires the pinned artifact actions, but act ${act_version} does not support the artifact-service protocol they need, and no currently released act version does either (compatibility threshold act >= ${ACT_ARTIFACT_MIN_VERSION} is not yet satisfied by any release). Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
   fi
 }
 
