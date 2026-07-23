@@ -602,7 +602,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // Dotted outer keys make candidate splits ambiguous, so an
                     // inner "Unknown property" must `continue` to the next
                     // (shorter) outer-key split — mirroring get_prop's retry
-                    // loop above — while real value errors return (#9285, via
+                    // loop above — while real value errors return (via
                     // `crate::config::is_unknown_property_error`).
                     let double_map_set_gate = build_set_prop_delegation_gate(
                         quote! { inner.set_prop(&inner_name, value_str) },
@@ -1135,7 +1135,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // (T carries its own configurable_prefix), so the namespace is
                 // shared with sibling fields: an inner "Unknown property"
                 // falls through so siblings still get their chance, while
-                // real value errors propagate (#9285) — see
+                // real value errors propagate — see
                 // `build_set_prop_delegation_gate` /
                 // `crate::config::is_unknown_property_error`.
                 let option_set_gate = build_set_prop_delegation_gate(
@@ -1682,7 +1682,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     // so an inner "Unknown property" falls through — sibling
                     // own-fields and the generic leaf fallback must still get
                     // their chance — while real value errors propagate
-                    // (#9285); see `build_set_prop_delegation_gate` /
+                    // — see `build_set_prop_delegation_gate` /
                     // `crate::config::is_unknown_property_error`.
                     let flatten_set_gate = build_set_prop_delegation_gate(
                         quote! { self.#field_ident.set_prop(&inner_name, value_str) },
@@ -2622,8 +2622,8 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
 
 /// Shared `set_prop` delegation gate for nested sites whose dotted namespace
 /// is (or may be) shared with sibling candidates: serde-flatten fields,
-/// `Option<T>` nested fields, and the two-level dotted-key candidate loop
-/// (#9285). `Ok` and real value errors return immediately — the path is
+/// `Option<T>` nested fields, and the two-level dotted-key candidate loop.
+/// `Ok` and real value errors return immediately — the path is
 /// confirmed, so a failure is a value problem that must reach the caller.
 /// The generated "Unknown property" marker
 /// (`crate::config::is_unknown_property_error`) instead means "not one of

@@ -32440,7 +32440,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert!(config.set_prop("gateway.port", "8080").is_ok());
     }
 
-    // ── #9285: nested map-routed set_prop must not mask value errors as
+    // ── nested map-routed set_prop must not mask value errors as
     // "Unknown property" ────────────────────────────────────────────────
     //
     // Once the router/key lookup has confirmed a path belongs to a
@@ -32613,7 +32613,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(outer.get_prop("dm.types.a.x.sub.value").unwrap(), "true");
     }
 
-    // ── #9285 anchor: the issue's own repro through the serde(flatten)
+    // ── regression anchor: repro through the serde(flatten)
     // delegation site (`OpenAIModelProviderConfig { #[serde(flatten)] base }`).
     // A bad-typed value on a flattened base field of a live alias must
     // propagate the value error, not degrade into "Unknown property".

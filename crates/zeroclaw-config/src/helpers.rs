@@ -67,7 +67,7 @@ pub fn route_double_hashmap_path<'a>(
 /// `prop_name_to_serde_field` in this module). Namespace-sharing nested
 /// delegation sites (serde-flatten, `Option<T>`, dotted-key candidate
 /// loops) use it to tell "not one of mine — keep trying siblings" apart
-/// from a real value error on a confirmed path (#9285). The same prefix
+/// from a real value error on a confirmed path. The same prefix
 /// convention is what downstream consumers branch on
 /// (`config_patch_map_prop_error` in `src/main.rs`, `map_prop_error` in
 /// `zeroclaw-gateway`).
