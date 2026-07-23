@@ -18848,14 +18848,20 @@ impl Config {
     }
 
     /// Surface the cross-provider shape on a legacy config that has NOT
-    /// migrated to `summary_provider`. The deprecated
-    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare model
-    /// id dispatched onto each consuming agent's OWN provider; when a single
-    /// profile is shared by agents resolving to MORE THAN ONE distinct provider,
-    /// that one bare id is cross-provider for at least one of them and silently
-    /// fails at runtime. The new `summary_provider` (agent override or profile
-    /// level) supersedes the bare id and is self-contained, so an agent that
-    /// sets it is safe and excluded from the count.
+    /// migrated to `summary_provider`. Context compression is not currently
+    /// implemented in the runtime, so this knob is already inert like every
+    /// other `context_compression` field (see
+    /// `collect_context_compression_ignored_warnings`); this diagnostic adds
+    /// cross-provider detail as a more specific companion for the same
+    /// config line. The deprecated
+    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare
+    /// model id that names no provider of its own — it would need to be
+    /// resolved onto each consuming agent's OWN provider were the field ever
+    /// read again — so when a single profile is shared by agents resolving
+    /// to MORE THAN ONE distinct provider, that one bare id is ambiguous for
+    /// at least one of them. The new `summary_provider` (agent override or
+    /// profile level) supersedes the bare id and is self-contained, so an
+    /// agent that sets it is safe and excluded from the count.
     ///
     /// This is the offline, deterministic "startup diagnostic" the review
     /// asked for: no schema bump, no network, no model catalog. It names the
@@ -18921,12 +18927,13 @@ impl Config {
                 "cross_provider_summary_model",
                 format!(
                     "runtime_profiles.{profile_alias}.context_compression.summary_model \
-                     ({summary_model:?}) is a bare model id reused by agents resolving to \
-                     different providers ({detail}); the deprecated summary_model is \
-                     dispatched on each agent's own provider, so it is sent to the wrong \
-                     provider for at least one of them and silently fails at runtime (#7964). \
-                     Migrate to context_compression.summary_provider (or an agent-level \
-                     summary_provider), which is self-contained and runs on its own provider."
+                     ({summary_model:?}) is set, but context compression is not currently \
+                     implemented in the runtime; this setting has no effect. It is also a \
+                     bare model id reused by agents resolving to different providers \
+                     ({detail}), which names no provider of its own and would be ambiguous \
+                     for at least one of them if compression were read again. Migrate to \
+                     context_compression.summary_provider (or an agent-level \
+                     summary_provider), which is self-contained and names its own provider."
                 ),
                 format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
             ));
@@ -19004,11 +19011,11 @@ impl Config {
                 // Ordering dependency: `collect_warnings()` runs
                 // `collect_cross_provider_summary_model_warnings` before this
                 // helper, so a cross-provider `summary_model` diagnostic for
-                // this same path is already in `warnings`. When it is, the
-                // more specific diagnostic wins — emitting the generic
-                // "has no effect" inert warning alongside "silently fails at
-                // runtime" would be two contradictory statements
-                // about the same config line. All other `summary_model`
+                // this same path is already in `warnings`. That diagnostic
+                // reports the same "has no effect" fact plus the specific
+                // cross-provider agents affected, so it wins and the generic
+                // inert warning is skipped to avoid printing two warnings
+                // for the same config line. All other `summary_model`
                 // shapes (single-provider, unshared) still get the inert
                 // warning; no other diagnostic covers them.
                 let summary_model_path =
@@ -34412,6 +34419,75 @@ allowed_users = []
         );
     }
 
+    // The `cross_provider_summary_model` diagnostic must report the setting
+    // as unsupported/inert like every other `context_compression` knob, not
+    // as something that is actively dispatched onto per-agent providers and
+    // fails at runtime — there is no runtime consumer left to dispatch
+    // anything. The cross-provider detail (which agents, which providers)
+    // must still be present since it is useful context for the fix, but the
+    // message must not claim any runtime behavior.
+    #[tokio::test]
+    async fn collect_warnings_cross_provider_summary_model_reports_inert_not_dispatch() {
+        let toml = r#"
+            [providers.models.custom.p1]
+            api_key = "k"
+            model = "m1"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.p2]
+            api_key = "k"
+            model = "m2"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.shared.context_compression]
+            summary_model = "haiku"
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.p1"
+            risk_profile = "default"
+            runtime_profile = "shared"
+
+            [agents.beta]
+            enabled = true
+            model_provider = "custom.p2"
+            risk_profile = "default"
+            runtime_profile = "shared"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let warnings = cfg.collect_warnings();
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "cross_provider_summary_model")
+            .expect("expected cross_provider_summary_model warning");
+        assert!(
+            w.message.contains("not currently implemented") && w.message.contains("no effect"),
+            "message must truthfully report the setting as unsupported/inert: {}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("silently fails"),
+            "message must not claim the setting silently fails at runtime: {}",
+            w.message
+        );
+        assert!(
+            !w.message.contains("dispatched"),
+            "message must not claim the setting is dispatched to a provider at runtime: {}",
+            w.message
+        );
+        // Cross-provider specificity must survive the rewrite — it is still
+        // useful detail even though the setting is inert.
+        assert!(
+            w.message.contains("alpha -> custom.p1") && w.message.contains("beta -> custom.p2"),
+            "message must keep naming the affected agents and providers: {}",
+            w.message
+        );
+    }
+
     // The runtime context compressor was removed; nothing reads
     // `context_compression` at runtime anymore, so an explicit
     // `enabled = true` on a named runtime profile is inert and must be
@@ -34574,10 +34650,11 @@ allowed_users = []
 
     // Specific-warning-wins dedup: a bare cross-provider `summary_model`
     // already draws the more specific `cross_provider_summary_model`
-    // diagnostic ("silently fails at runtime"), so the generic inert
-    // `context_compression_unsupported` warning ("has no effect") must NOT
-    // also fire for the identical path — doctor/gateway print both with no
-    // dedup, and the two statements contradict each other.
+    // diagnostic, which itself reports the setting as inert (same fact as
+    // `context_compression_unsupported`) plus the cross-provider detail, so
+    // the generic inert warning must NOT also fire for the identical path —
+    // doctor/gateway print both with no dedup, and it would just be the same
+    // statement twice.
     #[tokio::test]
     async fn collect_warnings_context_compression_defers_to_cross_provider_summary_model() {
         let toml = r#"
