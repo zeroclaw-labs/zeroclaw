@@ -574,7 +574,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         )
         .await;
 
-        enforce_tool_loop_budget()?;
+        enforce_tool_loop_budget().await?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -651,7 +651,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
-                .await;
+                .await?;
                 (
                     interpreted.response_text,
                     interpreted.parsed_text,
@@ -874,10 +874,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
@@ -891,6 +887,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+        // Decide parallelism after hook/default/dedup preparation, not from
+        // raw model calls. `before_tool_call` hooks may rewrite the tool name;
+        // policy-sensitive goal admission tools must be seen under their
+        // executable names before a batch is allowed to run concurrently.
+        let allow_parallel_execution =
+            parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
@@ -1376,6 +1378,7 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         None,
+        crate::tools::GoalAdmissionToolPolicy::Omit,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // The same gated seam run(), process_message, and independent delegation use:

@@ -112,7 +112,7 @@ pub struct DiscordChannel {
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -142,6 +142,48 @@ pub struct DiscordChannel {
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
+}
+
+/// One request-scoped approval authority. Button and plaintext replies must
+/// match this principal before the decision can consume the pending token.
+struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    expected_principal: Option<String>,
+}
+
+struct PendingApprovalCleanup {
+    pending: Arc<AsyncMutex<HashMap<String, PendingApproval>>>,
+    token: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(pending: Arc<AsyncMutex<HashMap<String, PendingApproval>>>, token: String) -> Self {
+        Self {
+            pending,
+            token,
+            armed: true,
+        }
+    }
+    async fn remove_and_disarm(&mut self) {
+        self.pending.lock().await.remove(&self.token);
+        self.armed = false;
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let pending = Arc::clone(&self.pending);
+            let token = self.token.clone();
+            zeroclaw_spawn::spawn!(async move {
+                pending.lock().await.remove(&token);
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2811,9 +2853,18 @@ impl Channel for DiscordChannel {
                                             Some(ComponentIntent::Approval { token, decision }) => {
                                                 let resolved = {
                                                     let mut guard = pending_approvals.lock().await;
-                                                    approval::resolve_parked_approval(
-                                                        &mut guard, &token, decision,
+                                                    take_pending_approval(
+                                                        &mut guard,
+                                                        &token,
+                                                        &user_id,
                                                     )
+                                                    .map(|pending| {
+                                                        pending
+                                                            .sender
+                                                            .send(decision.response())
+                                                            .is_ok()
+                                                    })
+                                                    .unwrap_or(false)
                                                 };
                                                 let key = if resolved {
                                                     "channel-discord-approval-recorded"
@@ -3210,8 +3261,9 @@ impl Channel for DiscordChannel {
                         crate::util::parse_approval_reply(&final_content)
                     {
                         let mut map = self.pending_approvals.lock().await;
-                        if let Some(sender) = map.remove(&token) {
-                            let _ = sender.send(response);
+                        if let Some(pending) = take_pending_approval(&mut map, &token, author_id)
+                        {
+                            let _ = pending.sender.send(response);
                             continue;
                         }
                     }
@@ -3832,6 +3884,43 @@ impl Channel for DiscordChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        self.request_approval_inner(recipient, None, request).await
+    }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
+    }
+
+    async fn send_gate_prompt(
+        &self,
+        recipient: &str,
+        prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        self.send_gate_prompt_inner(recipient, prompt).await
+    }
+
+    async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
+        self.finalize_gate_prompt_inner(reference, outcome).await
+    }
+}
+
+impl DiscordChannel {
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         // Approval prompts can't be delivered over a deferred interaction
         // reply (the sentinel is not a channel and the single @original
         // edit is reserved for the answer). Fail fast so the agent loop's
@@ -3842,10 +3931,15 @@ impl Channel for DiscordChannel {
         let token = crate::util::new_approval_token();
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: expected_principal.map(str::to_owned),
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), token.clone());
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
@@ -3858,24 +3952,27 @@ impl Channel for DiscordChannel {
                 .await
         };
         if let Err(err) = emitted {
-            self.pending_approvals.lock().await.remove(&token);
+            cleanup.remove_and_disarm().await;
             return Err(err);
         }
 
         // Timeout → Deny, preserving the deny-by-default silence semantics. The
         // pending entry is dropped so a late click can't resolve a stale token.
-        let response =
-            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => resp,
-                _ => {
-                    self.pending_approvals.lock().await.remove(&token);
-                    ChannelApprovalResponse::Deny
-                }
-            };
-        Ok(Some(response))
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            Ok(Ok(response)) => {
+                cleanup.disarm();
+                Ok(Some(response))
+            }
+            _ => {
+                cleanup.remove_and_disarm().await;
+                Ok(crate::util::approval_timeout_response(
+                    expected_principal.is_some(),
+                ))
+            }
+        }
     }
 
-    async fn send_gate_prompt(
+    async fn send_gate_prompt_inner(
         &self,
         recipient: &str,
         prompt: &ChannelGatePrompt,
@@ -3941,8 +4038,6 @@ impl Channel for DiscordChannel {
                 channel_alias: self.alias.clone(),
                 channel_id: channel_id.to_string(),
                 message_id,
-                title: prompt.title.clone(),
-                resolved_description: prompt.resolved_description.clone(),
                 inputs: prompt
                     .choices
                     .iter()
@@ -3959,7 +4054,11 @@ impl Channel for DiscordChannel {
         Ok(true)
     }
 
-    async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
+    async fn finalize_gate_prompt_inner(
+        &self,
+        reference: &str,
+        outcome: &str,
+    ) -> anyhow::Result<bool> {
         // Process-wide registry (see `gate_prompts`): the instance that sent the
         // prompt and the one finalizing it are usually DIFFERENT instances of
         // the same alias (separate channel maps). The registry records the
@@ -3971,16 +4070,16 @@ impl Channel for DiscordChannel {
         }
 
         while let Some(record) = records.pop() {
-            // Keep the approval CONTEXT in place and append the outcome under it —
-            // a resolved prompt should still show what was approved, not erase it.
+            // The generic gate layer has constructed and checked the complete
+            // final text under the current policy. Do not append title or
+            // context retained by this adapter: it can predate a policy reload
+            // and would make Discord the owner of cross-channel safety policy.
+            // The deliberate tradeoff is that a resolved embed shows the final
+            // decision, not a second copy of the original approval context.
             // PATCH with an EXPLICIT empty components array: omitting the key would
             // leave the buttons in place on Discord's side.
-            let description = match &record.resolved_description {
-                Some(base) => format!("{base}\n\n{outcome}"),
-                None => outcome.to_string(),
-            };
             let body = serde_json::json!({
-                "embeds": [{"title": record.title, "description": description}],
+                "embeds": [{"title": "SOP approval resolved", "description": outcome}],
                 "components": [],
             });
             let url = format!(
@@ -4019,9 +4118,47 @@ impl Channel for DiscordChannel {
     }
 }
 
+fn take_pending_approval(
+    pending: &mut HashMap<String, PendingApproval>,
+    token: &str,
+    principal: &str,
+) -> Option<PendingApproval> {
+    let entry = pending.get(token)?;
+    if entry
+        .expected_principal
+        .as_deref()
+        .is_some_and(|expected| expected != principal)
+    {
+        return None;
+    }
+    pending.remove(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_approval_cleanup_removes_pending_entry() {
+        let pending = Arc::new(AsyncMutex::new(HashMap::new()));
+        let (sender, _receiver) = oneshot::channel();
+        pending.lock().await.insert(
+            "approval".into(),
+            PendingApproval {
+                sender,
+                expected_principal: Some("owner".into()),
+            },
+        );
+        drop(PendingApprovalCleanup::new(
+            Arc::clone(&pending),
+            "approval".into(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            pending.lock().await.is_empty(),
+            "cancelled waiters must not retain tokens"
+        );
+    }
 
     #[test]
     fn effective_recipient_prefers_per_message_target() {
@@ -7334,13 +7471,30 @@ mod tests {
             mention_only,
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Deny).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: None,
+            },
+        );
+        let pending = ch.pending_approvals.lock().await.remove("abc123").unwrap();
+        pending.sender.send(ChannelApprovalResponse::Deny).unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    #[test]
+    fn bound_approval_reply_from_another_principal_is_not_consumed() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            "token".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("operator".to_string()),
+            },
+        )]);
+        assert!(take_pending_approval(&mut pending, "token", "other").is_none());
+        assert!(pending.contains_key("token"));
     }
 
     /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate

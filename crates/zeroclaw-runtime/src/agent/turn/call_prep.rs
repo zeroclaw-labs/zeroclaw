@@ -6,6 +6,7 @@ use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{StreamDelta, emit_tool_call_pair};
+use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -213,6 +214,7 @@ pub(crate) async fn prepare_tool_calls(
                     Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
                 continue;
             }
+            ApprovalGateOutcome::Cancel => return Err(ToolLoopCancelled.into()),
         };
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 

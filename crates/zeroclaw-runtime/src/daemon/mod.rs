@@ -380,9 +380,12 @@ pub async fn run(
     }
 
     if crate::control_plane::control_plane().is_none()
-        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
-            .await
-            .map(crate::control_plane::init_control_plane)
+        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(
+            &config.data_dir,
+            config.goal.restart_recovery,
+        )
+        .await
+        .map(crate::control_plane::init_control_plane)
     {
         ::zeroclaw_log::record!(
             WARN,
@@ -397,6 +400,7 @@ pub async fn run(
     if let Some(handle) = crate::control_plane::control_plane() {
         handle.spawn_reaper(
             crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+            config.goal.restart_recovery,
             channels_cancel.clone(),
         );
         crate::health::mark_component_ok("control-plane");

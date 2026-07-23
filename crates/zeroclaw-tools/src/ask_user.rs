@@ -30,7 +30,7 @@ impl AskUserTool {
 }
 
 /// Format a question with optional choices for display.
-fn format_question(question: &str, choices: Option<&[String]>) -> String {
+pub fn format_question(question: &str, choices: Option<&[String]>) -> String {
     let mut lines = Vec::new();
     lines.push(format!("**{question}**"));
 

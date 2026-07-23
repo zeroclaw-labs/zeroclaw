@@ -4059,6 +4059,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // Cron delivery is registered earlier (before the command match)
             // so it works for both `daemon` and `gateway start`.
 
+            let live_config = Arc::new(parking_lot::RwLock::new(config));
+            let leak_detection_resolver =
+                approval_route_leak_detection_resolver(Arc::clone(&live_config));
             let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
@@ -4073,13 +4076,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // (loop re-reads config from disk and re-runs). The PID stays
             // the same across reloads — only the in-process subsystems
             // tear down + re-instantiate.
-            let mut current_config = config;
             // Nag task for the degraded-security warning, scoped to the
             // current config. Re-evaluated each reload iteration so a repaired
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
-                gate_security_posture(&current_config, allow_degraded_security)?;
+                gate_security_posture(&live_config.read(), allow_degraded_security)?;
             loop {
+                let current_config = live_config.read().clone();
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -4093,7 +4096,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
-                    let sop_adapters = build_sop_adapters(&current_config);
+                    let sop_adapters =
+                        build_sop_adapters(&current_config, Arc::clone(&leak_detection_resolver));
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
@@ -4250,7 +4254,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
-                        current_config = Box::pin(Config::load_or_init()).await?;
+                        let reloaded_config = Box::pin(Config::load_or_init()).await?;
+                        *live_config.write() = reloaded_config;
+                        let current_config = live_config.read();
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
                             &current_config.observability,
@@ -4851,14 +4857,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     })
                 }));
 
+                let live_config = Arc::new(parking_lot::RwLock::new(config));
+                let current_config = live_config.read().clone();
+                let leak_detection_resolver =
+                    approval_route_leak_detection_resolver(Arc::clone(&live_config));
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
-                    let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
-                    let sop_adapters = build_sop_adapters(&config);
+                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory_from_config(&current_config, None)?,
+                    );
+                    let sop_adapters = build_sop_adapters(&current_config, leak_detection_resolver);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-                        config.sop.clone(),
-                        &config.data_dir,
+                        current_config.sop.clone(),
+                        &current_config.data_dir,
                         mem,
                         sop_adapters,
                     );
@@ -4870,10 +4881,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let sop_maintenance = spawn_sop_maintenance(
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
-                    config.sop.maintenance_interval_secs,
+                    current_config.sop.maintenance_interval_secs,
                 );
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    current_config,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -7573,7 +7588,19 @@ fn gate_security_posture(
 /// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
 /// to the async channel/provider calls.
 #[cfg(feature = "agent-runtime")]
-fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
+fn approval_route_leak_detection_resolver(
+    live_config: Arc<parking_lot::RwLock<Config>>,
+) -> Arc<dyn Fn() -> zeroclaw_config::schema::LeakDetectionConfig + Send + Sync> {
+    Arc::new(move || live_config.read().security.leak_detection.clone())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn build_sop_adapters(
+    config: &Config,
+    leak_detection_resolver: Arc<
+        dyn Fn() -> zeroclaw_config::schema::LeakDetectionConfig + Send + Sync,
+    >,
+) -> zeroclaw_runtime::sop::SopEngineAdapters {
     // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
     // daemon-level model of record. No resolvable provider = fail-closed.
     let llm: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>> =
@@ -7693,6 +7720,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
         std::sync::Arc::new(zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
             channels.clone(),
             handle.clone(),
+            leak_detection_resolver,
         ));
     // Only offer the forge adapter when a git channel actually exists, so
     // `forge.comment` stays fail-closed on daemons without a forge.

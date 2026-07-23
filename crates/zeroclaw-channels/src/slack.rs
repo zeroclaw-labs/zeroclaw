@@ -65,7 +65,7 @@ pub struct SlackChannel {
     lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     cancel_reaction: Option<String>,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -74,6 +74,48 @@ pub struct SlackChannel {
     /// `Channel::self_handle` override reads it without an HTTP call so
     /// the guard runs on every inbound after the first.
     cached_bot_user_id: Mutex<Option<String>>,
+}
+
+/// The one request-scoped authority record for a pending approval. A bound
+/// goal only accepts the same normalized Slack identity that started it.
+struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    expected_principal: Option<String>,
+}
+
+struct PendingApprovalCleanup {
+    pending: Arc<AsyncMutex<HashMap<String, PendingApproval>>>,
+    token: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(pending: Arc<AsyncMutex<HashMap<String, PendingApproval>>>, token: String) -> Self {
+        Self {
+            pending,
+            token,
+            armed: true,
+        }
+    }
+    async fn remove_and_disarm(&mut self) {
+        self.pending.lock().await.remove(&self.token);
+        self.armed = false;
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let pending = Arc::clone(&self.pending);
+            let token = self.token.clone();
+            zeroclaw_spawn::spawn!(async move {
+                pending.lock().await.remove(&token);
+            });
+        }
+    }
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -3561,9 +3603,14 @@ impl SlackChannel {
                     if let Some((token, response)) =
                         Self::try_parse_approval_block_action(&envelope)
                     {
+                        let user_id = envelope
+                            .pointer("/payload/user/id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let principal = self.resolve_sender_identity(user_id).await;
                         let mut map = self.pending_approvals.lock().await;
-                        if let Some(sender) = map.remove(&token) {
-                            let _ = sender.send(response);
+                        if let Some(pending) = take_pending_approval(&mut map, &token, &principal) {
+                            let _ = pending.sender.send(response);
                         }
                         continue;
                     }
@@ -3753,17 +3800,17 @@ impl SlackChannel {
                     continue;
                 };
 
+                let sender = self.resolve_sender_identity(user).await;
                 if let Some((token, response)) = crate::util::parse_approval_reply(&normalized_text)
                 {
                     let mut map = self.pending_approvals.lock().await;
-                    if let Some(ap_sender) = map.remove(&token) {
-                        let _ = ap_sender.send(response);
+                    if let Some(pending) = take_pending_approval(&mut map, &token, &sender) {
+                        let _ = pending.sender.send(response);
                         continue;
                     }
                 }
 
                 last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
-                let sender = self.resolve_sender_identity(user).await;
 
                 let channel_msg = ChannelMessage {
                     id: format!("slack_{channel_id}_{ts}"),
@@ -4940,8 +4987,9 @@ impl Channel for SlackChannel {
                             crate::util::parse_approval_reply(&normalized_text)
                         {
                             let mut map = self.pending_approvals.lock().await;
-                            if let Some(ap_sender) = map.remove(&token) {
-                                let _ = ap_sender.send(response);
+                            if let Some(pending) = take_pending_approval(&mut map, &token, &sender)
+                            {
+                                let _ = pending.sender.send(response);
                                 continue;
                             }
                         }
@@ -5047,8 +5095,8 @@ impl Channel for SlackChannel {
                         crate::util::parse_approval_reply(&normalized_text)
                     {
                         let mut map = self.pending_approvals.lock().await;
-                        if let Some(ap_sender) = map.remove(&token) {
-                            let _ = ap_sender.send(response);
+                        if let Some(pending) = take_pending_approval(&mut map, &token, &sender) {
+                            let _ = pending.sender.send(response);
                             continue;
                         }
                     }
@@ -5166,13 +5214,43 @@ impl Channel for SlackChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        self.request_approval_inner(recipient, None, request).await
+    }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
+    }
+}
+
+impl SlackChannel {
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         let token = crate::util::new_approval_token();
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: expected_principal.map(str::to_owned),
+            },
+        );
+        let mut cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), token.clone());
 
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
@@ -5215,25 +5293,66 @@ impl Channel for SlackChannel {
         };
 
         if let Err(err) = send_result {
-            self.pending_approvals.lock().await.remove(&token);
+            cleanup.remove_and_disarm().await;
             return Err(err);
         }
 
-        let response =
-            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => resp,
-                _ => {
-                    self.pending_approvals.lock().await.remove(&token);
-                    ChannelApprovalResponse::Deny
-                }
-            };
-        Ok(Some(response))
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            Ok(Ok(response)) => {
+                cleanup.disarm();
+                Ok(Some(response))
+            }
+            _ => {
+                cleanup.remove_and_disarm().await;
+                Ok(crate::util::approval_timeout_response(
+                    expected_principal.is_some(),
+                ))
+            }
+        }
     }
+}
+
+fn take_pending_approval(
+    pending: &mut HashMap<String, PendingApproval>,
+    token: &str,
+    principal: &str,
+) -> Option<PendingApproval> {
+    let entry = pending.get(token)?;
+    if entry
+        .expected_principal
+        .as_deref()
+        .is_some_and(|expected| expected != principal)
+    {
+        return None;
+    }
+    pending.remove(token)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_approval_cleanup_removes_pending_entry() {
+        let pending = Arc::new(AsyncMutex::new(HashMap::new()));
+        let (sender, _receiver) = oneshot::channel();
+        pending.lock().await.insert(
+            "approval".into(),
+            PendingApproval {
+                sender,
+                expected_principal: Some("owner".into()),
+            },
+        );
+        drop(PendingApprovalCleanup::new(
+            Arc::clone(&pending),
+            "approval".into(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            pending.lock().await.is_empty(),
+            "cancelled waiters must not retain tokens"
+        );
+    }
 
     #[test]
     fn split_text_into_chunks_safe_on_multibyte_utf8() {
@@ -6794,13 +6913,33 @@ mod tests {
             Arc::new(Vec::new),
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::AlwaysApprove).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: None,
+            },
+        );
+        let pending = ch.pending_approvals.lock().await.remove("abc123").unwrap();
+        pending
+            .sender
+            .send(ChannelApprovalResponse::AlwaysApprove)
+            .unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[test]
+    fn bound_approval_reply_from_another_principal_is_not_consumed() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            "token".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("operator".to_string()),
+            },
+        )]);
+        assert!(take_pending_approval(&mut pending, "token", "other").is_none());
+        assert!(pending.contains_key("token"));
     }
 
     #[test]

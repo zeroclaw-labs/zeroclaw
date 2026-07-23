@@ -799,6 +799,7 @@ pub async fn run_gateway(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                tools::GoalAdmissionToolPolicy::Omit,
             );
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -932,6 +933,7 @@ pub async fn run_gateway(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
@@ -2951,9 +2953,10 @@ async fn process_whatsapp_message(
         // Route approval replies to pending approval requests before dispatching to agent
         if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         {
-            let mut map = wa.pending_approvals().lock().await;
-            if let Some(sender) = map.remove(&token) {
-                let _ = sender.send(response);
+            if wa
+                .resolve_pending_approval(&token, &msg.sender, response)
+                .await
+            {
                 continue;
             }
         }
