@@ -42,6 +42,7 @@ pub mod field {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    #[serde(default)]
     pub method: String,
     #[serde(default)]
     pub params: Value,
