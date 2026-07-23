@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
+/// - `context_compression_inert`: a runtime profile sets
+///   `context_compression.enabled = true`, but the compressor was removed and
+///   no runtime path consumes it, so it has no effect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

@@ -242,7 +242,12 @@ impl Default for EvalHarnessConfig {
 }
 
 fn default_cc_enabled() -> bool {
-    true
+    // The runtime compressor was intentionally removed; no production code path
+    // consumes `ContextCompressionConfig` today. Default to inactive so
+    // generated and inspected configs do not claim compression is enabled when
+    // it has no runtime effect. A future compression architecture would be a
+    // separate decision that could flip this back on.
+    false
 }
 fn default_threshold_ratio() -> f64 {
     0.50
@@ -276,6 +281,9 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
+    /// INERT: retained for schema compatibility after the runtime compressor
+    /// was removed. No runtime path consumes this today, so enabling it has no
+    /// effect; `config validate` surfaces a warning when it is set to `true`.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
