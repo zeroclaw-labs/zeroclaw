@@ -3622,7 +3622,7 @@ mod tests {
         );
     }
 
-    // Regression for #9016: OpenAI's Chat Completions API (this provider's
+    // Regression test: OpenAI's Chat Completions API (this provider's
     // only wire) rejects `reasoning_effort` on tool-bearing requests with an
     // HTTP 400. The field must be omitted whenever tools are present, even
     // for models that otherwise qualify for reasoning_effort.

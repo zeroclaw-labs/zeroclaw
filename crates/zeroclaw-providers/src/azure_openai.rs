@@ -805,7 +805,7 @@ mod tests {
         assert!(p.credential.is_none());
     }
 
-    // Regression for #9016: Azure OpenAI mirrors the Chat Completions
+    // Regression test: Azure OpenAI mirrors the Chat Completions
     // provider's rejection of `reasoning_effort` on tool-bearing requests.
     // `has_tools=true` must omit the field even for a model that otherwise
     // qualifies; `has_tools=false` must keep behaving as before.
