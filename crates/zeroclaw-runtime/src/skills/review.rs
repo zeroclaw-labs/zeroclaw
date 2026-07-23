@@ -81,8 +81,8 @@ pub async fn maybe_run_skill_review(
     let review_config_ref = full_config.unwrap_or(&review_default_config);
     let review_alias = agent_alias.unwrap_or("default");
     let review_security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
-    let assembled_review = crate::tools::scoped::ScopedToolRegistry::assemble(
-        crate::tools::scoped::ScopedAssembly {
+    let assembled_review =
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
             config: review_config_ref,
             agent_alias: review_alias,
             security: &review_security,
@@ -96,9 +96,8 @@ pub async fn maybe_run_skill_review(
             list_deferred_mcp_specs: false,
             emit_assembly_logs: false,
             mcp_registry: None,
-        },
-    )
-    .await;
+        })
+        .await;
     let tools = assembled_review.registry;
     let review_input = build_review_input(&failed_slugs);
 

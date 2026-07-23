@@ -2587,8 +2587,10 @@ impl DelegateTool {
                 // peripherals / MCP / skills / memory-strip, so `config` /
                 // `agent_alias` are never read beyond satisfying the signature.
                 let bounded_default_config = Config::default();
-                let bounded_config_ref =
-                    self.root_config.as_deref().unwrap_or(&bounded_default_config);
+                let bounded_config_ref = self
+                    .root_config
+                    .as_deref()
+                    .unwrap_or(&bounded_default_config);
                 let bounded_security = Arc::new(SecurityPolicy::default());
                 let assembled_bounded = crate::tools::scoped::ScopedToolRegistry::assemble(
                     crate::tools::scoped::ScopedAssembly {

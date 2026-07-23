@@ -133,10 +133,11 @@ fn parity_matrix_rows_are_owned_tracked_and_evidenced() {
 #[tokio::test]
 async fn parity_l1_engine_honors_excluded_tools() {
     let exec_count = Arc::new(AtomicUsize::new(0));
-    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
-        name: "echo",
-        calls: Arc::clone(&exec_count),
-    })]);
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec_count),
+        })]);
     let provider = ScriptedProvider::new(vec![
         tool_response(vec![tool_call("tc1", "echo")]),
         text_response("done"),

@@ -142,7 +142,9 @@ impl Tool for CountingTool {
 fn build_agent(provider: Box<dyn ModelProvider>, tools_vec: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
         .model_provider(provider)
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools_vec))
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
         .memory(mem_none())
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -158,7 +160,9 @@ fn build_agent_with_runtime(
 ) -> Agent {
     Agent::builder()
         .model_provider(provider)
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools_vec))
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
         .memory(mem_none())
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -418,10 +422,11 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         calls: AtomicUsize::new(0),
     };
     let exec_count = Arc::new(AtomicUsize::new(0));
-    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
-        name: "echo",
-        calls: Arc::clone(&exec_count),
-    })]);
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec_count),
+        })]);
     let mut history = vec![ChatMessage::user("hi")];
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -603,10 +608,12 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
                 extra_content: None,
             },
         ])])))
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
-            name: "echo",
-            calls: Arc::clone(&exec_count),
-        })]))
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::clone(&exec_count),
+            })],
+        ))
         .memory(mem_none())
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -802,9 +809,10 @@ async fn safety_net_task_locals_probe_per_entry_path() {
     // channel/E1 path — the caller scopes thread id + session key (control)
     let seen: Probe = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let provider = ScriptedProvider::new(vec![tool_response(vec![tool_call("p3", "echo")])]);
-    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(ProbeTool {
-        seen: Arc::clone(&seen),
-    })]);
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(ProbeTool {
+            seen: Arc::clone(&seen),
+        })]);
     let mut history = vec![ChatMessage::user("probe")];
     let turn_id = uuid::Uuid::new_v4().to_string();
     crate::agent::loop_::scope_thread_id(
@@ -1059,10 +1067,12 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
             tool_round,
             final_round,
         ])))
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
-            name: "echo",
-            calls: Arc::clone(&calls),
-        })]))
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::clone(&calls),
+            })],
+        ))
         .memory(mem_none())
         .observer(Arc::clone(&capture) as Arc<dyn Observer>)
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -1728,7 +1738,9 @@ fn approval_agent(
 ) -> Agent {
     let mut builder = Agent::builder()
         .model_provider(provider)
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools_vec))
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
         .memory(mem_none())
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))

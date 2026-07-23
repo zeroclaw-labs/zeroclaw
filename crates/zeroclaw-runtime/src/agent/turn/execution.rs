@@ -11,8 +11,8 @@ use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
-use crate::tools::scoped::ScopedToolRegistry;
 use crate::tools::ActivatedToolSet;
+use crate::tools::scoped::ScopedToolRegistry;
 
 /// The resolved model binding: which provider, model, and temperature a turn
 /// uses. The base layer any LLM call needs; [`ResolvedAgentExecution`] composes

@@ -452,7 +452,9 @@ mod tests {
 
         let agent = Agent::builder()
             .model_provider(Box::new(UsageProvider))
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))

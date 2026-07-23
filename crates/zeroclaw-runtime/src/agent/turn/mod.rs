@@ -2984,9 +2984,12 @@ mod sop_step_reassembly_tests {
         let parent_provider = TextProvider;
         // Parent scope carries a sensitive tool the child must never be offered.
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })]);
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3160,9 +3163,12 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly { config: &config };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })]);
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3204,9 +3210,12 @@ mod sop_step_reassembly_tests {
         let shell_calls = Arc::new(AtomicUsize::new(0));
         // Parent/delegate scope: a sensitive tool the cross-agent step must never
         // reach.
-        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })]);
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
