@@ -281,10 +281,12 @@ where
         };
 
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
+            discard_non_final_output(&message, assistant);
             handle_server_request(stdin, &message).await?;
             continue;
         }
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_none() {
+            discard_non_final_output(&message, assistant);
             append_agent_message_chunk(&message, assistant)?;
             continue;
         }
@@ -379,8 +381,10 @@ where
             Ok(Ok(Some(message))) => {
                 quiet_intervals = 0;
                 if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
+                    discard_non_final_output(&message, assistant);
                     handle_server_request(stdin, &message).await?;
                 } else if message.get(field::METHOD).is_some() {
+                    discard_non_final_output(&message, assistant);
                     append_agent_message_chunk(&message, assistant)?;
                 }
             }
@@ -406,6 +410,40 @@ fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result
     }
     assistant.push_str(chunk);
     Ok(())
+}
+
+/// Grok can emit user-visible progress as `agent_message_chunk` before it
+/// starts a plan or tool call. That text is not the completed answer for a
+/// one-shot provider. Keep only the latest message segment after a non-final
+/// ACP update; classify by protocol event, never by the model's wording.
+fn discard_non_final_output(message: &Value, assistant: &mut String) {
+    if is_permission_request(message) {
+        assistant.clear();
+        return;
+    }
+
+    let Some(method) = message.get(field::METHOD).and_then(Value::as_str) else {
+        return;
+    };
+    if method != "session/update" && !method.ends_with("/session/update") {
+        return;
+    }
+    let Some(update) = message.pointer("/params/update") else {
+        return;
+    };
+    let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        return;
+    };
+    if kind == "agent_thought_chunk" || kind == "plan" || kind.starts_with("tool_") {
+        assistant.clear();
+    }
+}
+
+fn is_permission_request(message: &Value) -> bool {
+    let Some(method) = message.get(field::METHOD).and_then(Value::as_str) else {
+        return false;
+    };
+    method == "session/request_permission" || method.ends_with("/session/request_permission")
 }
 
 fn select_auth_method_id(
@@ -497,6 +535,53 @@ mod tests {
             });
             assert_eq!(extract_agent_message_chunk(&echo), None);
         }
+    }
+
+    #[test]
+    fn non_final_updates_discard_preceding_progress_text() {
+        let mut assistant = String::new();
+        let progress = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "internal progress" }
+                }
+            }
+        });
+        append_agent_message_chunk(&progress, &mut assistant).expect("progress text");
+        assert_eq!(assistant, "internal progress");
+
+        let tool_call = json!({
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "tool_call" } }
+        });
+        discard_non_final_output(&tool_call, &mut assistant);
+        assert!(assistant.is_empty());
+
+        let final_message = json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "final answer" }
+                }
+            }
+        });
+        append_agent_message_chunk(&final_message, &mut assistant).expect("final text");
+        assert_eq!(assistant, "final answer");
+    }
+
+    #[test]
+    fn permission_requests_discard_preceding_progress_text() {
+        let mut assistant = "internal progress".to_string();
+        let permission = json!({
+            "method": "session/request_permission",
+            "id": 7,
+            "params": { "options": [] }
+        });
+        discard_non_final_output(&permission, &mut assistant);
+        assert!(assistant.is_empty());
     }
 
     #[test]

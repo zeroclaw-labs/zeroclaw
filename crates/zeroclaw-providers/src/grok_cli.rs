@@ -28,8 +28,8 @@
 //! - requires an explicit absolute working directory;
 //! - clears the inherited environment and forwards only process-runtime entries
 //!   plus explicit per-alias `env_passthrough` names;
-//! - defaults to `--sandbox strict`, `--permission-mode dontAsk`, and an empty
-//!   built-in tool set;
+//! - defaults to `--no-plan`, `--sandbox strict`, `--permission-mode dontAsk`,
+//!   and an empty built-in tool set;
 //! - rejects ACP permission requests without cancelling the complete turn;
 //! - bounds ACP frames, aggregate stdout, assistant output, and stderr;
 //! - kills the child process tree on success, failure, timeout, or cancellation;
@@ -556,6 +556,7 @@ impl GrokCliModelProvider {
     fn build_cli_args(model: &str, extra_args: &[String]) -> Vec<String> {
         let mut args = Vec::with_capacity(16 + extra_args.len());
         args.push("--no-auto-update".to_string());
+        args.push("--no-plan".to_string());
 
         if !Self::extra_args_set_any(extra_args, &["--sandbox"]) {
             args.push("--sandbox".to_string());
@@ -1002,6 +1003,7 @@ mod tests {
         let args = GrokCliModelProvider::build_cli_args("grok-4.5", &[]);
         assert_eq!(&args[args.len() - 2..], ["agent", "stdio"]);
         assert!(args.iter().any(|arg| arg == "--no-auto-update"));
+        assert!(args.iter().any(|arg| arg == "--no-plan"));
 
         let sandbox = args
             .iter()
@@ -1171,6 +1173,7 @@ mod tests {
         let output = std::process::Command::new("grok")
             .args([
                 "--no-auto-update",
+                "--no-plan",
                 "--sandbox",
                 "strict",
                 "--permission-mode",
@@ -1232,10 +1235,10 @@ mod tests {
                 .await
                 .expect("live Grok ACP response");
             eprintln!("{label}: {reply}");
-            // The live agent may prepend user-visible prose to an
-            // `agent_message_chunk`; the marker proves that the complete
-            // prompt reached Grok without treating model wording as
-            // deterministic test output.
+            // The live agent may include additional prose in its final
+            // answer; the marker proves that the complete prompt reached
+            // Grok without treating model wording as deterministic test
+            // output.
             assert!(
                 reply.contains(marker),
                 "live Grok ACP response must contain {marker}: {reply}"
@@ -1357,6 +1360,21 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
 while IFS= read -r line; do :; done
 "#;
 
+        const PROGRESS_THEN_TOOL_BODY: &str = r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fake-session"}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"PROGRESS_MUST_NOT_ESCAPE"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"tool_call","title":"lookup"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FAKE_PROGRESS_BOUNDARY_OK"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+while IFS= read -r line; do :; done
+"#;
+
         fn fake_grok(temp: &TempDir, body: &str) -> PathBuf {
             let path = temp.path().join("fake-grok");
             std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).expect("write fake Grok");
@@ -1423,6 +1441,7 @@ while IFS= read -r line; do :; done
                 assert!(!args.contains("--single"));
                 assert!(!args.contains("--prompt-file"));
                 assert!(args.contains("agent\nstdio"));
+                assert!(args.contains("--no-plan\n"));
                 assert!(args.contains("--permission-mode\ndontAsk"));
                 assert!(args.contains("--tools\n\n"));
 
@@ -1430,6 +1449,18 @@ while IFS= read -r line; do :; done
                     .expect("captured requests");
                 assert!(requests.contains(&prompt));
             }
+        }
+
+        #[tokio::test]
+        async fn fake_child_discards_progress_before_tool_result() {
+            let temp = TempDir::new().expect("tempdir");
+            let model_provider = fake_provider(&temp, PROGRESS_THEN_TOOL_BODY, 5);
+            let reply = model_provider
+                .invoke_acp("hello", "default")
+                .await
+                .expect("fake ACP reply");
+            assert_eq!(reply, "FAKE_PROGRESS_BOUNDARY_OK");
+            assert!(!reply.contains("PROGRESS_MUST_NOT_ESCAPE"));
         }
 
         #[tokio::test]

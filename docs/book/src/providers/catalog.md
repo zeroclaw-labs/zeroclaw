@@ -77,7 +77,7 @@ that alias. Other provider-owned `XAI_*` names and all `GROK_*` names are
 rejected. Grok's discovered user and project configuration, together with alias
 `extra_args`, owns Grok tool policy.
 
-The default argv adds `--no-auto-update`, `--sandbox strict`,
+The default argv adds `--no-auto-update`, `--no-plan`, `--sandbox strict`,
 `--permission-mode dontAsk`, and `--tools ""`. The ACP client never approves a
 permission request. When the request supplies a `reject_once` option, the
 client selects that option instead of cancelling the complete agent turn;
@@ -95,6 +95,13 @@ session, cwd, and update flags remain provider-owned and are rejected in
 value-taking options accept either `["--flag", "value"]` or `--flag=value`;
 unknown option shapes require the inline form so they cannot consume the
 trailing ACP command.
+
+Grok may emit progress as an `agent_message_chunk` before a plan, tool call, or
+permission request. The provider discards the preceding message segment at
+those ACP boundaries and returns only the latest answer segment, so planning
+or tool-gathering narration is not delivered as the channel reply. Explicit
+`--no-plan` also keeps the default one-shot channel alias out of Grok's plan
+mode; tool/MCP configuration remains an operator-controlled capability.
 
 ACP stdout frames, aggregate stdout, assistant text, and stderr processing are
 bounded while the child is running. Stderr is drained but its content is never
