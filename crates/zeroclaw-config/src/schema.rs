@@ -13520,8 +13520,10 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
-    /// Delay (ms) between sending each message chunk in multi-message mode.
-    /// Only used when `stream_mode = "multi_message"`.
+    /// Minimum delay (ms) between successive multi_message narration messages
+    /// (and before the approval prompt) for one recipient. Does not apply to the
+    /// fixed pacing between physical fragments of a single over-4096-character
+    /// message. Only used when `stream_mode = "multi_message"`.
     #[tab(Behavior)]
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
