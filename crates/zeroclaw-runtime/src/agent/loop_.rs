@@ -1073,7 +1073,15 @@ pub fn apply_text_tool_prompt_policy(
 
 #[derive(Default)]
 pub struct AgentRunOverrides {
+    /// Validated security policy supplied by a parent runtime.
+    ///
+    /// This is a dependency override, not a serialized policy snapshot. When
+    /// absent, the run path resolves the policy from canonical config.
     pub security: Option<Arc<SecurityPolicy>>,
+    /// Validated memory backend supplied by a parent runtime.
+    ///
+    /// This lets delegated/subagent runs inherit the already-narrowed memory
+    /// surface. When absent, the run path resolves memory from canonical config.
     pub memory: Option<Arc<dyn Memory>>,
     pub is_subagent: bool,
     /// Spawn-site opt-out of the engine's memory-context injection (e.g. a
@@ -1334,6 +1342,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2288,7 +2297,6 @@ pub async fn run(
                     &effective_input,
                     &mcp_tool_names,
                 );
-
                 let excluded_tool_names: HashSet<&str> =
                     excluded_tools.iter().map(String::as_str).collect();
                 let runtime_capability_names = tools_registry
@@ -2957,6 +2965,7 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -5017,6 +5026,30 @@ mod tests {
         }
     }
 
+    struct RewriteToolHook {
+        from: &'static str,
+        to: &'static str,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for RewriteToolHook {
+        fn name(&self) -> &str {
+            "rewrite-tool-hook"
+        }
+
+        async fn before_tool_call(
+            &self,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            if name == self.from {
+                crate::hooks::HookResult::Continue((self.to.to_string(), args))
+            } else {
+                crate::hooks::HookResult::Continue((name, args))
+            }
+        }
+    }
+
     /// A tool that always returns a failure with a given error reason.
     struct FailingTool {
         tool_name: String,
@@ -6323,6 +6356,103 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_serializes_hook_rewritten_goal_start_batch() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![
+                ("call_rewrite", "rewrite_me", "{\"value\":\"goal\"}"),
+                ("call_delay", "delay_sibling", "{\"value\":\"other\"}"),
+            ],
+            "done",
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(DelayTool::new(
+                crate::tools::GoalStartTool::NAME,
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_sibling",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+        ];
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(RewriteToolHook {
+            from: "rewrite_me",
+            to: crate::tools::GoalStartTool::NAME,
+        }));
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run rewritten goal_start batch"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                config: None,
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 4,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: true,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::agent_direct(),
+            memory: None,
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("hook-rewritten goal_start batch should complete");
+
+        assert!(result.ends_with("done"), "got: {result}");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "goal_start introduced by hooks must be considered before parallel execution is chosen"
         );
     }
 

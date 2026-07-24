@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-commands.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true

@@ -13511,6 +13511,7 @@ dependencies = [
  "windows 0.61.3",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-commands",
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-log",

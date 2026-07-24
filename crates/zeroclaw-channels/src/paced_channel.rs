@@ -445,6 +445,17 @@ impl Channel for PacedChannel {
         self.inner.request_approval(recipient, request).await
     }
 
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
+        self.inner
+            .request_approval_for_principal(recipient, principal, request)
+            .await
+    }
+
     async fn request_choice(
         &self,
         question: &str,
@@ -532,6 +543,41 @@ mod tests {
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct PrincipalApprovalChannel {
+        calls: AtomicUsize,
+    }
+
+    impl Attributable for PrincipalApprovalChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "principal-approval"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for PrincipalApprovalChannel {
+        fn name(&self) -> &str {
+            "principal-approval"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn request_approval_for_principal(
+            &self,
+            _recipient: &str,
+            principal: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> Result<Option<ChannelApprovalResponse>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok((principal == "owner").then_some(ChannelApprovalResponse::Approve))
         }
     }
 
@@ -858,6 +904,31 @@ mod tests {
         async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn forwards_principal_bound_approval_without_falling_back() {
+        let inner = Arc::new(PrincipalApprovalChannel {
+            calls: AtomicUsize::new(0),
+        });
+        let cfg = PacingFixture {
+            interval_secs: 1,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner.clone(), &cfg);
+        let request = ChannelApprovalRequest {
+            tool_name: "deploy".into(),
+            arguments_summary: "{}".into(),
+            raw_arguments: None,
+        };
+        assert_eq!(
+            paced
+                .request_approval_for_principal("room", "owner", &request)
+                .await
+                .unwrap(),
+            Some(ChannelApprovalResponse::Approve)
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

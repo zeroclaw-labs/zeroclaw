@@ -8,7 +8,7 @@ use super::protocol_detect::{
 };
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
-use crate::agent::cost::record_tool_loop_cost_usage;
+use crate::agent::cost::record_tool_loop_cost_usage_optional;
 use crate::agent::loop_::capture_llm_messages;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
@@ -86,6 +86,11 @@ pub(crate) fn resolve_display_text(
     }
 }
 
+/// Narration to relay after the live stream, given what was already forwarded.
+/// Returns the suffix of `display_text` past `streamed_visible_text` when the
+/// latter is a genuine prefix. On any divergence the whole `display_text` is
+/// relayed: duplicate output is recoverable noise, a dropped tail is permanent
+/// loss, so the total function never truncates.
 pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
@@ -106,12 +111,28 @@ pub(crate) fn unforwarded_narration<'a>(
 }
 
 /// The interpreted Ok-arm of one provider call.
+///
+/// This is a transient split of one model response into the surfaces that need
+/// different handling: visible text, tool dispatch, native provider tool calls,
+/// and conversation-history content. It is not a transcript record; callers
+/// decide which fields become user-visible output, which feed the next tool
+/// loop iteration, and which are committed to history.
 pub(crate) struct InterpretedResponse {
+    /// Raw assistant text after provider-level extraction.
     pub(crate) response_text: String,
+    /// Assistant text after XML/tool-call protocol parsing removes command
+    /// scaffolding that should not be replayed as ordinary narration.
     pub(crate) parsed_text: String,
+    /// Tool calls parsed from ZeroClaw's text protocol.
     pub(crate) tool_calls: Vec<ParsedToolCall>,
+    /// Assistant content to commit to conversation history for this provider
+    /// response. This may differ from user-visible narration when streaming or
+    /// protocol suppression is active.
     pub(crate) assistant_history_content: String,
+    /// Provider-native tool calls supplied outside the text protocol.
     pub(crate) native_tool_calls: Vec<ToolCall>,
+    /// Whether parsing saw malformed protocol content that should affect loop
+    /// decisions or diagnostics.
     pub(crate) parse_issue_detected: bool,
     pub(crate) input_tokens: Option<u64>,
 }
@@ -127,7 +148,7 @@ pub(crate) async fn interpret_chat_response(
     llm_started_at: Instant,
     iteration: usize,
     detect_protocol_without_tools: bool,
-) -> InterpretedResponse {
+) -> anyhow::Result<InterpretedResponse> {
     let (resp_input_tokens, resp_output_tokens) = resp
         .usage
         .as_ref()
@@ -151,11 +172,29 @@ pub(crate) async fn interpret_chat_response(
         messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
     });
 
-    let call_cost_usd = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    // Record cost via the task-local tracker (no-op when not scoped) and keep
+    // the per-call USD so both the Usage event and the llm_response log line
+    // can carry it. `None` = untracked (no cost scope or no usage). A tracked
+    // unpriced call still returns `Some(0.0)`, and the persisted cost row marks
+    // Non-goal unpriced calls remain observable as `Some(0.0)`; a
+    // goal-attributed call instead returns an accounting error before its
+    // response can advance the tool loop.
+    let call_cost_usd = match record_tool_loop_cost_usage_optional(
+        ctx.provider_name,
+        ctx.model,
+        resp.usage.as_ref(),
+    )
+    .await
+    {
+        Ok(usage) => usage.map(|(_total_tokens, cost_usd)| cost_usd),
+        Err(error) => {
+            if let Some(task_id) = crate::agent::cost::current_exact_goal_task_id() {
+                let _ =
+                    crate::control_plane::pause_goal_for_accounting_failure(&task_id, &error).await;
+            }
+            return Err(error);
+        }
+    };
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
@@ -298,7 +337,7 @@ pub(crate) async fn interpret_chat_response(
     };
 
     let native_calls = resp.tool_calls;
-    InterpretedResponse {
+    Ok(InterpretedResponse {
         response_text,
         parsed_text,
         tool_calls: calls,
@@ -306,7 +345,7 @@ pub(crate) async fn interpret_chat_response(
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
         input_tokens: resp_input_tokens,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -418,6 +457,17 @@ mod cost_usd_regression_tests {
     use std::sync::Arc;
     use zeroclaw_providers::traits::TokenUsage;
 
+    /// Regression guard for the per-call USD that
+    /// `record_tool_loop_cost_usage` returns and `interpret_chat_response`
+    /// threads into BOTH the `TurnEvent::Usage { cost_usd }` event and the
+    /// `cost_usd` attribute of the `llm_response` log record. The test fails
+    /// if either path drops the cost.
+    ///
+    /// Pricing/usage are picked so the expected cost is an exact f64:
+    ///   input  = 2_000_000 tokens @ 1.5 / 1e6  = 3.0
+    ///   output = 1_000_000 tokens @ 3.0 / 1e6  = 3.0
+    ///   cached = 0 tokens                       = 0.0
+    ///   expected total                          = 6.0
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cost_usd_flows_to_usage_event_and_llm_response() {
@@ -509,7 +559,9 @@ mod cost_usd_regression_tests {
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(cost_ctx), async {
-                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
+                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false)
+                    .await
+                    .unwrap();
             })
             .await;
 

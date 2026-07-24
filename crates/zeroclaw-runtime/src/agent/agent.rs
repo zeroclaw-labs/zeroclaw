@@ -28,6 +28,17 @@ pub fn build_session_model_provider(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    build_session_model_provider_with_options(config, model_provider_ref, model_override, |_| {})
+}
+
+/// Build a session provider while allowing a scoped caller to override its
+/// resolved runtime options before construction.
+pub fn build_session_model_provider_with_options(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+    configure_options: impl FnOnce(&mut zeroclaw_providers::ModelProviderRuntimeOptions),
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -59,11 +70,12 @@ pub fn build_session_model_provider(
             ))
         })?;
 
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+    let mut model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
         &model_provider_name,
         &model_provider_alias,
     );
+    configure_options(&mut model_provider_runtime_options);
 
     let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
         config,
@@ -101,7 +113,11 @@ pub(crate) enum RoutedApproval {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
     },
-    /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
+    /// Explicit `InheritOriginator` — defer to the caller's trusted fallback.
+    ///
+    /// Ordinary turns use the originating-channel fan-out. Goal turns instead
+    /// use their durable continuation binding, so they never recover authority
+    /// from mutable inbound routing.
     Fallthrough,
 }
 
@@ -113,9 +129,8 @@ pub(crate) async fn resolve_routed_approval(
 ) -> RoutedApproval {
     let approver: Option<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = handles
         .read()
-        .iter()
-        .find(|(name, _)| name.as_str() == route.approver_channel)
-        .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+        .get(route.approver_channel.as_str())
+        .map(|channel| (route.approver_channel.clone(), Arc::clone(channel)));
 
     let reason: &str = if let Some((channel_name, channel)) = approver {
         let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
@@ -1515,6 +1530,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -2604,10 +2620,12 @@ impl Agent {
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
-                Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
+                let bridge = crate::agent::approval_bridge::AskUserApprovalBridge::new(
                     Arc::clone(handles),
                     self.approval_route.clone(),
-                )) as Box<dyn zeroclaw_api::channel::Channel>
+                )
+                .with_goal_scope_binding();
+                Box::new(bridge) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
         let knobs = crate::agent::loop_::LoopKnobs {

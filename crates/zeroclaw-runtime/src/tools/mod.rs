@@ -10,6 +10,10 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
+pub mod goal_human_gate;
+pub mod goal_objective;
+pub mod goal_resume;
+pub mod goal_start;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
@@ -128,6 +132,9 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
+pub use goal_objective::GoalObjectiveTool;
+pub use goal_resume::GoalResumeTool;
+pub use goal_start::GoalStartTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
@@ -439,19 +446,45 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
 
 /// Bundled return values from tool registry construction.
 /// Named struct to avoid an ever-growing positional tuple that's painful
-/// to destructure across many callers.
+/// to destructure across many callers. The fields are construction artifacts,
+/// not durable runtime state: channel handles stay owned by the channel
+/// registry, tool instances stay owned by the caller that installs them into a
+/// loop, and goal-mode wrappers reuse those same handles instead of carrying
+/// their own delivery copies.
 #[allow(clippy::type_complexity)]
 pub struct AllToolsResult {
+    /// Tool objects registered for the current loop after policy filtering.
     pub tools: Vec<Box<dyn Tool>>,
+    /// Shared parent-tool context used by synchronous delegation.
     pub delegate_handle: Option<DelegateParentToolsHandle>,
+    /// Channel delivery handle used by the `ask_user` tool and its goal-aware
+    /// pause wrapper.
     pub ask_user_handle: Option<PerToolChannelHandle>,
+    /// Channel room-management handle used by tools that create/list/send to
+    /// rooms.
     pub channel_room_handle: Option<PerToolChannelHandle>,
+    /// Reaction delivery handle for tools that emit channel reactions.
     pub reaction_handle: PerToolChannelHandle,
+    /// Poll delivery handle for poll-capable channels.
     pub poll_handle: Option<PerToolChannelHandle>,
+    /// Channel delivery handle used by `escalate_to_human` and its goal-aware
+    /// pause wrapper.
     pub escalate_handle: Option<PerToolChannelHandle>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+}
+
+/// Controls whether tools that require a scoped `GoalAdmissionContext` are
+/// registered for the current tool loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalAdmissionToolPolicy {
+    /// Exclude goal-only tools from ordinary turns so the model cannot start or
+    /// resume goals without trusted admission context.
+    Omit,
+    /// Include goal-only tools for a turn already running under trusted goal
+    /// admission context.
+    Include,
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -501,6 +534,7 @@ pub fn all_tools(
         None,
         None,
         None,
+        GoalAdmissionToolPolicy::Omit,
     )
 }
 
@@ -549,6 +583,7 @@ pub fn all_tools_with_runtime(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    goal_admission_tools: GoalAdmissionToolPolicy,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -658,6 +693,15 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
     ];
+
+    if matches!(goal_admission_tools, GoalAdmissionToolPolicy::Include) {
+        tool_arcs.push(Arc::new(GoalObjectiveTool::new(
+            agent_alias,
+            config.clone(),
+        )));
+        tool_arcs.push(Arc::new(GoalResumeTool::new(agent_alias, config.clone())));
+        tool_arcs.push(Arc::new(GoalStartTool::new(agent_alias, config.clone())));
+    }
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
@@ -1249,9 +1293,16 @@ pub fn all_tools_with_runtime(
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
     let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
-    tool_arcs.push(Arc::new(ask_user_tool));
+    let ask_user_tool: Arc<dyn Tool> = Arc::new(AskUserTool::new(
+        security.clone(),
+        ask_user_handle.as_ref().cloned().unwrap(),
+    ));
+    tool_arcs.push(Arc::new(goal_human_gate::GoalHumanGateTool::ask_user(
+        ask_user_tool,
+        security.clone(),
+        ask_user_handle.as_ref().cloned().unwrap(),
+        Arc::clone(&config),
+    )));
 
     {
         let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
@@ -1270,12 +1321,19 @@ pub fn all_tools_with_runtime(
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
     let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let escalate_tool = EscalateToHumanTool::new(
+    let escalate_tool: Arc<dyn Tool> = Arc::new(EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
         escalate_handle.as_ref().cloned().unwrap(),
-    );
-    tool_arcs.push(Arc::new(escalate_tool));
+    ));
+    tool_arcs.push(Arc::new(
+        goal_human_gate::GoalHumanGateTool::escalate_to_human(
+            escalate_tool,
+            security.clone(),
+            escalate_handle.as_ref().cloned().unwrap(),
+            Arc::clone(&config),
+        ),
+    ));
 
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {
@@ -1738,6 +1796,123 @@ mod tests {
     }
 
     #[test]
+    fn goal_admission_tools_require_goal_admission_registry_scope() {
+        fn assert_openai_compatible_tool_names(tools: &[Box<dyn Tool>]) {
+            for tool in tools {
+                let name = tool.name();
+                assert!(
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                    "tool name {name:?} must be 1-64 chars and contain only letters, numbers, underscores, or hyphens"
+                );
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let general_tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem.clone(),
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        assert_openai_compatible_tool_names(&general_tools);
+        assert!(
+            general_tools.iter().all(|tool| tool.name() != "goal_start"),
+            "general registries must not expose goal_start without trusted admission context"
+        );
+        assert!(
+            general_tools
+                .iter()
+                .all(|tool| tool.name() != "goal_objective"),
+            "general registries must not expose goal_objective without trusted admission context"
+        );
+        assert!(
+            general_tools
+                .iter()
+                .all(|tool| tool.name() != "goal_resume"),
+            "general registries must not expose goal_resume without trusted admission context"
+        );
+
+        let scoped_tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            GoalAdmissionToolPolicy::Include,
+        )
+        .tools;
+        assert_openai_compatible_tool_names(&scoped_tools);
+        assert!(
+            scoped_tools.iter().any(|tool| tool.name() == "goal_start"),
+            "goal_start should be exposed only when the caller scopes trusted admission context"
+        );
+        assert!(
+            scoped_tools
+                .iter()
+                .any(|tool| tool.name() == "goal_objective"),
+            "goal_objective should be exposed only when the caller scopes trusted admission context"
+        );
+        assert!(
+            scoped_tools.iter().any(|tool| tool.name() == "goal_resume"),
+            "goal_resume should be exposed only when the caller scopes trusted admission context"
+        );
+    }
+
+    /// SOP tools MUST appear in the tool registry when an engine handle is
+    /// provided, regardless of config. Proves the parameter-passing path
+    /// works end-to-end.
+    #[test]
     fn sop_tools_present_when_engine_provided() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -1784,6 +1959,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            GoalAdmissionToolPolicy::Omit,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1854,6 +2030,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            GoalAdmissionToolPolicy::Omit,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1911,6 +2088,7 @@ mod tests {
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            GoalAdmissionToolPolicy::Omit,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -1934,6 +2112,7 @@ mod tests {
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            GoalAdmissionToolPolicy::Omit,
         );
 
         for tools in [&session_a.tools, &session_b.tools] {
@@ -2060,6 +2239,7 @@ mod tests {
                 Some(shared_engine.clone()),
                 None,
                 None,
+                GoalAdmissionToolPolicy::Omit,
             )
             .tools
         };
@@ -2156,6 +2336,7 @@ mod tests {
             None,
             None,
             None,
+            GoalAdmissionToolPolicy::Omit,
         )
         .tools;
 
@@ -2475,6 +2656,7 @@ mod tests {
                 Some(sop_engine),
                 Some(sop_audit),
                 None,
+                GoalAdmissionToolPolicy::Omit,
             )
             .tools
         };

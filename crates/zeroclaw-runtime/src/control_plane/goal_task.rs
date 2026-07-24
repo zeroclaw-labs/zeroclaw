@@ -1,10 +1,22 @@
 //! Goal-specific task extensions for the durable control plane.
+//!
+//! Goal mode is represented as [`TaskKind::Goal`](super::TaskKind::Goal) in
+//! the canonical task table. This module owns only the goal extension record,
+//! continuation context, and goal-oriented repository operations layered on top
+//! of that generic task record.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::task_registry::{TaskRecord, TaskStatus};
 
+/// Goal-specific extension record keyed by the canonical task id.
+///
+/// Lifecycle, ownership, route, principal, timestamps, and terminal state stay on
+/// [`TaskRecord`]. This record owns only goal-specific state that has no meaning
+/// for delegates/subagents. In source-of-truth terms: this is the authoritative
+/// row for the objective, effective limits, and goal pause details; it is not a
+/// copy of the generic task row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoalTaskRecord {
     /// Foreign key to the canonical [`TaskRecord`].
@@ -12,11 +24,23 @@ pub struct GoalTaskRecord {
     /// Operator/model-supplied objective text. Treated as prompt input, not as
     /// trusted policy data.
     pub objective: String,
+    /// Effective token limit for this goal after config defaults and command
+    /// overrides have been resolved.
+    ///
+    /// This is persisted because later config edits must not rewrite a goal's
+    /// already-admitted policy. Consumed and remaining tokens stay derived from
+    /// the cost ledger.
     #[serde(default)]
     pub effective_token_limit: Option<u64>,
+    /// Effective USD limit for this goal after config defaults and command
+    /// overrides have been resolved.
+    ///
+    /// This is the admitted limit, not a usage counter. Actual spend is derived
+    /// from canonical cost records.
     #[serde(default)]
     pub effective_cost_limit_usd: Option<f64>,
     /// Controller-readable reason the goal is paused.
+    ///
     /// This explains a canonical [`TaskStatus::Paused`] state, but does not
     /// replace it. Terminal lifecycle state remains on the canonical task row.
     #[serde(default)]
@@ -26,12 +50,20 @@ pub struct GoalTaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_description: Option<String>,
     /// Structured blockers that explain what must change before continuation.
+    ///
     /// The blocker list is the durable machine-readable resume surface for
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
 }
 
+/// Per-call view of a canonical task plus its goal extension.
+///
+/// This is deliberately not stored or cached. Lifecycle, routing, ownership,
+/// timestamps, and terminal state remain canonical on [`TaskRecord`];
+/// goal-only state remains canonical on [`GoalTaskRecord`]. The view exists so
+/// controller code can pass one coherent domain object instead of repeatedly
+/// pairing unrelated-looking values.
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -87,6 +119,12 @@ impl TaskGoal {
         &self.goal.objective
     }
 
+    /// Return a per-call view with updated effective budget limits.
+    ///
+    /// This does not persist anything. The caller must first commit the limit
+    /// update through [`GoalTaskRegistry::update_goal_limits`], then use this
+    /// helper to keep the controller's in-memory task/goal pair coherent for
+    /// the rest of the admission decision.
     pub fn with_effective_limits(
         mut self,
         token_limit: Option<u64>,
@@ -97,6 +135,11 @@ impl TaskGoal {
         self
     }
 
+    /// Consume the view and return only the canonical task row.
+    ///
+    /// Use this after goal-extension facts have already been folded into the
+    /// controller decision. Mutations that move both lifecycle and pause state
+    /// must still go through [`GoalTaskRegistry`] transaction methods.
     pub fn into_task(self) -> TaskRecord {
         self.task
     }
@@ -108,6 +151,7 @@ impl TaskGoal {
 }
 
 /// Typed policy input for why a goal is paused.
+///
 /// A pause reason is goal-specific explanation layered on top of
 /// [`TaskStatus::Paused`]. It must not be used as a second lifecycle enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +180,7 @@ pub enum GoalPauseReason {
 }
 
 /// Structured blocker packet attached to a paused goal.
+///
 /// Free-form text is only explanatory. Policy branches on `kind` and payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalBlocker {
@@ -143,11 +188,17 @@ pub struct GoalBlocker {
     pub kind: GoalBlockerKind,
     /// Human-readable explanation of the blocker.
     pub message: String,
+    /// Optional structured detail supplied by the tool/controller that created
+    /// the blocker.
+    ///
+    /// This is durable goal-control metadata, not a generic event log. Consumers
+    /// must treat embedded user/model text as untrusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
 }
 
 /// Coarse class of a blocker attached to a paused goal.
+///
 /// This is intentionally separate from [`GoalPauseReason`]: a pause has one
 /// primary reason, while the blocker list can contain several actionable items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +222,11 @@ pub enum GoalBlockerKind {
     RestartRecovery,
 }
 
+/// Complete pause extension to persist on a goal task.
+///
+/// The canonical task row says only that the task is paused. This structure
+/// carries the goal-specific reason and actionable blockers needed for status,
+/// resume, and recovery behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalPauseState {
     /// Primary pause reason for controller policy.
@@ -183,6 +239,15 @@ pub struct GoalPauseState {
     pub blockers: Vec<GoalBlocker>,
 }
 
+/// Persisted channel scope needed to synthesize trusted goal continuation turns.
+///
+/// This is intentionally narrower than `ChannelMessage`: it owns only delivery
+/// and history-routing facts that cannot be reconstructed from
+/// [`TaskRecord::originator_route`]. User text, attachments, and other
+/// transient message data stay out of the durable control plane. The same
+/// scope is reused for `/goal resume`, budget-triggered continuation, and
+/// daemon-restart recovery so those paths do not invent separate delivery
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskContinuationContext {
     /// Channel family that should receive the continuation turn.
@@ -220,8 +285,20 @@ pub enum TaskContinuationConversationScope {
     ReplyTarget,
 }
 
+/// Repository operations for the goal extension table.
+///
+/// Implementations should store goal-specific rows beside, not inside, the
+/// canonical [`TaskRecord`]. `create_goal` exists only to preserve the atomic
+/// transaction boundary between the generic task row and its goal extension.
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
+    /// Atomically insert the canonical task row and its goal extension row.
+    ///
+    /// The caller supplies both records because they are different sources of
+    /// truth: [`TaskRecord`] owns lifecycle/routing/ownership, while
+    /// [`GoalTaskRecord`] owns objective/limits/pause details. Implementations
+    /// must reject mismatched ids or non-goal task kinds rather than repairing
+    /// them silently.
     async fn create_goal(
         &self,
         task: TaskRecord,
@@ -234,6 +311,11 @@ pub trait GoalTaskRegistry: Send + Sync {
     async fn latest_active_goal_for_agent(&self, agent: &str)
     -> anyhow::Result<Option<TaskRecord>>;
 
+    /// Resolve the latest non-terminal goal for the trusted runtime context.
+    ///
+    /// Route and principal filters are matched against canonical `TaskRecord`
+    /// fields when present. Callers that have no route/principal context pass
+    /// `None` and intentionally fall back to agent-scoped resolution.
     async fn latest_active_goal_for_context(
         &self,
         agent: &str,
@@ -251,11 +333,24 @@ pub trait GoalTaskRegistry: Send + Sync {
         principal_id: Option<&str>,
     ) -> anyhow::Result<Option<String>>;
 
+    /// Load the goal extension row for a canonical task id.
+    ///
+    /// Absence means either the task is not a goal or the extension row is
+    /// missing. Callers that require lifecycle state must pair this with a
+    /// fresh canonical [`TaskRecord`] read; the extension row alone is not a
+    /// complete lifecycle view.
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
 
+    /// Replace the canonical objective text for a goal.
+    ///
+    /// Objective text is goal-specific untrusted prompt input, so it belongs on
+    /// the goal extension row rather than the generic task row. Callers must
+    /// resolve lifecycle and visibility from the canonical [`TaskRecord`]
+    /// before invoking this mutation; the store only owns the extension write.
     async fn update_goal_objective(&self, task_id: &str, objective: &str) -> anyhow::Result<()>;
 
     /// Replace the persisted effective budget limits for a goal.
+    ///
     /// These are creation/update-time policy limits only. Consumed and
     /// remaining usage stay derived from canonical usage ledger rows.
     async fn update_goal_limits(
@@ -265,28 +360,90 @@ pub trait GoalTaskRegistry: Send + Sync {
         cost_limit_usd: Option<f64>,
     ) -> anyhow::Result<()>;
 
+    /// Replace only the goal-extension pause payload.
+    ///
+    /// This is for extension-only repairs or tests that already control the
+    /// canonical lifecycle row. Runtime pause/resume paths must use
+    /// [`GoalTaskRegistry::pause_goal_task_if_status`] or
+    /// [`GoalTaskRegistry::resume_paused_goal_task`] so `tasks.status` and
+    /// `goal_tasks` cannot diverge.
     async fn update_goal_pause(
         &self,
         task_id: &str,
         pause: Option<GoalPauseState>,
     ) -> anyhow::Result<()>;
 
-    async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
+    /// Atomically persist a pause only if the canonical task is still in the
+    /// expected lifecycle state.
+    ///
+    /// A controller command resolves a task before it mutates it. The expected
+    /// state prevents that stale read from overwriting an operator or terminal
+    /// transition that won the race in the meantime.
+    async fn pause_goal_task_if_status(
+        &self,
+        task_id: &str,
+        expected_status: TaskStatus,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<bool>;
 
-    async fn resume_goal_task(
+    /// Atomically cancel a goal only if its lifecycle state still matches the
+    /// controller's resolved target. A false result means a concurrent state
+    /// transition won and no terminal output or error was written.
+    async fn cancel_goal_task_if_status(
+        &self,
+        task_id: &str,
+        expected_status: TaskStatus,
+        error: String,
+    ) -> anyhow::Result<bool>;
+
+    /// Atomically complete exactly a running goal. A false result means a
+    /// concurrent pause/cancel/terminal transition won the lifecycle race.
+    async fn complete_running_goal_task(
+        &self,
+        task_id: &str,
+        output: String,
+    ) -> anyhow::Result<bool>;
+
+    /// Complete a running goal only when its canonical effective limits still
+    /// match the policy that was verified. This prevents a verifier result from
+    /// bypassing an operator budget update that landed while it was running.
+    async fn complete_running_goal_task_if_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+        output: String,
+    ) -> anyhow::Result<bool>;
+    /// Atomically clear goal pause state, claim ownership, and mark the task running.
+    ///
+    /// `continuation_context` is written only when supplied by trusted ingress.
+    /// This keeps manual resume, budget-triggered resume, and future recovery
+    /// paths from splitting lifecycle and goal-extension updates across
+    /// independent writes.
+    async fn resume_paused_goal_task(
         &self,
         task_id: &str,
         owner_pid: u32,
         owner_boot_id: &str,
         continuation_context: Option<TaskContinuationContext>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 
+    /// Replace or clear the continuation delivery context for a task.
+    ///
+    /// The context is control-plane-owned delivery state, not lifecycle state.
+    /// It is consumed when resume, budget, or restart-recovery paths need to
+    /// enqueue a trusted continuation prompt through the channel runtime.
     async fn set_continuation_context(
         &self,
         task_id: &str,
         context: Option<TaskContinuationContext>,
     ) -> anyhow::Result<()>;
 
+    /// Load the durable channel continuation context for a task, when present.
+    ///
+    /// The returned context is delivery metadata only. It does not authorize a
+    /// resume by itself; callers still need trusted admission/recovery context
+    /// before injecting a synthetic continuation into a channel loop.
     async fn get_continuation_context(
         &self,
         task_id: &str,

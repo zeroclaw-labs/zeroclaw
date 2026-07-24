@@ -13,6 +13,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 const VALID_URGENCY_LEVELS: &[&str] = &["low", "medium", "high", "critical"];
 
+pub fn is_valid_urgency_level(urgency: &str) -> bool {
+    VALID_URGENCY_LEVELS.contains(&urgency)
+}
+
 /// Agent-callable tool for escalating situations to a human operator with urgency routing.
 pub struct EscalateToHumanTool {
     security: Arc<SecurityPolicy>,
@@ -34,7 +38,7 @@ impl EscalateToHumanTool {
     }
 
     /// Format the escalation message with urgency prefix.
-    fn format_message(urgency: &str, summary: &str, context: Option<&str>) -> String {
+    pub fn format_message(urgency: &str, summary: &str, context: Option<&str>) -> String {
         let prefix = match urgency {
             "low" => "\u{2139}\u{fe0f} [LOW]",
             "high" => "\u{1f534} [HIGH]",
@@ -184,7 +188,7 @@ impl Tool for EscalateToHumanTool {
             .and_then(|v| v.as_str())
             .unwrap_or("medium");
 
-        if !VALID_URGENCY_LEVELS.contains(&urgency) {
+        if !is_valid_urgency_level(urgency) {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

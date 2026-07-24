@@ -761,6 +761,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Request approval from one exact authenticated principal.
+    ///
+    /// The default is deliberately fail-closed: adapters that cannot verify
+    /// the responder identity must not approve a goal-bound action merely
+    /// because they can display a prompt.
+    async fn request_approval_for_principal(
+        &self,
+        _recipient: &str,
+        _principal: &str,
+        _request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(None)
+    }
+
     /// Like [`Channel::request_approval`], but also reports which
     /// back-channel produced the decision when this channel fans the request
     /// out. Default delegates to [`Channel::request_approval`] with
