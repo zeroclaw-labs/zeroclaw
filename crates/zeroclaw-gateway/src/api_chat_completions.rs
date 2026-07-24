@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_providers::sanitize_api_error;
 use zeroclaw_runtime::agent::TurnEvent;
 
@@ -21,7 +23,7 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 // Request structures
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChatCompletionRequest {
     #[serde(default)]
@@ -39,6 +41,14 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<ChatCompletionTool>>,
     pub tool_choice: Option<serde_json::Value>,
     pub stream_options: Option<StreamOptions>,
+    pub n: Option<u32>,
+    pub response_format: Option<serde_json::Value>,
+    pub seed: Option<i64>,
+    pub logprobs: Option<bool>,
+    pub top_logprobs: Option<u32>,
+    pub user: Option<String>,
+    pub logit_bias: Option<serde_json::Value>,
+    pub max_completion_tokens: Option<u32>,
 }
 
 fn default_temperature() -> f64 {
@@ -56,7 +66,8 @@ pub struct StreamOptions {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChatCompletionMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
     pub name: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -114,6 +125,8 @@ pub(crate) struct NonStreamChoice {
     index: u32,
     message: AssistantMessage,
     finish_reason: String,
+    #[serde(default)]
+    pub logprobs: Option<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,18 +166,18 @@ pub(crate) struct CompletionUsage {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub(crate) struct ErrorResponse {
-    error: ErrorDetail,
+    pub(crate) error: ErrorDetail,
 }
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub(crate) struct ErrorDetail {
-    message: String,
+    pub(crate) message: String,
     #[serde(rename = "type")]
-    error_type: String,
-    code: Option<()>,
-    param: Option<()>,
-    status: u16,
+    pub(crate) error_type: String,
+    pub(crate) code: Option<String>,
+    pub(crate) param: Option<String>,
+    pub(crate) status: u16,
 }
 
 // Helpers
@@ -263,7 +276,7 @@ fn convert_messages(msgs: &[ChatCompletionMessage]) -> Vec<ChatMessage> {
     msgs.iter()
         .map(|m| ChatMessage {
             role: normalize_role(&m.role),
-            content: m.content.clone(),
+            content: m.content.clone().unwrap_or_default(),
         })
         .collect()
 }
@@ -292,18 +305,21 @@ fn split_messages(msgs: &[ChatCompletionMessage]) -> (Vec<ChatMessage>, String) 
         }
         history.push(ChatMessage {
             role: normalize_role(&msg.role),
-            content: msg.content.clone(),
+            content: msg.content.clone().unwrap_or_default(),
         });
     }
 
-    (history, msgs[active_idx].content.clone())
+    (
+        history,
+        msgs[active_idx].content.clone().unwrap_or_default(),
+    )
 }
 
 fn request_system_prompt_prefix(msgs: &[ChatCompletionMessage]) -> Option<String> {
     let parts: Vec<&str> = msgs
         .iter()
         .filter(|m| matches!(m.role.as_str(), "system" | "developer"))
-        .map(|m| m.content.as_str())
+        .filter_map(|m| m.content.as_deref())
         .filter(|s| !s.trim().is_empty())
         .collect();
 
@@ -318,15 +334,21 @@ fn request_has_authoritative_history(request: &ChatCompletionRequest) -> bool {
     request.messages.len() > 1
 }
 
-fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+fn error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
             error: ErrorDetail {
                 message: message.to_string(),
                 error_type: error_type.to_string(),
-                code: None,
-                param: None,
+                code: code.map(String::from),
+                param: param.map(String::from),
                 status: status.as_u16(),
             },
         }),
@@ -348,6 +370,102 @@ fn add_session_key_header(mut response: Response, session_id: &str) -> Response 
         HeaderValue::from_str(session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
     response
+}
+
+/// Structured error from ownership-check functions. The caller wraps these
+/// fields into an axum `Response` with transport headers.
+pub(crate) struct OwnershipError {
+    pub(crate) status: StatusCode,
+    pub(crate) error_type: String,
+    pub(crate) message: String,
+}
+
+/// Attempt to record the session→agent binding so ownership can be enforced
+/// on subsequent requests. Fails closed: if the backend cannot persist the
+/// binding (and it is not merely `Unsupported`), the function returns an
+/// `Err(OwnershipError)` that the caller must propagate as a 500.
+///
+/// The `Unsupported` error kind is treated as graceful degradation because an
+/// owner-tracking-capable backend may not be configured yet.
+pub(crate) fn try_persist_session_ownership(
+    backend: &dyn SessionBackend,
+    session_key: &str,
+    agent_alias: &str,
+) -> Result<(), OwnershipError> {
+    match backend.set_session_agent_alias(session_key, agent_alias) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        Err(e) => {
+            let sanitized =
+                sanitize_api_error(&format!("Failed to persist session ownership: {e}"));
+            Err(OwnershipError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: "server_error".to_string(),
+                message: sanitized,
+            })
+        }
+    }
+}
+
+/// Before loading history for an existing session (one identified by a
+/// `session_id_from_header`), verify the session belongs to the requested
+/// agent. Returns:
+/// - `Ok(())` when the check passes (matching alias, no stored alias, or
+///   backend doesn't support ownership tracking and session is empty).
+/// - `Err(OwnershipError)` when the check fails (mismatched alias, or backend
+///   doesn't support ownership tracking and session has data).
+pub(crate) fn try_check_session_ownership_on_resume(
+    backend: &dyn SessionBackend,
+    session_key: &str,
+    agent_alias: &str,
+    session_id_from_header: Option<&str>,
+) -> Result<(), OwnershipError> {
+    // No session key header means this is a new session -- skip the check.
+    let Some(_header_key) = session_id_from_header else {
+        return Ok(());
+    };
+
+    match backend.get_session_agent_alias(session_key) {
+        Ok(Some(stored_alias)) if stored_alias != agent_alias => Err(OwnershipError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error".to_string(),
+            message: format!("Session belongs to agent '{stored_alias}', not '{agent_alias}'"),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            if !backend.load(session_key).is_empty() {
+                Err(OwnershipError {
+                    status: StatusCode::BAD_REQUEST,
+                    error_type: "invalid_request_error".to_string(),
+                    message: "Cannot resume session: backend does not track agent ownership"
+                        .to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => Err(OwnershipError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: "internal_error".to_string(),
+            message: "Failed to read session metadata".to_string(),
+        }),
+        Ok(None) => {
+            // No ownership record exists. If the session already has
+            // messages, the caller might be attempting to claim a
+            // pre-migration session that belongs to a different agent.
+            // Reject to prevent cross-agent context contamination.
+            if !backend.load(session_key).is_empty() {
+                Err(OwnershipError {
+                    status: StatusCode::BAD_REQUEST,
+                    error_type: "invalid_request_error".to_string(),
+                    message: "Cannot resume session: no agent ownership record exists. Use `zeroclaw migrate-session-ownership` to claim this session.".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        // Ok(Some(matching alias)): pass through.
+        _ => Ok(()),
+    }
 }
 
 fn add_rate_limit_headers(
@@ -409,7 +527,8 @@ fn chunk_json(
     let choice = serde_json::json!({
         "index": 0,
         "delta": delta,
-        "finish_reason": finish_reason
+        "finish_reason": finish_reason,
+        "logprobs": null
     });
 
     serde_json::json!({
@@ -469,7 +588,13 @@ pub async fn handle_chat_completions(
             let msg = format!("Invalid request: {}", e.body_text());
             return add_session_key_header(
                 add_request_id_header(
-                    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &msg),
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &msg,
+                        None,
+                        None,
+                    ),
                     &request_id,
                 ),
                 &session_id,
@@ -488,6 +613,8 @@ pub async fn handle_chat_completions(
                 "Rate limit exceeded. Retry after {} seconds.",
                 RATE_LIMIT_WINDOW_SECS
             ),
+            Some("rate_limit_exceeded"),
+            None,
         );
         let mut resp = add_request_id_header(err, &request_id);
         resp = add_rate_limit_headers(resp, chat_rate_limit, 0, reset_ts);
@@ -514,7 +641,10 @@ pub async fn handle_chat_completions(
             "api_error"
         };
         return add_session_key_header(
-            add_request_id_header(error_response(status, err_type, msg), &request_id),
+            add_request_id_header(
+                error_response(status, err_type, msg, None, None),
+                &request_id,
+            ),
             &session_id,
         );
     }
@@ -533,7 +663,13 @@ pub async fn handle_chat_completions(
         Err(e) => {
             return add_session_key_header(
                 add_request_id_header(
-                    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &e),
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &e,
+                        None,
+                        Some("model"),
+                    ),
                     &request_id,
                 ),
                 &session_id,
@@ -550,6 +686,8 @@ pub async fn handle_chat_completions(
                     &format!(
                         "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured."
                     ),
+                    None,
+                    Some("model"),
                 ),
                 &request_id,
             ),
@@ -568,6 +706,8 @@ pub async fn handle_chat_completions(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "server_error",
                     "Agent not configured — complete onboarding at /onboard",
+                    None,
+                    Some("model"),
                 ),
                 &request_id,
             ),
@@ -603,6 +743,8 @@ pub async fn handle_chat_completions(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "internal_error",
                             &sanitized,
+                            None,
+                            None,
                         ),
                         &request_id,
                     ),
@@ -622,27 +764,6 @@ pub async fn handle_chat_completions(
         &session_id,
     )));
 
-    // Reject HTTP requests when an active WebSocket connection holds this
-    // session. The WebSocket agent owns the structured in-memory transcript
-    // for the connection lifetime; concurrent HTTP access would create a
-    // diverging backend transcript.
-    {
-        let tokens = state.cancel_tokens.lock().unwrap();
-        if tokens.contains_key(&session_key) {
-            return add_session_key_header(
-                add_request_id_header(
-                    error_response(
-                        StatusCode::CONFLICT,
-                        "cross_transport_session_in_use",
-                        "This session is currently owned by an active WebSocket connection. Disconnect the WebSocket or use a different session key.",
-                    ),
-                    &request_id,
-                ),
-                &session_id,
-            );
-        }
-    }
-
     // Acquire the per-session queue BEFORE any backend access so concurrent
     // requests sharing the same session are serialized across the complete
     // lifecycle: alias check → history load → turn execution → persistence.
@@ -654,6 +775,8 @@ pub async fn handle_chat_completions(
                     StatusCode::TOO_MANY_REQUESTS,
                     "rate_limit_error",
                     &format!("Session busy: {e}"),
+                    Some("rate_limit_exceeded"),
+                    None,
                 ),
                 &request_id,
             );
@@ -666,56 +789,43 @@ pub async fn handle_chat_completions(
         }
     };
 
+    // Cross-transport guard: reject HTTP requests when an active WebSocket
+    // connection holds this session. Checked AFTER session_queue acquisition
+    // after session queue acquisition and against ws_connections which is
+    // connection-scoped.
+    {
+        let ws = state.ws_connections.lock();
+        if ws.contains(&session_key) {
+            return add_session_key_header(
+                add_request_id_header(
+                    error_response(
+                        StatusCode::CONFLICT,
+                        "cross_transport_session_in_use",
+                        "This session is currently owned by an active WebSocket connection. Disconnect the WebSocket or use a different session key.",
+                        None,
+                        None,
+                    ),
+                    &request_id,
+                ),
+                &session_id,
+            );
+        }
+    }
+
     if let Some(ref backend) = state.session_backend {
-        // Session agent_alias consistency check — must run BEFORE loading
-        // history to prevent cross-agent context contamination.
-        if session_id_from_header.is_some() {
-            match backend.get_session_agent_alias(&session_key) {
-                Ok(Some(stored_alias)) if stored_alias != agent_alias => {
-                    return add_session_key_header(
-                        add_request_id_header(
-                            error_response(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_request_error",
-                                &format!(
-                                    "Session belongs to agent '{stored_alias}', not '{agent_alias}'"
-                                ),
-                            ),
-                            &request_id,
-                        ),
-                        &session_id,
-                    );
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                    if !backend.load(&session_key).is_empty() {
-                        return add_session_key_header(
-                            add_request_id_header(
-                                error_response(
-                                    StatusCode::BAD_REQUEST,
-                                    "invalid_request_error",
-                                    "Cannot resume session: backend does not track agent ownership",
-                                ),
-                                &request_id,
-                            ),
-                            &session_id,
-                        );
-                    }
-                }
-                Err(_) => {
-                    return add_session_key_header(
-                        add_request_id_header(
-                            error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "internal_error",
-                                "Failed to read session metadata",
-                            ),
-                            &request_id,
-                        ),
-                        &session_id,
-                    );
-                }
-                _ => {}
-            }
+        if let Err(err) = try_check_session_ownership_on_resume(
+            backend.as_ref(),
+            &session_key,
+            &agent_alias,
+            session_id_from_header.as_deref(),
+        ) {
+            return add_session_key_header(
+                add_request_id_header(
+                    error_response(err.status, &err.error_type, &err.message, None, None),
+                    &request_id,
+                ),
+                &session_id,
+            );
         }
 
         // Load history only after confirming the session belongs to this agent.
@@ -762,24 +872,16 @@ pub async fn handle_chat_completions(
     }
 
     if let Some(ref backend) = state.session_backend {
-        match backend.set_session_agent_alias(&session_key, &agent_alias) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                // Backend doesn't support ownership — already warned above if session had data.
-            }
-            Err(e) => {
-                return add_request_id_header(
-                    add_session_key_header(
-                        error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            &format!("Failed to persist session ownership: {e}"),
-                        ),
-                        &session_id,
-                    ),
-                    &request_id,
-                );
-            }
+        if let Err(err) =
+            try_persist_session_ownership(backend.as_ref(), &session_key, &agent_alias)
+        {
+            return add_request_id_header(
+                add_session_key_header(
+                    error_response(err.status, &err.error_type, &err.message, None, None),
+                    &session_id,
+                ),
+                &request_id,
+            );
         }
     }
 
@@ -807,43 +909,74 @@ pub async fn handle_chat_completions(
         }
     };
 
-    if request.stream {
-        let include_usage = request
-            .stream_options
-            .as_ref()
-            .map(|o| o.include_usage)
-            .unwrap_or(false);
-        stream_mode(
-            agent,
-            user_message,
-            response_model,
-            include_usage,
-            request_id,
-            chat_rate_limit,
-            rate_limit_remaining,
-            reset_ts,
-            session_key,
-            session_id,
-            state,
-            ws_memory,
-            session_guard,
-        )
-        .await
-    } else {
-        blocking_mode(
-            agent,
-            user_message,
-            response_model,
-            request_id,
-            chat_rate_limit,
-            rate_limit_remaining,
-            reset_ts,
-            session_key,
-            session_id,
-            state,
-            ws_memory,
-        )
-        .await
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .map(|o| o.include_usage)
+        .unwrap_or(false);
+    let timeout_secs = state
+        .config
+        .read()
+        .gateway
+        .long_running_request_timeout_secs;
+    let turn_request_id = request_id.clone();
+    let turn_session_id = session_id.clone();
+    let turn_result = tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
+        if request.stream {
+            stream_mode(
+                agent,
+                user_message,
+                response_model,
+                include_usage,
+                turn_request_id,
+                chat_rate_limit,
+                rate_limit_remaining,
+                reset_ts,
+                session_key,
+                turn_session_id,
+                state,
+                ws_memory,
+                session_guard,
+            )
+            .await
+        } else {
+            drop(session_guard);
+            blocking_mode(
+                agent,
+                user_message,
+                response_model,
+                turn_request_id,
+                chat_rate_limit,
+                rate_limit_remaining,
+                reset_ts,
+                session_key,
+                turn_session_id,
+                state,
+                ws_memory,
+            )
+            .await
+        }
+    })
+    .await;
+
+    match turn_result {
+        Ok(response) => response,
+        Err(_elapsed) => {
+            let msg = format!("Request exceeded the {}s timeout", timeout_secs);
+            add_session_key_header(
+                add_request_id_header(
+                    error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "timeout_error",
+                        &msg,
+                        None,
+                        None,
+                    ),
+                    &request_id,
+                ),
+                &session_id,
+            )
+        }
     }
 }
 
@@ -1001,23 +1134,81 @@ async fn stream_mode(
     // chunks to the response body concurrently with the turn.
     let session_key_for_runner = session_key.clone();
     let user_message_for_runner = user_message.clone();
+
+    // Read timeout config before spawning -- the value is Copy (u64).
+    let timeout_secs = {
+        let cfg = state.config.read();
+        cfg.gateway.long_running_request_timeout_secs
+    };
+
     let _runner_task = zeroclaw_spawn::spawn!(async move {
         // Hold the session queue guard for the full turn duration.
         // The guard serialises concurrent same-session requests across
         // the complete lifecycle: turn execution → persistence → state.
         let _session_guard = session_guard;
         let mut agent = agent;
-        let outcome = crate::turn_runner::run_gateway_turn(
-            &state,
-            &mut agent,
-            &user_message_for_runner,
-            &session_key_for_runner,
-            &ws_memory,
-            None,
-            "http",
-            forward,
+        let outcome = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            crate::turn_runner::run_gateway_turn(
+                &state,
+                &mut agent,
+                &user_message_for_runner,
+                &session_key_for_runner,
+                &ws_memory,
+                None,
+                "http",
+                forward,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                // ── Timeout: run_gateway_turn was cancelled mid-flight ──
+                //
+                // run_gateway_turn registered a CancellationToken in
+                // state.cancel_tokens and set the session state to
+                // "running" BEFORE the tokio::join! -- those side-effects
+                // survive the cancellation and must be cleaned up here.
+                //
+                // 1. Cancel the token so any waiters (e.g., DELETE session)
+                //    are unblocked, then remove the entry.
+                {
+                    let mut tokens = state.cancel_tokens.lock();
+                    if let Some(token) = tokens.remove(&session_key_for_runner) {
+                        token.cancel();
+                    }
+                }
+
+                // 2. Best-effort session state reset to "idle".
+                if let Some(ref backend) = state.session_backend {
+                    let _ = backend.set_session_state(&session_key_for_runner, "idle", None);
+                }
+
+                // 3. Broadcast agent_end so dashboards don't show a
+                //    perpetual "running" indicator.
+                let _ = state.event_tx.send(serde_json::json!({
+                    "type": "agent_end",
+                }));
+
+                // 4. Synthetic error outcome -- the terminal SSE handler
+                //    below will emit an error event to the client.
+                crate::turn_runner::TurnOutcome {
+                    status: crate::turn_runner::TurnStatus::Error,
+                    error: Some(format!("Gateway turn timed out after {}s", timeout_secs)),
+                    response_text: String::new(),
+                    new_messages: vec![],
+                    total_input_tokens: None,
+                    total_output_tokens: None,
+                    last_input_tokens: None,
+                    usage: None,
+                    max_context_tokens: 0,
+                    turn_id: String::new(),
+                    turn_provider: String::new(),
+                    turn_model: String::new(),
+                }
+            }
+        };
 
         // ── Terminal SSE chunks (transport-specific) ───────────────
         // The runner has already persisted `new_messages`, transitioned
@@ -1059,8 +1250,9 @@ async fn stream_mode(
                     }
                 });
                 let error_event = Event::default()
+                    .event("error")
                     .json_data(&error_body)
-                    .unwrap_or_else(|_| Event::default().data("[Error]"));
+                    .unwrap_or_else(|_| Event::default().event("error").data("[Error]"));
                 let _ = sse_tx.send(Ok::<_, Infallible>(error_event)).await;
             }
         }
@@ -1110,7 +1302,7 @@ async fn stream_mode(
 
 #[allow(clippy::too_many_arguments)]
 async fn blocking_mode(
-    mut agent: zeroclaw_runtime::agent::Agent,
+    agent: zeroclaw_runtime::agent::Agent,
     user_message: String,
     model: String,
     request_id: String,
@@ -1184,17 +1376,62 @@ async fn blocking_mode(
         }
     };
 
-    let outcome = crate::turn_runner::run_gateway_turn(
-        &state,
-        &mut agent,
-        &user_message,
-        &session_key,
-        &ws_memory,
-        None,
-        "http",
-        forward,
-    )
-    .await;
+    // ── Spawned runner task (same pattern as stream_mode) ──
+    // By spawning the turn lifecycle in a separate task, cleanup
+    // (cancel_tokens removal, session state transition, persistence,
+    // agent_end broadcast, tracing) is guaranteed to execute even when
+    // the enclosing HTTP request future is dropped by the TimeoutLayer.
+    let (outcome_tx, outcome_rx) =
+        tokio::sync::oneshot::channel::<crate::turn_runner::TurnOutcome>();
+
+    let session_key_for_spawn = session_key.clone();
+    let user_message_for_spawn = user_message.clone();
+    let ws_memory_for_spawn = ws_memory.clone();
+    let state_for_spawn = state.clone();
+
+    let _runner_task = zeroclaw_spawn::spawn!(async move {
+        let mut agent = agent;
+        let outcome = crate::turn_runner::run_gateway_turn(
+            &state_for_spawn,
+            &mut agent,
+            &user_message_for_spawn,
+            &session_key_for_spawn,
+            &ws_memory_for_spawn,
+            None,
+            "http",
+            forward,
+        )
+        .await;
+        // If the receiver was dropped (TimeoutLayer killed the request
+        // future), the send fails silently -- the spawned task has still
+        // completed all cleanup. The outcome is simply discarded.
+        let _ = outcome_tx.send(outcome);
+    });
+
+    // ── Await the oneshot (inside TimeoutLayer scope) ──
+    let outcome = match outcome_rx.await {
+        Ok(outcome) => outcome,
+        Err(_recv_error) => {
+            // RecvError means the sender was dropped without sending.
+            // This can only happen if the spawned task panicked (tokio
+            // aborts the task on panic). Return a 500 to the caller.
+            // Note: the standard timeout path does NOT reach here -- the
+            // TimeoutLayer drops the entire future, so this match arm is
+            // also dropped. It only serves as a panic-safety net.
+            let mut resp = add_request_id_header(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Agent task terminated unexpectedly",
+                    None,
+                    None,
+                ),
+                &request_id,
+            );
+            resp = add_rate_limit_headers(resp, rate_limit, rate_limit_remaining, rate_limit_reset);
+            return add_session_key_header(resp, &session_id);
+        }
+    };
 
     match outcome.status {
         crate::turn_runner::TurnStatus::Success => {
@@ -1218,6 +1455,7 @@ async fn blocking_mode(
                         tool_calls: None,
                     },
                     finish_reason: "stop".to_string(),
+                    logprobs: None,
                 }],
                 usage: CompletionUsage {
                     prompt_tokens: input_tokens,
@@ -1244,6 +1482,8 @@ async fn blocking_mode(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     &sanitized,
+                    None,
+                    None,
                 ),
                 &request_id,
             );
@@ -1266,6 +1506,8 @@ async fn blocking_mode(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     &sanitized,
+                    None,
+                    None,
                 ),
                 &request_id,
             );
@@ -1284,6 +1526,8 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "messages must not be empty",
+            None,
+            Some("messages"),
         ));
     }
 
@@ -1294,6 +1538,8 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "Only 'function' tool type is supported",
+                    None,
+                    Some("tools"),
                 ));
             }
             if tool.function.name.trim().is_empty() {
@@ -1301,6 +1547,8 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     "tool.function.name is required",
+                    None,
+                    Some("tools"),
                 ));
             }
         }
@@ -1313,6 +1561,8 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     &format!("Unsupported tool_choice: {s}"),
+                    None,
+                    Some("tool_choice"),
                 ));
             }
         } else if tc.is_object() {
@@ -1322,6 +1572,8 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                 StatusCode::BAD_REQUEST,
                 "unsupported_parameter",
                 "tool_choice with a specific function is not yet supported; use \"auto\" instead",
+                None,
+                Some("tool_choice"),
             ));
         } else {
             // Malformed: number, array, bool, null
@@ -1329,6 +1581,8 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "tool_choice must be a string (\"auto\", \"none\", \"required\") or a function object",
+                None,
+                Some("tool_choice"),
             ));
         }
     }
@@ -1363,6 +1617,8 @@ fn resolve_tool_specs(
                             StatusCode::BAD_REQUEST,
                             "invalid_request_error",
                             "tools list must not be empty",
+                            None,
+                            Some("tools"),
                         ));
                     }
                     // Reject if any named tool is unavailable (fail-closed contract)
@@ -1383,6 +1639,8 @@ fn resolve_tool_specs(
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             ),
+                            None,
+                            Some("tools"),
                         ));
                     }
                     Ok(Some(convert_request_tools(requested_tools)))
@@ -1397,6 +1655,8 @@ fn resolve_tool_specs(
                 StatusCode::BAD_REQUEST,
                 "unsupported_parameter",
                 "tool_choice: \"required\" is not yet supported; use \"auto\" instead",
+                None,
+                Some("tool_choice"),
             ))
         }
         ToolChoiceMode::SpecificFunction { ref name } => {
@@ -1409,6 +1669,8 @@ fn resolve_tool_specs(
                 StatusCode::BAD_REQUEST,
                 "unsupported_parameter",
                 "tool_choice with a specific function is not yet supported; use \"auto\" instead",
+                None,
+                Some("tool_choice"),
             ))
         }
     }
@@ -1426,6 +1688,8 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             "max_tokens is not supported per-request; configure it in provider settings",
+            None,
+            Some("max_tokens"),
         ));
     }
     if req.top_p.is_some() {
@@ -1433,6 +1697,8 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             "top_p is not supported per-request",
+            None,
+            Some("top_p"),
         ));
     }
     if req.stop.is_some() {
@@ -1440,6 +1706,8 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             "stop is not supported per-request",
+            None,
+            Some("stop"),
         ));
     }
     if req.presence_penalty.is_some() {
@@ -1447,6 +1715,8 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             "presence_penalty is not supported per-request",
+            None,
+            Some("presence_penalty"),
         ));
     }
     if req.frequency_penalty.is_some() {
@@ -1454,6 +1724,80 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             "frequency_penalty is not supported per-request",
+            None,
+            Some("frequency_penalty"),
+        ));
+    }
+    if req.n.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "n is not supported; ZeroClaw returns a single completion per request",
+            None,
+            Some("n"),
+        ));
+    }
+    if req.response_format.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "response_format is not supported; configure output format in provider settings",
+            None,
+            Some("response_format"),
+        ));
+    }
+    if req.seed.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "seed is not supported; configure in provider settings",
+            None,
+            Some("seed"),
+        ));
+    }
+    if req.logprobs.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "logprobs is not supported",
+            None,
+            Some("logprobs"),
+        ));
+    }
+    if req.top_logprobs.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "top_logprobs is not supported",
+            None,
+            Some("top_logprobs"),
+        ));
+    }
+    if req.user.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "user is not supported",
+            None,
+            Some("user"),
+        ));
+    }
+    if req.logit_bias.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "logit_bias is not supported",
+            None,
+            Some("logit_bias"),
+        ));
+    }
+    if req.max_completion_tokens.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "max_completion_tokens is not supported; use provider settings",
+            None,
+            Some("max_completion_tokens"),
         ));
     }
     Ok(())
@@ -1518,7 +1862,7 @@ mod tests {
     fn chat_message(role: &str, content: &str) -> ChatCompletionMessage {
         ChatCompletionMessage {
             role: role.to_string(),
-            content: content.to_string(),
+            content: Some(content.to_string()),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -1689,6 +2033,14 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream_options: None,
+            n: None,
+            response_format: None,
+            seed: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            logit_bias: None,
+            max_completion_tokens: None,
         };
         assert!(!request_has_authoritative_history(&single));
 
@@ -1781,6 +2133,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_request(&req);
         assert!(result.is_err());
@@ -1792,7 +2145,7 @@ mod tests {
             model: "test".into(),
             messages: vec![ChatCompletionMessage {
                 role: "user".into(),
-                content: "hi".into(),
+                content: Some("hi".into()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -1814,6 +2167,7 @@ mod tests {
             }]),
             tool_choice: None,
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_request(&req);
         assert!(result.is_err());
@@ -1825,7 +2179,7 @@ mod tests {
             model: "test".into(),
             messages: vec![ChatCompletionMessage {
                 role: "user".into(),
-                content: "hi".into(),
+                content: Some("hi".into()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -1840,6 +2194,7 @@ mod tests {
             tools: None,
             tool_choice: Some(serde_json::json!("invalid")),
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_request(&req);
         assert!(result.is_err());
@@ -1851,7 +2206,7 @@ mod tests {
             model: "test".into(),
             messages: vec![ChatCompletionMessage {
                 role: "user".into(),
-                content: "hi".into(),
+                content: Some("hi".into()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -1873,6 +2228,7 @@ mod tests {
             }]),
             tool_choice: Some(serde_json::json!("auto")),
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_request(&req);
         assert!(result.is_ok());
@@ -1893,6 +2249,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_unsupported_params(&req);
         assert!(result.is_err());
@@ -1913,6 +2270,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_unsupported_params(&req);
         assert!(result.is_err());
@@ -1933,6 +2291,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_unsupported_params(&req);
         assert!(result.is_err());
@@ -1953,6 +2312,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream_options: None,
+            ..Default::default()
         };
         let result = validate_unsupported_params(&req);
         assert!(result.is_ok());
@@ -2364,18 +2724,440 @@ mod tests {
         );
     }
 
-    // Ownership write failure returns 500 before model execution.
-    // If the backend cannot persist the session→agent binding, the handler
-    // must abort fail-closed — the agent must not execute without a recorded
-    // owner.
+    // ── Ownership test infrastructure ───────────────────────────────────
+    //
+    // Extracted ownership-check functions tested with injectable
+    // `SessionBackend` implementations. The extracted functions are
+    // synchronous and require zero AppState/Config/Provider/Agent
+    // construction.
+
+    /// Builder for ad-hoc `SessionBackend` implementations used in ownership
+    /// tests. Only the methods that are configured matter; unconfigured
+    /// methods return vacuously-successful defaults.
+    struct MockBackendBuilder {
+        set_alias_result: std::io::Result<()>,
+        get_alias_result: std::io::Result<Option<String>>,
+        load_data: Vec<ChatMessage>,
+    }
+
+    impl MockBackendBuilder {
+        fn new() -> Self {
+            Self {
+                set_alias_result: Ok(()),
+                get_alias_result: Ok(None),
+                load_data: vec![],
+            }
+        }
+
+        fn set_alias_result(mut self, result: std::io::Result<()>) -> Self {
+            self.set_alias_result = result;
+            self
+        }
+
+        fn get_alias_result(mut self, result: std::io::Result<Option<String>>) -> Self {
+            self.get_alias_result = result;
+            self
+        }
+
+        fn load_data(mut self, data: Vec<ChatMessage>) -> Self {
+            self.load_data = data;
+            self
+        }
+
+        fn build(self) -> MockSessionBackend {
+            MockSessionBackend {
+                set_alias_result: self.set_alias_result,
+                get_alias_result: self.get_alias_result,
+                load_data: self.load_data,
+            }
+        }
+    }
+
+    struct MockSessionBackend {
+        set_alias_result: std::io::Result<()>,
+        get_alias_result: std::io::Result<Option<String>>,
+        load_data: Vec<ChatMessage>,
+    }
+
+    impl SessionBackend for MockSessionBackend {
+        fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+            self.load_data.clone()
+        }
+
+        fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn session_exists(&self, _session_key: &str) -> bool {
+            false
+        }
+
+        fn set_session_agent_alias(
+            &self,
+            _session_key: &str,
+            _agent_alias: &str,
+        ) -> std::io::Result<()> {
+            match &self.set_alias_result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            }
+        }
+
+        fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+            match &self.get_alias_result {
+                Ok(val) => Ok(val.clone()),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            }
+        }
+    }
+
+    /// Helper: create a simple user `ChatMessage` for load_data.
+    fn user_msg(content: &str) -> ChatMessage {
+        ChatMessage::user(content)
+    }
+
+    // ── WRITE tests (try_persist_session_ownership) ──────────────────────
 
     #[test]
-    fn set_session_agent_alias_write_error_response_is_500() {
-        let resp = error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "Failed to persist session ownership: disk full",
+    fn persist_session_ownership_succeeds() {
+        let backend = MockBackendBuilder::new().build();
+        let result = try_persist_session_ownership(&backend, "gw_test", "default");
+        assert!(result.is_ok(), "successful write should return Ok");
+    }
+
+    #[test]
+    fn persist_session_ownership_write_error_returns_500() {
+        let backend = MockBackendBuilder::new()
+            .set_alias_result(Err(std::io::Error::other("disk full")))
+            .build();
+        let result = try_persist_session_ownership(&backend, "gw_test", "default");
+        assert!(result.is_err(), "failing write should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.error_type, "server_error");
+    }
+
+    #[test]
+    fn persist_session_ownership_unsupported_is_ok() {
+        let backend = MockBackendBuilder::new()
+            .set_alias_result(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not supported",
+            )))
+            .build();
+        let result = try_persist_session_ownership(&backend, "gw_test", "default");
+        assert!(
+            result.is_ok(),
+            "Unsupported should be treated as Ok (graceful degradation)"
         );
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn persist_session_ownership_error_message_is_sanitized() {
+        // sanitize_api_error scrubs secret patterns (API keys, tokens) and
+        // truncates overly long messages to MAX_API_ERROR_CHARS (500). This
+        // test verifies the error message is present, correctly typed, and
+        // truncated when it exceeds the limit.
+        let long_err = "E".repeat(600);
+        let backend = MockBackendBuilder::new()
+            .set_alias_result(Err(std::io::Error::other(long_err.clone())))
+            .build();
+        let result = try_persist_session_ownership(&backend, "gw_test", "default");
+        assert!(result.is_err(), "write error should be an Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.error_type, "server_error");
+        // The message must contain the "Failed to persist session ownership"
+        // prefix and be truncated (≤ 500 chars + "...").
+        assert!(
+            err.message
+                .starts_with("Failed to persist session ownership:"),
+            "message must include the descriptive prefix; got: {}",
+            err.message
+        );
+        assert!(
+            err.message.len() <= 503,
+            "message should be truncated by sanitize_api_error (max 500 chars + '...'); \
+             len={}",
+            err.message.len()
+        );
+    }
+
+    #[test]
+    fn persist_session_ownership_permission_denied_is_500() {
+        let backend = MockBackendBuilder::new()
+            .set_alias_result(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )))
+            .build();
+        let result = try_persist_session_ownership(&backend, "gw_test", "default");
+        assert!(result.is_err(), "PermissionDenied should fail-closed");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── READ tests (try_check_session_ownership_on_resume) ──────────────
+
+    #[test]
+    fn ownership_resume_no_session_header_is_ok() {
+        let backend = MockBackendBuilder::new().build();
+        let result = try_check_session_ownership_on_resume(
+            &backend, "gw_test", "default", None, // no session header => new session
+        );
+        assert!(result.is_ok(), "no session header should skip the check");
+    }
+
+    #[test]
+    fn ownership_resume_matching_alias_is_ok() {
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Ok(Some("default".to_string())))
+            .build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(result.is_ok(), "matching alias should pass");
+    }
+
+    #[test]
+    fn ownership_resume_no_stored_alias_is_ok() {
+        let backend = MockBackendBuilder::new().get_alias_result(Ok(None)).build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(
+            result.is_ok(),
+            "no stored alias (empty session) should pass"
+        );
+    }
+
+    #[test]
+    fn ownership_resume_no_stored_alias_non_empty_session_returns_400() {
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Ok(None))
+            .load_data(vec![ChatMessage::user("hi")])
+            .build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(
+            result.is_err(),
+            "Ok(None) with non-empty session should be rejected (pre-migration session)"
+        );
+    }
+
+    #[test]
+    fn ownership_resume_mismatched_alias_returns_400() {
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Ok(Some("coding".to_string())))
+            .build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(result.is_err(), "mismatched alias should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert!(
+            err.message.contains("coding"),
+            "error must mention the stored alias; got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("default"),
+            "error must mention the requested alias; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn ownership_resume_unsupported_empty_session_is_ok() {
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not supported",
+            )))
+            .load_data(vec![])
+            .build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(
+            result.is_ok(),
+            "Unsupported + empty session should pass (graceful degradation)"
+        );
+    }
+
+    #[test]
+    fn ownership_resume_unsupported_non_empty_session_returns_400() {
+        // When backend doesn't support ownership tracking AND the
+        // session already has data, return 400 to prevent cross-agent
+        // context contamination.
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not supported",
+            )))
+            .load_data(vec![user_msg("existing message")])
+            .build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(
+            result.is_err(),
+            "Unsupported + non-empty session should return Err"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert!(
+            err.message.contains("does not track agent ownership"),
+            "error must mention ownership tracking; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn ownership_resume_io_error_returns_500() {
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Err(std::io::Error::other("I/O failure")))
+            .build();
+        let result = try_check_session_ownership_on_resume(
+            &backend,
+            "gw_test",
+            "default",
+            Some("existing-session-id"),
+        );
+        assert!(result.is_err(), "I/O error should return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.error_type, "internal_error");
+    }
+
+    // ── ErrorDetail serialization tests (code/param as Option<String>) ────────
+
+    #[test]
+    fn error_detail_serializes_code_and_param_when_set() {
+        let detail = ErrorDetail {
+            message: "Rate limit exceeded".into(),
+            error_type: "rate_limit_error".into(),
+            code: Some("rate_limit_exceeded".into()),
+            param: None,
+            status: 429,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["code"], "rate_limit_exceeded");
+        assert_eq!(json["param"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn error_detail_serializes_code_null_and_param_set() {
+        let detail = ErrorDetail {
+            message: "max_tokens is not supported".into(),
+            error_type: "unsupported_parameter".into(),
+            code: None,
+            param: Some("max_tokens".into()),
+            status: 400,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["code"], serde_json::Value::Null);
+        assert_eq!(json["param"], "max_tokens");
+    }
+
+    #[test]
+    fn error_detail_serializes_both_null() {
+        let detail = ErrorDetail {
+            message: "Internal error".into(),
+            error_type: "internal_error".into(),
+            code: None,
+            param: None,
+            status: 500,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["code"], serde_json::Value::Null);
+        assert_eq!(json["param"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn error_detail_serializes_both_set() {
+        let detail = ErrorDetail {
+            message: "Invalid model".into(),
+            error_type: "invalid_request_error".into(),
+            code: Some("invalid_request_error".into()),
+            param: Some("model".into()),
+            status: 400,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["code"], "invalid_request_error");
+        assert_eq!(json["param"], "model");
+    }
+
+    #[test]
+    fn error_response_includes_code_and_param() {
+        let resp = error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "top_p is not supported per-request",
+            None,
+            Some("top_p"),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let body_bytes = rt
+            .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let error = &body["error"];
+        assert_eq!(error["message"], "top_p is not supported per-request");
+        assert_eq!(error["type"], "unsupported_parameter");
+        assert_eq!(error["code"], serde_json::Value::Null);
+        assert_eq!(error["param"], "top_p");
+        assert_eq!(error["status"], 400);
+    }
+
+    #[test]
+    fn error_response_includes_code_for_rate_limit() {
+        let resp = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "Rate limit exceeded",
+            Some("rate_limit_exceeded"),
+            None,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let body_bytes = rt
+            .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let error = &body["error"];
+        assert_eq!(error["code"], "rate_limit_exceeded");
+        assert_eq!(error["param"], serde_json::Value::Null);
     }
 }

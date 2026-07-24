@@ -179,8 +179,40 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Record the agent alias that owns a session. Called on WebSocket
-    /// handshake when the alias is known. Backends that don't support
-    /// per-agent attribution return `Unsupported` (fail-closed).
+    /// handshake and HTTP chat-completions session-load when the alias is known.
+    ///
+    /// # Compatibility note for custom backends
+    ///
+    /// The default implementation returns `Unsupported`, which causes the
+    /// gateway handlers to:
+    ///
+    /// - **Empty sessions (new):** Silently accept the turn. No ownership
+    ///   enforcement applies -- any agent alias can use this session key, and
+    ///   cross-agent isolation is absent.
+    /// - **Non-empty sessions (existing data):** The handler returns HTTP 400
+    ///   (`"Cannot resume session: backend does not track agent ownership"`).
+    ///   Sessions with prior data become **unusable** until the backend
+    ///   implements this method.
+    ///
+    /// # Data model contract
+    ///
+    /// `agent_alias` is a string that identifies the owning agent. It
+    /// corresponds to the key in `config.agents` (the `[agents.<alias>]`
+    /// TOML section name). The alias is written once on first access and
+    /// not changed thereafter (except via `clear_agent_attribution` /
+    /// `rename_agent_attribution`).
+    ///
+    /// # Migration path for existing backends
+    ///
+    /// If a custom backend has session data from before these methods were
+    /// introduced, it must either (a) implement both alias methods to return
+    /// `Ok(None)` for existing sessions (which, combined with the non-empty
+    /// guard, allows the first caller to claim ownership), or (b) backfill
+    /// agent_alias metadata for all existing sessions.
+    ///
+    /// For single-agent deployments or backends that do not need ownership
+    /// enforcement, implement this as a no-op returning `Ok(())` to avoid
+    /// the 400 rejection -- the `Unsupported` default is fail-closed.
     fn set_session_agent_alias(
         &self,
         _session_key: &str,
@@ -193,8 +225,38 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Get the agent alias associated with a session, if recorded.
-    /// Backends that don't support per-agent attribution return
-    /// `Unsupported` (fail-closed).
+    ///
+    /// # Compatibility note for custom backends
+    ///
+    /// The default implementation returns `Unsupported`, which causes the
+    /// gateway handlers to:
+    ///
+    /// - **Empty sessions (new):** Silently accept the turn. No ownership
+    ///   enforcement applies.
+    /// - **Non-empty sessions (existing data):** The handler returns HTTP 400
+    ///   (`"Cannot resume session: backend does not track agent ownership"`).
+    ///   Sessions with prior data become **unusable** until the backend
+    ///   implements this method.
+    ///
+    /// # Data model contract
+    ///
+    /// Returns `Ok(Some(alias))` if the session has a recorded owner,
+    /// `Ok(None)` if the session exists but has no recorded owner, or
+    /// `Err(Unsupported)` if the backend lacks ownership tracking.
+    /// Returning `Ok(None)` tells the handler the session has no recorded
+    /// owner, which is accepted for **empty** sessions but rejected for
+    /// **non-empty** sessions (to prevent cross-agent history leakage).
+    ///
+    /// # Migration path for existing backends
+    ///
+    /// If a custom backend has session data from before these methods were
+    /// introduced, it must either (a) implement this method to return
+    /// `Ok(None)` for existing sessions (the first caller then claims
+    /// ownership), or (b) backfill agent_alias metadata.
+    ///
+    /// For single-agent deployments, implement this as a no-op returning
+    /// `Ok(None)` to avoid the 400 rejection -- the `Unsupported` default
+    /// is fail-closed.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

@@ -15,6 +15,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,9 +26,36 @@ use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
 };
 
-/// Default wall-clock budget for the operator to answer an
-/// `approval_request` frame before the channel auto-denies. Mirrors the
-/// channel-side default on `TelegramConfig::approval_timeout_secs`.
+/// RAII guard that registers a WebSocket connection in
+/// `AppState::ws_connections` on construction and unregisters on Drop.
+///
+/// Designed for use in `handle_socket`: create after `session_key` is
+/// computed (past all early-return validation) and before the message
+/// loop. Drop handles cleanup on all exit paths (normal disconnect,
+/// error, panic).
+struct WsConnectionGuard {
+    session_key: String,
+    ws_connections: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl WsConnectionGuard {
+    fn new(
+        session_key: String,
+        ws_connections: Arc<Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        ws_connections.lock().insert(session_key.clone());
+        Self {
+            session_key,
+            ws_connections,
+        }
+    }
+}
+
+impl Drop for WsConnectionGuard {
+    fn drop(&mut self) {
+        self.ws_connections.lock().remove(&self.session_key);
+    }
+}
 const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Deserialize)]
@@ -405,7 +433,29 @@ async fn handle_socket(
                     let _ = sender.close().await;
                     return;
                 }
-                _ => {}
+                Ok(Some(_)) => {
+                    // Session already belongs to this agent — proceed.
+                }
+                Ok(None) => {
+                    // No ownership record exists. If the session already has
+                    // messages, the caller might be attempting to claim a
+                    // pre-migration session that belongs to a different agent.
+                    // Reject to prevent cross-agent context contamination.
+                    if !backend.load(&session_key).is_empty() {
+                        let err_frame = serde_json::json!({
+                            "type": "error",
+                            "code": "SESSION_UNOWNED_WITH_DATA",
+                            "message": "Cannot resume session: no agent ownership record exists. Use `zeroclaw migrate-session-ownership` to claim this session."
+                        });
+                        let _ = sender
+                            .send(Message::Text(err_frame.to_string().into()))
+                            .await;
+                        let _ = sender.close().await;
+                        return;
+                    }
+                    // Empty session — safe. Ownership will be recorded when the
+                    // first message is appended (via set_session_agent_alias below).
+                }
             }
             let messages = backend.load(&session_key);
             if !messages.is_empty() {
@@ -688,6 +738,12 @@ async fn handle_socket(
             let _ = sender.send(Message::Text(err.to_string().into())).await;
         }
     }
+
+    // Register this WebSocket connection in the cross-transport guard so
+    // /v1/chat/completions rejects concurrent HTTP requests for as long as
+    // this socket is open. The RAII guard removes the entry on every exit
+    // path (normal close, client disconnect, error, panic).
+    let _ws_guard = WsConnectionGuard::new(session_key.clone(), Arc::clone(&state.ws_connections));
 
     // Subscribe to the shared broadcast channel so cron/heartbeat events
     // are forwarded to this WebSocket client.

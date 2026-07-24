@@ -1900,11 +1900,7 @@ pub async fn handle_api_session_delete(
         }
     };
 
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
+    let token = state.cancel_tokens.lock().remove(&session_key);
     if let Some(token) = token {
         token.cancel();
         ::zeroclaw_log::record!(
@@ -2142,12 +2138,7 @@ pub async fn handle_api_session_abort(
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
-        .cloned();
+    let token = state.cancel_tokens.lock().get(&session_key).cloned();
 
     if let Some(token) = token {
         token.cancel();
@@ -2192,7 +2183,7 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
+    use parking_lot::{Mutex, RwLock};
     #[cfg(feature = "channel-linq")]
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2401,12 +2392,14 @@ pub(crate) mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,

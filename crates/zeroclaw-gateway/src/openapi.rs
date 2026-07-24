@@ -445,6 +445,18 @@ pub fn build_spec() -> serde_json::Value {
                         "description": "Invalid request, unsupported parameter, unknown agent, or unavailable tool.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
                     },
+                    "408": {
+                        "description": "Request exceeded the configured timeout (default 600s).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "409": {
+                        "description": "Session currently owned by an active WebSocket connection.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "413": {
+                        "description": "Request body exceeds the maximum allowed size (64 KB).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
                     "401": {
                         "description": "Authentication required (when `require_pairing` is enabled).",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }

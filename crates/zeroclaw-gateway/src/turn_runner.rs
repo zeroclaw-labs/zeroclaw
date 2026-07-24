@@ -5,9 +5,11 @@
 //! concurrently with the turn future (the channel is capped at 64; awaiting
 //! the turn before draining would backpressure and deadlock).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Once};
 
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
@@ -52,6 +54,21 @@ pub struct TurnRunnerHandle {
     /// Cancelled on client disconnect / SSE failure / abort; the runtime
     /// propagates `ToolLoopCancelled`.
     pub cancel_token: CancellationToken,
+}
+
+/// RAII guard that removes the cancel token from `cancel_tokens` when dropped.
+///
+/// Created immediately after the token is registered in
+/// [`run_gateway_turn`]. Guarantees cleanup even if the forward closure panics.
+struct CancelTokenGuard {
+    tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    session_key: String,
+}
+
+impl Drop for CancelTokenGuard {
+    fn drop(&mut self) {
+        self.tokens.lock().remove(&self.session_key);
+    }
 }
 
 /// Run a gateway turn: the transport-neutral spine (pre-turn setup + post-turn
@@ -100,26 +117,71 @@ where
     });
 
     // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "agent_start",
-        "model_provider": provider_label,
-        "model": turn_model,
-    }));
+    if state.event_tx.receiver_count() > 0 {
+        if let Err(e) = state.event_tx.send(serde_json::json!({
+            "type": "agent_start",
+            "model_provider": provider_label,
+            "model": turn_model,
+        })) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "event_type": "agent_start",
+                        "model_provider": provider_label,
+                        "model": turn_model,
+                        "error": format!("{}", e),
+                    })),
+                "Failed to broadcast agent_start event"
+            );
+        }
+    } else {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "event_type": "agent_start",
+                })),
+            "Skipping agent_start broadcast: no active receivers"
+        );
+    }
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
     if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+        if let Err(e) = backend.set_session_state(session_key, "running", Some(&turn_id)) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "turn_id": turn_id,
+                        "state": "running",
+                        "error": format!("{}", e),
+                    })),
+                "Failed to set session state to running"
+            );
+        }
     }
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
+    let _cancel_guard = {
         state
             .cancel_tokens
             .lock()
-            .expect("cancel_tokens lock poisoned")
             .insert(session_key.to_string(), cancel_token.clone());
-    }
+        CancelTokenGuard {
+            tokens: Arc::clone(&state.cancel_tokens),
+            session_key: session_key.to_string(),
+        }
+    };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
 
@@ -168,13 +230,8 @@ where
     let (result, (total_input_tokens, total_output_tokens, last_input_tokens)) =
         tokio::join!(turn_fut, forward(handle));
 
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
-    }
+    // CancelTokenGuard removes the token from cancel_tokens on drop, even if
+    // the forward closure panicked.
 
     let was_cancelled = match &result {
         Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
@@ -204,7 +261,25 @@ where
                             zeroclaw_providers::ChatMessage::assistant(&error.committed_response);
                         // Re-check: the session may be deleted between the outer check and here.
                         if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
+                            if let Err(e) = backend.append(session_key, &assistant_msg) {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Write
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "session_key": session_key,
+                                            "message_role": "assistant",
+                                            "error": format!("{}", e),
+                                        })
+                                    ),
+                                    "Failed to persist cancelled-turn fallback assistant message"
+                                );
+                            }
                         }
                     }
                 }
@@ -215,14 +290,55 @@ where
         if let Some(ref backend) = state.session_backend
             && backend.session_exists(session_key)
         {
-            let _ = backend.set_session_state(session_key, "idle", None);
+            if let Err(e) = backend.set_session_state(session_key, "idle", None) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "state": "idle",
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to set session state to idle after cancellation"
+                );
+            }
         }
 
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_end",
-            "model_provider": provider_label,
-            "model": turn_model,
-        }));
+        if state.event_tx.receiver_count() > 0 {
+            if let Err(e) = state.event_tx.send(serde_json::json!({
+                "type": "agent_end",
+                "model_provider": provider_label,
+                "model": turn_model,
+            })) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "event_type": "agent_end",
+                            "model_provider": provider_label,
+                            "model": turn_model,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to broadcast agent_end event"
+                );
+            }
+        } else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "event_type": "agent_end",
+                    })),
+                "Skipping agent_end broadcast: no active receivers"
+            );
+        }
 
         // Trace cancelled turns so `zeroclaw doctor` sees them.
         let trace_name = format!("gateway_{}_turn", channel_name);
@@ -241,6 +357,10 @@ where
             &trace_name
         );
 
+        let cancelled_error_msg = result
+            .as_ref()
+            .err()
+            .map(|e| zeroclaw_providers::sanitize_api_error(&e.error.to_string()));
         let (response_text, new_messages) = match result {
             Err(error) => (error.committed_response, error.new_messages),
             Ok(_) => (String::new(), Vec::new()),
@@ -257,7 +377,7 @@ where
             turn_provider: provider_label,
             turn_model,
             status: TurnStatus::Cancelled,
-            error: None,
+            error: cancelled_error_msg,
         };
     }
 
@@ -344,14 +464,55 @@ where
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
+                if let Err(e) = backend.set_session_state(session_key, "idle", None) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": session_key,
+                                "state": "idle",
+                                "error": format!("{}", e),
+                            })),
+                        "Failed to set session state to idle after successful turn"
+                    );
+                }
             }
 
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "agent_end",
-                "model_provider": provider_label,
-                "model": turn_model,
-            }));
+            if state.event_tx.receiver_count() > 0 {
+                if let Err(e) = state.event_tx.send(serde_json::json!({
+                    "type": "agent_end",
+                    "model_provider": provider_label,
+                    "model": turn_model,
+                })) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": session_key,
+                                "event_type": "agent_end",
+                                "model_provider": provider_label,
+                                "model": turn_model,
+                                "error": format!("{}", e),
+                            })),
+                        "Failed to broadcast agent_end event"
+                    );
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "event_type": "agent_end",
+                        })),
+                    "Skipping agent_end broadcast: no active receivers"
+                );
+            }
 
             // Trace gateway turns for `zeroclaw doctor`.
             let total_tokens = match (total_input_tokens, total_output_tokens) {
@@ -405,7 +566,21 @@ where
             }
 
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+                if let Err(e) = backend.set_session_state(session_key, "error", Some(&turn_id)) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": session_key,
+                                "turn_id": turn_id,
+                                "state": "error",
+                                "error": format!("{}", e),
+                            })),
+                        "Failed to set session state to error after failed turn"
+                    );
+                }
             }
 
             ::zeroclaw_log::record!(
@@ -463,6 +638,8 @@ pub(crate) fn persist_conversation_messages(
     // created automatically. Deleted-session protection is handled by
     // the caller-side `session_exists` checks that return early with an
     // error before reaching this code path.
+    let mut failed: usize = 0;
+    let mut total: usize = 0;
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
@@ -470,7 +647,36 @@ pub(crate) fn persist_conversation_messages(
         if message.role == "system" {
             continue;
         }
-        let _ = backend.append(session_key, message);
+        total += 1;
+        if let Err(e) = backend.append(session_key, message) {
+            failed += 1;
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "message_role": message.role,
+                        "error": format!("{}", e),
+                    })),
+                "Failed to persist conversation message"
+            );
+        }
+    }
+    if failed > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "total_messages": total,
+                    "failed_count": failed,
+                })),
+            "Conversation message persistence incomplete: {failed}/{total} messages failed"
+        );
     }
 }
 
@@ -488,6 +694,7 @@ pub(crate) fn has_assistant_chat_message(messages: &[ConversationMessage]) -> bo
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -736,12 +943,14 @@ mod tests {
             node_registry: Arc::new(crate::nodes::NodeRegistry::new(16)),
             session_backend: backend,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -836,7 +1045,6 @@ mod tests {
             let registered = state_ref
                 .cancel_tokens
                 .lock()
-                .expect("cancel_tokens lock")
                 .get(&session_key_owned)
                 .cloned();
             assert!(
@@ -874,12 +1082,7 @@ mod tests {
         // of outcome — verify it's gone so a subsequent abort doesn't fire
         // a stale token.
         assert!(
-            state
-                .cancel_tokens
-                .lock()
-                .expect("cancel_tokens lock")
-                .get(session_key)
-                .is_none(),
+            state.cancel_tokens.lock().get(session_key).is_none(),
             "runner must remove the cancel token from state.cancel_tokens \
              after the turn completes (cancelled branch included)"
         );
@@ -1426,5 +1629,38 @@ mod tests {
         persist_conversation_messages(&backend, "gw_new", &messages);
 
         assert_eq!(backend.calls.lock().unwrap().len(), 2);
+    }
+
+    // ── CancelTokenGuard Drop behaviour ──────────────────────────────────
+    //
+    // The guard removes the cancel token from `cancel_tokens` when
+    // dropped, preventing leaks if the forward closure panics after the
+    // token is registered but before the explicit removal.
+
+    #[test]
+    fn cancel_token_guard_removes_token_on_drop() {
+        let tokens = Arc::new(Mutex::new(HashMap::new()));
+        let key = "gw_guard_drop_test".to_string();
+        tokens.lock().insert(key.clone(), CancellationToken::new());
+        assert!(
+            tokens.lock().contains_key(&key),
+            "token should be present before guard is created"
+        );
+
+        {
+            let _guard = super::CancelTokenGuard {
+                tokens: Arc::clone(&tokens),
+                session_key: key.clone(),
+            };
+            assert!(
+                tokens.lock().contains_key(&key),
+                "token should still be present while guard is alive"
+            );
+        }
+        // After the guard is dropped, the token must be removed.
+        assert!(
+            !tokens.lock().contains_key(&key),
+            "guard must remove token from cancel_tokens on drop"
+        );
     }
 }

@@ -75,12 +75,6 @@ use axum::body::Bytes;
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
-#[cfg(any(
-    feature = "channel-linq",
-    feature = "channel-nextcloud",
-    feature = "channel-wati",
-    feature = "channel-whatsapp-cloud"
-))]
 use axum::response::Response;
 use axum::{
     Router,
@@ -176,6 +170,25 @@ pub fn gateway_long_running_request_timeout_secs(
     cfg: &zeroclaw_config::schema::GatewayConfig,
 ) -> u64 {
     cfg.long_running_request_timeout_secs
+}
+
+/// Rewrites a 413 Payload Too Large response from `RequestBodyLimitLayer`
+/// into a `ChatError` JSON body, matching the format of all other error
+/// responses from the chat completions endpoint.
+async fn rewrite_payload_too_large(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let body = Json(crate::api_chat_completions::ErrorResponse {
+        error: crate::api_chat_completions::ErrorDetail {
+            message: format!("Request body exceeds the {} byte limit", MAX_BODY_SIZE),
+            error_type: "payload_too_large".to_string(),
+            code: None,
+            param: None,
+            status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        },
+    });
+    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -542,6 +555,10 @@ pub struct AppState {
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
+    /// Semaphore bounding concurrent memory consolidation tasks across all
+    /// sessions. Each permit represents one in-flight `consolidate_turn` call
+    /// (LLM inference + memory-backend writes). Default 4 permits.
+    pub consolidation_semaphore: Arc<tokio::sync::Semaphore>,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
@@ -555,9 +572,14 @@ pub struct AppState {
     /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
     /// current turn. Entries are inserted before each turn and removed after
     /// completion (normal or cancelled).
-    pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
-    >,
+    pub cancel_tokens:
+        Arc<Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Set of session_keys (e.g. `gw_<session_id>`) that currently have an
+    /// open WebSocket connection. Used by the cross-transport guard in
+    /// `/v1/chat/completions` to reject HTTP requests when a WebSocket
+    /// owns the session. Inserted on WS accept, removed on disconnect --
+    /// this is connection-scoped, unlike `cancel_tokens` which is turn-scoped.
+    pub ws_connections: Arc<Mutex<std::collections::HashSet<String>>>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -1551,12 +1573,14 @@ pub async fn run_gateway(
         node_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
+        consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -1949,8 +1973,11 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    // Chat completions route needs the long-running timeout (LLM streaming
-    // can take minutes).  Same pattern as long_running_router above.
+    // Chat completions route: timeout is handled at the handler level
+    // (tokio::time::timeout produces a ChatError JSON 408) instead of a
+    // middleware-level TimeoutLayer.  413 responses from the body-size
+    // limit middleware are rewritten into ChatError JSON by the
+    // map_response layer.
     // Disabled by default; set gateway.chat_completions_enabled = true to expose.
     let chat_completions_router: Router<AppState> = if config.gateway.chat_completions_enabled {
         Router::new().route(
@@ -1963,10 +1990,7 @@ pub async fn run_gateway(
     let chat_completions_router: Router = chat_completions_router
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
-        ));
+        .layer(axum::middleware::map_response(rewrite_payload_too_large));
 
     let inner = inner
         .merge(long_running_router)
@@ -4413,10 +4437,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: registry,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5041,10 +5067,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5128,10 +5156,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5722,10 +5752,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5827,10 +5859,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5947,10 +5981,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6047,10 +6083,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6166,10 +6204,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6251,10 +6291,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6341,10 +6383,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6438,10 +6482,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6531,10 +6577,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6676,10 +6724,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
@@ -7499,10 +7549,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7585,10 +7637,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7745,10 +7799,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

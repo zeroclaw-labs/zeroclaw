@@ -122,17 +122,26 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a session's JSONL file and its sidecar metadata. Returns `true` if the file existed.
+    /// Delete a session's JSONL file and its sidecar metadata. Returns `true`
+    /// if either file existed (i.e., the session had any on-disk state).
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let path = self.session_path(session_key);
-        if !path.exists() {
-            return Ok(false);
+        let jsonl_path = self.session_path(session_key);
+        let meta_path = self.meta_path(session_key);
+
+        let jsonl_existed = jsonl_path.exists();
+        let meta_existed = meta_path.exists();
+
+        if jsonl_existed {
+            std::fs::remove_file(&jsonl_path)?;
         }
-        std::fs::remove_file(&path)?;
-        // Best-effort removal of the sidecar metadata; the JSONL file is the
-        // canonical existence signal.
-        let _ = std::fs::remove_file(self.meta_path(session_key));
-        Ok(true)
+        // Always clean up the sidecar, even for meta-only sessions.
+        // Without this, meta-only sessions (where a WS handshake wrote
+        // .meta.json but no messages followed) become invisible-to-listing /
+        // invisible-to-delete tombstones that permanently block the
+        // session key for other agents.
+        let _ = std::fs::remove_file(&meta_path);
+
+        Ok(jsonl_existed || meta_existed)
     }
 
     /// Return the modification time of a session's JSONL file.
@@ -149,13 +158,20 @@ impl SessionStore {
             Err(_) => return Vec::new(),
         };
 
-        entries
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let name = entry.file_name().into_string().ok()?;
-                name.strip_suffix(".jsonl").map(String::from)
-            })
-            .collect()
+        let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if let Some(key) = name.strip_suffix(".jsonl") {
+                sessions.insert(key.to_string());
+            } else if let Some(key) = name.strip_suffix(".meta.json") {
+                sessions.insert(key.to_string());
+            }
+        }
+        let mut result: Vec<String> = sessions.into_iter().collect();
+        result.sort();
+        result
     }
 }
 
@@ -220,16 +236,35 @@ impl SessionBackend for SessionStore {
         self.delete_session(session_key)
     }
 
-    /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk Checking file presence is the same
-    /// O(1) `stat` that `delete_session` itself performs.
+    /// Quick existence probe. A session exists if either the JSONL data file
+    /// or the sidecar metadata file is present on disk. This prevents
+    /// meta-only sessions (handshake with no messages) from becoming
+    /// invisible tombstones.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        self.session_path(session_key).exists() || self.meta_path(session_key).exists()
     }
 
     fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
         let mut meta: SessionMeta = match std::fs::read_to_string(self.meta_path(session_key)) {
-            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "file": self.meta_path(session_key).display().to_string(),
+                                "error": format!("{e}"),
+                            })),
+                        "Corrupted session metadata file"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "corrupted session metadata",
+                    ));
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => SessionMeta::default(),
             Err(e) => return Err(e),
         };

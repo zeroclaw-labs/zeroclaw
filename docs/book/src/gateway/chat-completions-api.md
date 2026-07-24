@@ -154,6 +154,9 @@ The error `type` is always `internal_error`. Cancellation and server errors prod
 | **400** | `invalid_request_error` | Invalid request | Empty messages, JSON parse error, unknown agent, malformed agent target |
 | **400** | `unsupported_parameter` | Unsupported parameter | `max_tokens`, `top_p`, `stop`, `presence_penalty`, or `frequency_penalty` provided |
 | **401** | `authentication_error` | Auth failure | Missing or invalid token (only when `require_pairing=true`) |
+| **408** | `timeout_error` | Request timeout | Request exceeded the configured timeout (default 600s) |
+| **409** | `cross_transport_session_in_use` | Session conflict | Session currently owned by an active WebSocket connection |
+| **413** | `payload_too_large` | Request body too large | Request body exceeds 64 KB limit |
 | **429** | `rate_limit_error` | Rate limited | Exceeded `chat_rate_limit_per_minute` config |
 | **500** | `internal_error` | Internal server error | Provider API exception |
 | **503** | `server_error` | Agent not configured | Agent missing model config (complete onboarding) |
@@ -236,7 +239,18 @@ curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
 | **Accept** | `text/event-stream` (streaming) or `application/json` (non-streaming) |
 | **Auth** | Bearer Token (required when `require_pairing=true`) |
 | **Timeout** | Long-running timeout (600s, shared with cron sub-route) |
-| **Enabled** | Disabled by default -- set `chat_completions_enabled = true` in `[gateway]` config |
+| **Enabled** | Disabled by default -- set `chat_completions_enabled = true` in `[gateway]` config, then reload (daemon) or restart (standalone). See [Config lifecycle](../architecture/config-lifecycle.md) for reload semantics. |
+
+> **Deployment mode note:** The `chat_completions_enabled` toggle takes effect
+> differently depending on how the gateway is run:
+>
+> - **Daemon-supervised** (recommended deployment): Config changes + `/admin/reload`
+>   cause the daemon to re-spawn the gateway with the updated route surface.
+>   Toggling `chat_completions_enabled` on or off takes effect on reload.
+> - **Standalone** (`zeroclaw gateway start`): Routes are fixed at process start.
+>   Changing `chat_completions_enabled` in the config file has **no effect** on the
+>   running process -- restart the gateway to apply the change. `/admin/reload`
+>   returns 503 in this mode.
 
 ---
 
@@ -544,6 +558,9 @@ The following parameters are **not supported** per-request and will return a **4
 | **400** | `invalid_request_error` | Empty messages | Provide at least one message |
 | **400** | `unsupported_parameter` | Unsupported per-request parameter | Remove `max_tokens`, `top_p`, `stop`, `presence_penalty`, or `frequency_penalty` from request |
 | **401** | `authentication_error` | Auth failure | Provide a valid Bearer Token |
+| **408** | `timeout_error` | Request timeout | The request took longer than the configured timeout. Reduce message complexity or increase the timeout in `[gateway] long_running_request_timeout_secs`. |
+| **409** | `cross_transport_session_in_use` | Session conflict | An active WebSocket connection owns this session. Disconnect the WebSocket or use a different session key. |
+| **413** | `payload_too_large` | Request body too large | Keep the request body under 64 KB. Large message histories should use `x-session-key` for multi-turn context instead. |
 | **429** | `rate_limit_error` | Rate limited | Retry after wait (see `Retry-After` header) |
 | **500** | `internal_error` | Internal server error | Contact admin, provide `X-Request-ID` |
 | **503** | `server_error` | Agent not configured | Complete onboarding or check agent's model_provider config |
@@ -598,6 +615,45 @@ The following parameters are **not supported** per-request and will return a **4
     "code": null,
     "param": null,
     "status": 503
+  }
+}
+```
+
+**408 -- request timeout**:
+```json
+{
+  "error": {
+    "message": "Request exceeded the 600s timeout",
+    "type": "timeout_error",
+    "code": null,
+    "param": null,
+    "status": 408
+  }
+}
+```
+
+**409 -- session in use**:
+```json
+{
+  "error": {
+    "message": "This session is currently owned by an active WebSocket connection. Disconnect the WebSocket or use a different session key.",
+    "type": "cross_transport_session_in_use",
+    "code": null,
+    "param": null,
+    "status": 409
+  }
+}
+```
+
+**413 -- payload too large**:
+```json
+{
+  "error": {
+    "message": "Request body exceeds the 65536 byte limit",
+    "type": "payload_too_large",
+    "code": null,
+    "param": null,
+    "status": 413
   }
 }
 ```
@@ -930,7 +986,45 @@ This ensures a tool outside the requested subset can never run, regardless of wh
 
 ---
 
-## 9. Best Practices
+## 9. Custom Session Backend Compatibility
+
+ZeroClaw supports pluggable session backends via the `SessionBackend` trait
+(`crates/zeroclaw-infra/src/session_backend.rs`). If you implement a custom
+backend, be aware of the following compatibility requirements introduced
+by cross-agent session isolation:
+
+| Method | Default behavior | Impact if not implemented |
+|--------|-----------------|--------------------------|
+| `set_session_agent_alias` | `Err(Unsupported)` | **Non-empty sessions:** HTTP 400 (`"Cannot resume session: backend does not track agent ownership"`). **Empty sessions:** Turn proceeds without ownership tracking -- cross-agent isolation is absent. |
+| `get_session_agent_alias` | `Err(Unsupported)` | Same as above -- the handler calls this at history-load time and rejects non-empty sessions if unsupported. |
+
+**To support multi-agent deployments**, implement both methods to persist
+and retrieve the agent alias associated with each session key. The JSONL
+backend (`SessionStore`) uses a `.meta.json` sidecar file for this purpose
+as a reference implementation.
+
+**For single-agent deployments** that don't need ownership enforcement,
+implement both methods as no-ops:
+
+```rust
+fn set_session_agent_alias(&self, _key: &str, _alias: &str) -> std::io::Result<()> {
+    Ok(())
+}
+fn get_session_agent_alias(&self, _key: &str) -> std::io::Result<Option<String>> {
+    Ok(None)
+}
+```
+
+Returning `Ok(None)` from `get_session_agent_alias` tells the handler the
+session has no recorded owner, which is accepted for **empty** sessions
+but rejected for **non-empty** sessions (to prevent cross-agent history
+leakage). See the `SessionBackend` trait documentation in
+`crates/zeroclaw-infra/src/session_backend.rs` for the full contract,
+including migration guidance for backends with pre-existing session data.
+
+---
+
+## 10. Best Practices
 
 ### 1. Session Management
 
@@ -980,7 +1074,7 @@ This ensures a tool outside the requested subset can never run, regardless of wh
 
 ---
 
-## 10. Changelog
+## 11. Changelog
 
 ### v1.0 (2026-06-30) -- Initial Stable Release
 
