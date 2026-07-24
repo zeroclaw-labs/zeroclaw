@@ -6,6 +6,25 @@ use std::sync::{Arc, Mutex};
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
+tokio::task_local! {
+    /// Pending model switch for one active tool loop. The loop owns this state;
+    /// tools only borrow the current task-local handle while they execute.
+    static MODEL_SWITCH_REQUEST: ModelSwitchCallback;
+}
+
+pub(crate) fn current_model_switch_state() -> anyhow::Result<ModelSwitchCallback> {
+    MODEL_SWITCH_REQUEST.try_with(Arc::clone).map_err(|_| {
+        anyhow::Error::msg("model_switch is only available inside an active agent turn")
+    })
+}
+
+pub(crate) async fn scope_model_switch_state<F>(state: ModelSwitchCallback, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    MODEL_SWITCH_REQUEST.scope(state, future).await
+}
+
 #[derive(Debug)]
 pub struct ToolLoopCancelled;
 

@@ -120,9 +120,8 @@ use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -5277,7 +5276,6 @@ async fn process_channel_message_body(
         Cancelled,
     }
 
-    let model_switch_callback = get_model_switch_state();
     let scale_cap = ctx
         .pacing
         .message_timeout_scale_max
@@ -5369,7 +5367,7 @@ async fn process_channel_message_body(
                         config: Some(ctx.prompt_config.as_ref()),
                         hooks: ctx.hooks.as_deref(),
                         activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: Some(model_switch_callback.clone()),
+                        model_switch_callback: None,
                         receipt_generator: ctx.receipt_generator.as_ref(),
                     },
                     ResolvedRuntimeKnobs {
@@ -5479,7 +5477,6 @@ async fn process_channel_message_body(
                             .with_attrs(::serde_json::json!({"err": err.to_string()})),
                             "Failed to resolve model_provider after model switch"
                         );
-                        clear_model_switch_request();
                         break loop_result;
                     }
                 };
@@ -5511,8 +5508,6 @@ async fn process_channel_message_body(
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
                         route.api_key = resolved_api_key;
-                        clear_model_switch_request();
-
                         // Persist the route override so subsequent messages
                         // from this sender continue using the switched model.
                         set_route_selection(
@@ -5539,7 +5534,6 @@ async fn process_channel_message_body(
                             .with_attrs(::serde_json::json!({"err": err.to_string()})),
                             "Failed to create model_provider after model switch"
                         );
-                        clear_model_switch_request();
                         // Fall through with the original error
                     }
                 }
@@ -14115,22 +14109,6 @@ api_key = "anthropic-key"
         );
     }
 
-    /// Serializes tests that interact with the process-wide model-switch
-    /// request (`MODEL_SWITCH_REQUEST` in zeroclaw-runtime's agent loop).
-    /// While a pending request exists, ANY concurrently running
-    /// `process_channel_message` turn can observe it, short-circuit to the
-    /// switch handler, and clear it — so the test that sets it AND tests
-    /// whose assertions are sensitive to an unexpected switch retry must
-    /// hold this guard. `tokio::sync::Mutex` because it is held across
-    /// awaits; the `OnceLock` wrapper gives a `'static` initializer in a
-    /// `static` context without `lazy_static`.
-    static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-
-    fn model_switch_test_guard() -> &'static tokio::sync::Mutex<()> {
-        MODEL_SWITCH_TEST_GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     /// Observer that records every event, for turn-lifecycle assertions.
     #[derive(Default)]
     struct RecordingObserver {
@@ -14240,10 +14218,6 @@ api_key = "anthropic-key"
     /// all sharing one `turn_id` and carrying the channel + agent alias.
     #[tokio::test]
     async fn process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
-        // The exactly-one-AgentStart assertion is sensitive to a leaked
-        // process-wide model-switch request (the switch retry emits an
-        // extra re-attributing AgentStart), so serialize on the guard.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
@@ -14311,8 +14285,6 @@ api_key = "anthropic-key"
     /// and one `AgentEnd`, same `turn_id`.
     #[tokio::test]
     async fn process_channel_message_emits_brackets_when_llm_errors() {
-        // See the guard note on the success-turn bracket test.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
@@ -14348,8 +14320,6 @@ api_key = "anthropic-key"
     /// `AgentStart`.
     #[tokio::test]
     async fn process_channel_message_emits_brackets_when_cancelled_mid_turn() {
-        // See the guard note on the success-turn bracket test.
-        let _guard = model_switch_test_guard().lock().await;
         let token = CancellationToken::new();
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -15078,6 +15048,76 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         fn alias(&self) -> &str {
             "ModelCaptureModelProvider"
+        }
+    }
+
+    #[derive(Default)]
+    struct ModelSwitchRequestProvider {
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ModelSwitchRequestProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "switch-call".to_string(),
+                        name: "model_switch".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "set",
+                            "model_provider": "openrouter.default",
+                            "model": "switched-model"
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("original-provider-should-not-be-reused".to_string()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ModelSwitchRequestProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ModelSwitchRequestProvider"
         }
     }
 
@@ -17196,26 +17236,20 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_persists_model_switch_with_route_credential() {
-        // Serialize on the process-wide model-switch state so this test
-        // doesn't race other tests that also touch the same static.
-        let _guard = model_switch_test_guard().lock().await;
-        clear_model_switch_request();
-
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let default_model_provider_impl = Arc::new(ModelSwitchRequestProvider::default());
         let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
         let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
 
-        // The switch handler resolves the requested provider `openrouter` to
-        // a configured `<type>.<alias>` ref via
-        // `resolve_provider_ref_for_runtime_switch`, so the provider that is
-        // built, cached, and persisted is the dotted form.
+        // The model_switch tool requests the configured dotted provider ref;
+        // the switch handler must preserve it through provider construction,
+        // caching, and route persistence.
         let switched_provider_ref = "openrouter.default";
         let switched_key = Some("route-specific-key");
 
@@ -17235,14 +17269,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".to_string(),
-            model_provider: "openrouter".to_string(),
+            model_provider: switched_provider_ref.to_string(),
             model: "switched-model".to_string(),
             api_key: Some("route-specific-key".to_string()),
         }];
 
-        // `resolve_provider_ref_for_runtime_switch` resolves `openrouter`
-        // against the configured providers, so the prompt config must define
-        // the `openrouter.default` entry for the switch to resolve and build.
+        // The prompt config owns the profile accepted by ModelSwitchTool and
+        // later resolved by the channel switch handler.
         let prompt_config = {
             let mut cfg = zeroclaw_config::schema::Config::default();
             {
@@ -17257,13 +17290,10 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::new(cfg)
         };
 
-        // Pre-set the model_switch request — simulates the tool having
-        // been called on a previous turn and waiting to be consumed.
-        {
-            let state = get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
-        }
+        let model_switch_tool = zeroclaw_runtime::tools::ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::clone(&prompt_config),
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -17279,7 +17309,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(vec![Box::new(model_switch_tool)]),
             observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -17322,7 +17352,10 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    auto_approve: vec!["model_switch".to_string()],
+                    ..zeroclaw_config::schema::RiskProfileConfig::default()
+                },
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -17451,9 +17484,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 assert_eq!(start, end, "each logical turn must keep one matched pair");
             }
         }
-
-        // Clean up shared global state so we don't leak into other tests.
-        clear_model_switch_request();
     }
 
     #[tokio::test]
@@ -17593,6 +17623,10 @@ BTC is currently around $65,000 based on latest tool output."#
                         .get("message")
                         .and_then(|v| v.as_str())
                         .is_some_and(|m| m == "reply-intent precheck completed")
+                        && value
+                            .pointer("/attributes/message_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| id == "msg-precheck-log")
                     {
                         precheck_event = Some(value);
                         break;
@@ -22763,13 +22797,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_persists_image_payload_verbatim() {
-        // `calls.len() == 1` below is sensitive to a leaked process-wide
-        // model-switch request (a pending request makes this turn
-        // short-circuit and retry, doubling the provider calls), so
-        // serialize on the shared guard. Observed colliding with
-        // `process_channel_message_persists_model_switch_with_route_credential`
-        // in parallel runs.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 

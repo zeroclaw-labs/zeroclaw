@@ -219,28 +219,6 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
     }
 }
 
-/// Global model switch request state - used for runtime model switching via model_switch tool.
-/// This is set by the model_switch tool and checked by the agent loop.
-#[allow(clippy::type_complexity)]
-static MODEL_SWITCH_REQUEST: LazyLock<Arc<Mutex<Option<(String, String)>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(None)));
-
-/// Get the global model switch request state
-pub fn get_model_switch_state() -> ModelSwitchCallback {
-    Arc::clone(&MODEL_SWITCH_REQUEST)
-}
-
-/// Clear any pending model switch request
-pub fn clear_model_switch_request() {
-    if let Ok(guard) = MODEL_SWITCH_REQUEST.lock() {
-        let mut guard = guard;
-        *guard = None;
-    }
-}
-
-#[cfg(test)]
-pub(crate) static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
         None => pattern == name,
@@ -1475,8 +1453,6 @@ pub async fn run(
                 &provider_runtime_options,
             )?;
 
-        let model_switch_callback = get_model_switch_state();
-
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
@@ -1919,7 +1895,7 @@ pub async fn run(
                                         config: Some(&config),
                                         hooks: None,
                                         activated_tools: activated_handle.as_ref(),
-                                        model_switch_callback: Some(model_switch_callback.clone()),
+                                        model_switch_callback: None,
                                         receipt_generator: None,
                                     },
                                     ResolvedRuntimeKnobs {
@@ -2019,8 +1995,6 @@ pub async fn run(
 
                             provider_name = new_model_provider;
                             model_name = new_model;
-
-                            clear_model_switch_request();
 
                             observer.record_event(&ObserverEvent::AgentStart {
                                 model_provider: provider_name.to_string(),
@@ -2471,9 +2445,7 @@ pub async fn run(
                                             config: Some(&config),
                                             hooks: None,
                                             activated_tools: activated_handle.as_ref(),
-                                            model_switch_callback: Some(
-                                                model_switch_callback.clone(),
-                                            ),
+                                            model_switch_callback: None,
                                             receipt_generator: None,
                                         },
                                         ResolvedRuntimeKnobs {
@@ -2579,8 +2551,6 @@ pub async fn run(
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
-
-                                clear_model_switch_request();
 
                                 observer.record_event(&ObserverEvent::AgentStart {
                                     model_provider: provider_name.to_string(),
@@ -3902,6 +3872,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -3945,6 +3916,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -3994,6 +3966,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4028,6 +4001,7 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,
@@ -4083,6 +4057,7 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &observer,

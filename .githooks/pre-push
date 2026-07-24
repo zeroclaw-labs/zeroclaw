@@ -56,4 +56,10 @@ cargo test --locked --workspace --exclude zeroclaw-desktop || {
     exit 1
 }
 
+echo "==> pre-push: repeating parallel runtime tests..."
+./scripts/ci/parallel_runtime_test_gate.sh || {
+    echo "FAIL: parallel runtime regression gate did not pass."
+    exit 1
+}
+
 echo "==> pre-push: all checks passed."

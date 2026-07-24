@@ -15,7 +15,7 @@ Composite job with multiple matrix legs:
 - **check**: all features + no-default-features
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh`, plus `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh`, `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`, and repeated same-process parallel runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh` on Linux
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`

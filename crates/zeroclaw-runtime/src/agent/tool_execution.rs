@@ -1,6 +1,7 @@
 //! Tool execution helpers extracted from `loop_`.
 
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -12,7 +13,7 @@ use zeroclaw_api::agent::TurnEvent;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
-use super::turn::TurnMeta;
+use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -42,6 +43,7 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub tools_registry: &'a [Box<dyn Tool>],
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
+    pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
@@ -250,14 +252,21 @@ pub(crate) async fn execute_one_tool(
     let tool_future = tool
         .execute(call_arguments.clone())
         .instrument(tool_span.clone());
-    let tool_result = if let Some(token) = cancellation_token {
-        tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
+    let execute = async {
+        if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
+                result = tool_future => Ok(result),
+            }
+        } else {
+            Ok(tool_future.await)
         }
-    } else {
-        tool_future.await
     };
+    let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
+        scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
+    } else {
+        execute.await
+    }?;
 
     let outcome = {
         let _result_guard = tool_span.entered();
@@ -633,6 +642,7 @@ mod tests {
                 tools_registry: &[], // no static tools - force activated-tools path
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,
@@ -688,6 +698,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,

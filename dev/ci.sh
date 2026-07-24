@@ -104,6 +104,7 @@ case "$1" in
     # process and emits per-binary JUnit reports; cargo test uses the test
     # harness's default process model).
     run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
+    run_in_ci "./scripts/ci/parallel_runtime_test_gate.sh"
     ;;
 
   test-component)
@@ -156,6 +157,7 @@ case "$1" in
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
     run_firmware_protocol_gate
     run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
+    run_in_ci "./scripts/ci/parallel_runtime_test_gate.sh"
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
