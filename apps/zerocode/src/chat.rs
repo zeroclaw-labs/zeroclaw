@@ -122,16 +122,17 @@ pub(crate) struct Chat {
     /// Double-click tracker for the session picker: a second click on the same row
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
-    /// constructs. Defaults until fetched.
-    todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
-    /// repeat on every session start.
-    todo_settings_loaded: bool,
     /// One-shot app-level Help request, set by the `/help` slash command and
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
+    /// Inbound `elicitation/create` requests that arrived while the pane was
+    /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
+    /// Rather than auto-cancel a legitimately-owned prompt during that
+    /// transient window — which silently drops the agent's `ask_user` — we
+    /// hold it here and retry installation on subsequent drains until it
+    /// either matches (modal installed) or its grace deadline expires (then
+    /// answered `cancel`, unblocking the daemon's tool call). See
+    /// `drain_inbound_requests` / `try_install_elicitation`.
     deferred_elicitations: Vec<DeferredInboundRequest>,
 }
 
@@ -203,8 +204,6 @@ impl Chat {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
-            todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
-            todo_settings_loaded: false,
             help_requested: false,
             deferred_elicitations: Vec::new(),
         }
@@ -419,13 +418,23 @@ impl Chat {
     }
 
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        if !self.todo_settings_loaded {
-            self.todo_settings_loaded = true;
-            if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
-                self.todo_settings =
-                    crate::todo_tracker::TodoTrackerSettings::from_config_fields(&fields);
-            }
-        }
+        // Resolve the local `[todotracker]` and `[message_queue]` config at
+        // every new-session boundary. These are ZeroCode UI concerns owned by
+        // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
+        // — so read them from the local config file (honoring `--config-dir` /
+        // `ZEROCLAW_CONFIG_DIR`), not over RPC. Resolving per session (rather
+        // than caching once for the pane's lifetime) makes the file the single
+        // source of truth: a Config-pane save is picked up by the *next*
+        // session without restarting zerocode. Best-effort: a load failure
+        // falls back to the built-in defaults.
+        let (todo_settings, queue_settings) =
+            match crate::config::ensure_and_load(&crate::i18n::config_dir()) {
+                Ok(cfg) => (cfg.resolve_todo_tracker(), cfg.resolve_message_queue()),
+                Err(_) => (
+                    crate::todo_tracker::TodoTrackerSettings::default(),
+                    crate::config::MessageQueueSettings::default(),
+                ),
+            };
 
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
@@ -464,7 +473,8 @@ impl Chat {
                 let mut state = ChatState::new(
                     session.session_id,
                     agent_alias.to_string(),
-                    self.todo_settings,
+                    todo_settings,
+                    queue_settings,
                 );
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
@@ -5220,6 +5230,9 @@ pub struct ChatState {
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
+    /// Local UI settings for the message queue (cap, widths, auto-open, etc.).
+    /// Retained across session resets.
+    pub(crate) message_queue_settings: crate::config::MessageQueueSettings,
 }
 
 impl ChatState {
@@ -5227,6 +5240,7 @@ impl ChatState {
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        queue_settings: crate::config::MessageQueueSettings,
     ) -> Self {
         Self {
             session_id,
@@ -5283,7 +5297,7 @@ impl ChatState {
             queue_paused: false,
             resume_override: false,
             cancel_started_at: None,
-            queue_sidebar_cols: 36,
+            queue_sidebar_cols: queue_settings.default_width,
             queue_sel: None,
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
@@ -5291,6 +5305,7 @@ impl ChatState {
             info_message: None,
             model_picker: ModelPickerOverlay::None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
+            message_queue_settings: queue_settings,
         }
     }
 
@@ -6249,10 +6264,6 @@ impl ChatState {
         self.turn_started_at = Instant::now();
     }
 
-    const QUEUE_CAP: usize = 32;
-    const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
-    const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
-    const QUEUE_SIDEBAR_COLS_STEP: u16 = 4;
     const QUEUE_CHAT_COLS_MIN: u16 = 20;
 
     fn alloc_queue_id(&mut self) -> u64 {
@@ -6270,10 +6281,10 @@ impl ChatState {
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         let pending = self.message_queue.len();
-        if pending >= Self::QUEUE_CAP {
+        if pending >= self.message_queue_settings.cap {
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
+                &[("cap", &self.message_queue_settings.cap.to_string())],
             ));
         }
         let id = self.alloc_queue_id();
@@ -6294,10 +6305,10 @@ impl ChatState {
         if text.trim().is_empty() && attachments.is_empty() {
             return Err(crate::i18n::t("zc-queue-empty"));
         }
-        if self.message_queue.len() >= Self::QUEUE_CAP {
+        if self.message_queue.len() >= self.message_queue_settings.cap {
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
+                &[("cap", &self.message_queue_settings.cap.to_string())],
             ));
         }
         let id = self.alloc_queue_id();
@@ -6416,11 +6427,11 @@ impl ChatState {
         }
     }
 
-    /// The queue sidebar is open exactly when the queue is non-empty. There is
-    /// no manual toggle: it appears with the first queued message and closes
-    /// when the queue drains, so its presence always reflects real state.
+    /// The queue sidebar is open when auto_open is enabled and either the
+    /// queue has items or stay_open_when_empty is set.
     pub fn queue_sidebar_open(&self) -> bool {
-        !self.message_queue.is_empty()
+        let s = self.message_queue_settings;
+        s.auto_open && (!self.message_queue.is_empty() || s.stay_open_when_empty)
     }
 
     /// Default the sidebar selection to the front item when nothing is selected
@@ -6477,16 +6488,21 @@ impl ChatState {
     }
 
     pub fn widen_queue_sidebar(&mut self) {
-        self.queue_sidebar_cols = (self.queue_sidebar_cols + Self::QUEUE_SIDEBAR_COLS_STEP)
-            .min(Self::QUEUE_SIDEBAR_COLS_MAX);
+        // `width_step` is operator-supplied (`[message_queue] width_step`), so
+        // widen with a saturating add: a large step near the u16 ceiling must
+        // clamp to `max_width`, never wrap around to a tiny sidebar.
+        self.queue_sidebar_cols = self
+            .queue_sidebar_cols
+            .saturating_add(self.message_queue_settings.width_step)
+            .min(self.message_queue_settings.max_width);
         self.mark_dirty_full();
     }
 
     pub fn narrow_queue_sidebar(&mut self) {
         self.queue_sidebar_cols = self
             .queue_sidebar_cols
-            .saturating_sub(Self::QUEUE_SIDEBAR_COLS_STEP)
-            .max(Self::QUEUE_SIDEBAR_COLS_MIN);
+            .saturating_sub(self.message_queue_settings.width_step)
+            .max(self.message_queue_settings.min_width);
         self.mark_dirty_full();
     }
 
@@ -6494,9 +6510,11 @@ impl ChatState {
     /// column width is clamped to the absolute range, then to whatever leaves
     /// the chat column its floor on a terminal too narrow for both.
     pub fn queue_sidebar_width(&self, area_width: u16) -> u16 {
-        let upper =
-            Self::QUEUE_SIDEBAR_COLS_MAX.min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
-        let lower = Self::QUEUE_SIDEBAR_COLS_MIN.min(upper);
+        let s = self.message_queue_settings;
+        let upper = s
+            .max_width
+            .min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
+        let lower = s.min_width.min(upper);
         self.queue_sidebar_cols.clamp(lower, upper)
     }
 
@@ -6761,7 +6779,33 @@ mod tests {
             "sess-1".to_string(),
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         )
+    }
+
+    // Reviewer Blocking #3: the resolved `message_queue.default_width` must
+    // seed the runtime sidebar column count, not the old hardcoded `36`.
+    #[test]
+    fn queue_sidebar_seeds_from_configured_default_width() {
+        let queue = crate::config::MessageQueueSettings {
+            default_width: 52,
+            min_width: 20,
+            max_width: 100,
+            ..crate::config::MessageQueueSettings::default()
+        };
+        let st = ChatState::new(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            queue,
+        );
+        assert_eq!(
+            st.queue_sidebar_cols, 52,
+            "initial sidebar width must come from the configured default_width"
+        );
+        // And a non-default value must survive the on-screen clamp when the
+        // terminal is wide enough for it.
+        assert_eq!(st.queue_sidebar_width(200), 52);
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
@@ -7268,6 +7312,7 @@ mod tests {
             "9caf2a14-0e6d-4127-b016-357c0b757b87".to_string(),
             "personal_code".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("anthropic.personal_code"), Some("claude-opus-4-8"));
         assert_eq!(
@@ -7282,6 +7327,7 @@ mod tests {
             "abcdef1234".to_string(),
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         assert_eq!(s.title(), "myagent  abcdef1");
     }
@@ -7292,6 +7338,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         assert_eq!(s.title(), "ag  abcdef1  openai.work  gpt-5");
@@ -7310,6 +7357,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
         let area = Rect::new(10, 4, 80, 20);
@@ -7331,6 +7379,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
@@ -7346,6 +7395,7 @@ mod tests {
             "abcdef1234".to_string(),
             "ag".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.set_model_identity(Some("openai.work"), Some("gpt-5"));
 
@@ -7555,20 +7605,13 @@ mod tests {
             None,
         );
 
-        // Second request: the one-shot [todotracker] config fetch fired on the
-        // first session start. Respond with an empty field set (defaults apply).
-        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("start_session should fetch todotracker config")
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "config/list");
-        let id = request["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
-
-        // Third request must be session_new_with_id carrying the prior id for
+        // Second request must be session_new_with_id carrying the prior id for
         // the prior agent — NOT a fresh pick / fresh session. This is the whole
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
+        //
+        // No config/list fetch precedes it: TodoWrite tracker and message-queue
+        // settings are ZeroCode-local (`zerocode-config.toml`), resolved without
+        // a daemon round-trip, so session start goes straight to `session/new`.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("reconnect should reattach the prior session")
@@ -7717,11 +7760,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "resume should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Enter should resume selected session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -7831,11 +7869,6 @@ mod tests {
             chat
         });
 
-        let request = next_rpc_request(&mut rx, "fresh start should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "Esc should start a fresh session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -7900,12 +7933,6 @@ mod tests {
         .await;
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
-
-        let request =
-            next_rpc_request(&mut rx, "fresh fallback should load todotracker config").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let request =
             next_rpc_request(&mut rx, "stale carried resume should not be sent for alpha").await;
@@ -7988,6 +8015,7 @@ mod tests {
             "sess-old".to_string(),
             "alpha".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         let mut list_state = ListState::default();
         list_state.select(Some(0));
@@ -8085,6 +8113,7 @@ mod tests {
             "sess-old".to_string(),
             "alpha".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         let mut list_state = ListState::default();
         list_state.select(Some(0));
@@ -8158,6 +8187,7 @@ mod tests {
             "abcdef1234".to_string(),
             "beta".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.refresh_title_hit_rects(area);
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -8219,6 +8249,7 @@ mod tests {
             "abcdef1234".to_string(),
             "beta".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.turn_in_flight = true;
         state.refresh_title_hit_rects(area);
@@ -9538,6 +9569,7 @@ mod tests {
             "sess".to_string(),
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
         let body = Rect::new(0, 0, 60, 20);
@@ -9558,6 +9590,7 @@ mod tests {
             "sess".to_string(),
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
         let body = Rect::new(0, 0, 60, 20);
@@ -9577,6 +9610,7 @@ mod tests {
             "sess".to_string(),
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         let pad = "filler line\n".repeat(200);
         state
@@ -10141,7 +10175,8 @@ mod tests {
     fn queue_cap_enforced() {
         let mut s = state();
         s.turn_in_flight = true;
-        for i in 0..ChatState::QUEUE_CAP {
+        let cap = s.message_queue_settings.cap;
+        for i in 0..cap {
             s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
         }
         assert!(
@@ -10182,11 +10217,11 @@ mod tests {
         for _ in 0..40 {
             s.widen_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MAX);
+        assert_eq!(s.queue_sidebar_cols, s.message_queue_settings.max_width);
         for _ in 0..40 {
             s.narrow_queue_sidebar();
         }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MIN);
+        assert_eq!(s.queue_sidebar_cols, s.message_queue_settings.min_width);
     }
 
     #[test]
@@ -10207,7 +10242,7 @@ mod tests {
         let s = state();
         let wide = s.queue_sidebar_width(400);
         assert!(
-            wide <= ChatState::QUEUE_SIDEBAR_COLS_MAX,
+            wide <= s.message_queue_settings.max_width,
             "sidebar exceeded absolute column cap"
         );
         // Narrow terminal: chat column keeps its minimum, sidebar shrinks.
@@ -10224,6 +10259,7 @@ mod tests {
             "40be7731122334455".to_string(),
             "personal_code".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         assert_eq!(s.title(), "personal_code  40be773");
     }
@@ -10234,6 +10270,7 @@ mod tests {
             "40be7731122334455".to_string(),
             "personal_code".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
+            crate::config::MessageQueueSettings::default(),
         );
         s.session_name = Some("my work".to_string());
         assert_eq!(s.title(), "personal_code  — my work  40be773");

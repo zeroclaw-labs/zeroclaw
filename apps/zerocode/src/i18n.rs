@@ -129,7 +129,7 @@ fn load_ftl_from_disk(locale: &str) -> Option<String> {
 /// `client::resolve_config_dir`: the `--config-dir` flag (passed to `init` and
 /// cached in `CONFIG_DIR`) first, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`.
 /// This keeps the FTL read path aligned with the flag the rest of zerocode uses.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(dir) = CONFIG_DIR.get() {
         return dir.clone();
     }
@@ -227,6 +227,83 @@ mod tests {
         .unwrap();
         assert!(mismatch.contains("0.8.1"));
         assert!(mismatch.contains("0.8.0"));
+    }
+
+    // Regression: every Config-pane key the zerocode UI section renders must
+    // resolve through the *same* Fluent bundle the TUI uses, not fall back to
+    // the raw `{key}` identifier. A prior revision shipped the code using
+    // `zc-zerocode-tab-todo-tracker` / `zc-zerocode-tracker-*` / `zc-zerocode-queue-*`
+    // while the catalog only defined a differently named `zc-zerocode-todo-*`
+    // family, so the pane rendered fallback key names. This guards the exact
+    // keys `zerocode_pane.rs` looks up for the Todo tracker + Message queue UI.
+    #[test]
+    fn todo_tracker_and_queue_config_keys_resolve() {
+        let map = format_ftl_messages(EN_FTL, "en");
+        const KEYS: &[&str] = &[
+            // Section tabs
+            "zc-zerocode-tab-todo-tracker",
+            "zc-zerocode-tab-message-queue",
+            // Todo tracker section
+            "zc-zerocode-tracker-title",
+            "zc-zerocode-tracker-enabled",
+            "zc-zerocode-tracker-enabled-at-start",
+            "zc-zerocode-tracker-location",
+            "zc-zerocode-tracker-width",
+            "zc-zerocode-tracker-max-height",
+            "zc-zerocode-tracker-saved",
+            "zc-zerocode-tracker-edit-number",
+            "zc-zerocode-tracker-edit-bool",
+            "zc-zerocode-tracker-edit-location",
+            // Message queue section
+            "zc-zerocode-queue-title",
+            "zc-zerocode-queue-cap",
+            "zc-zerocode-queue-default-width",
+            "zc-zerocode-queue-min-width",
+            "zc-zerocode-queue-max-width",
+            "zc-zerocode-queue-width-step",
+            "zc-zerocode-queue-auto-open",
+            "zc-zerocode-queue-stay-open-when-empty",
+            "zc-zerocode-queue-saved",
+            "zc-zerocode-queue-edit-number",
+            "zc-zerocode-queue-edit-bool",
+            "zc-zerocode-config-invalid-number",
+            "zc-zerocode-config-positive-required",
+            "zc-zerocode-config-width-order",
+            "zc-zerocode-config-save-mismatch",
+            // Help hints
+            "zc-zerocode-help-todo-tracker",
+            "zc-zerocode-help-message-queue",
+        ];
+        for key in KEYS {
+            let value = map
+                .get(*key)
+                .unwrap_or_else(|| panic!("catalog missing Config-pane key `{key}`"));
+            assert!(
+                !value.is_empty(),
+                "catalog key `{key}` resolved to an empty string"
+            );
+            // `t()` must not fall back to the raw `{key}` brace form.
+            assert_ne!(
+                t(key),
+                format!("{{{key}}}"),
+                "key `{key}` renders as its raw identifier instead of a translation"
+            );
+        }
+        let save_failed = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-zerocode-config-save-failed",
+            &[("error", "disk unavailable")],
+        )
+        .expect("argument-bearing Config-pane save error key must format");
+        assert!(save_failed.contains("disk unavailable"));
+        assert_ne!(
+            t_args(
+                "zc-zerocode-config-save-failed",
+                &[("error", "disk unavailable")]
+            ),
+            "{zc-zerocode-config-save-failed}"
+        );
     }
 
     #[test]

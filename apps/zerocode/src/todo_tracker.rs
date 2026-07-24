@@ -1,97 +1,23 @@
 //! Read-only TodoWrite tracker widget for the Code pane.
+//!
+//! Holds the last authoritative plan (whole-list replace) and owns the
+//! show/hide state machine: auto-pop once on the first plan of a
+//! session, after which the user's toggle is authoritative; a master
+//! `enabled` flag hard-gates all rendering.
+//!
+//! The config-derived types this widget is built from
+//! ([`TodoLocation`](crate::config::TodoLocation) and
+//! [`TodoTrackerSettings`](crate::config::TodoTrackerSettings)) live in
+//! [`crate::config`], the single owner of `zerocode-config.toml` parsing.
 
-use crate::wire::{ConfigFieldEntry, PlanEntry, PlanStatus};
+use crate::wire::{PlanEntry, PlanStatus};
 
-/// Where the tracker renders relative to the Code pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum TodoLocation {
-    Bottom,
-    Left,
-    Right,
-}
-
-impl TodoLocation {
-    /// Parse the `[todotracker] location` config value. Unknown values
-    /// fall back to `Right` (the schema default).
-    fn from_config_str(s: &str) -> Self {
-        match s {
-            "bottom" => Self::Bottom,
-            "left" => Self::Left,
-            _ => Self::Right,
-        }
-    }
-}
-
-/// Parsed `[todotracker]` config, sourced from the daemon over
-/// `config/list` at pane init. Defaults mirror the schema defaults so a
-/// fetch failure or absent section still yields correct behavior.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub(crate) struct TodoTrackerSettings {
-    pub enabled: bool,
-    pub enabled_at_start: bool,
-    pub location: TodoLocation,
-    pub width: u16,
-    pub max_height: u16,
-}
-
-impl Default for TodoTrackerSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            enabled_at_start: false,
-            location: TodoLocation::Right,
-            width: 32,
-            max_height: 5,
-        }
-    }
-}
-
-impl TodoTrackerSettings {
-    #[allow(dead_code)]
-    pub(crate) fn from_config_fields(fields: &[ConfigFieldEntry]) -> Self {
-        let mut s = Self::default();
-        for f in fields {
-            let key = f.path.rsplit('.').next().unwrap_or(f.path.as_str());
-            let Some(value) = f.value.as_ref() else {
-                continue;
-            };
-            match key {
-                "enabled" => {
-                    if let Some(b) = value.as_bool() {
-                        s.enabled = b;
-                    }
-                }
-                "enabled_at_start" => {
-                    if let Some(b) = value.as_bool() {
-                        s.enabled_at_start = b;
-                    }
-                }
-                "location" => {
-                    if let Some(loc) = value.as_str() {
-                        s.location = TodoLocation::from_config_str(loc);
-                    }
-                }
-                "width" => {
-                    if let Some(n) = value.as_u64() {
-                        s.width = n.clamp(1, u16::MAX as u64) as u16;
-                    }
-                }
-                "max_height" => {
-                    if let Some(n) = value.as_u64() {
-                        s.max_height = n.clamp(1, u16::MAX as u64) as u16;
-                    }
-                }
-                _ => {}
-            }
-        }
-        s
-    }
-}
+// Re-export the config-owned runtime types so existing `crate::todo_tracker::*`
+// call sites keep resolving after these moved to `crate::config` (their single
+// owner). The widget below is built from them.
+pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings};
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
     visible: bool,
@@ -104,7 +30,6 @@ pub(crate) struct TodoTracker {
     max_height: u16,
 }
 
-#[allow(dead_code)]
 impl TodoTracker {
     /// Construct from parsed `[todotracker]` settings.
     pub(crate) fn from_settings(settings: TodoTrackerSettings) -> Self {
@@ -164,6 +89,7 @@ impl TodoTracker {
         self.enabled && self.visible
     }
 
+    #[cfg(test)]
     pub(crate) fn entries(&self) -> &[PlanEntry] {
         &self.entries
     }
@@ -265,24 +191,6 @@ mod tests {
         }
     }
 
-    fn field(path: &str, value: serde_json::Value) -> crate::wire::ConfigFieldEntry {
-        crate::wire::ConfigFieldEntry {
-            path: path.to_string(),
-            category: "todotracker".to_string(),
-            kind: crate::wire::PropKind::String,
-            type_hint: String::new(),
-            value: Some(value),
-            populated: true,
-            is_secret: false,
-            is_env_overridden: false,
-            enum_variants: Vec::new(),
-            description: String::new(),
-            section: None,
-            tab: crate::wire::ConfigTab::None,
-            alias_source: None,
-        }
-    }
-
     #[test]
     fn settings_default_matches_schema_defaults() {
         let s = TodoTrackerSettings::default();
@@ -294,38 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_parse_all_fields_from_config() {
-        let fields = vec![
-            field("todotracker.enabled", serde_json::json!(true)),
-            field("todotracker.enabled_at_start", serde_json::json!(true)),
-            field("todotracker.location", serde_json::json!("bottom")),
-            field("todotracker.width", serde_json::json!(40)),
-            field("todotracker.max_height", serde_json::json!(8)),
-        ];
-        let s = TodoTrackerSettings::from_config_fields(&fields);
-        assert!(s.enabled);
-        assert!(s.enabled_at_start);
-        assert_eq!(s.location, TodoLocation::Bottom);
-        assert_eq!(s.width, 40);
-        assert_eq!(s.max_height, 8);
-    }
-
-    #[test]
-    fn settings_keep_defaults_for_absent_or_bad_fields() {
-        // Unknown location string falls back to Right; missing fields keep defaults.
-        let fields = vec![field("todotracker.location", serde_json::json!("diagonal"))];
-        let s = TodoTrackerSettings::from_config_fields(&fields);
-        assert_eq!(s.location, TodoLocation::Right);
-        assert_eq!(s.width, 32);
-        assert!(s.enabled);
-    }
-
-    #[test]
     fn config_enabled_false_disables_tracker() {
         // The reviewer's core case: [todotracker] enabled = false must
         // actually disable the running tracker.
-        let fields = vec![field("todotracker.enabled", serde_json::json!(false))];
-        let s = TodoTrackerSettings::from_config_fields(&fields);
+        let s = TodoTrackerSettings {
+            enabled: false,
+            ..TodoTrackerSettings::default()
+        };
         let mut t = TodoTracker::from_settings(s);
         t.set_plan(vec![entry("A", PlanStatus::Pending)]);
         assert!(
@@ -337,11 +220,12 @@ mod tests {
 
     #[test]
     fn config_enabled_at_start_shows_tracker_at_launch() {
-        let fields = vec![
-            field("todotracker.enabled", serde_json::json!(true)),
-            field("todotracker.enabled_at_start", serde_json::json!(true)),
-        ];
-        let t = TodoTracker::from_settings(TodoTrackerSettings::from_config_fields(&fields));
+        let s = TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            ..TodoTrackerSettings::default()
+        };
+        let t = TodoTracker::from_settings(s);
         assert!(
             t.is_visible(),
             "enabled_at_start=true must be visible at launch"
@@ -350,11 +234,12 @@ mod tests {
 
     #[test]
     fn config_width_and_max_height_flow_to_tracker() {
-        let fields = vec![
-            field("todotracker.width", serde_json::json!(50)),
-            field("todotracker.max_height", serde_json::json!(9)),
-        ];
-        let t = TodoTracker::from_settings(TodoTrackerSettings::from_config_fields(&fields));
+        let s = TodoTrackerSettings {
+            width: 50,
+            max_height: 9,
+            ..TodoTrackerSettings::default()
+        };
+        let t = TodoTracker::from_settings(s);
         assert_eq!(t.width(), 50);
         assert_eq!(t.max_height(), 9);
     }

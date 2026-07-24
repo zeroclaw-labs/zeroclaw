@@ -9,7 +9,6 @@
 
 mod color_depth;
 mod theme;
-mod todo_tracker;
 mod widgets;
 
 pub mod client;

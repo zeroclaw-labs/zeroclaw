@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::config;
-use crate::config::WssSection;
+use crate::config::{MessageQueueSection, TodoTrackerSection, WssSection};
 use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
 
@@ -29,15 +29,20 @@ enum Focus {
     Bindings,
     Locale,
     Connection,
+    // ── UI heading (Task 7) ────────────────────────────────────────
+    TodoTracker,
+    MessageQueue,
 }
 
-const FOCI: [Focus; 6] = [
+const FOCI: [Focus; 8] = [
     Focus::Theme,
     Focus::AgentTheme,
     Focus::Presets,
     Focus::Bindings,
     Focus::Locale,
     Focus::Connection,
+    Focus::TodoTracker,
+    Focus::MessageQueue,
 ];
 
 /// Which side of the split holds the live cursor. `Sections` is the left list
@@ -59,6 +64,8 @@ impl Focus {
             Self::Bindings => "zc-zerocode-tab-bindings",
             Self::Locale => "zc-zerocode-tab-locale",
             Self::Connection => "zc-zerocode-tab-connection",
+            Self::TodoTracker => "zc-zerocode-tab-todo-tracker",
+            Self::MessageQueue => "zc-zerocode-tab-message-queue",
         }
     }
 }
@@ -90,6 +97,74 @@ impl ConnField {
             Self::Uri => "uri",
             Self::SkipVerify => "tls.skip_verify",
             Self::SkipVerifyRoutes => "tls.skip_verify_routes",
+        }
+    }
+}
+
+// ── Todo tracker fields (Task 7) ────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackerField {
+    Enabled,
+    EnabledAtStart,
+    Location,
+    Width,
+    MaxHeight,
+}
+
+const TRACKER_FIELDS: [TrackerField; 5] = [
+    TrackerField::Enabled,
+    TrackerField::EnabledAtStart,
+    TrackerField::Location,
+    TrackerField::Width,
+    TrackerField::MaxHeight,
+];
+
+impl TrackerField {
+    fn fluent_key(self) -> &'static str {
+        match self {
+            Self::Enabled => "zc-zerocode-tracker-enabled",
+            Self::EnabledAtStart => "zc-zerocode-tracker-enabled-at-start",
+            Self::Location => "zc-zerocode-tracker-location",
+            Self::Width => "zc-zerocode-tracker-width",
+            Self::MaxHeight => "zc-zerocode-tracker-max-height",
+        }
+    }
+}
+
+// ── Message queue fields (Task 7) ───────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueField {
+    Cap,
+    DefaultWidth,
+    MinWidth,
+    MaxWidth,
+    WidthStep,
+    AutoOpen,
+    StayOpenWhenEmpty,
+}
+
+const QUEUE_FIELDS: [QueueField; 7] = [
+    QueueField::Cap,
+    QueueField::DefaultWidth,
+    QueueField::MinWidth,
+    QueueField::MaxWidth,
+    QueueField::WidthStep,
+    QueueField::AutoOpen,
+    QueueField::StayOpenWhenEmpty,
+];
+
+impl QueueField {
+    fn fluent_key(self) -> &'static str {
+        match self {
+            Self::Cap => "zc-zerocode-queue-cap",
+            Self::DefaultWidth => "zc-zerocode-queue-default-width",
+            Self::MinWidth => "zc-zerocode-queue-min-width",
+            Self::MaxWidth => "zc-zerocode-queue-max-width",
+            Self::WidthStep => "zc-zerocode-queue-width-step",
+            Self::AutoOpen => "zc-zerocode-queue-auto-open",
+            Self::StayOpenWhenEmpty => "zc-zerocode-queue-stay-open-when-empty",
         }
     }
 }
@@ -167,10 +242,27 @@ pub(crate) struct ZerocodePane {
     conn: WssSection,
     conn_cursor: usize,
     conn_edit: Option<ConnEdit>,
+    // ── UI heading (Task 7) ────────────────────────────────────────
+    tracker: TodoTrackerSection,
+    tracker_cursor: usize,
+    tracker_edit: Option<TrackerEdit>,
+    queue: MessageQueueSection,
+    queue_cursor: usize,
+    queue_edit: Option<QueueEdit>,
 }
 
 struct ConnEdit {
     field: ConnField,
+    buf: String,
+}
+
+struct TrackerEdit {
+    field: TrackerField,
+    buf: String,
+}
+
+struct QueueEdit {
+    field: QueueField,
     buf: String,
 }
 
@@ -232,6 +324,18 @@ impl ZerocodePane {
                 .unwrap_or_default(),
             conn_cursor: 0,
             conn_edit: None,
+            tracker: config::ensure_and_load(config_dir)
+                .ok()
+                .map(|c| c.todotracker)
+                .unwrap_or_default(),
+            tracker_cursor: 0,
+            tracker_edit: None,
+            queue: config::ensure_and_load(config_dir)
+                .ok()
+                .map(|c| c.message_queue)
+                .unwrap_or_default(),
+            queue_cursor: 0,
+            queue_edit: None,
         };
         pane.rebuild_rows();
         pane
@@ -247,7 +351,7 @@ impl ZerocodePane {
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.conn_edit.is_some()
+        self.conn_edit.is_some() || self.tracker_edit.is_some() || self.queue_edit.is_some()
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -275,6 +379,8 @@ impl ZerocodePane {
             Focus::Bindings => self.draw_bindings(frame, cols[1]),
             Focus::Locale => self.draw_locale(frame, cols[1]),
             Focus::Connection => self.draw_connection(frame, cols[1]),
+            Focus::TodoTracker => self.draw_todo_tracker(frame, cols[1]),
+            Focus::MessageQueue => self.draw_message_queue(frame, cols[1]),
         }
 
         if self.capture.is_some() {
@@ -692,6 +798,198 @@ impl ZerocodePane {
         );
     }
 
+    // ── Todo tracker section (Task 7) ───────────────────────────────
+
+    fn tracker_field_value(&self, field: TrackerField) -> String {
+        match field {
+            TrackerField::Enabled => if self.tracker.enabled {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            TrackerField::EnabledAtStart => if self.tracker.enabled_at_start {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            TrackerField::Location => match self.tracker.location {
+                config::TodoTrackerLocation::Bottom => "bottom",
+                config::TodoTrackerLocation::Left => "left",
+                config::TodoTrackerLocation::Right => "right",
+            }
+            .to_string(),
+            TrackerField::Width => self.tracker.width.to_string(),
+            TrackerField::MaxHeight => self.tracker.max_height.to_string(),
+        }
+    }
+
+    fn draw_todo_tracker(&self, frame: &mut Frame, area: Rect) {
+        if let Some(edit) = &self.tracker_edit {
+            use ratatui::layout::{Constraint, Direction, Layout};
+            let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
+            let hint = match edit.field {
+                TrackerField::Enabled | TrackerField::EnabledAtStart => {
+                    crate::i18n::t("zc-zerocode-tracker-edit-bool")
+                }
+                TrackerField::Location => crate::i18n::t("zc-zerocode-tracker-edit-location"),
+                TrackerField::Width | TrackerField::MaxHeight => {
+                    crate::i18n::t("zc-zerocode-tracker-edit-number")
+                }
+            };
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+
+            let buf_lines: Vec<&str> = edit.buf.split('\n').collect();
+            let lines: Vec<Line> = buf_lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let text = if i + 1 == buf_lines.len() {
+                        format!("{l}█")
+                    } else {
+                        (*l).to_string()
+                    };
+                    Line::from(Span::styled(text, theme::input_style()))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(theme::panel_block(&title))
+                    .wrap(Wrap { trim: false }),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(hint, theme::dim_style())),
+                rows[1],
+            );
+            return;
+        }
+
+        let items: Vec<ListItem> = TRACKER_FIELDS
+            .iter()
+            .map(|f| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<22}", crate::i18n::t(f.fluent_key())),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(self.tracker_field_value(*f), theme::body_style()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.tracker_cursor.min(TRACKER_FIELDS.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&crate::i18n::t(
+                    "zc-zerocode-tracker-title",
+                )))
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
+            area,
+            &mut state,
+        );
+    }
+
+    // ── Message queue section (Task 7) ──────────────────────────────
+
+    fn queue_field_value(&self, field: QueueField) -> String {
+        match field {
+            QueueField::Cap => self.queue.cap.to_string(),
+            QueueField::DefaultWidth => self.queue.default_width.to_string(),
+            QueueField::MinWidth => self.queue.min_width.to_string(),
+            QueueField::MaxWidth => self.queue.max_width.to_string(),
+            QueueField::WidthStep => self.queue.width_step.to_string(),
+            QueueField::AutoOpen => if self.queue.auto_open {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+            QueueField::StayOpenWhenEmpty => if self.queue.stay_open_when_empty {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        }
+    }
+
+    fn draw_message_queue(&self, frame: &mut Frame, area: Rect) {
+        if let Some(edit) = &self.queue_edit {
+            use ratatui::layout::{Constraint, Direction, Layout};
+            let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
+            let hint = match edit.field {
+                QueueField::AutoOpen | QueueField::StayOpenWhenEmpty => {
+                    crate::i18n::t("zc-zerocode-queue-edit-bool")
+                }
+                QueueField::Cap
+                | QueueField::DefaultWidth
+                | QueueField::MinWidth
+                | QueueField::MaxWidth
+                | QueueField::WidthStep => crate::i18n::t("zc-zerocode-queue-edit-number"),
+            };
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+
+            let buf_lines: Vec<&str> = edit.buf.split('\n').collect();
+            let lines: Vec<Line> = buf_lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let text = if i + 1 == buf_lines.len() {
+                        format!("{l}█")
+                    } else {
+                        (*l).to_string()
+                    };
+                    Line::from(Span::styled(text, theme::input_style()))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(theme::panel_block(&title))
+                    .wrap(Wrap { trim: false }),
+                rows[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(hint, theme::dim_style())),
+                rows[1],
+            );
+            return;
+        }
+
+        let items: Vec<ListItem> = QUEUE_FIELDS
+            .iter()
+            .map(|f| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<28}", crate::i18n::t(f.fluent_key())),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(self.queue_field_value(*f), theme::body_style()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.queue_cursor.min(QUEUE_FIELDS.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(theme::panel_block(&crate::i18n::t(
+                    "zc-zerocode-queue-title",
+                )))
+                .highlight_style(self.detail_highlight().0)
+                .highlight_symbol(self.detail_highlight().1),
+            area,
+            &mut state,
+        );
+    }
+
     // ── RPC bridge (config_manager holds the RpcClient) ──────────
 
     /// Feed the locale registry fetched via `locales/list`.
@@ -898,6 +1196,14 @@ impl ZerocodePane {
             self.handle_conn_edit_key(key);
             return true;
         }
+        if self.tracker_edit.is_some() {
+            self.handle_tracker_edit_key(key);
+            return true;
+        }
+        if self.queue_edit.is_some() {
+            self.handle_queue_edit_key(key);
+            return true;
+        }
         use crate::keymap::ConfigTabAction;
         match ConfigTabAction::from_chord(&key) {
             // Up/Down move within whichever side holds the cursor: the section
@@ -1030,6 +1336,8 @@ impl ZerocodePane {
                 Focus::Bindings => self.rows.len(),
                 Focus::Locale => self.locales.len() + 1,
                 Focus::Connection => CONN_FIELDS.len(),
+                Focus::TodoTracker => TRACKER_FIELDS.len(),
+                Focus::MessageQueue => QUEUE_FIELDS.len(),
             }
         };
         if len == 0 {
@@ -1045,6 +1353,8 @@ impl ZerocodePane {
                 Focus::Bindings => &mut self.binding_cursor,
                 Focus::Locale => &mut self.locale_cursor,
                 Focus::Connection => &mut self.conn_cursor,
+                Focus::TodoTracker => &mut self.tracker_cursor,
+                Focus::MessageQueue => &mut self.queue_cursor,
             }
         };
         let next = (*cursor as isize + delta).clamp(0, len as isize - 1);
@@ -1070,6 +1380,8 @@ impl ZerocodePane {
             }
             Focus::Locale => self.select_locale_row(),
             Focus::Connection => self.activate_connection(),
+            Focus::TodoTracker => self.activate_tracker(),
+            Focus::MessageQueue => self.activate_queue(),
         }
     }
 
@@ -1168,6 +1480,268 @@ impl ZerocodePane {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                     && let Some(e) = self.conn_edit.as_mut()
+                {
+                    e.buf.push(c);
+                }
+            }
+        }
+    }
+
+    // ── Todo tracker activate / edit (Task 7) ───────────────────────
+
+    fn activate_tracker(&mut self) {
+        let Some(field) = TRACKER_FIELDS.get(self.tracker_cursor).copied() else {
+            return;
+        };
+        // Booleans toggle on Enter without opening the editor.
+        if field == TrackerField::Enabled || field == TrackerField::EnabledAtStart {
+            let mut candidate = self.tracker.clone();
+            match field {
+                TrackerField::Enabled => candidate.enabled = !candidate.enabled,
+                TrackerField::EnabledAtStart => {
+                    candidate.enabled_at_start = !candidate.enabled_at_start
+                }
+                _ => {}
+            }
+            self.persist_tracker_candidate(candidate);
+            return;
+        }
+        // Location cycles on Enter.
+        if field == TrackerField::Location {
+            let mut candidate = self.tracker.clone();
+            candidate.location = match candidate.location {
+                config::TodoTrackerLocation::Bottom => config::TodoTrackerLocation::Left,
+                config::TodoTrackerLocation::Left => config::TodoTrackerLocation::Right,
+                config::TodoTrackerLocation::Right => config::TodoTrackerLocation::Bottom,
+            };
+            self.persist_tracker_candidate(candidate);
+            return;
+        }
+        // Numbers and text open the editor.
+        let buf = match field {
+            TrackerField::Width => self.tracker.width.to_string(),
+            TrackerField::MaxHeight => self.tracker.max_height.to_string(),
+            _ => String::new(),
+        };
+        self.tracker_edit = Some(TrackerEdit { field, buf });
+    }
+
+    fn set_ui_validation_error(&mut self, error: config::UiSectionValidationError) {
+        let key = match error {
+            config::UiSectionValidationError::PositiveRequired => {
+                "zc-zerocode-config-positive-required"
+            }
+            config::UiSectionValidationError::WidthOrder => "zc-zerocode-config-width-order",
+        };
+        self.status = Some(crate::i18n::t(key));
+    }
+
+    fn set_ui_save_error(&mut self, error: &anyhow::Error) {
+        self.status = Some(crate::i18n::t_args(
+            "zc-zerocode-config-save-failed",
+            &[("error", &error.to_string())],
+        ));
+    }
+
+    fn persist_tracker_candidate(&mut self, candidate: TodoTrackerSection) {
+        if let Err(error) = candidate.validate() {
+            self.set_ui_validation_error(error);
+            return;
+        }
+        if let Err(error) = config::persist_todotracker(&self.config_dir, &candidate) {
+            self.set_ui_save_error(&error);
+            return;
+        }
+        match config::ensure_and_load(&self.config_dir) {
+            Ok(loaded) => {
+                let resolved_matches = loaded.resolve_todo_tracker() == candidate.resolve();
+                if loaded.todotracker != candidate || !resolved_matches {
+                    self.tracker = loaded.todotracker;
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-save-mismatch"));
+                    return;
+                }
+                self.tracker = candidate;
+                self.status = Some(crate::i18n::t("zc-zerocode-tracker-saved"));
+            }
+            Err(error) => self.set_ui_save_error(&error),
+        }
+    }
+
+    fn commit_tracker_edit(&mut self) {
+        let Some(edit) = self.tracker_edit.take() else {
+            return;
+        };
+        let parsed = match edit.buf.trim().parse::<u16>() {
+            Ok(value) => value,
+            Err(_) => {
+                self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                return;
+            }
+        };
+        let mut candidate = self.tracker.clone();
+        match edit.field {
+            TrackerField::Width => {
+                candidate.width = parsed;
+            }
+            TrackerField::MaxHeight => {
+                candidate.max_height = parsed;
+            }
+            _ => return,
+        }
+        self.persist_tracker_candidate(candidate);
+    }
+
+    fn handle_tracker_edit_key(&mut self, key: KeyEvent) {
+        use crate::keymap::ConfigEditorAction;
+        match ConfigEditorAction::from_chord(&key) {
+            Some(ConfigEditorAction::Cancel) => {
+                self.tracker_edit = None;
+            }
+            Some(ConfigEditorAction::Save) => {
+                self.commit_tracker_edit();
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.commit_tracker_edit();
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                if let Some(e) = self.tracker_edit.as_mut() {
+                    e.buf.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(e) = self.tracker_edit.as_mut()
+                {
+                    e.buf.push(c);
+                }
+            }
+        }
+    }
+
+    // ── Message queue activate / edit (Task 7) ──────────────────────
+
+    fn activate_queue(&mut self) {
+        let Some(field) = QUEUE_FIELDS.get(self.queue_cursor).copied() else {
+            return;
+        };
+        // Booleans toggle on Enter without opening the editor.
+        if field == QueueField::AutoOpen || field == QueueField::StayOpenWhenEmpty {
+            let mut candidate = self.queue.clone();
+            match field {
+                QueueField::AutoOpen => candidate.auto_open = !candidate.auto_open,
+                QueueField::StayOpenWhenEmpty => {
+                    candidate.stay_open_when_empty = !candidate.stay_open_when_empty
+                }
+                _ => {}
+            }
+            self.persist_queue_candidate(candidate);
+            return;
+        }
+        // Numbers open the editor.
+        let buf = match field {
+            QueueField::Cap => self.queue.cap.to_string(),
+            QueueField::DefaultWidth => self.queue.default_width.to_string(),
+            QueueField::MinWidth => self.queue.min_width.to_string(),
+            QueueField::MaxWidth => self.queue.max_width.to_string(),
+            QueueField::WidthStep => self.queue.width_step.to_string(),
+            _ => String::new(),
+        };
+        self.queue_edit = Some(QueueEdit { field, buf });
+    }
+
+    fn persist_queue_candidate(&mut self, candidate: MessageQueueSection) {
+        if let Err(error) = candidate.validate() {
+            self.set_ui_validation_error(error);
+            return;
+        }
+        if let Err(error) = config::persist_message_queue(&self.config_dir, &candidate) {
+            self.set_ui_save_error(&error);
+            return;
+        }
+        match config::ensure_and_load(&self.config_dir) {
+            Ok(loaded) => {
+                let resolved_matches = loaded.resolve_message_queue() == candidate.resolve();
+                if loaded.message_queue != candidate || !resolved_matches {
+                    self.queue = loaded.message_queue;
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-save-mismatch"));
+                    return;
+                }
+                self.queue = candidate;
+                self.status = Some(crate::i18n::t("zc-zerocode-queue-saved"));
+            }
+            Err(error) => self.set_ui_save_error(&error),
+        }
+    }
+
+    fn commit_queue_edit(&mut self) {
+        let Some(edit) = self.queue_edit.take() else {
+            return;
+        };
+        let trimmed = edit.buf.trim();
+        let mut candidate = self.queue.clone();
+        match edit.field {
+            QueueField::Cap => {
+                let Ok(value) = trimmed.parse::<usize>() else {
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                    return;
+                };
+                candidate.cap = value;
+            }
+            QueueField::DefaultWidth => {
+                let Ok(value) = trimmed.parse::<u16>() else {
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                    return;
+                };
+                candidate.default_width = value;
+            }
+            QueueField::MinWidth => {
+                let Ok(value) = trimmed.parse::<u16>() else {
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                    return;
+                };
+                candidate.min_width = value;
+            }
+            QueueField::MaxWidth => {
+                let Ok(value) = trimmed.parse::<u16>() else {
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                    return;
+                };
+                candidate.max_width = value;
+            }
+            QueueField::WidthStep => {
+                let Ok(value) = trimmed.parse::<u16>() else {
+                    self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                    return;
+                };
+                candidate.width_step = value;
+            }
+            _ => return,
+        }
+        self.persist_queue_candidate(candidate);
+    }
+
+    fn handle_queue_edit_key(&mut self, key: KeyEvent) {
+        use crate::keymap::ConfigEditorAction;
+        match ConfigEditorAction::from_chord(&key) {
+            Some(ConfigEditorAction::Cancel) => {
+                self.queue_edit = None;
+            }
+            Some(ConfigEditorAction::Save) => {
+                self.commit_queue_edit();
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.commit_queue_edit();
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                if let Some(e) = self.queue_edit.as_mut() {
+                    e.buf.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(e) = self.queue_edit.as_mut()
                 {
                     e.buf.push(c);
                 }
@@ -1397,6 +1971,18 @@ impl ZerocodePane {
                     crate::i18n::t("zc-zerocode-help-conn"),
                 ));
             }
+            Focus::TodoTracker => {
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-todo-tracker"),
+                ));
+            }
+            Focus::MessageQueue => {
+                entries.push(E::new(
+                    keys(A::Enter),
+                    crate::i18n::t("zc-zerocode-help-message-queue"),
+                ));
+            }
         }
         entries.push(E::new(
             [keys(A::TabLeft), keys(A::Back)].concat(),
@@ -1485,6 +2071,8 @@ impl ZerocodePane {
             Focus::Bindings => self.rows.len(),
             Focus::Locale => self.locales.len() + 1,
             Focus::Connection => CONN_FIELDS.len(),
+            Focus::TodoTracker => TRACKER_FIELDS.len(),
+            Focus::MessageQueue => QUEUE_FIELDS.len(),
         }
     }
 
@@ -1505,6 +2093,8 @@ impl ZerocodePane {
             Focus::Bindings => self.binding_cursor = idx,
             Focus::Locale => self.locale_cursor = idx,
             Focus::Connection => self.conn_cursor = idx,
+            Focus::TodoTracker => self.tracker_cursor = idx,
+            Focus::MessageQueue => self.queue_cursor = idx,
         }
     }
 }
@@ -1641,6 +2231,125 @@ mod tests {
         while pane.focus != target {
             pane.handle_key(key(KeyCode::Down));
         }
+    }
+
+    fn edit_tracker_number(pane: &mut ZerocodePane, field: TrackerField, value: &str) {
+        pane.tracker_cursor = TRACKER_FIELDS
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("tracker field is registered");
+        pane.activate_tracker();
+        pane.tracker_edit
+            .as_mut()
+            .expect("numeric tracker field opens an editor")
+            .buf = value.to_string();
+        pane.handle_tracker_edit_key(key(KeyCode::Enter));
+    }
+
+    fn edit_queue_number(pane: &mut ZerocodePane, field: QueueField, value: &str) {
+        pane.queue_cursor = QUEUE_FIELDS
+            .iter()
+            .position(|candidate| *candidate == field)
+            .expect("queue field is registered");
+        pane.activate_queue();
+        pane.queue_edit
+            .as_mut()
+            .expect("numeric queue field opens an editor")
+            .buf = value.to_string();
+        pane.handle_queue_edit_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn tracker_malformed_edit_does_not_persist_or_report_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = TodoTrackerSection {
+            width: 40,
+            ..TodoTrackerSection::default()
+        };
+        config::persist_todotracker(dir.path(), &original).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.todotracker, original);
+        assert_eq!(reloaded.resolve_todo_tracker().width, 40);
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    #[test]
+    fn queue_zero_edit_does_not_persist_or_report_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = MessageQueueSection {
+            cap: 64,
+            ..MessageQueueSection::default()
+        };
+        config::persist_message_queue(dir.path(), &original).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_queue_number(&mut pane, QueueField::Cap, "0");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.message_queue, original);
+        assert_eq!(reloaded.resolve_message_queue().cap, 64);
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-config-positive-required").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-queue-saved").as_str())
+        );
+    }
+
+    #[test]
+    fn queue_inconsistent_width_edit_does_not_persist_or_report_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = MessageQueueSection::default();
+        config::persist_message_queue(dir.path(), &original).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_queue_number(&mut pane, QueueField::MinWidth, "60");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.message_queue, original);
+        assert_eq!(
+            reloaded.resolve_message_queue(),
+            MessageQueueSection::default().resolve()
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-config-width-order").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-queue-saved").as_str())
+        );
+    }
+
+    #[test]
+    fn valid_queue_edit_persists_exact_session_consumed_value() {
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_message_queue(dir.path(), &MessageQueueSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_queue_number(&mut pane, QueueField::DefaultWidth, "52");
+
+        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        assert_eq!(reloaded.message_queue.default_width, 52);
+        assert_eq!(reloaded.resolve_message_queue().default_width, 52);
+        assert_eq!(pane.queue.default_width, 52);
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-queue-saved").as_str())
+        );
     }
 
     // The Locale tab is a pick-from-list surface with no free-entry, so the

@@ -259,13 +259,6 @@ pub struct Config {
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
 
-    /// ZeroCode live task tracker (`[todotracker]`), the read-only
-    /// TodoWrite visual tracker in the Code pane.
-    #[serde(default)]
-    #[nested]
-    #[group = "Operations"]
-    pub todotracker: TodoTrackerConfig,
-
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
     /// Each entry is a named scheduled job synced into the database at
@@ -12382,74 +12375,6 @@ impl Default for HeartbeatConfig {
     }
 }
 
-// ── TodoTracker ──────────────────────────────────────────────────
-
-/// Location of the ZeroCode TodoWrite tracker panel.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum TodoTrackerLocation {
-    /// Horizontal strip between the transcript and the input bar (Claude Code style).
-    Bottom,
-    /// Vertical side panel on the left.
-    Left,
-    /// Vertical side panel on the right (OpenCode style). Default.
-    #[default]
-    Right,
-}
-
-/// ZeroCode live task tracker configuration (`[todotracker]` section).
-///
-/// Read-only visual tracker driven by the model's `TodoWrite` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "todotracker"]
-pub struct TodoTrackerConfig {
-    /// Master switch. When `false` the tracker never renders and never
-    /// auto-pops. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Whether the panel is visible at launch (when `enabled`). When
-    /// `false` it stays hidden until toggled or auto-popped by the first
-    /// plan. Default: `false`.
-    #[serde(default)]
-    pub enabled_at_start: bool,
-    /// Panel location: `bottom` (between transcript and input), `left`,
-    /// or `right` (default).
-    #[serde(default)]
-    pub location: TodoTrackerLocation,
-    /// Side-panel target column width (left/right). Runtime-clamped to at
-    /// most half the terminal width. Ignored for `bottom`. Default: `32`.
-    #[serde(default = "default_todotracker_width")]
-    pub width: u16,
-    /// Bottom-strip maximum height in rows (grows up to this). Ignored for
-    /// left/right. Default: `5`.
-    #[serde(default = "default_todotracker_max_height")]
-    pub max_height: u16,
-}
-
-fn default_todotracker_width() -> u16 {
-    32
-}
-
-fn default_todotracker_max_height() -> u16 {
-    5
-}
-
-impl Default for TodoTrackerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            enabled_at_start: false,
-            location: TodoTrackerLocation::Right,
-            width: default_todotracker_width(),
-            max_height: default_todotracker_max_height(),
-        }
-    }
-}
-
 // ── Cron ────────────────────────────────────────────────────────
 
 /// A declarative cron job definition (`[cron.<alias>]`).
@@ -17381,7 +17306,6 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -22176,32 +22100,6 @@ impl HasPropKind for serde_json::Value {
 mod tests {
 
     #[::core::prelude::v1::test]
-    fn todotracker_config_defaults() {
-        let cfg = super::TodoTrackerConfig::default();
-        assert!(cfg.enabled);
-        assert!(!cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
-        assert_eq!(cfg.width, 32);
-        assert_eq!(cfg.max_height, 5);
-    }
-
-    #[::core::prelude::v1::test]
-    fn todotracker_config_parses_from_toml() {
-        let toml = r#"
-enabled = true
-enabled_at_start = true
-location = "bottom"
-width = 40
-max_height = 8
-"#;
-        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
-        assert_eq!(cfg.width, 40);
-        assert_eq!(cfg.max_height, 8);
-    }
-
-    #[::core::prelude::v1::test]
     fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
         // Absent field defaults to empty.
         let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
@@ -24417,7 +24315,6 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
@@ -25352,7 +25249,6 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
