@@ -807,9 +807,13 @@ impl DelegateTool {
         {
             return (
                 type_key.to_string(),
-                cfg.api_key
-                    .clone()
-                    .or_else(|| self.global_credential.clone()),
+                if cfg.requires_openai_auth {
+                    cfg.api_key.clone()
+                } else {
+                    cfg.api_key
+                        .clone()
+                        .or_else(|| self.global_credential.clone())
+                },
                 cfg.model.clone().unwrap_or_default(),
                 cfg.temperature,
             );
@@ -8086,6 +8090,100 @@ command = "echo hi"
             !result.output.contains("forbidden_tool_seen"),
             "target policy should have filtered out file_write, but got: {}",
             result.output
+        );
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_returns_none_credential() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: None,
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (provider_type, credential, model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(provider_type, "openai");
+        assert!(
+            credential.is_none(),
+            "OAuth target must not inherit global coordinator credential"
+        );
+        assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_preserves_explicit_alias_key() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: Some("sk-codex-custom-gateway-key".to_string()),
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-codex-custom-gateway-key"),
+            "OAuth target with explicit api_key must preserve the alias key"
+        );
+    }
+
+    #[test]
+    fn resolve_brain_non_oauth_fallback_preserved() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut custom_map = HashMap::new();
+        custom_map.insert(
+            "local".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: false,
+                api_key: None,
+                model: Some("llama3".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("custom".to_string(), custom_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("custom.local");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-ant-global-coordinator-key"),
+            "non-OAuth target without api_key must fall back to global credential"
         );
     }
 }
