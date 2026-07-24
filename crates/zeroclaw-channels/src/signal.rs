@@ -4,9 +4,10 @@ use lru::LruCache;
 use parking_lot::Mutex as SyncMutex;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -17,6 +18,11 @@ use zeroclaw_api::channel::{
 const GROUP_TARGET_PREFIX: &str = "group:";
 
 const RECENT_TARGETS_CAPACITY: usize = 1024;
+
+/// Cap on `recent_self_sends`: outbound Note-to-Self bodies we're still
+/// watching for so the echo they generate on the SSE stream doesn't get
+/// re-ingested as a fresh inbound message.
+const RECENT_SELF_SENDS_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
@@ -59,6 +65,20 @@ pub struct SignalChannel {
     /// sender (E.164 phone number or UUID) in `ChannelMessage.id`. Bounded
     /// LRU; once a message ages out, reactions against it fail cleanly.
     recent_targets: Arc<SyncMutex<LruCache<String, ReactionTarget>>>,
+    /// `(token, body)` of outbound text messages just sent to
+    /// `self.account` (our own Note-to-Self number), so the
+    /// `syncMessage.sentMessage` echo signal-cli plays back for our own
+    /// sends isn't re-ingested as a new inbound message. Echo matching is
+    /// by body (oldest entry first, consumed once); the token lets a
+    /// failed `send` roll back exactly its own entry without stealing an
+    /// identical-content in-flight send's. Covers plain text sends only:
+    /// polls (`sendPollCreate`) echo without a message body and are
+    /// already dropped by the empty-content gate, and speculatively
+    /// recording a poll question could leave a never-consumed entry that
+    /// later swallows a genuine identical note. Bounded ring buffer.
+    recent_self_sends: Arc<SyncMutex<VecDeque<(u64, String)>>>,
+    /// Monotonic token source for `recent_self_sends` entries.
+    self_send_seq: Arc<AtomicU64>,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -81,6 +101,30 @@ struct Envelope {
     story_message: Option<serde_json::Value>,
     #[serde(default)]
     timestamp: Option<u64>,
+    #[serde(rename = "syncMessage", default)]
+    sync_message: Option<SyncMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncMessage {
+    #[serde(rename = "sentMessage", default)]
+    sent_message: Option<SentMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentMessage {
+    #[serde(default)]
+    destination: Option<String>,
+    #[serde(rename = "destinationNumber", default)]
+    destination_number: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    timestamp: Option<u64>,
+    #[serde(rename = "groupInfo", default)]
+    group_info: Option<GroupInfo>,
+    #[serde(default)]
+    attachments: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +206,10 @@ impl SignalChannel {
                 NonZeroUsize::new(RECENT_TARGETS_CAPACITY)
                     .expect("RECENT_TARGETS_CAPACITY is a non-zero constant"),
             ))),
+            recent_self_sends: Arc::new(SyncMutex::new(VecDeque::with_capacity(
+                RECENT_SELF_SENDS_CAPACITY,
+            ))),
+            self_send_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -404,6 +452,13 @@ impl SignalChannel {
         }
 
         let Some(data_msg) = envelope.data_message.as_ref() else {
+            if let Some(sent) = envelope
+                .sync_message
+                .as_ref()
+                .and_then(|s| s.sent_message.as_ref())
+            {
+                return self.process_sent_sync_message(envelope, sent);
+            }
             return Vec::new();
         };
 
@@ -436,15 +491,7 @@ impl SignalChannel {
         let timestamp = data_msg
             .timestamp
             .or(envelope.timestamp)
-            .unwrap_or_else(|| {
-                u64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis(),
-                )
-                .unwrap_or(u64::MAX)
-            });
+            .unwrap_or_else(Self::now_ms);
 
         // Build the list of synthetic content strings. For poll votes,
         // emit one entry per selected title (or per selected index when
@@ -476,6 +523,86 @@ impl SignalChannel {
                 .map(|t| vec![t.to_string()])
                 .unwrap_or_default()
         };
+
+        self.build_messages(&sender, &target, timestamp, contents)
+    }
+
+    /// Handle a Signal "Note to Self" sync envelope
+    /// (`syncMessage.sentMessage`). signal-cli surfaces messages the
+    /// linked account sent to itself this way rather than as a
+    /// `dataMessage`, so without this path Note-to-Self traffic is
+    /// silently dropped upstream in `process_envelope`.
+    ///
+    /// Only sync sent-messages addressed to `self.account` are accepted;
+    /// sync echoes of messages sent to other contacts and group sync
+    /// messages are ignored. Sender and reply target both resolve to the
+    /// envelope's source (falling back to `self.account`), mirroring the
+    /// direct-DM path so replies land back in the Note-to-Self
+    /// conversation.
+    fn process_sent_sync_message(
+        &self,
+        envelope: &Envelope,
+        sent: &SentMessage,
+    ) -> Vec<ChannelMessage> {
+        // Group sync messages are out of scope for Note-to-Self.
+        if sent.group_info.is_some() {
+            return Vec::new();
+        }
+
+        let destination = sent
+            .destination_number
+            .as_deref()
+            .or(sent.destination.as_deref());
+        if destination != Some(self.account.as_str()) {
+            return Vec::new();
+        }
+
+        // Skip attachment-only messages when configured, mirroring the
+        // dataMessage path.
+        if self.ignore_attachments {
+            let has_attachments = sent.attachments.as_ref().is_some_and(|a| !a.is_empty());
+            if has_attachments && sent.message.is_none() {
+                return Vec::new();
+            }
+        }
+
+        // Our own outbound Note-to-Self replies echo back through this
+        // same sync path; drop the echo instead of re-ingesting it as a
+        // new inbound message.
+        if self.consume_self_send_echo(sent.message.as_deref()) {
+            return Vec::new();
+        }
+
+        let sender = Self::sender(envelope).unwrap_or_else(|| self.account.clone());
+
+        if !self.is_sender_allowed(&sender) {
+            return Vec::new();
+        }
+
+        let timestamp = sent
+            .timestamp
+            .or(envelope.timestamp)
+            .unwrap_or_else(Self::now_ms);
+
+        let Some(content) = sent.message.as_deref().filter(|t| !t.is_empty()) else {
+            return Vec::new();
+        };
+
+        self.build_messages(&sender, &sender, timestamp, vec![content.to_string()])
+    }
+
+    /// Build one `ChannelMessage` per content string, seeding
+    /// `recent_targets` for each so outbound reactions can round-trip to
+    /// `(author, timestamp)` without embedding the sender in the opaque
+    /// id. Shared by the `dataMessage` and `syncMessage.sentMessage`
+    /// paths so their emission logic can't drift apart.
+    fn build_messages(
+        &self,
+        sender: &str,
+        reply_target: &str,
+        timestamp: u64,
+        contents: Vec<String>,
+    ) -> Vec<ChannelMessage> {
         contents
             .into_iter()
             .enumerate()
@@ -488,15 +615,15 @@ impl SignalChannel {
                 self.recent_targets.lock().put(
                     id.clone(),
                     ReactionTarget {
-                        author: sender.clone(),
+                        author: sender.to_string(),
                         timestamp_ms: timestamp,
                     },
                 );
 
                 ChannelMessage {
                     id,
-                    sender: sender.clone(),
-                    reply_target: target.clone(),
+                    sender: sender.to_string(),
+                    reply_target: reply_target.to_string(),
                     content,
                     channel: "signal".to_string(),
                     channel_alias: Some(self.alias.clone()),
@@ -511,6 +638,63 @@ impl SignalChannel {
             })
             .collect()
     }
+
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    /// Record an outbound Note-to-Self text body so its
+    /// `syncMessage.sentMessage` echo on the SSE stream can be recognized
+    /// and dropped once, instead of being re-ingested as a new inbound
+    /// message. Returns the entry's token so a failed send can roll back
+    /// exactly its own entry via `remove_self_send`. Text sends only —
+    /// see the `recent_self_sends` field docs for why poll sends don't
+    /// record. Bounded ring buffer; oldest entry is evicted once
+    /// `RECENT_SELF_SENDS_CAPACITY` is reached.
+    fn record_self_send(&self, content: String) -> u64 {
+        let token = self.self_send_seq.fetch_add(1, Ordering::Relaxed);
+        let mut recent = self.recent_self_sends.lock();
+        if recent.len() >= RECENT_SELF_SENDS_CAPACITY {
+            recent.pop_front();
+        }
+        recent.push_back((token, content));
+        token
+    }
+
+    /// Remove the entry `record_self_send` returned `token` for, if it's
+    /// still present. No-op when the echo already consumed it — the
+    /// token-exact match guarantees a rollback can never remove an
+    /// unrelated identical-content entry.
+    fn remove_self_send(&self, token: u64) {
+        let mut recent = self.recent_self_sends.lock();
+        if let Some(pos) = recent.iter().position(|(t, _)| *t == token) {
+            recent.remove(pos);
+        }
+    }
+
+    /// If `content` matches a body recorded by `record_self_send`,
+    /// consume the oldest such entry and report the match so the caller
+    /// can drop the echo. Returns `false` (no-op) for `None`.
+    fn consume_self_send_echo(&self, content: Option<&str>) -> bool {
+        let Some(content) = content else {
+            return false;
+        };
+        let mut recent = self.recent_self_sends.lock();
+        match recent.iter().position(|(_, c)| c == content) {
+            Some(pos) => {
+                recent.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn random_id_suffix() -> String {
         use rand::RngExt;
         const CHARSET: &[u8] = b"0123456789abcdef";
@@ -568,7 +752,8 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(&message.recipient) {
+        let target = Self::parse_recipient_target(&message.recipient);
+        let params = match &target {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
                 "message": &message.content,
@@ -581,7 +766,26 @@ impl Channel for SignalChannel {
             }),
         };
 
-        self.rpc_request("send", params).await?;
+        // Record Note-to-Self sends BEFORE the RPC: the SSE listen() loop
+        // runs as an independent task, and signal-cli can push the
+        // syncMessage.sentMessage echo before the send response resolves.
+        // Recording first closes that race; rolling back the entry by
+        // token on RPC failure keeps failed sends from poisoning the
+        // guard (and is a no-op if the echo already consumed it).
+        let self_send_token = match &target {
+            RecipientTarget::Direct(number) if *number == self.account => {
+                Some(self.record_self_send(message.content.clone()))
+            }
+            _ => None,
+        };
+
+        if let Err(err) = self.rpc_request("send", params).await {
+            if let Some(token) = self_send_token {
+                self.remove_self_send(token);
+            }
+            return Err(err);
+        }
+
         Ok(())
     }
 
@@ -941,6 +1145,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -1318,6 +1523,7 @@ mod tests {
             source_number: Some("+1111111111".to_string()),
             data_message: None,
             story_message: None,
+            sync_message: None,
             timestamp: Some(1000),
         };
         assert_eq!(SignalChannel::sender(&env), Some("+1111111111".to_string()));
@@ -1330,6 +1536,7 @@ mod tests {
             source_number: None,
             data_message: None,
             story_message: None,
+            sync_message: None,
             timestamp: Some(1000),
         };
         assert_eq!(SignalChannel::sender(&env), Some("uuid-123".to_string()));
@@ -1363,6 +1570,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let mut msgs = ch.process_envelope(&env);
@@ -1422,6 +1630,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let mut msgs = ch.process_envelope(&env);
@@ -1442,6 +1651,7 @@ mod tests {
             source_number: None,
             data_message: None,
             story_message: None,
+            sync_message: None,
             timestamp: None,
         };
         assert_eq!(SignalChannel::sender(&env), None);
@@ -1590,6 +1800,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         assert!(ch.process_envelope(&env).is_empty());
@@ -1624,6 +1835,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let mut msgs = ch.process_envelope(&env);
@@ -1680,6 +1892,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let mut msgs = ch.process_envelope(&env);
@@ -1910,6 +2123,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let mut msgs = ch.process_envelope(&env);
@@ -1991,6 +2205,7 @@ mod tests {
                 poll_vote: None,
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -2012,6 +2227,7 @@ mod tests {
                 }),
             }),
             story_message: None,
+            sync_message: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -2105,5 +2321,461 @@ mod tests {
         // PollAnswer present but both vecs empty (signal-cli weirdness).
         let env = poll_envelope(Some("+1111111111"), vec![], vec![]);
         assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    // ── Note-to-Self (syncMessage.sentMessage) ─────────────────────
+
+    /// Note-to-Self channels need the account itself in the allowlist,
+    /// since the "sender" of a Note-to-Self message is the account.
+    fn make_self_allowed_channel(ignore_attachments: bool) -> SignalChannel {
+        SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            ignore_attachments,
+            false,
+        )
+    }
+
+    fn make_sent_sync_envelope(
+        source: Option<&str>,
+        destination: Option<&str>,
+        message: Option<&str>,
+        group_id: Option<&str>,
+        attachments: Option<Vec<serde_json::Value>>,
+    ) -> Envelope {
+        Envelope {
+            source: source.map(String::from),
+            source_number: source.map(String::from),
+            data_message: None,
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+            sync_message: Some(SyncMessage {
+                sent_message: Some(SentMessage {
+                    destination: destination.map(String::from),
+                    destination_number: destination.map(String::from),
+                    message: message.map(String::from),
+                    timestamp: Some(1_700_000_000_000),
+                    group_info: group_id.map(|gid| GroupInfo {
+                        group_id: Some(gid.to_string()),
+                    }),
+                    attachments,
+                }),
+            }),
+        }
+    }
+
+    /// Wrap a hand-built `SentMessage` in a sync envelope, for tests
+    /// needing destination/timestamp shapes `make_sent_sync_envelope`
+    /// doesn't cover.
+    fn wrap_sent_sync(
+        source: Option<&str>,
+        envelope_timestamp: Option<u64>,
+        sent: SentMessage,
+    ) -> Envelope {
+        Envelope {
+            source: source.map(String::from),
+            source_number: source.map(String::from),
+            data_message: None,
+            story_message: None,
+            timestamp: envelope_timestamp,
+            sync_message: Some(SyncMessage {
+                sent_message: Some(sent),
+            }),
+        }
+    }
+
+    #[test]
+    fn process_envelope_note_to_self_happy_path() {
+        let ch = make_self_allowed_channel(false);
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1234567890"),
+            Some("note to self text"),
+            None,
+            None,
+        );
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
+        assert_eq!(msg.sender, "+1234567890");
+        assert_eq!(msg.reply_target, "+1234567890");
+        assert_eq!(msg.content, "note to self text");
+        assert_eq!(msg.channel, "signal");
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp: {}",
+            msg.id
+        );
+        let target = ch
+            .recent_targets
+            .lock()
+            .peek(&msg.id)
+            .cloned()
+            .expect("recent_targets should contain the just-emitted id");
+        assert_eq!(target.author, "+1234567890");
+        assert_eq!(target.timestamp_ms, 1_700_000_000_000);
+
+        // Verify reply routing: the Note-to-Self reply target must route
+        // as a Direct send back to the account's own number.
+        assert_eq!(
+            SignalChannel::parse_recipient_target(&msg.reply_target),
+            RecipientTarget::Direct("+1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_to_other_contact_ignored() {
+        let ch = make_self_allowed_channel(false);
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1999999999"),
+            Some("hey there"),
+            None,
+            None,
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_destination_number_takes_precedence() {
+        let ch = make_self_allowed_channel(false);
+        // destinationNumber matches the account: accepted even though
+        // `destination` names someone else.
+        let env = wrap_sent_sync(
+            Some("+1234567890"),
+            Some(1_700_000_000_000),
+            SentMessage {
+                destination: Some("+1999999999".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("number wins".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+            },
+        );
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "number wins");
+
+        // destinationNumber names someone else: skipped even though
+        // `destination` matches the account.
+        let env = wrap_sent_sync(
+            Some("+1234567890"),
+            Some(1_700_000_000_000),
+            SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1999999999".to_string()),
+                message: Some("number wins".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+            },
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_no_destination_ignored() {
+        let ch = make_self_allowed_channel(false);
+        let env = wrap_sent_sync(
+            Some("+1234567890"),
+            Some(1_700_000_000_000),
+            SentMessage {
+                destination: None,
+                destination_number: None,
+                message: Some("nowhere to go".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+            },
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_timestamp_falls_back_to_envelope() {
+        let ch = make_self_allowed_channel(false);
+        let env = wrap_sent_sync(
+            Some("+1234567890"),
+            Some(1_720_000_000_000),
+            SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("envelope time".to_string()),
+                timestamp: None,
+                group_info: None,
+                attachments: None,
+            },
+        );
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].timestamp, 1_720_000_000);
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_timestamp_falls_back_to_now() {
+        let ch = make_self_allowed_channel(false);
+        let env = wrap_sent_sync(
+            Some("+1234567890"),
+            None,
+            SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("no timestamps at all".to_string()),
+                timestamp: None,
+                group_info: None,
+                attachments: None,
+            },
+        );
+        let now_secs_before = SignalChannel::now_ms() / 1000;
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            msgs[0].timestamp >= now_secs_before,
+            "timestamp {} should be at least {}",
+            msgs[0].timestamp,
+            now_secs_before
+        );
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_empty_string_message_ignored() {
+        let ch = make_self_allowed_channel(false);
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1234567890"),
+            Some(""),
+            None,
+            None,
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_note_to_self_echo_guard_consumes_once() {
+        let ch = make_self_allowed_channel(false);
+        ch.record_self_send("already sent this".to_string());
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1234567890"),
+            Some("already sent this"),
+            None,
+            None,
+        );
+        // First sighting: matches the recorded outbound send, consumed as
+        // an echo rather than ingested.
+        assert!(ch.process_envelope(&env).is_empty());
+        // Second sighting of the identical sync envelope: the guard entry
+        // was already consumed, so this is treated as genuine inbound.
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "already sent this");
+    }
+
+    #[tokio::test]
+    async fn failed_self_send_rolls_back_echo_guard() {
+        // Nothing listens on port 9 (discard), so the RPC fails; the
+        // pre-recorded guard entry must be removed again so a send that
+        // never happened can't swallow a later genuine Note-to-Self.
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:9".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            false,
+            false,
+        );
+        let result = ch
+            .send(&SendMessage::new("doomed note", "+1234567890"))
+            .await;
+        assert!(result.is_err());
+        assert!(ch.recent_self_sends.lock().is_empty());
+    }
+
+    #[test]
+    fn consume_self_send_echo_removes_oldest_matching_entry() {
+        let ch = make_self_allowed_channel(false);
+        let first = ch.record_self_send("dup".to_string());
+        let second = ch.record_self_send("dup".to_string());
+        let _ = ch.record_self_send("other".to_string());
+        assert!(ch.consume_self_send_echo(Some("dup")));
+        // Only the oldest of the two duplicates is consumed per match.
+        {
+            let recent = ch.recent_self_sends.lock();
+            assert_eq!(recent.len(), 2);
+            assert!(!recent.iter().any(|(t, _)| *t == first));
+            assert!(recent.iter().any(|(t, _)| *t == second));
+        }
+        assert!(ch.consume_self_send_echo(Some("dup")));
+        assert!(!ch.consume_self_send_echo(Some("dup")));
+        assert!(!ch.consume_self_send_echo(None));
+        assert!(ch.consume_self_send_echo(Some("other")));
+        assert!(ch.recent_self_sends.lock().is_empty());
+    }
+
+    #[test]
+    fn remove_self_send_is_token_exact() {
+        // A rollback whose entry was already consumed by the real echo
+        // must NOT steal an unrelated identical-content entry.
+        let ch = make_self_allowed_channel(false);
+        let first = ch.record_self_send("same text".to_string());
+        let second = ch.record_self_send("same text".to_string());
+        // The echo consumes the oldest entry (the first send's).
+        assert!(ch.consume_self_send_echo(Some("same text")));
+        // Rolling back the first send is now a no-op; the second send's
+        // entry survives for its own echo.
+        ch.remove_self_send(first);
+        assert_eq!(ch.recent_self_sends.lock().len(), 1);
+        assert!(ch.consume_self_send_echo(Some("same text")));
+        // Rolling back the second send after consumption is also a no-op.
+        ch.remove_self_send(second);
+        assert!(ch.recent_self_sends.lock().is_empty());
+    }
+
+    #[test]
+    fn record_self_send_evicts_oldest_at_capacity() {
+        let ch = make_self_allowed_channel(false);
+        for i in 0..RECENT_SELF_SENDS_CAPACITY + 1 {
+            ch.record_self_send(format!("note {i}"));
+        }
+        assert_eq!(
+            ch.recent_self_sends.lock().len(),
+            RECENT_SELF_SENDS_CAPACITY
+        );
+        // The very first entry was evicted; the newest survives.
+        assert!(!ch.consume_self_send_echo(Some("note 0")));
+        assert!(ch.consume_self_send_echo(Some(&format!("note {RECENT_SELF_SENDS_CAPACITY}"))));
+    }
+
+    #[test]
+    fn sent_sync_envelope_serde_fixture() {
+        let json = r#"{
+            "envelope": {
+                "source": "+1234567890",
+                "sourceNumber": "+1234567890",
+                "sourceUuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                "timestamp": 1720000000000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "destination": "+1234567890",
+                        "destinationNumber": "+1234567890",
+                        "destinationUuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                        "timestamp": 1720000000000,
+                        "message": "note text",
+                        "expiresInSeconds": 0,
+                        "viewOnce": false
+                    }
+                }
+            }
+        }"#;
+        let sse: SseEnvelope = serde_json::from_str(json).unwrap();
+        let env = sse.envelope.unwrap();
+        let sent = env
+            .sync_message
+            .as_ref()
+            .and_then(|s| s.sent_message.as_ref())
+            .expect("sentMessage should deserialize");
+        assert_eq!(sent.destination_number.as_deref(), Some("+1234567890"));
+        assert_eq!(sent.message.as_deref(), Some("note text"));
+        assert_eq!(sent.timestamp, Some(1_720_000_000_000));
+    }
+
+    #[test]
+    fn process_envelope_group_sent_sync_ignored() {
+        let ch = make_self_allowed_channel(false);
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1234567890"),
+            Some("group note"),
+            Some("group_xyz"),
+            None,
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_empty_message_ignored() {
+        let ch = make_self_allowed_channel(false);
+        let env =
+            make_sent_sync_envelope(Some("+1234567890"), Some("+1234567890"), None, None, None);
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_denied_self_sender() {
+        // Default make_channel()'s allowlist doesn't include the
+        // account itself, so a Note-to-Self message is dropped exactly
+        // like an unknown-sender DM would be.
+        let ch = make_channel();
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1234567890"),
+            Some("hi self"),
+            None,
+            None,
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_data_message_precedence_over_sync() {
+        let ch = make_self_allowed_channel(false);
+        let mut env = make_envelope(Some("+1234567890"), Some("dataMessage wins"));
+        env.sync_message = Some(SyncMessage {
+            sent_message: Some(SentMessage {
+                destination: Some("+1234567890".to_string()),
+                destination_number: Some("+1234567890".to_string()),
+                message: Some("syncMessage should be ignored".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+            }),
+        });
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
+        assert_eq!(msg.content, "dataMessage wins");
+        assert_eq!(msg.sender, "+1234567890");
+        assert_eq!(msg.reply_target, "+1234567890");
+    }
+
+    #[test]
+    fn process_envelope_sent_sync_attachment_only_skipped() {
+        let ch = make_self_allowed_channel(true);
+        let env = make_sent_sync_envelope(
+            Some("+1234567890"),
+            Some("+1234567890"),
+            None,
+            None,
+            Some(vec![serde_json::json!({"contentType": "image/png"})]),
+        );
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_note_to_self_sender_falls_back_to_account() {
+        // If the envelope carries no `source`/`sourceNumber` at all,
+        // sender and reply_target should both fall back to the
+        // configured account rather than dropping the message.
+        let ch = make_self_allowed_channel(false);
+        let env = make_sent_sync_envelope(
+            None,
+            Some("+1234567890"),
+            Some("no source here"),
+            None,
+            None,
+        );
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
+        assert_eq!(msg.sender, "+1234567890");
+        assert_eq!(msg.reply_target, "+1234567890");
     }
 }
