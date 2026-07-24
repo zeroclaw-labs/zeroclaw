@@ -185,6 +185,17 @@ real `GITHUB_TOKEN` to every workflow run:
 
    </div>
 
+   Artifact-producing jobs need an `act` artifact-service protocol that
+   `actions/upload-artifact` v7 and `actions/download-artifact` v8 require,
+   and **no currently released version of `act` implements it** (checked
+   through the latest release as of this writing). The helper preflights the
+   installed `act` version before starting a job that uses the pinned
+   artifact actions and fails closed: it will not attempt the job on an
+   unverified version. Until a compatible `act` release ships and is
+   verified against a real artifact round-trip, use the GitHub-hosted
+   fallback below for any artifact-producing or artifact-consuming job; that
+   is the recommended path today, not a rare exception.
+
 3. Install Docker Engine or Docker Desktop from
    <https://docs.docker.com/engine/install/>. On Linux, add yourself to
    the `docker` group so you don't need `sudo`. `act` also works with
@@ -247,6 +258,40 @@ value never lands in argv), and sets `--artifact-server-path` so
 `actions/upload-artifact` and `actions/download-artifact` work between
 jobs. All of that is plain `act` underneath; the script just removes
 the flag soup.
+
+Before any artifact-producing or artifact-consuming job starts, the helper
+checks the resolved standalone `act` or `gh act` version against an internal
+compatibility threshold (`act` >= 0.2.90). That threshold is **not** a
+version to go install; it is the floor a future `act` release must clear,
+and it only moves once a real artifact round-trip has been verified against
+that release. No currently released `act` version meets it, so every
+release fails the preflight before the build starts and points to
+GitHub-hosted Actions; do not downgrade the pinned artifact actions to make
+a local runner pass.
+
+For `--all`, compatibility is checked across the complete selected job set
+before the first job starts. If any selected job needs the artifact service,
+the sweep fails closed (no currently released `act` clears the threshold) and
+exits without running a partial subset. `--all --no-allowlist` follows the
+same compatibility policy.
+
+Local artifact preflight failures are expected on every currently released
+`act`, not an occasional hiccup. Push the exact commit to GitHub and use the
+hosted workflow as the validation fallback for artifact-bearing jobs. The
+read-only cross-platform build can be dispatched safely and watched from the
+CLI:
+
+```sh
+gh workflow run cross-platform-build-manual.yml --ref <validation-branch>
+gh run list --workflow cross-platform-build-manual.yml --branch <validation-branch> --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Do not trigger `release-stable-manual.yml` early as a dry-run substitute: that
+workflow publishes after its environment approvals. Record the local artifact
+jobs as skipped because of the version policy, use the hosted cross-platform
+build for the artifact round trip, and leave the protected stable-release run
+for Step 4.
 
 ### `--all` only runs jobs on a dry-run-safe allowlist
 

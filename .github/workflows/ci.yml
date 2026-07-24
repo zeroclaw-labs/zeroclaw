@@ -152,6 +152,8 @@ jobs:
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
           bash scripts/ci/comment_hygiene_gate.sh
+      - name: act-local artifact compatibility tests
+        run: bash scripts/dev/act-local.test.sh
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes

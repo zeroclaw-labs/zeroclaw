@@ -45,6 +45,17 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARTIFACT_DIR="${ACT_LOCAL_ARTIFACT_DIR:-/tmp/act-artifacts}"
 ACT_CACHE_DIR="${HOME}/.cache/act"
+# actions/upload-artifact v7 and actions/download-artifact v8 need an
+# artifact-service protocol that no currently released act version
+# implements (checked through the latest release as of this writing).
+# ACT_ARTIFACT_MIN_VERSION is NOT a version to tell users to install — it is
+# the floor a future act release must clear, and it must only move after an
+# actual artifact round-trip has been verified against that release. Until
+# then every released act version fails the preflight below and the
+# GitHub-hosted workflow is the fallback. Keep this policy independent from
+# the pinned action refs: the GitHub-hosted workflow remains canonical and
+# must not be downgraded for a local runner.
+ACT_ARTIFACT_MIN_VERSION="0.2.90"
 NO_ALLOWLIST=false
 # Resolved at setup time. Prefers a standalone `act` on PATH, falls
 # back to `gh act` (the gh-act extension) — that's the install path
@@ -91,6 +102,138 @@ is_dry_run_safe_job() {
 
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "$1 not found — install from $2"
+}
+
+parse_released_act_version() {
+  awk '
+    NR == 1 && NF == 3 && $1 == "act" && $2 == "version" {
+      candidate = $3
+      sub(/^v/, "", candidate)
+      if (candidate ~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/) {
+        print candidate
+      }
+      exit
+    }
+  '
+}
+
+version_at_least() {
+  awk -v current="$1" -v minimum="$2" '
+    BEGIN {
+      split(current, have, ".")
+      split(minimum, need, ".")
+      for (i = 1; i <= 3; i++) {
+        if ((have[i] + 0) > (need[i] + 0)) exit 0
+        if ((have[i] + 0) < (need[i] + 0)) exit 1
+      }
+      exit 0
+    }
+  '
+}
+
+job_requires_artifact_service() {
+  workflow_file="$1"
+  target_job="$2"
+
+  awk -v target="$target_job" '
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+    in_jobs && /^[^[:space:]]/ { exit }
+    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:[[:space:]]*$/, "", job)
+      in_target = (job == target)
+      next
+    }
+    in_target && /uses:[[:space:]]*actions\/(upload|download)-artifact@/ {
+      found = 1
+      exit
+    }
+    END { exit !found }
+  ' "$workflow_file"
+}
+
+job_local_reusable_workflows() {
+  workflow_file="$1"
+  target_job="$2"
+
+  awk -v target="$target_job" '
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+    in_jobs && /^[^[:space:]]/ { exit }
+    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:[[:space:]]*$/, "", job)
+      in_target = (job == target)
+      next
+    }
+    in_target && /^    uses:[[:space:]]*\.\/\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml[[:space:]]*$/ {
+      reusable = $0
+      sub(/^    uses:[[:space:]]*/, "", reusable)
+      print reusable
+    }
+  ' "$workflow_file"
+}
+
+workflow_requires_artifact_service() {
+  grep -qE 'uses:[[:space:]]*actions/(upload|download)-artifact@' "$1"
+}
+
+pair_requires_artifact_service() {
+  pair="$1"
+  stem=${pair%%:*}
+  job=${pair#*:}
+  workflow_file="$REPO_ROOT/.github/workflows/$stem.yml"
+  [ -f "$workflow_file" ] || return 1
+
+  planned_jobs=$($ACT_BIN -W "$workflow_file" -j "$job" -l 2>/dev/null \
+    | awk 'NR > 1 && NF >= 2 && $2 != "" { print $2 }') || {
+      die "could not inspect the act plan for ${pair}; refusing to bypass the artifact compatibility preflight"
+    }
+  [ -n "$planned_jobs" ] || {
+    die "act returned an empty plan for ${pair}; refusing to bypass the artifact compatibility preflight"
+  }
+
+  for planned_job in $planned_jobs; do
+    if job_requires_artifact_service "$workflow_file" "$planned_job"; then
+      return 0
+    fi
+    for reusable in $(job_local_reusable_workflows "$workflow_file" "$planned_job"); do
+      reusable_file="$REPO_ROOT/${reusable#./}"
+      if [ -f "$reusable_file" ] && workflow_requires_artifact_service "$reusable_file"; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+preflight_artifact_service() {
+  context="$1"
+  version_output=$($ACT_BIN --version 2>&1) || {
+    die "could not query act version before ${context}; use GitHub-hosted Actions as the fallback"
+  }
+  act_version=$(printf '%s\n' "$version_output" | parse_released_act_version)
+
+  if [ -z "$act_version" ]; then
+    die "could not parse the released act version; no currently released act version meets the artifact-service compatibility threshold (act >= ${ACT_ARTIFACT_MIN_VERSION}, not yet satisfied by any release). Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
+  fi
+
+  if ! version_at_least "$act_version" "$ACT_ARTIFACT_MIN_VERSION"; then
+    die "${context} requires the pinned artifact actions, but act ${act_version} does not support the artifact-service protocol they need, and no currently released act version does either (compatibility threshold act >= ${ACT_ARTIFACT_MIN_VERSION} is not yet satisfied by any release). Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
+  fi
+}
+
+preflight_selected_jobs() {
+  pairs="$1"
+  context="$2"
+
+  for pair in $pairs; do
+    if pair_requires_artifact_service "$pair"; then
+      preflight_artifact_service "$context"
+      return
+    fi
+  done
 }
 
 # ── Setup ──────────────────────────────────────────────────────────
@@ -218,10 +361,15 @@ workflow_has_version_input() {
 
 run_one() {
   pair="$1"
+  preflight_done="${2:-false}"
   stem=${pair%%:*}
   job=${pair#*:}
   workflow_file="$REPO_ROOT/.github/workflows/$stem.yml"
   [ -f "$workflow_file" ] || die "workflow file missing: $workflow_file"
+
+  if [ "$preflight_done" != true ] && pair_requires_artifact_service "$pair"; then
+    preflight_artifact_service "$pair"
+  fi
 
   # Export the token into the environment so act resolves `-s
   # GITHUB_TOKEN` (no value) from getenv. Keeps the credential out of
@@ -270,13 +418,32 @@ run_all() {
   else
     log "running dry-run-safe jobs only (others skipped — pass --no-allowlist or run explicitly to override)"
   fi
-  discover_jobs | while IFS= read -r pair; do
+  selected_pairs=""
+  skipped_pairs=""
+  all_pairs=$(discover_jobs)
+  for pair in $all_pairs; do
     [ -n "$pair" ] || continue
     if [ "$NO_ALLOWLIST" != true ] && ! is_dry_run_safe_job "$pair"; then
-      log "skip ${pair} (not on dry-run-safe allowlist)"
+      skipped_pairs="${skipped_pairs}${skipped_pairs:+
+}${pair}"
       continue
     fi
-    run_one "$pair"
+    selected_pairs="${selected_pairs}${selected_pairs:+
+}${pair}"
+  done
+
+  # --all is atomic with respect to compatibility checks. If any selected job
+  # needs the local artifact service, reject an unsupported act version before
+  # starting even the non-artifact jobs. This avoids reporting a partial sweep
+  # as useful release evidence.
+  preflight_selected_jobs "$selected_pairs" "--all"
+
+  for pair in $skipped_pairs; do
+    log "skip ${pair} (not on dry-run-safe allowlist)"
+  done
+
+  for pair in $selected_pairs; do
+    run_one "$pair" true
   done
 }
 
