@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
@@ -1113,7 +1112,7 @@ async fn run_job_command_with_timeout(
     // manually-edited job stores.
     let approved = false; // scheduler runs are never pre-approved
     if let Err(error) =
-        crate::cron::validate_shell_command_with_security(security, &job.command, approved)
+        crate::cron::validate_shell_command_with_security(config, security, &job.command, approved)
     {
         return (false, error.to_string());
     }
@@ -1132,12 +1131,20 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match build_cron_shell_command(&job.command, &config.data_dir) {
-        Ok(mut cmd) => match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => return (false, format!("spawn error: {e}")),
-        },
-        Err(e) => return (false, format!("shell setup error: {e}")),
+    let mut command =
+        match crate::cron::build_configured_shell_command(config, &job.command, &config.data_dir) {
+            Ok(command) => command,
+            Err(error) => return (false, format!("shell setup error: {error}")),
+        };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return (false, format!("spawn error: {error}")),
     };
 
     match time::timeout(timeout, child.wait_with_output()).await {
@@ -1160,22 +1167,6 @@ async fn run_job_command_with_timeout(
     }
 }
 
-fn build_cron_shell_command(
-    command: &str,
-    workspace_dir: &std::path::Path,
-) -> anyhow::Result<Command> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    Ok(cmd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,7 +1174,7 @@ mod tests {
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::{Config, RuntimeKind};
 
     const TEST_AGENT: &str = "test-agent";
 
@@ -2418,9 +2409,13 @@ mod tests {
     }
 
     #[test]
-    fn build_cron_shell_command_uses_sh_non_login() {
+    #[cfg(not(target_os = "windows"))]
+    fn build_cron_shell_command_uses_configured_runtime() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let cmd = build_cron_shell_command("echo cron-test", &workspace).unwrap();
+        let cmd =
+            crate::cron::build_configured_shell_command(&config, "echo cron-test", &workspace)
+                .unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("echo cron-test"));
         assert!(debug.contains("\"sh\""), "should use sh: {debug}");
@@ -2433,13 +2428,115 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn build_cron_shell_command_executes_successfully() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let mut cmd = build_cron_shell_command("echo cron-ok", &workspace).unwrap();
+        let mut cmd =
+            crate::cron::build_configured_shell_command(&config, "echo cron-ok", &workspace)
+                .unwrap();
         let output = cmd.output().await.unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("cron-ok"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn build_cron_shell_command_executes_with_custom_native_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("cron-shell-shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nprintf 'CUSTOM_SHELL\\n'\nprintf 'arg:%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = Config::default();
+        config.runtime.shell = Some(shim.to_string_lossy().into_owned());
+        let mut cmd =
+            crate::cron::build_configured_shell_command(&config, "echo cron-custom", tmp.path())
+                .unwrap();
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(stdout.contains("CUSTOM_SHELL"), "{stdout}");
+        assert!(stdout.contains("arg:-c"), "{stdout}");
+        assert!(stdout.contains("arg:echo cron-custom"), "{stdout}");
+    }
+
+    #[test]
+    fn build_cron_shell_command_preserves_docker_runtime_boundary() {
+        let mut config = Config::default();
+        config.runtime.kind = RuntimeKind::Docker;
+        config.runtime.docker.image = "alpine:3.20".into();
+        config.runtime.docker.network = "none".into();
+        config.runtime.docker.mount_workspace = false;
+
+        let cmd = crate::cron::build_configured_shell_command(
+            &config,
+            "echo cron-docker",
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        let debug = format!("{cmd:?}");
+
+        assert!(debug.contains("\"docker\""), "{debug}");
+        assert!(debug.contains("\"run\""), "{debug}");
+        assert!(debug.contains("\"--network\""), "{debug}");
+        assert!(debug.contains("\"none\""), "{debug}");
+        assert!(debug.contains("\"alpine:3.20\""), "{debug}");
+        assert!(
+            debug.contains("\"sh\" \"-c\" \"echo cron-docker\""),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn build_cron_shell_command_uses_configured_powershell() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let workspace = std::env::temp_dir();
+        let cmd = crate::cron::build_configured_shell_command(
+            &config,
+            "Write-Output cron-ok",
+            &workspace,
+        )
+        .unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("powershell"));
+        assert!(debug.contains("-Command"));
+        assert!(!debug.contains("cmd.exe"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let security = SecurityPolicy::default();
+
+        crate::cron::validate_shell_command_with_security(
+            &config,
+            &security,
+            "Write-Output $PSHOME",
+            false,
+        )
+        .expect("documented read-only PowerShell command should pass");
+        assert!(
+            crate::cron::validate_shell_command_with_security(
+                &config,
+                &security,
+                "echo ([System.IO.File]::Delete('important.txt'))",
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

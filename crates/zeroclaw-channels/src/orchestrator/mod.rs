@@ -15726,6 +15726,9 @@ BTC is currently around $65,000 based on latest tool output."#
         fn supports_long_running(&self) -> bool {
             false
         }
+        fn shell_dialect(&self) -> platform::ShellDialect {
+            platform::ShellDialect::Posix
+        }
         fn build_shell_command(
             &self,
             _command: &str,

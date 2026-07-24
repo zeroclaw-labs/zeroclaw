@@ -3,7 +3,7 @@ pub mod native;
 
 pub use docker::DockerRuntime;
 pub use native::NativeRuntime;
-pub use zeroclaw_api::runtime_traits::RuntimeAdapter;
+pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
 
@@ -13,6 +13,8 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
             let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
             #[cfg(unix)]
             validate_shell(&shell)?;
+            #[cfg(windows)]
+            validate_shell_windows(&shell)?;
             Ok(Box::new(NativeRuntime::with_shell(shell)))
         }
         RuntimeKind::Docker => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
@@ -80,6 +82,21 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Validate a configured `runtime.shell` on Windows.
+///
+/// Unlike the Unix check this does not resolve a binary on `PATH`: on Windows
+/// `runtime.shell` selects the *interpreter family* (`cmd.exe` vs PowerShell)
+/// via [`native::windows_shell_kind`], and the interpreter is located at spawn
+/// time. The only fail-fast condition worth catching up front is an
+/// empty/whitespace value, which would otherwise spawn with no program.
+#[cfg(windows)]
+fn validate_shell_windows(shell: &str) -> anyhow::Result<()> {
+    if shell.trim().is_empty() {
+        anyhow::bail!("runtime.shell must not be empty or whitespace");
+    }
     Ok(())
 }
 

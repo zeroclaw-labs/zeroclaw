@@ -2955,6 +2955,10 @@ mod tests {
             false
         }
 
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
+        }
+
         fn build_shell_command(
             &self,
             command: &str,

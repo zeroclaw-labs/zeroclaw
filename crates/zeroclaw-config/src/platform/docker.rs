@@ -1,7 +1,7 @@
 use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 /// Docker runtime with lightweight container isolation.
 #[derive(Debug, Clone)]
@@ -83,6 +83,10 @@ impl RuntimeAdapter for DockerRuntime {
             .map_or(0, |mb| mb.saturating_mul(1024 * 1024))
     }
 
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::Posix
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -155,6 +159,12 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         assert_eq!(runtime.memory_budget(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn docker_reports_posix_shell_dialect() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
     }
 
     #[test]

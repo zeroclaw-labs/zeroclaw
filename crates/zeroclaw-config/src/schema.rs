@@ -11898,11 +11898,10 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used. The shell is
-    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
-    /// shell binary.
+    /// When unset or `null`, the system default `sh` is used.
     ///
-    /// Accepted forms (Unix):
+    /// **Unix:** the shell is invoked as `<shell> -c "<command>"`, so it must be
+    /// a POSIX-compatible shell binary. Accepted forms:
     /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
     /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
     ///
@@ -11913,15 +11912,33 @@ pub struct RuntimeConfig {
     /// instead); a bare name not found on `PATH`; and a path that does not
     /// exist or is not executable.
     ///
-    /// **Ignored on Windows and Android** (and not validated there): Windows
-    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
-    /// (its shell is not on `PATH` for spawned processes).
+    /// **Windows:** the value selects the interpreter *family* by its file stem
+    /// (case-insensitive), which fixes the invocation convention:
+    /// - `"powershell"` (Windows PowerShell 5.x) or `"pwsh"` (PowerShell 7+),
+    ///   as a bare name resolved via `PATH` or an absolute path (e.g.
+    ///   `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), run the command as
+    ///   `<interpreter> -NoProfile -NonInteractive -Command <command>`;
+    /// - any other value (including the default `sh` and an explicit `"cmd"`)
+    ///   runs `cmd.exe /C "<command>"`, preserving the historical behaviour.
+    ///
+    /// Only an empty/whitespace value is rejected on Windows; the interpreter is
+    /// located at spawn time.
+    ///
+    /// Command policy uses the selected interpreter's dialect. PowerShell
+    /// accepts a bounded grammar of simple command invocations, arguments,
+    /// variable reads, and pipelines; expression and invocation constructs
+    /// that cannot be safely classified are rejected before execution.
+    ///
+    /// **Ignored on Android** (always `/system/bin/sh`, whose shell is not on
+    /// `PATH` for spawned processes).
     ///
     /// **Examples:**
     /// ```toml
     /// [runtime]
-    /// shell = "bash" # resolves via PATH
-    /// shell = "/bin/zsh" # absolute path
+    /// shell = "bash" # Unix: resolves via PATH
+    /// shell = "/bin/zsh" # Unix: absolute path
+    /// shell = "pwsh" # Windows: PowerShell 7+
+    /// shell = "powershell" # Windows: Windows PowerShell 5.x
     /// ```
     #[serde(default)]
     pub shell: Option<String>,
@@ -22569,7 +22586,6 @@ max_height = 8
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;
-    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -22580,13 +22596,11 @@ max_height = 8
     use tokio::sync::MutexGuard;
     use tokio::test;
 
-    #[cfg(unix)]
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
-    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -22603,7 +22617,6 @@ max_height = 8
         }
     }
 
-    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().

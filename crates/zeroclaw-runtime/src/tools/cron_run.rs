@@ -94,14 +94,17 @@ impl Tool for CronRunTool {
         };
 
         if matches!(job.job_type, JobType::Shell)
-            && let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
+            && let Err(reason) = cron::validate_shell_command_with_security(
+                &self.config,
+                &self.security,
+                &job.command,
+                approved,
+            )
         {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(reason),
+                error: Some(reason.to_string()),
             });
         }
 

@@ -56,9 +56,26 @@ By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].sh
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-The shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. The value must be either a bare command name found on `PATH` (e.g. `"bash"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
+On Unix the shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. The value must be either a bare command name found on `PATH` (e.g. `"bash"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
 
-Only applies to the native runtime kind. Docker uses its container's shell, and Windows (always `cmd.exe`) and Android (always `/system/bin/sh`) ignore the setting and do not validate it.
+On **Windows**, the value selects the interpreter family by its file name:
+
+```toml
+[runtime]
+shell = "pwsh"        # PowerShell 7+   -> pwsh -NoProfile -NonInteractive -Command <cmd>
+# shell = "powershell"  # Windows PowerShell 5.x
+# shell = "cmd"         # or leave unset -> cmd.exe /C "<cmd>"   (default)
+```
+
+`powershell` and `pwsh` (as a bare name resolved via `PATH`, or an absolute path such as `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`) run through PowerShell; any other value (including the default `sh` and an explicit `cmd`) runs through `cmd.exe /C`, matching the historical behaviour. Only an empty/whitespace value is rejected; the interpreter is located at spawn time.
+
+The shell tool, shell-backed skill tools, and cron/schedule shell jobs all use this runtime selection. The runtime also reports the shell dialect to security policy, so policy validates the same language that will execute the command.
+
+PowerShell policy accepts a bounded grammar: simple command invocations, plain or quoted arguments, and pipelines. Simple variable reads such as `$PSHOME` and `$PSVersionTable.PSVersion` are limited to a standalone `Write-Output`/`echo` command so they cannot hide filesystem paths from later commands. Expressions and alternate invocation forms, including subexpressions, parentheses, script blocks, type literals/static method calls, call operators, redirection, statement separators, backtick escapes, PowerShell provider paths, direct script execution, and nested command interpreters, fail closed even when hidden behind an allowed command. The default Windows allowlist includes the read-only `Write-Output`, `Get-Date`, `Get-ChildItem`, and `Get-Location` cmdlets. Known mutation cmdlets follow the medium/high-risk approval gates; unknown `Verb-Noun` cmdlets are high risk by default.
+
+Cron shell jobs inherit the global runtime boundary at both validation and execution time. Native jobs use the configured native shell, while Docker jobs run through the configured image, mount, network, CPU, memory, and read-only-root settings. Scheduled cron runs are revalidated and are never pre-approved.
+
+Only applies to the native runtime kind. Docker uses its container's shell, and Android (always `/system/bin/sh`) ignores the setting and does not validate it.
 
 ## Per-backend notes
 

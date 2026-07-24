@@ -1,5 +1,21 @@
 use std::path::{Path, PathBuf};
 
+/// Shell language understood by a runtime's command builder.
+///
+/// This is part of the execution boundary: security policy must validate the
+/// same language that [`RuntimeAdapter::build_shell_command`] will interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellDialect {
+    /// A POSIX-style shell such as `sh`, `bash`, or `zsh`.
+    Posix,
+    /// The Windows command processor (`cmd.exe`).
+    WindowsCmd,
+    /// Windows PowerShell or PowerShell 7+.
+    PowerShell,
+    /// The runtime does not expose shell execution.
+    None,
+}
+
 /// Runtime adapter that abstracts platform differences for the agent.
 ///
 /// Implement this trait to port the agent to a new execution environment.
@@ -52,6 +68,14 @@ pub trait RuntimeAdapter: Send + Sync {
         0
     }
 
+    /// Return the shell language accepted by [`Self::build_shell_command`].
+    ///
+    /// Implementations with shell access must override the fail-closed default
+    /// and report the language they actually execute.
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::None
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
@@ -97,6 +121,17 @@ mod tests {
             true
         }
 
+        fn shell_dialect(&self) -> ShellDialect {
+            #[cfg(windows)]
+            {
+                ShellDialect::WindowsCmd
+            }
+            #[cfg(not(windows))]
+            {
+                ShellDialect::Posix
+            }
+        }
+
         fn build_shell_command(
             &self,
             command: &str,
@@ -133,6 +168,10 @@ mod tests {
         assert!(runtime.has_shell_access());
         assert!(runtime.has_filesystem_access());
         assert!(runtime.supports_long_running());
+        #[cfg(windows)]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
+        #[cfg(not(windows))]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
         assert_eq!(runtime.storage_path(), PathBuf::from("/tmp/dummy-runtime"));
     }
 

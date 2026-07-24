@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use zeroclaw_api::runtime_traits::ShellDialect;
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -274,6 +275,12 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "npm".into(),
         "cargo".into(),
         "echo".into(),
+        // PowerShell-native read-only commands used by the default Windows
+        // shell examples. Mutating cmdlets remain opt-in.
+        "write-output".into(),
+        "get-date".into(),
+        "get-childitem".into(),
+        "get-location".into(),
         // Windows-native equivalents
         "dir".into(),
         "type".into(),
@@ -1186,6 +1193,241 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     false
 }
 
+/// Split a PowerShell command into simple pipeline stages.
+///
+/// PowerShell is an expression language, not just a command launcher. The
+/// generic POSIX-oriented splitter cannot safely reason about constructs such
+/// as `(...)`, script blocks, type literals, call operators, or backtick
+/// escapes. This parser intentionally accepts only a bounded command grammar:
+/// bare command invocations, quoted/plain arguments, simple variable reads,
+/// and pipelines. Everything else fails closed.
+fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        // Backtick changes PowerShell parsing in every quoting mode. Supporting
+        // it would require a complete lexer, so the bounded grammar rejects it.
+        if ch == '`' || ch == '\0' {
+            return None;
+        }
+
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        current.push(ch);
+                        current.push(chars.next().unwrap());
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::Double => {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        current.push(ch);
+                        current.push(chars.next().unwrap());
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::None => match ch {
+                '\'' => {
+                    quote = QuoteState::Single;
+                    current.push(ch);
+                }
+                '"' => {
+                    quote = QuoteState::Double;
+                    current.push(ch);
+                }
+                '|' => {
+                    // `||` is a control-flow operator, not a pipeline.
+                    if chars.peek() == Some(&'|') {
+                        return None;
+                    }
+                    let segment = current.trim();
+                    if segment.is_empty() {
+                        return None;
+                    }
+                    segments.push(segment.to_string());
+                    current.clear();
+                }
+                // These characters introduce expressions, statements,
+                // redirection, splatting, or alternate invocation forms.
+                ';' | '\r' | '\n' | '&' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '@' => {
+                    return None;
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if quote != QuoteState::None {
+        return None;
+    }
+
+    let segment = current.trim();
+    if segment.is_empty() {
+        return None;
+    }
+    segments.push(segment.to_string());
+
+    powershell_variables_are_simple(command).then_some(segments)
+}
+
+/// Accept only `$Name` and `$Name.Property` reads outside single-quoted
+/// literals. Subexpressions, braced variables, scoped variables, and special
+/// variables are rejected because they change parsing or hide executable text.
+fn powershell_variables_are_simple(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut quote = QuoteState::None;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                }
+                i += 1;
+                continue;
+            }
+            QuoteState::Double => {
+                if ch == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        i += 2;
+                        continue;
+                    }
+                    quote = QuoteState::None;
+                    i += 1;
+                    continue;
+                }
+            }
+            QuoteState::None => {
+                if ch == '\'' {
+                    quote = QuoteState::Single;
+                    i += 1;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::Double;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        if ch != '$' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= chars.len() || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            return false;
+        }
+        i += 1;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        while chars.get(i) == Some(&'.') {
+            i += 1;
+            if i >= chars.len() || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+                return false;
+            }
+            i += 1;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+        }
+    }
+
+    true
+}
+
+fn is_powershell_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+) -> bool {
+    if allowed.trim() == "*" {
+        return true;
+    }
+
+    let allowed = strip_wrapping_quotes(allowed).trim();
+    if looks_like_path(allowed) {
+        return allowed.eq_ignore_ascii_case(executable);
+    }
+
+    let allowed = strip_powershell_executable_suffix(allowed);
+    allowed.eq_ignore_ascii_case(executable_base)
+}
+
+fn strip_powershell_executable_suffix(name: &str) -> &str {
+    name.strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".cmd"))
+        .or_else(|| name.strip_suffix(".bat"))
+        .unwrap_or(name)
+}
+
+fn is_powershell_provider_argument(argument: &str) -> bool {
+    let argument = strip_wrapping_quotes(argument).to_ascii_lowercase();
+    argument.contains("::")
+        || [
+            "alias:",
+            "cert:",
+            "env:",
+            "function:",
+            "hkcu:",
+            "hklm:",
+            "variable:",
+            "wsman:",
+        ]
+        .iter()
+        .any(|provider| argument.starts_with(provider))
+}
+
+fn is_known_read_only_powershell_command(base: &str) -> bool {
+    matches!(
+        base,
+        "write-output"
+            | "echo"
+            | "get-date"
+            | "get-childitem"
+            | "gci"
+            | "dir"
+            | "ls"
+            | "get-location"
+            | "gl"
+            | "pwd"
+            | "get-content"
+            | "gc"
+            | "type"
+            | "cat"
+            | "test-path"
+            | "resolve-path"
+            | "measure-object"
+            | "select-object"
+            | "sort-object"
+            | "compare-object"
+            | "format-list"
+            | "format-table"
+            | "format-wide"
+            | "format-custom"
+    )
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -1254,6 +1496,30 @@ impl SecurityPolicy {
                     | "wmic"
                     | "sc"
                     | "netsh"
+                    // PowerShell-native destructive, process, and network commands.
+                    | "remove-item"
+                    | "clear-content"
+                    | "set-content"
+                    | "add-content"
+                    | "out-file"
+                    | "start-process"
+                    | "stop-process"
+                    | "invoke-webrequest"
+                    | "invoke-restmethod"
+                    | "invoke-expression"
+                    | "invoke-command"
+                    // Common aliases for the commands above. Aliases already
+                    // covered by the cross-platform table are not repeated.
+                    | "erase"
+                    | "rd"
+                    | "ri"
+                    | "saps"
+                    | "start"
+                    | "spps"
+                    | "kill"
+                    | "iwr"
+                    | "irm"
+                    | "iex"
             ) {
                 return CommandRiskLevel::High;
             }
@@ -1302,11 +1568,89 @@ impl SecurityPolicy {
                 }),
                 "touch" | "mkdir" | "mv" | "cp" | "ln"
                 // Windows medium-risk equivalents
-                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink" => true,
+                | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink"
+                // PowerShell-native mutation commands and common aliases
+                | "new-item" | "copy-item" | "move-item" | "rename-item"
+                | "ni" | "cpi" | "mi" | "rni" | "md" => true,
                 _ => false,
             };
 
             saw_medium |= medium;
+        }
+
+        if saw_medium {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }
+    }
+
+    /// Classify command risk using the language the runtime will execute.
+    pub fn command_risk_level_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> CommandRiskLevel {
+        if dialect != ShellDialect::PowerShell {
+            return self.command_risk_level(command);
+        }
+
+        let Some(segments) = split_simple_powershell_pipeline(command) else {
+            return CommandRiskLevel::High;
+        };
+        let mut saw_medium = false;
+        let has_pipeline = segments.len() > 1;
+
+        for segment in segments {
+            let mut words = segment.split_whitespace();
+            let Some(base_raw) = words.next() else {
+                return CommandRiskLevel::High;
+            };
+            let base_owned = command_basename(base_raw).to_ascii_lowercase();
+            let base = strip_powershell_executable_suffix(&base_owned);
+            let arguments: Vec<&str> = words.collect();
+            if arguments
+                .iter()
+                .any(|argument| is_powershell_provider_argument(argument))
+                || (segment.contains('$')
+                    && (has_pipeline || !matches!(base, "write-output" | "echo")))
+            {
+                return CommandRiskLevel::High;
+            }
+            let generic_risk = self.command_risk_level(&segment);
+
+            if base_owned.ends_with(".ps1")
+                || base_owned.ends_with(".psm1")
+                || base_owned.ends_with(".psd1")
+                || matches!(
+                    base,
+                    "." | "cmd"
+                        | "command"
+                        | "powershell"
+                        | "pwsh"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "fish"
+                )
+            {
+                return CommandRiskLevel::High;
+            }
+
+            if generic_risk == CommandRiskLevel::High {
+                return CommandRiskLevel::High;
+            }
+            if generic_risk == CommandRiskLevel::Medium {
+                saw_medium = true;
+                continue;
+            }
+
+            // PowerShell cmdlets follow Verb-Noun naming. Unknown cmdlets are
+            // high risk by default because aliases and modules can introduce
+            // new code-evaluation or mutation surfaces at runtime.
+            if base.contains('-') && !is_known_read_only_powershell_command(base) {
+                return CommandRiskLevel::High;
+            }
         }
 
         if saw_medium {
@@ -1322,14 +1666,30 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
+        self.validate_command_execution_for_shell(command, approved, ShellDialect::Posix)
+    }
+
+    /// Validate a command against the policy and the runtime's shell language.
+    pub fn validate_command_execution_for_shell(
+        &self,
+        command: &str,
+        approved: bool,
+        dialect: ShellDialect,
+    ) -> Result<CommandRiskLevel, String> {
+        if dialect == ShellDialect::None {
+            return Err("Command blocked: configured runtime has no shell access".into());
+        }
+
+        if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
-        let risk = self.command_risk_level(command);
+        let risk = self.command_risk_level_for_shell(command, dialect);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
+            if self.block_high_risk_commands
+                && !self.is_command_explicitly_allowed_for_shell(command, dialect)
+            {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -1351,6 +1711,40 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    fn is_command_explicitly_allowed_for_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> bool {
+        match dialect {
+            ShellDialect::PowerShell => {
+                let Some(segments) = split_simple_powershell_pipeline(command) else {
+                    return false;
+                };
+                segments.iter().all(|segment| {
+                    let raw_executable =
+                        strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
+                            .trim();
+                    let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+                    let base = strip_powershell_executable_suffix(&base_owned);
+                    !base.is_empty()
+                        && self.allowed_commands.iter().any(|allowed| {
+                            allowed.trim() != "*"
+                                && is_powershell_allowlist_entry_match(
+                                    allowed,
+                                    raw_executable,
+                                    base,
+                                )
+                        })
+                })
+            }
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                self.is_command_explicitly_allowed(command)
+            }
+            ShellDialect::None => false,
+        }
     }
 
     fn is_command_explicitly_allowed(&self, command: &str) -> bool {
@@ -1398,6 +1792,78 @@ impl SecurityPolicy {
     // technique. If any gate rejects, the whole command is blocked.
 
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        self.is_command_allowed_for_shell(command, ShellDialect::Posix)
+    }
+
+    /// Check the command allowlist using the runtime's actual shell language.
+    pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
+        match dialect {
+            ShellDialect::PowerShell => self.is_simple_powershell_command_allowed(command),
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                self.is_posix_like_command_allowed(command)
+            }
+            ShellDialect::None => false,
+        }
+    }
+
+    fn is_simple_powershell_command_allowed(&self, command: &str) -> bool {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return true;
+        }
+
+        let Some(segments) = split_simple_powershell_pipeline(command) else {
+            return false;
+        };
+
+        let has_pipeline = segments.len() > 1;
+        for segment in &segments {
+            let mut words = segment.split_whitespace();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            if raw_executable.is_empty()
+                || raw_executable.starts_with('$')
+                || raw_executable.starts_with(['\'', '"'])
+            {
+                return false;
+            }
+
+            let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+            let base = strip_powershell_executable_suffix(&base_owned);
+            if !self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_powershell_allowlist_entry_match(allowed, raw_executable, base))
+            {
+                return false;
+            }
+
+            let args_cased: Vec<String> = words.map(str::to_string).collect();
+            if args_cased
+                .iter()
+                .any(|argument| is_powershell_provider_argument(argument))
+            {
+                return false;
+            }
+            if segment.contains('$') && (has_pipeline || !matches!(base, "write-output" | "echo")) {
+                return false;
+            }
+            let args: Vec<String> = args_cased
+                .iter()
+                .map(|word| word.to_ascii_lowercase())
+                .collect();
+            if !self.is_args_safe(base, &args, &args_cased) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn is_posix_like_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -2919,6 +3385,75 @@ mod tests {
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
         );
+    }
+
+    #[test]
+    fn command_risk_classifies_powershell_commands() {
+        let p = default_policy();
+        for command in [
+            "Remove-Item important.txt",
+            "Set-Content output.txt value",
+            "Start-Process calc.exe",
+            "Invoke-WebRequest https://example.com",
+            "ri important.txt",
+            "iwr https://example.com",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::High,
+                "PowerShell-native command should be high risk: {command}"
+            );
+        }
+
+        for command in [
+            "New-Item output.txt",
+            "Copy-Item from.txt to.txt",
+            "ni output.txt",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "PowerShell-native mutation should be medium risk: {command}"
+            );
+        }
+
+        for command in ["Write-Output safe", "Get-Date", "Get-ChildItem"] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "read-only PowerShell command should stay low risk: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_blocks_powershell_native_command_via_wildcard() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let error = p
+            .validate_command_execution("Remove-Item important.txt", true)
+            .expect_err("PowerShell-native high-risk commands must be blocked");
+        assert!(error.contains("high-risk"));
+    }
+
+    #[test]
+    fn validate_command_allows_low_risk_powershell_command_via_wildcard() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        let risk = p
+            .validate_command_execution("Write-Output safe", false)
+            .expect("low-risk PowerShell commands should not require approval");
+        assert_eq!(risk, CommandRiskLevel::Low);
     }
 
     #[test]

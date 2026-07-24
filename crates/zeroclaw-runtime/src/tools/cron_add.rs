@@ -410,11 +410,16 @@ impl Tool for CronAddTool {
                     }
                 };
 
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                if let Err(reason) = cron::validate_shell_command_with_security(
+                    &self.config,
+                    &self.security,
+                    command,
+                    approved,
+                ) {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(reason),
+                        error: Some(reason.to_string()),
                     });
                 }
 
