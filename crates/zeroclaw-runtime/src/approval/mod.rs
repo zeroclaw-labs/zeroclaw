@@ -138,6 +138,28 @@ impl ApprovalManager {
         }
     }
 
+    /// Derive a manager for a different agent's risk profile while preserving
+    /// THIS manager's interactivity mode. Used when a delegated execution (an
+    /// SOP step naming a different agent) must run under the delegate agent's
+    /// own approval policy without losing an operator approval route the
+    /// current surface provides: an interactive parent stays interactive, a
+    /// back-channel parent keeps routing shell approvals through the client
+    /// channel, and a plain non-interactive parent stays auto-deny. Policy
+    /// sets (`auto_approve` / `always_ask` / autonomy level) come entirely
+    /// from `risk_profile`; the session allowlist and audit trail start
+    /// fresh — "Always" grants to one agent never transfer to another.
+    pub fn derive_for_risk_profile(&self, risk_profile: &RiskProfileConfig) -> Self {
+        Self {
+            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
+            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            autonomy_level: risk_profile.level,
+            non_interactive: self.non_interactive,
+            non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Returns `true` when this manager operates in non-interactive mode
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {

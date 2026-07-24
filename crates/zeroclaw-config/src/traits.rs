@@ -3,6 +3,13 @@
 /// into persisted config.
 pub const UNSET_DISPLAY: &str = "<unset>";
 
+/// Return whether a submitted display value represents no configured value.
+#[must_use]
+pub fn is_unset_display_value(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value == UNSET_DISPLAY
+}
+
 /// Describes a single secret field discovered via `#[derive(Configurable)]`.
 #[derive(Debug, Clone)]
 pub struct SecretFieldInfo {
@@ -802,6 +809,7 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+    /// Optional natural key used to address entries in list-backed sections.
     pub natural_key: Option<&'static str>,
     /// Whether this section's map key is a `#[resource_key]` — a value
     /// drawn from another domain (a model id, tool name, …) that may

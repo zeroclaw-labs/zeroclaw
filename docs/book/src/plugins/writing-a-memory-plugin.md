@@ -139,9 +139,10 @@ Every required method is then a straightforward walk:
 - `recall-for-agents` adds the agent-filter walk over the key's second
   component.
 
-A real backend swaps the map for its store (an embedded KV, a remote vector
-DB over `wasi:http` with the `http_client` permission) without the contract
-changing shape.
+A real backend can swap the map for an embedded store without changing the
+contract shape. The memory adapter intentionally does not link `wasi:http` yet,
+even when its scope carries `http_client`; remote backends require the separate,
+component-tested memory-network boundary.
 
 ## What the host does around you
 
@@ -168,9 +169,10 @@ edges:
 
 {{#include ../_snippets/plugin-manifest-fields.md}}
 
-For a memory backend: `capabilities` containing `memory`; `config_read` if
-the backend needs connection settings; `http_client` only if it talks to a
-remote store.
+For a memory backend: `capabilities` containing `memory`, and `config_read` if
+the backend needs connection settings. Do not rely on `http_client` yet: a grant
+alone cannot widen the memory adapter, which currently exposes no network
+surface.
 
 {{#include ../_snippets/plugin-build-component.md}}
 

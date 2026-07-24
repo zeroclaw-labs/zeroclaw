@@ -597,6 +597,7 @@ impl Default for PersistedAuthProfiles {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedAuthProfile {
+    #[serde(alias = "provider")]
     model_provider: String,
     profile_name: String,
     kind: String,
@@ -678,6 +679,31 @@ mod tests {
             profile_id("openai-codex", "default"),
             "openai-codex:default"
         );
+    }
+
+    #[test]
+    fn persisted_profile_accepts_legacy_provider_key() {
+        let raw = r#"{
+            "schema_version": 2,
+            "updated_at": "2026-07-11T00:00:00Z",
+            "active_profiles": {
+                "openai-codex": "openai-codex:default"
+            },
+            "profiles": {
+                "openai-codex:default": {
+                    "provider": "openai-codex",
+                    "profile_name": "default",
+                    "kind": "oauth",
+                    "access_token": "access-token"
+                }
+            }
+        }"#;
+
+        let parsed: PersistedAuthProfiles = serde_json::from_str(raw).unwrap();
+        let profile = parsed.profiles.get("openai-codex:default").unwrap();
+
+        assert_eq!(profile.model_provider, "openai-codex");
+        assert_eq!(profile.profile_name, "default");
     }
 
     #[test]

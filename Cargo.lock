@@ -13347,6 +13347,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
@@ -13455,7 +13456,6 @@ dependencies = [
  "directories",
  "encoding_rs",
  "filetime",
- "flate2",
  "fluent",
  "futures-util",
  "glob",
@@ -13523,7 +13523,6 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
- "zip",
 ]
 
 [[package]]
@@ -13733,6 +13732,7 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "url",
 ]
 
 [[package]]

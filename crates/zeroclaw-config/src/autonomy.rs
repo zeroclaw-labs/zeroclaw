@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+/// The agent's autonomy level, ordered from least to most autonomous.
 #[derive(
     Debug,
     Clone,
@@ -41,6 +42,7 @@ impl crate::config::HasPropKind for DelegationMode {
     const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
 }
 
+/// Risk-profile delegation policy for work sent to agents that share it.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::Configurable,
 )]
@@ -79,6 +81,7 @@ fn default_approval_timeout_secs() -> u64 {
     120
 }
 
+/// Routes tool approvals to a distinct approver channel with fail-closed defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ApprovalRoute {

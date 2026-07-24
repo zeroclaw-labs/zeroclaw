@@ -25,6 +25,8 @@ move it). The current layout is:
 │   │   ├── sessions.db         # default chat/session backend
 │   │   └── acp-sessions.db     # ACP protocol sessions
 │   ├── cron/jobs.db            # scheduled job state
+│   ├── sop/runs.db             # optional durable SOP run state
+│   ├── control_plane.db        # task supervision records
 │   ├── state/
 │   │   ├── runtime-trace.jsonl # persisted logs
 │   │   └── costs.jsonl         # cost ledger
@@ -51,6 +53,9 @@ new runtime state should be described in terms of `<install>/data/`,
 | ACP sessions | ACP protocol session store | `data/sessions/acp-sessions.db` | `AcpSessionStore` opened at daemon boot and in RPC context | WAL-backed SQLite store, separate from chat sessions | ACP `session/load` and `session/resume` operate on this protocol store, not the chat session backend. |
 | Live RPC/TUI sessions | RPC `SessionStore` | none by itself | `crates/zeroclaw-runtime/src/rpc/session.rs` in-memory map | Process-local; session history persists only through the chat or ACP backend | Live session handles, uploads, cancel tokens, owners, and overrides are runtime state. |
 | Cron jobs | Declarative config membership plus cron SQLite store | `data/cron/jobs.db` | `zeroclaw-runtime::cron` scheduler/store | Read paths do not create `jobs.db`; scheduler owns due/lock state | Declarative jobs are reconciled from config, while run metadata and locks live in the cron DB. |
+| SOP runs | `SopEngine` plus `SopRunStore` | None by default; `data/sop/runs.db` when durable SQLite initialization succeeds | SOP engine active/finished run caches | The durable store owns admission claims and persisted revisions; the engine restores active and terminal state on startup | Store initialization failure logs a warning and falls back to memory. Memory-backed audit records are not the run-lifecycle source of truth. |
+| Background task supervision | Durable task control plane | `data/control_plane.db` | control-plane handle, task producers, and reaper | Owner PID/boot ID identifies prior-boot orphans; heartbeat timeout applies only to producers that emit heartbeats | Current delegate/subagent producers register best-effort rows but leave heartbeat, parent, route, and principal fields absent. Goal APIs exist, but end-to-end goal execution is not yet wired. |
+| Background delegate results | Delegate result record | `<workspace>/delegate_results/<task-id>.json` | delegate tool cancellation registry and running future | Result files survive restart; live cancellation handles do not | Reads are file-first and overlay only `lost` or `timed_out` supervision when the file still says `running`; result and control-plane writes are independent and can diverge. |
 | Runtime logs | `zeroclaw-log` event schema and subscriber layer | `data/state/runtime-trace.jsonl` when persistence is enabled | broadcast hook, JSONL writer, `/api/logs` reader, `Observer` bridge | Rolling/full/none persistence is config-controlled; dashboard SSE receives events even when JSONL is disabled | Logs are evidence and observability, not the source of user config or session state. |
 | Cost ledger | `CostTracker` plus rate config | `data/state/costs.jsonl` | process-global `CostTracker` | Reload hot-swaps `CostConfig`; the tracker is constructed on demand if cost tracking becomes enabled | Existing records keep their recorded price; rate edits affect future requests after reload. |
 | Gateway pairing tokens | `PairingGuard` from `gateway.paired_tokens` | token hashes in config | pairing guard | Reload reconstructs the guard from config | Valid bearer tokens are config state, not `devices.db` rows. |
@@ -79,6 +84,8 @@ At minimum, include:
 - `data/memory/`
 - `data/sessions/`
 - `data/cron/jobs.db` if cron jobs are configured through runtime surfaces
+- `data/sop/runs.db` if durable SOP runs are enabled
+- `data/control_plane.db` if supervised task history matters
 - `data/state/costs.jsonl` if cost history matters
 - `data/state/runtime-trace.jsonl` if logs are needed for incident review
 - `data/devices.db` for paired-device metadata
@@ -94,6 +101,9 @@ the instance.
 - ACP session store: `crates/zeroclaw-infra/src/acp_session_store.rs`
 - RPC live sessions: `crates/zeroclaw-runtime/src/rpc/session.rs`
 - Cron persistence: `crates/zeroclaw-runtime/src/cron/store.rs`
+- SOP persistence: `crates/zeroclaw-runtime/src/sop/store/`
+- Background task and goal supervision: `crates/zeroclaw-runtime/src/control_plane/`
+- Background delegation results: `crates/zeroclaw-runtime/src/tools/delegate.rs`
 - Logs: `crates/zeroclaw-log/`
 - Cost ledger: `crates/zeroclaw-config/src/cost/tracker.rs`
 - Pairing guard: `crates/zeroclaw-config/src/pairing.rs`

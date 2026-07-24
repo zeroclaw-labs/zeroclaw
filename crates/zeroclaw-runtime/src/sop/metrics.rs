@@ -32,6 +32,8 @@ struct MetricCounters {
     steps_skipped: u64,
     human_approvals: u64,
     timeout_auto_approvals: u64,
+    /// EPIC G: deterministic `kind = capability` steps executed via the registry.
+    capability_executed: u64,
 }
 
 // ── RunSnapshot ────────────────────────────────────────────────
@@ -176,6 +178,26 @@ impl SopMetricsCollector {
         entry.1 += 1;
     }
 
+    /// EPIC G: record a deterministic capability step execution (global + per-SOP).
+    pub fn record_capability_executed(&self, sop_name: &str) {
+        let Ok(mut state) = self.inner.write() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_capability_executed"
+            );
+            return;
+        };
+        state.global.counters.capability_executed += 1;
+        state
+            .per_sop
+            .entry(sop_name.to_string())
+            .or_default()
+            .counters
+            .capability_executed += 1;
+    }
+
     /// Record a timeout auto-approval event.
     /// Call after the timeout action resolves the gate (the `system`-attributed
     /// `gate_resolved` ledger row is written inside `engine.resolve_gate`).
@@ -254,8 +276,16 @@ impl SopMetricsCollector {
                 continue;
             };
             for ev in &events {
+                // An `amend` IS an approval (of the operator's text) — the live
+                // path meters it via `record_approval_metric` exactly like a
+                // plain approve, so the rebuild must count it too or the
+                // counters drift across a restart. Denials, escalations, and
+                // revises (the gate stays open) are not approvals.
                 if ev.kind != "gate_resolved"
-                    || ev.payload.get("decision").and_then(|d| d.as_str()) != Some("approve")
+                    || !matches!(
+                        ev.payload.get("decision").and_then(|d| d.as_str()),
+                        Some("approve") | Some("amend")
+                    )
                 {
                     continue;
                 }
@@ -572,6 +602,7 @@ fn resolve_from_counters(c: &MetricCounters, metric: &str) -> Option<serde_json:
         "runs_completed" => Some(json!(c.runs_completed)),
         "runs_failed" => Some(json!(c.runs_failed)),
         "runs_cancelled" => Some(json!(c.runs_cancelled)),
+        "capability_executed" => Some(json!(c.capability_executed)),
         "deviation_rate" => {
             if c.steps_executed == 0 {
                 Some(json!(0.0))
@@ -685,11 +716,14 @@ mod tests {
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         }
     }
 
     fn make_step(number: u32, status: SopStepStatus) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: number,
             status,
             output: format!("Step {number}"),
@@ -1256,6 +1290,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1368,6 +1404,8 @@ mod tests {
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
 

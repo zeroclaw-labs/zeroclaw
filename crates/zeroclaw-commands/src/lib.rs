@@ -275,6 +275,27 @@ mod tests {
     }
 
     #[test]
+    fn normalize_command_name_empty_and_whitespace_returns_none() {
+        assert_eq!(normalize_command_name(""), None);
+        assert_eq!(normalize_command_name("   "), None);
+        assert_eq!(normalize_command_name("\t\n"), None);
+    }
+
+    #[test]
+    fn normalize_command_name_pure_slash_or_at_suffix_returns_none() {
+        assert_eq!(normalize_command_name("/"), None);
+        assert_eq!(normalize_command_name("@bot"), None);
+        assert_eq!(normalize_command_name("/@bot"), None);
+        assert_eq!(normalize_command_name("  /  @bot  "), None);
+    }
+
+    #[test]
+    fn normalize_command_name_unicode_preserved() {
+        assert_eq!(normalize_command_name("/新"), Some("新".to_string()));
+        assert_eq!(normalize_command_name("/新@my_bot"), Some("新".to_string()));
+    }
+
+    #[test]
     fn goal_is_advertised_only_where_admission_is_implemented() {
         assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
         assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());

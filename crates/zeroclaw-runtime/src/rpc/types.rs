@@ -11,6 +11,7 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
+pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -91,6 +92,14 @@ rpc_type! {
         pub protocol_version: u64,
         pub active_sessions: usize,
         pub session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_kind: Option<RuntimeConfigKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub local_ipc_endpoint: Option<String>,
     }
 }
 
@@ -1362,6 +1371,11 @@ pub enum SessionUpdateEvent {
         /// at cancel point (Cancelled).
         content: String,
     },
+    /// Emitted whenever older whole turns were dropped from structured history
+    /// to fit a token budget or message cap. Surfaces a user-visible "context
+    /// was cut here" marker so trimming is never silent. `dropped_messages` is
+    /// the count of conversation messages removed; `kept_turns` is how many
+    /// whole turns remained after the cut.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: usize,

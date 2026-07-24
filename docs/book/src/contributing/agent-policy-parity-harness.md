@@ -27,10 +27,20 @@ runtime knobs) are assembled at several distinct sites:
 | Gateway | the gateway server |
 | `loop_::run` | non-interactive runs: cron jobs, the daemon heartbeat, sub-agent spawning |
 | Delegate | sub-agent delegation |
+| SOP live nested step | `drive_live_sop_actions`: a step delegating to a different agent re-assembles that agent's engine input in-flight |
 
 Each path must hand the engine the same policy for the same agent config. The
 parity harness asserts exactly that: a setting enforced on one path is enforced
-on every path.
+on every path. The SOP live nested-step path is a sub-turn inside an already-running
+turn: when a step names a different agent, its complete execution contract is
+re-assembled through the same seam rather than inherited from the parent turn --
+gated tools, security policy, MCP scope, provider binding and temperature, resolved
+runtime controls, and an approval manager carrying the step agent's risk profile
+under the parent surface's interactivity mode. The step runs on an explicit child
+transcript (its own system prompt plus the step context; the parent conversation
+never reaches the step agent's provider), and its records stamp the step agent as
+the acting identity with the delegating agent as parent correlation. A path that
+cannot re-assemble fails the cross-agent step closed.
 
 ## The parity matrix
 
@@ -75,7 +85,7 @@ The per-agent tool registry is the first surface with a single gated constructor
 `ScopedToolRegistry::assemble` (`crates/zeroclaw-runtime/src/tools/scoped.rs`). The
 registry has historically been assembled by hand at six construction sites - the
 reason the built-in filter and MCP scoping had to be patched per-site (#7064,
-#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
+\#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
 (when connected - see the knob below), the built-in `allowed_tools`/
 `excluded_tools` filter, the ACP memory strip, MCP server scoping per `mcp_bundles`
 plus per-tool gating (eager or deferred; omission is not a grant) with the MCP

@@ -28,6 +28,7 @@ pub mod router;
 pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
+pub mod vision_override;
 
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 
@@ -608,6 +609,11 @@ pub struct ModelProviderRuntimeOptions {
     /// Enable or disable chain-of-thought thinking. Forwarded as
     /// `enable_thinking` in the request body. `None` lets the model decide.
     pub think: Option<bool>,
+    /// Override the provider's vision (image input) capability. `None` keeps
+    /// the provider family's built-in default; `Some(false)` marks a text-only
+    /// model served by a vision-capable family as non-vision. Mapped from
+    /// `ModelProviderConfig::vision`.
+    pub vision: Option<bool>,
     /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
@@ -634,6 +640,7 @@ impl Default for ModelProviderRuntimeOptions {
             native_tools: None,
             wire_api: None,
             think: None,
+            vision: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
         }
@@ -696,6 +703,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
+        vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
     }
@@ -757,6 +765,10 @@ pub fn options_for_provider_ref(
             let mut options = fallback.clone();
             options.provider_kind = None;
             options.provider_api_url = None;
+            // `vision` is provider-specific: a bare family ref must not inherit
+            // the fallback provider's capability flag. Clearing it falls back to
+            // the family default (or the choke point's own resolution).
+            options.vision = None;
             options
         }
     }
@@ -1085,6 +1097,24 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
+/// Apply the config `vision` capability override to a freshly-constructed
+/// provider. Called at every exit of `create_model_provider_inner`, the single
+/// construction choke point every subsystem funnels through, so the override
+/// lands once and `supports_vision()` stays consistent across the
+/// vision-routing gate, the channel media pipeline, and the model router
+/// without per-family or per-consumer re-derivation.
+fn apply_vision_override(
+    provider: Box<dyn ModelProvider>,
+    vision: Option<bool>,
+) -> Box<dyn ModelProvider> {
+    match vision {
+        Some(vision) => Box::new(vision_override::VisionOverrideProvider::new(
+            provider, vision,
+        )),
+        None => provider,
+    }
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1124,9 +1154,12 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
-            alias, options, api_key,
-        )?));
+        return Ok(apply_vision_override(
+            Box::new(openai_codex::OpenAiCodexModelProvider::new(
+                alias, options, api_key,
+            )?),
+            options.vision,
+        ));
     }
     let resolved_credential = resolve_model_provider_credential(provider_kind, api_key)
         .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
@@ -1172,13 +1205,17 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(factory::apply_compat_options(
-            factory::build_kimi_code_compat(alias, key, base_url),
-            options,
+        return Ok(apply_vision_override(
+            factory::apply_compat_options(
+                factory::build_kimi_code_compat(alias, key, base_url),
+                options,
+            ),
+            options.vision,
         ));
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
+        .map(|provider| apply_vision_override(provider, options.vision))
 }
 
 pub fn create_resilient_model_provider_with_options(
@@ -1296,27 +1333,23 @@ fn push_pinned_entries(
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push(ReliableModelProviderEntry::new(
+    out.push(ReliableModelProviderEntry::new_pinned(
         family,
         cooldown_key.clone(),
-        Box::new(crate::model_pin::ModelPinnedProvider::new(
-            alias,
-            primary_model,
-            Box::new(std::sync::Arc::clone(&built)),
-        )),
+        alias,
+        primary_model,
+        Box::new(std::sync::Arc::clone(&built)),
     ));
     for model in extra_models {
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
-        out.push(ReliableModelProviderEntry::new(
+        out.push(ReliableModelProviderEntry::new_pinned(
             family,
             cooldown_key.clone(),
-            Box::new(crate::model_pin::ModelPinnedProvider::new(
-                alias,
-                model,
-                Box::new(std::sync::Arc::clone(&built)),
-            )),
+            alias,
+            model,
+            Box::new(std::sync::Arc::clone(&built)),
         ));
     }
 }
@@ -1425,6 +1458,89 @@ pub fn create_resilient_model_provider_from_ref(
         options,
         None,
     )
+}
+
+/// A provider resolved from a config reference together with the model declared
+/// by that same alias. The model is an on-demand view of Config, not stored
+/// provider state.
+pub struct ResolvedModelProviderRef {
+    pub provider: Box<dyn ModelProvider>,
+    pub model: Option<String>,
+}
+
+/// Build a **bare** (non-resilient) provider named by `name` - a bare family
+/// (`"llamacpp"`), a dotted alias (`"llamacpp.text_model"`), or a `custom:<url>`
+/// ref - resolving its alias-specific runtime options from `config`: the
+/// `vision` capability override, the endpoint URI, and per-alias credentials
+/// from `[providers.models.<family>.<alias>]`.
+///
+/// Unlike the legacy `create_model_provider(name, None)` (which passes
+/// `config = None` and `ModelProviderRuntimeOptions::default()`, so it cannot see
+/// any per-alias config), this honors the alias's `vision` override and typed
+/// config while returning an un-wrapped provider - the shape the dedicated
+/// vision route needs so its configured `[multimodal] vision_model_provider`
+/// respects a per-alias `vision = true/false`.
+pub fn create_model_provider_from_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_model_provider_from_ref_with_model(config, name).map(|resolved| resolved.provider)
+}
+
+/// Resolve a provider reference and its alias-owned model as one materialized
+/// view. Callers may apply their own explicit model override after resolution;
+/// when the reference is bare or URL-based, `model` is `None`.
+pub fn create_model_provider_from_ref_with_model(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<ResolvedModelProviderRef> {
+    // A dotted `<family>.<alias>` that names a REAL configured entry resolves
+    // through the alias factory (honoring the alias's `vision` override, endpoint
+    // URI and credentials). Two exclusions keep the intact name flowing to the
+    // factory instead:
+    //   * a `custom:<url>` / `anthropic-custom:<url>` colon ref whose host carries
+    //     dots (the pre-dot segment holds the scheme colon, e.g. `custom:https://api`
+    //     from `custom:https://api.example.com/v1`) - splitting would truncate it;
+    //   * a dotted ref to a NON-existent alias - splitting it and building the bare
+    //     family would silently fall OPEN to a family-default provider (e.g. a
+    //     typoed `vision_model_provider = "llamacpp.typo"` would route images to a
+    //     default llama.cpp instead of erroring).
+    // In both cases the intact name reaches `create_model_provider_inner`, which
+    // applies family defaults or errors on an unknown provider - keeping a bad ref
+    // fail-closed, exactly as the legacy `create_model_provider(vp, None)` did.
+    if let Some((family, alias)) = name.split_once('.')
+        && !family.contains(':')
+        && let Some(entry) = config.providers.models.find(family, alias)
+    {
+        let options = provider_runtime_options_for_alias(config, family, alias);
+        let provider = create_model_provider_inner(
+            Some(config),
+            family,
+            alias,
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
+            &options,
+        )?;
+        let model = entry
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string);
+        return Ok(ResolvedModelProviderRef { provider, model });
+    }
+    let provider = create_model_provider_inner(
+        None,
+        name,
+        "default",
+        None,
+        None,
+        &ModelProviderRuntimeOptions::default(),
+    )?;
+    Ok(ResolvedModelProviderRef {
+        provider,
+        model: None,
+    })
 }
 
 fn create_resilient_model_provider_from_ref_with_model_override(
@@ -1836,7 +1952,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("baseten", "Baseten", false),
             ("nscale", "Nscale", false),
             ("anyscale", "Anyscale", false),
-            ("nebius", "Nebius AI Studio", false),
+            ("nebius", "Nebius Token Factory", false),
             ("friendli", "Friendli AI", false),
             ("lepton", "Lepton AI", false),
         ],
@@ -2317,6 +2433,113 @@ mod tests {
     fn factory_llamacpp() {
         assert!(create_model_provider("llamacpp", Some("key")).is_ok());
         assert!(create_model_provider("llamacpp", None).is_ok());
+    }
+
+    #[test]
+    fn vision_override_applies_once_at_construction_for_any_family() {
+        // llama.cpp and the generic custom endpoint both default to
+        // vision-capable. `vision = Some(false)` must mark the constructed
+        // provider non-vision regardless of family, and show up in BOTH
+        // `supports_vision()` and `capabilities().vision` so every consumer
+        // (routing gate, media pipeline, model router) agrees.
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            let off = ModelProviderRuntimeOptions {
+                vision: Some(false),
+                ..Default::default()
+            };
+            let provider =
+                create_model_provider_inner(None, name, "default", None, None, &off).unwrap();
+            assert!(
+                !provider.supports_vision(),
+                "{name}: vision=false should mark the provider non-vision"
+            );
+            assert!(
+                !provider.capabilities().vision,
+                "{name}: capabilities().vision must stay consistent with supports_vision()"
+            );
+
+            // `None` preserves the family default (vision-capable here).
+            let provider = create_model_provider_inner(
+                None,
+                name,
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                provider.supports_vision(),
+                "{name}: no override should keep the family default"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.vision, Some(false));
+    }
+
+    #[test]
+    fn openai_responses_alias_honors_configured_vision_capability() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "responses_vision".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    wire_api: Some(WireApi::Responses),
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "responses_vision");
+        let provider = create_model_provider_for_alias(
+            &config,
+            "openai",
+            "responses_vision",
+            Some("sk-test"),
+            &options,
+        )
+        .expect("configured OpenAI Responses alias builds");
+
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert!(
+            provider.capabilities().native_tool_calling,
+            "the alias must use the Responses provider"
+        );
+        assert!(
+            provider.capabilities_for_model("gpt-4o").vision,
+            "vision=true must reach the exact OpenAI Responses production factory path"
+        );
+    }
+
+    #[test]
+    fn options_for_bare_provider_ref_does_not_inherit_fallback_vision() {
+        use zeroclaw_config::schema::Config;
+        // A bare family ref (no alias) must not inherit the fallback provider's
+        // `vision` flag — otherwise a `-p llamacpp` override would carry the
+        // agent provider's capability. Falls back to the family default.
+        let fallback = ModelProviderRuntimeOptions {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let resolved = options_for_provider_ref(&Config::default(), "llamacpp", &fallback);
+        assert_eq!(resolved.vision, None);
     }
 
     #[test]
@@ -2908,6 +3131,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn create_model_provider_from_ref_preserves_custom_url_with_dotted_host() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::Config;
+        // A `custom:<url>` vision route whose host contains dots (e.g. 127.0.0.1)
+        // must NOT be split on '.' into a bogus `<family>.<alias>` - the whole ref
+        // must reach the factory intact, exactly as the legacy
+        // `create_model_provider(vp, None)` did. Regression for the alias-aware ref
+        // factory added for the dedicated vision route.
+        let config = Config::default();
+        let url = "custom:http://127.0.0.1:9999/v1";
+        let via_ref =
+            create_model_provider_from_ref(&config, url).expect("ref factory builds custom URL");
+        let via_legacy =
+            create_model_provider(url, None).expect("legacy factory builds custom URL");
+        assert_eq!(
+            via_ref.alias(),
+            via_legacy.alias(),
+            "custom:<url> with a dotted host must build identically to the legacy \
+             factory (not be mis-split into a bogus family/alias)"
+        );
+    }
+
+    #[test]
+    fn create_model_provider_from_ref_fails_closed_on_nonexistent_dotted_alias() {
+        use zeroclaw_config::schema::Config;
+        // A dotted `vision_model_provider` that names no configured alias (e.g. a
+        // typo) must fail CLOSED - an error the operator sees - not silently fall
+        // open to a family-default provider. `llamacpp` builds a default endpoint
+        // for a bare family, so without the entry-exists guard `llamacpp.typo`
+        // would (wrongly) succeed and route images to a default llama.cpp.
+        let config = Config::default();
+        assert!(
+            create_model_provider_from_ref(&config, "llamacpp.typo").is_err(),
+            "a dotted ref to a non-existent alias must fail closed, not fall open to a default provider"
+        );
+        // Same fail-closed behavior as the legacy factory the vision route used.
+        assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
     // ── Error cases ──────────────────────────────────────────
 
     #[test]
@@ -3488,7 +3751,9 @@ mod tests {
         assert_eq!(tuning.num_predict, 4096);
         assert_eq!(tuning.temperature_override, Some(0.5));
 
-        let provider = ollama::OllamaModelProvider::new("test", None, None).with_tuning(tuning);
+        let provider = ollama::OllamaModelProvider::builder("test")
+            .tuning(tuning)
+            .build();
         assert_eq!(provider.tuning(), tuning);
     }
 

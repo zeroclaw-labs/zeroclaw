@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
@@ -21,6 +21,17 @@ import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
+
+// Open chat links in a new tab so navigation never replaces the live chat
+// page. In-page anchors (e.g. GFM footnote refs) keep default navigation.
+const markdownComponents: Components = {
+  a: ({ node: _node, href, ...props }) =>
+    href?.startsWith('#') ? (
+      <a {...props} href={href} />
+    ) : (
+      <a {...props} href={href} target="_blank" rel="noopener noreferrer" />
+    ),
+};
 
 /** Format token count with commas (e.g., 12345 -> "12,345"). */
 function fmtTokens(n: number): string {
@@ -703,12 +714,16 @@ const MessageItem = memo(function MessageItem({
       {!compact && (
         <div
           className={`flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border ${
-            msg.role === 'user'
+            msg.notice
+              ? 'bg-status-warning/10 border-status-warning/30'
+              : msg.role === 'user'
               ? 'bg-pc-accent/15 border-pc-accent/30'
               : 'bg-pc-elevated border-pc-border'
           }`}
         >
-          {msg.role === 'user' ? (
+          {msg.notice ? (
+            <AlertCircle className="h-4 w-4 text-status-warning" />
+          ) : msg.role === 'user' ? (
             <User className="h-4 w-4 text-pc-accent" />
           ) : (
             <Bot className="h-4 w-4 text-pc-accent" />
@@ -718,7 +733,9 @@ const MessageItem = memo(function MessageItem({
       <div className="relative max-w-[75%]">
         <div
           className={`${compact ? 'rounded-[var(--radius-md)] px-3 py-1.5 border' : 'rounded-[var(--radius-lg)] px-4 py-3 border'} text-pc-text ${
-            msg.role === 'user'
+            msg.notice
+              ? 'bg-status-warning/5 border-status-warning/30'
+              : msg.role === 'user'
               ? 'bg-pc-accent/10 border-pc-accent/20'
               : 'bg-pc-elevated border-pc-border'
           }`}
@@ -732,7 +749,7 @@ const MessageItem = memo(function MessageItem({
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
           ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent}</ReactMarkdown></div>
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{cleanContent}</ReactMarkdown></div>
           ) : (
             <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}

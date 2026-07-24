@@ -62,6 +62,7 @@ struct LogEntry {
     category: String,
     action: String,
     message: String,
+    live_detail_fallback: Option<Value>,
 }
 
 pub(crate) struct LogDetail {
@@ -77,6 +78,16 @@ pub(crate) enum DetailState {
 
 impl LogEntry {
     fn from_value(v: &Value) -> Option<Self> {
+        Self::from_value_with_fallback(v, None)
+    }
+
+    fn from_live_value(v: Value) -> Option<Self> {
+        let mut entry = Self::from_value_with_fallback(&v, None)?;
+        entry.live_detail_fallback = Some(v);
+        Some(entry)
+    }
+
+    fn from_value_with_fallback(v: &Value, live_detail_fallback: Option<Value>) -> Option<Self> {
         let timestamp = v.get("@timestamp")?.as_str()?.to_string();
         let id = v
             .get("id")
@@ -107,7 +118,15 @@ impl LogEntry {
             category,
             action,
             message,
+            live_detail_fallback,
         })
+    }
+
+    fn fallback_detail(&self) -> LogDetail {
+        self.live_detail_fallback
+            .clone()
+            .map(LogDetail::new)
+            .unwrap_or_else(|| LogDetail::from_preview(self))
     }
 
     fn short_time(&self) -> &str {
@@ -621,7 +640,7 @@ impl Logs {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == LOGS_EVENT_METHOD => {
-                    if let Some(entry) = LogEntry::from_value(&notif.params) {
+                    if let Some(entry) = LogEntry::from_live_value(notif.params) {
                         self.events.push(entry);
                     }
                 }
@@ -1126,11 +1145,12 @@ impl Logs {
         self.detail_request_id = Some(id.clone());
         // `logs/get` can fail for push-delivered rows the persistent
         // store hasn't flushed yet (their id falls back to the
-        // timestamp). Fall back to the preview row rather than leaving
-        // the pane stuck on "Loading…".
+        // timestamp). Prefer the pushed full event as a bounded
+        // in-memory fallback; only drop to preview fields when the row
+        // truly has no full payload.
         let resolved = match self.rpc.logs_get(&id).await {
             Ok(r) => LogDetail::new(r.event),
-            Err(_) => LogDetail::from_preview(&self.events[idx]),
+            Err(_) => self.events[idx].fallback_detail(),
         };
         if self.detail_request_id.as_deref() == Some(id.as_str()) {
             self.detail = DetailState::Ready(resolved);
@@ -1249,6 +1269,7 @@ mod tests {
             category: "internal".into(),
             action: "note".into(),
             message: "TUI disconnected; session ended".into(),
+            live_detail_fallback: None,
         }
     }
 
@@ -1296,6 +1317,33 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
+        assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+    }
+
+    #[test]
+    fn live_fallback_preserves_full_event_attributes() {
+        let raw = serde_json::json!({
+            "@timestamp": "2026-07-04T06:32:41.044Z",
+            "severity_number": SEV_INFO,
+            "event": { "category": "provider", "action": "send" },
+            "message": "llm_request",
+            "attributes": {
+                "model": "switched-model",
+                "messages_count": 2
+            }
+        });
+        let entry = LogEntry::from_live_value(raw).expect("live event row");
+        let detail = entry.fallback_detail();
+        assert!(!detail.is_preview_only());
+        assert_eq!(detail.attributes()["model"], "switched-model");
+
+        let text: String = detail
+            .detail_lines()
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("switched-model"));
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
     }
 }

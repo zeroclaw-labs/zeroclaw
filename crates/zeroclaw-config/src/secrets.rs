@@ -384,6 +384,12 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
     if (hex.len() & 1) != 0 {
         anyhow::bail!("Hex string has odd length");
     }
+    // Reject non-ASCII up front: valid hex is always ASCII, and this guarantees
+    // every byte is a char boundary so the byte-index slicing below cannot panic
+    // on a corrupt/tampered ciphertext (it returns the Err the signature promises).
+    if !hex.is_ascii() {
+        anyhow::bail!("Hex string contains non-ASCII characters");
+    }
     (0..hex.len())
         .step_by(2)
         .map(|i| {
@@ -1113,6 +1119,17 @@ exit 65
     #[test]
     fn hex_decode_invalid_chars_fails() {
         assert!(hex_decode("zzzz").is_err());
+    }
+
+    #[test]
+    fn hex_decode_non_ascii_returns_error() {
+        // A corrupt/tampered ciphertext with even *byte* length made of
+        // non-ASCII chars previously slipped past the odd-length check and
+        // panicked on mid-UTF-8-char byte slicing. It must now return Err
+        // gracefully (the signature's promise). "€€" is 6 bytes.
+        assert!(hex_decode("€€").is_err());
+        // Non-ASCII that is a whole 2-byte char also errors, not panics.
+        assert!(hex_decode("ÿÿ").is_err());
     }
 
     #[test]

@@ -292,8 +292,8 @@ Examples:
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
-        /// Telegram channel alias to bind to (the <alias> in
-        /// channels.telegram.<alias>). Defaults to `default`.
+        /// Telegram channel alias to bind to (the `<alias>` in
+        /// `channels.telegram.<alias>`). Defaults to `default`.
         #[arg(long, default_value = "default")]
         alias: String,
     },
@@ -517,6 +517,9 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        #[arg(long)]
+        skill: Option<String>,
     },
     /// Remove an installed skill
     Remove {
@@ -588,6 +591,10 @@ pub enum MigrateCommands {
         /// Validate and preview migration without writing any data
         #[arg(long)]
         dry_run: bool,
+
+        /// Rebuild backend indexes after importing entries
+        #[arg(long)]
+        reindex: bool,
     },
 }
 

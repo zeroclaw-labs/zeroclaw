@@ -15,7 +15,6 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
@@ -23,9 +22,10 @@ use ratatui::{
 };
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
+use crate::terminal_backend::WideCellCleanupBackend;
 use crate::theme;
 
-pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -66,7 +66,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    Ok(Terminal::new(WideCellCleanupBackend::new(stdout))?)
 }
 
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
@@ -419,42 +419,6 @@ impl App {
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
-        Ok(())
-    }
-
-    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
-        self.section = ConfigSection::Zeroclaw;
-        self.zeroclaw_pane = ZeroclawPane::Detail;
-        self.deactivate_filter();
-
-        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
-            return Ok(());
-        };
-
-        self.section_cursor = section_idx;
-        self.loaded_section = Some(section_idx);
-        self.load_aliases("agents").await?;
-
-        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
-            self.alias_cursor = 0;
-            self.screen = Screen::AliasList {
-                section_idx,
-                map_path: "agents".to_string(),
-                breadcrumb: vec!["agents".to_string()],
-            };
-            self.status_msg = None;
-            return Ok(());
-        };
-
-        self.alias_cursor = alias_idx;
-        let prefix = format!("agents.{alias}");
-        self.load_fields(&prefix).await?;
-        self.screen = Screen::FieldList {
-            section_idx,
-            prefix,
-            breadcrumb: vec!["agents".to_string(), alias.to_string()],
-        };
-        self.status_msg = None;
         Ok(())
     }
 

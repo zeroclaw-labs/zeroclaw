@@ -48,6 +48,7 @@ pub struct OtelObserver {
     memory_recall_count: Counter<u64>,
     memory_recall_duration: Histogram<f64>,
     memory_store_count: Counter<u64>,
+    memory_audit_count: Counter<u64>,
     rag_retrieve_count: Counter<u64>,
     rag_retrieve_duration: Histogram<f64>,
 
@@ -206,6 +207,11 @@ impl OtelObserver {
             .with_description("Total memory.store calls from the runtime boundary")
             .build();
 
+        let memory_audit_count = meter
+            .u64_counter("zeroclaw.memory.audit.count")
+            .with_description("Total memory audit trail actions")
+            .build();
+
         let rag_retrieve_count = meter
             .u64_counter("zeroclaw.rag.retrieve.count")
             .with_description("Total rag.retrieve calls from the runtime boundary")
@@ -237,6 +243,7 @@ impl OtelObserver {
             memory_recall_count,
             memory_recall_duration,
             memory_store_count,
+            memory_audit_count,
             rag_retrieve_count,
             rag_retrieve_duration,
             active_agent_spans: Mutex::new(HashMap::new()),
@@ -315,6 +322,7 @@ impl Observer for OtelObserver {
                 messages_count,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
@@ -334,6 +342,10 @@ impl Observer for OtelObserver {
                                 "gen_ai.agent.name",
                                 agent_alias.clone().unwrap_or_default(),
                             ),
+                            KeyValue::new(
+                                "zeroclaw.parent_agent_alias",
+                                parent_agent_alias.clone().unwrap_or_default(),
+                            ),
                             KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                         ]),
                     &parent_cx,
@@ -346,6 +358,7 @@ impl Observer for OtelObserver {
                 arguments,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let mut span_attrs = vec![
@@ -353,6 +366,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("tool.name", tool.clone()),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(id) = tool_call_id {
@@ -384,6 +401,9 @@ impl Observer for OtelObserver {
                 num_entries,
                 backend,
                 success,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -398,6 +418,9 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", backend.clone()),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(q) = query_summary {
                     // Langfuse-specific Input/Output pane attrs. Emitting
@@ -411,11 +434,13 @@ impl Observer for OtelObserver {
                     ));
                 }
 
-                let mut span = tracer.build(
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("memory.recall")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 if *success {
                     span.set_status(Status::Ok);
@@ -433,6 +458,9 @@ impl Observer for OtelObserver {
                 duration,
                 num_chunks,
                 num_boards,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -445,6 +473,9 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", "zeroclaw_rag"),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(q) = query_summary {
                     span_attrs.push(KeyValue::new("input.value", q.clone()));
@@ -454,11 +485,13 @@ impl Observer for OtelObserver {
                     ));
                 }
 
-                let mut span = tracer.build(
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("rag.retrieve")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 span.set_status(Status::Ok);
                 span.end();
@@ -471,6 +504,9 @@ impl Observer for OtelObserver {
                 backend,
                 duration,
                 success,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -484,13 +520,18 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("db.system", backend.clone()),
                     KeyValue::new("db.operation", "INSERT"),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
 
-                let mut span = tracer.build(
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
                     opentelemetry::trace::SpanBuilder::from_name("memory.store")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
                         .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 if *success {
                     span.set_status(Status::Ok);
@@ -506,6 +547,45 @@ impl Observer for OtelObserver {
                 ];
                 self.memory_store_count.add(1, &metric_attrs);
             }
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                let secs = duration.as_secs_f64();
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+                let span_attrs = vec![
+                    KeyValue::new("memory.action", action.clone()),
+                    KeyValue::new("memory.backend", backend.clone()),
+                    KeyValue::new("memory.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("db.system", backend.clone()),
+                    KeyValue::new("db.operation", action.clone()),
+                ];
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("memory.audit")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+
+                let metric_attrs = [
+                    KeyValue::new("action", action.clone()),
+                    KeyValue::new("backend", backend.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.memory_audit_count.add(1, &metric_attrs);
+            }
             ObserverEvent::LlmResponse {
                 model_provider,
                 model,
@@ -516,6 +596,7 @@ impl Observer for OtelObserver {
                 output_tokens,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
                 messages,
             } => {
@@ -529,6 +610,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 self.llm_calls.add(1, &attrs);
@@ -543,6 +628,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(input) = input_tokens {
@@ -689,6 +778,7 @@ impl Observer for OtelObserver {
                 result,
                 channel,
                 agent_alias,
+                parent_agent_alias,
                 turn_id,
             } => {
                 let secs = duration.as_secs_f64();
@@ -706,6 +796,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
                     KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new(
+                        "zeroclaw.parent_agent_alias",
+                        parent_agent_alias.clone().unwrap_or_default(),
+                    ),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 if let Some(id) = tool_call_id {
@@ -1237,6 +1331,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
@@ -1245,6 +1340,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(250),
@@ -1278,6 +1374,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             arguments: None,
@@ -1286,6 +1383,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -1297,6 +1395,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "file_read".into(),
             tool_call_id: None,
             duration: Duration::from_millis(5),
@@ -1347,6 +1446,9 @@ mod tests {
             num_entries: 7,
             backend: "sqlite".into(),
             success: true,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // MemoryRecall failure path with query_summary: None.
         obs.record_event(&ObserverEvent::MemoryRecall {
@@ -1355,6 +1457,9 @@ mod tests {
             num_entries: 0,
             backend: "qdrant".into(),
             success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // RagRetrieve with populated query_summary.
@@ -1363,6 +1468,9 @@ mod tests {
             duration: Duration::from_millis(120),
             num_chunks: 12,
             num_boards: 3,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // RagRetrieve with query_summary: None.
         obs.record_event(&ObserverEvent::RagRetrieve {
@@ -1370,6 +1478,9 @@ mod tests {
             duration: Duration::ZERO,
             num_chunks: 0,
             num_boards: 0,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // MemoryStore success path.
@@ -1378,12 +1489,30 @@ mod tests {
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // MemoryStore failure path.
         obs.record_event(&ObserverEvent::MemoryStore {
             category: "fact".into(),
             backend: "qdrant".into(),
             duration: Duration::from_millis(3),
+            success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(5),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "purge".into(),
+            backend: "qdrant".into(),
+            duration: Duration::from_millis(2),
             success: false,
         });
     }
@@ -1392,6 +1521,7 @@ mod tests {
     fn tool_call_with_id_args_and_result_does_not_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("toolu_01ABC".into()),
             arguments: Some(r#"{"command":"ls -la /tmp"}"#.into()),
@@ -1400,6 +1530,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("toolu_01ABC".into()),
             duration: Duration::from_millis(42),
@@ -1413,6 +1544,7 @@ mod tests {
         // Failure case — the issue author specifically wants to see *why*
         // a tool call failed, so the result field is the error text.
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("toolu_02DEF".into()),
             duration: Duration::from_millis(3),
@@ -1441,6 +1573,7 @@ mod tests {
     fn otel_records_llm_failure_without_panic() {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "missing-model".into(),
             duration: Duration::from_millis(0),
@@ -1493,6 +1626,7 @@ mod tests {
         );
 
         obs.record_event(&ObserverEvent::LlmRequest {
+            parent_agent_alias: None,
             model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             messages_count: 2,
@@ -1501,6 +1635,7 @@ mod tests {
             turn_id: Some("turn-1".into()),
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             duration: Duration::from_millis(25),
@@ -1514,6 +1649,7 @@ mod tests {
             messages: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("call-1".into()),
             arguments: Some(r#"{"command":"date"}"#.into()),
@@ -1522,6 +1658,7 @@ mod tests {
             turn_id: Some("turn-1".into()),
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: Some("call-1".into()),
             duration: Duration::from_millis(5),
@@ -1553,6 +1690,97 @@ mod tests {
                 .contains_key("turn-1"),
             "AgentEnd should close the live span"
         );
+    }
+
+    /// Memory/RAG events carrying a live turn_id must parent under the
+    /// active agent span. As with the other span tests we
+    /// cannot assert exported parent/child linkage (OTLP export is async);
+    /// we assert the recording path exercises `parent_cx_for` for all three
+    /// arms without panicking and without disturbing the live turn entry.
+    #[test]
+    fn memory_rag_spans_nest_under_turn() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-m1"),
+            "AgentStart should open a live span keyed by turn_id"
+        );
+
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: Some("coffee preferences".into()),
+            duration: Duration::from_millis(45),
+            num_entries: 3,
+            backend: "sqlite".into(),
+            success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        obs.record_event(&ObserverEvent::RagRetrieve {
+            query_summary: Some("ESP32 pinout".into()),
+            duration: Duration::from_millis(12),
+            num_chunks: 4,
+            num_boards: 1,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        obs.record_event(&ObserverEvent::MemoryStore {
+            category: "conversation".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(8),
+            success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-m1"),
+            "memory/RAG child events must not remove the live turn entry"
+        );
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(90),
+            tokens_used: None,
+            cost_usd: None,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-m1".into()),
+        });
+        assert!(
+            !obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-m1"),
+            "AgentEnd should close the live span"
+        );
+
+        // Unknown or absent turn_id degrades to a root span, no panic.
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: None,
+            duration: Duration::from_millis(5),
+            num_entries: 0,
+            backend: "sqlite".into(),
+            success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some("no-such-turn".into()),
+        });
     }
 
     #[test]
@@ -1599,6 +1827,7 @@ mod tests {
         )
         .expect("creation should succeed");
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(100),
@@ -1612,6 +1841,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(50),

@@ -313,9 +313,9 @@ true), `patterns` (comma-separated literals, default empty).
 For this plugin: `name` and `version` matching what `plugin-info` reports,
 `wasm_path` naming the component file you will ship next to it,
 `capabilities` containing exactly `tool`, and `permissions` containing exactly
-`config_read`. Add `http_client` only if your tool makes outbound HTTP calls;
-that permission is what attaches the `wasi:http` context to your store, and
-without it there is no network surface at all.
+`config_read`. Add `http_client` only if your tool makes outbound HTTP calls.
+The tool adapter implements `wasi:http`, but links it only after that grant is
+validated; without both adapter support and the grant there is no HTTP surface.
 
 ### Tools that call the network
 

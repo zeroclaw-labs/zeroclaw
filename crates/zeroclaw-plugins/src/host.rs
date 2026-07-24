@@ -3,7 +3,7 @@
 use super::error::PluginError;
 use super::signature::{self, SignatureMode, VerificationResult};
 use super::{PluginCapability, PluginInfo, PluginManifest};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Subdirectory inside a skill-capable plugin that holds individual skills.
@@ -118,6 +118,7 @@ impl PluginHost {
             return Ok(());
         }
 
+        let mut ambiguous_packages = HashSet::new();
         let entries = std::fs::read_dir(&self.plugins_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -135,6 +136,27 @@ impl PluginHost {
                     let manifest_toml = std::fs::read_to_string(&manifest_path).unwrap_or_default();
                     match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
                         Ok(verification) => {
+                            if ambiguous_packages.contains(&manifest.name) {
+                                continue;
+                            }
+                            if self.loaded.remove(&manifest.name).is_some() {
+                                ambiguous_packages.insert(manifest.name.clone());
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Load
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "plugin": manifest.name,
+                                        })
+                                    ),
+                                    "rejecting ambiguous duplicate plugin package"
+                                );
+                                continue;
+                            }
                             let wasm_path = manifest.wasm_path.as_deref().map(|p| path.join(p));
                             self.loaded.insert(
                                 manifest.name.clone(),
@@ -383,6 +405,8 @@ fn validate_manifest_shape(
     manifest: &PluginManifest,
     plugin_dir: &Path,
 ) -> Result<(), PluginError> {
+    crate::instance::validate_package_name(&manifest.name).map_err(PluginError::InvalidManifest)?;
+
     if manifest.capabilities.is_empty() {
         return Err(PluginError::InvalidManifest(format!(
             "plugin '{}' declares no capabilities",
@@ -872,6 +896,39 @@ capabilities = ["tool"]
         let host = PluginHost::new(dir.path()).unwrap();
         // Discovery skips invalid manifests rather than failing.
         assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn manifest_name_must_be_a_canonical_package_slug() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("unsafe-name");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"../escape\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn duplicate_package_names_are_all_rejected() {
+        let dir = tempdir().unwrap();
+        let plugins_dir = dir.path().join("plugins");
+        for directory in ["first", "second"] {
+            let plugin_dir = plugins_dir.join(directory);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                "name = \"shared\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+            )
+            .unwrap();
+        }
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.get_plugin("shared").is_none());
     }
 
     #[test]
