@@ -65,6 +65,13 @@ Download the latest `zeroclaw-x86_64-pc-windows-msvc.zip`, extract it, add its d
 setup.bat --prebuilt
 ```
 
+**Scoop:**
+
+```cmd
+scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
+scoop install zeroclaw
+```
+
 **From source:**
 
 ```cmd
