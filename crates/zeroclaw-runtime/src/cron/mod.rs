@@ -55,18 +55,20 @@ pub fn validate_shell_command(
     approved: bool,
 ) -> Result<()> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    validate_shell_command_with_security(&security, command, approved)
+    validate_shell_command_with_security(config, &security, command, approved)
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
 /// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
 pub fn validate_shell_command_with_security(
+    config: &Config,
     security: &SecurityPolicy,
     command: &str,
     approved: bool,
 ) -> Result<()> {
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
     security
-        .validate_command_execution(command, approved)
+        .validate_command_execution_for_shell(command, approved, runtime.shell_dialect())
         .map(|_| ())
         .map_err(|reason| {
             ::zeroclaw_log::record!(
@@ -689,8 +691,12 @@ mod tests {
             &config.data_dir,
         );
         // Simulate scheduler validation path
-        let result =
-            validate_shell_command_with_security(&security, "curl https://example.com", false);
+        let result = validate_shell_command_with_security(
+            &Config::default(),
+            &security,
+            "curl https://example.com",
+            false,
+        );
         assert!(result.is_err());
         assert!(
             result

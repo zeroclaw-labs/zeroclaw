@@ -3,7 +3,7 @@ pub mod native;
 
 pub use docker::DockerRuntime;
 pub use native::NativeRuntime;
-pub use zeroclaw_api::runtime_traits::RuntimeAdapter;
+pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
 

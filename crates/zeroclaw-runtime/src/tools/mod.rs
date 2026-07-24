@@ -1994,6 +1994,9 @@ mod tests {
         fn supports_long_running(&self) -> bool {
             false
         }
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            self.0.shell_dialect()
+        }
         fn build_shell_command(
             &self,
             command: &str,

@@ -31,6 +31,17 @@ mod tests {
             true
         }
 
+        fn shell_dialect(&self) -> ShellDialect {
+            #[cfg(windows)]
+            {
+                ShellDialect::WindowsCmd
+            }
+            #[cfg(not(windows))]
+            {
+                ShellDialect::Posix
+            }
+        }
+
         fn build_shell_command(
             &self,
             command: &str,

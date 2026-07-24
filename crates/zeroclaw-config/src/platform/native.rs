@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use zeroclaw_api::platform::is_android;
-use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
@@ -180,6 +180,25 @@ impl RuntimeAdapter for NativeRuntime {
         true
     }
 
+    fn shell_dialect(&self) -> ShellDialect {
+        #[cfg(not(target_os = "windows"))]
+        if is_android() {
+            return ShellDialect::Posix;
+        }
+
+        if windows_shell_kind(&self.shell) == WindowsShellKind::PowerShell {
+            return ShellDialect::PowerShell;
+        }
+
+        #[cfg(target_os = "windows")]
+        return ShellDialect::WindowsCmd;
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            ShellDialect::Posix
+        }
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -237,6 +256,23 @@ mod tests {
     #[test]
     fn native_memory_budget_unlimited() {
         assert_eq!(NativeRuntime::new().memory_budget(), 0);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn native_reports_posix_shell_dialect() {
+        assert_eq!(
+            NativeRuntime::with_shell("bash".into()).shell_dialect(),
+            ShellDialect::Posix
+        );
+    }
+
+    #[test]
+    fn configured_powershell_maps_to_powershell_policy_dialect() {
+        assert_eq!(
+            NativeRuntime::with_shell("pwsh".into()).shell_dialect(),
+            ShellDialect::PowerShell
+        );
     }
 
     #[test]

@@ -283,7 +283,11 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution(command, approved) {
+        match self.security.validate_command_execution_for_shell(
+            command,
+            approved,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -773,6 +777,37 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("high-risk")),
             "PowerShell-native operation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_uses_runtime_dialect_to_reject_powershell_expression_bypass() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["echo".into()],
+            ..SecurityPolicy::default()
+        });
+        // Policy rejection happens before spawn, so this test does not require
+        // pwsh to be installed on the host.
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({
+                "command": "echo ([System.IO.File]::Delete('important.txt'))"
+            }))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "PowerShell expression must be rejected before spawn: {:?}",
             result.error
         );
     }

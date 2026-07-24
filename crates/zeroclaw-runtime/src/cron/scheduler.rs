@@ -1107,7 +1107,7 @@ async fn run_job_command_with_timeout(
     // manually-edited job stores.
     let approved = false; // scheduler runs are never pre-approved
     if let Err(error) =
-        crate::cron::validate_shell_command_with_security(security, &job.command, approved)
+        crate::cron::validate_shell_command_with_security(config, security, &job.command, approved)
     {
         return (false, error.to_string());
     }
@@ -1169,7 +1169,7 @@ mod tests {
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::{Config, RuntimeKind};
 
     const TEST_AGENT: &str = "test-agent";
 
@@ -2436,6 +2436,61 @@ mod tests {
         assert!(stdout.contains("cron-ok"));
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn build_cron_shell_command_executes_with_custom_native_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("cron-shell-shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nprintf 'CUSTOM_SHELL\\n'\nprintf 'arg:%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = Config::default();
+        config.runtime.shell = Some(shim.to_string_lossy().into_owned());
+        let mut cmd =
+            crate::cron::build_configured_shell_command(&config, "echo cron-custom", tmp.path())
+                .unwrap();
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert!(stdout.contains("CUSTOM_SHELL"), "{stdout}");
+        assert!(stdout.contains("arg:-c"), "{stdout}");
+        assert!(stdout.contains("arg:echo cron-custom"), "{stdout}");
+    }
+
+    #[test]
+    fn build_cron_shell_command_preserves_docker_runtime_boundary() {
+        let mut config = Config::default();
+        config.runtime.kind = RuntimeKind::Docker;
+        config.runtime.docker.image = "alpine:3.20".into();
+        config.runtime.docker.network = "none".into();
+        config.runtime.docker.mount_workspace = false;
+
+        let cmd = crate::cron::build_configured_shell_command(
+            &config,
+            "echo cron-docker",
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        let debug = format!("{cmd:?}");
+
+        assert!(debug.contains("\"docker\""), "{debug}");
+        assert!(debug.contains("\"run\""), "{debug}");
+        assert!(debug.contains("\"--network\""), "{debug}");
+        assert!(debug.contains("\"none\""), "{debug}");
+        assert!(debug.contains("\"alpine:3.20\""), "{debug}");
+        assert!(
+            debug.contains("\"sh\" \"-c\" \"echo cron-docker\""),
+            "{debug}"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "windows")]
     fn build_cron_shell_command_uses_configured_powershell() {
@@ -2452,6 +2507,31 @@ mod tests {
         assert!(debug.contains("powershell"));
         assert!(debug.contains("-Command"));
         assert!(!debug.contains("cmd.exe"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let security = SecurityPolicy::default();
+
+        crate::cron::validate_shell_command_with_security(
+            &config,
+            &security,
+            "Write-Output $PSHOME",
+            false,
+        )
+        .expect("documented read-only PowerShell command should pass");
+        assert!(
+            crate::cron::validate_shell_command_with_security(
+                &config,
+                &security,
+                "echo ([System.IO.File]::Delete('important.txt'))",
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

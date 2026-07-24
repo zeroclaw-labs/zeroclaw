@@ -11581,8 +11581,10 @@ pub struct RuntimeConfig {
     /// Only an empty/whitespace value is rejected on Windows; the interpreter is
     /// located at spawn time.
     ///
-    /// Command policy evaluates the submitted script with the shared
-    /// cross-shell risk table, including PowerShell-native cmdlets and aliases.
+    /// Command policy uses the selected interpreter's dialect. PowerShell
+    /// accepts a bounded grammar of simple command invocations, arguments,
+    /// variable reads, and pipelines; expression and invocation constructs
+    /// that cannot be safely classified are rejected before execution.
     ///
     /// **Ignored on Android** (always `/system/bin/sh`, whose shell is not on
     /// `PATH` for spawned processes).
