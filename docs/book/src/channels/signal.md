@@ -13,6 +13,17 @@ groups; `group_ids = ["<signal-group-id>"]` accepts only listed groups while
 still accepting DMs; `ignore_attachments` and `ignore_stories` drop those
 message types before they reach the agent.
 
+Messages you send yourself to your own number ("Note to Self" in the Signal
+app) arrive from `signal-cli` as a sync event rather than a normal message,
+and ZeroClaw only accepts the ones addressed back to the configured
+`account`; sync traffic sent to other contacts, and group sync traffic, is
+ignored. Because the sender of a Note-to-Self message is the account
+itself, that number must also be listed in the `external_peers` of a
+`[peer_groups.<name>]` block with `channel = "signal"` for these messages
+to reach the agent. ZeroClaw's own Note-to-Self replies (which also echo
+back as sync events) are recognized and not re-ingested as new inbound
+messages.
+
 ## Prerequisites
 
 - A Signal account linked or registered in `signal-cli`.
