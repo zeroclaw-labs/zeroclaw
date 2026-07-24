@@ -8960,6 +8960,19 @@ pub struct FileDownloadConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
+
+    /// Opt-in allowlist of hostnames or IPs that may appear in `url` even when
+    /// the literal host is loopback / private / link-local. Use this for
+    /// internal document services that an operator legitimately wants the bot
+    /// to reach (e.g. `["files.corp.lan"]` or `["*"]` to blanket-tolerate any
+    /// private host). Wildcard `"*"` matches every host. Empty (the default)
+    /// rejects all private/local hosts so a misconfigured `url` cannot quietly
+    /// turn the download tool into an SSRF probe. This field only lifts the
+    /// private/local literal-host rejection for the configured `[file_download].url`;
+    /// it does not change which endpoint is used, and redirects remain disabled.
+    /// See `web_fetch.allowed_private_hosts` for the matching shape.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_file_download_max_size_bytes() -> u64 {
@@ -8977,6 +8990,7 @@ impl Default for FileDownloadConfig {
             max_file_size_bytes: default_file_download_max_size_bytes(),
             timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }
