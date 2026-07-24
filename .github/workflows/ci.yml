@@ -81,6 +81,9 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Guard release attestation contract
+        run: python3 scripts/ci/release_attestation_contract_test.py
+
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
@@ -550,6 +553,7 @@ jobs:
           for path in (
               ".github/workflows/ci.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/release-stable-manual.yml",
           ):
               yaml.safe_load(open(path))
               print(f"{path}: valid")

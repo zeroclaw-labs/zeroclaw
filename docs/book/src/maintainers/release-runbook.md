@@ -358,6 +358,9 @@ Once `publish` completes, confirm:
 [ ] GitHub Release exists at /releases/tag/vX.Y.Z and is marked Latest
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
+[ ] Both SPDX and CycloneDX SBOM assets are present
+[ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
+[ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
 ```
@@ -379,6 +382,12 @@ its own schedule.
 Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
 published artifacts can follow
 [Release artifact verification](./release-verification.md).
+
+After any release-attestation workflow change, a human maintainer must also run
+the online and disconnected verification rehearsal in
+`docs/maintainers/release-attestation-runbook.md` before closing the tracking
+issue. A local workflow lint or `act` run does not replace that release-level
+check because neither can mint GitHub's production OIDC attestation.
 
 ---
 

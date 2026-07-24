@@ -19,10 +19,9 @@ permissions:
   contents: write
   packages: write
   # OIDC (`id-token: write`) is granted at the job level only — see
-  # `slsa-provenance`, `sign-and-sbom`, and `docker` — so non-signing jobs
-  # cannot mint OIDC tokens. Workflow-level grants would also propagate to
-  # validate/build/publish/redeploy/package-sync, which never need keyless
-  # signing.
+  # `publish` and `docker` — so non-signing jobs cannot mint OIDC tokens.
+  # Workflow-level grants would also propagate to validate/build/redeploy/
+  # package-sync, which never need keyless signing.
 
 env:
   CARGO_TERM_COLOR: always
@@ -684,11 +683,44 @@ jobs:
           path: desktop-assets/*
           retention-days: 14
 
+  sbom:
+    name: Generate Release SBOMs
+    needs: [validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Generate SBOM — SPDX
+        uses: anchore/sbom-action@df80a981bc6edbc4e220a492d3cbe9f5547a6e75 # v0.17.9
+        with:
+          path: .
+          format: spdx-json
+          output-file: zeroclaw-${{ needs.validate.outputs.tag }}-sbom.spdx.json
+          upload-artifact: false
+
+      - name: Generate SBOM — CycloneDX
+        uses: anchore/sbom-action@df80a981bc6edbc4e220a492d3cbe9f5547a6e75 # v0.17.9
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: zeroclaw-${{ needs.validate.outputs.tag }}-sbom.cdx.json
+          upload-artifact: false
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-sboms
+          path: |
+            zeroclaw-${{ needs.validate.outputs.tag }}-sbom.spdx.json
+            zeroclaw-${{ needs.validate.outputs.tag }}-sbom.cdx.json
+          retention-days: 14
+
   publish:
     name: Publish Stable Release
     # The Linux/Windows desktop jobs are continue-on-error: listing them in
     # needs only sequences the download; their failure cannot block publish.
-    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows]
+    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -726,8 +758,15 @@ jobs:
           name: desktop-windows
           path: artifacts/desktop-windows
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-sboms
+          path: artifacts/sboms
+
       - name: Verify required release assets
         shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           required_assets=(
             "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
@@ -741,6 +780,8 @@ jobs:
             "zeroclaw-aarch64-linux-android.tar.gz"
             "zeroclaw-x86_64-pc-windows-msvc.zip"
             "ZeroClaw.dmg"
+            "zeroclaw-${TAG}-sbom.spdx.json"
+            "zeroclaw-${TAG}-sbom.cdx.json"
           )
           missing=0
           for asset in "${required_assets[@]}"; do
@@ -755,63 +796,80 @@ jobs:
             exit 1
           fi
 
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
-          cat SHA256SUMS
-
       - name: Collect release assets
         run: |
+          set -euo pipefail
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' -o -name '*-sbom.spdx.json' -o -name '*-sbom.cdx.json' \) -exec cp {} release-assets/ \;
           cp install.sh release-assets/
           echo "--- Assets ---"
           ls -lh release-assets/
 
-      - id: attest
-        name: Attach SLSA provenance attestation
+      # Attest payloads before creating the verification archive. The archive
+      # contains these exact bundles, so changing a payload later invalidates
+      # both its digest and its offline verification material.
+      - id: attest_payloads
+        name: Attest release payloads
         continue-on-error: true
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: release-assets/*
 
-      - id: attestation_bundles
-        name: Download attestation bundles for offline verification
-        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+      - id: verification_archive
+        name: Package offline verification archive
+        if: ${{ !cancelled() && steps.attest_payloads.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release-stable-manual.yml
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
 
-          cd release-assets
-          tmp_dir="$(mktemp -d ../attestation-bundles.XXXXXX)"
+          assets_dir="$PWD/release-assets"
+          tmp_dir="$(mktemp -d "$RUNNER_TEMP/zeroclaw-verification.XXXXXX")"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
           gh attestation trusted-root > "$tmp_dir/trusted_root.jsonl"
-          printf 'Artifact | SHA256 | Bundle\n' > "$tmp_dir/ATTESTATION-BUNDLES.md"
-          printf '%s\n' '--- | --- | ---' >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+          {
+            printf '# ZeroClaw offline attestation bundles\n\n'
+            printf -- '- Source commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Signer workflow: `%s`\n\n' "$SIGNER_WORKFLOW"
+            printf 'Artifact | SHA256 | Bundle\n'
+            printf '%s\n' '--- | --- | ---'
+          } > "$tmp_dir/ATTESTATION-BUNDLES.md"
+
+          mapfile -d '' artifacts < <(find "$assets_dir" -maxdepth 1 -type f -print0 | sort -z)
 
           artifact_count=0
           bundle_count=0
-          for artifact in *.tar.gz *.zip *.dmg *.deb *.AppImage *.msi *-setup.exe SHA256SUMS install.sh; do
-            [ -f "$artifact" ] || continue
+          for artifact_path in "${artifacts[@]}"; do
+            artifact="$(basename "$artifact_path")"
             artifact_count=$((artifact_count + 1))
-            digest=$(sha256sum "$artifact" | awk '{print $1}')
-            bundle="sha256:${digest}.jsonl"
+            digest=$(sha256sum "$artifact_path" | awk '{print $1}')
             target="${artifact}.attestation.jsonl"
 
             for attempt in 1 2 3 4 5; do
-              gh attestation download "$artifact" --repo "$GITHUB_REPOSITORY" && break
+              rm -f "$tmp_dir/sha256:${digest}.jsonl" "$tmp_dir/sha256-${digest}.jsonl"
+              (cd "$tmp_dir" && gh attestation download "$artifact_path" \
+                --repo "$GITHUB_REPOSITORY" \
+                --predicate-type https://slsa.dev/provenance/v1) && break
               if [[ "$attempt" == 5 ]]; then
                 exit 1
               fi
               sleep 10
             done
 
+            bundle="$tmp_dir/sha256:${digest}.jsonl"
+            if [[ ! -f "$bundle" ]]; then
+              # gh uses a dash instead of a colon on platforms that reject
+              # colons in filenames. Accept both forms so local rehearsals and
+              # future runner changes preserve the contract.
+              bundle="$tmp_dir/sha256-${digest}.jsonl"
+            fi
             test -f "$bundle"
             mv "$bundle" "$tmp_dir/$target"
-            gh attestation verify "$artifact" \
+            gh attestation verify "$artifact_path" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$SIGNER_WORKFLOW" \
               --source-digest "$GITHUB_SHA" \
@@ -823,10 +881,43 @@ jobs:
 
           test "$artifact_count" -gt 0
           test "$bundle_count" -eq "$artifact_count"
-          mv "$tmp_dir"/* .
+          archive="$assets_dir/zeroclaw-${TAG}-verification.tar.gz"
+          tar -C "$tmp_dir" -czf "$archive" .
 
-          echo "--- Attestation bundles ---"
-          ls -lh ./*.attestation.jsonl ./trusted_root.jsonl ./ATTESTATION-BUNDLES.md
+          echo "--- Verification archive ---"
+          tar -tzf "$archive"
+          ls -lh "$archive"
+
+      # SHA256SUMS is final only after the verification archive exists. Never
+      # mutate it after the metadata attestations below.
+      - name: Generate final checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's|  \./|  |' > SHA256SUMS
+          test -s SHA256SUMS
+          cat SHA256SUMS
+
+      - id: attest_checksums
+        name: Attest final checksums
+        continue-on-error: true
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-assets/SHA256SUMS
+
+      # The archive cannot contain its own attestation bundle. Consumers first
+      # verify it online, then use its contents without network access.
+      - id: attest_verification_archive
+        name: Attest verification archive
+        if: ${{ !cancelled() && steps.verification_archive.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: release-assets/zeroclaw-${{ needs.validate.outputs.tag }}-verification.tar.gz
 
       - name: Write release notes
         env:
@@ -835,18 +926,23 @@ jobs:
 
       - name: Append verification instructions to release notes
         env:
-          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
-          BUNDLE_OUTCOME: ${{ steps.attestation_bundles.outcome }}
+          PAYLOAD_ATTEST_OUTCOME: ${{ steps.attest_payloads.outcome }}
+          CHECKSUM_ATTEST_OUTCOME: ${{ steps.attest_checksums.outcome }}
+          ARCHIVE_OUTCOME: ${{ steps.verification_archive.outcome }}
+          ARCHIVE_ATTEST_OUTCOME: ${{ steps.attest_verification_archive.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SOURCE_DIGEST: ${{ github.sha }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          if [[ "$ATTEST_OUTCOME" == "success" ]]; then
+          if [[ "$PAYLOAD_ATTEST_OUTCOME" == "success" ]]; then
             cat >> release-notes.md <<VERIFY_EOF
 
           ---
           ### Verify SLSA Provenance
 
-          Release artifacts have GitHub artifact provenance attestations.
+          Release payloads have GitHub-hosted SLSA v1.0 Build Level 2 provenance attestations.
+          Provenance proves build origin and instructions, not human review or immunity from
+          maintainer-account, runner, dependency, or GitHub control-plane compromise.
 
           **Online**
           \`\`\`bash
@@ -857,24 +953,39 @@ jobs:
           \`\`\`
           VERIFY_EOF
 
-            if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
+            if [[ "$ARCHIVE_OUTCOME" == "success" && "$ARCHIVE_ATTEST_OUTCOME" == "success" && "$CHECKSUM_ATTEST_OUTCOME" == "success" ]]; then
               cat >> release-notes.md <<VERIFY_EOF
 
           **Offline**
-          Download \`<artifact>\`, \`<artifact>.attestation.jsonl\`, and \`trusted_root.jsonl\` from the release assets, then run:
+          In a connected staging environment, download \`<artifact>\`, \`SHA256SUMS\`, and
+          \`zeroclaw-${TAG}-verification.tar.gz\`. Verify the archive and checksums online:
+          \`\`\`bash
+          gh attestation verify zeroclaw-${TAG}-verification.tar.gz \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
+            --source-digest ${SOURCE_DIGEST}
+          gh attestation verify SHA256SUMS \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
+            --source-digest ${SOURCE_DIGEST}
+          awk -v file="zeroclaw-${TAG}-verification.tar.gz" '\$2 == file { print }' SHA256SUMS | sha256sum -c -
+          mkdir verification
+          tar -xzf zeroclaw-${TAG}-verification.tar.gz -C verification
+          \`\`\`
+          Move those files into the offline environment, then run:
           \`\`\`bash
           gh attestation verify <artifact> \\
             --repo zeroclaw-labs/zeroclaw \\
             --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
             --source-digest ${SOURCE_DIGEST} \\
-            --bundle <artifact>.attestation.jsonl \\
-            --custom-trusted-root trusted_root.jsonl
+            --bundle verification/<artifact>.attestation.jsonl \\
+            --custom-trusted-root verification/trusted_root.jsonl
           \`\`\`
           VERIFY_EOF
             else
               cat >> release-notes.md <<VERIFY_EOF
 
-          Offline attestation bundles were unavailable in this best-effort release.
+          The consolidated offline verification archive was unavailable in this best-effort release.
           Inspect the release workflow run for details: ${RUN_URL}
           VERIFY_EOF
             fi
@@ -1070,141 +1181,6 @@ jobs:
         run: |
           cosign sign --yes \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
-
-  # ── Post-publish: signing, SBOM, and SLSA provenance ─────────────────
-  hash-artifacts:
-    name: Hash Release Artifacts
-    needs: [validate, build, build-desktop, build-desktop-linux, build-desktop-windows]
-    runs-on: ubuntu-latest
-    outputs:
-      hashes: ${{ steps.hash.outputs.hashes }}
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: zeroclaw-*
-          path: artifacts/bins
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: desktop-macos
-          path: artifacts/desktop
-
-      # Optional platforms — may be absent when their bundle job failed.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true
-        with:
-          name: desktop-linux
-          path: artifacts/desktop-linux
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true
-        with:
-          name: desktop-windows
-          path: artifacts/desktop-windows
-
-      - name: Compute SHA256 hashes (base64, SLSA input format)
-        id: hash
-        run: |
-          set -euo pipefail
-          cd artifacts
-          # Collect all release archives and desktop artifacts; strip leading directory
-          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' \) \
-            -exec sha256sum {} + \
-            | sed 's|  \./[^/]*/|  |' \
-            | base64 -w0)
-          echo "hashes=$hashes" >> "$GITHUB_OUTPUT"
-
-  slsa-provenance:
-    # Non-blocking for the first release cycle — make blocking once the provenance
-    # format is verified downstream. SLSA L2: GitHub-hosted runner + OIDC-signed
-    # provenance written to Rekor by slsa-github-generator's trusted builder.
-    #
-    # Note: job-level `continue-on-error` is not supported for reusable workflow
-    # calls. The SLSA generator exposes its own `continue-on-error` input instead.
-    #
-    # `publish` is included in `needs` so the SLSA generator's
-    # `upload-assets: true` cannot create or update the release tag before the
-    # `github-releases` environment gate has approved the canonical publish path.
-    # Without that dependency the provenance upload could become the first writer
-    # to the release, outside the existing publish gate.
-    name: SLSA Provenance (non-blocking)
-    needs: [validate, publish, hash-artifacts]
-    permissions:
-      actions: read
-      id-token: write
-      contents: write
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
-    with:
-      base64-subjects: "${{ needs.hash-artifacts.outputs.hashes }}"
-      upload-assets: true
-      upload-tag-name: ${{ needs.validate.outputs.tag }}
-      continue-on-error: true
-
-  sign-and-sbom:
-    name: Sign Release Assets & Publish SBOM
-    needs: [validate, publish]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write   # required for keyless cosign OIDC token → Rekor entry
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
-
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          mkdir -p release-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
-          echo "--- Downloaded assets ---"
-          ls -lh release-assets/
-
-      - name: Sign release assets (keyless / Rekor transparency log)
-        # Each .bundle file contains the certificate chain and signature; consumers
-        # verify with: cosign verify-blob --bundle <file>.bundle <file>
-        # The Rekor log URL is printed to stdout for each signature.
-        run: |
-          for f in release-assets/*.tar.gz release-assets/*.zip release-assets/*.dmg release-assets/*.deb release-assets/*.AppImage release-assets/*.msi release-assets/*-setup.exe; do
-            [ -f "$f" ] || continue
-            cosign sign-blob --yes --bundle "${f}.bundle" "$f"
-            echo "Signed: $(basename "$f")"
-          done
-
-      - name: Generate SBOM — SPDX
-        uses: anchore/sbom-action@df80a981bc6edbc4e220a492d3cbe9f5547a6e75 # v0.17.9
-        with:
-          path: .
-          format: spdx-json
-          output-file: zeroclaw-${{ needs.validate.outputs.tag }}-sbom.spdx.json
-          upload-artifact: false
-
-      - name: Generate SBOM — CycloneDX
-        uses: anchore/sbom-action@df80a981bc6edbc4e220a492d3cbe9f5547a6e75 # v0.17.9
-        with:
-          path: .
-          format: cyclonedx-json
-          output-file: zeroclaw-${{ needs.validate.outputs.tag }}-sbom.cdx.json
-          upload-artifact: false
-
-      - name: Upload signatures and SBOMs to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          set -euo pipefail
-          assets=()
-          for bundle in release-assets/*.bundle; do
-            [ -f "$bundle" ] && assets+=("$bundle")
-          done
-          assets+=("zeroclaw-${TAG}-sbom.spdx.json")
-          assets+=("zeroclaw-${TAG}-sbom.cdx.json")
-          gh release upload "$TAG" "${assets[@]}" \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Uploaded ${#assets[@]} artifacts to release $TAG"
 
   # ── Post-publish: package manager auto-sync ─────────────────────────
   scoop:
