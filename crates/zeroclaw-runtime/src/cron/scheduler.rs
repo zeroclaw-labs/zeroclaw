@@ -17,7 +17,7 @@ use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
+use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
 use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
@@ -276,6 +276,7 @@ pub async fn run(
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: CronShellOutputFormat::default(),
         };
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1132,6 +1133,15 @@ async fn run_job_command_with_timeout(
         );
     }
 
+    // `job.shell_output_format` is already the canonical value by the time
+    // it reaches here: due_jobs()/all_overdue_jobs() resolve declarative jobs
+    // from config and leave imperative jobs on their stored field (see
+    // resolve_declarative_shell_output_format in store.rs). Re-deriving it
+    // here from `config.cron.get(&job.id)` without checking `job.source`
+    // would let an unrelated same-ID declarative config entry silently
+    // override an imperative job's stored format.
+    let output_format = &job.shell_output_format;
+
     let child = match build_cron_shell_command(&job.command, &config.data_dir) {
         Ok(mut cmd) => match cmd.spawn() {
             Ok(child) => child,
@@ -1144,12 +1154,21 @@ async fn run_job_command_with_timeout(
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!(
-                "status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                stdout.trim(),
-                stderr.trim()
-            );
+            let combined = match output_format {
+                // Raw mode on success returns bare stdout, by design — the
+                // point is to hand back exactly what a direct shell run
+                // would print on stdout, with no wrapper. stderr on a
+                // successful exit is intentionally dropped, not lost by
+                // accident; a failing exit still gets the full wrapped
+                // status/stdout/stderr envelope below for diagnosis.
+                CronShellOutputFormat::Raw if output.status.success() => stdout.trim().to_string(),
+                _ => format!(
+                    "status={}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ),
+            };
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
@@ -1297,6 +1316,7 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             source: "imperative".into(),
+            shell_output_format: CronShellOutputFormat::default(),
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
@@ -1441,6 +1461,92 @@ mod tests {
         assert!(success);
         assert!(output.contains("scheduler-ok"));
         assert!(output.contains("status=exit status: 0"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_success() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // The store layer resolves shell_output_format before handing the job
+        // to the scheduler (see resolve_declarative_shell_output_format), so
+        // the job's own field is already canonical by the time it gets here.
+        let mut job = test_job("echo raw-format-ok");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Raw output should be just the command's trimmed stdout, no wrapper.
+        assert_eq!(output, "raw-format-ok");
+        assert!(!output.contains("status="));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_success_drops_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // A zero-exit command that still writes to stderr (e.g. a tool's
+        // progress/warning chatter) must not leak into raw-mode output.
+        let mut job = test_job("echo raw-stdout-ok; echo raw-stderr-noise >&2");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Dropping stderr on a successful exit is intentional design, not
+        // an oversight — see the comment at the call site.
+        assert_eq!(output, "raw-stdout-ok");
+        assert!(!output.contains("raw-stderr-noise"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_failure_still_uses_wrapped() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("ls definitely_missing_file_raw_test");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        // On failure, raw mode should still include the wrapped format
+        // so operators can diagnose the failure.
+        assert!(output.contains("status=exit status:"));
+        assert!(output.contains("definitely_missing_file_raw_test"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_imperative_job_ignores_same_id_declarative_config_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // An unrelated declarative config entry happens to share the
+        // imperative job's ID and asks for raw output. Execution must go by
+        // the job's own (already-resolved) field, not re-derive from config
+        // by ID match, or the imperative job's stored format gets silently
+        // overridden.
+        config.cron.insert(
+            "test-job".into(),
+            zeroclaw_config::schema::CronJobDecl {
+                command: Some("echo collision-ok".into()),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..Default::default()
+            },
+        );
+        let mut job = test_job("echo collision-ok");
+        job.source = "imperative".into();
+        job.shell_output_format = CronShellOutputFormat::Wrapped;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(
+            output.contains("status="),
+            "imperative job's own Wrapped format must win over a same-ID declarative config entry: {output}"
+        );
     }
 
     #[tokio::test]

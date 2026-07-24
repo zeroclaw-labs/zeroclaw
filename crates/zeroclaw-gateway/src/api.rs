@@ -127,6 +127,11 @@ pub struct CronAddBody {
     pub delete_after_run: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
     pub uses_memory: Option<bool>,
+    /// Shell output format for shell-type cron jobs. `"wrapped"` (default) or
+    /// `"raw"`. Only meaningful when `job_type` is `"shell"` (or inferred as
+    /// shell when no prompt is given). Rejected for agent jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +153,10 @@ pub struct CronPatchBody {
     pub enabled: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
     pub uses_memory: Option<bool>,
+    /// Shell output format override. `"wrapped"` (default) or `"raw"`.
+    /// Only applied to shell-type jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 enum CronTimezonePatch {
@@ -419,6 +428,7 @@ pub async fn handle_api_cron_add(
         allowed_tools,
         delete_after_run,
         uses_memory,
+        shell_output_format,
     } = body;
 
     let config = state.config.read().clone();
@@ -452,6 +462,12 @@ pub async fn handle_api_cron_add(
         matches!(job_type.as_deref(), Some("agent")) || (job_type.is_none() && prompt.is_some());
 
     let result = if is_agent {
+        if shell_output_format.is_some() {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
         let prompt = match prompt.as_deref() {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
@@ -496,7 +512,8 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let fmt = shell_output_format.unwrap_or_default();
+        zeroclaw_runtime::cron::add_shell_job_with_approval_and_format(
             &config,
             &agent_alias,
             name,
@@ -504,6 +521,7 @@ pub async fn handle_api_cron_add(
             command,
             delivery,
             false,
+            fmt,
         )
     };
 
@@ -633,6 +651,7 @@ pub async fn handle_api_cron_patch(
         prompt,
         enabled,
         uses_memory,
+        shell_output_format,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -650,6 +669,22 @@ pub async fn handle_api_cron_patch(
         }
     };
     let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    if shell_output_format.is_some() {
+        if is_agent {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
+        if existing.source == "declarative" {
+            return bad_request(format!(
+                "shell_output_format for declarative job '{id}' is set via \
+                 cron.{id}.shell_output_format in config.toml, not the API; \
+                 the DB column is not read for declarative jobs and this PATCH would have no effect"
+            ))
+            .into_response();
+        }
+    }
     let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
     if setting_shell_command && config.agent(&agent_alias).is_none() {
         return (
@@ -708,6 +743,7 @@ pub async fn handle_api_cron_patch(
         prompt: patch_prompt,
         enabled,
         uses_memory,
+        shell_output_format,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -4052,6 +4088,275 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn cron_api_patch_updates_imperative_shell_output_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("format-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello-raw-patch-run",
+            None,
+            true,
+        )
+        .expect("job added");
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "imperative jobs default to wrapped"
+        );
+        // Imperative jobs get UUID ids; the scheduler resolves owning agent
+        // by reverse-lookup against `agent.cron_jobs`, same as
+        // `cron_api_run_executes_shell_job_and_records_run`.
+        link_job_to_test_agent(&state, &job.id);
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an imperative job's shell_output_format is a real, storable mutation"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must reflect the patched format for an imperative job"
+        );
+
+        // The regression this PATCH must actually prove: the persisted
+        // value is what execution reads, not just what get_job() reports.
+        // A job created wrapped, then PATCHed to raw, must run raw.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["success"], true);
+        let output = run_json["output"].as_str().unwrap_or_default();
+        assert!(
+            output.contains("hello-raw-patch-run"),
+            "expected bare stdout in output, got: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "a PATCH-to-raw job must run raw (bare stdout), not the wrapped status envelope; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_rejects_shell_output_format_for_declarative_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config = with_test_agent(config);
+        // `sync_declarative_jobs` only materializes a job for an agent that
+        // claims it via `cron_jobs`, exactly like `seed_claiming_agent` in
+        // cron::store's own tests.
+        config.agents.get_mut("test-agent").unwrap().cron_jobs = vec!["decl-job".to_string()];
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let mut decls = std::collections::HashMap::new();
+        decls.insert("decl-job".to_string(), decl.clone());
+        config.cron.insert("decl-job".to_string(), decl);
+        zeroclaw_runtime::cron::sync_declarative_jobs(&config, &decls).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("decl-job".to_string()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a declarative job's shell_output_format is owned by config.toml, not the API"
+        );
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("declarative"),
+            "error should explain the field is config-owned for declarative jobs"
+        );
+        assert!(
+            error.contains("cron.decl-job.shell_output_format"),
+            "error should name the exact config key to edit instead: {error}"
+        );
+        let unchanged =
+            zeroclaw_runtime::cron::get_job(&state.config.read().clone(), "decl-job").unwrap();
+        assert_eq!(
+            unchanged.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "the rejected PATCH must not have changed the resolved format"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+            .id
+            .clone();
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format is shell-only and must not be persisted for agent jobs"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_add_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format must be rejected at creation for agent jobs, matching the PATCH contract, \
+             instead of silently discarded"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "a rejected create must not persist a job"
+        );
+    }
+
+    #[tokio::test]
     async fn cron_api_rejects_announce_delivery_without_target() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -4631,6 +4936,86 @@ pub(crate) mod tests {
             codes_issued, 1,
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
+        );
+    }
+
+    /// Regression: a shell cron job created via the gateway API with
+    /// `shell_output_format = raw` must persist the format, return raw
+    /// stdout when triggered, and not wrap output in the status envelope.
+    #[tokio::test]
+    async fn cron_api_shell_raw_output_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        // 1. Create a shell job with shell_output_format = raw via the API.
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "raw-echo",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello-raw",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let add_json = response_json(add_response).await;
+        assert_eq!(add_json["status"], "ok");
+        let job_id = add_json["job"]["id"].as_str().expect("job id").to_string();
+
+        // 2. Read the job back via list and verify shell_output_format persisted.
+        let list_response = handle_api_cron_list(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let list_json = response_json(list_response).await;
+        let jobs = list_json["jobs"].as_array().expect("jobs array");
+        let listed = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some(&job_id))
+            .expect("job in list");
+        assert_eq!(
+            listed["shell_output_format"].as_str(),
+            Some("raw"),
+            "shell_output_format must persist through the API store path"
+        );
+
+        // 3. Link to test-agent so the scheduler can resolve the owner.
+        link_job_to_test_agent(&state, &job_id);
+
+        // 4. Trigger the job manually and verify raw output.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job_id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["status"], "ok", "job should succeed: {run_json}");
+        assert_eq!(run_json["success"], true);
+
+        let output = run_json["output"].as_str().expect("output string");
+        assert_eq!(
+            output, "hello-raw",
+            "raw mode must return trimmed stdout, not the wrapped envelope: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "raw output must not contain the status envelope: {output}"
+        );
+        assert!(
+            !output.contains("stdout:"),
+            "raw output must not contain the stdout header: {output}"
         );
     }
 
