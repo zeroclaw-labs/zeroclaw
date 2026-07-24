@@ -15852,6 +15852,7 @@ Let me check the result."#;
             false, // parallel_tools
             0,     // max_tool_result_chars: disabled for test
             0,     // context_token_budget: disabled for test
+            0,     // model_context_window: disabled for test
             None,  // channel
             TurnOrigin::SubTurn,
             None,
