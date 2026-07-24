@@ -487,12 +487,24 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.uses_memory = uses_memory;
     }
     if let Some(shell_output_format) = patch.shell_output_format {
-        // Declarative jobs read this from `config.cron`, not the DB column
-        // (the API rejects this patch for them already; this is
-        // defense-in-depth for any other caller of `update_job`).
-        if job.source != "declarative" {
-            job.shell_output_format = shell_output_format;
+        // Config-owned (declarative) and non-shell (agent) jobs never store
+        // this field: the gateway API already rejects both cases, but this
+        // is the core boundary every caller of `update_job` goes through,
+        // so it must reject them too rather than silently ignoring or
+        // persisting a value execution never consumes.
+        if job.source == "declarative" {
+            anyhow::bail!(
+                "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
+                 declarative job, not the database"
+            );
         }
+        if job.job_type != JobType::Shell {
+            let job_type: &str = job.job_type.into();
+            anyhow::bail!(
+                "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
+            );
+        }
+        job.shell_output_format = shell_output_format;
     }
 
     if schedule_changed {
@@ -1030,15 +1042,17 @@ fn encode_allowed_tools(allowed_tools: Option<&Vec<String>>) -> Result<Option<St
 }
 
 fn decode_shell_output_format(raw: Option<&str>) -> Result<CronShellOutputFormat> {
-    let Some(raw) = raw else {
-        return Ok(CronShellOutputFormat::default());
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(CronShellOutputFormat::default());
+    // Exact match against the canonical `#[serde(rename_all = "snake_case")]`
+    // spellings, not a JSON-string round trip: wrapping arbitrary stored text
+    // in quotes and handing it to a JSON parser would let an escape sequence
+    // in the raw column (e.g. `raw`) decode as a different value than
+    // what was actually persisted.
+    match raw {
+        None => Ok(CronShellOutputFormat::default()),
+        Some("wrapped") => Ok(CronShellOutputFormat::Wrapped),
+        Some("raw") => Ok(CronShellOutputFormat::Raw),
+        Some(other) => anyhow::bail!("Unknown cron shell_output_format value: {other:?}"),
     }
-    serde_json::from_str(&format!("\"{trimmed}\""))
-        .with_context(|| format!("Unknown cron shell_output_format value: {trimmed}"))
 }
 
 fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
@@ -1290,6 +1304,12 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
             if decl.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
                 anyhow::bail!(
                     "Declarative cron job '{id}': agent job requires a non-empty 'prompt'"
+                );
+            }
+            if decl.shell_output_format != zeroclaw_config::schema::CronShellOutputFormat::default()
+            {
+                anyhow::bail!(
+                    "Declarative cron job '{id}': shell_output_format is shell-only and cannot be set on an agent job"
                 );
             }
         }
@@ -2258,29 +2278,37 @@ mod tests {
         let config = test_config(&tmp);
         let now = Utc::now();
 
-        with_initialized_connection(&config, |conn| {
-            conn.execute(
-                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run, shell_output_format)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    "shell-output-format-invalid",
-                    "*/5 * * * *",
-                    "echo ok",
-                    Option::<String>::None,
-                    "shell",
-                    now.to_rfc3339(),
-                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
-                    "raw2",
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+        // "raw2": an ordinary unrecognized value. "": a present-but-empty
+        // column (distinct from the column being absent/NULL). "raw":
+        // an escaped spelling that a JSON-string round trip would have
+        // decoded as "raw" even though the persisted bytes are not the
+        // canonical value.
+        for (i, invalid) in ["raw2", "", "r\\u0061w"].into_iter().enumerate() {
+            let id = format!("shell-output-format-invalid-{i}");
+            with_initialized_connection(&config, |conn| {
+                conn.execute(
+                    "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run, shell_output_format)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id,
+                        "*/5 * * * *",
+                        "echo ok",
+                        Option::<String>::None,
+                        "shell",
+                        now.to_rfc3339(),
+                        (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                        invalid,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
-        assert!(
-            get_job(&config, "shell-output-format-invalid").is_err(),
-            "an unparseable persisted shell_output_format must surface an error, not silently become Wrapped"
-        );
+            assert!(
+                get_job(&config, &id).is_err(),
+                "persisted shell_output_format {invalid:?} must surface an error, not silently become Wrapped"
+            );
+        }
     }
 
     #[test]
@@ -2642,6 +2670,28 @@ mod tests {
         let result = sync_declarative_jobs(&config, &decls);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prompt"));
+    }
+
+    #[test]
+    fn sync_validates_agent_job_rejects_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_agent_decl("bad-agent-format", "0 2 * * *", "do stuff");
+        decl.shell_output_format = zeroclaw_config::schema::CronShellOutputFormat::Raw;
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "shell_output_format is shell-only and must be rejected on a declarative agent job"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("shell_output_format")
+        );
     }
 
     #[test]
@@ -3077,6 +3127,87 @@ schedule = { kind = "every", every_ms = 300000 }
             overdue_job.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
             "all_overdue_jobs must follow the current config value, not a stored snapshot"
+        );
+    }
+
+    #[test]
+    fn update_job_rejects_shell_output_format_for_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["decl-job"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo ok".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
+        config.cron.insert("decl-job".to_string(), decl);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let err = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                shell_output_format: Some(zeroclaw_config::schema::CronShellOutputFormat::Raw),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("config.toml"),
+            "the core update_job boundary must reject a config-owned mutation, not silently ignore it: {err}"
+        );
+    }
+
+    #[test]
+    fn update_job_rejects_shell_output_format_for_agent_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["default"]);
+
+        let job = add_agent_job(
+            &config,
+            "default",
+            Some("agent-job".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "summarize logs",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let err = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                shell_output_format: Some(zeroclaw_config::schema::CronShellOutputFormat::Raw),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("shell-only"),
+            "the core update_job boundary must reject shell_output_format on a non-shell job: {err}"
         );
     }
 }
