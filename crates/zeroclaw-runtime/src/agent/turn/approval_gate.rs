@@ -7,6 +7,7 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
+use zeroclaw_api::observability_traits::{AuthorizationResponseType, ObserverEvent};
 
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
@@ -35,6 +36,16 @@ pub(crate) async fn gate_tool_approval(
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
         };
+
+        // Emit AuthorizationRequested before prompting
+        let arguments_summary = crate::approval::summarize_args(tool_args);
+        let event = ObserverEvent::AuthorizationRequested {
+            tool_name: tool_name.to_string(),
+            arguments_summary,
+            channel: Some(ctx.channel_name.to_string()),
+            turn_id: Some(ctx.turn_id.to_string()),
+        };
+        ctx.observer.record_event(&event);
 
         // Interactive CLI: prompt the operator.
         // Non-interactive (channels): try the channel's inline
@@ -94,6 +105,22 @@ pub(crate) async fn gate_tool_approval(
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+
+        // Emit AuthorizationResponded event
+        let response_type = match decision {
+            ApprovalResponse::Yes => AuthorizationResponseType::Yes,
+            ApprovalResponse::Always => AuthorizationResponseType::Always,
+            ApprovalResponse::No => AuthorizationResponseType::No,
+            ApprovalResponse::ReplaceWith(_) => AuthorizationResponseType::ReplaceWith,
+        };
+        let event = ObserverEvent::AuthorizationResponded {
+            tool_name: tool_name.to_string(),
+            granted: matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always),
+            response_type,
+            channel: Some(ctx.channel_name.to_string()),
+            turn_id: Some(ctx.turn_id.to_string()),
+        };
+        ctx.observer.record_event(&event);
 
         if decision == ApprovalResponse::No {
             let denied = "Denied by user.".to_string();
@@ -174,3 +201,6 @@ pub(crate) async fn gate_tool_approval(
         approved: approval_requirement == ApprovalRequirement::Approved,
     }
 }
+
+#[cfg(test)]
+mod herdr_tests;

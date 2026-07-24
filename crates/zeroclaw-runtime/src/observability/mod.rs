@@ -277,6 +277,15 @@ impl Observer for TeeObserver {
 
     fn flush(&self) {
         self.primary.flush();
+        // Fan out to the broadcast hook so short-lived processes (CLI one-shot,
+        // guarded by `FlushGuard`) drain any buffered state — e.g. the Herdr
+        // observer's idle + release_agent notifications — before the runtime
+        // tears down. Long-lived callers (daemon, channels) rely on periodic
+        // export and never construct a `FlushGuard`, so this is a no-op for
+        // them unless they explicitly call `flush()`.
+        if let Some(hook) = current_broadcast_hook() {
+            hook.flush();
+        }
     }
 
     fn name(&self) -> &str {
@@ -748,10 +757,8 @@ mod tests {
         let mut guard = FlushGuard::new(observer.clone());
         guard.fire();
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
-        // Second explicit fire is a no-op.
         guard.fire();
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
-        // Dropping after fire must not flush again.
         drop(guard);
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
     }

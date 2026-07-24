@@ -41,6 +41,21 @@ pub struct LlmMessageSnapshot {
     pub system_instructions: Option<String>,
 }
 
+/// User response type for an authorization request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AuthorizationResponseType {
+    /// User approved this single call.
+    Yes,
+    /// User approved and added tool to session allowlist.
+    Always,
+    /// User denied the request.
+    No,
+    /// User provided a replacement tool result.
+    ReplaceWith,
+}
+
 /// Token usage breakdown for a single agent turn.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TurnTokenUsage {
@@ -312,6 +327,26 @@ pub enum ObserverEvent {
         reason: String,
         channel: Option<String>,
         agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// User authorization is required for a tool/action.
+    ///
+    /// Emitted when the agent needs explicit user approval before executing
+    /// a tool (e.g., in supervised mode when a tool is not auto-approved).
+    AuthorizationRequested {
+        tool_name: String,
+        arguments_summary: String,
+        channel: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// User responded to an authorization request.
+    ///
+    /// Emitted when the user responds to an authorization request (Yes/No/Always/ReplaceWith).
+    AuthorizationResponded {
+        tool_name: String,
+        granted: bool,
+        response_type: AuthorizationResponseType,
+        channel: Option<String>,
         turn_id: Option<String>,
     },
 }
