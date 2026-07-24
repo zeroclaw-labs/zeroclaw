@@ -111,7 +111,7 @@ V0.8.0 eradicated all per-provider native env-var fallbacks. The schema-mirror g
 
 ### OpenAI STT (`TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY`)
 
-The OpenAI Whisper STT provider resolves its API key on demand during provider construction via `resolve_openai_stt_api_key()` in `zeroclaw-config`. This is a config-layer, stateless resolver — the environment value is never written into `Config` or persisted to disk.
+The OpenAI Whisper STT provider resolves its API key on demand during provider construction via `resolve_openai_stt_api_key()` in `zeroclaw-config`. This is a config-layer, stateless resolver; the environment value is never written into `Config` or persisted to disk.
 
 **Precedence (highest wins):**
 

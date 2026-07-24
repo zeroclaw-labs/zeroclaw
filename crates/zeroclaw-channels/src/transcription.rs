@@ -6,10 +6,7 @@ use reqwest::multipart::{Form, Part};
 
 use zeroclaw_config::env_overrides::resolve_openai_stt_api_key;
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
-use zeroclaw_config::schema::{
-    AssemblyAiSttConfig, Config, DeepgramSttConfig, GoogleSttConfig, LocalWhisperConfig,
-    OpenAiSttConfig, TranscriptionConfig,
-};
+use zeroclaw_config::schema::{Config, OpenAiSttConfig, TranscriptionConfig};
 
 /// Maximum upload size accepted by most Whisper-compatible APIs (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
@@ -964,10 +961,10 @@ impl TranscriptionManager {
             transcription_providers.insert("groq".to_string(), Box::new(groq));
         }
 
-        if let Some(ref openai_cfg) = config.openai {
-            if let Ok(p) = OpenAiWhisperProvider::from_config("openai", openai_cfg) {
-                transcription_providers.insert("openai".to_string(), Box::new(p));
-            }
+        if let Some(ref openai_cfg) = config.openai
+            && let Ok(p) = OpenAiWhisperProvider::from_config("openai", openai_cfg)
+        {
+            transcription_providers.insert("openai".to_string(), Box::new(p));
         }
 
         if let Some(ref deepgram_cfg) = config.deepgram
@@ -2580,8 +2577,10 @@ mod tests {
             unsafe {
                 std::env::set_var("TRANSCRIPTION_API_KEY", "sk-env-test");
             }
-            let mut config = TranscriptionConfig::default();
-            config.enabled = true;
+            let config = TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            };
             // No [transcription.openai] table, no other providers.
             assert!(config.openai.is_none());
             assert!(config.api_key.is_none());
@@ -2630,8 +2629,10 @@ mod tests {
         #[test]
         fn legacy_path_no_env_and_no_table_errors_when_enabled() {
             let _iso = EnvIsolation::isolate();
-            let mut config = TranscriptionConfig::default();
-            config.enabled = true;
+            let config = TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            };
             assert!(config.openai.is_none());
 
             let err = match TranscriptionManager::new(&config) {
@@ -2680,12 +2681,14 @@ mod tests {
             unsafe {
                 std::env::set_var("TRANSCRIPTION_API_KEY", "sk-env-value");
             }
-            let mut config = TranscriptionConfig::default();
-            config.enabled = true;
-            config.openai = Some(OpenAiSttConfig {
-                api_key: Some("sk-config".to_string()),
-                model: "whisper-1".to_string(),
-            });
+            let config = TranscriptionConfig {
+                enabled: true,
+                openai: Some(OpenAiSttConfig {
+                    api_key: Some("sk-config".to_string()),
+                    model: "whisper-1".to_string(),
+                }),
+                ..TranscriptionConfig::default()
+            };
 
             let manager = TranscriptionManager::new(&config).unwrap();
             let providers = manager.available_providers();
