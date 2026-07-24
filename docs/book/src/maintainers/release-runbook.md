@@ -61,13 +61,16 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 
 This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
-`cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
+`cargo generate installers`: install.sh, setup.bat, `dist/aur/PKGBUILD`,
 `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
-sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
-feature lists from the canonical install spec (`Cargo.toml` plus
-`[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
-never hand-edit a generated region. This script also refreshes the Nix git
-dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
+sets, `dev/ci/docker-tags.toml`, and `docs/book/src/_snippets/install.md`.
+Version, feature, and application-packaging values come from `Cargo.toml` and
+`[package.metadata.zeroclaw]`; the four stable installation routes come from
+typed contracts in `xtask/src/generate/spec.rs`. The bump keeps these surfaces
+in step automatically, so never hand-edit a generated region. Live release
+availability remains hand-authored and is not inferred by the generator. This
+script also refreshes the Nix git dependency hashes (`nix/hashes.json`) via
+`scripts/dev/refresh-nix-hashes.sh`.
 
 ### Refresh and pin translations
 

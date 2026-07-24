@@ -14,6 +14,7 @@ Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on y
 
 From a PowerShell prompt:
 
+<!-- >>> generated:windows-prebuilt-powershell by `cargo generate installers` - do not edit <<< -->
 ```powershell
 # Idempotent: re-running this block is a no-op when zeroclaw is already
 # installed at the latest release and on the user PATH. After a release
@@ -33,9 +34,10 @@ if ($current -ne $ver) {
     Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
 }
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$environment = [Environment]
+$userPath = $environment::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $dst) {
-    [Environment]::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+    $environment::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
 }
 if (($env:Path -split ';') -notcontains $dst) {
     $env:Path = "$dst;$env:Path"
@@ -43,8 +45,11 @@ if (($env:Path -split ';') -notcontains $dst) {
 
 & $exe quickstart
 ```
+<!-- >>> end generated:windows-prebuilt-powershell <<< -->
 
-The zip ships a self-contained binary, with no Rust toolchain, no Visual Studio Build Tools needed.
+For the stable behavior shared by the Windows prebuilt and source routes, see the [canonical installation paths](../getting-started/quickstart.md#install). Release availability and the PowerShell download block remain documented here because they depend on live GitHub assets.
+
+The prebuilt zip is self-contained; Visual Studio Build Tools are required only when building from source.
 
 After install, verify:
 

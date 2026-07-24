@@ -10,6 +10,7 @@ Use this page when a change touches a schema, CLI flag, feature or hardware inve
 | --- | --- | --- | --- | --- | --- |
 | Config reference | `zeroclaw_config::schema::Config` plus `Configurable` derives | `cargo mdbook refs` or `cargo mdbook build`, through `markdown-schema` | `docs/book/src/reference/config.md` | Ignored derived file | Config reference chapter and schema-backed directives |
 | CLI reference | Clap command tree in `src/main.rs` | `cargo mdbook refs` or `cargo mdbook build`, through `markdown-help` | `docs/book/src/reference/cli.md` | Ignored derived file | CLI reference chapter |
+| Installation paths | Typed route contracts in `xtask/src/generate/spec.rs` and generated behavior bodies in the installer renderers | `cargo generate installers`, through `xtask/src/generate/docs.rs` and `xtask/src/generate/install_sh.rs` | `docs/book/src/_snippets/install.md`, generated regions in `install.sh`, and the Windows prebuilt block in `docs/book/src/setup/windows.md` | Tracked generated surfaces | README-linked first-time setup, executable Unix routes, Quickstart, and platform setup pages |
 | Rust API reference | Public Rust items across workspace crates | `cargo doc` inside `cargo mdbook refs` or `cargo mdbook build` | `target/doc/`, copied to `docs/book/book/api/` | Ignored build output | Published API reference |
 | Feature matrix | Channel inventory, model-provider slots, default tools, and `docs/book/feature-matrix-parity.toml` | `xtask/src/cmd/mdbook/feature_matrix.rs` during locale builds | `docs/book/src/_snippets/feature-matrix-*.md` | Ignored derived snippets | Feature comparison pages through `{{#include}}` |
 | Hardware tables | Hardware board registry and tool catalog, transport descriptions in the generator, release workflow targets, and the low-memory threshold in `install.sh` | `xtask/src/cmd/mdbook/hardware.rs` during locale builds | `docs/book/src/_snippets/hardware-*.md` | Ignored derived snippets | Hardware and release-target guides |
@@ -44,7 +45,7 @@ The docs deployment workflow initializes the translation submodule, installs the
 
 Tracked files are reviewable inputs or templates: authored Markdown, `locales.toml`, `docs/book/peer-groups.toml`, feature-matrix parity metadata, theme templates, Rust/WIT sources, and workflow definitions. The `docs/book/po` path is a tracked gitlink to the separate translation-catalog repository; its contents and release tags have their own lifecycle.
 
-Ignored files are reproducible materializations: CLI and config references, generated snippets, rustdoc, rendered HTML, locale-switcher JavaScript, generated theme CSS, and the dashboard TypeScript API client. They may exist in a working tree after a docs build without belonging in a commit.
+Ignored files are reproducible materializations: CLI and config references, most generated snippets, rustdoc, rendered HTML, locale-switcher JavaScript, generated theme CSS, and the dashboard TypeScript API client. They may exist in a working tree after a docs build without belonging in a commit. The tracked installation surfaces are explicit exceptions: `docs/book/src/_snippets/install.md`, generated regions in `install.sh`, and the Windows prebuilt block in `docs/book/src/setup/windows.md`.
 
 `docs/book/theme/index.hbs` is the notable mixed case. It is a tracked template, but the theme generator rewrites only the marked theme-list region from `themes.json`. If a standard generation command changes that region, inspect whether the canonical registry or generator changed; do not treat the generated list as independently authored content.
 
@@ -68,6 +69,7 @@ Required PR CI runs the docs quality and added-link gates, but it does not run t
 
 - Fix config reference errors in the typed schema, derives, or schema-to-Markdown generator.
 - Fix CLI reference errors in the Clap command definition or Markdown-help generator.
+- Fix stable installation behavior in the typed route contract or its renderer, then run `cargo generate installers`; do not hand-edit the tracked installation snippet.
 - Fix source-backed snippet errors in the owning registry, metadata file, contract, or snippet generator.
 - Fix theme-list drift in `themes.json` or the marked-region generator, not by hand-editing generated buttons.
 - Fix translated content or fallback behavior through the catalog lifecycle, not in rendered locale HTML.

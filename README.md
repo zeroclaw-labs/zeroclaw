@@ -33,21 +33,51 @@ Read the [Philosophy](docs/book/src/philosophy/index.md) for the four opinions t
 
 ## Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+### Unix (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
+"$HOME/.cargo/bin/zeroclaw" quickstart
 ```
 
-Or clone and run:
+### Windows (recommended)
 
-```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./install.sh
+Run this idempotent prebuilt install from PowerShell:
+
+```powershell
+# Idempotent: re-running this block is a no-op when zeroclaw is already
+# installed at the latest release and on the user PATH. After a release
+# bumps, the version check fails and the install side runs again.
+$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
+$dst = "$env:USERPROFILE\.zeroclaw\bin"
+$exe = "$dst\zeroclaw.exe"
+
+$current = if (Test-Path $exe) {
+    ((& $exe --version 2>$null) | Select-String -Pattern '\d+\.\d+\.\d+').Matches.Value
+} else { '' }
+
+if ($current -ne $ver) {
+    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
+    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+}
+
+$environment = [Environment]
+$userPath = $environment::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $dst) {
+    $environment::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+}
+if (($env:Path -split ';') -notcontains $dst) {
+    $env:Path = "$dst;$env:Path"
+}
+
+& $exe quickstart
 ```
 
-The piped installer uses a prebuilt binary when one is available and falls back to a source build otherwise. It skips interactive setup and prints `zeroclaw quickstart` as the next step.
+For the guided Unix installer, source builds, app and feature selection, and PATH behavior, compare the [installation paths](docs/book/src/getting-started/quickstart.md#install).
 
-When the platform maps to a supported prebuilt target, running `./install.sh` from a clone in an interactive terminal offers prebuilt or source installation; other platforms build from source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based Quickstart. Use `--skip-quickstart` when you only want to install.
+Run `./install.sh --help` for the complete Unix installer flag reference.
 
 > **Working on the docs?** The translated documentation catalogues live in a
 > git submodule (`docs/book/po`). The Rust build does not need it, but building
@@ -57,25 +87,6 @@ When the platform maps to a supported prebuilt target, running `./install.sh` fr
 > git clone --recurse-submodules https://github.com/zeroclaw-labs/zeroclaw.git
 > git submodule update --init docs/book/po   # existing clone
 > ```
-
-Flags:
-
-```
-./install.sh --prebuilt              # always prebuilt; don't ask
-./install.sh --source                # always build from source
-./install.sh --preset minimal        # kernel-only source preset (~6.6 MB)
-./install.sh --minimal               # alias for --preset minimal
-./install.sh --source --features agent-runtime,channel-discord  # custom feature set
-./install.sh --apps zerocode         # select apps to install; use "none" to skip all
-./install.sh --without-tui           # skip building zerocode
-./install.sh --with-gateway          # force gateway support on
-./install.sh --without-gateway       # force gateway support off
-./install.sh --prefix /tmp/zc-test   # install under a custom prefix
-./install.sh --dry-run --prebuilt    # preview without installing
-./install.sh --skip-quickstart       # install only, run `zeroclaw quickstart` later
-./install.sh --list-features         # print available feature flags
-./install.sh --uninstall             # remove ZeroClaw
-```
 
 Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/book/src/setup/macos.md) · [Windows](docs/book/src/setup/windows.md) · [FreeBSD](docs/book/src/setup/freebsd.md) · [NixOS](docs/book/src/setup/nixos.md) · [Docker](docs/book/src/setup/container.md)
 

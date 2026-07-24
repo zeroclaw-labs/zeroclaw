@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 </div>
 
-When the platform maps to a supported prebuilt target, an interactive run offers prebuilt or source installation; other platforms build from source. Source installs also offer app and optional-feature choices. For an unconfigured install, the installer then offers CLI or browser-based setup. The piped `curl | bash` path is noninteractive: it selects a prebuilt binary when available, falls back to a source build otherwise, skips the setup prompt, and prints [`zeroclaw quickstart`](../getting-started/quickstart.md) as the next step. Both paths install to Cargo's bin directory, usually `~/.cargo/bin/zeroclaw`. Pass `--help` for the full flag reference, or `--skip-quickstart` to install only.
+The [canonical installation paths](../getting-started/quickstart.md#install) explain the fast and guided routes, source fallback, app selection, PATH handoff, and the next Quickstart step.
 
 ### Homebrew (Linuxbrew)
 

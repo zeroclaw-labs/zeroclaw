@@ -24,13 +24,16 @@ die() {
 }
 bold() { printf "${BOLD}%s${RESET}" "$*"; }
 
+  # >>> generated:route-contract by `cargo generate installers` - do not edit <<<
 TUI_BIN_NAME="zerocode"
-
-# Apps installed by default (the rest are discovered and listed but off
-# until selected via --apps or the interactive picker). Intentionally a
-# fixed list: zeroclaw-desktop needs the Tauri toolchain + webview deps,
-# so it ships off-by-default.
 DEFAULT_APPS="zerocode"
+PIPED_INSTALL_MODE="prebuilt"
+QUICKSTART_COMMAND="zeroclaw quickstart"
+QUICKSTART_SUBCOMMAND="quickstart"
+GUIDED_INSTALL_MODE="choice"
+GUIDED_QUICKSTART_MODE="offer"
+UNIX_PATH_RELOAD="true"
+  # >>> end generated:route-contract <<<
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
 
@@ -819,8 +822,10 @@ while [ $# -gt 0 ]; do
   --dry-run) DRY_RUN=true ;;
   --no-modify-path) MODIFY_PATH=false ;;
   --skip-quickstart) SKIP_QUICKSTART=true ;;
+  # >>> generated:route-flags by `cargo generate installers` - do not edit <<<
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
+  # >>> end generated:route-flags <<<
   --uninstall) UNINSTALL=true ;;
   -h | --help)
     usage
@@ -866,10 +871,10 @@ fi
 
 # ── Decide: pre-built or source ───────────────────────────────────
 
+  # >>> generated:route-decision by `cargo generate installers` - do not edit <<<
 # --minimal, --features, --apps, --without-gateway, or --preset full imply
-# source. Prebuilt binaries always ship with default features and no apps,
-# so any flag that changes the feature set or selects apps must force a
-# source build.
+# source. Prebuilt archives have fixed feature and app contents, so any flag
+# that changes the feature set or selects apps must force a source build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] || [ -n "$USER_APPS" ] ||
   [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
   INSTALL_MODE="source"
@@ -878,7 +883,7 @@ fi
 if [ "$INSTALL_MODE" = "" ]; then
   triple=$(detect_target_triple)
   if [ -n "$triple" ]; then
-    if [ -t 0 ]; then
+    if [ "$GUIDED_INSTALL_MODE" = "choice" ] && [ -t 0 ]; then
       echo
       printf "  %s\n" "$(bold "How would you like to install ZeroClaw?")"
       printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
@@ -891,7 +896,7 @@ if [ "$INSTALL_MODE" = "" ]; then
       esac
     else
       # Non-interactive (curl | bash): default to pre-built silently
-      INSTALL_MODE="prebuilt"
+      INSTALL_MODE="$PIPED_INSTALL_MODE"
     fi
   else
     INSTALL_MODE="source"
@@ -907,6 +912,7 @@ if [ "$INSTALL_MODE" = "prebuilt" ]; then
     PREBUILT_OK=false
   fi
 fi
+  # >>> end generated:route-decision <<<
 
 [ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
   BIN="$CARGO_HOME/bin/zeroclaw"
@@ -925,12 +931,9 @@ fi
 
 # ── Locate source ─────────────────────────────────────────────────
 
-[ "${PREBUILT_OK:-false}" = true ] && {
-  # Jump past the source build to PATH + quickstart
-  SOURCE_SKIPPED=true
-}
-
-if [ "${SOURCE_SKIPPED:-false}" != true ]; then
+  # >>> generated:source-dispatch-open by `cargo generate installers` - do not edit <<<
+if [ "${PREBUILT_OK:-false}" != true ]; then
+  # >>> end generated:source-dispatch-open <<<
 
   echo
   printf "%s\n" "$(bold "ZeroClaw — source install")"
@@ -965,6 +968,7 @@ if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
   # ── Preflight: Rust ───────────────────────────────────────────────
 
+  # >>> generated:rust-bootstrap by `cargo generate installers` - do not edit <<<
   NEED_RUST=false
   if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     NEED_RUST=true
@@ -990,6 +994,7 @@ if [ "${SOURCE_SKIPPED:-false}" != true ]; then
     fi
     info "Rust $RUST_VERSION (>= $MSRV)"
   fi
+  # >>> end generated:rust-bootstrap <<<
 
   # ── Preflight: 32-bit ARM ────────────────────────────────────────
 
@@ -1055,6 +1060,7 @@ See all available features:
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
   # `--without-gateway`, and any non-interactive run (curl | bash).
+  # >>> generated:feature-picker by `cargo generate installers` - do not edit <<<
   if [ -t 0 ] &&
     [ "$MINIMAL" != true ] &&
     [ -z "$USER_FEATURES" ] &&
@@ -1091,6 +1097,7 @@ See all available features:
       CARGO_FLAGS="$CARGO_FLAGS --features $USER_FEATURES"
     fi
   fi
+  # >>> end generated:feature-picker <<<
 
   # ── Detect existing installs ──────────────────────────────────────
 
@@ -1198,6 +1205,7 @@ See all available features:
   # Resolve the app set: explicit --apps list, "none" to skip, or the
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
+  # >>> generated:app-selection by `cargo generate installers` - do not edit <<<
   if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
     # --full installs every discovered app (an explicit --apps still wins) —
     # except Tauri-based apps (tauri.conf.json present): they need the Tauri
@@ -1249,6 +1257,7 @@ See all available features:
       cargo install --path "$app_path" --locked --force
     fi
   done
+  # >>> end generated:app-selection <<<
 
   # ── Summary ───────────────────────────────────────────────────────
 
@@ -1278,12 +1287,15 @@ See all available features:
     fi
   fi
 
+  # >>> generated:source-dispatch-close by `cargo generate installers` - do not edit <<<
 fi # end source build block
+  # >>> end generated:source-dispatch-close <<<
 
 BIN="$CARGO_HOME/bin/zeroclaw"
 
 # ── PATH setup ────────────────────────────────────────────────────
 
+  # >>> generated:path-handoff by `cargo generate installers` - do not edit <<<
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
@@ -1319,7 +1331,9 @@ elif [ "$MODIFY_PATH" = true ] && [ "$PREFIX" = "$HOME" ]; then
     printf '# <<< zeroclaw <<<\n'
   } >>"$PROFILE" 2>/dev/null; then
     info "Added $CARGO_HOME/bin to PATH in $PROFILE"
-    printf "    Reload your shell or run: source %s\n" "$PROFILE"
+    if [ "$UNIX_PATH_RELOAD" = true ]; then
+      printf "    Reload your shell or run: source %s\n" "$PROFILE"
+    fi
   else
     warn "Could not write to $PROFILE — add this line manually:"
     print_path_help
@@ -1328,23 +1342,25 @@ else
   # --no-modify-path, or a custom --prefix install we won't auto-edit for.
   print_path_help
 fi
+  # >>> end generated:path-handoff <<<
 
 # ── Quickstart prompt ─────────────────────────────────────────────
 
+  # >>> generated:quickstart-handoff by `cargo generate installers` - do not edit <<<
 if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   # Skip the prompt entirely when the operator already has a configured
   # ZeroClaw — re-installs should not re-prompt.
   if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
-    info "Run 'zeroclaw quickstart' to reconfigure."
-  elif [ -t 0 ]; then
+    info "Run '$QUICKSTART_COMMAND' to reconfigure."
+  elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ]; then
     # 3-way setup choice. Bare Enter accepts the [1] CLI quickstart default;
     # option [2] foregrounds the daemon so the operator can finish in the
     # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
     # Non-TTY runs fall through to the silent skip in the else branch.
     echo
     printf "%s\n" "$(bold "ZeroClaw installed. How would you like to complete setup?")"
-    printf "  [1] CLI quickstart  (zeroclaw quickstart)\n"
+    printf "  [1] CLI quickstart  ($QUICKSTART_COMMAND)\n"
     printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
     printf "  [3] Skip for now\n"
     printf "  Choice [1-3, default 1]: "
@@ -1352,7 +1368,7 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
     case "${quickstart_choice:-1}" in
     1 | "")
       echo
-      "$BIN" quickstart || warn "Quickstart exited with an error — run 'zeroclaw quickstart' manually"
+      "$BIN" "$QUICKSTART_SUBCOMMAND" || warn "Quickstart exited with an error — run '$QUICKSTART_COMMAND' manually"
       ;;
     2)
       echo
@@ -1362,16 +1378,17 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
       "$BIN" daemon || warn "Daemon exited with an error — run 'zeroclaw daemon' manually"
       ;;
     3)
-      info "Skipped setup. Run 'zeroclaw quickstart' (CLI) or 'zeroclaw daemon' (browser) when ready."
+      info "Skipped setup. Run '$QUICKSTART_COMMAND' (CLI) or 'zeroclaw daemon' (browser) when ready."
       ;;
     *)
-      warn "Unknown choice '$quickstart_choice' — skipping. Run 'zeroclaw quickstart' to configure."
+      warn "Unknown choice '$quickstart_choice' — skipping. Run '$QUICKSTART_COMMAND' to configure."
       ;;
     esac
   else
-    info "Non-interactive — skipping setup prompt. Run 'zeroclaw quickstart' to configure."
+    info "Non-interactive — skipping setup prompt. Run '$QUICKSTART_COMMAND' to configure."
   fi
 fi
+  # >>> end generated:quickstart-handoff <<<
 
 echo
 # Next-step hint, smartest-first: if zerocode (the TUI) was installed, that's
