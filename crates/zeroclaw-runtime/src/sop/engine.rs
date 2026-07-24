@@ -7097,6 +7097,32 @@ mod tests {
         assert!(engine.cancel_run("nonexistent").is_err());
     }
 
+    #[test]
+    fn finish_unknown_run_returns_error_without_mutating_engine() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+
+        let error = engine
+            .finish_run("nonexistent", SopRunStatus::Failed, Some("failed".into()))
+            .expect_err("finishing an unknown run must return an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Active run not found: nonexistent")
+        );
+        assert!(engine.active_runs().is_empty());
+        assert!(engine.finished_runs(None).is_empty());
+
+        let action = engine
+            .start_run("s1", manual_event())
+            .expect("the engine must remain usable after an unknown finish");
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+    }
+
     // ── Concurrency ─────────────────────────────────────
 
     #[test]

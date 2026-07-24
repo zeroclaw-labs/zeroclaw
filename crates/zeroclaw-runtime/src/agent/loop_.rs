@@ -3688,35 +3688,6 @@ mod tests {
         assert_eq!(est, 10_004);
     }
 
-    // ── shared_budget tests ───────────────────────────────────────
-
-    #[test]
-    fn shared_budget_decrement_logic() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let budget = Arc::new(AtomicUsize::new(3));
-
-        // Simulate 3 iterations decrementing
-        for i in 0..3 {
-            let remaining = budget.load(Ordering::Relaxed);
-            assert!(remaining > 0, "Budget should be >0 at iteration {i}");
-            budget.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Budget should now be 0
-        assert_eq!(budget.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn shared_budget_none_has_no_effect() {
-        // When shared_budget is None, the check is simply skipped
-        let budget: Option<Arc<std::sync::atomic::AtomicUsize>> = None;
-        assert!(budget.is_none());
-    }
-
-    // ── existing tests ────────────────────────────────────────────
-
     #[test]
     fn interactive_session_state_round_trips_history() {
         let dir = tempdir().unwrap();

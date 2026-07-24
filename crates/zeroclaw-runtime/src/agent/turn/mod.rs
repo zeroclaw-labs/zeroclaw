@@ -86,6 +86,16 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
+    budget
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+}
+
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -386,20 +396,18 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
 
         // Shared iteration budget: parent + subagents share a global counter
-        if let Some(ref budget) = shared_budget {
-            let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
-            if remaining == 0 {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration"
-                );
-                break;
-            }
-            budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref budget) = shared_budget
+            && !try_reserve_shared_iteration(budget)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"iteration": iteration})),
+                "Shared iteration budget exhausted at iteration"
+            );
+            break;
         }
 
         preflight_history_maintenance(history);
@@ -2163,6 +2171,50 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+#[cfg(test)]
+mod shared_iteration_budget_tests {
+    use super::try_reserve_shared_iteration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn exhausted_budget_never_wraps() {
+        let budget = AtomicUsize::new(1);
+
+        assert!(try_reserve_shared_iteration(&budget));
+        assert!(!try_reserve_shared_iteration(&budget));
+        assert_eq!(budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn contention_grants_exactly_the_available_iterations() {
+        const AVAILABLE: usize = 8;
+        const WORKERS: usize = 64;
+
+        let budget = Arc::new(AtomicUsize::new(AVAILABLE));
+        let granted = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let budget = Arc::clone(&budget);
+                let granted = Arc::clone(&granted);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    if try_reserve_shared_iteration(&budget) {
+                        granted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            start.wait();
+        });
+
+        assert_eq!(granted.load(Ordering::Relaxed), AVAILABLE);
+        assert_eq!(budget.load(Ordering::Acquire), 0);
     }
 }
 
