@@ -19,6 +19,7 @@ use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionS
 
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -442,6 +443,34 @@ impl fmt::Display for DaemonVersionMismatch {
 
 impl std::error::Error for DaemonVersionMismatch {}
 
+/// The transport connected, but the daemon did not finish the ACP handshake.
+#[derive(Debug)]
+pub struct DaemonInitializeTimeout {
+    timeout: Duration,
+}
+
+impl DaemonInitializeTimeout {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    pub fn timeout_seconds(&self) -> u64 {
+        self.timeout.as_secs()
+    }
+}
+
+impl fmt::Display for DaemonInitializeTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "daemon did not complete initialization within {}s",
+            self.timeout_seconds()
+        )
+    }
+}
+
+impl std::error::Error for DaemonInitializeTimeout {}
+
 #[derive(Debug)]
 struct InitializeResponse {
     server_version: String,
@@ -467,6 +496,21 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
             .and_then(Value::as_str)
             .map(String::from),
     })
+}
+
+async fn request_initialize(
+    rpc: &RpcOutbound,
+    init_params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    match tokio::time::timeout(timeout, rpc.request(method::INITIALIZE, init_params)).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(anyhow::Error::msg(format!(
+            "initialize: {} ({})",
+            e.message, e.code
+        ))),
+        Err(_) => Err(DaemonInitializeTimeout::new(timeout).into()),
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────
@@ -643,14 +687,11 @@ impl RpcClient {
         // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
-        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+        let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
-                return Err(anyhow::Error::msg(format!(
-                    "initialize: {} ({})",
-                    e.message, e.code
-                )));
+                return Err(e);
             }
         };
 
@@ -794,14 +835,11 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
-        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+        let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
-                return Err(anyhow::Error::msg(format!(
-                    "initialize: {} ({})",
-                    e.message, e.code
-                )));
+                return Err(e);
             }
         };
 
@@ -1721,6 +1759,28 @@ mod initialize_version_tests {
 
         assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(mismatch.server_version(), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod initialize_timeout_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_request_times_out_when_transport_never_responds() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        let rpc = RpcOutbound::new(writer_tx);
+        let receiver = tokio::spawn(async move {
+            writer_rx.recv().await.expect("initialize request");
+            std::future::pending::<()>().await;
+        });
+
+        let err = request_initialize(&rpc, serde_json::json!({}), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<DaemonInitializeTimeout>().is_some());
+        receiver.abort();
     }
 }
 
