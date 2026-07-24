@@ -2,6 +2,15 @@ name: Cross-Platform Build
 
 on:
   workflow_dispatch:
+    inputs:
+      distribution:
+        description: Feature distribution to measure
+        required: true
+        type: choice
+        default: dist
+        options:
+          - dist
+          - dist-broad
 
 permissions:
   contents: read
@@ -43,10 +52,10 @@ jobs:
           retention-days: 1
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ inputs.distribution }} / ${{ matrix.target }}
     needs: [web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -118,32 +127,46 @@ jobs:
           fi
           echo "$NDK_PREBUILT/bin" >> "$GITHUB_PATH"
 
+      - name: Configure target environment
+        shell: bash
+        run: |
+          {
+            if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+              echo "${{ matrix.linker_env }}=${{ matrix.linker }}"
+            fi
+            if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+              # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556).
+              # Ubuntu's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+              # which segfaults on ARMv6 devices (e.g., Raspberry Pi Zero W).
+              echo "CFLAGS_arm_unknown_linux_gnueabihf=-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+              echo "CXXFLAGS_arm_unknown_linux_gnueabihf=-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+              echo "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-C target-feature=-neon"
+            fi
+          } >> "$GITHUB_ENV"
+
       - name: Build release
         shell: bash
         run: |
-          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
-            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
-          fi
-          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
-            # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556).
-            # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
-            # which segfaults on ARMv6 devices (e.g., Raspberry Pi Zero W).
-            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
-            export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
-            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
-          fi
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection "${{ inputs.distribution }}" --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           cargo build --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
-          if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
-            cargo build --release --locked -p zerocode --target ${{ matrix.target }}
-          fi
+          binary="target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
+          bytes="$(wc -c < "$binary" | tr -d ' ')"
+          {
+            echo "### ${{ inputs.distribution }} / ${{ matrix.target }}"
+            echo
+            echo "- Binary bytes: $bytes"
+            echo "- Resolved features: \`$FEATURES\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zeroclaw-manual-${{ matrix.target }}
+          name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}
           if-no-files-found: error
           retention-days: 1
+      - name: Build ZeroCode companion
+        if: matrix.target != 'aarch64-linux-android'
+        run: cargo build --release --locked -p zerocode --target ${{ matrix.target }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: matrix.target != 'aarch64-linux-android'
         with:

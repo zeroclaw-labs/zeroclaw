@@ -93,6 +93,7 @@ fn test_state(config: Config) -> AppState {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         reload_tx: None,
         node_registry: Arc::new(gateway::nodes::NodeRegistry::new(16)),
+        mdns_peer_registry: gateway::nodes::mdns::MdnsPeerRegistry::default(),
         path_prefix: String::new(),
         web_dist_dir: None,
         session_backend: None,

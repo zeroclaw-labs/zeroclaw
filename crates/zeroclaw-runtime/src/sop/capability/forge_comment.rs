@@ -254,7 +254,7 @@ impl SopCapability for ForgeCommentCapability {
 /// flight at that point, the bridge joins it and returns the eventual result
 /// instead of letting a public comment continue in the background while the SOP
 /// takes `on_failure`. The sync->async bridge runs the send on a DEDICATED
-/// thread with its own small runtime (see [`run_bridged_to_completion`]) rather
+/// thread with its own small runtime (see `run_bridged_to_completion`) rather
 /// than spawning onto the host runtime: the capability executes while blocking a
 /// host thread, and on a current-thread host context a task spawned back onto
 /// that same runtime cannot be polled until the caller unblocks — a guaranteed

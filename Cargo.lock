@@ -13223,6 +13223,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.6.3",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -13346,6 +13347,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
@@ -13454,7 +13456,6 @@ dependencies = [
  "directories",
  "encoding_rs",
  "filetime",
- "flate2",
  "fluent",
  "futures-util",
  "glob",
@@ -13522,7 +13523,6 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
- "zip",
 ]
 
 [[package]]

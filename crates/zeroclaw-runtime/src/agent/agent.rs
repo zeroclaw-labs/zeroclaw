@@ -1057,6 +1057,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
+        turn_id: &str,
     ) {
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
@@ -1076,6 +1077,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.to_string()),
             });
         }
 
@@ -1802,6 +1806,54 @@ impl Agent {
         }
     }
 
+    /// Append a user-visible notice when the resilient provider wrapper served
+    /// this turn with a different model or provider than requested (silent
+    /// model downgrade, e.g. a `fallback_models` entry kicking in). The record
+    /// is consumed from the `zeroclaw_providers::reliable` task-local (single
+    /// source of truth); nothing is stored.
+    ///
+    /// The notice is BOTH appended to the returned response (rendered by
+    /// consumers of the final text, e.g. the gateway web UI's `done` frame)
+    /// and streamed as a trailing [`TurnEvent::Chunk`] (rendered by streaming
+    /// consumers that discard the final text on a clean finish, e.g. the
+    /// ZeroCode TUI).
+    async fn append_model_fallback_notice(
+        response: String,
+        fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+        event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> String {
+        let Some(fallback) = fallback else {
+            return response;
+        };
+        // The wrapper also records plain retries (attempt > 0 on the primary
+        // entry); an identical requested/served pair is not a downgrade.
+        if fallback.actual_provider == fallback.requested_provider
+            && fallback.actual_model == fallback.requested_model
+        {
+            return response;
+        }
+        let notice = crate::i18n::get_required_cli_string_with_args(
+            "turn-model-fallback-notice",
+            &[
+                ("requested_model", fallback.requested_model.as_str()),
+                ("requested_provider", fallback.requested_provider.as_str()),
+                ("actual_model", fallback.actual_model.as_str()),
+                ("actual_provider", fallback.actual_provider.as_str()),
+            ],
+        );
+        let delta = format!("\n\n{notice}");
+        let _ = event_tx
+            .send(TurnEvent::Chunk {
+                delta: delta.clone(),
+            })
+            .await;
+        if response.is_empty() {
+            notice
+        } else {
+            format!("{response}{delta}")
+        }
+    }
+
     fn build_system_prompt(&self) -> Result<String> {
         self.build_system_prompt_with_dispatcher(self.tool_dispatcher.as_ref())
     }
@@ -2126,6 +2178,19 @@ impl Agent {
                 )));
         }
 
+        let effective_model = self.classify_model(user_message);
+
+        let turn_id = Self::new_turn_id();
+        let turn_observer = Arc::clone(&self.observer);
+        let mut guard = crate::observability::AgentTurnGuard::start(
+            turn_observer.as_ref(),
+            self.model_provider_name.clone(),
+            effective_model.clone(),
+            Some(self.channel_name.clone()),
+            self.observer_agent_alias(),
+            Some(turn_id.clone()),
+        );
+
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
         if self.auto_save {
@@ -2144,6 +2209,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
             });
         }
 
@@ -2158,19 +2226,6 @@ impl Agent {
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
-        let effective_model = self.classify_model(user_message);
-
-        let turn_id = Self::new_turn_id();
-        let turn_observer = Arc::clone(&self.observer);
-        let mut guard = crate::observability::AgentTurnGuard::start(
-            turn_observer.as_ref(),
-            self.model_provider_name.clone(),
-            effective_model.clone(),
-            Some(self.channel_name.clone()),
-            self.observer_agent_alias(),
-            Some(turn_id.clone()),
-        );
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -2456,15 +2511,18 @@ impl Agent {
         }
 
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
-        self.append_streamed_user_message_to_history(user_message, &mut new_msgs)
-            .await;
-
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_pending_model_switch`) can rebind it for later rounds
         let mut effective_model = self.classify_model(user_message);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
+        // Requested-vs-served divergence for THIS turn. Source of truth is the
+        // task-local record inside `zeroclaw_providers::reliable`, consumed
+        // once per round below; this is a per-turn transient resolved at
+        // use-time, never stored on the agent.
+        let mut turn_model_fallback: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
+            None;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
@@ -2474,6 +2532,8 @@ impl Agent {
             self.observer_agent_alias(),
             Some(turn_id.clone()),
         );
+        self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
+            .await;
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -2598,8 +2658,12 @@ impl Agent {
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
-                    .await;
+                self.append_streamed_user_message_to_history(
+                    &steering_message,
+                    &mut new_msgs,
+                    &turn_id,
+                )
+                .await;
                 if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
                     loop_history.push(user_msg.clone());
                 }
@@ -2610,102 +2674,114 @@ impl Agent {
             // error exits — never derived from history indices, which the
             // loop's own preflight pruning can invalidate.
             let mut round_added: Vec<ChatMessage> = Vec::new();
-            let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    Some(cost_context.clone()),
-                    crate::agent::tool_receipts::scope_receipts(
-                        receipt_scope.clone(),
-                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                                crate::agent::loop_::ResolvedModelAccess {
-                                    model_provider: self.model_provider.as_ref(),
-                                    provider_name: &self.model_provider_name,
-                                    model: &effective_model,
-                                    temperature: self.temperature,
-                                },
-                                crate::agent::loop_::ResolvedIo {
-                                    tools_registry: &self.tools,
-                                    observer: self.observer.as_ref(),
-                                    silent: true,
-                                    approval: self.approval_manager.as_deref(),
-                                    multimodal_config: &self.multimodal_config,
-                                    // Inlined `full_config()` (per-field borrow) so it coexists with
-                                    // the `&mut self.image_cache` in this same ToolLoop expression.
-                                    config: self
-                                        .provider_switch_config
-                                        .as_ref()
-                                        .and_then(|c| c.config.as_deref()),
-                                    hooks: self.hook_runner.as_deref(),
-                                    activated_tools: self.activated_tools.as_ref(),
-                                    model_switch_callback: Some(
-                                        crate::agent::loop_::get_model_switch_state(),
-                                    ),
-                                    receipt_generator: receipt_scope
-                                        .as_ref()
-                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                                },
-                                crate::agent::loop_::ResolvedRuntimeKnobs {
-                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                    excluded_tools: &[],
-                                    dedup_exempt_tools: &self
-                                        .config
-                                        .resolved
-                                        .tool_call_dedup_exempt,
-                                    pacing: &pacing,
-                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                    parallel_tools: self.config.resolved.parallel_tools,
-                                    max_tool_result_chars: self
-                                        .config
-                                        .resolved
-                                        .max_tool_result_chars,
-                                    context_token_budget: self
-                                        .config
-                                        .resolved
-                                        .effective_context_budget(),
-                                    knobs: &knobs,
-                                },
-                            ),
-                            history: &mut loop_history,
-                            channel_name: &self.channel_name,
-                            channel_reply_target: None,
-                            cancellation_token: cancel_token.clone(),
-                            on_delta: None,
-                            shared_budget: None,
-                            channel: approval_bridge.as_deref(),
-                            collected_receipts: receipt_scope
-                                .as_ref()
-                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                            event_tx: Some(event_tx.clone()),
-                            steering: None,
-                            new_messages_out: Some(&mut round_added),
-                            image_cache: Some(&mut self.image_cache),
-                            // Direct embedded Agent::turn call; source/transport/
-                            // trust stay placeholders, not yet stamped at the edge.
-                            memory: Some(crate::agent::memory_inject::TurnMemory {
-                                handle: self.memory.as_ref(),
-                                query: user_message.to_string(),
-                                sessions: vec![self.memory_session_id.clone()],
-                                suppress: false,
-                                cfg: self.memory_inject_cfg,
-                            }),
-                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                            agent_alias: agent_alias_for_loop.as_deref(),
-                            parent_agent_alias: None,
-                            turn_id: &turn_id,
-                            // Live-daemon SOP path: re-assemble a nested step's
-                            // agent when it delegates elsewhere. Config survives
-                            // only via `provider_switch_config`; with `None`
-                            // (test builder) a cross-agent step FAILS CLOSED
-                            // rather than inheriting this turn's context.
-                            sop_reassembly: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|c| c.config.as_deref())
-                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+            let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                Some(cost_context.clone()),
+                crate::agent::tool_receipts::scope_receipts(
+                    receipt_scope.clone(),
+                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                            crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: self.model_provider.as_ref(),
+                                provider_name: &self.model_provider_name,
+                                model: &effective_model,
+                                temperature: self.temperature,
+                            },
+                            crate::agent::loop_::ResolvedIo {
+                                tools_registry: &self.tools,
+                                observer: self.observer.as_ref(),
+                                silent: true,
+                                approval: self.approval_manager.as_deref(),
+                                multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
+                                hooks: self.hook_runner.as_deref(),
+                                activated_tools: self.activated_tools.as_ref(),
+                                model_switch_callback: Some(
+                                    crate::agent::loop_::get_model_switch_state(),
+                                ),
+                                receipt_generator: receipt_scope
+                                    .as_ref()
+                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            },
+                            crate::agent::loop_::ResolvedRuntimeKnobs {
+                                max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                pacing: &pacing,
+                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                parallel_tools: self.config.resolved.parallel_tools,
+                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                context_token_budget: self
+                                    .config
+                                    .resolved
+                                    .effective_context_budget(),
+                                knobs: &knobs,
+                            },
+                        ),
+                        history: &mut loop_history,
+                        channel_name: &self.channel_name,
+                        channel_reply_target: None,
+                        cancellation_token: cancel_token.clone(),
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: approval_bridge.as_deref(),
+                        collected_receipts: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        event_tx: Some(event_tx.clone()),
+                        steering: None,
+                        new_messages_out: Some(&mut round_added),
+                        image_cache: Some(&mut self.image_cache),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay placeholders, not yet stamped at the edge.
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: user_message.to_string(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
                         }),
-                    ),
-                )
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
+                        turn_id: &turn_id,
+                        // Live-daemon SOP path: re-assemble a nested step's
+                        // agent when it delegates elsewhere. Config survives
+                        // only via `provider_switch_config`; with `None`
+                        // (test builder) a cross-agent step FAILS CLOSED
+                        // rather than inheriting this turn's context.
+                        sop_reassembly: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|c| c.config.as_deref())
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                    }),
+                ),
+            );
+            // Scope the provider-fallback task-local around the round so the
+            // resilient wrapper's requested-vs-served record is visible here,
+            // then read it immediately (same pattern as the channels
+            // orchestrator's `scope_provider_fallback` wrapping). Box::pin
+            // moves the round future to the heap: nesting it inside another
+            // async block otherwise grows the turn future past the tokio
+            // worker stack in debug builds (observed live as a worker-thread
+            // stack overflow aborting the gateway).
+            let (loop_result, round_fallback) =
+                zeroclaw_providers::reliable::scope_provider_fallback(async {
+                    let result = Box::pin(round_loop).await;
+                    (
+                        result,
+                        zeroclaw_providers::reliable::take_last_provider_fallback(),
+                    )
+                })
                 .await;
+            if round_fallback.is_some() {
+                turn_model_fallback = round_fallback;
+            }
 
             // Feed cumulative usage into the AgentEnd guard before any return
             // below drops it — the error paths must still report usage from
@@ -2758,6 +2834,12 @@ impl Agent {
                     self.observer.record_event(&ObserverEvent::TurnComplete);
                     let committed_response =
                         self.append_receipts_block(committed_response, receipt_scope.as_ref());
+                    let committed_response = Self::append_model_fallback_notice(
+                        committed_response,
+                        turn_model_fallback.as_ref(),
+                        &event_tx,
+                    )
+                    .await;
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
@@ -3083,6 +3165,329 @@ mod tests {
             .await
             .expect_err("whitespace-only turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    // ── model-fallback notice (silent downgrade surfacing) ──────────────
+
+    fn fallback_info(
+        requested_provider: &str,
+        requested_model: &str,
+        actual_provider: &str,
+        actual_model: &str,
+    ) -> zeroclaw_providers::reliable::ProviderFallbackInfo {
+        zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: requested_provider.into(),
+            requested_model: requested_model.into(),
+            actual_provider: actual_provider.into(),
+            actual_model: actual_model.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_fallback_notice_appended_and_streamed_on_model_downgrade() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // Same provider family, different model — the case the channels
+        // orchestrator's family check suppresses; direct-turn surfaces must
+        // still see it.
+        let info = fallback_info("anthropic", "model-requested", "anthropic", "model-served");
+        let out = Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+        assert!(
+            out.starts_with("hello\n\n"),
+            "reply text must be preserved ahead of the notice: {out}"
+        );
+        assert!(
+            out.contains("model-requested") && out.contains("model-served"),
+            "notice must name both models: {out}"
+        );
+        match rx.try_recv() {
+            Ok(TurnEvent::Chunk { delta }) => {
+                assert!(
+                    delta.contains("model-served"),
+                    "streamed chunk must carry the notice for delta-only consumers: {delta}"
+                );
+            }
+            other => panic!("expected a trailing Chunk carrying the notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_fallback_notice_skipped_for_pure_retry() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // The resilient wrapper records retries too (attempt > 0 on the
+        // primary entry); an identical requested/served pair is not a
+        // downgrade and must stay silent.
+        let info = fallback_info("anthropic", "same-model", "anthropic", "same-model");
+        let out = Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+        assert_eq!(out, "hello");
+        assert!(rx.try_recv().is_err(), "no chunk for a retry");
+    }
+
+    #[tokio::test]
+    async fn model_fallback_notice_absent_without_fallback_info() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let out = Agent::append_model_fallback_notice("hello".to_string(), None, &tx).await;
+        assert_eq!(out, "hello");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[derive(Clone, Copy)]
+    enum RuntimeStreamPlan {
+        Unsupported,
+        Text(&'static str),
+        Error,
+    }
+
+    struct RuntimeStreamingProbeProvider {
+        stream: RuntimeStreamPlan,
+        chat_text: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RuntimeStreamingProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok(self.chat_text.unwrap_or("ok").to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let Some(text) = self.chat_text else {
+                anyhow::bail!("chat path must not be used for this probe");
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            !matches!(self.stream, RuntimeStreamPlan::Unsupported)
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+
+            match self.stream {
+                RuntimeStreamPlan::Unsupported => futures_util::stream::empty().boxed(),
+                RuntimeStreamPlan::Text(text) => futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk::delta(text),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed(),
+                RuntimeStreamPlan::Error => futures_util::stream::iter(vec![Err(
+                    zeroclaw_providers::traits::StreamError::ModelProvider(
+                        "stream failed before output".into(),
+                    ),
+                )])
+                .boxed(),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RuntimeStreamingProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "RuntimeStreamingProbeProvider"
+        }
+    }
+
+    fn streaming_probe_reliable_provider(
+        primary: RuntimeStreamingProbeProvider,
+        fallback: RuntimeStreamingProbeProvider,
+    ) -> zeroclaw_providers::reliable::ReliableModelProvider {
+        zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "provider-requested".to_string(),
+                    Box::new(primary) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "provider-served".to_string(),
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    /// End-to-end: a resilient wrapper that fails over to a second entry
+    /// mid-turn must surface the downgrade in BOTH the returned response and
+    /// the event stream.
+    #[tokio::test]
+    async fn streamed_turn_surfaces_provider_fallback_notice() {
+        struct FailingModelProvider;
+        #[async_trait]
+        impl ModelProvider for FailingModelProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("primary provider is down")
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                anyhow::bail!("primary provider is down")
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for FailingModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "FailingModelProvider"
+            }
+        }
+
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "provider-requested".to_string(),
+                    Box::new(FailingModelProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "provider-served".to_string(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(Vec::new()),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            50,
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("turn must succeed via the fallback entry");
+
+        assert!(
+            outcome.response.contains("provider-served")
+                && outcome.response.contains("provider-requested"),
+            "final response must carry the fallback notice: {}",
+            outcome.response
+        );
+
+        let mut chunk_carried_notice = false;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event
+                && delta.contains("provider-served")
+            {
+                chunk_carried_notice = true;
+            }
+        }
+        assert!(
+            chunk_carried_notice,
+            "the notice must also be streamed for delta-only consumers (ZeroCode)"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_surfaces_streaming_provider_fallback_notice() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: None,
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Text("streamed fallback"),
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("turn must succeed via the streaming fallback entry");
+
+        assert!(
+            outcome.response.contains("streamed fallback")
+                && outcome.response.contains("provider-served"),
+            "final response must include streamed text and fallback notice: {}",
+            outcome.response
+        );
+
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(
+            streamed.contains("streamed fallback") && streamed.contains("provider-served"),
+            "streamed chunks must include the live fallback output and notice: {streamed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_does_not_surface_stale_record_after_stream_error() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: Some("primary final"),
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Error,
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("pre-output stream error must fall back to primary chat");
+
+        assert_eq!(
+            outcome.response, "primary final",
+            "failed fallback streams must not leave stale fallback notice state"
+        );
     }
 
     #[tokio::test]
@@ -7916,7 +8321,10 @@ mod tests {
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
             | ObserverEvent::ToolCall { turn_id, .. }
-            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
             _ => None,
         }
     }
@@ -7965,6 +8373,24 @@ mod tests {
                     turn_id,
                     ..
                 } => ("ToolCall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryRecall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryRecall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryStore {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryStore", channel, agent_alias, turn_id),
+                ObserverEvent::RagRetrieve {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("RagRetrieve", channel, agent_alias, turn_id),
                 _ => continue,
             };
             assert!(
@@ -7997,7 +8423,10 @@ mod tests {
                     | ObserverEvent::LlmRequest { agent_alias, .. }
                     | ObserverEvent::LlmResponse { agent_alias, .. }
                     | ObserverEvent::ToolCallStart { agent_alias, .. }
-                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    | ObserverEvent::ToolCall { agent_alias, .. }
+                    | ObserverEvent::MemoryRecall { agent_alias, .. }
+                    | ObserverEvent::MemoryStore { agent_alias, .. }
+                    | ObserverEvent::RagRetrieve { agent_alias, .. } => agent_alias,
                     _ => continue,
                 };
                 assert_eq!(
@@ -8016,7 +8445,10 @@ mod tests {
                     | ObserverEvent::LlmResponse { channel: ch, .. }
                     | ObserverEvent::ToolCallStart { channel: ch, .. }
                     | ObserverEvent::ToolCall { channel: ch, .. }
-                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    | ObserverEvent::AgentEnd { channel: ch, .. }
+                    | ObserverEvent::MemoryRecall { channel: ch, .. }
+                    | ObserverEvent::MemoryStore { channel: ch, .. }
+                    | ObserverEvent::RagRetrieve { channel: ch, .. } => ch,
                     _ => continue,
                 };
                 assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
@@ -8492,12 +8924,70 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .agent_alias("test-agent".into())
+            .auto_save(true)
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must cause Agent::turn to emit a MemoryStore event \
+             so its (channel, agent_alias, turn_id) triple is actually asserted below"
+        );
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_events_share_consistent_turn_id() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed_with_steering_state("test", event_tx, None, None)
+            .await
+            .expect("streamed turn should succeed");
+        while event_rx.recv().await.is_some() {}
+
+        let events = capturing.events.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { .. })),
+            "auto_save(true) must cause the streamed turn to emit a MemoryStore event"
+        );
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 
