@@ -417,8 +417,8 @@ Surrounding double quotes on the comparand are stripped, so quote string
 literals: `$.status == "critical"`. Direct numeric conditions are numeric-only:
 if either side does not parse as a number, there is no match.
 
-JSON booleans serialize as the strings `true` and `false`, so compare them as
-quoted strings, for example `$.active == "true"`.
+The condition evaluator converts JSON booleans to the strings `true` and
+`false`, so compare them as quoted strings, for example `$.active == "true"`.
 
 A condition is a single comparison. Logical combinators such as `AND`, `OR`,
 and `NOT` are not supported.
