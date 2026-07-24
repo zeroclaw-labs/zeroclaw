@@ -22586,7 +22586,6 @@ max_height = 8
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;
-    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -22597,13 +22596,11 @@ max_height = 8
     use tokio::sync::MutexGuard;
     use tokio::test;
 
-    #[cfg(unix)]
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
-    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -22620,7 +22617,6 @@ max_height = 8
         }
     }
 
-    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().
