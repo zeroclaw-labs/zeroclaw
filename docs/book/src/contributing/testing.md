@@ -2,6 +2,8 @@
 
 ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost; pick the lowest level that proves what you need to prove.
 
+When a PR claims behavior that a user directly runs, clicks, sends, installs, or observes, use [User-boundary proof](./user-boundary-proof.md) to identify the smallest test or manual check that reaches that boundary.
+
 ## The five levels
 
 | Level | What it tests | Boundary | Where it lives |

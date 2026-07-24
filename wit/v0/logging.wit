@@ -68,6 +68,7 @@ interface logging {
         migrate,
         validate,
         note,
+        memory-audit,
     }
 
     /// Binary outcome reported alongside an action. Absent maps to
