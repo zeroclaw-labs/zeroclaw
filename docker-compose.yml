@@ -35,7 +35,9 @@ services:
       # - ZEROCLAW_providers__models__anthropic__default__api_key=${ANTHROPIC_API_KEY:-}
       # - ZEROCLAW_providers__models__openai__default__api_key=${OPENAI_API_KEY:-}
 
-      # Allow public bind inside Docker (required for container networking)
+      # Listen on the container interface so Docker's published port can reach
+      # the gateway. The separate permission opt-in is intentionally required.
+      - ZEROCLAW_gateway__host=0.0.0.0
       - ZEROCLAW_gateway__allow_public_bind=true
       # Default gateway port inside container
       - ZEROCLAW_gateway__port=${ZEROCLAW_GATEWAY_PORT:-42617}
