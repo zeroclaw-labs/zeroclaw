@@ -27,7 +27,7 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
-cli-desktop-about = Launch the ZeroClaw companion desktop app
+cli-desktop-about = Launch the companion desktop app, or open its download page
 
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
@@ -363,11 +363,11 @@ cli-desktop-long-about =
 
     The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
 
-    Use --install to download the pre-built companion app for your platform.
+    Use --install to open the download page for your platform. It does not install anything itself.
 
     Examples:
       zeroclaw desktop              # launch the companion app
-      zeroclaw desktop --install    # download and install it
+      zeroclaw desktop --install    # open the download page
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
