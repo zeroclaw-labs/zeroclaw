@@ -72,6 +72,28 @@ When a tracker marker label is needed, use `type:tracker`. It applies to issue-o
 
 If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or routing evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
+### Named milestone policy
+
+Named milestones are finite delivery cohorts for bounded outcomes within capability domains, not permanent domain backlogs. For this policy, a named milestone is organized around an outcome rather than a numbered release; `Parking Lot` and `Icebox` are holding areas, not named milestones. Name each new milestone as `Domain: Bounded Outcome`. Prefer `RPC Client: Authentication & Authorization` over a broad reusable name such as `Auth`. A combined title occupies each domain it names.
+
+Treat every open named milestone as active. Before opening another, maintainers must explicitly confirm that coordination and review capacity exists for the added cohort. Record why the cohort cannot wait and which current milestone is expected to close next. When capacity is exhausted, do not open another named milestone until one closes or the proposed work is consolidated into an existing cohort. Reassess capacity whenever maintainer availability or review load materially changes.
+
+Keep at most one active named milestone per domain. An explicit maintainer exception may allow independent outcomes in the same domain to proceed in parallel when the decision records why the added coordination cost is justified.
+
+Every named milestone needs an explicit scope and close criteria, though a due date is optional. Do not leave a paused cohort open: reroute its unfinished work and close the milestone. Before closing any named milestone, close or reroute every unfinished issue and add a closure note stating whether the outcome was completed, canceled, or superseded. Closed named milestones stay closed. Follow-on work can form a new named milestone only when enough coherent scope exists to define another finite outcome. Name that milestone for the outcome; do not create rolling `v2`, `v2.1`, or similar successors by default.
+
+GitHub allows an issue or pull request to belong to only one milestone. Work required to complete a named cohort stays in that named milestone through completion, even when it ships in a numbered release. Record release inclusion in the release tracker and changelog. Use numbered release milestones for urgent bugs, maintenance, and other release-bound work outside a named cohort.
+
+Once a named milestone is active, limit new intake to work required to finish its stated cohort: direct scope, blockers, dependencies, and regressions. Route other work by intent:
+
+| Destination | Use for |
+|---|---|
+| Current named milestone | Work required to complete the milestone's defined cohort. |
+| Numbered release milestone | Urgent bugs, maintenance, or other release-bound work outside a named cohort. |
+| RFC or design issue | Work whose design or governance direction is not settled. |
+| `Parking Lot` | Short-term routing while maintainers decide the next concrete home. |
+| `Icebox` | Valid future work for a domain with an active named milestone when it is outside the current cohort and is not scheduled soon. |
+
 ## PR lanes
 
 PR lanes are routing expectations, not another required label family. Use them to decide how much review depth, sequencing, and maintainer attention a PR needs. CODEOWNERS, native GitHub review state, CI, labels, linked issues, and explicit relationship keywords still carry the actual routing data.
