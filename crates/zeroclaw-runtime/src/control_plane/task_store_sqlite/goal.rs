@@ -10,8 +10,8 @@ use crate::control_plane::goal_task::{
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
 use super::{
-    SqliteTaskStore, add_column_if_missing, claim_task_owner_record, insert_task_record,
-    log_unreadable_task_row, row_to_record, update_task_status_record,
+    SqliteTaskStore, add_column_if_missing, insert_task_record, log_unreadable_task_row,
+    row_to_record, status_to_db,
 };
 
 pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
@@ -527,53 +527,129 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
-    async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> Result<()> {
+    async fn pause_goal_task_if_status(
+        &self,
+        task_id: &str,
+        expected_status: TaskStatus,
+        pause: GoalPauseState,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .context("start pause goal task transaction")?;
         ensure_goal_task_row(&tx, task_id)?;
-        let updated = update_task_status_record(&tx, task_id, TaskStatus::Paused, None, None)?;
+        let updated = tx
+            .execute(
+                "UPDATE tasks SET status = 'paused'
+                   WHERE id = ?1 AND kind = 'goal' AND status = ?2",
+                params![task_id, status_to_db(expected_status)],
+            )
+            .context("conditionally pause goal task")?;
         if updated == 0 {
-            anyhow::bail!("goal task {task_id} is terminal or missing");
+            return Ok(false);
         }
         let updated = update_goal_pause_record(&tx, task_id, Some(pause))?;
         if updated == 0 {
             anyhow::bail!("goal task {task_id} has no goal extension row");
         }
         tx.commit().context("commit pause goal task transaction")?;
-        Ok(())
+        Ok(true)
     }
 
-    async fn resume_goal_task(
+    async fn cancel_goal_task_if_status(
+        &self,
+        task_id: &str,
+        expected_status: TaskStatus,
+        error: String,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
+        let updated = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'cancelled', error = COALESCE(?2, error),
+                        finished_at = ?3
+                  WHERE id = ?1 AND kind = 'goal' AND status = ?4",
+                params![
+                    task_id,
+                    error,
+                    chrono::Utc::now().to_rfc3339(),
+                    status_to_db(expected_status),
+                ],
+            )
+            .context("conditionally cancel goal task")?;
+        Ok(updated == 1)
+    }
+
+    async fn complete_running_goal_task(&self, task_id: &str, output: String) -> Result<bool> {
+        let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
+        let updated = conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', output = COALESCE(?2, output), finished_at = ?3
+             WHERE id = ?1 AND kind = 'goal' AND status = 'running'",
+                params![task_id, output, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("conditionally complete running goal task")?;
+        Ok(updated == 1)
+    }
+
+    async fn complete_running_goal_task_if_limits(
+        &self,
+        task_id: &str,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+        output: String,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
+        let token_limit = token_limit.map(i64::try_from).transpose()?;
+        let updated = conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', output = COALESCE(?4, output), finished_at = ?5
+                 WHERE id = ?1 AND kind = 'goal' AND status = 'running'
+                   AND EXISTS (SELECT 1 FROM goal_tasks
+                       WHERE task_id = ?1
+                         AND effective_token_limit IS ?2
+                         AND effective_cost_limit_usd IS ?3)",
+                params![task_id, token_limit, cost_limit_usd, output, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("conditionally complete goal task with verified limits")?;
+        Ok(updated == 1)
+    }
+    async fn resume_paused_goal_task(
         &self,
         task_id: &str,
         owner_pid: u32,
         owner_boot_id: &str,
         continuation_context: Option<TaskContinuationContext>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .context("start resume goal task transaction")?;
         ensure_goal_task_row(&tx, task_id)?;
+        let updated = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = 'running', owner_pid = ?2, owner_boot_id = ?3,
+                        heartbeat_at = NULL
+                  WHERE id = ?1 AND kind = 'goal' AND status = 'paused'",
+                params![task_id, owner_pid as i64, owner_boot_id],
+            )
+            .context("conditionally resume paused goal task")?;
+        if updated == 0 {
+            return Ok(false);
+        }
         if let Some(context) = continuation_context {
             upsert_continuation_context(&tx, task_id, &context)?;
-        }
-        let claimed = claim_task_owner_record(&tx, task_id, owner_pid, owner_boot_id)?;
-        if claimed == 0 {
-            anyhow::bail!("goal task {task_id} is terminal or missing");
-        }
-        let updated = update_task_status_record(&tx, task_id, TaskStatus::Running, None, None)?;
-        if updated == 0 {
-            anyhow::bail!("goal task {task_id} is terminal or missing");
         }
         let updated = update_goal_pause_record(&tx, task_id, None)?;
         if updated == 0 {
             anyhow::bail!("goal task {task_id} has no goal extension row");
         }
         tx.commit().context("commit resume goal task transaction")?;
-        Ok(())
+        Ok(true)
     }
 
     async fn set_continuation_context(
@@ -1221,20 +1297,23 @@ mod tests {
         .await
         .unwrap();
 
-        s.pause_goal_task(
-            "goal-paused",
-            GoalPauseState {
-                reason: GoalPauseReason::NeedsUserInput,
-                description: Some("waiting".into()),
-                blockers: vec![GoalBlocker {
-                    kind: GoalBlockerKind::NeedsUserInput,
-                    message: "Need operator answer".into(),
-                    payload: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
+        assert!(
+            s.pause_goal_task_if_status(
+                "goal-paused",
+                TaskStatus::Running,
+                GoalPauseState {
+                    reason: GoalPauseReason::NeedsUserInput,
+                    description: Some("waiting".into()),
+                    blockers: vec![GoalBlocker {
+                        kind: GoalBlockerKind::NeedsUserInput,
+                        message: "Need operator answer".into(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap()
+        );
 
         let task = s.get("goal-paused").await.unwrap().unwrap();
         let goal = s.get_goal_task("goal-paused").await.unwrap().unwrap();
@@ -1265,20 +1344,23 @@ mod tests {
         .await
         .unwrap();
 
-        s.pause_goal_task(
-            "goal-operator-paused",
-            GoalPauseState {
-                reason: GoalPauseReason::OperatorPaused,
-                description: Some("maintenance window".into()),
-                blockers: vec![GoalBlocker {
-                    kind: GoalBlockerKind::OperatorPause,
-                    message: "maintenance window".into(),
-                    payload: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
+        assert!(
+            s.pause_goal_task_if_status(
+                "goal-operator-paused",
+                TaskStatus::Running,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: Some("maintenance window".into()),
+                    blockers: vec![GoalBlocker {
+                        kind: GoalBlockerKind::OperatorPause,
+                        message: "maintenance window".into(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap()
+        );
 
         let task = s.get("goal-operator-paused").await.unwrap().unwrap();
         let goal = s
@@ -1304,8 +1386,9 @@ mod tests {
         s.create(task).await.unwrap();
 
         let err = s
-            .pause_goal_task(
+            .pause_goal_task_if_status(
                 "goal-missing-extension",
+                TaskStatus::Running,
                 GoalPauseState {
                     reason: GoalPauseReason::NeedsUserInput,
                     description: None,
@@ -1346,9 +1429,11 @@ mod tests {
         .await
         .unwrap();
 
-        s.resume_goal_task("goal-resume", 42, "boot-2", None)
-            .await
-            .unwrap();
+        assert!(
+            s.resume_paused_goal_task("goal-resume", 42, "boot-2", None)
+                .await
+                .unwrap()
+        );
 
         let task = s.get("goal-resume").await.unwrap().unwrap();
         let goal = s.get_goal_task("goal-resume").await.unwrap().unwrap();
@@ -1358,5 +1443,186 @@ mod tests {
         assert!(goal.pause_reason.is_none());
         assert!(goal.pause_description.is_none());
         assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_paused_goal_task_rejects_a_duplicate_resume() {
+        // The second controller must not publish a continuation after the first
+        // one has already claimed the exact paused task and made it running.
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-duplicate-resume", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-duplicate-resume".into(),
+                objective: "resume exactly once".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: Some(GoalPauseReason::OperatorPaused),
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            s.resume_paused_goal_task("goal-duplicate-resume", 42, "boot-2", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.resume_paused_goal_task("goal-duplicate-resume", 43, "boot-3", None)
+                .await
+                .unwrap()
+        );
+        let task = s.get("goal-duplicate-resume").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.owner_boot_id, "boot-2");
+    }
+
+    #[tokio::test]
+    async fn stale_pause_and_cancel_do_not_overwrite_newer_goal_state() {
+        // A controller acts on the status it resolved. Once another actor has
+        // paused or completed the task, stale commands must leave both durable
+        // lifecycle and pause payload untouched.
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-stale-cas", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-stale-cas".into(),
+                objective: "preserve newer state".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: Some(GoalPauseReason::OperatorPaused),
+                pause_description: Some("newer operator pause".into()),
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !s.pause_goal_task_if_status(
+                "goal-stale-cas",
+                TaskStatus::Running,
+                GoalPauseState {
+                    reason: GoalPauseReason::BudgetExhausted,
+                    description: Some("stale budget pause".into()),
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !s.cancel_goal_task_if_status(
+                "goal-stale-cas",
+                TaskStatus::Running,
+                "stale cancellation".into(),
+            )
+            .await
+            .unwrap()
+        );
+        let task = s.get("goal-stale-cas").await.unwrap().unwrap();
+        let goal = s.get_goal_task("goal-stale-cas").await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(
+            goal.pause_description.as_deref(),
+            Some("newer operator pause")
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_running_goal_task_loses_to_paused_goal_without_output_write() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-completion-cas-loses", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-completion-cas-loses".into(),
+                objective: "do not overwrite paused state".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: Some(GoalPauseReason::OperatorPaused),
+                pause_description: Some("operator won the race".into()),
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !s.complete_running_goal_task("goal-completion-cas-loses", "stale completion".into())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("goal-completion-cas-loses")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+        let conn = s.conn.lock();
+        let output: Option<String> = conn
+            .query_row(
+                "SELECT output FROM tasks WHERE id = ?1",
+                params!["goal-completion-cas-loses"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(output.is_none());
+    }
+
+    #[tokio::test]
+    async fn completion_with_verified_limits_loses_to_a_concurrent_budget_update() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-limit-cas", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-limit-cas".into(),
+                objective: "honor current policy".into(),
+                effective_token_limit: Some(100),
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        s.update_goal_limits("goal-limit-cas", Some(1), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !s.complete_running_goal_task_if_limits(
+                "goal-limit-cas",
+                Some(100),
+                None,
+                "stale completion".into(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            s.get("goal-limit-cas").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
     }
 }

@@ -28,6 +28,19 @@ pub fn build_session_model_provider(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    build_session_model_provider_with_options(config, model_provider_ref, model_override, |_| {})
+}
+
+/// Build a session model provider while letting narrow callers override the
+/// alias-resolved runtime options before construction. The parser, model
+/// resolution, credential lookup, routing, and resilience wiring stay here as
+/// the single provider-construction path.
+pub fn build_session_model_provider_with_options(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+    configure_options: impl FnOnce(&mut zeroclaw_providers::ModelProviderRuntimeOptions),
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -59,11 +72,12 @@ pub fn build_session_model_provider(
             ))
         })?;
 
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+    let mut model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
         &model_provider_name,
         &model_provider_alias,
     );
+    configure_options(&mut model_provider_runtime_options);
 
     let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
         config,

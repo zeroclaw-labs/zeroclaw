@@ -93,6 +93,38 @@ tool-file-write = Write contents to a file in the workspace
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
 
+tool-goal-start = Start a durable goal run. The objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
+tool-goal-start-objective-description = Goal objective to pursue.
+tool-goal-start-success-continue =
+    {$message}
+    Continue working on this active goal now; do not stop at an acknowledgement.
+tool-goal-start-success-paused =
+    {$message}
+    Do not continue this goal now; it is not admitted for another autonomous turn.
+tool-goal-start-error-empty-objective = goal_start requires a non-empty objective
+tool-goal-start-error-missing-context = goal_start is unavailable because trusted runtime admission context was not supplied.
+tool-goal-start-error-agent-context-mismatch = goal_start is unavailable because trusted runtime admission context does not match this agent.
+
+tool-goal-objective = Amend the current durable goal objective. The replacement objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
+tool-goal-objective-objective-description = Replacement objective text for the current durable goal. Use when new evidence changes the goal scope without requiring cancellation.
+tool-goal-objective-success =
+    {$message}
+    Continue under the amended objective when you are already working in the goal turn; do not start a separate acknowledgement-only response.
+tool-goal-objective-error-empty-objective = goal_objective requires a non-empty objective
+tool-goal-objective-error-missing-context = goal_objective is unavailable because trusted runtime admission context was not supplied.
+tool-goal-objective-error-agent-context-mismatch = goal_objective is unavailable because trusted runtime admission context does not match this agent.
+
+tool-goal-resume = Resume the current paused durable goal run. The optional reason is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
+tool-goal-resume-reason-description = Optional untrusted note explaining what changed since the pause, for example that the external blocker was fixed.
+tool-goal-resume-success-continue =
+    {$message}
+    Continue working on this resumed goal now; do not stop at an acknowledgement.
+tool-goal-resume-success-paused =
+    {$message}
+    Do not continue this goal now; it is not admitted for another autonomous turn.
+tool-goal-resume-error-missing-context = goal_resume is unavailable because trusted runtime admission context was not supplied.
+tool-goal-resume-error-agent-context-mismatch = goal_resume is unavailable because trusted runtime admission context does not match this agent.
+
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
 tool-git-forge-error-issue-close-reason = issue.close 'reason' must be 'completed' or 'not_planned'.

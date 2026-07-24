@@ -574,7 +574,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         )
         .await;
 
-        enforce_tool_loop_budget()?;
+        enforce_tool_loop_budget().await?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -651,7 +651,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
-                .await;
+                .await?;
                 (
                     interpreted.response_text,
                     interpreted.parsed_text,

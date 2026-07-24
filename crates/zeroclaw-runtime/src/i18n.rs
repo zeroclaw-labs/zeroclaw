@@ -1,4 +1,5 @@
 //! Fluent-based i18n for tool descriptions.
+//!
 //! English descriptions are embedded via `include_str!` at compile time.
 //! Non-English locales are loaded from disk and override English per-key.
 
@@ -9,6 +10,7 @@ use std::sync::OnceLock;
 static DESCRIPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
+static TOOL_FTL_SOURCES: OnceLock<ToolFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
 /// The canonical locale registry, embedded from repo-root `locales.toml` at
@@ -59,19 +61,40 @@ struct CliFtlSources {
     builtin: Option<&'static str>,
 }
 
+struct ToolFtlSources {
+    locale: String,
+    disk: Option<String>,
+}
+
 /// Initialize with a specific locale. No-op after first call.
 pub fn init(locale: &str) {
     let locale = LOCALE.get_or_init(|| normalize_locale(locale));
     DESCRIPTIONS.get_or_init(|| load_descriptions(locale));
     CLI_STRINGS.get_or_init(|| load_cli_strings(locale));
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(locale));
+    TOOL_FTL_SOURCES.get_or_init(|| load_tool_ftl_sources(locale));
 }
 
 /// Get a tool description by tool name (e.g. "shell", "file_read").
 pub fn get_tool_description(tool_name: &str) -> Option<&'static str> {
     let map = DESCRIPTIONS.get_or_init(|| load_descriptions(active_locale()));
-    let key = format!("tool-{}", tool_name.replace('_', "-"));
+    let key = format!("tool-{}", tool_name.replace(['_', '.'], "-"));
     map.get(&key).map(String::as_str)
+}
+
+/// Get a tool-surface string by key and format it with Fluent external arguments.
+pub fn get_tool_string_with_args(key: &str, args: &[(&str, &str)]) -> Option<String> {
+    format_tool_string_with_args(tool_ftl_sources(), key, args)
+}
+
+/// Get a required tool-surface string by key.
+pub fn get_required_tool_string(key: &str) -> String {
+    get_tool_string_with_args(key, &[]).unwrap_or_else(|| missing_tool_string(key))
+}
+
+/// Get a required tool-surface string by key with Fluent arguments.
+pub fn get_required_tool_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    get_tool_string_with_args(key, args).unwrap_or_else(|| missing_tool_string(key))
 }
 
 /// Get a CLI string by key (e.g. "cli-config-about").
@@ -103,6 +126,14 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
+fn tool_ftl_sources() -> &'static ToolFtlSources {
+    TOOL_FTL_SOURCES.get_or_init(|| load_tool_ftl_sources(active_locale()))
+}
+
+/// Resolve a CLI string against the embedded English catalogue only, ignoring
+/// the process locale and the filesystem. Used by tests that assert the
+/// canonical English wording without depending on the host's configured
+/// locale (the global `LOCALE` OnceLock would otherwise make them flaky).
 #[cfg(test)]
 pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
     let english = CliFtlSources {
@@ -120,6 +151,17 @@ fn missing_cli_string(key: &str) -> String {
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({"error_key": "i18n.missing_cli_string", "key": key})),
         "missing CLI Fluent string"
+    );
+    format!("{{{key}}}")
+}
+
+fn missing_tool_string(key: &str) -> String {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"error_key": "i18n.missing_tool_string", "key": key})),
+        "missing tool Fluent string"
     );
     format!("{{{key}}}")
 }
@@ -159,6 +201,15 @@ fn load_cli_ftl_sources(locale: &str) -> CliFtlSources {
     }
 }
 
+fn load_tool_ftl_sources(locale: &str) -> ToolFtlSources {
+    ToolFtlSources {
+        locale: locale.to_string(),
+        disk: (locale != "en")
+            .then(|| load_ftl_from_disk(locale, "tools.ftl"))
+            .flatten(),
+    }
+}
+
 fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
     match locale {
         "es" => Some(include_str!("../locales/es/cli.ftl")),
@@ -185,6 +236,19 @@ fn format_cli_string_with_args(
         return Some(value);
     }
     format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+}
+
+fn format_tool_string_with_args(
+    sources: &ToolFtlSources,
+    key: &str,
+    args: &[(&str, &str)],
+) -> Option<String> {
+    if let Some(locale_ftl) = sources.disk.as_deref()
+        && let Some(value) = format_ftl_message(locale_ftl, &sources.locale, key, args)
+    {
+        return Some(value);
+    }
+    format_ftl_message(include_str!("../locales/en/tools.ftl"), "en", key, args)
 }
 
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
@@ -287,6 +351,12 @@ fn locale_from_system() -> Option<String> {
     pick_locale(sys_locale::get_locales())
 }
 
+/// Pure: take the first candidate that isn't a POSIX "no locale" sentinel.
+/// Split out from `locale_from_system` so it is testable without environment
+/// access. Walks every candidate rather than just the first: `LC_ALL=C`
+/// (common in CI/containers to force deterministic tool output) would
+/// otherwise shadow a perfectly usable `LANG=zh_CN.UTF-8` and we'd give up
+/// instead of trying it.
 fn pick_locale(mut candidates: impl Iterator<Item = String>) -> Option<String> {
     candidates.find_map(|raw| normalized_env_locale(&raw))
 }
@@ -307,6 +377,12 @@ fn normalized_env_locale(raw: &str) -> Option<String> {
 }
 
 fn read_config_table() -> Option<toml::Table> {
+    // An explicit config dir is authoritative: when set, locale detection and
+    // FTL loading resolve only against it and never fall back to the home
+    // config. This keeps the lookup hermetic — tests (and sandboxed runs) point
+    // it at a known dir without the host's real ~/.zeroclaw/config.toml leaking
+    // in. Without this, locale detection reads the developer's own config and
+    // is non-deterministic across machines.
     if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
@@ -360,7 +436,39 @@ mod tests {
         let map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
         assert!(map.contains_key("tool-shell"));
         assert!(map.contains_key("tool-file-read"));
+        assert!(map.contains_key("tool-goal-start"));
+        assert!(map.contains_key("tool-goal-objective"));
+        assert!(map.contains_key("tool-goal-resume"));
         assert!(!map.contains_key("tool-nonexistent"));
+    }
+
+    #[test]
+    fn underscored_tool_names_resolve_to_fluent_description_keys() {
+        assert!(
+            get_tool_description("goal_start")
+                .is_some_and(|description| description.contains("durable goal run"))
+        );
+        assert!(
+            get_tool_description("goal_objective")
+                .is_some_and(|description| description.contains("durable goal objective"))
+        );
+        assert!(
+            get_tool_description("goal_resume")
+                .is_some_and(|description| description.contains("paused durable goal run"))
+        );
+    }
+
+    #[test]
+    fn tool_strings_format_from_tool_fluent_catalogue() {
+        let sources = ToolFtlSources {
+            locale: "en".to_string(),
+            disk: None,
+        };
+        let value =
+            format_tool_string_with_args(&sources, "tool-goal-start-error-empty-objective", &[])
+                .expect("goal_start tool error should format");
+
+        assert_eq!(value, "goal_start requires a non-empty objective");
     }
 
     #[test]
@@ -936,7 +1044,7 @@ mod tests {
 
     #[test]
     fn daemon_gateway_bind_cli_strings_format_from_fluent() {
-        // The daemon gateway-bind pre-flight messagesare routed through
+        // The daemon gateway-bind pre-flight messages are routed through
         // Fluent from src/main.rs via `ta(...)`. Guard the key names and their
         // `{$host}`/`{$port}` placeholders so a typo can't silently degrade the
         // operator-facing fail-fast message back to a `{cli-...}` stub.
