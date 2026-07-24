@@ -102,7 +102,7 @@ Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows 
 
 ### Release Stable (`release-stable-manual.yml`)
 
-Manual trigger for the full release pipeline. Builds all targets, creates the GitHub Release, pushes the prebuilt `latest`, versioned, and `debian` Docker images to GHCR, calls the generated Docker variant matrix at the release tag, triggers the website redeploy, and invokes the distribution sub-workflows (Scoop, AUR, Homebrew, Discord, tweet). Two environment gates require maintainer approval mid-run: `github-releases` (the `publish` job) and `docker`.
+Manual trigger for the full release pipeline. Builds all targets, creates the GitHub Release, pushes the prebuilt `latest`, versioned, and `debian` Docker images to GHCR, calls the generated Docker variant matrix at the release tag, triggers the website redeploy, and invokes the distribution sub-workflows (Scoop, AUR, Discord, tweet). Homebrew Core detects new releases through its own autobump service. Two environment gates require maintainer approval mid-run: `github-releases` (the `publish` job) and `docker`.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
@@ -113,8 +113,13 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 | Workflow | What it does |
 |---|---|
 | `pub-aur.yml` | Updates the Arch User Repository `PKGBUILD` and pushes to the AUR |
-| `pub-homebrew-core.yml` | Opens a PR against `homebrew/homebrew-core` with the new version |
 | `pub-scoop.yml` | Updates the Scoop manifest for Windows |
+
+Homebrew Core's
+[official autobump service](https://docs.brew.sh/Autobump) discovers stable
+GitHub releases and opens formula bumps independently. Do not restore a
+project-owned Homebrew publisher or fork token; that duplicates Homebrew's
+authoritative automation.
 
 ## Required secrets
 
@@ -123,12 +128,29 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 | `AUR_SSH_KEY` | `pub-aur.yml` |
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
-| `HOMEBREW_CORE_BOT_TOKEN`, `HOMEBREW_UPSTREAM_PR_TOKEN` | `pub-homebrew-core.yml` |
-| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml` |
+| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 
 Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. The release pipeline does not publish to crates.io, so no `CARGO_REGISTRY_TOKEN` is required.
+
+The organization currently disables deploy keys on the Scoop bucket, and the
+automatic `GITHUB_TOKEN` cannot write another repository. Keep
+`SCOOP_BUCKET_TOKEN` narrowly scoped to the bucket; do not reuse a maintainer's
+broad CLI token. The publisher checks write access with `git push --dry-run`,
+then uses the same Git transport for the real update.
+
+### AUR package ownership
+
+The project-owned package is currently
+[`zeroclawlabs`](https://aur.archlinux.org/packages/zeroclawlabs), maintained by
+`zeroclaw-bot`. The canonical-name
+[`zeroclaw`](https://aur.archlinux.org/packages/zeroclaw) package is a
+third-party package and cannot be taken over by rotating `AUR_SSH_KEY`. If that
+maintainer remains inactive, follow the
+[AUR orphan-request process](https://wiki.archlinux.org/title/AUR_submission_guidelines#Requests)
+before changing `pkgname` or the workflow clone target. After ownership
+transfers, coordinate the package rename or merge in one reviewed change.
 
 ## Build cache behavior
 
