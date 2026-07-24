@@ -24,6 +24,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# Keep required checks on GitHub-hosted runners until Blacksmith's organization-level
+# triggerer SSH access is disabled and the external control is attested in review.
+
 jobs:
   # ── Fast serial gate: fail formatting errors before burning compute ───────
 
