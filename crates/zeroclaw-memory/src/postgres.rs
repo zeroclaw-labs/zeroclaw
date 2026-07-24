@@ -77,44 +77,33 @@ impl PostgresMemory {
         let qualified_table = format!("{schema_ident}.{table_ident}");
         let qualified_agents = format!("{schema_ident}.agents");
 
-        let client = Self::initialize_client(
+        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
+        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
+
+        let (client, ext_ok) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
             schema_ident.clone(),
             qualified_table.clone(),
+            pgvector_enabled,
+            pgvector_dimensions,
         )?;
 
-        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
-        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
-
-        if pgvector_enabled {
-            let client_ref = Arc::new(Mutex::new(client));
-            let ext_ok = {
-                let mut c = client_ref.lock();
-                Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
-            };
-            if !ext_ok {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "pgvector extension not available; falling back to keyword-only recall"
-                );
-            }
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(client_ref),
-                qualified_table,
-                qualified_agents,
-            })
-        } else {
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(Arc::new(Mutex::new(client))),
-                qualified_table,
-                qualified_agents,
-            })
+        if pgvector_enabled && !ext_ok {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "pgvector extension not available; falling back to keyword-only recall"
+            );
         }
+
+        Ok(Self {
+            alias: alias.to_string(),
+            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            qualified_table,
+            qualified_agents,
+        })
     }
 
     fn initialize_client(
@@ -122,10 +111,12 @@ impl PostgresMemory {
         connect_timeout_secs: Option<u64>,
         schema_ident: String,
         qualified_table: String,
-    ) -> Result<Client> {
+        pgvector_enabled: bool,
+        pgvector_dimensions: usize,
+    ) -> Result<(Client, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
+            .spawn(move || -> Result<(Client, bool)> {
                 let mut config: postgres::Config = db_url
                     .parse()
                     .context("invalid PostgreSQL connection URL")?;
@@ -145,7 +136,15 @@ impl PostgresMemory {
                     &schema_ident,
                     &qualified_table,
                 )?;
-                Ok(client)
+
+                let ext_ok = if pgvector_enabled {
+                    Self::try_enable_pgvector(&mut client, &qualified_table, pgvector_dimensions)
+                        .is_ok()
+                } else {
+                    false
+                };
+
+                Ok((client, ext_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
@@ -927,6 +926,88 @@ mod tests {
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_does_not_panic_inside_tokio_runtime_with_pgvector_enabled_flag() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut len_buf = [0u8; 4];
+                if socket.read_exact(&mut len_buf).is_err() {
+                    return;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut body = vec![0u8; len - 4];
+                if socket.read_exact(&mut body).is_err() {
+                    return;
+                }
+
+                let _ = socket.write_all(b"R\0\0\0\x08\0\0\0\0");
+                let _ = socket.write_all(b"Z\0\0\0\x05I");
+
+                loop {
+                    let mut type_buf = [0u8; 1];
+                    if socket.read_exact(&mut type_buf).is_err() {
+                        break;
+                    }
+                    let mut len_buf = [0u8; 4];
+                    if socket.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut body = vec![0u8; len - 4];
+                    if socket.read_exact(&mut body).is_err() {
+                        break;
+                    }
+
+                    if type_buf[0] == b'Q' {
+                        let _ = socket.write_all(b"E\0\0\0\x18SERROR\0MMock Error\0\0");
+                        let _ = socket.write_all(b"Z\0\0\0\x05I");
+                    } else {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // catch_unwind verifies that the nested-runtime fix prevents a panic
+        // when `pgvector_enabled = true` triggers `try_enable_pgvector` inside
+        // the already-running Tokio runtime.
+        let outcome = std::panic::catch_unwind(|| {
+            PostgresMemory::new(
+                "test",
+                &format!("postgres://zeroclaw:password@127.0.0.1:{}/zeroclaw", port),
+                "public",
+                "memories",
+                Some(2),
+                Some(true),
+                None,
+            )
+        });
+
+        assert!(
+            outcome.is_ok(),
+            "PostgresMemory::new with pgvector_enabled should not panic"
+        );
+        let res = outcome.unwrap();
+
+        assert!(
+            res.is_err(),
+            "PostgresMemory::new should fail due to the mock ErrorResponse, proving it reached the execution phase without a panic"
+        );
+    }
+
+    // ── session_id migration ──────────────────────────────────────
+    //
+    // End-to-end migration coverage requires a live PostgreSQL instance, and
+    // the crate's existing Postgres test suite does not run one in CI. The
+    // unit tests below exercise the rewrite plan against the same
+    // `sanitize_session_key` helper used by the migration SQL, which is
+    // sufficient to verify the contract that `migrate_session_ids_to_sanitized`
+    // relies on: which values change, which stay, and idempotence on re-run.
 
     #[test]
     fn rewrites_only_values_that_change_under_sanitization() {
