@@ -1048,7 +1048,9 @@ fn decode_shell_output_format(raw: Option<&str>) -> Result<CronShellOutputFormat
     // in the raw column (e.g. `raw`) decode as a different value than
     // what was actually persisted.
     match raw {
-        None => Ok(CronShellOutputFormat::default()),
+        None => {
+            anyhow::bail!("cron shell_output_format column is NULL; schema requires TEXT NOT NULL")
+        }
         Some("wrapped") => Ok(CronShellOutputFormat::Wrapped),
         Some("raw") => Ok(CronShellOutputFormat::Raw),
         Some(other) => anyhow::bail!("Unknown cron shell_output_format value: {other:?}"),
@@ -2309,6 +2311,53 @@ mod tests {
                 "persisted shell_output_format {invalid:?} must surface an error, not silently become Wrapped"
             );
         }
+    }
+
+    #[test]
+    fn shell_output_format_from_sql_rejects_null() {
+        // Simulates a forward-compatible database where shell_output_format was
+        // added as a nullable column by a different schema version.
+        // add_column_if_missing skips the column if it already exists (regardless
+        // of type/nullability), so NULL can reach decode_shell_output_format.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let db_path = cron_db(&config);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        // Pre-create the DB with shell_output_format as nullable TEXT so that
+        // the normal migration path sees it already exists and leaves it as-is.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id               TEXT PRIMARY KEY,
+                    expression       TEXT NOT NULL,
+                    command          TEXT NOT NULL,
+                    created_at       TEXT NOT NULL,
+                    next_run         TEXT NOT NULL,
+                    shell_output_format TEXT
+                );",
+            )
+            .unwrap();
+            let now = Utc::now();
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, shell_output_format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    "shell-output-format-null",
+                    "*/5 * * * *",
+                    "echo ok",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            get_job(&config, "shell-output-format-null").is_err(),
+            "NULL shell_output_format must surface an error, not silently become Wrapped"
+        );
     }
 
     #[test]
