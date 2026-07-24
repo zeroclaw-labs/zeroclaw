@@ -76,7 +76,10 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    // Return the full model_provider_ref (type.alias) so the agent's
+    // model_provider_name carries the complete reference for context-window
+    // resolution on the wire.
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -1661,7 +1664,12 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            // Store the full "type.alias" ref so the live provider identity
+            // (attribution_fields().1) carries the same key the config
+            // provider registry is keyed by, and wire-emission paths can
+            // resolve model_context_window / cost pricing for the provider
+            // that actually served the call.
+            .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -2345,6 +2353,7 @@ impl Agent {
                                     .config
                                     .resolved
                                     .effective_context_budget(),
+                                model_context_window: self.config.resolved.model_context_window,
                                 knobs: &knobs,
                             },
                         ),
@@ -2719,6 +2728,7 @@ impl Agent {
                                     .config
                                     .resolved
                                     .effective_context_budget(),
+                                model_context_window: self.config.resolved.model_context_window,
                                 knobs: &knobs,
                             },
                         ),
@@ -9143,6 +9153,64 @@ mod tests {
             still_pending, None,
             "pending switch must be cleared after a successful switch"
         );
+    }
+
+    /// Regression: resolve_live_model_context_window follows the in-turn
+    /// provider switch, not the static agent alias.
+    #[test]
+    fn model_context_window_follows_in_turn_model_switch() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        let mut cfg = Config::default();
+        let provider_a = cfg
+            .providers
+            .models
+            .ensure("openai", "provider-a")
+            .expect("ensure provider A");
+        provider_a.context_window = Some(128_000);
+        let provider_b = cfg
+            .providers
+            .models
+            .ensure("ollama", "provider-b")
+            .expect("ensure provider B");
+        provider_b.context_window = Some(1_000_000);
+
+        let cfg_arc = std::sync::Arc::new(cfg);
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+        };
+
+        // Pre-set a switch to a provider that has a 1M window.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("ollama.provider-b".to_string(), "llama3".to_string()));
+        }
+
+        let mut agent = build_test_agent("openai.provider-a", "gpt-4o-mini", Some(switch_cfg));
+
+        // Before switch: resolve with provider A's ref
+        let (_, live_provider_before, _) = agent.attribution_fields();
+        assert_eq!(live_provider_before, "openai.provider-a");
+        let window_before =
+            crate::agent::resolve_live_model_context_window(&cfg_arc, &live_provider_before);
+        assert_eq!(window_before, Some(128_000));
+
+        // Apply in-turn switch
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        assert_eq!(
+            result.as_deref(),
+            Some("llama3"),
+            "switch must return the new effective model (proves switch ran, not short-circuited)"
+        );
+
+        // After switch: B's ref and window
+        let (_, live_provider_after, _) = agent.attribution_fields();
+        assert_eq!(live_provider_after, "ollama.provider-b");
+        let window_after =
+            crate::agent::resolve_live_model_context_window(&cfg_arc, &live_provider_after);
+        assert_eq!(window_after, Some(1_000_000));
     }
 
     #[test]

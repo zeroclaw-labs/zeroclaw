@@ -262,8 +262,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         }
         // Extract context window info from "done" frame (sent by gateway). See #7311.
         if (msg.type === 'done') {
-          if (typeof msg.max_context_tokens === 'number') {
-            setContextMaxTokens(msg.max_context_tokens);
+          // Prefer model_context_window (actual model capacity) for display,
+          // fall back to max_context_tokens (trim budget) for backward compat.
+          const displayMax = typeof msg.model_context_window === 'number'
+            ? msg.model_context_window
+            : msg.max_context_tokens;
+          if (typeof displayMax === 'number') {
+            setContextMaxTokens(displayMax);
           }
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.

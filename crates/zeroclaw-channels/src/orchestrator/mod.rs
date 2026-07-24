@@ -5381,6 +5381,7 @@ async fn process_channel_message_body(
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
                         context_token_budget: ctx.context_token_budget,
+                        model_context_window: ctx.agent_cfg.resolved.model_context_window,
                         knobs: &loop_knobs,
                     },
                 ),

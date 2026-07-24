@@ -4051,6 +4051,25 @@ impl Config {
         32_000
     }
 
+    /// Provider's explicit `context_window`, or `None`. Use on wire
+    /// boundaries: emitting the 32k stub from
+    /// `effective_model_context_window()` would freeze the client
+    /// meter at 32k instead of the profile budget. Use this instead
+    /// of the agent-alias variant when the live provider identity is
+    /// known (e.g., from `Agent.attribution_fields().1` or
+    /// `SessionOverrides.model_provider`). Returns `None` when the
+    /// ref is unparseable or the entry has no `context_window`, so
+    /// the wire omission path preserves absence (no 32k stub leak).
+    #[must_use]
+    pub fn model_provider_context_window_opt(&self, provider_ref: &str) -> Option<usize> {
+        let (type_key, alias_key) = provider_ref.split_once('.')?;
+        self.providers
+            .models
+            .iter_entries()
+            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
+            .and_then(|(_, _, cfg)| cfg.context_window)
+    }
+
     #[must_use]
     pub fn effective_memory_recall_limit(&self, agent_alias: &str) -> usize {
         let raw = self

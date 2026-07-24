@@ -352,6 +352,7 @@ mod payload_capture_tests {
             channel: None,
             agent_alias: None,
             turn_id: "trace-req-test",
+            serving_provider_name: None,
         }
     }
 

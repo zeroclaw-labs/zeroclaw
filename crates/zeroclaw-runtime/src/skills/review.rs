@@ -112,6 +112,7 @@ pub async fn maybe_run_skill_review(
                         // sequential for the mutation-capable fork
                         max_tool_result_chars,
                         context_token_budget: max_context_tokens,
+                        model_context_window: 0,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
                 ),

@@ -137,6 +137,8 @@ async fn enforce_reported_budget(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
+    agent_alias: Option<&str>,
+    turn_id: &str,
 ) {
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
         return;
@@ -166,8 +168,8 @@ async fn enforce_reported_budget(
                 kept_turns: result.kept_turns,
                 reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
             },
         );
     } else {
@@ -222,6 +224,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         parallel_tools,
         max_tool_result_chars,
         context_token_budget,
+        model_context_window,
         receipt_generator,
         knobs,
     } = exec;
@@ -323,7 +326,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let mut ctx = TurnCtx {
         observer,
         provider_name,
         model,
@@ -342,6 +345,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         agent_alias,
         parent_agent_alias,
+        serving_provider_name: None,
     };
 
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
@@ -546,6 +550,16 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             )
         } else {
             (model_provider, provider_name, model)
+        };
+        // When vision routing selects a provider different from the
+        // turn-start provider_name, carry the serving identity through
+        // to interpret_chat_response so the Usage event's provider_ref
+        // and the LlmResponse observer event reflect the actual call
+        // target.
+        ctx.serving_provider_name = if vision_model_provider_box.is_some() {
+            Some(active_model_provider_name.to_string())
+        } else {
+            None
         };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
@@ -844,6 +858,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     context_token_budget,
                     event_tx.as_ref(),
                     observer,
+                    agent_alias,
+                    turn_id,
                 )
                 .await;
             }
@@ -1089,6 +1105,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 parallel_tools,
                 max_tool_result_chars,
                 context_token_budget,
+                model_context_window,
                 receipt_generator,
                 knobs,
                 channel_name,
@@ -1116,6 +1133,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 context_token_budget,
                 event_tx.as_ref(),
                 observer,
+                agent_alias,
+                turn_id,
             )
             .await;
         }
@@ -1526,6 +1545,7 @@ async fn drive_live_sop_actions(
     parallel_tools: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
+    model_context_window: usize,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     knobs: &LoopKnobs,
     channel_name: &str,
@@ -1688,6 +1708,7 @@ async fn drive_live_sop_actions(
                             eff_context_token_budget,
                             eff_dedup_exempt_tools,
                             eff_pacing,
+                            eff_model_context_window,
                         ) = match owned {
                             Some(o) => (
                                 o.temperature,
@@ -1701,6 +1722,7 @@ async fn drive_live_sop_actions(
                                     .expect("owned implies a reassembly handle")
                                     .config
                                     .pacing,
+                                o.agent.resolved.model_context_window,
                             ),
                             None => (
                                 temperature,
@@ -1711,6 +1733,7 @@ async fn drive_live_sop_actions(
                                 context_token_budget,
                                 dedup_exempt_tools,
                                 pacing,
+                                model_context_window,
                             ),
                         };
 
@@ -1813,6 +1836,7 @@ async fn drive_live_sop_actions(
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
                                             context_token_budget: eff_context_token_budget,
+                                            model_context_window: eff_model_context_window,
                                             knobs,
                                         },
                                     ),
@@ -2130,7 +2154,16 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let reported = estimated * 4;
         let budget = reported / 2;
-        enforce_reported_budget(&mut history, reported, budget, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            budget,
+            None,
+            &NoopObserver,
+            None,
+            "test-turn",
+        )
+        .await;
         assert!(
             history.len() < before,
             "over-budget no-tool history must be trimmed before it is persisted"
@@ -2151,7 +2184,16 @@ mod reported_budget_tests {
         ];
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
-        enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            estimated,
+            estimated * 4,
+            None,
+            &NoopObserver,
+            None,
+            "test-turn",
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "within-budget history is untouched");
     }
@@ -2160,7 +2202,16 @@ mod reported_budget_tests {
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
-        enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            usize::MAX,
+            0,
+            None,
+            &NoopObserver,
+            None,
+            "test-turn",
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
     }
@@ -2804,6 +2855,7 @@ mod sop_step_reassembly_tests {
             false,
             false,
             30_000,
+            100_000,
             100_000,
             None,
             &LoopKnobs::default(),

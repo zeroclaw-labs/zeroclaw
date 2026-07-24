@@ -6130,12 +6130,17 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                model_context_window,
                 ..
             } => {
                 if input_tokens.is_some() {
                     self.context_input_tokens = input_tokens;
                 }
-                if max_context_tokens.is_some() {
+                // Use model_context_window for display (actual model window),
+                // fall back to max_context_tokens (trim budget) if not provided.
+                if model_context_window.is_some() {
+                    self.context_max_tokens = model_context_window;
+                } else if max_context_tokens.is_some() {
                     self.context_max_tokens = max_context_tokens;
                 }
             }
@@ -7170,6 +7175,48 @@ mod tests {
         let (_body, tracker) = carve_todo_area(&t, full);
         let tracker = tracker.expect("side panel visible");
         assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
+    }
+
+    #[test]
+    fn context_usage_client_prefers_model_window_then_falls_back() {
+        let mut s = state();
+        s.context_max_tokens = None;
+        s.context_input_tokens = None;
+
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".into(),
+            input_tokens: Some(100),
+            max_context_tokens: Some(800_000),
+            model_context_window: Some(1_000_000),
+        });
+        assert_eq!(
+            s.context_max_tokens,
+            Some(1_000_000),
+            "client must prefer model_context_window (provider capacity) for the meter ceiling"
+        );
+        assert_eq!(
+            s.context_input_tokens,
+            Some(100),
+            "input_tokens must be reported as-is"
+        );
+
+        s.context_max_tokens = None;
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".into(),
+            input_tokens: Some(250),
+            max_context_tokens: Some(800_000),
+            model_context_window: None,
+        });
+        assert_eq!(
+            s.context_max_tokens,
+            Some(800_000),
+            "legacy payload (no model_context_window) must fall back to max_context_tokens"
+        );
+        assert_eq!(
+            s.context_input_tokens,
+            Some(250),
+            "input_tokens must be updated on the legacy payload too"
+        );
     }
 
     async fn next_rpc_request(rx: &mut mpsc::Receiver<String>, reason: &str) -> serde_json::Value {

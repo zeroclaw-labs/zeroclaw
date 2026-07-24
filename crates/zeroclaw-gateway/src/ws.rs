@@ -901,6 +901,39 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+/// Build the `done`-frame JSON. `model_context_window` is only included
+/// when the provider has an explicit `context_window` — absent means
+/// clients fall back to `max_context_tokens`.
+fn build_done_frame_json(
+    full_response: &str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    tokens_used: Option<u64>,
+    cost_usd: Option<f64>,
+    model: &str,
+    provider: &str,
+    max_context_tokens: u64,
+    model_context_window: Option<u64>,
+    last_input_tokens: Option<u64>,
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "type": "done",
+        "full_response": full_response,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tokens_used": tokens_used,
+        "cost_usd": cost_usd,
+        "model": model,
+        "provider": provider,
+        "max_context_tokens": max_context_tokens,
+        "last_input_tokens": last_input_tokens,
+    });
+    if let Some(window) = model_context_window {
+        done["model_context_window"] = serde_json::Value::from(window);
+    }
+    done
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -940,10 +973,6 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
-    // model-window helper which falls back to 32_000 when unset.
     let max_context_tokens = {
         let cfg = state.config.read();
         cfg.effective_max_context_tokens(&turn_alias) as u64
@@ -1022,6 +1051,10 @@ async fn process_chat_message(
     // surfaces usage; we sum to produce a single done-frame total.
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
+
+    // Track the most recent provider that served usage events (for done-frame
+    // context_window resolution and provider label).
+    let mut last_provider_ref: Option<String> = None;
 
     // Track the most recent absolute provider-reported prompt size
     // (replaces on each TurnEvent::Usage; not accumulated).
@@ -1153,7 +1186,9 @@ async fn process_chat_message(
                             cached_input_tokens: _,
                             output_tokens,
                             cost_usd: _,
+                            provider_ref,
                         } => {
+                            last_provider_ref = Some(provider_ref.clone());
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
@@ -1368,18 +1403,48 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
-            let done = serde_json::json!({
-                "type": "done",
-                "full_response": outcome.response,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tokens_used": total_tokens,
-                "cost_usd": cost_usd,
-                "model": turn_model,
-                "provider": provider_label,
-                "max_context_tokens": max_context_tokens,
-                "last_input_tokens": last_input_tokens,
-            });
+            // Build the done-frame JSON. Use the last provider_ref from usage events
+            // for accurate context_window resolution (accounts for vision routing
+            // and mid-turn provider switches). Fall back to re-reading attribution
+            // fields when no usage events were emitted.
+            let (model_context_window, provider_ref_label) = if let Some(ref provider_ref) =
+                last_provider_ref
+            {
+                let cfg = state.config.read();
+                let window =
+                    zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_ref);
+                // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
+                let label = provider_ref.split('.').next_back().unwrap_or(provider_ref);
+                (window, label.to_string())
+            } else {
+                let (_, live_provider, _) = agent.attribution_fields();
+                if live_provider.is_empty() {
+                    (None, provider_label.clone())
+                } else {
+                    let cfg = state.config.read();
+                    let window = zeroclaw_runtime::agent::resolve_live_model_context_window(
+                        &cfg,
+                        &live_provider,
+                    );
+                    let label = live_provider
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(&live_provider);
+                    (window, label.to_string())
+                }
+            };
+            let done = build_done_frame_json(
+                &outcome.response,
+                total_input_tokens,
+                total_output_tokens,
+                total_tokens,
+                cost_usd,
+                &turn_model,
+                &provider_ref_label,
+                max_context_tokens,
+                model_context_window,
+                last_input_tokens,
+            );
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Set session state to idle
@@ -1390,7 +1455,7 @@ async fn process_chat_message(
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
-                "model_provider": provider_label,
+                "model_provider": provider_ref_label,
                 "model": turn_model,
             }));
 
@@ -1402,7 +1467,7 @@ async fn process_chat_message(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": provider_label,
+                        "model_provider": provider_ref_label,
                         "model": turn_model,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
@@ -2099,6 +2164,311 @@ mod tests {
             run_status(&state).as_deref(),
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
+        );
+    }
+
+    /// Regression: done-frame omits `model_context_window` when provider
+    /// has no explicit `context_window`.
+    #[test]
+    fn done_frame_omits_model_context_window_when_provider_unset() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openrouter.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("ensure creates entry");
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let model_ctx_window =
+            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, "openrouter.default");
+        assert!(
+            model_ctx_window.is_none(),
+            "resolve_live_model_context_window must return None when no \
+             provider context_window is set, preserving absence at the \
+             producer boundary"
+        );
+
+        let done = build_done_frame_json(
+            "ok",
+            Some(100),
+            Some(50),
+            Some(150),
+            Some(0.001),
+            "glm-5.2",
+            "openrouter",
+            max_ctx,
+            model_ctx_window,
+            Some(100),
+        );
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+        assert_eq!(v["type"], "done");
+        assert_eq!(
+            v["max_context_tokens"], 128_000,
+            "profile budget must be emitted"
+        );
+        assert!(
+            v.get("model_context_window").is_none(),
+            "model_context_window must be absent when provider has no context_window \
+             (#8872)"
+        );
+    }
+
+    /// Positive case: provider sets `context_window`, done-frame includes it.
+    #[test]
+    fn done_frame_includes_model_context_window_when_provider_set() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openrouter.glm-5.2".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "glm-5.2")
+            .expect("ensure creates entry")
+            .context_window = Some(1_000_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let model_ctx_window =
+            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, "openrouter.glm-5.2");
+        assert_eq!(
+            model_ctx_window,
+            Some(1_000_000),
+            "resolve_live_model_context_window must return the provider's \
+             explicit context_window when set"
+        );
+
+        let done = build_done_frame_json(
+            "ok",
+            Some(100),
+            Some(50),
+            Some(150),
+            Some(0.001),
+            "glm-5.2",
+            "openrouter",
+            max_ctx,
+            model_ctx_window,
+            Some(100),
+        );
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+        assert_eq!(v["type"], "done");
+        assert_eq!(v["max_context_tokens"], 800_000);
+        assert_eq!(
+            v["model_context_window"], 1_000_000,
+            "done-frame must carry the provider's explicit context_window"
+        );
+    }
+
+    /// Regression: done-frame model_context_window follows the live
+    /// provider after a session/configure A→B switch, not the static
+    /// agent alias.
+    #[test]
+    fn done_frame_model_window_follows_live_session_provider_switch() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openrouter.glm-5.2".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "glm-5.2")
+            .expect("ensure A");
+        providers
+            .models
+            .ensure("ollama", "provider-b")
+            .expect("ensure B")
+            .context_window = Some(1_000_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        let live_provider_ref = "ollama.provider-b";
+        let model_ctx_window =
+            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, live_provider_ref);
+        assert_eq!(
+            model_ctx_window,
+            Some(1_000_000),
+            "shared resolver must return B's window, not A's"
+        );
+
+        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let done = build_done_frame_json(
+            "ok",
+            Some(100),
+            Some(50),
+            Some(150),
+            Some(0.001),
+            "glm-5.2",
+            "openrouter",
+            max_ctx,
+            model_ctx_window,
+            Some(100),
+        );
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+        assert_eq!(v["type"], "done");
+        assert_eq!(
+            v["model_context_window"], 1_000_000,
+            "done-frame must carry B's live window, not A's static alias window"
+        );
+    }
+
+    /// Regression: done-frame model_context_window reflects the live provider
+    /// after an in-turn model_switch (not the static agent alias).
+    ///
+    /// Exercises the same shared resolver path that `process_chat_message`
+    /// uses at turn-end (ws.rs end-of-turn block) after
+    /// `try_apply_pending_model_switch` mutates `agent.model_provider_name`.
+    #[test]
+    fn done_frame_model_window_follows_in_turn_provider_switch() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openrouter.glm-5.2".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "glm-5.2")
+            .expect("ensure A");
+        providers
+            .models
+            .ensure("ollama", "llama3")
+            .expect("ensure B")
+            .context_window = Some(1_000_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        let live_provider_ref = "ollama.llama3";
+        let model_ctx_window =
+            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, live_provider_ref);
+        assert_eq!(
+            model_ctx_window,
+            Some(1_000_000),
+            "post-switch resolver must return B's window, not A's"
+        );
+
+        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let done = build_done_frame_json(
+            "ok",
+            Some(100),
+            Some(50),
+            Some(150),
+            Some(0.001),
+            "glm-5.2",
+            "openrouter",
+            max_ctx,
+            model_ctx_window,
+            Some(100),
+        );
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+        assert_eq!(v["type"], "done");
+        assert_eq!(
+            v["model_context_window"], 1_000_000,
+            "done-frame must carry B's post-switch window, not A's static alias window"
         );
     }
 }
