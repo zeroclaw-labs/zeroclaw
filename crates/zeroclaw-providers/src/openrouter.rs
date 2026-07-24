@@ -613,7 +613,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` to configure.",
             )
         })?;
 
@@ -678,7 +678,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` to configure.",
             )
         })?;
 
@@ -750,7 +750,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` to configure.",
             )
         })?;
 
@@ -844,7 +844,8 @@ impl ModelProvider for OpenRouterModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.".to_string(),
+                        "OpenRouter API key not set. Run `zeroclaw quickstart` to configure."
+                            .to_string(),
                     ))
                 })
                 .boxed();
@@ -942,7 +943,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
+                "OpenRouter API key not set. Run `zeroclaw quickstart` to configure.",
             )
         })?;
 
@@ -1130,9 +1131,9 @@ mod tests {
         assert!(first.is_err(), "expected error without API key");
         let err = first.unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("API key not set"),
-            "error should mention API key: {msg}"
+        assert_eq!(
+            msg,
+            "ModelProvider error: OpenRouter API key not set. Run `zeroclaw quickstart` to configure."
         );
     }
 
@@ -1260,7 +1261,31 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = model_provider
+            .chat(request, "openai/gpt-4o", Some(0.2))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` to configure."
+        );
     }
 
     #[tokio::test]
@@ -1284,7 +1309,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` to configure."
+        );
     }
 
     #[test]
@@ -1423,7 +1451,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key not set"));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `zeroclaw quickstart` to configure."
+        );
     }
 
     #[test]
