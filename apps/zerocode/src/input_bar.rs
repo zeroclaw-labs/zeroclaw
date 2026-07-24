@@ -2,6 +2,7 @@
 //! file explorer, and clipboard paste support.
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use directories::UserDirs;
@@ -15,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
+use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -28,21 +30,36 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
-    "/attach",
-    "/attachments",
-    "/browse",
-    "/clear-queue",
-    "/detach",
-    "/help",
-    "/model",
-    "/model-provider",
-    "/new",
-    "/new-session",
-    "/restart-session",
-    "/toggle-thinking",
+/// TUI-only slash commands: no channel/runtime counterpart exists in the
+/// shared `zeroclaw-commands` catalogue, so they have nothing to compose
+/// with and live here as plain names (no leading slash).
+const TUI_ONLY_COMMANDS: &[&str] = &[
+    "attach",
+    "attachments",
+    "detach",
+    "clear-queue",
+    "browse",
+    "model-provider",
+    "toggle-thinking",
+    "restart-session",
 ];
+
+/// The single source of truth for ZeroCode's slash commands: every name and
+/// alias the shared catalogue advertises on the `Tui` surface (currently
+/// help, model, new, new-session), unioned with [`TUI_ONLY_COMMANDS`].
+/// Autocomplete and `parse_slash_command`'s leading-token gate both read
+/// from this list, so the set ZeroCode advertises and the set it recognizes
+/// can never drift apart.
+static SLASH_COMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut names: Vec<String> = commands_for_surface(CommandSurface::Tui)
+        .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
+        .chain(TUI_ONLY_COMMANDS.iter().copied())
+        .map(|name| format!("/{name}"))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+});
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -122,6 +139,14 @@ enum SlashCommand<'a> {
 
 fn parse_slash_command(input: &str) -> SlashCommand<'_> {
     let trimmed = input.trim();
+    // Authoritative-by-membership: only dispatch into the arg-parsing chain
+    // below when the leading token is present in the single derived
+    // descriptor set. This is the parity guard — a command removed from (or
+    // never added to) `SLASH_COMMANDS` cannot silently keep parsing.
+    let head = trimmed.split(' ').next().unwrap_or(trimmed);
+    if !SLASH_COMMANDS.iter().any(|cmd| cmd == head) {
+        return SlashCommand::NotACommand;
+    }
     if let Some(path) = trimmed.strip_prefix("/attach ") {
         SlashCommand::Attach(path.trim())
     } else if trimmed == "/attach" {
@@ -658,8 +683,8 @@ impl InputBarState {
             self.autocomplete_target = AutocompleteTarget::Command;
             self.autocomplete_matches = SLASH_COMMANDS
                 .iter()
-                .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
-                .map(|c| (*c).to_string())
+                .filter(|cmd| cmd.starts_with(prefix) && cmd.as_str() != prefix)
+                .cloned()
                 .collect();
             self.finalize_autocomplete();
             return;
@@ -2040,6 +2065,112 @@ mod tests {
     }
 
     #[test]
+    fn derived_slash_command_set_matches_expected_twelve_entries() {
+        let expected: Vec<&str> = vec![
+            "/attach",
+            "/attachments",
+            "/browse",
+            "/clear-queue",
+            "/detach",
+            "/help",
+            "/model",
+            "/model-provider",
+            "/new",
+            "/new-session",
+            "/restart-session",
+            "/toggle-thinking",
+        ];
+        let derived: Vec<&str> = SLASH_COMMANDS.iter().map(String::as_str).collect();
+        assert_eq!(derived, expected);
+    }
+
+    /// Parity guard: every command the derived descriptor set advertises
+    /// must be recognized by `parse_slash_command` (advertise ⊆ recognize).
+    #[test]
+    fn every_advertised_command_is_recognized_by_parser() {
+        for command in SLASH_COMMANDS.iter() {
+            assert!(
+                !matches!(parse_slash_command(command), SlashCommand::NotACommand),
+                "{command} is advertised but not recognized by parse_slash_command"
+            );
+        }
+    }
+
+    /// Parity guard: unknown leading tokens are rejected (recognize ⊆
+    /// advertise), and each real token maps to its specific expected
+    /// variant — a silently dropped descriptor entry breaks this test.
+    #[test]
+    fn parser_rejects_unknown_tokens_and_matches_specific_variants() {
+        assert!(matches!(
+            parse_slash_command("/definitely-not-a-command"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
+            parse_slash_command("/helper"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
+            parse_slash_command("/attach"),
+            SlashCommand::Attach("")
+        ));
+        assert!(matches!(
+            parse_slash_command("/attachments"),
+            SlashCommand::ListAttachments
+        ));
+        assert!(matches!(
+            parse_slash_command("/browse"),
+            SlashCommand::EnterBrowseMode
+        ));
+        assert!(matches!(
+            parse_slash_command("/clear-queue"),
+            SlashCommand::ClearQueue(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/detach"),
+            SlashCommand::Detach(None)
+        ));
+        assert!(matches!(
+            parse_slash_command("/help"),
+            SlashCommand::OpenHelp
+        ));
+        assert!(matches!(
+            parse_slash_command("/model"),
+            SlashCommand::ModelPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/model-provider"),
+            SlashCommand::ModelProviderPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/new"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/new-session"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/restart-session"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/toggle-thinking"),
+            SlashCommand::ToggleThinking
+        ));
+    }
+
+    #[test]
+    fn autocomplete_for_bare_slash_returns_exactly_the_derived_set() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_active);
+        let mut matches = bar.autocomplete_matches.clone();
+        matches.sort();
+        let expected: Vec<String> = SLASH_COMMANDS.to_vec();
+        assert_eq!(matches, expected);
+    }
+
+    #[test]
     fn model_arg_autocomplete_filters_cached_catalog() {
         let mut bar = InputBarState::new();
         bar.set_model_catalog(
@@ -2185,7 +2316,7 @@ mod tests {
             .chain(node.children.iter().flat_map(|child| child.entries.iter()))
             .map(|entry| entry.key_str())
             .collect::<Vec<_>>();
-        for command in SLASH_COMMANDS {
+        for command in SLASH_COMMANDS.iter() {
             assert!(
                 !listed.iter().any(|key| key == command),
                 "{command} stays in autocomplete, not the general Help modal"
