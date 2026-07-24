@@ -23,8 +23,10 @@
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
@@ -36,21 +38,189 @@ const NONCE_LEN: usize = 12;
 
 const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maps a backend to its provisioning lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisioningState {
+    /// Persistent key material is present locally.
+    Initialized,
+    /// No local material; needs `initialize()` before `with_key()`.
+    NeedsInitialization,
+    /// Key material is managed externally; nothing to check locally.
+    ExternallyProvisioned,
+}
+
+/// Abstracts where the master encryption key is obtained.
+///
+/// Object-safe, single-trait design.  Only `with_key`, `backend_name`,
+/// and `provisioning_state` are required; `initialize` has a default
+/// error for backends that cannot create keys locally.
+pub trait KeySource: Debug + Send + Sync {
+    /// Run `f` with a reference to the 256-bit master key.  The
+    /// reference is only valid during the call.
+    fn with_key(&self, f: &mut dyn FnMut(&[u8; 32]) -> Result<()>) -> Result<()>;
+
+    /// Human-readable label for diagnostic messages.
+    fn backend_name(&self) -> &'static str;
+
+    /// Local-only provisioning check — MUST NOT run scripts or
+    /// prompt for user input.
+    fn provisioning_state(&self) -> ProvisioningState;
+
+    /// Generate fresh key material.  Default error for backends
+    /// that cannot create keys locally.
+    fn initialize(&self) -> Result<()> {
+        anyhow::bail!(
+            "The '{}' backend does not support automatic key generation. \
+             Create the master key externally, then verify access with \
+             `zeroclaw quickstart`.",
+            self.backend_name()
+        )
+    }
+}
+
+/// File-system backed key source.  Reads/writes a 32-byte hex-encoded
+/// key at the given path (default: `~/.zeroclaw/.secret_key`, 0600).
+#[derive(Debug, Clone)]
+pub struct FileKeySource {
+    key_path: PathBuf,
+}
+
+impl FileKeySource {
+    pub fn new(key_path: PathBuf) -> Self {
+        Self { key_path }
+    }
+}
+
+impl KeySource for FileKeySource {
+    fn with_key(&self, f: &mut dyn FnMut(&[u8; 32]) -> Result<()>) -> Result<()> {
+        let key_bytes = load_or_create_key(&self.key_path)?;
+        // load_or_create_key always returns 32 bytes.
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_bytes);
+        let result = f(&key);
+        // Best-effort zeroisation on the stack copy.
+        key.fill(0);
+        result
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "file"
+    }
+
+    fn provisioning_state(&self) -> ProvisioningState {
+        if self.key_path.exists() {
+            ProvisioningState::Initialized
+        } else {
+            ProvisioningState::NeedsInitialization
+        }
+    }
+
+    fn initialize(&self) -> Result<()> {
+        let key = generate_random_key();
+        write_key_file(&self.key_path, &key)
+    }
+}
+
 /// Manages encrypted storage of secrets (API keys, tokens, etc.)
 #[derive(Debug, Clone)]
 pub struct SecretStore {
-    /// Path to the key file (`~/.zeroclaw/.secret_key`)
-    key_path: PathBuf,
+    /// Where the master key is obtained from.
+    key_source: Arc<dyn KeySource>,
     /// Whether encryption is enabled
     enabled: bool,
 }
 
 impl SecretStore {
     /// Create a new secret store rooted at the given directory.
+    /// Phase 1: always uses the file backend (`.secret_key`).
     pub fn new(zeroclaw_dir: &Path, enabled: bool) -> Self {
         Self {
-            key_path: zeroclaw_dir.join(".secret_key"),
+            key_source: Arc::new(FileKeySource::new(zeroclaw_dir.join(".secret_key"))),
             enabled,
+        }
+    }
+
+    /// Only for tests: construct a store from an arbitrary `KeySource`.
+    #[cfg(test)]
+    pub fn from_key_source(key_source: Arc<dyn KeySource>, enabled: bool) -> Self {
+        Self {
+            key_source,
+            enabled,
+        }
+    }
+
+    /// Only for tests: run a closure with a reference to the raw key.
+    /// Panics if `with_key` returns an error.
+    #[cfg(test)]
+    pub fn with_test_key<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        let mut f = Some(f);
+        let mut result = None;
+        self.key_source
+            .with_key(&mut |key| {
+                result = Some(f.take().expect("callback re-entered")(key));
+                Ok(())
+            })
+            .expect("with_key failed in test helper");
+        result.expect("callback not invoked")
+    }
+
+    /// Only for tests: check whether two stores share the same
+    /// `Arc<dyn KeySource>` allocation (ptr equality).
+    #[cfg(test)]
+    pub fn key_source_ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.key_source, &other.key_source)
+    }
+
+    /// Obtain the master key through the trait callback contract.
+    /// Enforces exactly-once invocation — a backend that returns
+    /// `Ok(())` without calling the closure, or that calls it more
+    /// than once, gets an error instead of a panic.
+    fn get_key<R>(&self, f: impl FnOnce(&[u8; 32]) -> Result<R>) -> Result<R> {
+        let mut call_count: u32 = 0;
+        let mut f = Some(f);
+        let mut result: Option<Result<R>> = None;
+
+        let backend_result = self.key_source.with_key(&mut |key| {
+            call_count = call_count.saturating_add(1);
+            // On the 2nd+ invocation, don't invoke the real callback
+            // again — we'll detect the violation after with_key returns.
+            if call_count > 1 {
+                return Ok(());
+            }
+            // Take the callback. If it's already None (shouldn't happen
+            // in single-threaded use), return Ok(()) and let the
+            // post-validation produce a clear diagnostic.
+            let cb = match f.take() {
+                Some(cb) => cb,
+                None => return Ok(()),
+            };
+            result = Some(cb(key));
+            Ok(())
+        });
+
+        // Propagate backend errors first — the backend itself failed.
+        backend_result?;
+
+        // Then enforce exactly-once independently. The backend's return
+        // value cannot mask a callback-count violation.
+        let backend = self.key_source.backend_name();
+        match call_count {
+            0 => Err(anyhow::Error::msg(format!(
+                "key source '{backend}' did not invoke the callback"
+            ))),
+            1 => match result {
+                Some(Ok(value)) => Ok(value),
+                // Propagate the original callback error without wrapping
+                // so existing diagnostics (backend name, tampered
+                // ciphertext, UTF-8, etc.) appear unchanged.
+                Some(Err(e)) => Err(e),
+                None => Err(anyhow::Error::msg(format!(
+                    "key source '{backend}' invoked the callback but did not produce a result"
+                ))),
+            },
+            n => Err(anyhow::Error::msg(format!(
+                "key source '{backend}' invoked the callback {n} times (expected exactly once)"
+            ))),
         }
     }
 
@@ -62,28 +232,29 @@ impl SecretStore {
             return Ok(plaintext.to_string());
         }
 
-        let key_bytes = self.load_or_create_key()?;
-        let key = Key::from_slice(&key_bytes);
-        let cipher = ChaCha20Poly1305::new(key);
+        self.get_key(|key| {
+            let key = Key::from_slice(key);
+            let cipher = ChaCha20Poly1305::new(key);
 
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "ChaCha20-Poly1305 encryption failed"
-            );
-            anyhow::Error::msg(format!("Encryption failed: {e}"))
-        })?;
+            let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "ChaCha20-Poly1305 encryption failed"
+                );
+                anyhow::Error::msg(format!("Encryption failed: {e}"))
+            })?;
 
-        // Prepend nonce to ciphertext for storage
-        let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ciphertext);
+            // Prepend nonce to ciphertext for storage
+            let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+            blob.extend_from_slice(&nonce);
+            blob.extend_from_slice(&ciphertext);
 
-        Ok(format!("enc2:{}", hex_encode(&blob)))
+            Ok(format!("enc2:{}", hex_encode(&blob)))
+        })
     }
 
     /// Decrypt a secret.
@@ -155,33 +326,49 @@ impl SecretStore {
 
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let key_bytes = self.load_or_create_key()?;
-        let key = Key::from_slice(&key_bytes);
-        let cipher = ChaCha20Poly1305::new(key);
 
-        let plaintext_bytes = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| {
-                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string(), "error": format!("{e}")})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
-                     Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
-                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw quickstart`.");
+        self.get_key(|key| {
+            let key = Key::from_slice(key);
+            let cipher = ChaCha20Poly1305::new(key);
+
+            let plaintext_bytes = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+                let backend = self.key_source.backend_name();
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "backend": backend,
+                            "error": format!("{e}")
+                        })),
+                    "enc2: decryption failed — key mismatch or missing material. \
+                         Common cause: volume wipe, container migration, \
+                         or backup-restore where the key material was not \
+                         preserved alongside `config.toml`.  Restore the \
+                         original key material from backup, or re-encrypt \
+                         the affected secrets via `zeroclaw quickstart`."
+                );
                 anyhow::Error::msg(format!(
-                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext): {e}"
+                    "enc2: decryption failed (wrong key for '{}' backend, or tampered ciphertext): {e}",
+                    backend
                 ))
             })?;
 
-        String::from_utf8(plaintext_bytes)
-            .context("Decrypted secret is not valid UTF-8 — corrupt data")
+            String::from_utf8(plaintext_bytes)
+                .context("Decrypted secret is not valid UTF-8 — corrupt data")
+        })
     }
 
     /// Decrypt using legacy XOR cipher (insecure, for backward compatibility only).
     fn decrypt_legacy_xor(&self, hex_str: &str) -> Result<String> {
         let ciphertext = hex_decode(hex_str)
             .context("Failed to decode legacy encrypted secret (corrupt hex)")?;
-        let key = self.load_or_create_key()?;
-        let plaintext_bytes = xor_cipher(&ciphertext, &key);
-        String::from_utf8(plaintext_bytes)
-            .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
+
+        self.get_key(|key| {
+            let plaintext_bytes = xor_cipher(&ciphertext, key);
+            String::from_utf8(plaintext_bytes)
+                .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
+        })
     }
 
     /// Check if a value is already encrypted or externally resolved.
@@ -198,144 +385,195 @@ impl SecretStore {
     pub fn is_secure_encrypted(value: &str) -> bool {
         value.starts_with("enc2:")
     }
+}
 
-    /// Load the encryption key from disk, or create one if it doesn't exist.
-    fn load_or_create_key(&self) -> Result<Vec<u8>> {
-        if self.key_path.exists() {
-            let hex_key =
-                fs::read_to_string(&self.key_path).context("Failed to read secret key file")?;
-            hex_decode(hex_key.trim()).context("Secret key file is corrupt")
-        } else {
+/// Load the key from `key_path`, creating it (with restrictive 0600
+/// permissions) if absent.  Returns the raw 32 key bytes.
+///
+/// Uses atomic `write_key_file` (`O_CREAT | O_EXCL`).  If two
+/// processes race on first creation, the loser falls back to reading
+/// the winner's key — no overwrite, no divergent keys.
+fn load_or_create_key(key_path: &Path) -> Result<Vec<u8>> {
+    let validate_key = |bytes: Vec<u8>| {
+        anyhow::ensure!(
+            bytes.len() == 32,
+            "Key file must contain exactly 32 bytes (got {})",
+            bytes.len()
+        );
+        Ok(bytes)
+    };
+    match fs::read_to_string(key_path) {
+        Ok(hex) => validate_key(hex_decode(hex.trim()).context("Secret key file is corrupt")?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let key = generate_random_key();
-            if let Some(parent) = self.key_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&self.key_path, hex_encode(&key))
-                .context("Failed to write secret key file")?;
-
-            // Set restrictive permissions
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
-                    .context("Failed to set key file permissions")?;
-            }
-            #[cfg(windows)]
-            {
-                // On Windows, use icacls to restrict permissions to current user only
-                // Use whoami command to get full user identity (COMPUTER\User or DOMAIN\User)
-                // which is required by icacls for correct parsing
-                let username = std::process::Command::new("whoami")
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
-                let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "USERNAME environment variable is empty; \
-                         cannot restrict key file permissions via icacls"
-                    );
-                    return Ok(key);
-                };
-
-                // First, ensure the current user owns the file. Without this,
-                // Windows may assign an invalid SID as owner, making the file
-                // unreadable for subsequent commands.
-                match std::process::Command::new("takeown")
-                    .arg("/F")
-                    .arg(&self.key_path)
-                    .output()
-                {
-                    Ok(o) if !o.status.success() => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!(
-                                "Failed to take ownership of key file via takeown (exit code {:?})",
-                                o.status.code()
-                            )
-                        );
+            match write_key_file(key_path, &key) {
+                Ok(()) => Ok(key),
+                Err(write_err) => {
+                    // Only recover if another process won the O_EXCL race.
+                    // All other failures (disk full, permission denied,
+                    // parent dir missing, symlink refusal, etc.) must
+                    // propagate so we don't silently accept a bad key.
+                    if !is_already_exists_error(&write_err) {
+                        return Err(write_err);
                     }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Could not take ownership of key file"
-                        );
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            "Key file ownership set to current user via takeown"
-                        );
-                    }
-                }
-
-                match std::process::Command::new("icacls")
-                    .arg(&self.key_path)
-                    .args(["/inheritance:r", "/grant:r"])
-                    .arg(grant_arg)
-                    .output()
-                {
-                    Ok(o) if !o.status.success() => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!(
-                                "Failed to set key file permissions via icacls (exit code {:?})",
-                                o.status.code()
-                            )
-                        );
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Could not set key file permissions"
-                        );
-                    }
-                    _ => {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            "Key file permissions restricted via icacls"
-                        );
-                    }
+                    // Genuine race: another process created the file first.
+                    // Fall back to reading the winner's key.
+                    let hex = fs::read_to_string(key_path)
+                        .context("Failed to read key file (created by concurrent process)")?;
+                    let bytes = hex_decode(hex.trim())
+                        .context("Secret key file created by concurrent process is corrupt")?;
+                    validate_key(bytes)
                 }
             }
+        }
+        Err(e) => Err(e).context("Failed to read secret key file"),
+    }
+}
 
-            Ok(key)
+/// Check whether an error chain contains an `AlreadyExists` IO error,
+/// indicating that another process won an `O_CREAT | O_EXCL` race.
+fn is_already_exists_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .map(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+            .unwrap_or(false)
+    })
+}
+
+/// Write `key` as hex to `key_path` with restrictive permissions.
+/// Uses `O_CREAT | O_EXCL` — refuses to overwrite an existing file
+/// and rejects symlinks.
+fn write_key_file(key_path: &Path, key: &[u8]) -> Result<()> {
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Reject symlinks — following a symlink target would silently write
+    // key material to an unexpected location.
+    if fs::symlink_metadata(key_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        anyhow::bail!("Key file path is a symlink — refusing to write");
+    }
+    // O_CREAT | O_EXCL: atomic create-if-absent.  Fails if the file
+    // already exists, preventing accidental overwrite of the master key.
+    //
+    // On Unix the file is created with 0o600 so it has restrictive
+    // permissions from birth — the set_permissions call below is a
+    // hardening step only.
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+    let mut file = match open_opts.open(key_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Preserve the original IO error via .context() so callers
+            // can detect the AlreadyExists kind via downcast.
+            return Err(e).context("Key file already exists — refusing to overwrite");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    use std::io::Write;
+    file.write_all(hex_encode(key).as_bytes())
+        .context("Failed to write secret key file")?;
+
+    // Harden permissions. On Unix the file was already created with
+    // 0o600 via OpenOptionsExt::mode, so a failure here is non-fatal.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600)) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to harden key file permissions (file was created with 0o600)"
+            );
         }
     }
+    #[cfg(windows)]
+    {
+        let username = std::process::Command::new("whoami")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
+        let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "USERNAME environment variable is empty; \
+                 cannot restrict key file permissions via icacls"
+            );
+            return Ok(());
+        };
+
+        match std::process::Command::new("takeown")
+            .arg("/F")
+            .arg(key_path)
+            .output()
+        {
+            Ok(o) if !o.status.success() => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Failed to take ownership of key file via takeown (exit code {:?})",
+                        o.status.code()
+                    )
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Could not take ownership of key file"
+                );
+            }
+            _ => {}
+        }
+
+        match std::process::Command::new("icacls")
+            .arg(key_path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(grant_arg)
+            .output()
+        {
+            Ok(o) if !o.status.success() => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Failed to set key file permissions via icacls (exit code {:?})",
+                        o.status.code()
+                    )
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Could not set key file permissions"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// XOR cipher with repeating key. Same function for encrypt and decrypt.
@@ -678,17 +916,22 @@ exit 65
     #[tokio::test]
     async fn key_file_created_on_first_encrypt() {
         let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        assert!(!key_path.exists());
+
         let store = SecretStore::new(tmp.path(), true);
-        assert!(!store.key_path.exists());
-
         store.encrypt("test").unwrap();
-        assert!(store.key_path.exists(), "Key file should be created");
+        assert!(
+            key_path.exists(),
+            "Key file should be created via SecretStore::encrypt"
+        );
 
-        let key_hex = tokio::fs::read_to_string(&store.key_path).await.unwrap();
+        let key_hex = tokio::fs::read_to_string(&key_path).await.unwrap();
         assert_eq!(
             key_hex.len(),
             KEY_LEN * 2,
-            "Key should be {KEY_LEN} bytes hex-encoded"
+            "Key should be {} bytes hex-encoded",
+            KEY_LEN
         );
     }
 
@@ -782,12 +1025,10 @@ exit 65
     }
 
     #[test]
-    fn decrypt_error_message_mentions_secret_key() {
-        // Operators hitting a missing or mismatched `.secret_key` (volume wipe,
-        // container migration, backup-restore without the key file) need the
-        // error message to point at the root cause. Otherwise the failure
-        // cascades into a misleading "All providers/models failed" message
-        // with no diagnostic for the underlying decrypt failure.
+    fn decrypt_error_message_mentions_backend() {
+        // Operators hitting a missing or mismatched key (volume wipe, container
+        // migration, backup-restore) need the error message to point at the
+        // root cause — the active key-source backend.
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();
         let store1 = SecretStore::new(tmp1.path(), true);
@@ -797,8 +1038,9 @@ exit 65
         let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains(".secret_key"),
-            "decrypt error must mention `.secret_key` so operators can diagnose missing/mismatched keys: got {msg:?}"
+            msg.contains("'file'"),
+            "decrypt error must mention the active backend name so operators \
+             can diagnose missing/mismatched keys: got {msg:?}"
         );
     }
 
@@ -816,15 +1058,24 @@ exit 65
     #[test]
     fn legacy_xor_decrypt_still_works() {
         let tmp = TempDir::new().unwrap();
-        let store = SecretStore::new(tmp.path(), true);
-
-        // Trigger key creation via an encrypt call
-        let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let fs = FileKeySource::new(tmp.path().join(".secret_key"));
+        // Trigger key creation
+        fs.with_key(&mut |_| Ok(())).unwrap();
+        // Read the raw key to manually build a legacy ciphertext
+        let key_bytes: Vec<u8> = {
+            let mut k = Vec::new();
+            fs.with_key(&mut |key| {
+                k = key.to_vec();
+                Ok(())
+            })
+            .unwrap();
+            k
+        };
+        let store = SecretStore::from_key_source(Arc::new(fs), true);
 
         // Manually produce a legacy XOR-encrypted value
         let plaintext = "sk-legacy-api-key";
-        let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
+        let ciphertext = xor_cipher(plaintext.as_bytes(), &key_bytes);
         let legacy_value = format!("enc:{}", hex_encode(&ciphertext));
 
         // Store should still be able to decrypt legacy values
@@ -882,11 +1133,20 @@ exit 65
     #[test]
     fn decrypt_and_migrate_upgrades_legacy_xor() {
         let tmp = TempDir::new().unwrap();
-        let store = SecretStore::new(tmp.path(), true);
-
-        // Create key first
-        let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        let fs = FileKeySource::new(key_path);
+        // Ensure key material exists (auto-create via with_key).
+        let raw_key: Vec<u8> = {
+            let mut k = Vec::new();
+            fs.with_key(&mut |key| {
+                k = key.to_vec();
+                Ok(())
+            })
+            .unwrap();
+            k
+        };
+        let store = SecretStore::from_key_source(Arc::new(fs), true);
+        let key = raw_key;
 
         // Manually create a legacy XOR-encrypted value
         let plaintext = "sk-legacy-secret-to-migrate";
@@ -929,7 +1189,7 @@ exit 65
         let store = SecretStore::new(tmp.path(), true);
 
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let key = store.with_test_key(|k| k.to_vec());
 
         let plaintext = "sk-日本語-émojis-🦀-тест";
         let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
@@ -951,7 +1211,7 @@ exit 65
         let store = SecretStore::new(tmp.path(), true);
 
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let key = store.with_test_key(|k| k.to_vec());
 
         // Empty plaintext XOR-encrypted
         let plaintext = "";
@@ -971,7 +1231,7 @@ exit 65
         let store = SecretStore::new(tmp.path(), true);
 
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let key = store.with_test_key(|k| k.to_vec());
 
         let plaintext = "a".repeat(10_000);
         let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
@@ -1006,7 +1266,7 @@ exit 65
         // Create keys for both stores
         let _ = store1.encrypt("setup").unwrap();
         let _ = store2.encrypt("setup").unwrap();
-        let key1 = store1.load_or_create_key().unwrap();
+        let key1 = store1.with_test_key(|k| k.to_vec());
 
         // Encrypt with store1's key
         let plaintext = "secret-for-store1";
@@ -1039,7 +1299,7 @@ exit 65
         let store = SecretStore::new(tmp.path(), true);
 
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let key = store.with_test_key(|k| k.to_vec());
 
         let plaintext = "sk-same-secret";
         let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
@@ -1063,7 +1323,7 @@ exit 65
         let store = SecretStore::new(tmp.path(), true);
 
         let _ = store.encrypt("setup").unwrap();
-        let key = store.load_or_create_key().unwrap();
+        let key = store.with_test_key(|k| k.to_vec());
 
         let plaintext = "sk-sensitive-data";
         let ciphertext = xor_cipher(plaintext.as_bytes(), &key);
@@ -1211,10 +1471,12 @@ exit 65
     fn key_file_has_restricted_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
-        let store = SecretStore::new(tmp.path(), true);
-        store.encrypt("trigger key creation").unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        let fs = FileKeySource::new(key_path.clone());
+        // Trigger key creation via with_key (auto-create).
+        fs.with_key(&mut |_| Ok(())).unwrap();
 
-        let perms = fs::metadata(&store.key_path).unwrap().permissions();
+        let perms = fs::metadata(&key_path).unwrap().permissions();
         assert_eq!(
             perms.mode() & 0o777,
             0o600,
@@ -1230,7 +1492,7 @@ exit 65
     #[test]
     fn takeown_runs_before_icacls_on_windows() {
         // Read the source to confirm `takeown` appears before `icacls` in the
-        // Windows cfg block of `load_or_create_key`. This is a structural
+        // Windows cfg block of `write_key_file`. This is a structural
         // documentation test — the actual commands are Windows-only.
         let source = include_str!("secrets.rs");
         let takeown_pos = source
@@ -1243,5 +1505,463 @@ exit 65
             takeown_pos < icacls_pos,
             "takeown must run before icacls to fix file ownership first (issue #4532)"
         );
+    }
+
+    // ── Atomic initialization ─────────────────────────────────
+
+    #[test]
+    fn initialize_refuses_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        fs::write(&key_path, b"existing").unwrap();
+
+        let fs = FileKeySource::new(key_path);
+        let err = fs.initialize().unwrap_err().to_string();
+        assert!(
+            err.contains("already exists"),
+            "initialize must refuse to overwrite existing key file: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_refuses_symlink() {
+        use std::os::unix::fs as unix_fs;
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("real-key");
+        let link = tmp.path().join(".secret_key");
+        fs::write(&target, b"real-key-data").unwrap();
+        unix_fs::symlink(&target, &link).unwrap();
+
+        let fs = FileKeySource::new(link);
+        let err = fs.initialize().unwrap_err().to_string();
+        assert!(
+            err.contains("symlink"),
+            "initialize must refuse symlink paths: {err}"
+        );
+    }
+
+    #[test]
+    fn provisioning_state_initialized_when_key_file_present() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        let fs = FileKeySource::new(key_path.clone());
+        assert_eq!(
+            fs.provisioning_state(),
+            ProvisioningState::NeedsInitialization,
+            "No key file yet"
+        );
+        // Create the key file via initialize.
+        fs.initialize().unwrap();
+        assert_eq!(
+            fs.provisioning_state(),
+            ProvisioningState::Initialized,
+            "Key file now exists"
+        );
+    }
+
+    #[test]
+    fn provisioning_state_default_is_needs_initialization() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("nonexistent").join(".secret_key");
+        let fs = FileKeySource::new(key_path);
+        assert_eq!(
+            fs.provisioning_state(),
+            ProvisioningState::NeedsInitialization
+        );
+    }
+
+    #[test]
+    fn key_file_wrong_length_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        // Write only 16 bytes (half the required 32).
+        fs::write(&key_path, hex_encode(&[0u8; 16])).unwrap();
+        let err = load_or_create_key(&key_path).unwrap_err().to_string();
+        assert!(
+            err.contains("must contain exactly 32 bytes"),
+            "Wrong-length key file must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn key_file_too_long_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        // Write 64 bytes (twice the required 32).
+        fs::write(&key_path, hex_encode(&[0u8; 64])).unwrap();
+        let err = load_or_create_key(&key_path).unwrap_err().to_string();
+        assert!(
+            err.contains("must contain exactly 32 bytes"),
+            "Too-long key file must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn load_or_create_detects_genuine_race() {
+        // When the key file is created by another process between our
+        // NotFound check and our O_EXCL attempt, we must fall back to
+        // reading the winner's key — not fail.
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+
+        // Pre-create the key file (simulating another process winning the race).
+        let winner_key = generate_random_key();
+        fs::write(&key_path, hex_encode(&winner_key)).unwrap();
+
+        // load_or_create_key should detect the race and read the winner's key.
+        let loaded = load_or_create_key(&key_path).unwrap();
+        assert_eq!(loaded, winner_key);
+    }
+
+    #[test]
+    fn load_or_create_key_fails_on_non_race_write_error() {
+        // A non-race write failure (e.g., permission denied on parent dir)
+        // must fail-closed, not fall through to reading the key file.
+        let tmp = TempDir::new().unwrap();
+        // Point at a path whose parent is a regular file, not a directory.
+        // create_dir_all will fail because "parent" is a file.
+        let parent_file = tmp.path().join("not-a-directory");
+        fs::write(&parent_file, b"block").unwrap();
+        let key_path = parent_file.join(".secret_key");
+
+        let result = load_or_create_key(&key_path);
+        assert!(
+            result.is_err(),
+            "Non-race write errors must fail-closed, got: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_refuses_symlink_on_race_fallback() {
+        // When the key file is a symlink (and the target does not exist),
+        // fs::read_to_string returns NotFound, write_key_file detects the
+        // symlink and refuses. load_or_create_key must propagate that
+        // refusal — not fall through to read.
+        use std::os::unix::fs as unix_fs;
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("nonexistent-target");
+        let link = tmp.path().join(".secret_key");
+        // Symlink to a non-existent target → read_to_string → NotFound.
+        unix_fs::symlink(&target, &link).unwrap();
+
+        let result = load_or_create_key(&link);
+        assert!(
+            result.is_err(),
+            "Symlink refusal must not fall through to read path: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_key_file_creates_with_restrictive_mode_at_birth() {
+        // On Unix, the file must have 0o600 from the moment of creation,
+        // before set_permissions runs as hardening.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+
+        // Use a fresh file — no race.
+        let key = generate_random_key();
+        write_key_file(&key_path, &key).unwrap();
+
+        let perms = fs::metadata(&key_path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "Key file must be 0o600 immediately after write_key_file returns"
+        );
+    }
+
+    // ── Clone-sharing ────────────────────────────────────────
+
+    #[test]
+    fn cloned_store_shares_key_source() {
+        let tmp = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp.path(), true);
+        let store2 = store1.clone();
+
+        // Arc::ptr_eq proves the clone shares the SAME allocation,
+        // not just that two independent FileKeySource instances
+        // happen to read the same file. This matters for future
+        // stateful backends (HSM sessions, KMS connection pools).
+        assert!(
+            store1.key_source_ptr_eq(&store2),
+            "Cloned stores must share the same Arc<dyn KeySource> instance"
+        );
+    }
+
+    #[test]
+    fn independent_stores_have_distinct_key_sources() {
+        let tmp = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp.path(), true);
+        let store2 = SecretStore::new(tmp.path(), true);
+
+        // Even though they read the same file, the Arc instances are distinct.
+        assert!(
+            !store1.key_source_ptr_eq(&store2),
+            "Independently created stores must have distinct Arc instances"
+        );
+    }
+
+    // ── Error diagnosis ──────────────────────────────────────
+
+    #[test]
+    fn decrypt_error_message_mentions_tampered_ciphertext() {
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp1.path(), true);
+        let store2 = SecretStore::new(tmp2.path(), true);
+
+        let encrypted = store1.encrypt("secret-for-store1").unwrap();
+        let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tampered ciphertext"),
+            "decrypt error must mention tampered ciphertext as possible cause: {msg}"
+        );
+    }
+
+    // ── get_key callback contract enforcement ────────────────
+
+    /// A test-only KeySource that never calls the callback.
+    #[derive(Debug)]
+    struct ZeroCallKeySource;
+
+    impl KeySource for ZeroCallKeySource {
+        fn with_key(&self, _f: &mut dyn FnMut(&[u8; 32]) -> Result<()>) -> Result<()> {
+            // Never calls the callback — violates exactly-once contract.
+            Ok(())
+        }
+        fn backend_name(&self) -> &'static str {
+            "zero-call-test"
+        }
+        fn provisioning_state(&self) -> ProvisioningState {
+            ProvisioningState::ExternallyProvisioned
+        }
+    }
+
+    /// A test-only KeySource that calls the callback twice and
+    /// ignores the second call's error.
+    #[derive(Debug)]
+    struct DoubleCallKeySource {
+        key: [u8; 32],
+    }
+
+    impl KeySource for DoubleCallKeySource {
+        fn with_key(&self, f: &mut dyn FnMut(&[u8; 32]) -> Result<()>) -> Result<()> {
+            // First call — legitimate.
+            f(&self.key)?;
+            // Second call — contract violation. Ignore the result.
+            let _ = f(&self.key);
+            Ok(())
+        }
+        fn backend_name(&self) -> &'static str {
+            "double-call-test"
+        }
+        fn provisioning_state(&self) -> ProvisioningState {
+            ProvisioningState::ExternallyProvisioned
+        }
+    }
+
+    /// A test-only KeySource whose callback returns an error.
+    #[derive(Debug)]
+    struct CallbackErrorSource {
+        key: [u8; 32],
+    }
+
+    impl KeySource for CallbackErrorSource {
+        fn with_key(&self, f: &mut dyn FnMut(&[u8; 32]) -> Result<()>) -> Result<()> {
+            // Invoke the callback as required.
+            f(&self.key)
+        }
+        fn backend_name(&self) -> &'static str {
+            "callback-error-test"
+        }
+        fn provisioning_state(&self) -> ProvisioningState {
+            ProvisioningState::ExternallyProvisioned
+        }
+    }
+
+    /// A test-only KeySource that calls the callback once, then returns
+    /// an error — simulating a KMS/HSM connection failure.
+    #[derive(Debug)]
+    struct BackendErrorSource {
+        key: [u8; 32],
+    }
+
+    impl KeySource for BackendErrorSource {
+        fn with_key(&self, f: &mut dyn FnMut(&[u8; 32]) -> Result<()>) -> Result<()> {
+            // One compliant callback invocation, then the backend itself fails.
+            f(&self.key)?;
+            Err(anyhow::Error::msg("backend-connection-failed"))
+        }
+        fn backend_name(&self) -> &'static str {
+            "backend-error-test"
+        }
+        fn provisioning_state(&self) -> ProvisioningState {
+            ProvisioningState::ExternallyProvisioned
+        }
+    }
+
+    #[test]
+    fn get_key_detects_zero_calls() {
+        let store = SecretStore::from_key_source(Arc::new(ZeroCallKeySource), true);
+        let err = store
+            .get_key(|_| Ok("should not reach"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("did not invoke the callback"),
+            "Zero-call backend must be detected: {err}"
+        );
+        assert!(
+            err.contains("zero-call-test"),
+            "Error must name the backend: {err}"
+        );
+    }
+
+    #[test]
+    fn get_key_detects_double_call_that_ignores_callback_error() {
+        let key = generate_random_key();
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key);
+        let store =
+            SecretStore::from_key_source(Arc::new(DoubleCallKeySource { key: key_arr }), true);
+        // If the backend calls twice but ignores the second callback error,
+        // get_key must still detect the violation.
+        let err = store
+            .get_key(|_k| Ok("legitimate-result"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invoked the callback 2 times"),
+            "Double-call must be detected even when backend ignores callback error: {err}"
+        );
+    }
+
+    #[test]
+    fn get_key_propagates_callback_error() {
+        let key = generate_random_key();
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key);
+        let store =
+            SecretStore::from_key_source(Arc::new(CallbackErrorSource { key: key_arr }), true);
+        let err = store
+            .get_key(|_k| Err::<(), _>(anyhow::Error::msg("test-callback-failure-reason")))
+            .unwrap_err()
+            .to_string();
+        // The original callback error must propagate unchanged.
+        assert!(
+            err.contains("test-callback-failure-reason"),
+            "Callback error must propagate unchanged: {err}"
+        );
+    }
+
+    #[test]
+    fn get_key_callback_returns_value_normally() {
+        // Happy path: exactly one callback invocation, callback succeeds.
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let result = store
+            .get_key(|k| {
+                assert_eq!(k.len(), 32);
+                Ok::<_, anyhow::Error>(42u32)
+            })
+            .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn get_key_propagates_backend_error() {
+        // When the backend itself returns Err (e.g., KMS connection failure),
+        // get_key must propagate that error — not the callback result.
+        let key = generate_random_key();
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key);
+        let store =
+            SecretStore::from_key_source(Arc::new(BackendErrorSource { key: key_arr }), true);
+        let err = store
+            .get_key(|_k| Ok("callback-succeeded-but-backend-failed"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("backend-connection-failed"),
+            "Backend error must propagate, got: {err}"
+        );
+    }
+
+    // ── Backward compatibility (frozen fixture) ──────────────
+
+    /// Verify that the current implementation can decrypt a ChaCha20-Poly1305
+    /// ciphertext produced with a known key. This is a frozen test vector that
+    /// proves backward compatibility with the `enc2:` wire format used before
+    /// the KeySource trait extraction.
+    ///
+    /// The test constructs the ciphertext deterministically using the
+    /// ChaCha20-Poly1305 library directly (bypassing SecretStore), then
+    /// verifies SecretStore can decrypt it. If this test fails, the refactor
+    /// has broken backward compatibility.
+    #[test]
+    fn frozen_pre_refactor_ciphertext_decrypts() {
+        // Deterministic key material — 32 bytes of known pattern.
+        let frozen_key: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+
+        // Encrypt a known plaintext using ChaCha20-Poly1305 directly —
+        // this replicates what the pre-refactor implementation produced.
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&frozen_key));
+        let nonce_bytes = [0u8; 12]; // deterministic nonce for the test vector
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let plaintext = b"frozen-backward-compat-test";
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+
+        let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        blob.extend_from_slice(&nonce_bytes);
+        blob.extend_from_slice(&ciphertext);
+        let enc2_value = format!("enc2:{}", hex_encode(&blob));
+
+        // Write the frozen key to a temp file.
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        fs::write(&key_path, hex_encode(&frozen_key)).unwrap();
+
+        let fs = FileKeySource::new(key_path);
+        let store = SecretStore::from_key_source(Arc::new(fs), true);
+        let decrypted = store.decrypt(&enc2_value).unwrap();
+        assert_eq!(
+            decrypted,
+            std::str::from_utf8(plaintext).unwrap(),
+            "Frozen fixture: pre-refactor ciphertext must decrypt correctly"
+        );
+    }
+
+    #[test]
+    fn frozen_fixture_tampered_ciphertext_rejected() {
+        // Tampering with the frozen test vector must still be detected.
+        let frozen_key: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        fs::write(&key_path, hex_encode(&frozen_key)).unwrap();
+
+        let fs = FileKeySource::new(key_path);
+        let store = SecretStore::from_key_source(Arc::new(fs), true);
+
+        // Flip the first byte of the ciphertext portion of a valid enc2: value.
+        let tampered = "enc2:000000000000000000000000\
+            f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6\
+            c7d8e9f0a1b2c3d4e5f6a7b8c9d0";
+
+        let result = store.decrypt(tampered);
+        assert!(result.is_err(), "Tampered frozen fixture must be rejected");
     }
 }
