@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["host_matches_allowlist","is_private_or_local_host","normalize_allowed_domains","normalize_domain"]};

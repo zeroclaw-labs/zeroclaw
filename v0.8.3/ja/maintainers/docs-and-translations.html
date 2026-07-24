@@ -1,0 +1,573 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ドキュメントと翻訳 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-91a95759.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="ドキュメントと翻訳"><a class="header" href="#ドキュメントと翻訳">ドキュメントと翻訳</a></h1>
+<p>ZeroClawには2つの独立した翻訳レイヤーがあります：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>レイヤー</th><th>フォーマット</th><th>カバーする内容</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>アプリの文字列</strong></td><td>Mozilla Fluent (<code>.ftl</code>)</td><td>CLIヘルプテキスト、コマンドの説明、ランタイムメッセージ</td></tr>
+<tr><td><strong>ドキュメント</strong></td><td>gettext (<code>.po</code>)</td><td>このmdBookのすべての内容</td></tr>
+</tbody>
+</table>
+</div>
+<p>これらは別々に入力され、別々に保存されます。どちらもプロバイダー非依存の入力パイプラインを使用します。OpenAI互換のエンドポイントを <code>providers.models.&lt;kind&gt;.&lt;alias&gt;</code> の下に設定し、入力コマンドに <code>--model-provider &lt;alias&gt;</code> を渡してください。設定済みのエイリアスはどれでも選択可能です。エイリアスのみ（<code>--model-provider &lt;alias&gt;</code>）を指定するか、同じエイリアスが複数の kind の下に存在する場合は <code>kind.alias</code> 修飾子（<code>--model-provider anthropic.&lt;alias&gt;</code>）を指定します。リゾルバーは一致したエントリから <code>uri</code>、<code>model</code>、<code>api_key</code> を直接読み取ります。<code>uri</code> または <code>model</code> が欠落している場合は、推測されたデフォルトではなく、致命的なエラーとなります。</p>
+<p><a href="https://ollama.com">Ollama</a> を使ったローカルモデルは第一級の選択肢です。API キーは不要で、呼び出しごとのコストもかかりません。リリース品質を求める場合は、ホスト型プロバイダーでも構いません。翻訳はローカルでの操作です。専用の翻訳キャッシュ PR、リリース時の翻訳パス、新しいロケールの追加には <code>cargo mdbook sync</code> を実行してください。通常の英語ドキュメントの PR では、生成される <code>.po</code> ファイルの広範な変更を、専用のフォローアップに後回しにしても構いません。</p>
+<h2 id="プロバイダー設定"><a class="header" href="#プロバイダー設定">プロバイダー設定</a></h2>
+<p>Ollama は現在ドキュメントの標準的なソースです。<a href="https://ollama.com/">Ollama</a> がインストールされ、<code>qwen3:30b-a3b</code> がプルされていることを確認し、Ollama プロバイダーエントリを設定してください。<code>uri</code> はエンドポイントの完全な URL で、<strong>オプション</strong>です。設定しないままにすると、プロバイダーファミリーのデフォルトエンドポイント（ランタイムプロバイダースタックによって解決される）が使用されます。セルフホストのゲートウェイやプロキシを指す場合にのみ設定してください。設定済みのファミリーであれば何でも動作します（Anthropic、OpenAI、OpenRouter、Ollama、…）。翻訳ツールが実際のランタイムプロバイダーを構築するため、各ファミリーのエンドポイント、認証ヘッダー、ワイヤープロトコルは自動的に処理されます。OpenAI 互換性の要件はありません。</p>
+<h2 id="ドキュメントをローカルでビルドする"><a class="header" href="#ドキュメントをローカルでビルドする">ドキュメントをローカルでビルドする</a></h2>
+<!-- Canonical local docs-build commands and tooling. Edit here; reuse via
+     {{#include}}. Shared by developing/building-docs and
+     maintainers/docs-and-translations. -->
+<h2 id="翻訳カタログ-git-submodule"><a class="header" href="#翻訳カタログ-git-submodule">翻訳カタログ (git submodule)</a></h2>
+<p>翻訳済みの <code>.po</code> カタログは、<code>docs/book/po</code> にマウントされた <code>zeroclaw-labs/zeroclaw-docs-translations</code> サブモジュール内にあります。Rust の開発ループ（<code>cargo build</code>、<code>cargo test</code>、<code>cargo clippy</code>）では不要ですが、<strong>ドキュメントのビルドや同期には必要です</strong>。一度だけ初期化してください:</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">git clone --recurse-submodules https://github.com/zeroclaw-labs/zeroclaw   # 新規クローン
+git submodule update --init docs/book/po                                   # 既存のクローン
+</code></pre>
+</div>
+
+<p>サブモジュールをチェックアウトしていない場合でも英語のビルドは可能ですが（英語のソースは <code>docs/book/src/</code> にあります）、翻訳済みロケールは空として表示されます。</p>
+<h2 id="ワンコマンドで実行"><a class="header" href="#ワンコマンドで実行">ワンコマンドで実行</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">cargo mdbook serve                       # http://localhost:3000/en/ ですべてのロケールを配信
+cargo mdbook serve --locale ja           # 日本語ソースに対するライブリロード
+cargo mdbook build                       # すべてのロケールの静的ビルドを docs/book/book/ に
+cargo mdbook refs                        # 自動生成された参照ページを再生成する
+cargo mdbook sync                        # translation-cache パス: .po ファイルの再抽出とマージ
+cargo mdbook sync --locale ja            # 1 つのロケールのみ同期する
+cargo mdbook sync --force                # すべてを強制的に再翻訳する (品質チェック)
+cargo mdbook sync --locale ja --force    # 1 つのロケールのみ強制的に再翻訳する
+cargo mdbook stats                       # ロケールごとに翻訳済み/ファジー/未翻訳を表示する
+cargo mdbook check                       # .po フォーマットを検証する (翻訳 PR の前に実行)
+</code></pre>
+</div>
+
+<blockquote>
+<p>必ず <code>cargo mdbook …</code> ラッパー経由で実行してください。<code>docs/book/</code> から直接 <code>mdbook build</code> を実行すると、<code>locales.toml</code> から <code>theme/lang-switcher.js</code> をレンダリングする xtask ステップがスキップされ、<code>failed to open theme/lang-switcher.js for hashing</code> でビルドが失敗します。</p>
+</blockquote>
+<h2 id="必要なツール"><a class="header" href="#必要なツール">必要なツール</a></h2>
+<p><code>cargo mdbook</code> は、不足しているものを即座に報告して失敗しますが、参考までに：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ツール</th><th>インストール</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="https://rust-lang.github.io/mdBook/"><code>mdbook</code></a></td><td><code>cargo install mdbook --locked</code></td></tr>
+<tr><td><a href="https://github.com/google/mdbook-i18n-helpers"><code>mdbook-i18n-helpers</code></a></td><td><code>cargo install mdbook-i18n-helpers --locked</code></td></tr>
+<tr><td><code>cargo</code></td><td><a href="https://rustup.rs">https://rustup.rs</a></td></tr>
+<tr><td><code>gettext</code> (msgfmt, msgmerge)</td><td><code>apt install gettext</code> / <code>brew install gettext</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="何がどこにビルドされるか"><a class="header" href="#何がどこにビルドされるか">何がどこにビルドされるか</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ソース</th><th>出力</th><th>生成者</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/**/*.md</code> (手書き)</td><td><code>docs/book/book/&lt;locale&gt;/</code></td><td><code>mdbook build</code></td></tr>
+<tr><td><code>docs/book/src/reference/cli.md</code></td><td>(同じパス; <strong>gitignored</strong>)</td><td><code>cargo mdbook refs</code></td></tr>
+<tr><td><code>docs/book/src/reference/config.md</code></td><td>(同じパス; <strong>gitignored</strong>)</td><td><code>cargo mdbook refs</code></td></tr>
+<tr><td><code>target/doc/</code> (rustdoc)</td><td><code>docs/book/book/api/</code></td><td><code>cargo doc --no-deps --workspace</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>2 つの <code>reference/*.md</code> ファイルは、コード内の実際の <code>clap</code> derive と JSON スキーマから生成されるため、手作業で編集しないでください。代わりに、関連する Rust 型の <code>///</code> ドキュメントコメントを編集してください。</p>
+<p><code>cargo mdbook</code> は <code>cargo run -p xtask --bin mdbook --</code>（cargo の設定で定義）のエイリアスです。このセクションのコントリビューター向けの簡潔なバージョンについては、<a href="../developing/building-docs.html">ドキュメントをローカルでビルドする</a>を参照してください。</p>
+<blockquote>
+<p>[!NOTE] 全文検索は主要ロケール（英語、<code>locales.toml</code>の最初）に対してのみ構築されます。翻訳されたロケールは、検索インデックスや検索ボックスなしでビルドされます。ロケールごとの検索インデックスは大きく（それぞれ約6～7 MB）、<code>gh-pages</code>のクローンサイズの大半を占めます。検索を英語に限定することで、クローンを軽量に保てます。翻訳されたロケールに検索ボックスを戻すには、<code>build_locales</code>（<code>xtask/src/cmd/mdbook/build.rs</code>）でそのビルドの<code>output.html.search.enable</code>を再度有効にする必要があります。</p>
+</blockquote>
+<h3 id="翻訳を最新に保つ方法"><a class="header" href="#翻訳を最新に保つ方法">翻訳を最新に保つ方法</a></h3>
+<p>英語のソースが変更されると、<code>cargo mdbook sync</code> は2つのステージを実行します。</p>
+<ol>
+<li><strong>抽出</strong>: <code>mdbook-xgettext</code> は現在の英語ソースから <code>po/messages.pot</code> を再生成します。</li>
+<li><strong>マージ</strong>: <code>msgmerge</code> は各ロケールの <code>.po</code> ファイルを更新します。新規の文字列には空の <code>msgstr ""</code> が設定され、変更された文字列は <code>#, fuzzy</code> というマークが付けられ、開始点として古い翻訳が保持されます。</li>
+</ol>
+<p>次にコマンドはあいまい (fuzzy) + 未翻訳のエントリを数え、<code>--model-provider</code> が指定されている場合はそれらのみを補完します。変更されていない文字列にはコストがかかりません。<code>.po</code> キャッシュにより、変更されていないソースに対して再実行しても何も行われません。<code>--model-provider</code> を指定しない場合でも、sync は抽出 + マージを実行して差分を報告します。<code>msgstr</code> のない文字列は、レンダリング時に英語にフォールバックします。</p>
+<p>Sync は安定した出力ルール（<code>msgcat --sort-output --no-wrap --add-location=file</code>）でカタログを正規化するため、差分は実際のソース変更に集中したままになります。避けられない変更点：ヘッダーのメタデータ（<code>POT-Creation-Date</code> など）、文字列が別ファイルに移動した際の参照位置の更新、そして実際のソース文字列の編集です。</p>
+<p>通常の英語ドキュメントのPRでは、広範囲にわたる <code>.po</code> の変更を、それに特化したフォローアップに先送りしても構いません。<code>.po</code> の更新を含めるのは、PRが翻訳キャッシュの更新作業、リリース翻訳の更新作業、ロケールの追加、またはレビュー可能な小さな差分を生成する場合のみにしてください。</p>
+<h2 id="アプリの文字列を埋め込むfluent"><a class="header" href="#アプリの文字列を埋め込むfluent">アプリの文字列を埋め込む（Fluent）</a></h2>
+<p>アプリの文字列は <code>crates/zeroclaw-runtime/locales/</code> にあります。英語がソースとして扱われ、コンパイル時に埋め込まれます。</p>
+<blockquote>
+<p><strong>ランタイム読み込みの注意点（これに依存する前に確認してください）。</strong> ランタイムにビルトインとして組み込まれているのは <code>en</code> と <code>zh-CN</code> のみです。<code>crates/zeroclaw-runtime/src/i18n.rs</code> は <code>include_str!</code> を介して <code>en</code> を埋め込み、<code>builtin_cli_ftl_source()</code> は <code>zh-CN</code> に対して埋め込み済みの <code>zh-CN</code> カタログを返し、その他すべてのロケールには <code>None</code> を返します。ディスクオーバーライドのパスも存在します。<code>load_ftl_from_disk</code> は <code>zeroclaw_config::schema::ftl_locale_dir(locale)</code>、すなわち <code>&lt;config-dir&gt;/data/ftl/&lt;locale&gt;/cli.ftl</code>（<code>zeroclaw locales fetch</code> が配置するのと同じ場所）を解決します。<strong>したがって、新しく作成された <code>ja/cli.ftl</code> は生成されコミットされますが、ロケールが <code>builtin_cli_ftl_source()</code> に追加されるか、作成済みの <code>cli.ftl</code> が <code>&lt;config-dir&gt;/data/ftl/ja/</code> 配下に配置されない限り、ランタイムでは読み込まれません。</strong> このメモを信頼せず、<code>i18n.rs</code> と <code>zeroclaw_config::schema::ftl_locale_dir</code> で現在の状態を確認してください。</p>
+<p><code>apps/zerocode</code> TUIは独立したFluentカタログ（<code>apps/zerocode/locales/</code>）を管理しています。以下の<a href="#zerocode-strings-fluent-independent">zerocode strings</a>を参照してください。<code>cargo fluent</code>は<strong>両方</strong>のカタログルート（ランタイム＋zerocode）を走査するため、以下の各サブコマンドはデフォルトで両方を対象とします。</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">cargo fluent stats                                                   # ロケールごと、カタログごとのカバレッジ
+cargo fluent check                                                   # 両方のカタログにわたって .ftl 構文を検証する
+cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt;             # fill missing keys (default batch 50)
+cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --batch 10  # 小さいバッチ: リクエストごとのエントリ数を減らす (レート制限 / 切り詰めを緩和)
+cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --force     # すべてを再翻訳
+cargo fluent scan                                                    # Rust ソースコードとの間で、期限切れまたは欠落したキーを検出する
+</code></pre>
+</div>
+
+<p><strong>1つのカタログに限定する</strong>: すべてのサブコマンドは <code>--catalog &lt;runtime|zerocode&gt;</code> を取ります（デフォルト: 両方）。TUIのみを翻訳するには:</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --catalog zerocode
+cargo fluent check --catalog zerocode                                # syntax-check のみ zerocode
+</code></pre>
+</div>
+
+<p>不明な <code>--catalog</code> 値は、有効な選択肢とともにエラーになります。</p>
+<p><code>fill</code> は、<code>en/</code> ディレクトリを持つ選択されたすべてのカタログルートに対して <code>&lt;locale&gt;/&lt;domain&gt;.ftl</code> を生成します。ランタイムの <code>cli.ftl</code>/<code>tools.ftl</code> と zerocode の <code>zerocode.ftl</code> です。</p>
+<p><strong>プロバイダーの解決はランタイムと共有されます。</strong> <code>--model-provider</code> は <code>[providers.models.&lt;kind&gt;.&lt;alias&gt;]</code> の下に設定された任意のエイリアスを受け付けます。すなわち、単独のエイリアス（<code>&lt;alias&gt;</code>）か、曖昧な場合は <code>kind.alias</code> 修飾子（<code>anthropic.&lt;alias&gt;</code>）です。このツールは実際のランタイムプロバイダーを構築するため、エンドポイント、認証ヘッダー、ワイヤプロトコルはファミリーごとに解決されます（Anthropic は <code>/v1/messages</code> + <code>x-api-key</code>、OpenAI 互換は <code>/v1/chat/completions</code> + <code>Bearer</code> など）。何も仮定されません。暗号化された <code>api_key</code> の値は、正規の <code>SecretStore</code> を通じて復号されます。設定と <code>.secret-key</code> をデフォルト以外の場所から読み込むには <code>--config-dir &lt;dir&gt;</code>（<code>zeroclaw --config-dir</code> に対応）を使用してください。デフォルトは <code>~/.zeroclaw</code>、次に <code>~/.config/zeroclaw</code> です。</p>
+<p><strong>バッチ処理:</strong> <code>fill</code> はバッチごとに1リクエストを送信します（N個のエントリすべてを単一のJSONオブジェクトとして）。<code>--batch</code> はNを小さくして、プロバイダのレート制限や長いエントリでのレスポンス切り詰めを緩和します。各バッチは次のリクエストの前にディスクへ書き込まれるため、実行途中での失敗では処理中のバッチのみが失われます。再実行すると、ターゲットの <code>.ftl</code> にすでに存在するキーはスキップされるため、再開は自動的です。<code>--force</code> は不要です。</p>
+<h2 id="zerocode-文字列fluent独立"><a class="header" href="#zerocode-文字列fluent独立">zerocode 文字列（Fluent、独立）</a></h2>
+<p><code>apps/zerocode</code> は、上記のランタイムカタログとは別に、独自の自己完結した Fluent セットアップを備えています。TUI は意図的にワークスペースの他の部分から切り離されており、<code>zeroclaw-*</code> クレートへの依存関係を持たず、その文字列は <code>zeroclaw-runtime/locales/</code> 配下ではなくソースの隣に配置されています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>どこ</th><th>何</th></tr>
+</thead>
+<tbody>
+<tr><td><code>apps/zerocode/locales/en/zerocode.ftl</code></td><td>コンパイル時に組み込まれる信頼できる情報源</td></tr>
+<tr><td><code>apps/zerocode/locales/&lt;locale&gt;/zerocode.ftl</code></td><td>ツリー内に存在する場合は、その他のロケールも埋め込まれます</td></tr>
+<tr><td><code>$ZEROCODE_LOCALE_DIR/&lt;locale&gt;/zerocode.ftl</code></td><td>翻訳のテストに役立つ明示的なオーバーライド</td></tr>
+<tr><td><code>&lt;config-dir&gt;/zerocode/locales/&lt;locale&gt;/zerocode.ftl</code></td><td>ユーザーごとのカタログオーバーライド</td></tr>
+<tr><td><code>~/.zeroclaw/zerocode/locales/&lt;locale&gt;/zerocode.ftl</code></td><td>ユーザーごとの代替の場所</td></tr>
+<tr><td><code>&lt;install-prefix&gt;/share/zerocode/locales/&lt;locale&gt;/zerocode.ftl</code></td><td>システムインストールパス</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="キー名前空間"><a class="header" href="#キー名前空間">キー名前空間</a></h3>
+<p>すべての zerocode キーには <code>zc-</code> というプレフィックスが付き、ランタイムの <code>cli-</code>、<code>channel-</code>、<code>tool-</code> 名前空間と衝突することはありません。<code>zc-</code> 内の命名規則は <code>zc-&lt;pane&gt;-&lt;purpose&gt;</code> です。</p>
+<ul>
+<li><code>zc-pane-&lt;name&gt;</code>: トップレベルのモードバーのラベル</li>
+<li><code>zc-app-&lt;purpose&gt;</code>: <code>app.rs</code> が所有する文字列（ダイアログ、ヘルプ、ステータス）</li>
+<li><code>zc-&lt;pane&gt;-&lt;purpose&gt;</code>: 特定のペインに固有の文字列 (<code>zc-dashboard-*</code>, <code>zc-chat-*</code>, …)</li>
+</ul>
+<h3 id="コードリテラルは翻訳されません"><a class="header" href="#コードリテラルは翻訳されません">コードリテラルは翻訳されません</a></h3>
+<p><code>Ctrl+C</code>、<code>Esc</code>、<code>Shift+Up</code> のようなコードグリフは、言語ではなくプロトコルです。<code>HelpEntry</code> と <code>HelpNode</code> のコンストラクターは、コードベクターを <code>&amp;'static str</code> として、説明を <code>String</code> として受け取るため、コードリテラルはハードコードされたままで、説明は <code>t()</code> を通じて流れます。文章にコードをインラインで埋め込む場合は、<code>{ $keys }</code> という Fluent スロットを使用し、リテラルの周囲に翻訳済みテキストを連結するのではなく、レンダリング時にコードを渡してください。</p>
+<h3 id="ロケール解決"><a class="header" href="#ロケール解決">ロケール解決</a></h3>
+<p>ロケールは zerocode の設定にあるトップレベルの <code>locale</code> フィールドから取得されます。未設定の場合、<code>i18n::detect_locale()</code> は <code>--config-dir</code>、次に <code>ZEROCLAW_CONFIG_DIR</code>、次に <code>~/.zeroclaw</code> の順に解決された設定ディレクトリを読み込み、それでも見つからない場合は <code>en</code> にフォールバックします。zerocode は自身の設定からロケールを独立して解決し、デーモンのルックアップを共有しません。</p>
+<h3 id="文字列の追加"><a class="header" href="#文字列の追加">文字列の追加</a></h3>
+<ol>
+<li>キー + 英語の値を <code>apps/zerocode/locales/en/zerocode.ftl</code> に追加します。カタログを見やすく保つため、セクションコメントを付けてソースファイルごとにキーをグループ化してください。</li>
+<li>ソース内のリテラルを <code>crate::i18n::t("zc-…")</code> に置き換えます。enum→label の <code>match</code> アームでは、<code>fluent_key()</code> メソッドからキー定数（<code>&amp;'static str</code>）を返し、レンダリング側で <code>t()</code> を呼び出します。文字列に対して <code>match</code> を行ってはいけません。</li>
+<li><code>cargo check -p zerocode</code> と <code>i18n</code> の単体テスト (<code>cargo test -p zerocode i18n</code>) は、コンパイル時/テスト時に欠落しているキーを検出します。実行時に欠落しているキーは <code>{zc-key-name}</code> として表示され、一度限りの stderr 警告を出力します。</li>
+</ol>
+<h3 id="翻訳の入力"><a class="header" href="#翻訳の入力">翻訳の入力</a></h3>
+<p><code>cargo fluent</code> はランタイムのカタログと並行して zerocode カタログも走査するため、手動の手順は不要です。<code>cargo fluent fill --locale &lt;code&gt; --model-provider &lt;alias&gt;</code> を実行すると、ランタイムカタログを埋めるのと同じ処理で <code>apps/zerocode/locales/&lt;code&gt;/zerocode.ftl</code> が生成されます。<code>cargo fluent check</code> と <code>cargo fluent stats</code> も同様に zerocode を報告します。<code>scan</code> は <code>apps/</code> をインデックス化するため、<code>zc-</code> のキー参照は zerocode のソースに対して解決されます。生成された <code>&lt;code&gt;/zerocode.ftl</code> はコンパイル時にツリー内に埋め込まれるか、<code>--config-dir</code> でテストするために上記のディスク検索パスのいずれかに配置できます。</p>
+<h2 id="ドキュメントの翻訳gettext"><a class="header" href="#ドキュメントの翻訳gettext">ドキュメントの翻訳（gettext）</a></h2>
+<p>ドキュメントの翻訳は <code>docs/book/po/</code> にあります。<code>cargo mdbook sync</code> は、抽出 → マージ → 廃止項目の削除 → AI 補完を 1 ステップで実行します。<code>--model-provider</code> を指定しない場合でも、sync は抽出とマージを実行し、翻訳が必要な文字列数を報告します。部分的な翻訳は、レンダリング時に英語にフォールバックされます。</p>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">cargo mdbook sync --model-provider anthropic.&lt;alias&gt;              # delta fill
+cargo mdbook sync --model-provider anthropic.&lt;alias&gt; --force      # 品質パス：すべてのエントリを再翻訳
+cargo mdbook sync --model-provider anthropic.&lt;alias&gt; --batch 1    # すべてのエントリの後に書き込む（最も安全な再開）
+cargo mdbook sync --locale ja --model-provider anthropic.&lt;alias&gt;  # single locale
+cargo mdbook sync --model-provider anthropic.&lt;alias&gt; --config-dir ~/.zeroclaw  # 修飾エイリアス + 明示的な設定ディレクトリ
+</code></pre>
+</div>
+
+<p><code>--model-provider</code> は <code>cargo fluent</code> と同じ共有ランタイムプロバイダパス（設定済みの任意のファミリー/エイリアス、ファミリーごとのエンドポイント + 認証 + ワイヤプロトコル、<code>SecretStore</code> の復号、<code>--config-dir</code> のサポート）を経由して解決されます。バッチ全体を1つの JSON オブジェクトとして送信する <code>cargo fluent</code> とは異なり、gettext フィラーは <code>msgid → msgstr</code> のマッピングを明確に保つために<strong>ソース文字列ごとに1リクエスト</strong>を発行します。そのため <code>--batch</code> はリクエストのサイズではなく、<code>.po</code> がディスクにフラッシュされる頻度（チェックポイント間隔）を制御します。カタログ全体のロケールは数千の逐次リクエストになります。日常的な差分フィルには、安価なローカル Ollama エイリアスが経済的な選択肢です。</p>
+<p>パイプラインには組み込みの耐障害性があります：</p>
+<ul>
+<li><strong>漏洩検出</strong>: モデルが翻訳の代わりに自身の指示を返した場合、ツールはそのパターンを（応答長の比率と箇条書きの構造から）検出し、応答の末尾から本来の翻訳を復元しようと試み、復元に失敗した場合はそのエントリを空白にして再翻訳します。</li>
+<li><strong>保護されたリテラルチェック</strong>: <code>cargo mdbook check</code> は、生成された <code>.po</code> ファイル内の高信頼度なリテラル破損も拒否します。<code>ZeroClaw Maturity Framework</code> などの製品名、<code>zeroclaw daemon</code> などのコマンドリテラル、フェンスで囲まれた TOML のセクション/キーリテラルは、翻訳内でもバイト単位でそのまま維持する必要があります。周囲の文章を翻訳し、機械向けのテキストは翻訳しないでください。</li>
+<li><strong>パスリークチェック</strong>: 生成された翻訳は、英語ソースに存在しなかったマシンローカルの絶対パスを導入してはなりません。そのようなエントリは再翻訳のために空白にされ、<code>cargo mdbook check</code> によって拒否されます。</li>
+<li><strong>増分書き込み</strong>: 各バッチの後に <code>.po</code> ファイルが書き換えられます。実行中に Ctrl-C を押しても、その時点までの進捗は失われません。</li>
+<li><strong>廃止された文字列の削除</strong>: <code>msgmerge</code> と <code>msgattrib --no-obsolete</code> により、削除されたソース文字列が <code>#~</code> エントリとして蓄積されるのを防ぎます。</li>
+</ul>
+<p>メンテナは、<a href="../developing/building-docs.html">Building the docs locally</a>に記載されている、英語ドキュメントの通常の例外を受け入れるべきです。<code>.po</code>の更新を求めるのは、PR自体が翻訳キャッシュのパス、リリース翻訳のパス、新しいロケールの変更である場合、または生成された差分がレビューできるほど小さい場合のみにしてください。</p>
+<h2 id="新しいロケールの追加"><a class="header" href="#新しいロケールの追加">新しいロケールの追加</a></h2>
+<ol>
+<li>
+<p>リポジトリのルートにある <code>locales.toml</code> を編集してください。これが唯一手を加える必要のあるファイルです:</p>
+</li>
+<li>
+<p>アプリの文字列を翻訳してください。</p>
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">cargo fluent fill --locale &lt;code&gt; --model-provider ollama
+</code></pre>
+</div>
+
+</li>
+<li>
+<p>ドキュメントの <code>.po</code> ファイルを初期化して埋める:</p>
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh">cargo mdbook sync --locale &lt;code&gt; --model-provider ollama
+</code></pre>
+</div>
+
+</li>
+<li>
+<p>ステップ2の <code>cargo fluent fill</code> 実行は、<code>cargo fluent</code> がランタイムと zerocode の両方のカタログを走査するため、同じパスで <code>apps/zerocode/locales/&lt;code&gt;/zerocode.ftl</code> をすでに生成します。手動の zerocode ステップは不要です。カバレッジは <code>cargo fluent stats</code> で確認してください。</p>
+</li>
+</ol>
+<p>他のすべて、<code>lang-switcher.js</code>、CI のデプロイターゲット一覧、<code>cargo mdbook locales</code> の出力は、自動的に <code>locales.toml</code> から読み込まれます。</p>
+<h2 id="翻訳カタログのサブモジュール"><a class="header" href="#翻訳カタログのサブモジュール">翻訳カタログのサブモジュール</a></h2>
+<p>翻訳済みの <code>.po</code> カタログは、このリポジトリのメインツリーには含まれていません。専用の <a href="https://github.com/zeroclaw-labs/zeroclaw-docs-translations"><code>zeroclaw-labs/zeroclaw-docs-translations</code></a> リポジトリに置かれており、git サブモジュールとして <code>docs/book/po</code>（デフォルトブランチは <code>main</code>）にマウントされています。このマウントポイントはパス透過的です。<code>book.toml</code> の gettext プリプロセッサ、<code>cargo mdbook sync</code>、<code>cargo mdbook build</code> はいずれも、これまでと同じように <code>po/</code> を読み込みます。</p>
+<p>Rust クレートの開発ループでは、サブモジュールは一切必要ありません。サブモジュールが必要になるのは、docs のビルドと docs-deploy / release ジョブのみで、これらのチェックアウトでは <code>submodules: recursive</code> を指定します。それ以外はすべてサブモジュールなしのままです。</p>
+<p>リリースごとに、サブモジュールはメインリポジトリをミラーするために <code>v{version}</code> でタグ付けされ、<code>scripts/release/bump-version.sh</code> はそのタグに gitlink をピン留めします（タグがまだ切られていない場合は警告付きで <code>main</code> にフォールバックします）。<code>messages.pot</code> と <code>*.failures.log</code> は再生成される成果物であり、両方のリポジトリで gitignore され、追跡されていません。</p>
+<h2 id="リリース翻訳ワークフロー"><a class="header" href="#リリース翻訳ワークフロー">リリース翻訳ワークフロー</a></h2>
+<p>リリース時、<code>./scripts/release/bump-version.sh</code> が <code>Cargo.toml</code> にバージョンを設定した後、カタログを更新し、対応するサブモジュールのタグを切ります。これは1つのコマンドです。<code>Cargo.toml</code> からバージョンを読み取り、翻訳パスを実行し、カタログをサブモジュールのリポジトリにコミットしてプッシュし、<code>v{version}</code> でタグ付けし、そのタグに固定されたメインリポジトリの gitlink をステージします。手動で <code>git -C</code> を使う必要はなく、git コマンドにバージョンを手入力する必要もありません。必要に応じてサブモジュールを初期化します。</p>
+<div class="os-tabs-src">
+<h4 id="sh-7"><a class="header" href="#sh-7">sh</a></h4>
+<pre><code class="language-sh">./scripts/release/refresh-translations.sh    # Cargo.toml からのバージョン
+</code></pre>
+</div>
+
+<p><code>bump-version.sh</code> の後に実行することで、読み取られるバージョンがリリースバージョンになります。タグを切らずにカバレッジを確認したりフォーマットを検証したりするには、まず作業ツリーで <code>cargo mdbook stats</code> / <code>cargo mdbook check</code> を実行してください。カタログがすでに最新の場合に同期パスをスキップするには <code>--no-translate</code> を渡し、<code>Cargo.toml</code> のデフォルトを上書きするには明示的なバージョン（<code>./scripts/release/refresh-translations.sh 0.8.2</code>）を渡します。<code>Validate Translations Pin</code> CI ゲートは、マージ前にピン留めされたカタログを検証します。</p>
+<p>使用するモデルは、<code>providers.models.&lt;name&gt;</code> で設定されているものが使われます。</p>
+<h2 id="モデル品質に関する注記"><a class="header" href="#モデル品質に関する注記">モデル品質に関する注記</a></h2>
+<p>言語やモデルによって翻訳品質は大きく異なります。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ロケール</th><th>よくサポートされている</th><th>注釈</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ja</code>, <code>zh-CN</code></td><td>qwen3 ファミリー、各種フロンティアホスト型モデル</td><td>Qwenは中国語を第一言語としていますが、日本語も強力です。</td></tr>
+<tr><td><code>es</code>, <code>fr</code></td><td>qwen3、mistral、gemma3、hosted</td><td>ロマンス語は広範にわたってよく訓練されている</td></tr>
+<tr><td>低リソースのロケール</td><td>ホストされたフロンティアモデルのみ</td><td>ローカルモデルはしばしば単語を誤って生成することがあります。</td></tr>
+</tbody>
+</table>
+</div>
+<p>リリース品質のパスには、<code>--force</code> オプションを使用してホストされたフロンティアモデルを優先してください。開発中の継続的なデルタフィリングには、ローカルの Ollama モデルが適しており、無料で利用できます。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../maintainers/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../maintainers/ci-and-actions.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../maintainers/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../maintainers/ci-and-actions.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,683 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>実践において妥協ゼロ - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-ac15032f.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-006-妥協なき実践-コード健全性エラー規律本番対応標準"><a class="header" href="#fnd-006-妥協なき実践-コード健全性エラー規律本番対応標準">FND-006: 妥協なき実践: コード健全性、エラー規律、本番対応標準</a></h1>
+<blockquote>
+<p>v0.7.0 以降 · タイプ: 品質 · Rev. 1</p>
+<p><strong>正規の参照</strong> · チームによって承認済み · Rev. 1 議論スレッドおよび完全な改訂履歴: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p>これを読む前にチームへの注意書き。</p>
+<p>これは ZeroClaw の成熟度フレームワークにおける 6 番目のドキュメントです。これより前の 5 つでは、アーキテクチャ、ドキュメント、ガバナンス、エンジニアリング基盤、そしてコラボレーションを扱いました。これらは作業を取り巻く構造的・人的な足場です。それぞれが、このプロジェクトを共に構築する方法についての異なる問いに答えてきました。すべてを読んだなら、どれも答えていない問いに気づいたかもしれません。それは、では実際にどうやってうまく書くのか、という問いです。アーキテクチャ RFC は、どのような形で構築すべきかを示しました。ドキュメント RFC は、それをどう記録するかを示しました。ガバナンス RFC は、どう調整するかを示しました。CI/CD RFC は、どうゲートをかけるかを示しました。カルチャー RFC は、周囲の人々とどう協働するかを示しました。しかし、いずれも、文単位で、関数の内側で、選択を行うまさにその瞬間に、品質がどのようなものかは示しませんでした。</p>
+<p>これがこの文書の目的です。</p>
+<p>ここで扱う具体的なトピック、つまりエラーハンドリング、APIドキュメント、テスト設計、技術的負債は、表面上はRustのトピックです。しかし、それらが育てるスキルはそうではありません。テクノロジーは変化します。その変化は、反復のたびに前回よりも速くなっていきます。今日あなたが使っているツール、この言語、このフレームワーク、このAIアシスタントは、いずれ取って代わられるでしょう。その一部は、このプロジェクトの期間中にすら起こりうることです。このドキュメントが育てようとしている判断力は、取って代わられることはありません。それは、あなたが下すあらゆる決定の背後で、あなたが今後書くあらゆる言語で、あなたが今後構築するあらゆるシステムで、そしてソフトウェアとはまったく関係のないかもしれない仕事においてさえ、静かに積み重なっていきます。それこそが、私たちがあなたに対して行っている投資です。あなたがRustを書ける能力に対してではありません。品質、失敗、そして職人技について考える能力、そしてその思考を、今日あなたが使っているAIツールやまだ存在しないツールも含め、あなたが手に取るあらゆるツールへと携えていく能力に対する投資なのです。</p>
+<p>焦らずに、ゆっくり進めてください。</p>
+</blockquote>
+<hr>
+<h2 id="成熟度フレームワークスイート"><a class="header" href="#成熟度フレームワークスイート">成熟度フレームワークスイート</a></h2>
+<p>このRFCは、ZeroClawの成熟度フレームワークを構成する一連の文書のうち6番目です。これらは全体として読むことを意図していますが、それぞれが独立して成立しています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>スコープ</th><th>問題</th></tr>
+</thead>
+<tbody>
+<tr><td>意図的なアーキテクチャ: マイクロカーネルへの移行</td><td>私たちが構築しているものとその構造</td><td>#5574</td></tr>
+<tr><td>ドキュメントの標準化とナレッジアーキテクチャ</td><td>私たちが構築するものの文書化方法</td><td>#5576</td></tr>
+<tr><td>チーム編成とプロジェクトガバナンス</td><td>私たちの調整と意思決定の方法</td><td>#5577</td></tr>
+<tr><td>エンジニアリングインフラ：CI/CDパイプライン</td><td>信頼性の高いビルド、テスト、およびリリースの方法</td><td>#5579</td></tr>
+<tr><td>貢献の文化: 人間同士の協力、AIとのパートナーシップ、チームの成長</td><td>私たちの協力と成長</td><td>#5615</td></tr>
+<tr><td>実践におけるゼロ妥協: コードの健全性、エラー処理の規律、本番環境対応の標準</td><td>永続するコードの書き方</td><td>このRFC</td></tr>
+</tbody>
+</table>
+</div>
+<p>最初の5つのRFCは、構造的および人的な問いに答えています。このRFCは、それらすべての中に潜む問いに答えます。すなわち、構造が与えられ、チームが与えられ、ツールが与えられたとき、コードをうまく書くとはどういうことか、という問いです。</p>
+<hr>
+<h2 id="目次"><a class="header" href="#目次">目次</a></h2>
+<ol>
+<li>開発哲学：判断への投資</li>
+<li>正直な評価：コードベースが私たちに教えていること
+<ul>
+<li>2.1 証拠</li>
+<li>2.2 数字が示さないもの</li>
+<li>2.3 すでに良い点</li>
+</ul>
+</li>
+<li>ゲートと基準：中核的な違い</li>
+<li>七つの原則
+<ul>
+<li>4.1 エラーハンドリングを設計上の課題として</li>
+<li>4.2 Promise としての公開 API 表面</li>
+<li>4.3 テストを設計フィードバックとして</li>
+<li>4.4 技術的負債の優先順位付け</li>
+<li>4.5 アプリケーションレイヤーのセキュリティ</li>
+<li>4.6 観測可能性としてのデバッグ性</li>
+<li>4.7 床面より上の作業</li>
+</ul>
+</li>
+<li>これがAI支援開発に与える影響</li>
+<li>クラフトの移植性</li>
+<li>これがコントリビューターに与える影響</li>
+</ol>
+<hr>
+<h2 id="改訂履歴"><a class="header" href="#改訂履歴">改訂履歴</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rev</th><th>日付</th><th>目次</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月12日</td><td>初期ドラフト</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-開発哲学判断への投資"><a class="header" href="#1-開発哲学判断への投資">1. 開発哲学：判断への投資</a></h2>
+<p>アーキテクチャ RFC では、このプロジェクトにおけるすべての決定がどのように流れるべきかを示す決定階層を導入しました。</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>その階層構造は、各レイヤーで「何を」構築するかという問いに答えます。このRFCは「実装」と「テスト」のレイヤー内に位置し、異なる問いを投げかけています：「どのくらいよく？」</p>
+<p>「どれだけ優れているか」という問いの答えはチェックリストではありません。チェックリストは、理解されていなくても満たすことができますが、ソフトウェアにおいては、永続的な結果を生み出すのは理解なのです。ルールを暗記しただけの貢献者は、状況がほんの少し変わるまではそれに従うでしょう。一方、ルールの背後にある判断を内面化した貢献者は、ルールが想定していなかった状況にも正しくそれを適用します。それには最も重要な状況も含まれており、そうした状況は常に誰も計画していなかったものなのです。</p>
+<p>この区別は、特にこのプロジェクトの文脈において重要です。ZeroClaw は、強力なツールが揃った環境で運用されています。AI によるコード生成、幅広い一般的なエラーを捕捉する CI ゲート、IDE のリンター、自動化されたセキュリティスキャナーなどです。これらのツールは本当に価値があります。これらは下限、つまりコードをマージすべきでない最低ラインを定義します。しかし、これらのツールにできないのは、考えることです。エラーが運用上のものなのかプログラマーのミスなのかを判断することはできません。テストが正しい振る舞いをアサートしているかを評価することもできません。公開 API が、将来のコントリビューターが正しく実装できるほど明確にドキュメント化されているかを判断することもできません。プログラムされたチェックを行うことしかできないのです。</p>
+<p>ツールが検証できることと、長期にわたってユーザー、コントリビューター、プロジェクトに役立つ品質との間のギャップは、判断力によって埋められます。この文書が育てようとしているのは、まさにその判断力です。ツールを置き換えるためではなく、ツールを正しく方向づけるためのものです。</p>
+<hr>
+<h2 id="2-正直な評価コードベースが私たちに教えていること"><a class="header" href="#2-正直な評価コードベースが私たちに教えていること">2. 正直な評価：コードベースが私たちに教えていること</a></h2>
+<p>このセクションは批判ではありません。これは診断です。アーキテクチャ RFC で適用されたのと同じ枠組みがここにも適用されます：あなたは名前を付けれないものを改善することはできませんし、その詳細は、それらが具体的であるからこそ有用なのです。</p>
+<h3 id="21-証拠"><a class="header" href="#21-証拠">2.1 証拠</a></h3>
+<p>RFC §5574 のワークスペース分割は成功しました。クレートは存在し、トレイト境界も実体があり、コンパイラが依存方向を強制します。これは本当に良い仕事です。そして、それらの新しいクレートの内部では、元のモノリスを特徴づけていたのと同じパターンがそのまま引き継がれています。なぜなら、「実装レベルでの品質」とはどのようなものかについてチームが共通のモデルを持つ前に、コードベースが移行されてしまったからです。</p>
+<p>これらは測定された事実であり、推定値ではありません：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>メトリック</th><th>値</th><th>何を示しているか</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16,800行</td><td>現在、コードベースで最大のファイルです。元の <code>loop_.rs</code> はアーキテクチャRFCで9,500行と指摘されていましたが、これはそれを上回ります</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/mod.rs</code></td><td>11,813行</td><td>2番目に大きなファイル; 集中した責任を担う単一モジュール</td></tr>
+<tr><td><code>zeroclaw-runtime/src/onboard/wizard.rs</code></td><td>7,988行</td><td>1つのファイルに1つのワークフロー</td></tr>
+<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6,101行</td><td>モノリスの約9,500から削減：実質的で測定可能な進歩。それでもまだ大きい</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/telegram.rs</code></td><td>5,122行</td><td>1つのチャンネル実装；1つのファイル</td></tr>
+<tr><td><code>crates</code> 内の <code>.unwrap()</code> / <code>.expect()</code> 呼び出し</td><td>5,630</td><td>それぞれが、エラー処理に関する保留された判断です。§4.1 を参照してください</td></tr>
+<tr><td><code>src/</code> 内のレガシーな <code>.unwrap()</code> / <code>.expect()</code> 呼び出し</td><td>240</td><td>移行により、パターンが大規模に展開されました。</td></tr>
+<tr><td><code>zeroclaw-api</code> の公開関数</td><td>371</td><td>すべての基盤となる API サーフェス。他のすべてのクレートはこれに依存します</td></tr>
+<tr><td><code>zeroclaw-api</code> のドキュメントコメント行</td><td>~27</td><td>公開APIの未文書化率はおよそ14:1の比率、§4.2を参照</td></tr>
+<tr><td><code>#[allow(unused_imports)]</code> / <code>#[allow(dead_code)]</code> in legacy <code>src/</code> modules</td><td>約30以上のインスタンス</td><td>コンパイラは使用されていないコードを検出しましたが、その旨を報告しないように指示されています。</td></tr>
+<tr><td><code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code> をコードベース全体で</td><td>20</td><td>特筆して低く、ほとんどの負債が明示されずに潜在的であることを示唆しています</td></tr>
+</tbody>
+</table>
+</div>
+<p>最後の行には独自の注釈が必要です。この規模のコードベースにおいて、未完成の作業を示す明示的なマーカーが20個あることは、作業がほぼ完了したことを示すものではありません。それは、未完成の作業の大部分がそのようにラベル付けされていないことを示しています。ラベル付けされていない負債は、名前が付けられた負債よりも発見が難しく、優先順位付けが難しく、割り当てが困難です。沈黙は完了と同じではありません。</p>
+<h3 id="22-数字が示さないもの"><a class="header" href="#22-数字が示さないもの">2.2 数字が示さないもの</a></h3>
+<p>これらの数値は、計測可能なものを測定します。より重要な品質に関する質問は、数えることができません：</p>
+<ul>
+<li>5,630 個の <code>.unwrap()</code> 呼び出しがクリティカルパスにあるのか、テストユーティリティにあるのか</li>
+<li>既存のテストが動作をテストしているのか、実装の詳細をテストしているのか</li>
+<li><code>zeroclaw-api</code> の公開関数が、シグネチャと型のみを参照して正しく実装できるかどうか</li>
+<li>プロダクション障害中に出力されるログメッセージに、障害を診断するのに十分なコンテキストが含まれているかどうか</li>
+<li>セキュリティモジュールで作業しているコントリビューターが、どのデータが信頼境界を越えたか、そしてどのデータが越えていないかを理解しているかどうか</li>
+</ul>
+<p>これらは判断を要する質問です。CIゲートはありません。この文書が提案する基準と、私たちが一緒に築いていくレビューとメンターシップの文化があります。</p>
+<h3 id="23-すでに良い点"><a class="header" href="#23-すでに良い点">2.3 すでに良い点</a></h3>
+<p>診断が、本当に堅牢に構築されている部分を覆い隠してはならない。</p>
+<p><code>zeroclaw-api</code>のトレイト層は適切なアーキテクチャです。<code>Provider</code>、<code>Channel</code>、<code>Tool</code>、<code>Memory</code>、<code>Observer</code>、<code>RuntimeAdapter</code>、<code>Peripheral</code>は、整然とした、十分に考え抜かれた抽象化です。これらは適切な接合点です。問題は設計にあるのではありません。問題は、その設計がドキュメント、テストカバレッジ、エラー処理の規律において、まだ完全に表現されていないことです。このRFCは、そのギャップを埋めることを目的としています。</p>
+<p>セキュリティモデルは綿密に設計されています。ペアリングコード、自律レベル、サンドボックス層、ポリシー適用は、本物の設計意図を示しています。その意図は、信頼境界の近くでコードを書くすべての貢献者に理解される必要があり、この RFC は、それらの境界がどこにあるのかを貢献者が認識するための語彙を提供することも目的の一つとして存在しています。</p>
+<p>観測可能性インフラは成熟しています。OpenTelemetry、Prometheus、DORA メトリクスはすべて、クリーンな <code>Observer</code> トレイトに対して実装されています。インフラは整っています。課題は、コントリビューターがこれをどのように使用して、問題が発生した際に実際に役立てるかという点にあります。</p>
+<p>テストスイートが存在しないわけではありません。既存のテストへの投資は確かなものです。この RFC が述べる作業は、その投資の品質と配分に関するものです。つまり、何が、どのようにテストされ、そしてそのテストが見かけ通りのことを実際に証明しているかどうかについてです。</p>
+<p><a href="../architecture/decisions/ADR-004-tool-shared-state-ownership.html">ADR-004</a> は、アーキテクチャ記録の優れた一例です。これは、期待値が明確であればチームが高品質な設計ドキュメントを作成できることを証明しています。この RFC は、コード自体に対しても同等の期待値を提案するものです。</p>
+<hr>
+<h2 id="3-ゲートと基準中核的な違い"><a class="header" href="#3-ゲートと基準中核的な違い">3. ゲートと基準：中核的な違い</a></h2>
+<p>これは文書全体の核となる考え方です。§4の特定の手法よりも、これを明確に理解することが重要です。</p>
+<p><strong>ゲート</strong>はバイナリです。合格か不合格か。これは自動化され、ツールによって強制され、コードがマージされるための最小条件を定義します。CI/CD RFC がゲートを構築しました。それらは実際に動作しています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>ゲート</th><th>チェック対象</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cargo fmt --check</code></td><td>コードはワークスペース全体で一貫したフォーマットで記述されています。</td></tr>
+<tr><td><code>cargo clippy --workspace --all-targets -D warnings</code></td><td>Clippyが認識するアンチパターンはありません；ワークスペース全体</td></tr>
+<tr><td><code>cargo deny check</code></td><td>未確認のセキュリティアドバイザリなし；ライセンスおよびソースのコンプライアンス</td></tr>
+<tr><td><code>cargo nextest run --workspace</code></td><td>既存のテストはすべてパスします。</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>標準</strong>は理想を指します。それは、最低基準を上回る品質がどのようなものかを示します。標準は、判断、ピアレビュー、チームが一緒に築く習慣によって強制されます。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>標準</th><th>何を説明しているか</th></tr>
+</thead>
+<tbody>
+<tr><td>エラー処理の規律</td><td>障害はカテゴリ分けされ、運用上のエラーは適切なレイヤーでコンテキストとともに表示されます。</td></tr>
+<tr><td>API ドキュメント</td><td>すべての公開アイテムには、実装を読むことなく正しく使用するために十分なドキュメントがあります。</td></tr>
+<tr><td>テスト品質</td><td>テストは実装ではなく振る舞いを検証し、テストの難易度は設計フィードバックとして扱われます</td></tr>
+<tr><td>債務の優先順位付け</td><td>未対応の負債はラベル付けされ、特定され、リスク加重されます。高リスクの負債には所有者がいます。</td></tr>
+<tr><td>セキュリティ姿勢</td><td>信頼境界は、ポリシーレベルだけでなく、実装レベルでも明示的に定義されます。</td></tr>
+<tr><td>観測可能性の規律</td><td>ログメッセージは診断クエリに答えます。スパンは意味のある作業単位を束縛します。</td></tr>
+</tbody>
+</table>
+</div>
+<p>ゲートと基準は競合するものではありません。それらは補完的なレイヤーです。基準のないゲートは、すべてのチェックを通過するコードを生成しますが、ユーザーには失敗します。ゲートのない基準は強制できません。両方が必要です。現在、プロジェクトには適切なゲートと未熟な基準があります。</p>
+<blockquote>
+<p>コードベースはすべてのチェックを通過しても、次の開発者にとって理解不能なままになることがあります。エラーを表面化すべき場所で沈黙し、単体テストが不可能で、ユーザー入力とビジネスロジックが交差する境界で脆弱な状態になることもあります。緑のチェックマークは「このコードが私たちが定めたルールに適合したか」という問いには答えますが、「このコードが本当に良いか」という問いには答えません。これらは同じ問いではありません。</p>
+</blockquote>
+<p>これはゲートに対する批判ではありません。ゲートが価値を持つのは、まさにそれがすべての貢献者が作業する共有された強制可能なベースラインを定義しているからです。このドキュメントの目的は、そのベースラインを超えて「良い」とはどのようなものかを定義する共有された語彙と判断力を養うこと、そしてその判断をツールに委ねることができない理由を明確に説明することにあります。</p>
+<hr>
+<h2 id="4-七つの規律"><a class="header" href="#4-七つの規律">4. 七つの規律</a></h2>
+<h3 id="41-エラーハンドリングを設計上の課題として"><a class="header" href="#41-エラーハンドリングを設計上の課題として">4.1 エラーハンドリングを設計上の課題として</a></h3>
+<p>すべての <code>.unwrap()</code> 呼び出しは1つの判断です。コードベース内にある 5,630 個のほとんどは、意識的に行われたものではありませんでした。それらはデフォルトで行われたものです。なぜなら、<code>Result</code> や <code>Option</code> から値を取り出して先へ進みたいとき、<code>.unwrap()</code> が最も抵抗の少ない道だからです。デフォルトで行われた判断の問題点は、それが判断ではないということです。それらは先送りです。そして先送りされるのは、本質的な問いです。<em>ここで失敗したとき、何が起こるべきなのか？</em></p>
+<p>答えは、あなたが直面している障害の種類によって異なります。障害には3つの種類があり、それぞれに異なる適切な対応が必要です。</p>
+<p><strong>プログラマーエラー</strong>とは、正しいコードでは起こり得ないはずの不変条件の違反です。空でない <code>Vec</code> を要求する関数が、空のもので呼び出される。型システムが到達不可能にしているはずのアームに到達する enum マッチ。これらは運用上の障害ではなくバグ、つまり誤ったロジックを表します。これらに対する正しい対応は <code>panic!</code> です。なぜなら、目標はこれらをランタイムでユーザーの前で見つけることではなく、開発時に見つけることだからです。<code>assert!</code> と <code>debug_assert!</code> が適切なツールです。この状態が起こり得ない理由を説明するメッセージを添えた <code>.expect()</code> も、ここでは適切です。これにより推論が明示的かつ検索可能になり、次にコードを読む人がそのパニックが意図的だった理由を理解できるようになります。</p>
+<p><strong>運用エラー</strong>は想定される障害モードです。ネットワークのタイムアウト。存在しないファイル。期限切れのAPIキー。エラーステータスを返すプロバイダーのレスポンス。不正な形式の入力を行うユーザー。これらはバグではありません。世界と相互作用するシステムにおける通常の動作条件です。正しい対応は <code>Result&lt;T, E&gt;</code> です。<code>?</code> 演算子は、その障害について何をすべきかを判断するのにより適した立場にある呼び出し元へと、障害を伝播させます。運用エラーに対する <code>.unwrap()</code> は、遅延されたパニックです。それはいずれ、実際の条件下で、実際のユーザーの目の前で、有用なコンテキストもなく、回復する機会もなく発火します。</p>
+<p><strong>構成エラー</strong>は、起動時に検出される不正または欠落した構成です。正しい対応は、迅速に、かつ具体的に失敗することです。スタックトレースを伴うパニックでも、曖昧な「無効な構成」メッセージでもありません。特定のフィールドを指し示し、期待される内容を説明し、オペレーターに何を提供すべきかを伝えるメッセージです。構成ミスによって ZeroClaw を起動できないユーザーは、何を修正すべきかを正確に理解した上でプロセスを終了できるべきです。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>失敗の種類</th><th>これは何を意味するのか</th><th>正しい応答</th></tr>
+</thead>
+<tbody>
+<tr><td>プログラマーのエラー</td><td>不変条件違反; 正しいコードでは発生し得ない</td><td><code>panic!</code>、<code>assert!</code>、<code>.expect("この処理は安全である理由")</code></td></tr>
+<tr><td>運用エラー</td><td>予期される失敗モード：世界が協力していない</td><td><code>Result&lt;T, E&gt;</code>、<code>?</code>、コンテキスト付きの構造化エラー型</td></tr>
+<tr><td>設定エラー</td><td>無効または欠落した起動設定</td><td>具体的で実行可能なメッセージで迅速に失敗する</td></tr>
+</tbody>
+</table>
+</div>
+<p>すべての <code>.unwrap()</code> や <code>.expect()</code> の前に、自問してください。これはどの種類の失敗なのか、と。答えが「プログラマーのエラー：この状態は正しいコードでは発生しえない」であれば、その理由を説明するコメントを添えた <code>.expect()</code> が正しい選択であり、将来コードを読むすべての人にあなたの考えを伝えられます。それ以外の答えであれば、<code>?</code> を使うか、失敗を明示的に処理してください。</p>
+<p><code>?</code> 演算子は、それが何を <em>する</em> かだけでなく、何を <em>語る</em> かを理解する価値があります。それは次のように語ります。この操作は失敗し得ることを私は認識している。私はその失敗を明示的に呼び出し元へ伝播しており、呼び出し元はそれにどう対処するかを判断するのにより適した立場にある、と。この認識はアーキテクチャ上意味を持ちます。エラー処理の契約を呼び出し箇所で可視化し、最も多くのコンテキストを持つ層へ判断を委ねるのです。</p>
+<p>目標は <code>.unwrap()</code> の呼び出し数をゼロにすることではありません。中には適切な使用例もあります。目標は、すべての <code>.unwrap()</code> が明示的な判断に基づいており、コードを読む人なら誰でもその理由を理解できるようにすることです。<code>.unwrap()</code> と <code>.expect("this vec is guaranteed non-empty by the caller — see §4.2 of the SOP engine invariants")</code> の違いは、単なるスタイルの問題ではありません。それは「判断を先送りすること」と「判断を文書化すること」の違いです。</p>
+<h3 id="42-promise-としての公開-api-表面"><a class="header" href="#42-promise-としての公開-api-表面">4.2 Promise としての公開 API 表面</a></h3>
+<p><code>pub</code> はコントラクトです。</p>
+<p>関数、構造体、トレイト、またはモジュールを公開としてマークすると、すべての呼び出し元に約束をするということです。これには、あなたの元の意図を覚えていない状態で来月にこれに対して実装する貢献者も含まれます。これには、実装を生成するためにあなたのクレートを読むAIアシスタントも含まれます。これには、これが何を意図していたのかを理解する必要がある本番環境のインシデントをデバッグする人も含まれます。これには、2ヶ月間別の作業をした後にこのコードに戻ってくるあなた自身も含まれます。</p>
+<p>ドキュメントのない公開アイテムは、条項のない約束のようなものです。呼び出し側は、あなたがそれを書いたときにどのような前提を置いたのか、どのようなエラー条件をどのような状況で返すのか、どのような副作用があるのか、並行して呼び出しても安全かどうか、似た名前を持つ2つの関数の微妙な違いは何かを知る術がありません。あなたが3文で伝えられたはずのことを、名前、型シグネチャ、実装本体から推測するしかないのです。</p>
+<p><code>zeroclaw-api</code> の状況は、直接名前を挙げるに足るほど具体的です。これはアーキテクチャ全体が依存する唯一のクレートです。ワークスペース内のすべてのプロバイダー、チャネル、ツール、メモリーバックエンド、オブザーバー、ランタイムアダプター、そして周辺機器の実装は、これらのトレイトと型に対して構築されています。この基盤における文書化されていないインターフェースは、それを実装するすべてのクレート、それを動作させるすべてのテスト、そしてそれを扱うすべての AI 生成コードに混乱を伝播させます。文書化されていない公開 API サーフェスの 14:1 という比率は、ドキュメントのスタイル上の好みではありません。それは、アーキテクチャ RFC がシステムで最も重要な層であると述べた契約におけるギャップなのです。</p>
+<p>ここでのAIの観点は実践的で直接的です。ドキュメントのない関数を呼び出したり、トレイトを実装したりするようAIアシスタントに依頼すると、AIは名前と型シグネチャから意図を推測します。その推測が正しいこともあります。しかし、より多くの場合、コンパイルが通り、型チェッカーをパスするものの、AIが予測しようがなかった特定の条件下では正しく動作しないコードが生成されます。なぜなら、それを誰も書き残していないからです。ドキュメントは人間のためだけのものではありません。それは、あなたのコードと関わるすべてのツール、そしてあなたのコードに依存することになるすべての人に提供する仕様書なのです。</p>
+<p>少なくとも、<code>zeroclaw-api</code> のすべての公開項目には以下が含まれている必要があります：</p>
+<ul>
+<li><strong>それが何をするかを1文で説明します。</strong> 何であるかではなく、何をするかを説明します。</li>
+<li><strong><code># Errors</code> セクション</strong> (返り値が <code>Result</code> の場合): この関数がどのような条件で失敗し、呼び出し元が処理すべきエラーバリアントは何か。</li>
+<li><strong><code># Panics</code> セクション</strong> (パニックを引き起こす可能性がある場合): どのような条件で、なぜパニックが発生するのか？</li>
+<li><strong>前提条件</strong>（明らかなもの以外）: この関数を呼び出す前に満たされていなければならない条件は何ですか？</li>
+</ul>
+<p>パブリックなトレイトメソッドに付けられた3文のドキュメントコメントは、説明のない100行の実装よりも、次の実装者にとって価値があります。実装はコードが何をするかを伝えます。ドキュメントはコードが何をするべきかを伝えます。これは、両者が食い違ったときに重要となる点です。</p>
+<h3 id="43-テストを設計フィードバックとして"><a class="header" href="#43-テストを設計フィードバックとして">4.3 テストを設計フィードバックとして</a></h3>
+<p>テストの目的は、緑色のチェックマークを生成することではありません。目的は、あるコードが <em>何をすべきか</em> を正確かつ実行可能な形で記録することにあります。その記録は、振る舞いが変わった際には大々的に失敗する必要があります。</p>
+<p>この区別が重要なのは、テストには根本的に異なる2つの種類があり、そのうち1つだけがその目標を達成するからです。</p>
+<p>構造体の内部状態に踏み込み、値を直接設定し、メソッドを呼び出して戻り値をアサートするテストは、<em>実装</em> をテストしています。実装が変わった場合、同じ振る舞いを別のメカニズムで実現した場合、ユーザーが気にする部分は何も変わっていないにもかかわらず、テストは壊れてしまいます。これはリファクタリングに対する摩擦を生み出すだけで、安全性は生み出しません。また、テストが想定していなかった形で振る舞いが誤っている場合に、テストが通ってしまう傾向もあります。</p>
+<p>パブリックインターフェースを通じて値を構築し、パブリックメソッドを通じて動作を実行し、観測可能な結果に対してアサーションを行うテストは、<strong>振る舞い</strong>をテストしています。実装が変更されても振る舞いが維持されていれば、テストは成功します。ユーザーにとって重要な振る舞いの変更が発生した場合、テストは失敗します。これにより、自信を持ってリファクタリングを行うことが可能になります。テストは、特定の手段で結果を得たかどうかではなく、正しい結果が得られたかどうかを確認しているからです。</p>
+<p>より重要な原則は、診断的なものです：</p>
+<blockquote>
+<p>テストの記述が難しい場合は、通常、設計に関する何らかの問題を示しています。</p>
+</blockquote>
+<p>ある関数のユニットテストを書くために、データベース接続を確立し、6つの依存関係をモック化し、完全な構成オブジェクトを構築し、非同期ランタイムを明示的に起動する必要があるなら、その関数はおそらく多くのことをやりすぎているか、依存しすぎているか、アーキテクチャの誤った層に位置している可能性があります。この難しさは回避すべき厄介事ではありません。これはフィードバックなのです。テストは、コードがまだ正直になれていない何かについて正直に語っているのです。</p>
+<p>これはアーキテクチャRFCで確立されたクレート構造に直接結びついています。クレート分解の目的の一つは、独立してテストできるコンポーネントを作成することでした。<code>zeroclaw-tool-call-parser</code> は <code>&amp;str</code> 入力でランタイムなしにテストできるべきです。<code>zeroclaw-config</code> は config 構造体を直接構築してテストできるべきです。<code>zeroclaw-api</code> のトレイト実装は、本番フルスタックではなく、トレイトのフェイク実装に対してテストできるべきです。コンポーネントを環境全体なしにテストできないと感じたときは、アーキテクチャが意図していなかった依存関係が実装に入り込んでいないか問いかけてください。テストが答えを示してくれているのです。問題は、あなたがそれに耳を傾けているかどうかです。</p>
+<p>テストの品質を時間とともに高めるための実践的なアプローチ：</p>
+<ul>
+<li>バグを修正する際には、そのバグを検出できるテストを作成してください。この習慣を一貫して実践することで、テストスイートは実際に重要な失敗モードに近づいていきます。</li>
+<li>振る舞いを追加する際は、その振る舞いが存在し、独立して検証できることを証明するテストを書いてください。</li>
+<li>テストを書くのが難しい場合は、モックを使う前に「なぜ」かを考える時間を設けましょう。その答えは、あなたが書こうとしていたテストよりも通常は価値があります。</li>
+</ul>
+<h3 id="44-技術的負債の優先順位付け"><a class="header" href="#44-技術的負債の優先順位付け">4.4 技術的負債の優先順位付け</a></h3>
+<p>「負債」という言葉が有用なのは、適切な含意を持っているからです。つまり、利息が発生するということです。コードベースのトラフィックの多い領域で精査されないまま放置された負債は、複利的に膨らみます。新しいコードはその存在に適応し、新しい前提が古い前提の上に積み重なり、その対処コストはその上に追加されるレイヤーごとに増大していきます。</p>
+<p>技術的負債に対してチームが犯す最も一般的な誤りは、それを二元的に捉えることです。つまり、「すべてが負債であり、何も対処できない」か、「何も負債ではなく、時間を費やすべきではない」という立場です。どちらの立場も間違っています。有用な質問は、「現在、どの負債がどの場所で最も大きなリスクを伴っているか」です。</p>
+<p>優先順位は2つの軸によって決定されます。</p>
+<p><strong>信頼境界への近接性。</strong> ユーザー入力を処理する、セキュリティポリシーを適用する、ツールを実行する、認証を管理する、または外部ソースからのデータを処理するコードは、信頼境界の近くで動作しています。ここでの失敗は、悪用され、状態が静かに破損したり、セキュリティ上の影響を伴う誤った動作を引き起こしたりする可能性があります。信頼境界付近の負債は、その規模に対して不均衡なリスクを伴います。</p>
+<p><strong>影響範囲。</strong> 他のすべてが依存する基盤である <code>zeroclaw-api</code> の負債は、単一チャネルの実装における負債よりも影響範囲が大きくなります。基盤となる型における誤った前提は、その型が使われるあらゆる場所に波及します。リーフクレートの負債は、そのクレートの利用者にのみ影響します。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>広範な影響範囲</th><th>低爆発半径</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>信頼境界の近く</strong></td><td>現在のサイクルのアドレス</td><td>次の計画されたサイクルで対応</td></tr>
+<tr><td><strong>信頼境界から遠く離れて</strong></td><td>計画されたリファクタリングで対応</td><td>隣接する作業が通過する際に、適宜対応する</td></tr>
+</tbody>
+</table>
+</div>
+<p>このフレームワークにより、セキュリティポリシーの適用パスにおける <code>.unwrap()</code> は、CLIの表示フォーマッターにおける <code>.unwrap()</code> とは異なる問題であることがわかります。どちらも 5,630 件のカウントに含まれます。このカウントは範囲を示し、トリアージは優先度を示します。</p>
+<p>ファイル内で作業していて、負債に気づいたとき—処理されていない運用エラーを表す <code>.unwrap()</code>、4つの別々の関心事を扱うまでに肥大化した関数、誰も呼び出していない何かを黙らせている <code>#[allow(dead_code)]</code>—すべてを修正する必要はありません。問うべきは、これは高リスクな箇所にあるかどうかです。そうであれば、このPRで対処するか、具体的な箇所、リスク、提案する担当者を記したフォローアップのissueを起票してください。そうでなければ、<code>// TODO(debt): &lt;description&gt;</code> というコメントでマークし、緊急にすることなく可視化できます。やってはいけないのは、まったくマークせずに放置することです。なぜなら、沈黙こそが、誰もその傾向に気づくことなく5,630件もの先送りされた決定が積み重なる原因だからです。</p>
+<p>Strangler Fig パターンはこのレベルでも適用できます。アーキテクチャ RFC ではクレートレベルでこれを適用しました。つまり、古い構造の周りに新しい構造を構築し、時間をかけて内側へ移行していくのです。同じパターンは大きなファイルの内部でも機能します。<code>schema.rs</code> を 1 つの PR で書き直すことはありません。信頼境界に最も近い関数、最も頻繁に変更される関数、最もテストしづらい関数を特定し、それらを最初に抽出して、構造を段階的に改善し、残りはチームが維持できるペースで追従させていくのです。</p>
+<h3 id="45-アプリケーションレイヤーのセキュリティ"><a class="header" href="#45-アプリケーションレイヤーのセキュリティ">4.5 アプリケーションレイヤーのセキュリティ</a></h3>
+<p>CI/CD RFC は、サプライチェーンのセキュリティ姿勢を確立しました。<code>cargo deny</code> は依存関係の既知の脆弱性を検出し、ライセンスのコンプライアンスを強制し、依存関係が承認されたソースから来ることを保証します。これはプロジェクトに導入されるものの免疫システムです。このセクションでは、実行されるコードのセキュリティ姿勢について説明します。</p>
+<p><code>cargo deny</code> は、アプリケーションのロジックが引き起こす脆弱性を検出できません。ユーザー入力がビジネスロジックに到達する前に検証されているかどうかを判断することはできません。ツール実行が強制すべき自律レベルを遵守しているかどうかを判断することもできません。エラーパスがセキュリティチェックの失敗を静かに無視しているかどうかを判断することもできません。これらは、信頼境界がどこにあるか、そしてその両側で責任あるコードがどのようなものかを知っているコントリビューターに依存します。</p>
+<p>信頼境界の近くで書かれるすべてのコードを導くべき3つの原則：</p>
+<p><strong>信頼境界は暗黙ではなく明示的に扱う。</strong> 信頼境界とは、あなたの直接的な制御の外からデータが到着するあらゆる地点を指します。つまり、あらゆるチャネルからのユーザー入力、プロバイダーからのAPIレスポンス、ファイルシステムからのファイル内容、プラグインの出力、ツールの結果、ハードウェアの読み取り値などです。すべての信頼境界で、処理する前に検証してください。あなたが生成したわけではないデータの形式、サイズ、型、内容を前提にしてはいけません。ZeroClawのセキュリティモデルは、これらの境界をポリシーレベルで定義します。実装はそれらをコードレベルで反映すべきです。これはポリシーが失敗するからではなく、多層防御とは、他のすべての層が自分の役割を果たしたと信頼するのではなく、システムの各層がそれぞれ自分の役割を果たすことを意味するからです。</p>
+<p><strong>最小限のフットプリント。</strong> ファイルを読み取る必要のある関数が、ファイルを書き込めるべきではありません。あるチャネルのメッセージを処理するトレイト実装が、別のチャネルの状態にアクセスできるべきではありません。自律性レベル1で動作するツールが、レベル3を必要とする機能を行使できる立場にあるべきではありません。セキュリティモデルはすでにこれらの制約を定義しています。規律とは、目下のタスクに必要以上の機能を取得しない実装を書くこと、そして実装が意図された範囲外のものに手を伸ばそうとしているときにそれに気づくことにあります。</p>
+<p><strong>セキュリティ境界の近くでは大きく失敗させる。</strong> セキュリティチェックのエラー、ポリシー評価の失敗、署名検証の失敗、認可されていないツール呼び出しの試行、ペアリングコードの不一致は、決して暗黙のうちに握りつぶされてはならない。それらはログに記録され、伝播され、明示的に処理されるべきである。表示ヘルパーのエラーはログメッセージとともに正常に復旧できる。認可パスのエラーはそうはいかない。自分がどの種類の関数を書いているのかを把握し、その判断に基づいて、その関数からの失敗をどれだけ積極的に表面化させるかを決めること。</p>
+<p>これらは高度なセキュリティ原則ではありません。これらは、ユーザーが影響を与えられる何かに触れるあらゆるコードに適用される、基本的な衛生管理です。アーキテクチャRFCでは、セキュリティモデルを「熟慮されたもの」と表現していました。このRFCが求めている作業は、その熟慮を実装レベルで読み取れるようにすることです。すなわち、入力を検証する関数において、ポリシー違反を処理するエラーパスにおいて、そしてシステムが求められたこととシステムが実際に行うことの境界において、それを明確にすることです。</p>
+<h3 id="46-観測可能性としてのデバッグ性"><a class="header" href="#46-観測可能性としてのデバッグ性">4.6 観測可能性としてのデバッグ性</a></h3>
+<p>可観測性インフラは成熟しています。OpenTelemetryによるトレーシング、Prometheusメトリクス、DORAトラッキング、そして洗練された<code>Observer</code>トレイトがすべて整備されています。これはプロダクション品質の成果です。教育上のギャップは、インフラを「持っていること」と、何か問題が発生したときに（理想的には何が問題なのかわかる前に）実際に役立つ形で「使うこと」との間にあります。</p>
+<p>2つのログメッセージを考慮します。どちらもコンパイルが成功し、CIをパスし、構文的に正しいです。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(リクエストに失敗しました);
+<span class="boring">}</span></code></pre>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(
+    provider = %provider_name,
+    model    = %model_id,
+    user     = %sender_id,
+    tool     = %tool_name,
+    attempt  = attempt,
+    elapsed  = ?elapsed,
+    err      = %e,
+    プロバイダーのリクエストに失敗しました — リトライが尽きました
+);
+<span class="boring">}</span></code></pre>
+<p>1つ目は記録です。何かがうまくいかなかったことを伝えています。2つ目は_診断_です。重要な疑問に答えています。つまり、私たちは何をしようとしていたのか、どのような状況で、どのようなパラメータで、そして正確には何がうまくいかなかったのか、ということです。両者の違いは技術的な洗練度にあるのではありません。メッセージを書いた人が、いつかそれを読む必要に迫られる人のことを考えていたかどうかにあるのです。</p>
+<p><code>warn</code> 以上のレベルでログメッセージを出力する前に問うべき質問は：</p>
+<blockquote>
+<p>この失敗を最も重要な瞬間に診断する必要がある人が知るべきことは何ですか？</p>
+</blockquote>
+<p>その人物は、このコードを書いたことを忘れてしまった6ヶ月後のあなたかもしれません。このモジュールを一度も見たことがない別のコントリビューターかもしれません。ターミナルからコピーしたログの抜粋を添えてバグレポートを提出するユーザーかもしれません。彼らのために書いてください。ほぼ常に重要なフィールドは、何を目指していたのか、その時点でどのような文脈が考慮されていたのか、そして具体的に何が間違っていたのかです。</p>
+<p>同じ原則がトレーススパンの設計にも適用されます。スパンは意味のある作業単位を表し、その作業を理解するために必要なコンテキストを含み、フラムグラフやトレースビューアで読んだときに意味のある名前を持つべきです。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// レコード
+let _span = span!(Level::INFO, プロセス);
+
+// 診断情報
+let _span = span!(
+    Level::INFO,
+    "エージェントのツール呼び出し",
+    tool = %tool_name,
+    turn = turn_number,
+    sender = %sender_id,
+);
+<span class="boring">}</span></code></pre>
+<p>構造化ロギングと意味のあるスパン設計は、好みのスタイルではありません。それらこそが、既に持っているオブザーバビリティ基盤を実際に役立つものにするものです。これは開発中だけでなく、あなたが決して目にすることのないハードウェア上で、あなたが想定していなかった構成で、あなたが計画していなかったエラーに遭遇しながらZeroClawを実行するユーザーの手の中でも同様です。基盤は能力を生み出します。その能力が診断可能なシステムに結実するかどうかは、貢献者がそれをどのように使うかという規律によって決まります。</p>
+<h3 id="47-床面より上の作業"><a class="header" href="#47-床面より上の作業">4.7 床面より上の作業</a></h3>
+<p>これまでの6つの規律は、それぞれ特定の領域を扱ってきました。本セクションでは、それらを統合し、「水準を満たした状態」が実際にどのようなものかを一枚の絵として示します。すなわち、本RFCに記載された基準を満たすコードに出会ったとき、レビュアー、将来のコントリビューター、またはユーザーが実際に体験することです。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>次元</th><th>フロアでは、ゲートはそのまま通過します</th><th>床より上、標準に準拠</th></tr>
+</thead>
+<tbody>
+<tr><td>エラー処理</td><td>コードはコンパイル済みで、Clippyの警告はありません。</td><td>失敗はカテゴリ分けされ、運用上のエラーはコンテキスト付きで表示され、パニックは意図的かつ文書化されています。</td></tr>
+<tr><td>ドキュメント</td><td>ドキュメントテストが存在する場合は、それらがパスします。</td><td>すべての公開アイテムは、実装を読むことなく正しく理解し、使用することができます。</td></tr>
+<tr><td>テスト</td><td>存在するテストはすべてパスします</td><td>テストは振る舞いを検証します。テストの難易度は設計フィードバックとして扱われ、重要な失敗モードがカバーされます。</td></tr>
+<tr><td>負債</td><td>コンパイラのエラーや警告なし（残りは <code>#[allow]</code> で抑制済み）</td><td>負債はラベル付けされ、配置され、リスク加重されます。高リスクの負債には所有者とタイムラインがあります。</td></tr>
+<tr><td>セキュリティ</td><td><code>cargo deny</code> が成功しました</td><td>信頼境界は明示的であり、セキュリティ上の失敗は明確に表面化し、実装は意図された範囲を尊重します。</td></tr>
+<tr><td>観測性</td><td>コードが実行され、何かを出力する</td><td>ログメッセージは診断クエリに答えるものであり、スパンは有用なコンテキスト付きで意味のある作業単位を束縛します。</td></tr>
+<tr><td>コードの構成</td><td>ファイルはコンパイル済みです。モジュール構造が存在します。</td><td>関数は1つのことを行い、ファイルは関連する懸念事項をグループ化します。大きなファイルは抽出の候補となりますが、それが通常ではありません。</td></tr>
+</tbody>
+</table>
+</div>
+<p>これらすべてを完全に自動化で実現することはできません。すべては、なぜそれが重要なのかを理解し、一貫して適用するための判断力を備えたコントリビューターによって実現可能です。この文書はまさにその目標に向かって進んでいます。</p>
+<hr>
+<h2 id="5-ai支援開発が意味すること"><a class="header" href="#5-ai支援開発が意味すること">5. AI支援開発が意味すること</a></h2>
+<p>文化に関するRFCでは、共同作業チームの一員としてAIツールをどのように活用するかを扱いました。このセクションでは、より具体的な点を扱います。すなわち、AIが生成したコードが上記の基準に直面したときに何が起こるのか、そして基準を満たさない場合にそのギャップを認識して解消するために何が必要なのか、ということです。</p>
+<p>AIツールは、実際には「通過」に非常に優れています。コンパイルが成功し、型チェッカーを満たし、Clippyのチェックをパスし、実装とともにテストも生成します。これは確かに価値あることであり、このセクションはその価値を軽視するものではありません。問題は、AIツールが信頼できないことではありません。問題は、AIツールが「チェックを通過するコード」を生成するという「間違ったこと」に対して信頼できる点にあります。</p>
+<p>理由は構造的なものです。AI は推論できる内容に対してコードを生成します。関数にドキュメントがなければ、AI は名前とシグネチャから意図を推論しますが、その推論が正しいこともあれば、誰もテストしなかった条件下でのみ表面化する、わずかに誤った動作を生み出すこともあります。エラー型にいつ返されるかのドキュメントがなければ、AI はバリアントの名前に基づいて処理します。テストスイートが動作ではなく実装をテストしている場合、AI はそれらのテストに一致する実装を生成しますが、それはテストが本来捉えるはずだった意図された動作に一致することもしないこともあります。AI 出力の品質の上限は、あなたが提供するコンテキストの品質によって決まります。より良いコンテキスト、より明確なドキュメント、より具体的なエラー型、動作に焦点を当てたテストは、より良い出力を生み出します。未成熟なコンテキストは、ゲートを通過してしまい、その判断を次にレビューする誰かに先送りする出力を生み出します。</p>
+<p>これは、AI ツールを利用するコントリビューターにとって、具体的かつ必須の責任を生み出します。</p>
+<p><strong>AIが書いたからといってレビューが省略できるわけではありません。</strong> カルチャーRFCではこの点を明確に述べており、具体例とともに改めて強調する価値があります。AI生成コードをレビューする際、コンパイルが通るか、テストがパスするかというゲート質問は、レビューの終わりではなく始まりです。標準的な質問は次のとおりです。これは運用エラーを正しく処理しているか、それとも<code>.unwrap()</code>しているか。新しい公開APIは文書化されているか。テストは振る舞いをアサートしているか、それとも実装をアサートしているか。これは信頼境界の近くにあるか、もしそうなら入力を検証しているか。これらの質問は、誰がコードを書いたか、あるいはどのツールで生成したかにかかわらず、あなたの責任です。</p>
+<p><strong>AIはあなたの判断力を増幅するものであり、判断力の欠如を補うものではありません。</strong> 適切なエラー処理がどのようなものかについてのメンタルモデルをまだ持っていない貢献者は、AIが生成したエラー処理を額面どおりに受け入れてしまいます。<code>.unwrap()</code> も含めてです。§4.1を理解している貢献者は、同じ出力を見て、ツールにこう指示できます。「これは運用上のエラーパスだ。<code>?</code> を使い、コンテキストを付けて失敗を呼び出し元に伝播させよ」。ツールは修正版を生成します。同じパターンが§4のすべての規律に当てはまります。このツールは、何を求めるべきかを知っている人の手にかかれば強力です。その指示がなければ、ツールはコンパイラを満足させるだけのコードを生成し、本当の意思決定をチェーンの次の人に先送りしてしまいます。</p>
+<p><strong>この関係は双方向に増幅されます。</strong> 標準を理解しているチームは、ツールが改善するにつれてAIツールから段階的に多くの価値を得られます。なぜなら、より高性能なツールをより正確に指示できるからです。「ツールが生成したもの」と「標準が要求するもの」とのギャップは、手作業での書き直しではなく指示によって埋められるものになります。その判断力を養わないチームは、同じ品質の下限へより速く到達できますが、それを超えていく能力は持ちません。本書全体で説明されている投資は、チームが今後使用するあらゆるAIツールの長期的な有効性への投資でもあります。なぜなら、それらのツールの価値は、それらを指示する判断の明確さに比例して拡大するからです。</p>
+<hr>
+<h2 id="6-クラフトの移植性"><a class="header" href="#6-クラフトの移植性">6. クラフトの移植性</a></h2>
+<p>テクノロジーは変化します。その変化は反復ごとに前回よりも速くなり、その速度は加速しています。本ドキュメントで取り上げる具体的なツール—Rust、<code>cargo</code>、<code>clippy</code>、OpenTelemetry SDK、チームが現在使用しているAIアシスタント—は、いずれ置き換えられるでしょう。中にはこのプロジェクトの存続期間中に置き換わるものもあります。プラットフォームは変わります。言語は進化します。ツールのエコシステムは、5年後には今日とは異なる姿になり、10年後にはさらに異なる姿になるでしょう。</p>
+<p>この文書内のメンタルモデルは変更されません。</p>
+<p>「ここで失敗したとき何が起こるべきか、そして誰がそれを知る必要があるのか?」という問いは、言語が変わっても消えることはありません。あなたは次に学ぶ言語でも同じ問いを発するでしょう。「言語」がワイヤープロトコルである分散システムを設計するときにも、その問いを発するでしょう。他の人々が依存していて、あなた自身では監督できないものを構築するときには、いつでもこの問いを発するでしょう。それに答えるための具体的な Rust のメカニズム、つまり <code>Result&lt;T, E&gt;</code>、<code>?</code> 演算子、コンテキストを持つ構造化されたエラー型は、あらゆる場所に存在する問いに対する一つの答えなのです。</p>
+<p>「私が約束しているパブリックインターフェースとは何であり、私のドキュメントはその約束を反映しているか?」という問い。あなたはこの問いを、APIを設計するとき、技術仕様書を書くとき、チームの責任範囲を定義するとき、別のチームやAIツール、クライアント、請負業者に要件を伝えるときに投げかけることになるでしょう。パブリックインターフェースにおける約束と条件のモデルは、Rustをはるかに超え、ソフトウェアの領域をもはるかに超えて適用されます。</p>
+<p>「私のテストは実際に何を証明しているのか?」という問いは、ソフトウェアの枠を超えて、システムが意図したとおりに動作することを検証する必要のあらゆる領域に及びます。この問いを立てる直感、つまり実装が存在するという証拠と、正しいことが起こっているという証拠を区別する力こそがスキルなのです。それをRustで表現するための構文は、付随的なものにすぎません。</p>
+<p>「この障害を診断する必要がある人は、何を知っておく必要があるのか?」という問いは、他者が依存するものを構築する際にはどんなものにも当てはまるエンジニアリング上の問いです。それはまた、より深いレベルでは、共感に関する問い、つまりあなたの仕事の向こう側にいる人が、予測できない瞬間に、あなたがその場で提供できない文脈の中で、本当の問題を抱えた本当の人間であることを忘れないでいるための問いでもあります。</p>
+<blockquote>
+<p>あなたはRustを学んでいるのではありません。Rustという手段を通じて、信頼できるものを構築する方法を学んでいるのです。これは応用が利きます。実践し続ける限り、あらゆる言語、あらゆるシステム、あらゆるチーム、そしてあなたが関わるあらゆる領域にわたって、その力は積み重なっていきます。</p>
+</blockquote>
+<p>これは、プロジェクトがあなたに対して行う投資です。特定の技術スキルではなく、次にあなたが作るものに対して判断力、技術力、そして細部へのこだわりをどのように発揮するかという能力に対する投資です。そしてそれは、やがてあなたが作ったものによって支えられる人々一人ひとりに対する、あなた自身の投資でもあります。</p>
+<hr>
+<h2 id="7-貢献者にとっての意味"><a class="header" href="#7-貢献者にとっての意味">7. 貢献者にとっての意味</a></h2>
+<p><strong>Rust やソフトウェア開発が初めての方へ:</strong></p>
+<p>§4 の 7 つの規律は、貢献を始める前に習得しなければならない要件ではありません。これらは領域の地図です。作業を進める中で遭遇する事柄を、目にしたときに何を見ているのか分かる程度に明確に名付けたものです。</p>
+<p>§4.1 から始めましょう。エラーハンドリングのメンタルモデルは、早期に内面化できる最も効果的な概念の一つであり、これは Rust に限定されたものではありません。既存のコードを読み、<code>.unwrap()</code> に遭遇した際には、それがどのカテゴリに該当するかを自問してください。新しいコードを書く際にも、同様に自分の選択について自問しましょう。この習慣を一貫して実践することで、影響を受けるすべてのファイルが改善され、その判断力はあなたのキャリアを通じて役立つようになります。</p>
+<p>これらの基準を適用する準備が整うまで待たないでください。完璧でなくても構いません。何に該当するか分からない場合は質問し、レビューで受け取るフィードバックを、それが意図している通り学習の機会として捉えてください。こうしたことを最初から知っている人なんていません。ここであなたが行っているような作業を通じて、ゆっくりと学んでいったのです。</p>
+<p><strong>AIツールを使用して貢献する場合は:</strong></p>
+<p>本ドキュメントの基準は、入念なレビューがAI生成コードを評価する際の判断材料となるものです。同時に実務的には、AIの出力がレビューに到達する前により正確なものとなるためのコンテキストでもあります。AIに何かを実装するよう依頼する前に、それが実装対象とするインターフェースが文書化されているかどうかを確認してください。文書化されていない場合は、まずそれを文書化するか、その文書化作業をAIに依頼する内容の一部に含めてください。そうすることで出力はより正確になり、基盤における実際のギャップを埋めることができ、後から関わる次のコントリビューターもその両方の恩恵を受けられます。</p>
+<p>AI生成のコードに対するレビューフィードバックは、AIの使用に関するフィードバックではなく、コード自体に対するフィードバックとして受け取ってください。基準は著作者に関係なく一律に適用されます。常に問われるべきは、このコードが基準を満たしているかどうかです。もし満たしていない場合、何がどう変わるべきで、その理由は何でしょうか？</p>
+<p><strong>プルリクエストをレビューする場合:</strong></p>
+<p>ゲートとなる問い、すなわちコンパイルが通るか、テストがパスするか、Clippy が受け入れるか、これらは最低限の基準であって、到達すべき上限ではありません。これらの問いに答えるだけのレビューは、不完全なレビューです。§3 のフレームワークと §4 の規律を用いて、あなたの観察を構造化してください。適用している基準に名前を付け、それがなぜ重要なのかを説明し、ブロッキングとなる懸念事項を非ブロッキングの提案から明確に区別してください。</p>
+<p>レビューの目的は、欠点を見つけることではありません。理解を伝えることです。「これは運用上のエラーパスです。ここで <code>.unwrap()</code> が本番環境のリスクを生む理由と、代わりに何を使うべきか」といった説明を含む具体的なフィードバックの一つひとつは、レビュー対象となる貢献者への投資です。その投資は積み重なっていきます。原則を理解した貢献者は、再び指摘されることなく、それが重要となる次の10の状況でその原則を正しく適用するでしょう。</p>
+<p><strong>メンテナーまたは経験豊富なコントリビューターの場合:</strong></p>
+<p>これらの基準を現実のものにする上で、あなたは最も適した立場にいます。それは上から強制することによってではなく、あなた自身のコードで手本を示し、レビューで名前を挙げて言及することによってです。オープンソースプロジェクトで最も効果的な教育は、ドキュメントの中ではなく、PRスレッドやコードコメントの中で行われます。このドキュメントは語彙を提供します。それを日々のレビューで一貫して使うことこそが、ページ上の言葉から共有された実践へと変えるのです。</p>
+<p>運用エラーのパスで <code>.unwrap()</code> を見つけたら、それをそのものとして指摘してください。ドキュメントのない公開関数を見つけたら、次の問いを投げかけてください。将来の実装者がここで知っておくべきことは何か、と。妥当なリファクタリングで壊れてしまうテストを見つけたら、なぜそれが重要なのかを説明してください。これらは訂正ではありません。経験豊富なコントリビューターが提供できる最も重要なことの一つとして文化に関するRFCが特定した、継続的なメンターシップなのです。</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../contributing/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../contributing/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

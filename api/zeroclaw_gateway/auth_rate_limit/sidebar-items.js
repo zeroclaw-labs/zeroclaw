@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LOCKOUT_SECS","MAX_ATTEMPTS","WINDOW_SECS"],"struct":["AuthRateLimiter","RateLimitError"]};

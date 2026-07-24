@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["VecRoute"],"fn":["enum_variants","kebab_to_snake","make_prop_field","object_array_json_display_value","resolve_field_path","route_double_hashmap_path","route_hashmap_path","route_vec_path","serde_get_prop","serde_set_prop","validate_alias_key"]};

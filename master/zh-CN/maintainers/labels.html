@@ -1,0 +1,709 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>标签 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-11197ad7.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="标签"><a class="header" href="#标签">标签</a></h1>
+<p>每个在 PR 和 Issue 中使用的标签的单一参考来源。权威来源：</p>
+<ul>
+<li><code>.github/labeler.yml</code>：由 <code>actions/labeler</code> 使用的路径标签配置</li>
+<li><code>.github/label-policy.json</code>：贡献者等级阈值</li>
+<li>本页：定义、行为，以及哪些是自动化的、哪些是手动的</li>
+</ul>
+<p>当定义发生冲突时，请先更新源文件，然后同步此页面。</p>
+<h2 id="所有权边界"><a class="header" href="#所有权边界">所有权边界</a></h2>
+<p>标签是可移植的元数据。它们应该说明这是什么类型的工作、涉及哪部分代码区域、审查的风险有多大，以及是否需要对过期策略或分类策略进行特殊处理。</p>
+<p>项目看板自动化是规划辅助工具，不是第二个 PR 评审队列。当前的 issue-dashboard 规划器是手动且仅用于报告。看板应该回答更偏慢节奏的规划问题：哪些可以开始处理、哪些路由证据让它保持活跃、它属于哪个跟踪器或里程碑，以及哪些被阻塞。原生 GitHub PR 状态应继续回答快速变化的审查和合并问题。</p>
+<p>根据更新频率保持拆分：</p>
+<ul>
+<li>标签拥有持久的分类信息：工作类型、范围/组件、审查风险、已度量的 PR 规模以及过期豁免。</li>
+<li>项目看板字段适用于问题规划阶段、可见的路由证据、依赖状态、过期豁免原因以及路线图分组（前提是这些字段处于积极维护状态）。</li>
+<li>GitHub PR 原生状态负责管理快速变化的审查状态：审查决定、必需的检查、可合并性、冲突以及过期的批准。</li>
+</ul>
+<p>看板应当减少维护者的工作量。如果某个字段在每次 PR 推送或审查后都需要手动维护，建议改用标签、里程碑或 GitHub 原生状态。</p>
+<p>标签可以提示可能的路由方向，但它们不代表归属。<code>channel:*</code>、<code>provider:*</code>、<code>tool:*</code>、<code>security</code> 或 <code>docs</code> 标签标识了可能需要关注的范围。贡献者可见的路由依据规则详见 <a href="./pr-workflow.html#issue-routing-evidence">Project board contract</a>。</p>
+<p>为正在进行的工作使用 assignees。当需要解释特殊的搁置、跟踪器或延期决策状态时，使用 issue 评论、issue 正文部分、公共字段或关联的跟踪器作为路由依据。<code>status:blocked</code> 采用已记录的阻塞项规则。<a href="./pr-workflow.html#issue-routing-evidence">项目看板约定</a>定义了可接受的依据来源和路由结果。</p>
+<h2 id="规范拼写"><a class="header" href="#规范拼写">规范拼写</a></h2>
+<p>作用域标签使用无空格冒号写法：<code>provider:openai</code>、<code>channel:telegram</code>、<code>security:policy</code>、<code>risk:high</code>、<code>size:XS</code>、<code>type:docs</code> 以及类似标签。无命名空间的标签保持短语形式：<code>good first issue</code>、<code>help wanted</code>、<code>trusted contributor</code> 和 <code>stale-candidate</code>。</p>
+<p>诸如 <code>provider: openai</code>、<code>channel: telegram</code> 或 <code>tool: shell</code> 这类旧的重复标签是待清理项。像 <code>risk: high</code>、<code>size: XS</code> 和 <code>type: docs</code> 这类带空格的实时标签现在是迁移候选项，因为已批准的数据包已经创建或确认了无空格的规范标签。</p>
+<p>某些旧标签在分阶段迁移期间可能仍会保留为有效状态。新的或手动创建的应用应使用规范的无空格标签，而现有的旧 open refs 可以保留，直到 open-reference 迁移包处理它们。删除之前，请先将 open issues/PRs 迁移到规范标签。不要删除带有 open references 的标签、不要大范围重命名标签族，也不要在没有维护者对该清理批次作出决定的情况下移除 stale-policy 标签。</p>
+<h2 id="自动化契约"><a class="header" href="#自动化契约">自动化契约</a></h2>
+<p>实时 PR 标签自动化按来源拆分。<code>pr-path-labeler.yml</code> 会在 PR 打开、重新打开以及每次推送更新时，依据 <code>.github/labeler.yml</code> 运行 <code>actions/labeler</code>。由于该工作流使用 <code>sync-labels: true</code>，归属于 <code>.github/labeler.yml</code> 的标签会根据当前 PR 文件集重新计算：匹配的路径标签会被添加，而不再匹配的路径标签会被移除。</p>
+<p>Dependabot 还会根据 <code>.github/dependabot.yml</code> 为自己创建的 PR 添加已配置的标签：Cargo 更新会获得 <code>dependencies</code>；GitHub Actions 和 Docker 更新会获得 <code>ci</code> 和 <code>dependencies</code>。这些标签属于 Dependabot PR 的初始元数据，而不是同步的 path-labeler 约定。</p>
+<p>目前 <code>.github/labeler.yml</code> 仅管理路径和范围标签，例如 <code>docs</code>、<code>ci</code>、<code>channel</code>、<code>provider:openai</code> 和 <code>tool:file</code>。它不管理 <code>risk:*</code>、<code>size:*</code>、<code>type:*</code>、贡献者等级、状态、解决方案、过期或待领取标签。</p>
+<p>如果之后添加了风险或大小自动化，它应在每次推送的 PR 更新时重新计算，以便标签继续描述正在审查的实际差异。风险自动化必须将 <code>risk:manual</code> 作为覆盖项予以遵守，阻止该 PR 未来由自动化替换风险，直到维护者移除该覆盖项。</p>
+<h2 id="清理协议"><a class="header" href="#清理协议">清理协议</a></h2>
+<p>标签清理是维护者的操作，而非常规 PR 审查的附带结果。</p>
+<p>使用以下序列：</p>
+<ol>
+<li>操作前请刷新实时标签使用情况。</li>
+<li>将候选项划分为无历史删除、无打开项的重复删除、优先迁移的活跃标签，以及策略保留项。</li>
+<li>对于带有 open refs 的标签，在已批准的清理批次创建或确认 canonical label 之后，将 canonical label 添加到每个 open issue/PR，移除 legacy label，验证 legacy label 的 open refs 为零，然后将其删除。</li>
+<li>在进行模块标签清理时，请勿删除治理标签、过期策略标签、贡献者等级标签或 GitHub 默认标签。</li>
+</ol>
+<p>每个实时清理批次都需要维护者对正在更改的标签和 issue/PR 引用进行明确批准。</p>
+<h2 id="策略回退"><a class="header" href="#策略回退">策略回退</a></h2>
+<p>某些标签系列是故意不纳入机械清理的，即使它们看起来与较新的拼写或分类学偏好不一致。只有在另行作出政策决定并且有一份精确的实时操作包后，才应更改它们。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>家庭</th><th>当前维护者操作支持</th><th>在更改实时标签之前</th></tr>
+</thead>
+<tbody>
+<tr><td>终端和分辨率标签</td><td>说明工作为何离开活动队列：未继续处理、无效、重复或明确拒绝。</td><td>保留历史关闭含义和贡献者期望；在修改现有标签之前，先定义任何重命名、别名、迁移或删除包。替换和取代仍然是已记录的流程，除非后续批准的包创建或映射了一个现有标签。</td></tr>
+<tr><td>状态和过期标签</td><td>驱动问题生命周期和陈旧行为，包括已接受的工作、阻塞项、进行中的实现、<code>status:stale</code>、<code>status:no-stale</code>，以及 PR 待办中的陈旧处理。</td><td>将其视为 policy-first，因为自动化可能以不同方式进行保护、警告或关闭问题。不要将这些标签作为外观修正或模块标签清理来更改；请通过一个 stale/lifecycle policy packet 来处理它们，该包要考虑自动化和路由证据规则。</td></tr>
+<tr><td>贡献者级别标签</td><td>使用 <code>.github/label-policy.json</code> 阈值来提升 reviewer 信任和 contributor 体验。</td><td>同时更新策略文件和本指南；不要仅为外观整理而删除或重命名层级，因为这些标签会影响人员和审查路由。</td></tr>
+<tr><td>GitHub 默认标签</td><td>保留熟悉的贡献者入口点，例如 <code>bug</code>、<code>enhancement</code>、<code>documentation</code> 和 <code>question</code>。</td><td>仅通过明确的面向贡献者的分类决策来替换或退役。默认值可用于模板、搜索、外部链接和集成。</td></tr>
+</tbody>
+</table>
+</div>
+<p>保留敏感标签处于启用状态的测试是可操作的：维护者能否指出一项真实操作，一旦该启用标签消失，这项操作就会变得更难？如果可以，请有意地保留或替换它。如果不可以，请在审计包中保留历史映射，并通过批准的操作迁移或删除。</p>
+<h2 id="类型标签"><a class="header" href="#类型标签">类型标签</a></h2>
+<p>类型标签用于标识高层次的工作类别。它们与路径标签（如 <code>docs</code>、<code>ci</code> 或 <code>dependencies</code>）是相互独立的。</p>
+<p>新的或手动创建的应用程序在存在 live label 时应使用下面的规范无空格标签。现有的旧版 open refs 可继续保留带空格的标签，直到 open-reference 迁移包处理它们；请参见 <a href="#canonical-spelling">Canonical spelling</a>。</p>
+<p><code>type:tracker</code> 是用于活跃父级协调问题的规范 tracker 标记写法。不要将 <code>roadmap</code>、<code>type:roadmap</code> 或其他 tracker 标记创建或用作别名。如果当前尚不存在 <code>type:tracker</code> 这个 live 标签，则标签创建以及任何 tracker 标记迁移都必须仅通过单独的、完全一致的、经维护者批准的 packet 进行。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>目的</th></tr>
+</thead>
+<tbody>
+<tr><td><code>type:ci</code></td><td>CI、工作流或仓库自动化工作</td></tr>
+<tr><td><code>type:dependencies</code></td><td>依赖项或锁定文件维护</td></tr>
+<tr><td><code>type:docs</code></td><td>仅文档或以文档为主的工作</td></tr>
+<tr><td><code>type:rfc</code></td><td>RFC 议题或提案；在活动期间免于陈旧关闭</td></tr>
+<tr><td><code>type:refactor</code></td><td>旨在保持用户可见行为的代码结构清理或内部重组</td></tr>
+<tr><td><code>type:test</code></td><td>仅用于测试或以测试为主的工作</td></tr>
+<tr><td><code>type:tracker</code></td><td>用于发布、路线图、RFC/设计线程、实现批次、清理或审计的活动父级协调问题。仅问题标记；本身不会创建陈旧保护、分配、接受或贡献者就绪范围。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="路径标签"><a class="header" href="#路径标签">路径标签</a></h2>
+<p>由 <code>pr-path-labeler.yml</code> 自动应用。Glob 模式位于 <code>.github/labeler.yml</code>；当本页面与该配置不一致时，请以 <code>.github/labeler.yml</code> 作为实际生效的来源，并更新本页面。</p>
+<h3 id="基础作用域标签"><a class="header" href="#基础作用域标签">基础作用域标签</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>匹配</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs</code></td><td><code>docs/**</code>, <code>**/*.md</code>, <code>**/*.mdx</code>, <code>LICENSE</code>, <code>.markdownlint-cli2.yaml</code></td></tr>
+<tr><td><code>dependencies</code></td><td><code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>deny.toml</code>, <code>.github/dependabot.yml</code></td></tr>
+<tr><td><code>ci</code></td><td><code>.github/codeql/**</code>、<code>.github/workflows/**</code>、<code>.github/*.yaml</code>、<code>.github/*.yml</code>、<code>.github/*.json</code>、<code>.githooks/**</code></td></tr>
+<tr><td><code>core</code></td><td><code>src/*.rs</code></td></tr>
+<tr><td><code>agent</code></td><td><code>src/agent/**</code>、<code>crates/zeroclaw-runtime/src/agent/**</code></td></tr>
+<tr><td><code>channel</code></td><td><code>src/channels/**</code>、<code>crates/zeroclaw-channels/src/**</code></td></tr>
+<tr><td><code>gateway</code></td><td><code>src/gateway/**</code>、<code>crates/zeroclaw-gateway/src/**</code></td></tr>
+<tr><td><code>config</code></td><td><code>src/config/**</code>、<code>crates/zeroclaw-config/src/**</code></td></tr>
+<tr><td><code>cron</code></td><td><code>src/cron/**</code>、<code>crates/zeroclaw-runtime/src/cron/**</code></td></tr>
+<tr><td><code>daemon</code></td><td><code>src/daemon/**</code>、<code>crates/zeroclaw-runtime/src/daemon/**</code></td></tr>
+<tr><td><code>doctor</code></td><td><code>src/doctor/**</code>, <code>crates/zeroclaw-runtime/src/doctor/**</code></td></tr>
+<tr><td><code>health</code></td><td><code>src/health/**</code>、<code>crates/zeroclaw-runtime/src/health/**</code></td></tr>
+<tr><td><code>heartbeat</code></td><td><code>src/heartbeat/**</code>、<code>crates/zeroclaw-runtime/src/heartbeat/**</code></td></tr>
+<tr><td><code>integration</code></td><td><code>src/integrations/**</code>、<code>crates/zeroclaw-runtime/src/integrations/**</code></td></tr>
+<tr><td><code>memory</code></td><td><code>src/memory/**</code>、<code>crates/zeroclaw-memory/src/**</code></td></tr>
+<tr><td><code>security</code></td><td><code>src/security/**</code>、<code>crates/zeroclaw-runtime/src/security/**</code></td></tr>
+<tr><td><code>runtime</code></td><td><code>src/runtime/**</code>、<code>crates/zeroclaw-runtime/src/**</code></td></tr>
+<tr><td><code>quickstart</code></td><td><code>crates/zeroclaw-runtime/src/quickstart/**</code>、<code>crates/zeroclaw-gateway/src/api_quickstart.rs</code>、<code>apps/zerocode/src/quickstart_pane.rs</code>、<code>web/src/pages/quickstart/**</code></td></tr>
+<tr><td><code>provider</code></td><td><code>src/providers/**</code>、<code>crates/zeroclaw-providers/src/**</code></td></tr>
+<tr><td><code>service</code></td><td><code>src/service/**</code>、<code>crates/zeroclaw-runtime/src/service/**</code></td></tr>
+<tr><td><code>skillforge</code></td><td><code>src/skillforge/**</code>、<code>crates/zeroclaw-runtime/src/skillforge/**</code></td></tr>
+<tr><td><code>skills</code></td><td><code>src/skills/**</code>、<code>crates/zeroclaw-runtime/src/skills/**</code></td></tr>
+<tr><td><code>tool</code></td><td><code>src/tools/**</code>、<code>crates/zeroclaw-tools/src/**</code></td></tr>
+<tr><td><code>tunnel</code></td><td><code>src/tunnel/**</code>, <code>crates/zeroclaw-runtime/src/tunnel/**</code></td></tr>
+<tr><td><code>observability</code></td><td><code>src/observability/**</code>、<code>crates/zeroclaw-runtime/src/observability/**</code></td></tr>
+<tr><td><code>tests</code></td><td><code>tests/**</code></td></tr>
+<tr><td><code>scripts</code></td><td><code>scripts/**</code></td></tr>
+<tr><td><code>dev</code></td><td><code>dev/**</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>ci</code> 的作用范围限定为 GitHub 自动化/配置文件，而非所有 <code>.github/**</code> 路径。根级别的 <code>.github/*.json</code> 匹配器是专门针对自动化元数据设计的（例如 <code>.github/label-policy.json</code>），因此 <code>.github/assets/**</code>、<code>.github/ISSUE_TEMPLATE/**</code>、<code>.github/CODEOWNERS</code> 和 <code>.github/pull_request_template.md</code> 等文件不会匹配到 <code>ci</code>。</p>
+<h3 id="附加组件标签"><a class="header" href="#附加组件标签">附加组件标签</a></h3>
+<p>某些表面具有更窄范围的、由路径拥有的标签，用于维护者路由。当 PR diff 触及所列文件时，这些标签会由 <code>.github/labeler.yml</code> 同步。</p>
+<p>作用域路径标签不保证具有相同前缀的基础标签。由于 <code>pr-path-labeler.yml</code> 以 <code>sync-labels: true</code> 运行，维护者应将 <code>.github/labeler.yml</code> 视为 PR 会接收哪些基础标签和作用域标签的事实来源。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>匹配</th></tr>
+</thead>
+<tbody>
+<tr><td><code>observability:log</code></td><td><code>crates/zeroclaw-log/src/**</code>, <code>crates/zeroclaw-runtime/src/observability/log.rs</code></td></tr>
+<tr><td><code>observability:otel</code></td><td><code>otel.rs</code>，OTel 依赖功能回归覆盖范围</td></tr>
+<tr><td><code>observability:prometheus</code></td><td><code>prometheus.rs</code></td></tr>
+<tr><td><code>runtime:wasm</code></td><td>运行时 WASM 平台和第一方 WASM 插件宿主文件</td></tr>
+<tr><td><code>security:bubblewrap</code></td><td><code>bubblewrap.rs</code></td></tr>
+<tr><td><code>security:docker</code></td><td><code>docker.rs</code></td></tr>
+<tr><td><code>security:leak-detector</code></td><td>LeakDetector 脱敏和敏感输出扫描</td></tr>
+<tr><td><code>security:pairing</code></td><td>配对安全性、网关配对 API、Tauri 配对命令，以及网页配对页面</td></tr>
+<tr><td><code>security:policy</code></td><td>运行时安全策略、IAM 策略和配置策略文件</td></tr>
+<tr><td><code>security:secrets</code></td><td>运行时和配置密钥处理</td></tr>
+<tr><td><code>security:traits</code></td><td>共享的安全 trait 和接口定义</td></tr>
+<tr><td><code>memory:backend</code></td><td>内存后端选择和存储实现文件</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="手动组件标签"><a class="header" href="#手动组件标签">手动组件标签</a></h3>
+<p>某些作用域组件标签是手动路由标签，而不是同步路径标签。</p>
+<p><code>agent:prompt</code> 用于 provider 可见的提示、上下文和响应指导策略。当工作涉及 system prompt 内容、工具调用格式指导、prompt-cache 敏感上下文、channel 响应指导，或其他跨越基础 <code>agent</code>、<code>channel</code>、<code>memory</code>、<code>provider</code> 或 <code>runtime</code> 标签的模型可见指令面时使用。将它与适用的基础或作用域标签一起应用；它不能替代这些标签。不要将它应用于每个 <code>crates/zeroclaw-runtime/src/agent/**</code> 变更；普通的 agent 运行时变更请使用基础 <code>agent</code> 标签。</p>
+<p><code>agent:loop</code> 已废弃。对于 agent-loop 路由，请使用基础 <code>agent</code> 加上任何匹配的 <code>runtime</code>、provider、channel、tool 或 risk 标签。</p>
+<p>不要将旧的 <code>observability: runtime_trace</code> 应用于新的 issue 或 PR。对于与 OpenTelemetry tracing 相关的工作，请使用 <code>observability:otel</code>；只有当 issue 或 PR 也匹配该基础范围时，才添加基础 <code>observability</code>，并将任何未来专用于 runtime-trace 的规范标签放在单独的 create/migrate packet 中决定。</p>
+<p>不要将旧的 <code>security: leak_detector</code> 应用于新的问题或 PR。请将 <code>security:leak-detector</code> 用于 LeakDetector 脱敏和敏感输出扫描工作。</p>
+<p>诸如 <code>gateway: api</code>、<code>gateway: sse</code>、<code>gateway:local_bridge</code> 和 <code>gateway:webhook_ingress</code> 的网关子区域标签仍然是在线迁移的保留项。新的路由应使用基础 <code>gateway</code>，直到另一个独立的包要么创建规范的无空格/带连字符的子标签并迁移引用，要么将这些标签合并到基础 <code>gateway</code>。</p>
+<h3 id="按通道标签"><a class="header" href="#按通道标签">按通道标签</a></h3>
+<p>当更改涉及 channel crate 路径时，每个 channel 除了基础 <code>channel</code> 标签外，还会获得一个 <code>channel:&lt;name&gt;</code> 标签。诸如 <code>channel:acp</code> 之类的跨 surface channel 标签，也可以改为与匹配的基础 surface 标签配对，例如 <code>gateway</code>、<code>docs</code> 或 app/web 作用域标签。</p>
+<p><code>channel:core</code> 是共享的 channel API 和 orchestrator 标签。将其用于涉及 channel trait 契约、channel 编排、交付钩子、路由/会话行为、运行时命令处理，以及在单一 platform 标签下会产生误导的跨 channel 行为的工作。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>匹配</th></tr>
+</thead>
+<tbody>
+<tr><td><code>channel:acp</code></td><td><code>acp_channel.rs</code>、<code>acp_server.rs</code>、<code>zeroclaw-acp-bridge.rs</code>、<code>acp_session_store.rs</code>、<code>channels/acp.md</code>、选定的 ACP 网关/应用/网页入口点</td></tr>
+<tr><td><code>channel:core</code></td><td><code>crates/zeroclaw-api/src/channel.rs</code>, <code>crates/zeroclaw-channels/src/lib.rs</code>, <code>crates/zeroclaw-channels/src/orchestrator/**</code>, <code>src/channels/mod.rs</code></td></tr>
+<tr><td><code>channel:bluesky</code></td><td><code>bluesky.rs</code></td></tr>
+<tr><td><code>channel:clawdtalk</code></td><td><code>clawdtalk.rs</code></td></tr>
+<tr><td><code>channel:cli</code></td><td><code>cli.rs</code></td></tr>
+<tr><td><code>channel:dingtalk</code></td><td><code>dingtalk.rs</code></td></tr>
+<tr><td><code>channel:discord</code></td><td><code>discord.rs</code>、<code>discord_history.rs</code></td></tr>
+<tr><td><code>channel:email</code></td><td><code>email_channel.rs</code>, <code>gmail_push.rs</code></td></tr>
+<tr><td><code>channel:imessage</code></td><td><code>imessage.rs</code></td></tr>
+<tr><td><code>channel:irc</code></td><td><code>irc.rs</code></td></tr>
+<tr><td><code>channel:lark</code></td><td><code>lark.rs</code></td></tr>
+<tr><td><code>channel:line</code></td><td><code>line.rs</code>, <code>channels/line.md</code></td></tr>
+<tr><td><code>channel:linq</code></td><td><code>linq.rs</code></td></tr>
+<tr><td><code>channel:matrix</code></td><td><code>matrix.rs</code></td></tr>
+<tr><td><code>channel:mattermost</code></td><td><code>mattermost.rs</code></td></tr>
+<tr><td><code>channel:mochat</code></td><td><code>mochat.rs</code></td></tr>
+<tr><td><code>channel:mqtt</code></td><td><code>mqtt.rs</code></td></tr>
+<tr><td><code>channel:nextcloud-talk</code></td><td><code>nextcloud_talk.rs</code></td></tr>
+<tr><td><code>channel:nostr</code></td><td><code>nostr.rs</code></td></tr>
+<tr><td><code>channel:notion</code></td><td><code>notion.rs</code></td></tr>
+<tr><td><code>channel:qq</code></td><td><code>qq.rs</code></td></tr>
+<tr><td><code>channel:reddit</code></td><td><code>reddit.rs</code></td></tr>
+<tr><td><code>channel:signal</code></td><td><code>signal.rs</code></td></tr>
+<tr><td><code>channel:slack</code></td><td><code>slack.rs</code></td></tr>
+<tr><td><code>channel:telegram</code></td><td><code>telegram.rs</code></td></tr>
+<tr><td><code>channel:twitter</code></td><td><code>twitter.rs</code></td></tr>
+<tr><td><code>channel:wati</code></td><td><code>wati.rs</code></td></tr>
+<tr><td><code>channel:webhook</code></td><td><code>webhook.rs</code></td></tr>
+<tr><td><code>channel:wecom</code></td><td><code>wecom.rs</code>、<code>wecom_ws.rs</code></td></tr>
+<tr><td><code>channel:whatsapp</code></td><td><code>whatsapp.rs</code>, <code>whatsapp_storage.rs</code>, <code>whatsapp_web.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="每个提供者的标签"><a class="header" href="#每个提供者的标签">每个提供者的标签</a></h3>
+<p>特定于提供方的标签与专用的提供方源文件相匹配。提供方路由器有其自己的作用域标签，因为路由和模型分发工作属于共享的提供方子领域，而不是某个具体的提供方集成。共享的注册表或工厂文件只应使用基础 <code>provider</code> 标签；当共享文件的变更确实仅限于某一个提供方时，维护者可以手动添加特定于提供方的标签。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>匹配</th></tr>
+</thead>
+<tbody>
+<tr><td><code>provider:anthropic</code></td><td><code>anthropic.rs</code></td></tr>
+<tr><td><code>provider:azure-openai</code></td><td><code>azure_openai.rs</code></td></tr>
+<tr><td><code>provider:bedrock</code></td><td><code>bedrock.rs</code></td></tr>
+<tr><td><code>provider:claude-code</code></td><td><code>claude_code.rs</code></td></tr>
+<tr><td><code>provider:compatible</code></td><td><code>compatible.rs</code></td></tr>
+<tr><td><code>provider:copilot</code></td><td><code>copilot.rs</code></td></tr>
+<tr><td><code>provider:gemini</code></td><td><code>gemini.rs</code>, <code>gemini_cli.rs</code></td></tr>
+<tr><td><code>provider:glm</code></td><td><code>glm.rs</code></td></tr>
+<tr><td><code>provider:kilocli</code></td><td><code>kilocli.rs</code></td></tr>
+<tr><td><code>provider:ollama</code></td><td><code>ollama.rs</code></td></tr>
+<tr><td><code>provider:openai</code></td><td><code>openai.rs</code>, <code>openai_codex.rs</code></td></tr>
+<tr><td><code>provider:openrouter</code></td><td><code>openrouter.rs</code></td></tr>
+<tr><td><code>provider:reliable</code></td><td><code>reliable.rs</code></td></tr>
+<tr><td><code>provider:router</code></td><td><code>router.rs</code></td></tr>
+<tr><td><code>provider:telnyx</code></td><td><code>telnyx.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>某些提供方标签描述的是当前共享 OpenAI 兼容提供方实现、而不是使用独立源文件的提供方系列。当某个 issue 或 PR 确实涉及该系列时，维护者可以手动应用这些标签：<code>provider:groq</code>、<code>provider:kimi</code>、<code>provider:minimax</code>、<code>provider:moonshot</code> 和 <code>provider:qwen</code>。不要将共享工厂或兼容提供方文件添加到这些标签规则中；那样会把无关的共享更改过度打上标签。</p>
+<h3 id="每个工具组的标签"><a class="header" href="#每个工具组的标签">每个工具组的标签</a></h3>
+<p>工具按逻辑功能分组，而非每个文件一个标签。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>匹配</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tool:browser</code></td><td><code>browser.rs</code>, <code>browser_delegate.rs</code>, <code>browser_open.rs</code>, <code>text_browser.rs</code>, <code>screenshot.rs</code></td></tr>
+<tr><td><code>tool:cloud</code></td><td><code>cloud_ops.rs</code>, <code>cloud_patterns.rs</code></td></tr>
+<tr><td><code>tool:composio</code></td><td><code>composio.rs</code></td></tr>
+<tr><td><code>tool:cron</code></td><td><code>src/tools/cron_add.rs</code>、<code>src/tools/cron_list.rs</code>、<code>src/tools/cron_remove.rs</code>、<code>src/tools/cron_run.rs</code>、<code>src/tools/cron_runs.rs</code>、<code>src/tools/cron_update.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_add.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_common.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_list.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_remove.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_run.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_runs.rs</code>、<code>crates/zeroclaw-runtime/src/tools/cron_update.rs</code></td></tr>
+<tr><td><code>tool:delegate</code></td><td><code>crates/zeroclaw-runtime/src/tools/delegate.rs</code></td></tr>
+<tr><td><code>tool:file</code></td><td><code>src/tools/file_edit.rs</code>、<code>src/tools/file_read.rs</code>、<code>src/tools/file_write.rs</code>、<code>src/tools/glob_search.rs</code>、<code>src/tools/content_search.rs</code>、<code>crates/zeroclaw-tools/src/file_edit.rs</code>、<code>crates/zeroclaw-runtime/src/tools/file_read.rs</code>、<code>crates/zeroclaw-tools/src/file_write.rs</code>、<code>crates/zeroclaw-tools/src/glob_search.rs</code>、<code>crates/zeroclaw-tools/src/content_search.rs</code></td></tr>
+<tr><td><code>tool:google-workspace</code></td><td><code>google_workspace.rs</code></td></tr>
+<tr><td><code>tool:mcp</code></td><td><code>mcp_client.rs</code>, <code>mcp_deferred.rs</code>, <code>mcp_protocol.rs</code>, <code>mcp_tool.rs</code>, <code>mcp_transport.rs</code></td></tr>
+<tr><td><code>tool:memory</code></td><td><code>memory_forget.rs</code>, <code>memory_recall.rs</code>, <code>memory_store.rs</code></td></tr>
+<tr><td><code>tool:microsoft365</code></td><td><code>microsoft365/**</code></td></tr>
+<tr><td><code>tool:pushover</code></td><td><code>pushover.rs</code></td></tr>
+<tr><td><code>tool:security</code></td><td><code>src/tools/security_ops.rs</code>、<code>src/tools/verifiable_intent.rs</code>、<code>crates/zeroclaw-runtime/src/tools/security_ops.rs</code>、<code>crates/zeroclaw-runtime/src/tools/verifiable_intent.rs</code></td></tr>
+<tr><td><code>tool:shell</code></td><td><code>src/tools/shell.rs</code>、<code>src/tools/node_tool.rs</code>、<code>src/tools/cli_discovery.rs</code>、<code>crates/zeroclaw-runtime/src/tools/shell.rs</code>、<code>crates/zeroclaw-gateway/src/node_tool.rs</code>、<code>crates/zeroclaw-tools/src/cli_discovery.rs</code></td></tr>
+<tr><td><code>tool:sop</code></td><td><code>src/tools/sop_advance.rs</code>、<code>src/tools/sop_approve.rs</code>、<code>src/tools/sop_execute.rs</code>、<code>src/tools/sop_list.rs</code>、<code>src/tools/sop_status.rs</code>、<code>crates/zeroclaw-runtime/src/tools/sop_advance.rs</code>、<code>crates/zeroclaw-runtime/src/tools/sop_approve.rs</code>、<code>crates/zeroclaw-runtime/src/tools/sop_execute.rs</code>、<code>crates/zeroclaw-runtime/src/tools/sop_list.rs</code>、<code>crates/zeroclaw-runtime/src/tools/sop_status.rs</code></td></tr>
+<tr><td><code>tool:web</code></td><td><code>web_fetch.rs</code>, <code>web_search_tool.rs</code>, <code>web_search_provider_routing.rs</code>, <code>http_request.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>tool:schema</code> 是仅手动使用的标签，用于 tool-schema 序列化和清理问题。不要将广泛的 schema 文件添加到 <code>.github/labeler.yml</code>；许多 schema 文件是共享配置、provider 或 API 接口，这会给无关变更打上过多标签。</p>
+<h2 id="尺寸标签"><a class="header" href="#尺寸标签">尺寸标签</a></h2>
+<p>基于有效变更行数，并针对纯文档和大量锁文件的 PR 进行了归一化处理。目前为<strong>手动</strong>应用；之前用于计算这些指标的大小自动化工具已在 CI 简化过程中被移除。未来的大小自动化工具应遵循<a href="#automation-contract">自动化契约</a>。</p>
+<p>新的或手动应用应使用下面的标准无空格标签。现有的旧版 open refs 可暂时保留带空格的标签，直到 open-reference 迁移包处理它们；参见 <a href="#canonical-spelling">Canonical spelling</a>。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>阈值</th></tr>
+</thead>
+<tbody>
+<tr><td><code>size:XS</code></td><td>≤ 80 行</td></tr>
+<tr><td><code>size:S</code></td><td>≤ 250 行</td></tr>
+<tr><td><code>size:M</code></td><td>≤ 500 行</td></tr>
+<tr><td><code>size:L</code></td><td>≤ 1000 行</td></tr>
+<tr><td><code>size:XL</code></td><td>&gt; 超过 1000 行</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="风险标签"><a class="header" href="#风险标签">风险标签</a></h2>
+<p>对于 PR，风险标签描述了正在审查的实际差异：涉及的路径、行为变更、安全边界暴露以及回滚难度。对于 issue，风险标签描述了基于报告的潜在修复影响范围，有助于分流审查者的深度和贡献者的匹配度，并且可能在具体 PR 显示实际实现路径后发生变化。当前为<strong>手动</strong>应用。未来的风险自动化应遵循<a href="#automation-contract">自动化契约</a>。</p>
+<p>新的或手动应用应使用下面的标准无空格标签。现有的旧版 open refs 可暂时保留带空格的标签，直到 open-reference 迁移包处理它们；参见 <a href="#canonical-spelling">Canonical spelling</a>。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>risk:low</code></td><td>未触及高风险路径，属于小改动</td></tr>
+<tr><td><code>risk:medium</code></td><td>对 <code>crates/*/src/**</code> 进行行为变更，但不影响边界或安全性</td></tr>
+<tr><td><code>risk:high</code></td><td>触及高风险路径，或进行大型安全相关变更</td></tr>
+<tr><td><code>risk:manual</code></td><td>维护者覆盖，用于冻结自动风险重新计算</td></tr>
+</tbody>
+</table>
+</div>
+<p>高风险路径（规范集；其他维护者页面引用此列表）：<code>crates/zeroclaw-runtime/src/**</code>、<code>crates/zeroclaw-gateway/src/**</code>、<code>crates/zeroclaw-tools/src/**</code>、<code>crates/zeroclaw-runtime/src/security/**</code>、<code>.github/workflows/**</code>。</p>
+<p>将 <code>risk:high</code> 应用于任何提高工作区 MSRV、固定 Rust 工具链、生成的安装程序/Docker 工具链基线，或发布工作流工具链下限的 PR。不要因为 diff 看起来只是 CI、依赖或文档整理就降低风险：更高的 Rust 版本要求会影响下游源码构建、发行版打包、容器构建，以及固定在较旧工具链上的用户。</p>
+<p>当不确定时，视为高风险。</p>
+<h2 id="贡献者层级标签"><a class="header" href="#贡献者层级标签">贡献者层级标签</a></h2>
+<p>定义在 <code>.github/label-policy.json</code> 中。根据从 GitHub API 查询到的作者已合并的 PR 数量。目前<strong>手动</strong>应用。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>最小合并的 PR</th></tr>
+</thead>
+<tbody>
+<tr><td><code>受信任的贡献者</code></td><td>5</td></tr>
+<tr><td><code>经验丰富的贡献者</code></td><td>10</td></tr>
+<tr><td><code>主要贡献者</code></td><td>20</td></tr>
+<tr><td><code>杰出贡献者</code></td><td>50</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="状态标签"><a class="header" href="#状态标签">状态标签</a></h2>
+<p>跟踪 RFC 和跟踪工作项的生命周期状态。除非有维护中的工作流另作说明，否则手动应用。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>status:accepted</code></td><td>由团队批准的 RFC 或工作项。但这本身并不能使该问题免于过期处理。</td></tr>
+<tr><td><code>status:blocked</code></td><td>工作有效，但正在等待外部依赖、维护者决策或关联的前置条件。在阻塞因素被记录且未解决期间，可豁免标记为过时。请勿针对同一阻塞因素与 <code>status:no-stale</code> 搭配使用。</td></tr>
+<tr><td><code>status:in-progress</code></td><td>一个开放的 PR 正在积极处理此 issue。在过期检查时请与实时的 PR 状态进行核对；该标签在 PR 关闭后并非永久豁免。</td></tr>
+<tr><td><code>status:stale</code></td><td>Issue is in the response window defined by the <a href="#issue-stale-policy">issue stale policy</a></td></tr>
+<tr><td><code>status:no-stale</code></td><td>针对已接受或其他长期存在的工作的显式过期豁免，前提是这些工作尚未受到其他过期排除规则的保护。目标策略：仅当<a href="./pr-workflow.html#issue-routing-evidence">项目看板约定</a>具有贡献者可见的过期豁免原因和路由证据时才使用。处于活动状态的发布跟踪器以及活动的 RFC 或设计跟踪器，在其保持活动状态期间，可将跟踪器本身用作可见原因和路由载体；当里程碑关闭、跟踪器偏离实时状态、RFC 达成决议、被取代或关闭，或该 issue 不再代表活动的项目决策载体时，应重新审视它们。对于缺失上述事实的现有豁免，应在过期清理停止承认它们之前进行审计和修复。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="issue-stale-policy"><a class="header" href="#issue-stale-policy">Issue stale policy</a></h2>
+<p>This section is the canonical operational source for issue stale timing, qualifying activity, exclusions, and re-engagement. Other maintainer docs and skills should link here instead of copying these rules.</p>
+<ul>
+<li><strong>Entry window:</strong> Apply <code>status:stale</code> once 15 or more days have elapsed without qualifying activity.</li>
+<li><strong>Response window:</strong> Close only when 15 or more days have elapsed since <code>status:stale</code> was applied and no qualifying activity occurred afterward.</li>
+<li><strong>Qualifying activity:</strong> A substantive comment that demonstrates current relevance. It must confirm the issue on a current release or commit, explain why the issue is version-independent, or add useful evidence such as a reproduction, logs or error details, environment information, a concrete affected use case, regression confirmation, or a workaround. A generic <code>+1</code>, administrative comment, label change, bot event, or link event does not qualify.</li>
+<li><strong>Exclusions:</strong> Do not apply stale handling to <code>priority:p0</code>, <code>type:rfc</code>, <code>status:no-stale</code>, an issue with an open linked PR, an issue with 10 or more 👍 reactions on the opening post, or <code>status:blocked</code> while a recorded blocker remains unresolved. If an exclusion begins while an issue carries <code>status:stale</code>, remove the stale label. When the exclusion ends, restart the entry clock from that date.</li>
+<li><strong>Re-engagement:</strong> Remove <code>status:stale</code> when qualifying activity occurs after the label was applied or when the issue is reopened. Reset the clock from that activity or reopen date. After a stale closure, qualifying new evidence in a comment is grounds for a maintainer to reopen the issue and remove <code>status:stale</code>; the commenter may instead open a new issue with the updated context.</li>
+</ul>
+<p><code>stale-candidate</code> is separate: it is the dormant-PR backlog-pruning signal and does not replace <code>status:stale</code> for issues.</p>
+<h2 id="分辨率标签"><a class="header" href="#分辨率标签">分辨率标签</a></h2>
+<p>解决方案标签用于说明某个 issue 或 PR 被关闭或移出活动队列的原因。它们代表最终结果，而非生命周期状态标签，并且应当包含足够的注释上下文，以便后续维护者理解该决策。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>目的</th></tr>
+</thead>
+<tbody>
+<tr><td><code>wontfix</code></td><td>有效的请求，或者明确说明项目选择不予采纳的报告。请简要说明理由，不要无声关闭。</td></tr>
+<tr><td><code>invalid</code></td><td>无法作为缺陷、功能请求、支持事项、RFC 或跟踪的项目工作处理。请说明不匹配之处或缺失的需求。</td></tr>
+<tr><td><code>duplicate</code></td><td>与另一个已跟踪的问题或 PR 属于同一底层问题。在关闭或重定向讨论之前，请链接到规范的目标。</td></tr>
+</tbody>
+</table>
+</div>
+<p>在维护者批准的标签迁移包明确定义具体的重命名、别名或删除计划之前，请勿创建或应用诸如 <code>status:wont-do</code> 或 <code>status:wont-fix</code> 之类的拟议终端标签。当前看板级“Won’t Do“概念使用的有效标签为 <code>wontfix</code>。</p>
+<p>取代（Superseding）是一种替换流程，目前并不是一个生效的标签。在后续批准的迁移数据包创建或映射取代标签之前，请使用 <a href="./superseding.html">Superseding PRs</a> 中的替换规则和归属要求。</p>
+<h2 id="分类标签"><a class="header" href="#分类标签">分类标签</a></h2>
+<p>手动应用：之前用于处理这些的自动响应自动化已在 CI 简化过程中被移除。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>目的</th></tr>
+</thead>
+<tbody>
+<tr><td><code>r:needs-repro</code></td><td>不完整的错误报告；请求提供可复现的确定性步骤</td></tr>
+<tr><td><code>r:support</code></td><td>用法/帮助项应在错误积压之外更好地处理</td></tr>
+<tr><td><code>needs-author-action</code></td><td>Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself.</td></tr>
+<tr><td><code>stale-candidate</code></td><td>Dormant PR that is a candidate for closing. Follow the stale ramp in <a href="./reviewer-playbook.html#pr-backlog-pruning">Reviewer Playbook → PR backlog pruning</a>. Issue stale passes use <code>status:stale</code> instead.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="社区接手标签"><a class="header" href="#社区接手标签">社区接手标签</a></h2>
+<p>维护者希望接受外部贡献时手动应用。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>目的</th></tr>
+</thead>
+<tbody>
+<tr><td><code>good first issue</code></td><td>适合新贡献者的小型、独立、文档完善的 XS/S 任务，安全可控，并附有验收标准、相关代码或文档链接，以及指定的导师或联系人</td></tr>
+<tr><td><code>help wanted</code></td><td>维护者希望获得外部帮助、可供审查且无阻塞的可执行工作，通常存在低或中等程度的潜在问题风险</td></tr>
+</tbody>
+</table>
+</div>
+<p>不要将 <code>help wanted</code> 作为“有效但无人认领“的通用标记。如果某个 issue 被阻塞、依赖架构、缺少验收标准、可能存在高风险，或正在等待策略决策，请暂不添加认领标签，直到阻塞因素解除或维护者补充缺失的范围说明。</p>
+<h2 id="维护触发器"><a class="header" href="#维护触发器">维护触发器</a></h2>
+<p>在以下情况时更新此页面：</p>
+<ul>
+<li>向源代码树中添加了新的通道、提供程序或工具（路径标签需要新增条目）。</li>
+<li>标签策略或阈值已更改。</li>
+<li>新的分诊工作流出现，或旧的被移除。</li>
+</ul>
+<p>自动化状态备注（“目前手动应用”）被特意包含在内，以便未来的维护者不会误以为工作流的缺失意味着标签层级不存在。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../maintainers/reviewer-playbook.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../maintainers/superseding.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../maintainers/reviewer-playbook.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../maintainers/superseding.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

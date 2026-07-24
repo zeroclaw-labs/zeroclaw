@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RedactCategory"],"fn":["redact"],"struct":["RedactionHit"]};

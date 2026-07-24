@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["build","check","feature_matrix","hardware","keymap","linkcheck","peer_groups","plugins","protected","refs","serve","stats","sync","themes","versions"]};

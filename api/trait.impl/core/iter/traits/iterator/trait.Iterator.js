@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["zeroclaw_api",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.1/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"zeroclaw_api/attribution/struct.ChannelKindIter.html\" title=\"struct zeroclaw_api::attribution::ChannelKindIter\">ChannelKindIter</a>",0]]],["zeroclaw_runtime",[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.1/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"zeroclaw_runtime/sop/condition/struct.ConditionOpIter.html\" title=\"struct zeroclaw_runtime::sop::condition::ConditionOpIter\">ConditionOpIter</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.1/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"zeroclaw_runtime/sop/types/struct.FilesystemEventKindIter.html\" title=\"struct zeroclaw_runtime::sop::types::FilesystemEventKindIter\">FilesystemEventKindIter</a>",0],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.97.1/core/iter/traits/iterator/trait.Iterator.html\" title=\"trait core::iter::traits::iterator::Iterator\">Iterator</a> for <a class=\"struct\" href=\"zeroclaw_runtime/sop/types/struct.SopTriggerSourceIter.html\" title=\"struct zeroclaw_runtime::sop::types::SopTriggerSourceIter\">SopTriggerSourceIter</a>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[370,1141]}

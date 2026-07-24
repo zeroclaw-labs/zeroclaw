@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["QrPairingChannel"],"fn":["compiled_channels","configured_uncompiled_channels","is_channel_type_compiled","qr_pairing_channel"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DaemonExit","GatewayBindMode"],"fn":["detect_gateway_bind_mode","run","state_file_path"],"struct":["DaemonRegistry","GatewayReloadControls"]};

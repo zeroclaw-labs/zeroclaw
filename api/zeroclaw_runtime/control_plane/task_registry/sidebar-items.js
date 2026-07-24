@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["TaskKind","TaskStatus"],"struct":["TaskRecord"],"trait":["TaskRegistry"]};

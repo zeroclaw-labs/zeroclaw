@@ -1,0 +1,683 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Zéro compromis en pratique - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-2b91720a.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-006--le-zéro-compromis-en-pratique--santé-du-code-discipline-des-erreurs-et-norme-de-préparation-à-la-production"><a class="header" href="#fnd-006--le-zéro-compromis-en-pratique--santé-du-code-discipline-des-erreurs-et-norme-de-préparation-à-la-production">FND-006 : Le zéro compromis en pratique : santé du code, discipline des erreurs et norme de préparation à la production</a></h1>
+<blockquote>
+<p>À partir de la version 0.7.0 · Type : Qualité · Rév. 1</p>
+<p><strong>Référence canonique</strong> · Ratifié par l’équipe · Rév. 1 Fil de discussion et historique complet des révisions : <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p>Une note à l’équipe avant que vous lisiez ceci.</p>
+<p>Ceci est le sixième document du cadre de maturité de ZeroClaw. Les cinq précédents traitaient de l’architecture, de la documentation, de la gouvernance, de l’infrastructure d’ingénierie et de la collaboration — l’échafaudage structurel et humain qui entoure le travail. Chacun répondait à une question différente sur la manière dont nous construisons ce projet ensemble. Si vous les avez tous lus, vous avez peut-être remarqué une question à laquelle aucun d’eux n’a répondu : oui, mais comment l’écrire bien, concrètement ? La RFC sur l’architecture vous a indiqué dans quelle forme construire. La RFC sur la documentation vous a indiqué comment le consigner. La RFC sur la gouvernance vous a indiqué comment vous coordonner. La RFC sur le CI/CD vous a indiqué comment le contrôler. La RFC sur la culture vous a indiqué comment travailler avec les personnes qui vous entourent. Aucune ne vous a dit à quoi ressemble la qualité au niveau de la phrase, à l’intérieur d’une fonction, au moment où vous faites un choix.</p>
+<p>C’est à cela que sert ce document.</p>
+<p>Les sujets spécifiques abordés ici, la gestion des erreurs, la documentation d’API, la conception de tests, la dette technique, sont des sujets Rust en surface. Les compétences qu’ils développent ne le sont pas. La technologie change. Elle change plus vite à chaque itération que la fois précédente. Les outils que vous utilisez aujourd’hui, ce langage, ce framework, cet assistant IA, seront remplacés. Certains d’entre eux pendant la durée de vie de ce projet. Le jugement que ce document tente de vous aider à construire ne sera pas remplacé. Il se cumulera silencieusement en arrière-plan de chaque décision que vous prendrez, dans chaque langage que vous écrirez, dans chaque système que vous construirez, et dans des travaux qui n’auront peut-être rien à voir avec le logiciel. C’est l’investissement que nous faisons en vous. Pas dans votre capacité à écrire du Rust. Dans votre capacité à réfléchir à la qualité, à l’échec et au savoir-faire, et à emporter cette réflexion avec vous dans chaque outil que vous prendrez en main, y compris les outils d’IA que vous utilisez aujourd’hui et ceux qui n’existent pas encore.</p>
+<p>Prenez votre temps.</p>
+</blockquote>
+<hr>
+<h2 id="la-suite-du-cadre-de-maturité"><a class="header" href="#la-suite-du-cadre-de-maturité">La suite du cadre de maturité</a></h2>
+<p>Ce RFC est le sixième d’un ensemble de documents qui forment ensemble le cadre de maturité de ZeroClaw. Ils sont conçus pour être lus dans leur ensemble, bien que chacun puisse être lu indépendamment.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>Portée</th><th>Problème</th></tr>
+</thead>
+<tbody>
+<tr><td>Architecture intentionnelle : transition vers le micronoyau</td><td>Ce que nous construisons et comment il est structuré</td><td>#5574</td></tr>
+<tr><td>Normes de documentation et architecture des connaissances</td><td>Comment nous documentons ce que nous construisons</td><td>#5576</td></tr>
+<tr><td>Organisation de l’équipe et gouvernance du projet</td><td>Comment nous coordonnons et prenons des décisions</td><td>#5577</td></tr>
+<tr><td>Infrastructure d’ingénierie : Pipeline CI/CD</td><td>Comment nous construisons, testons et déployons de manière fiable</td><td>#5579</td></tr>
+<tr><td>Culture de contribution : collaboration humaine, partenariat avec l’IA et développement de l’équipe</td><td>Comment nous travaillons ensemble et grandissons</td><td>#5615</td></tr>
+<tr><td>Zéro compromis en pratique : santé du code, discipline de gestion des erreurs et norme de préparation à la production</td><td>Comment écrire du code qui dure</td><td>ce RFC</td></tr>
+</tbody>
+</table>
+</div>
+<p>Les cinq premières RFC répondent à des questions structurelles et humaines. Celle-ci répond à la question qui se trouve au cœur de toutes les autres : étant donné la structure, étant donné l’équipe, étant donné les outils, que signifie bien écrire le code ?</p>
+<hr>
+<h2 id="table-des-matières"><a class="header" href="#table-des-matières">Table des matières</a></h2>
+<ol>
+<li>Une philosophie de développement : l’investissement dans le jugement</li>
+<li>Évaluation honnête : Ce que la base de code nous dit
+<ul>
+<li>2.1 Les preuves</li>
+<li>2.2 Ce que les chiffres ne montrent pas</li>
+<li>2.3 Ce qui est déjà bien</li>
+</ul>
+</li>
+<li>Portes et normes : la distinction centrale</li>
+<li>Les Sept Disciplines
+<ul>
+<li>4.1 La gestion des erreurs comme préoccupation de conception</li>
+<li>4.2 Surface de l’API publique en tant que Promise</li>
+<li>4.3 Les tests comme retour sur la conception</li>
+<li>4.4 Tri de la dette technique</li>
+<li>4.5 Sécurité au niveau de l’application</li>
+<li>4.6 L’observabilité comme capacité de débogage</li>
+<li>4.7 Travailler au-dessus du sol</li>
+</ul>
+</li>
+<li>Ce que cela signifie pour le développement assisté par l’IA</li>
+<li>La portabilité de Craft</li>
+<li>Ce que cela signifie pour les contributeurs</li>
+</ol>
+<hr>
+<h2 id="historique-des-révisions"><a class="header" href="#historique-des-révisions">Historique des révisions</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Rév</th><th>Date</th><th>Résumé</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026-04-12</td><td>Brouillon initial</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-une-philosophie-de-développement--linvestissement-dans-le-jugement"><a class="header" href="#1-une-philosophie-de-développement--linvestissement-dans-le-jugement">1. Une philosophie de développement : l’investissement dans le jugement</a></h2>
+<p>La RFC sur l’architecture a introduit une hiérarchie de décisions qui décrit comment chaque choix dans ce projet doit être pris :</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>Cette hiérarchie répond à la question de <em>quoi</em> construire à chaque niveau. Ce RFC se situe dans les couches Implémentation et Tests et pose une question différente : <em>à quel point ?</em></p>
+<p>La réponse à « dans quelle mesure » n’est pas une liste de contrôle. Les listes de contrôle peuvent être satisfaites sans être comprises, et en logiciel, c’est la compréhension qui produit des résultats durables. Un contributeur qui a mémorisé les règles les suivra jusqu’à ce que la situation soit légèrement différente. Un contributeur qui a intériorisé le jugement derrière les règles l’appliquera correctement aux situations que les règles n’avaient pas anticipées, y compris les situations qui comptent le plus, qui sont toujours celles que personne n’avait prévues.</p>
+<p>Cette distinction est particulièrement importante dans le contexte de ce projet. ZeroClaw est exploité dans un environnement d’outils puissants : génération de code par IA, portes de contrôle CI qui détectent un large éventail d’erreurs courantes, linters d’IDE, scanners de sécurité automatisés. Ces outils sont réellement précieux. Ils définissent un plancher, un minimum en dessous duquel le code ne devrait pas être fusionné. Mais ce qu’ils ne peuvent pas faire, c’est réfléchir. Ils ne peuvent pas décider si une erreur est opérationnelle ou une erreur de programmeur. Ils ne peuvent pas évaluer si un test vérifie le bon comportement. Ils ne peuvent pas déterminer si une API publique est documentée assez clairement pour qu’un futur contributeur puisse l’implémenter correctement. Ils ne peuvent vérifier que ce qu’ils ont été programmés pour vérifier.</p>
+<p>L’écart entre « ce que les outils peuvent vérifier » et « la qualité qui sert les utilisateurs, les contributeurs et le projet dans la durée » est comblé par le jugement. C’est ce jugement que ce document cherche à vous aider à développer, non pas pour remplacer les outils, mais pour les orienter.</p>
+<hr>
+<h2 id="2-évaluation-honnête--ce-que-la-base-de-code-nous-dit"><a class="header" href="#2-évaluation-honnête--ce-que-la-base-de-code-nous-dit">2. Évaluation honnête : Ce que la base de code nous dit</a></h2>
+<p>Cette section n’est pas une critique. C’est un diagnostic. Le même cadre qui s’appliquait dans la RFC sur l’architecture s’applique ici : vous ne pouvez pas améliorer ce que vous ne pouvez pas nommer, et les détails sont utiles précisément parce qu’ils sont spécifiques.</p>
+<h3 id="21-les-preuves"><a class="header" href="#21-les-preuves">2.1 Les preuves</a></h3>
+<p>La décomposition du workspace issue de la RFC §5574 a réussi. Les crates existent, les frontières des traits sont réelles, et le compilateur fait respecter la direction des dépendances. C’est un travail véritablement de qualité. Et au sein de ces nouveaux crates, les mêmes patterns qui caractérisaient le monolithe d’origine ont été reconduits, parce que la base de code a évolué avant que l’équipe ne dispose d’un modèle partagé de ce à quoi ressemble la « qualité au niveau de l’implémentation ».</p>
+<p>Ce sont des faits mesurés, pas des estimations :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Métrique</th><th>Valeur</th><th>Ce que cela indique</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16 800 lignes</td><td>Désormais le fichier le plus volumineux de la base de code ; le <code>loop_.rs</code> d’origine avait été signalé à 9 500 lignes dans la RFC d’architecture ; celui-ci le dépasse</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/mod.rs</code></td><td>11 813 lignes</td><td>Deuxième fichier le plus volumineux ; un seul module portant une responsabilité concentrée</td></tr>
+<tr><td><code>zeroclaw-runtime/src/onboard/wizard.rs</code></td><td>7 988 lignes</td><td>Un seul workflow dans un seul fichier</td></tr>
+<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6 101 lignes</td><td>Réduit par rapport aux ~9 500 du monolithe : un progrès réel et mesurable ; reste néanmoins volumineux</td></tr>
+<tr><td><code>zeroclaw-channels/src/orchestrator/telegram.rs</code></td><td>5 122 lignes</td><td>Une implémentation de canal ; un fichier</td></tr>
+<tr><td>Appels à <code>.unwrap()</code> / <code>.expect()</code> dans les crates</td><td>5 630</td><td>Chacune est une décision reportée concernant la gestion des erreurs, voir §4.1</td></tr>
+<tr><td>Appels à <code>.unwrap()</code> / <code>.expect()</code> dans <code>src/</code> hérité</td><td>240</td><td>La migration a propagé le modèle à grande échelle.</td></tr>
+<tr><td>Fonctions publiques dans <code>zeroclaw-api</code></td><td>371</td><td>La totalité de la surface d’API fondamentale ; tous les autres crates dépendent de celui-ci</td></tr>
+<tr><td>Lignes de commentaires de documentation dans <code>zeroclaw-api</code></td><td>~27</td><td>Ratio d’environ 14:1 d’API publique non documentée, voir §4.2</td></tr>
+<tr><td><code>#[allow(unused_imports)]</code> / <code>#[allow(dead_code)]</code> dans les modules <code>src/</code> hérités</td><td>~30+ instances</td><td>Le compilateur a identifié du code qui n’est plus utilisé ; il a été demandé de ne pas l’indiquer.</td></tr>
+<tr><td><code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code> dans l’ensemble de la base de code</td><td>20</td><td>Notablement faible, ce qui suggère que la majeure partie de la dette est silencieuse plutôt que marquée</td></tr>
+</tbody>
+</table>
+</div>
+<p>La dernière ligne mérite une note à part. Vingt marqueurs explicites de travail incomplet dans une base de code de cette taille ne sont pas un signe que le travail est presque terminé. C’est un signe que la plupart des travaux incomplets ne sont pas étiquetés comme tels. La dette non marquée est plus difficile à trouver, à prioriser et à attribuer que la dette qui a été nommée. Le silence n’est pas synonyme de complétude.</p>
+<h3 id="22-ce-que-les-chiffres-ne-montrent-pas"><a class="header" href="#22-ce-que-les-chiffres-ne-montrent-pas">2.2 Ce que les chiffres ne montrent pas</a></h3>
+<p>Ces chiffres mesurent ce qui est comptable. Les questions de qualité plus importantes ne peuvent pas être comptées :</p>
+<ul>
+<li>Que les 5 630 appels à <code>.unwrap()</code> se trouvent dans des chemins critiques ou dans des utilitaires de test</li>
+<li>Si les tests existants testent le comportement ou les détails de l’implémentation.</li>
+<li>Les fonctions publiques de <code>zeroclaw-api</code> peuvent-elles être correctement implémentées par quelqu’un qui lit uniquement la signature et le type ?</li>
+<li>Si un message de journal émis lors d’une défaillance en production contient suffisamment de contexte pour diagnostiquer la défaillance.</li>
+<li>Si un contributeur travaillant dans le module de sécurité comprend quelles données ont franchi une limite de confiance et lesquelles ne l’ont pas.</li>
+</ul>
+<p>Il s’agit de questions d’évaluation. Elles ne sont pas soumises à un contrôle CI. Elles reposent sur les normes que ce document propose de nommer, ainsi que sur la culture de revue et de mentorat que nous construisons ensemble.</p>
+<h3 id="23-ce-qui-est-déjà-bien"><a class="header" href="#23-ce-qui-est-déjà-bien">2.3 Ce qui est déjà bien</a></h3>
+<p>Le diagnostic ne doit pas obscurcir ce qui est véritablement bien conçu.</p>
+<p>La couche de traits dans <code>zeroclaw-api</code> est la bonne architecture. <code>Provider</code>, <code>Channel</code>, <code>Tool</code>, <code>Memory</code>, <code>Observer</code>, <code>RuntimeAdapter</code> et <code>Peripheral</code> sont des abstractions propres et bien pensées. Ce sont les bonnes lignes de séparation. Le problème ne vient pas de la conception. C’est que la conception n’est pas encore pleinement exprimée dans la documentation, la couverture de tests et la discipline de gestion des erreurs. Cette RFC vise à combler cet écart.</p>
+<p>Le modèle de sécurité est réfléchi. Les codes d’appairage, les niveaux d’autonomie, les couches de sandboxing et l’application des politiques témoignent d’une véritable intention de conception. Cette intention doit être comprise par chaque contributeur qui écrit du code à proximité d’une frontière de confiance, et cette RFC existe en partie pour donner aux contributeurs le vocabulaire nécessaire pour reconnaître où se situent ces frontières.</p>
+<p>L’infrastructure d’observabilité est mature. OpenTelemetry, Prometheus et les indicateurs DORA sont tous implémentés en fonction d’un trait <code>Observer</code> propre. L’infrastructure est en place. Le fossé pédagogique réside dans la manière dont les contributeurs l’utilisent pour qu’elle soit réellement utile en cas de problème.</p>
+<p>La suite de tests n’est pas absente. L’investissement existant dans les tests est réel. Le travail décrit dans cette RFC concerne la qualité et la répartition de cet investissement : ce qui est testé, comment, et si les tests prouvent ce qu’ils semblent prouver.</p>
+<p><a href="../architecture/decisions/ADR-004-tool-shared-state-ownership.html">ADR-004</a> est un excellent exemple de documentation architecturale. Il prouve que l’équipe peut produire une documentation de conception de haute qualité lorsque l’attente est claire. Ce RFC propose une attente équivalente pour le code lui-même.</p>
+<hr>
+<h2 id="3-portes-et-normes--la-distinction-centrale"><a class="header" href="#3-portes-et-normes--la-distinction-centrale">3. Portes et normes : la distinction centrale</a></h2>
+<p>C’est l’idée organisatrice de l’ensemble du document. La comprendre clairement est plus importante que toute technique spécifique du §4.</p>
+<p>Une <strong>gate</strong> est binaire : succès ou échec. Elle est automatisée, imposée par des outils et définit le seuil minimum en dessous duquel aucun code n’est fusionné. La RFC CI/CD a établi ces gates. Elles sont réelles et fonctionnelles.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Porte</th><th>Ce qu’il vérifie</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cargo fmt --check</code></td><td>Le code est formaté de manière cohérente dans l’ensemble de l’espace de travail.</td></tr>
+<tr><td><code>cargo clippy --workspace --all-targets -D warnings</code></td><td>Aucune antipattern connue de Clippy ; à l’échelle de l’espace de travail</td></tr>
+<tr><td><code>cargo deny check</code></td><td>Aucun avis de sécurité non acquitté ; conformité de la licence et de la source</td></tr>
+<tr><td><code>cargo nextest run --workspace</code></td><td>Les tests qui existent, passent</td></tr>
+</tbody>
+</table>
+</div>
+<p>Un <strong>standard</strong> est un idéal à atteindre. Il décrit à quoi ressemble la qualité au-delà du minimum requis. Il est appliqué grâce au jugement, à la revue par les pairs et aux habitudes que l’équipe construit ensemble.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Standard</th><th>Ce que cela décrit</th></tr>
+</thead>
+<tbody>
+<tr><td>Discipline de gestion des erreurs</td><td>Les échecs sont catégorisés ; les erreurs opérationnelles remontent avec du contexte à la bonne couche.</td></tr>
+<tr><td>Documentation de l’API</td><td>Chaque élément public dispose d’une documentation suffisante pour être utilisé correctement sans avoir à lire l’implémentation.</td></tr>
+<tr><td>Qualité des tests</td><td>Les tests affirment le comportement, pas l’implémentation ; la difficulté des tests est considérée comme un retour sur la conception.</td></tr>
+<tr><td>Triage des dettes</td><td>La dette non résolue est étiquetée, localisée et pondérée en fonction du risque ; la dette à haut risque a un propriétaire.</td></tr>
+<tr><td>Posture de sécurité</td><td>Les limites de confiance sont explicites au niveau de l’implémentation, et pas seulement au niveau de la politique.</td></tr>
+<tr><td>Discipline d’observabilité</td><td>Les messages de journal répondent à la question diagnostique ; les étendues lient des unités significatives de travail.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Les portes et les normes ne sont pas en concurrence. Elles constituent des couches complémentaires. Des portes sans normes produisent du code qui passe tous les contrôles mais échoue auprès des utilisateurs. Des normes sans portes sont inapplicables. Vous avez besoin des deux. Le projet dispose actuellement de bonnes portes et de normes sous-développées.</p>
+<blockquote>
+<p>Un code peut réussir chaque étape de validation et rester incompréhensible pour le prochain contributeur, se taire au lieu de remonter les erreurs, être impossible à tester de manière isolée, et présenter des failles de sécurité à l’interface entre les entrées utilisateur et la logique métier. La coche verte répond à la question « ce code a-t-il passé les règles que nous avons définies ? » Elle ne répond pas à la question « ce code est-il de qualité ? » Ces deux questions ne sont pas identiques.</p>
+</blockquote>
+<p>Ceci n’est pas une critique des barrières de qualité. Les barrières sont précieuses justement parce qu’elles définissent un socle commun et applicable dans lequel chaque contributeur travaille. L’objectif de ce document est de construire le vocabulaire et le jugement partagés qui définissent ce à quoi ressemble la qualité au-delà de ce socle, et d’expliquer clairement pourquoi ce jugement ne peut pas être délégué à un outil.</p>
+<hr>
+<h2 id="4-les-sept-disciplines"><a class="header" href="#4-les-sept-disciplines">4. Les sept disciplines</a></h2>
+<h3 id="41-la-gestion-des-erreurs-comme-préoccupation-de-conception"><a class="header" href="#41-la-gestion-des-erreurs-comme-préoccupation-de-conception">4.1 La gestion des erreurs comme préoccupation de conception</a></h3>
+<p>Chaque appel à <code>.unwrap()</code> est une décision. La plupart des 5 630 présents dans la base de code n’ont pas été faits consciemment. Ils ont été faits par défaut, parce que <code>.unwrap()</code> est le chemin de moindre résistance quand on a besoin d’extraire une valeur d’un <code>Result</code> ou d’une <code>Option</code> et qu’on veut passer à autre chose. Le problème avec les décisions prises par défaut, c’est qu’elles ne sont pas des décisions. Ce sont des reports. Et ce qu’elles reportent, c’est une vraie question : <em>que devrait-il se passer ici en cas d’échec ?</em></p>
+<p>La réponse dépend du type de panne que vous rencontrez. Il existe trois types de pannes, et chacune a sa propre réponse correcte.</p>
+<p><strong>Les erreurs de programmation</strong> sont des violations d’invariants qui devraient être impossibles dans un code correct. Une fonction qui exige un <code>Vec</code> non vide, appelée avec un <code>Vec</code> vide. Un match sur une enum qui atteint une branche que le système de types aurait dû rendre inaccessible. Cela représente des bugs, et non des défaillances opérationnelles, mais une logique incorrecte. <code>panic!</code> est la réponse correcte, car l’objectif est de détecter ces erreurs au moment du développement, et non devant un utilisateur à l’exécution. <code>assert!</code> et <code>debug_assert!</code> sont les bons outils. <code>.expect()</code> avec un message expliquant pourquoi cet état est impossible est également approprié ici. Cela rend le raisonnement explicite et facile à rechercher, afin que la prochaine personne qui lit le code comprenne pourquoi le panic était intentionnel.</p>
+<p><strong>Les erreurs opérationnelles</strong> sont des modes de défaillance attendus. Délais d’attente réseau. Fichiers inexistants. Clés API expirées. Réponses de fournisseurs portant un statut d’erreur. Utilisateurs fournissant des entrées mal formées. Ce ne sont pas des bugs. Ce sont les conditions de fonctionnement normales d’un système qui interagit avec le monde. La réponse correcte est <code>Result&lt;T, E&gt;</code>. L’opérateur <code>?</code> propage la défaillance à un appelant qui est mieux placé pour décider quoi en faire. Un <code>.unwrap()</code> sur une erreur opérationnelle est une panique différée : elle se déclenchera, tôt ou tard, dans des conditions réelles, devant un utilisateur réel, sans contexte utile et sans possibilité de récupération.</p>
+<p><strong>Les erreurs de configuration</strong> sont des configurations malformées ou manquantes découvertes au démarrage. La bonne réponse consiste à échouer rapidement, mais de manière précise. Pas une panique avec une trace de pile, pas un message vague du type « invalid config ». Un message qui pointe vers le champ spécifique, explique ce qui était attendu et indique à l’opérateur ce qu’il doit fournir. Un utilisateur qui ne peut pas démarrer ZeroClaw à cause d’une mauvaise configuration devrait quitter le processus en comprenant clairement ce qu’il doit corriger.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type d’échec</th><th>Ce que cela signifie</th><th>Réponse correcte</th></tr>
+</thead>
+<tbody>
+<tr><td>Erreur de programmation</td><td>Invariant violée ; devrait être impossible dans un code correct</td><td><code>panic!</code>, <code>assert!</code>, <code>.expect("raison pour laquelle ceci est sûr")</code></td></tr>
+<tr><td>Erreur opérationnelle</td><td>Mode d’échec attendu ; le monde ne coopère pas</td><td><code>Result&lt;T, E&gt;</code>, <code>?</code>, type d’erreur structuré avec contexte</td></tr>
+<tr><td>Erreur de configuration</td><td>Configuration de démarrage invalide ou manquante</td><td>Échec rapide avec un message spécifique et exploitable</td></tr>
+</tbody>
+</table>
+</div>
+<p>Avant chaque <code>.unwrap()</code> ou <code>.expect()</code>, demandez-vous : de quel type de défaillance s’agit-il ? Si la réponse est « erreur de programmation : cet état ne peut pas se produire dans un code correct », alors <code>.expect()</code> accompagné d’un commentaire expliquant pourquoi est le bon choix, et cela communique votre raisonnement à chaque futur lecteur. Si la réponse est autre, utilisez <code>?</code> ou gérez la défaillance explicitement.</p>
+<p>L’opérateur <code>?</code> mérite d’être compris pour ce qu’il <em>dit</em>, pas seulement pour ce qu’il fait. Il dit : je reconnais que cette opération peut échouer. Je propage explicitement cet échec à mon appelant, qui est mieux placé pour décider quoi en faire. Cette reconnaissance est significative sur le plan architectural : elle rend le contrat de gestion des erreurs visible au point d’appel et reporte les décisions vers la couche qui dispose du plus de contexte.</p>
+<p>L’objectif n’est pas d’éliminer tous les appels <code>.unwrap()</code>. Certains sont justifiés. L’objectif est que chaque appel représente une décision consciente, avec la justification rendue visible pour quiconque lit le code. La différence entre <code>.unwrap()</code> et <code>.expect("ce vecteur est garanti non vide par l’appelant — voir §4.2 des invariants du moteur SOP")</code> n’est pas seulement une question de style. C’est la différence entre un jugement différé et un jugement documenté.</p>
+<h3 id="42-surface-de-lapi-publique-en-tant-que-promise"><a class="header" href="#42-surface-de-lapi-publique-en-tant-que-promise">4.2 Surface de l’API publique en tant que Promise</a></h3>
+<p><code>pub</code> est un contrat.</p>
+<p>Lorsque vous marquez une fonction, une structure, un trait ou un module comme public, vous faites une promesse à chaque appelant. Cela inclut le contributeur qui implémente contre cette API le mois prochain, sans se souvenir de votre intention initiale. Cela inclut l’assistant IA qui lit votre crate pour générer une implémentation. Cela inclut la personne qui débogue un incident en production et qui doit comprendre ce que cela était censé faire. Cela inclut également vous-même, revenant à ce code après deux mois passés sur autre chose.</p>
+<p>Un élément public sans documentation est une promesse sans conditions. L’appelant n’a aucun moyen de connaître les hypothèses que vous avez faites en l’écrivant, les conditions d’erreur qu’il peut renvoyer et dans quelles circonstances, ses effets de bord, s’il peut être appelé en toute sécurité de manière concurrente, ou quelle est la différence subtile entre deux fonctions aux noms similaires. Il ne lui reste plus qu’à déduire, à partir du nom, de la signature de type et du corps de l’implémentation, ce que vous auriez pu lui dire en trois phrases.</p>
+<p>La situation de <code>zeroclaw-api</code> est suffisamment spécifique pour être nommée directement. C’est la seule crate dont dépend l’ensemble de l’architecture. Chaque provider, canal, outil, backend de mémoire, observateur, adaptateur de runtime et implémentation périphérique de l’espace de travail est construit sur ces traits et ces types. Une interface non documentée dans cette fondation propage la confusion dans chaque crate qui l’implémente, chaque test qui l’exerce et chaque code généré par IA qui interagit avec elle. Le ratio de 14:1 de surface d’API publique non documentée n’est pas une préférence de style de documentation. C’est une lacune dans le contrat que la RFC d’architecture désignait comme la couche la plus importante du système.</p>
+<p>La dimension IA ici est pratique et directe : lorsque vous demandez à un assistant IA d’implémenter un trait ou d’appeler une fonction sans documentation, l’IA infère l’intention à partir du nom et de la signature de type. Parfois, cette inférence est correcte. Plus souvent, elle produit du code qui compile, passe le vérificateur de types et se comporte incorrectement dans des conditions spécifiques que l’IA ne pouvait pas anticiper, parce que personne ne les a écrites. La documentation n’est pas seulement destinée aux humains. C’est la spécification que vous fournissez à chaque outil qui travaillera un jour avec votre code, et à chaque personne qui en dépendra un jour.</p>
+<p>Au minimum, chaque élément public de <code>zeroclaw-api</code> doit comporter :</p>
+<ul>
+<li><strong>Une phrase décrivant ce qu’il fait.</strong> Pas ce qu’il est : ce qu’il fait.</li>
+<li><strong>Une section <code># Erreurs</code></strong> (si elle retourne <code>Result</code>) : dans quelles conditions échoue-t-elle, et quelles variantes d’erreur l’appelant doit-il gérer ?</li>
+<li><strong>Une section <code># Paniques</code></strong> (si elle peut provoquer une panique) : dans quelles conditions et pourquoi ?</li>
+<li><strong>Préconditions</strong> (le cas échéant) : que doit être vrai avant d’appeler cela ?</li>
+</ul>
+<p>Un commentaire de documentation de trois phrases sur une méthode publique de trait vaut plus pour le prochain implémenteur que cent lignes d’implémentation sans explication. L’implémentation lui indique ce que le code fait. La documentation lui indique ce qu’il est censé faire, ce qui est ce qui compte lorsque les deux divergent.</p>
+<h3 id="43-les-tests-comme-retour-sur-la-conception"><a class="header" href="#43-les-tests-comme-retour-sur-la-conception">4.3 Les tests comme retour sur la conception</a></h3>
+<p>Le but d’un test n’est pas de produire une coche verte. Le but est de créer un enregistrement précis et exécutable de ce qu’un morceau de code est <em>censé faire</em> : un enregistrement qui échoue bruyamment si ce comportement vient à changer.</p>
+<p>Cette distinction est importante car il existe deux types fondamentalement différents de tests, et un seul d’entre eux permet d’atteindre cet objectif.</p>
+<p>Un test qui accède à l’état interne d’une struct, définit des valeurs directement, appelle une méthode et fait des assertions sur les valeurs de retour teste l’<em>implémentation</em>. Si l’implémentation change, si le même comportement est obtenu par un mécanisme différent, le test échoue, alors même que rien de ce qui importe à l’utilisateur n’a changé. Cela crée des frictions contre le refactoring sans apporter de sécurité. Un tel test a aussi tendance à réussir alors que le comportement est incorrect, de manières que le test n’avait pas anticipées.</p>
+<p>Un test qui construit des valeurs via des interfaces publiques, exerce le comportement par le biais de méthodes publiques et vérifie les résultats observables teste le <em>comportement</em>. Si l’implémentation change mais que le comportement est préservé, le test réussit. Si le comportement change d’une manière qui a de l’importance pour les utilisateurs, le test échoue. C’est ce qui rend possible une refactorisation en toute confiance : les tests vérifient que vous avez obtenu le bon résultat, et non que vous l’avez obtenu d’une manière particulière.</p>
+<p>Le principe plus important est le principe diagnostique :</p>
+<blockquote>
+<p>Un test difficile à écrire indique généralement un problème de conception.</p>
+</blockquote>
+<p>Si écrire un test unitaire pour une fonction nécessite de mettre en place une connexion à une base de données, de simuler six dépendances, de construire un objet de configuration complet et de démarrer explicitement un runtime asynchrone, cette fonction en fait probablement trop, dépend de trop de choses, ou se situe au mauvais niveau de l’architecture. Cette difficulté n’est pas une gêne à contourner. C’est un retour d’information. Le test est honnête à propos de quelque chose dont le code n’est pas encore honnête.</p>
+<p>Cela se rattache directement à la structure de crates établie par le RFC d’architecture. L’un des objectifs de la décomposition en crates était de créer des composants pouvant être testés de manière isolée. <code>zeroclaw-tool-call-parser</code> devrait être testable avec une entrée <code>&amp;str</code> et sans runtime. <code>zeroclaw-config</code> devrait être testable en construisant directement les structs de configuration. Les implémentations de traits dans <code>zeroclaw-api</code> devraient être testables avec des implémentations factices du trait, et non avec la pile de production complète. Lorsque vous constatez qu’il est impossible de tester un composant sans l’intégralité de son environnement, demandez-vous si une dépendance non prévue par l’architecture ne s’est pas glissée dans l’implémentation. Le test vous donne la réponse ; la question est de savoir si vous l’écoutez.</p>
+<p>Une approche pratique pour améliorer la qualité des tests au fil du temps :</p>
+<ul>
+<li>Lorsque vous corrigez un bug, écrivez un test qui l’aurait détecté. Cette habitude, pratiquée de manière constante, oriente la suite de tests vers les modes de défaillance qui comptent vraiment.</li>
+<li>Lorsque vous ajoutez un comportement, écrivez un test qui prouve que ce comportement existe et peut être vérifié de manière isolée.</li>
+<li>Lorsqu’un test est difficile à écrire, prenez le temps de vous demander <em>pourquoi</em> avant de recourir à un mock. La réponse à cette question est généralement plus précieuse que le test que vous étiez sur le point d’écrire.</li>
+</ul>
+<h3 id="44-tri-de-la-dette-technique"><a class="header" href="#44-tri-de-la-dette-technique">4.4 Tri de la dette technique</a></h3>
+<p>Le mot « dette » est utile car il véhicule la bonne implication : elle produit des intérêts. Une dette laissée sans examen dans une zone très fréquentée de la base de code s’accumule de manière composée : le nouveau code s’adapte à sa présence, de nouvelles hypothèses s’édifient sur les anciennes, et le coût de son traitement augmente à chaque couche ajoutée au-dessus.</p>
+<p>L’erreur la plus courante que les équipes commettent avec la dette technique est de la considérer comme binaire : soit tout est de la dette et rien ne peut être fait à ce sujet, soit rien n’est de la dette et aucun temps ne devrait être consacré à cela. Ces deux positions sont erronées. La question utile est : <em>quelle dette, à quel endroit, présente le plus de risque en ce moment ?</em></p>
+<p>Deux axes déterminent la priorité.</p>
+<p><strong>Proximité d’une frontière de confiance.</strong> Le code qui gère les entrées utilisateur, applique les politiques de sécurité, exécute des outils, gère l’authentification ou traite des données provenant de sources externes opère près d’une frontière de confiance. Des défaillances à cet endroit peuvent être exploitées, corrompre silencieusement l’état du système ou produire un comportement incorrect avec des conséquences sur la sécurité. La dette technique près des frontières de confiance présente un risque disproportionné par rapport à sa taille.</p>
+<p><strong>Rayon d’impact.</strong> La dette dans <code>zeroclaw-api</code>, la fondation dont tout le reste dépend, a un rayon d’impact plus large que la dette dans l’implémentation d’un seul canal. Une hypothèse erronée dans un type fondamental se propage partout où ce type est utilisé. La dette dans un crate feuille n’affecte que les consommateurs de ce crate.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>Forte impact</th><th>Faible rayon d’explosion</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Près d’une limite de confiance</strong></td><td>Adresse dans le cycle actuel</td><td>Adresse dans le prochain cycle prévu</td></tr>
+<tr><td><strong>Loin d’une frontière de confiance</strong></td><td>Adresse dans une refactorisation planifiée</td><td>Traiter de manière opportuniste, au fur et à mesure que le travail adjacent passe.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Ce cadre signifie qu’un <code>.unwrap()</code> dans le chemin de vérification de la politique de sécurité n’est pas le même problème qu’un <code>.unwrap()</code> dans un formateur d’affichage CLI. Les deux apparaissent dans le décompte de 5 630. Le décompte nous indique l’étendue. Le triage nous indique la priorité.</p>
+<p>Lorsque vous travaillez dans un fichier et que vous remarquez de la dette, un <code>.unwrap()</code> qui représente une erreur opérationnelle non gérée, une fonction qui a grossi au point de gérer quatre préoccupations distinctes, un <code>#[allow(dead_code)]</code> qui fait taire quelque chose que personne n’appelle, vous n’avez pas besoin de tout corriger. Vous devez vous demander : est-ce situé à un emplacement à haut risque ? Si c’est le cas, traitez le problème dans cette PR ou créez un ticket de suivi avec l’emplacement précis, le risque et un responsable proposé. Si ce n’est pas le cas, vous pouvez le marquer avec un commentaire <code>// TODO(debt): &lt;description&gt;</code> qui le rend visible sans le rendre urgent. Ce que vous ne devez pas faire, c’est le laisser complètement non marqué, car c’est par le silence que 5 630 décisions différées s’accumulent sans que personne ne remarque la tendance.</p>
+<p>Le patron Strangler Fig s’applique aussi à ce niveau. La RFC d’architecture l’a appliqué au niveau des crates : construire la nouvelle structure autour de l’ancienne, puis migrer vers l’intérieur au fil du temps. Le même patron fonctionne à l’intérieur d’un fichier volumineux. On ne réécrit pas <code>schema.rs</code> en une seule PR. On identifie les fonctions les plus proches des frontières de confiance, les plus fréquemment modifiées ou les plus difficiles à tester, et on les extrait en premier, en améliorant la structure de manière incrémentale, en laissant le reste suivre à un rythme que l’équipe peut soutenir.</p>
+<h3 id="45-sécurité-au-niveau-de-lapplication"><a class="header" href="#45-sécurité-au-niveau-de-lapplication">4.5 Sécurité au niveau de l’application</a></h3>
+<p>La RFC CI/CD a défini la posture de sécurité de la <em>chaîne d’approvisionnement</em> : <code>cargo deny</code> détecte les vulnérabilités connues dans les dépendances, impose la conformité des licences et garantit que les dépendances proviennent de sources approuvées. C’est le système immunitaire de ce qui entre dans le projet. Cette section traite de la posture de sécurité du code qui s’exécute.</p>
+<p><code>cargo deny</code> ne peut pas détecter une vulnérabilité créée par la logique de votre application. Il ne peut pas vous indiquer si les entrées utilisateur sont validées avant d’atteindre votre logique métier. Il ne peut pas vérifier si l’exécution d’un outil respecte le niveau d’autonomie qu’il est censé imposer. Il ne peut pas non plus vous dire si un chemin d’erreur avale silencieusement un échec de vérification de sécurité. Cela nécessite un contributeur qui comprend où se trouvent les limites de confiance et à quoi ressemble un code responsable de part et d’autre de celles-ci.</p>
+<p>Trois principes qui devraient guider tout code écrit près d’une limite de confiance :</p>
+<p><strong>Les frontières de confiance sont explicites, pas supposées.</strong> Une frontière de confiance est tout point où des données arrivent depuis l’extérieur de votre contrôle direct : entrées utilisateur provenant de n’importe quel canal, réponses d’API des fournisseurs, contenus de fichiers du système de fichiers, sorties de plugins, résultats d’outils, mesures matérielles. À chaque frontière de confiance, validez avant de traiter. Ne supposez pas la forme, la taille, le type ou le contenu de données que vous n’avez pas produites. Le modèle de sécurité de ZeroClaw définit ces frontières au niveau de la politique. L’implémentation doit les refléter au niveau du code, non pas parce que la politique échouera, mais parce que la défense en profondeur signifie que chaque couche du système fait sa part, plutôt que de présumer que toutes les autres couches ont fait la leur.</p>
+<p><strong>Empreinte minimale.</strong> Une fonction qui doit lire un fichier ne devrait pas pouvoir en écrire un. Une implémentation de trait qui gère les messages d’un canal ne devrait pas avoir accès à l’état d’un autre canal. Un outil s’exécutant au niveau d’autonomie 1 ne devrait pas être en mesure d’exercer des capacités qui requièrent le niveau 3. Le modèle de sécurité définit déjà ces contraintes. La discipline consiste à écrire des implémentations qui n’acquièrent pas plus de capacités que ce dont elles ont besoin pour la tâche en cours, et à remarquer lorsqu’une implémentation cherche à atteindre quelque chose en dehors de son périmètre prévu.</p>
+<p><strong>Échouez bruyamment à proximité des limites de sécurité.</strong> Une erreur dans une vérification de sécurité, une évaluation de politique échouée, un échec de vérification de signature, une tentative d’appel d’outil non autorisée, une non-correspondance de code d’appairage, ne doit jamais être silencieusement ignorée. Elle doit être journalisée, propagée et gérée explicitement. Une erreur dans une fonction d’aide à l’affichage peut être récupérée avec élégance via un message de journal. Une erreur dans un chemin d’autorisation ne le peut pas. Sachez quel type de fonction vous écrivez, et laissez cette détermination guider l’intensité avec laquelle vous faites remonter les échecs qui en proviennent.</p>
+<p>Ce ne sont pas des principes de sécurité avancés. Ce sont des règles d’hygiène fondamentales qui s’appliquent à tout code en contact avec quelque chose qu’un utilisateur peut influencer. La RFC d’architecture décrivait le modèle de sécurité comme « réfléchi ». Le travail demandé par cette RFC consiste à rendre cette réflexion lisible au niveau de l’implémentation : dans les fonctions qui valident les entrées, dans les chemins d’erreur qui gèrent les échecs de politique, et dans les frontières entre ce que le système a été chargé de faire et ce qu’il fait réellement.</p>
+<h3 id="46-lobservabilité-comme-capacité-de-débogage"><a class="header" href="#46-lobservabilité-comme-capacité-de-débogage">4.6 L’observabilité comme capacité de débogage</a></h3>
+<p>L’infrastructure d’observabilité est mature : traçage OpenTelemetry, métriques Prometheus, suivi DORA et un trait <code>Observer</code> propre sont tous en place. C’est un travail de qualité production. Le manque pédagogique se situe entre le fait de disposer de l’infrastructure et le fait de l’utiliser d’une manière qui aide réellement quand quelque chose tourne mal, idéalement avant de savoir ce qui a mal tourné.</p>
+<p>Considérez deux messages de journal. Les deux se compilent. Les deux passent les vérifications CI. Les deux sont syntaxiquement corrects.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(« la requête a échoué »);
+<span class="boring">}</span></code></pre>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>error!(
+    provider = %provider_name,
+    model    = %model_id,
+    user     = %sender_id,
+    tool     = %tool_name,
+    attempt  = attempt,
+    elapsed  = ?elapsed,
+    err      = %e,
+    « la requête du fournisseur a échoué — les tentatives de retry sont épuisées »
+);
+<span class="boring">}</span></code></pre>
+<p>Le premier est un constat. Il confirme que quelque chose s’est mal passé. Le second est un <em>diagnostic</em>. Il répond aux questions qui comptent : qu’essayions-nous de faire, dans quel contexte, avec quels paramètres, et qu’est-ce qui s’est exactement mal passé. La différence entre les deux n’est pas une question de sophistication technique. C’est de savoir si la personne qui a écrit le message pensait à la personne qui aura un jour besoin de le lire.</p>
+<p>La question à se poser avant de rédiger tout message de journal au niveau <code>warn</code> ou supérieur :</p>
+<blockquote>
+<p>Que doit savoir la personne qui doit diagnostiquer cette défaillance au pire moment ?</p>
+</blockquote>
+<p>Cette personne pourrait être vous, dans six mois, sans aucun souvenir d’avoir écrit ce code. Cela pourrait être un autre contributeur qui n’a jamais vu ce module. Cela pourrait être un utilisateur soumettant un rapport de bug avec un extrait de journal qu’il a copié depuis son terminal. Écrivez pour eux. Les champs qui importent presque toujours sont : que cherchions-nous à faire, quel contexte était pertinent à ce moment-là, et qu’est-ce qui a spécifiquement mal tourné.</p>
+<p>Le même principe régit la conception des spans de traçage. Une span doit représenter une unité de travail significative, porter le contexte nécessaire pour comprendre ce travail, et avoir un nom pertinent lorsqu’on le lit dans un graphe de flamme ou un visualiseur de traces.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Un enregistrement
+let _span = span!(Level::INFO, "processus");
+
+// Un diagnostic
+let _span = span!(
+    Level::INFO,
+    "agent.tool_call",
+    tool = %tool_name,
+    turn = turn_number,
+    sender = %sender_id,
+);
+<span class="boring">}</span></code></pre>
+<p>La journalisation structurée et la conception de spans pertinents ne sont pas des préférences de style. C’est ce qui rend l’infrastructure d’observabilité dont vous disposez réellement utile, non seulement pendant le développement, mais aussi entre les mains d’utilisateurs exécutant ZeroClaw sur du matériel que vous ne verrez jamais, dans des configurations que vous n’aviez pas anticipées, face à des erreurs que vous n’aviez pas prévues. L’infrastructure crée la capacité. La discipline avec laquelle les contributeurs l’utilisent détermine si cette capacité se traduit par des systèmes diagnosticables.</p>
+<h3 id="47-travailler-au-dessus-du-sol"><a class="header" href="#47-travailler-au-dessus-du-sol">4.7 Travailler au-dessus du sol</a></h3>
+<p>Les six disciplines précédentes traitent chacune d’un domaine spécifique. Cette section les synthétise en une vision unifiée de ce à quoi ressemble concrètement le « au-dessus du minimum » : ce qu’un relecteur, un futur contributeur ou un utilisateur vit réellement lorsqu’il rencontre du code conforme aux normes décrites dans cette RFC.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Dimension</th><th>Au sol, les portes passent</th><th>Au-dessus du plancher, norme respectée</th></tr>
+</thead>
+<tbody>
+<tr><td>Gestion des erreurs</td><td>Le code compile ; aucun avertissement Clippy</td><td>Les erreurs sont catégorisées ; les erreurs opérationnelles apparaissent avec du contexte ; les paniques sont intentionnelles et documentées.</td></tr>
+<tr><td>Documentation</td><td>Les tests de documentation passent s’ils existent</td><td>Chaque élément public peut être compris et utilisé correctement sans avoir à lire l’implémentation.</td></tr>
+<tr><td>Tests</td><td>Les tests qui existent passent</td><td>Les tests affirment le comportement ; la difficulté des tests est considérée comme un retour sur la conception ; les modes de défaillance pertinents sont couverts</td></tr>
+<tr><td>Dette</td><td>Aucune erreur ni avertissement du compilateur (avec <code>#[allow]</code> pour masquer le reste)</td><td>La dette est étiquetée, localisée et pondérée en fonction du risque ; la dette à haut risque a un propriétaire et un calendrier.</td></tr>
+<tr><td>Sécurité</td><td><code>cargo deny</code> est passé avec succès</td><td>Les limites de confiance sont explicites ; les échecs de sécurité se manifestent de manière visible ; les implémentations respectent leur périmètre prévu.</td></tr>
+<tr><td>Observabilité</td><td>Le code s’exécute et émet quelque chose.</td><td>Les messages de journal répondent à la question diagnostique ; les étendues lient des unités significatives de travail avec un contexte utile.</td></tr>
+<tr><td>Organisation du code</td><td>Le fichier compile ; la structure du module existe.</td><td>Les fonctions font une seule chose ; les fichiers regroupent les préoccupations liées ; les fichiers volumineux sont des candidats à l’extraction, et non la norme.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Aucun de ces éléments n’est entièrement réalisable par l’automatisation. Tous peuvent être atteints par des contributeurs qui comprennent leur importance et ont développé le jugement nécessaire pour les appliquer de manière cohérente. C’est précisément l’objectif de ce document.</p>
+<hr>
+<h2 id="5-ce-que-cela-signifie-pour-le-développement-assisté-par-lia"><a class="header" href="#5-ce-que-cela-signifie-pour-le-développement-assisté-par-lia">5. Ce que cela signifie pour le développement assisté par l’IA</a></h2>
+<p>La RFC sur la culture abordait la manière de travailler avec les outils d’IA au sein d’une équipe collaborative. Cette section traite d’un sujet plus spécifique : ce qui se passe lorsque le code généré par l’IA est confronté aux normes décrites ci-dessus, et ce qu’il faut pour reconnaître et combler l’écart lorsqu’il ne les respecte pas.</p>
+<p>Les outils d’IA sont réellement performants pour franchir les étapes de validation. Ils génèrent du code qui compile, satisfait le vérificateur de types, passe Clippy, et produisent souvent des tests en même temps que l’implémentation. C’est une vraie valeur ajoutée, et il ne s’agit pas ici de la minimiser. Le problème n’est pas que les outils d’IA sont peu fiables. Le problème est qu’ils sont fiables sur le mauvais aspect : produire du code qui passe les vérifications, plutôt que du code qui respecte les normes.</p>
+<p>La raison est structurelle. L’IA génère du code en fonction de ce qu’elle peut inférer. Si une fonction n’a pas de documentation, l’IA infère l’intention à partir du nom et de la signature, et parfois cette inférence est correcte, et parfois elle produit un comportement subtilement erroné qui ne se manifeste que dans des conditions que personne n’a testées. Si un type d’erreur n’a pas de documentation indiquant quand il est retourné, l’IA le gère en se basant sur le nom du variant. Si une suite de tests teste l’implémentation plutôt que le comportement, l’IA génère des implémentations qui correspondent à ces tests, lesquelles peuvent ou non correspondre au comportement attendu que les tests étaient censés capturer. Le plafond de qualité des sorties de l’IA est déterminé par la qualité du contexte que vous fournissez. Un meilleur contexte, une documentation plus claire, des types d’erreur plus spécifiques, des tests axés sur le comportement, produisent de meilleures sorties. Un contexte sous-développé produit des sorties qui passent les contrôles et reportent le jugement sur la personne qui les examinera ensuite.</p>
+<p>Cela crée une responsabilité spécifique et non optionnelle pour les contributeurs travaillant avec des outils d’IA.</p>
+<p><strong>La revue n’est pas facultative parce que c’est l’IA qui l’a écrit.</strong> La RFC sur la culture l’a clairement énoncé, et cela mérite d’être répété avec des précisions : lors de la revue de code généré par IA, les questions de validation — est-ce que ça compile, est-ce que les tests passent — sont le début de la revue, pas la fin. Les questions standard sont : ce code gère-t-il correctement les erreurs opérationnelles, ou les traite-t-il avec <code>.unwrap()</code> ? La nouvelle API publique est-elle documentée ? Le test vérifie-t-il le comportement ou l’implémentation ? Ce code est-il proche d’une frontière de confiance, et si oui, valide-t-il ses entrées ? Ces questions relèvent de votre responsabilité, quel que soit l’auteur du code ou les outils utilisés pour le produire.</p>
+<p><strong>L’IA amplifie votre jugement, pas son absence.</strong> Un contributeur qui n’a pas encore de modèle mental de ce à quoi ressemble une bonne gestion des erreurs acceptera telle quelle la gestion des erreurs générée par l’IA : <code>.unwrap()</code> et tout le reste. Un contributeur qui a intériorisé le §4.1 peut examiner le même résultat et diriger l’outil : « il s’agit d’un chemin d’erreur opérationnel ; utilisez <code>?</code> et propagez l’échec à l’appelant avec du contexte. » L’outil produira une version corrigée. Le même schéma s’applique à chaque discipline du §4. L’outil est puissant entre les mains de quelqu’un qui sait quoi demander. Sans cette direction, il produit du code qui satisfait le compilateur et reporte les véritables décisions sur la personne suivante dans la chaîne.</p>
+<p><strong>Cette relation se renforce dans les deux sens.</strong> Une équipe qui comprend les normes tire progressivement davantage de valeur des outils d’IA à mesure que ces outils s’améliorent, car elle peut diriger des outils plus performants avec plus de précision. L’écart entre « ce que l’outil a produit » et « ce que la norme exige » devient quelque chose qu’elle peut combler par des directives plutôt que par une réécriture manuelle. Une équipe qui ne développe pas ce jugement obtient un chemin plus rapide vers le même niveau de qualité plancher, sans la capacité de le dépasser. L’investissement décrit tout au long de ce document est aussi, directement, un investissement dans l’efficacité à long terme de chaque outil d’IA que l’équipe utilisera, car la valeur de ces outils évolue proportionnellement à la clarté du jugement qui les dirige.</p>
+<hr>
+<h2 id="6-la-portabilité-de-lartisanat"><a class="header" href="#6-la-portabilité-de-lartisanat">6. La portabilité de l’artisanat</a></h2>
+<p>La technologie change. Elle change plus vite à chaque itération que la fois précédente, et ce rythme s’accélère. Les outils spécifiques mentionnés dans ce document : Rust, <code>cargo</code>, <code>clippy</code>, le SDK OpenTelemetry, les assistants IA que l’équipe utilise aujourd’hui, seront remplacés. Certains d’entre eux au cours de la durée de vie de ce projet. Les plateformes changeront. Les langages évolueront. L’écosystème d’outillage sera différent dans cinq ans de ce qu’il est aujourd’hui, et différent encore dans dix ans.</p>
+<p>Les modèles mentuels dans ce document ne changeront pas.</p>
+<p>La question « que doit-il se passer ici en cas d’échec, et qui doit en être informé ? » n’expire pas lorsque le langage change. Vous la poserez dans le prochain langage que vous apprendrez. Vous la poserez lors de la conception d’un système distribué où le « langage » est un protocole de communication. Vous la poserez lorsque vous construirez quelque chose dont d’autres personnes dépendent et que vous ne pouvez pas superviser personnellement. Le mécanisme Rust spécifique pour y répondre : <code>Result&lt;T, E&gt;</code>, l’opérateur <code>?</code>, les types d’erreurs structurés avec contexte, est une réponse à une question qui existe partout.</p>
+<p>La question « quelle est l’interface publique que je promets, et ma documentation reflète-t-elle cette promesse ? » : vous vous la poserez lors de la conception d’une API, lors de la rédaction d’une spécification technique, lors de la définition du périmètre des responsabilités d’une équipe, lors de la communication d’exigences à une autre équipe, à un outil d’IA, à un client, à un prestataire. Le modèle de promesse et de conditions des interfaces publiques s’étend bien au-delà de Rust et bien au-delà du logiciel.</p>
+<p>La question « que prouve réellement mon test ? » s’étend au-delà du logiciel à tout domaine où vous devez vérifier qu’un système se comporte comme prévu. L’instinct de la poser, de distinguer entre la preuve que votre implémentation existe et la preuve que la bonne chose se produit, voilà la compétence. La syntaxe pour l’exprimer en Rust est accessoire.</p>
+<p>La question « que devrait savoir la personne qui doit diagnostiquer cette panne ? » est une question d’ingénierie qui s’applique à tout ce que vous construisez et dont d’autres personnes dépendent. C’est aussi, à un niveau plus profond, une question d’empathie, qui nous rappelle que la personne de l’autre côté de votre travail est une personne réelle avec un problème réel, à un moment que vous ne pouvez pas prédire, avec un contexte que vous ne serez pas là pour fournir.</p>
+<blockquote>
+<p>Vous n’êtes pas en train d’apprendre Rust. Vous êtes, par l’intermédiaire de Rust, en train d’apprendre à construire des choses dignes de confiance. C’est transférable. Cela se cumulera aussi longtemps que vous le pratiquerez, dans chaque langage, chaque système, chaque équipe et chaque domaine où vous travaillerez.</p>
+</blockquote>
+<p>C’est l’investissement que le projet fait en vous. Non pas dans vos compétences techniques spécifiques, mais dans votre capacité à apporter du jugement, du savoir-faire et du soin à tout ce que vous construirez ensuite. Et c’est, à son tour, l’investissement que vous faites en chaque personne qui, un jour, dépendra de quelque chose que vous avez créé.</p>
+<hr>
+<h2 id="7-ce-que-cela-signifie-pour-les-contributeurs"><a class="header" href="#7-ce-que-cela-signifie-pour-les-contributeurs">7. Ce que cela signifie pour les contributeurs</a></h2>
+<p><strong>Si vous êtes nouveau dans Rust ou dans le développement logiciel :</strong></p>
+<p>Les sept disciplines du §4 ne sont pas des prérequis à maîtriser avant de pouvoir contribuer. Elles constituent une carte du territoire : des choses que vous rencontrerez au fil de votre travail, nommées suffisamment clairement pour que vous sachiez ce que vous avez sous les yeux lorsque vous les croiserez.</p>
+<p>Commencez par la section 4.1. Le modèle mental de gestion des erreurs est l’élément qui offre le plus grand levier d’action à intégrer tôt, et il n’est pas spécifique à Rust. Lorsque vous lisez du code existant et que vous rencontrez <code>.unwrap()</code>, demandez-vous dans laquelle des trois catégories il se situe. Lorsque vous écrivez du nouveau code, posez-vous la même question concernant vos propres choix. Cette habitude unique, pratiquée de manière constante, améliore chaque fichier qu’elle touche et développe un jugement qui vous accompagnera partout.</p>
+<p>N’attendez pas de vous sentir prêt pour appliquer ces normes. Appliquez-les de manière imparfaite, posez des questions lorsque vous n’êtes pas sûr de la catégorie à laquelle appartient quelque chose, et considérez les retours que vous recevez lors de la révision comme l’enseignement qu’ils sont censés être. Personne n’est arrivé en sachant tout cela. Cela s’apprend, lentement, à travers exactement ce type de travail que vous effectuez ici.</p>
+<p><strong>Si vous utilisez des outils d’IA pour vous aider à contribuer :</strong></p>
+<p>Les normes décrites dans ce document sont les critères selon lesquels une revue attentive évaluera le code généré par l’IA. Elles constituent également, en pratique, le contexte qui rend les résultats de l’IA plus corrects avant qu’ils n’atteignent la revue. Avant de demander à une IA d’implémenter quelque chose, vérifiez si les interfaces sur lesquelles elle s’appuiera sont documentées. Si elles ne le sont pas, documentez-les d’abord, ou incluez la documentation dans ce que vous demandez à l’IA de produire. Le résultat sera plus correct, vous aurez comblé une véritable lacune dans les fondations, et le prochain contributeur qui passera par là bénéficiera des deux.</p>
+<p>Lorsque vous recevez des commentaires sur du code généré par l’IA, considérez-les comme des retours sur le code lui-même, et non sur votre choix d’utiliser l’IA. Les normes s’appliquent de manière égale, quelle que soit l’auteur. La question est toujours : ce code respecte-t-il les normes ? Si ce n’est pas le cas, qu’est-ce qui doit être modifié et pourquoi ?</p>
+<p><strong>Si vous examinez des pull requests :</strong></p>
+<p>Les questions de validation — est-ce que ça compile, les tests passent-ils, Clippy l’accepte-t-il — constituent le plancher, pas le plafond. Une revue qui ne répond qu’à ces questions est une revue incomplète. Utilisez le cadre du §3 et les disciplines du §4 pour structurer vos observations. Nommez le standard que vous appliquez, expliquez pourquoi il est important, et séparez clairement les préoccupations bloquantes des suggestions non bloquantes.</p>
+<p>L’objectif d’une revue n’est pas de trouver des fautes. C’est de transférer de la compréhension. Chaque retour spécifique accompagné d’une explication, « ceci est un chemin d’erreur opérationnel ; voici pourquoi <code>.unwrap()</code> crée ici un risque en production et ce qu’il faut utiliser à la place », est un investissement dans le contributeur dont vous relisez le travail. Cet investissement se cumule. Le contributeur qui comprend le principe l’appliquera correctement aux dix prochaines situations où il compte, sans qu’on ait besoin de le lui redire.</p>
+<p><strong>Si vous êtes un mainteneur ou un contributeur plus expérimenté :</strong></p>
+<p>Vous êtes le mieux placé pour rendre ces normes concrètes, non pas en les imposant d’en haut, mais en les illustrant dans votre propre code et en les nommant explicitement lors des revues. L’enseignement le plus efficace dans un projet open source se fait dans les fils de discussion des PR et les commentaires de code, pas dans les documents. Ce document fournit le vocabulaire. C’est son utilisation systématique dans les revues quotidiennes qui le fait passer de simples mots sur une page à une pratique partagée.</p>
+<p>Lorsque vous voyez un <code>.unwrap()</code> sur un chemin d’erreur opérationnel, nommez-le comme tel. Lorsque vous voyez une fonction publique sans documentation, posez la question : que doit savoir un futur implémenteur ici ? Lorsque vous voyez un test qui échouerait lors d’un refactoring valide, expliquez pourquoi cela compte. Ce ne sont pas des corrections : c’est le mentorat continu que la RFC sur la culture a identifié comme l’une des choses les plus importantes qu’un contributeur plus expérimenté puisse offrir.</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../contributing/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../contributing/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

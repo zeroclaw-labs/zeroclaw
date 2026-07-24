@@ -1,0 +1,1094 @@
+<!DOCTYPE HTML>
+<html lang="es" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Arquitectura intencional - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-533d9136.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-001-arquitectura-intencional-transición-al-microkernel-de-zeroclaw"><a class="header" href="#fnd-001-arquitectura-intencional-transición-al-microkernel-de-zeroclaw">FND-001: Arquitectura intencional: Transición al microkernel de ZeroClaw</a></h1>
+<blockquote>
+<p>A partir de v0.7.0 · Tipo: Arquitectura · Rev. 4</p>
+<p><strong>Referencia canónica</strong> · Ratificado por el equipo · Rev. 4 Hilo de discusión e historial completo de revisiones: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5574">#5574</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>Una nota para el equipo antes de que lean esto.</strong></p>
+<p>Este documento fue escrito para ayudarnos a pasar de una base de código que creció de forma reactiva a una construida con intención. Si algunos de los conceptos aquí presentados son nuevos para ti, no hay ningún problema. Significa que este documento está cumpliendo su propósito. Todos los ingenieros sénior con los que llegarás a trabajar han aprendido estas lecciones por las malas, en una base de código que creció demasiado para poder entenderla. Tenemos la rara oportunidad de reconocer el patrón a tiempo y corregir el rumbo antes de que se vuelva doloroso. Esto es algo bueno. Tómate tu tiempo con ello.</p>
+</blockquote>
+<hr>
+<h2 id="tabla-de-contenidos"><a class="header" href="#tabla-de-contenidos">Tabla de contenidos</a></h2>
+<ol>
+<li><a href="#1-a-development-philosophy-vision-first">Una filosofía de desarrollo: visión primero</a></li>
+<li><a href="#2-the-vision-what-zeroclaw-is">La visión: qué es ZeroClaw</a></li>
+<li><a href="#3-honest-assessment-where-we-are-today">Evaluación honesta: dónde estamos hoy</a></li>
+<li><a href="#4-la-arquitectura-objetivo">La arquitectura objetivo</a>
+<ul>
+<li><a href="#441-versioning-policy">4.4.1 Política de versionado</a></li>
+<li><a href="#442-release-artifacts">Artefactos de la versión 4.4.2</a></li>
+</ul>
+</li>
+<li><a href="#5-standards-we-should-adopt">Estándares que deberíamos adoptar</a></li>
+<li><a href="#6-phased-roadmap-v070--v100">Hoja de ruta por fases: v0.7.0 → v1.0.0</a></li>
+<li><a href="#7-code-and-complexity-metrics">Medidas de código y complejidad</a></li>
+<li><a href="#8-what-this-means-for-contributors">Lo que esto significa para los colaboradores</a></li>
+</ol>
+<hr>
+<h2 id="historial-de-revisiones"><a class="header" href="#historial-de-revisiones">Historial de revisiones</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Revisar</th><th>Fecha</th><th>Resumen</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026-04-09</td><td>Borrador inicial</td></tr>
+<tr><td>2</td><td>2026-04-09</td><td>Se ha añadido la §4.4.1 Política de versionado (herencia unificada del espacio de trabajo, niveles de estabilidad, definición de cambios incompatibles a nivel de producto); se ha añadido la §4.4.2 Artefactos de lanzamiento (destino de las banderas de función, perfil canónico del binario de lanzamiento, matriz de artefactos de lanzamiento); se han añadido Preguntas de discusión sobre la estrategia de versionado y los valores predeterminados de observabilidad</td></tr>
+<tr><td>3</td><td>2026-04-10</td><td>Corrección de terminología según la retroalimentación de implementación del PR #5559: “kernel” → “runtime” para la capa de orquestación del agente en todo el documento; “kernel” ahora se refiere específicamente a la base irreducible (compilación con <code>--no-default-features</code>); §4.1 actualizado para describir la arquitectura explícita de dos capas (base + runtime); §4.2–§4.3 diagrama de dependencias y mapa de componentes actualizados para mostrar <code>zeroclaw-runtime</code>; Fase 2 renombrada de “The Kernel” a “The Runtime”; objetivos de tamaño binario reformulados como estrellas norte aspiracionales con seguimiento de progreso medido en lugar de umbrales estrictos; §7 actualizado con la medición real de la Fase 1 (compilación de base de 6.6 MB) y nota explícita de que la descomposición arquitectónica permite la optimización, pero la optimización es una segunda pasada dedicada</td></tr>
+<tr><td>4</td><td>2026-06-02</td><td>Se actualizó §5.2 para apuntar a <code>wasm32-wasip2</code> y habilitar archivos WIT. Se actualizó la Fase 2 §D2 para reemplazar Extism con wasmtime y habilitar destinos ARM32 y archivos WIT</td></tr>
+<tr><td>5</td><td>2026-06-29</td><td>Se modificó §4.4.2 para reemplazar la única fila siempre activa de <code>plugins-wasm</code> con la taxonomía de backend de ejecución de tres banderas (<code>plugins-wasm</code> host más los backends <code>plugins-wasm-cranelift</code> / <code>plugins-wasm-pulley</code>), completando la desambiguación del RFC #6943</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-una-filosofía-de-desarrollo-visión-primero"><a class="header" href="#1-una-filosofía-de-desarrollo-visión-primero">1. Una filosofía de desarrollo: visión primero</a></h2>
+<p>Cada decisión que tomamos en software, qué construir, cómo construirlo, qué omitir, debe fluir hacia abajo desde una jerarquía de intención:</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>Este no es un proceso en cascada. Es una <strong>jerarquía de decisiones</strong>. Esto significa que, al escribir una función, deberías poder trazar una línea recta hacia arriba: esta función existe debido a esta decisión de diseño, que existe debido a esta elección arquitectónica, que existe debido a esta visión. Si no puedes trazar esa línea, es probable que el código no deba existir.</p>
+<p><strong>Qué significa cada capa en la práctica:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capa</th><th>La pregunta que responde</th><th>Qué sale mal sin ello</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Visión</strong></td><td>¿Por qué existe este proyecto? ¿Para quién está dirigido? ¿Cómo se ve el éxito?</td><td>Construyes cosas que nadie necesita, o te contradices entre versiones</td></tr>
+<tr><td><strong>Arquitectura</strong></td><td>¿Cuáles son las decisiones estructurales que hacen posible la visión?</td><td>Terminas con una “Gran Bola de Lodo”: código que funciona pero que no puede modificarse sin romper algo más</td></tr>
+<tr><td><strong>Diseño</strong></td><td>¿Cómo se relacionan los componentes? ¿Cuáles son las interfaces entre ellos?</td><td>Obtienes un acoplamiento fuerte: componentes que conocen demasiado sobre los detalles internos de los demás</td></tr>
+<tr><td><strong>Implementación</strong></td><td><em>¿Cómo construimos este componente específico?</em></td><td>Errores, problemas de rendimiento, vulnerabilidades de seguridad</td></tr>
+<tr><td><strong>Pruebas</strong></td><td>¿La implementación coincide con el diseño? ¿El diseño sirve a la arquitectura?</td><td>Envías cosas rotas y no sabes por qué</td></tr>
+<tr><td><strong>Documentación</strong></td><td><em>¿Cómo transferimos este conocimiento a la siguiente persona?</em></td><td>Cada colaborador tiene que redescubrir todo desde cero.</td></tr>
+<tr><td><strong>Lanzamiento</strong></td><td><em>¿Cómo podemos entregar esto a los usuarios de manera segura y sostenible?</em></td><td>Los usuarios obtienen software roto o confuso</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="el-problema-con-omitir-la-parte-superior"><a class="header" href="#el-problema-con-omitir-la-parte-superior">El problema con omitir la parte superior</a></h3>
+<p>ZeroClaw fue creado mediante herramientas de IA que trabajaron a partir de la base de código de TypeScript de OpenClaw. La generación de código por IA opera en la capa de <strong>Implementación</strong>. Escribe funciones, estructuras y módulos que realizan acciones. No establece la Visión. No toma decisiones de Arquitectura. No define contratos de Diseño.</p>
+<p>El resultado es una base de código impresionantemente funcional pero arquitectónicamente accidental. El código hace lo que necesita hacer hoy, pero no fue diseñado. Se acumuló. Este patrón tiene un nombre en nuestra industria: <strong>the Big Ball of Mud</strong>. Es la arquitectura más común en el software, no porque alguien la haya elegido, sino porque es lo que se obtiene cuando se omite la parte superior de la jerarquía.</p>
+<p>Este RFC es nuestra oportunidad de arreglar eso, no descartando lo que funciona, sino haciendo crecer una arquitectura intencional a su alrededor usando una técnica llamada el <strong>Strangler Fig Pattern</strong>: construimos la nueva estructura alrededor de los bordes de la antigua, migrando hacia el interior con el tiempo, hasta que la estructura antigua desaparece. Sin reescrituras “big bang”. Sin descartar código que funciona. Solo una mejora constante e intencional.</p>
+<hr>
+<h2 id="2-la-visión-qué-es-zeroclaw"><a class="header" href="#2-la-visión-qué-es-zeroclaw">2. La visión: qué es ZeroClaw</a></h2>
+<p>Antes de hablar sobre la arquitectura, debemos ser precisos sobre lo que estamos construyendo. Esta es la capa de Visión. Todo lo que sigue debe servir a esto.</p>
+<blockquote>
+<p><strong>ZeroClaw es un runtime de asistente de IA personal que cualquier persona puede ejecutar en cualquier hardware, desde una placa embebida de $10 hasta un servidor en la nube, sin sobrecarga de configuración, sin requisitos de servicios externos y sin compromisos en capacidad ni seguridad.</strong></p>
+</blockquote>
+<p>Desglosando esto en compromisos concretos:</p>
+<p><strong>Cero sobrecarga.</strong> El agente principal se inicia en milisegundos y usa menos memoria que una pestaña del navegador. Esto no es una afirmación de marketing. Es una restricción arquitectónica. Cada decisión que tomamos debe ser evaluada en función de ella.</p>
+<p><strong>Cero requisitos externos.</strong> Un usuario que descarga ZeroClaw y tiene un proveedor de LLM configurado debería tener un asistente de IA funcional y útil sin instalar nada más. Los canales, los paneles de control y las integraciones son cosas que agregas cuando las quieres, no cosas que necesitas antes de que funcione.</p>
+<p><strong>Cero compromisos.</strong> Lean no significa débil. ZeroClaw debe tener un modelo de seguridad sólido, observabilidad real y extensibilidad genuina. La tensión entre “binario pequeño” y “capacidad completa” se resuelve mediante la composición: un núcleo pequeño, extendido por componentes que tú eliges.</p>
+<p><strong>Para todos los niveles de experiencia.</strong> Un estudiante con una Raspberry Pi de $10 y un equipo ejecutando un despliegue en producción deberían sentir que ZeroClaw fue diseñado para ellos. Esto significa que la experiencia predeterminada debe ser simple, y la experiencia avanzada debe ser potente, no dos productos diferentes.</p>
+<p><strong>Propiedad del usuario.</strong> Tus datos, tu hardware, tu configuración. ZeroClaw no requiere una cuenta, no envía datos a servidores externos y no te limita a una plataforma.</p>
+<hr>
+<h2 id="3-evaluación-honesta-dónde-estamos-hoy"><a class="header" href="#3-evaluación-honesta-dónde-estamos-hoy">3. Evaluación honesta: dónde estamos hoy</a></h2>
+<p>Esta sección no es una crítica al trabajo de nadie. Es un diagnóstico, y no puedes arreglar lo que no nombras.</p>
+<h3 id="31-el-problema-estructural"><a class="header" href="#31-el-problema-estructural">3.1 El problema estructural</a></h3>
+<p>El código completo de ZeroClaw actualmente reside en un único crate de Rust. Esto significa:</p>
+<ul>
+<li>Un canal de Telegram y el bucle principal del agente se compilan desde el mismo árbol de código fuente, ya sea que uses Telegram o no.</li>
+<li>El panel de control web (una aplicación completa de React) está incrustado en el binario mediante <code>rust-embed</code>, lo que hace que cada binario incluya la interfaz de usuario web incluso para los usuarios que solo utilizan la CLI.</li>
+<li>El servidor HTTP del gateway contiene manejadores de webhooks para WhatsApp, WATI, Linq, Nextcloud Talk y Gmail, lo que significa que las integraciones de canales específicos están incorporadas directamente en el servidor web</li>
+<li>Cada una de las 70+ herramientas se compila en el binario, independientemente de las herramientas que un usuario pueda llegar a llamar.</li>
+<li>El único mecanismo para excluir código es una bandera de característica de Cargo, lo que requiere que los usuarios tengan un entorno de desarrollo de Rust y recompilen desde el código fuente.</li>
+</ul>
+<p><strong>La consecuencia para los usuarios:</strong> El objetivo declarado es un binario ligero para hardware de $10. Pero el binario se distribuye con código para 27 canales de mensajería, más de 70 herramientas, un servidor web completo, una aplicación React e integraciones con Jira, Notion, Google Workspace, LinkedIn y más, la mayoría de las cuales un usuario cualquiera nunca llegará a usar.</p>
+<p><strong>La consecuencia para los contribuyentes:</strong> Cuando un archivo tiene 9.500 líneas, no es posible entenderlo. Cuando todas las funcionalidades están en un solo crate, tocar cualquier cosa arriesga romper todo.</p>
+<h3 id="32-la-evidencia"><a class="header" href="#32-la-evidencia">3.2 La Evidencia</a></h3>
+<p>Estos son hechos medidos del código actual, no estimaciones:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Archivo</th><th>Líneas</th><th>Qué hace</th><th>Lo que debería hacer</th></tr>
+</thead>
+<tbody>
+<tr><td><code>src/agent/loop_.rs</code></td><td>~9.500</td><td>Análisis de llamadas de herramientas, transmisión, historial, seguimiento de costos, enrutamiento de modelos, memoria, eliminación de credenciales, construcción de contexto</td><td>Orquestar un turno de un solo agente</td></tr>
+<tr><td><code>src/gateway/mod.rs</code></td><td>~2.260</td><td>Servidor web + servidor de aplicación React + webhooks de WhatsApp + webhooks de WATI + webhooks de Linq + webhooks de Nextcloud + webhooks de Gmail + emparejamiento + limitación de tasa + WebAuthn</td><td>Servir la API del panel web</td></tr>
+<tr><td><code>src/providers/mod.rs</code></td><td>~3.750</td><td>Factory + 40+ implementaciones de proveedores + flujos de OAuth + resolución de credenciales + limpieza de errores</td><td>Enrutamiento a un proveedor</td></tr>
+<tr><td><code>src/tools/mod.rs</code></td><td><code>all_tools_with_runtime()</code> en L387–L1066</td><td>Instanciar todas las 70+ herramientas de forma incondicional</td><td>Registrar las herramientas que el usuario configuró</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Un archivo de 9.500 líneas no es un módulo. Es un monolito que simplemente tiene una extensión <code>.rs</code>.</strong></p>
+<h3 id="33-qué-es-bueno"><a class="header" href="#33-qué-es-bueno">3.3 Qué es bueno</a></h3>
+<p>Este diagnóstico no debe oscurecer lo que está genuinamente bien diseñado:</p>
+<ul>
+<li><strong>La capa de rasgos es excelente.</strong> <code>Provider</code>, <code>Channel</code>, <code>Tool</code>, <code>Memory</code>, <code>Observer</code>, <code>RuntimeAdapter</code> y <code>Peripheral</code> son rasgos de Rust limpios y bien documentados. Estas son las uniones adecuadas. El problema es que no corresponden a los límites de los crates, por lo que el compilador no puede imponer la capa.</li>
+<li><strong>El sistema de plugins WASM está parcialmente implementado.</strong> <code>PluginHost</code>, <code>WasmTool</code>, <code>WasmChannel</code>, <code>PluginManifest</code> y la verificación de firmas Ed25519 ya existen en <code>src/plugins/</code>. El puente de ejecución es un esqueleto, pero la estructura es correcta.</li>
+<li><strong>El sistema de observabilidad es maduro.</strong> OpenTelemetry, Prometheus y las métricas DORA están implementados en función de un trait <code>Observer</code> limpio. Este es un trabajo de calidad de producción.</li>
+<li><strong>El modelo de seguridad es cuidadoso.</strong> La combinación de códigos de emparejamiento, niveles de autonomía, aislamiento y aplicación de políticas muestra una clara intención de diseño.</li>
+</ul>
+<p>No estamos reescribiendo ZeroClaw. Estamos dando a sus buenas ideas existentes una estructura en la que puedan crecer.</p>
+<hr>
+<h2 id="4-la-arquitectura-objetivo"><a class="header" href="#4-la-arquitectura-objetivo">4. La arquitectura objetivo</a></h2>
+<h3 id="41-el-modelo-de-microkernel"><a class="header" href="#41-el-modelo-de-microkernel">4.1 El modelo de microkernel</a></h3>
+<p>Una arquitectura de microkernel separa un núcleo mínimo y estable de los subsistemas opcionales que lo extienden. En los sistemas operativos, el ejemplo clásico es un kernel que solo gestiona la memoria y la planificación, mientras que todo lo demás —sistemas de archivos, controladores de dispositivos, pilas de red— se ejecuta como procesos separados que se comunican a través de una interfaz bien definida.</p>
+<p>Para un entorno de ejecución de agentes de IA, el mapeo revela <strong>dos capas internas distintas</strong> que la analogía del sistema operativo confunde:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Concepto de Microkernel del Sistema Operativo</th><th>Equivalente de ZeroClaw</th></tr>
+</thead>
+<tbody>
+<tr><td>Núcleo</td><td><strong>Capa de fundación</strong>: traits de API, configuración, proveedores, backends de memoria, infraestructura, analizador de llamadas a herramientas. El núcleo irreducible: compila con <code>--no-default-features</code>. Puede intercambiar mensajes con un LLM y almacenar memoria. Nada más.</td></tr>
+<tr><td>Sistema de inicio / tiempo de ejecución</td><td><strong>Capa de tiempo de ejecución del agente</strong>: Bucle de orquestación, aplicación de políticas de seguridad, host de plugins, herramientas principales, API de IPC. El crate <code>zeroclaw-runtime</code>, condicionado por la característica <code>agent-runtime</code>. Esto es lo que hace que ZeroClaw sea un <em>agente</em>, no solo una biblioteca.</td></tr>
+<tr><td>IPC</td><td>API de socket local / IPC entre el entorno de ejecución y los componentes externos</td></tr>
+<tr><td>Controladores de dispositivo</td><td>Plugins de canales (Telegram, Discord, etc.)</td></tr>
+<tr><td>Controladores de Filesystem</td><td>Plugins de backend de memoria (SQLite, Markdown)</td></tr>
+<tr><td>Procesos de usuario</td><td>Binario de la puerta de enlace, aplicación de escritorio de Tauri</td></tr>
+</tbody>
+</table>
+</div>
+<p>La distinción es importante: la <strong>base</strong> es lo mínimo que debe existir para que cualquier binario de ZeroClaw funcione. El <strong>tiempo de ejecución</strong> es lo mínimo que debe existir para que funcione <em>como un agente</em>. Todo lo demás se compone.</p>
+<p>Esta división en dos capas se identificó durante la descomposición del espacio de trabajo de la Fase 1 (PR #5559) y se refleja en la nomenclatura de los crates: <code>zeroclaw-runtime</code> (el crate) está condicionado por <code>agent-runtime</code> (la característica). Las revisiones anteriores de este RFC utilizaban “kernel” de manera imprecisa para referirse a lo que ahora se denomina correctamente la capa de runtime. Esta revisión corrige dicha terminología en todo el documento.</p>
+<h3 id="42-la-regla-de-dependencia"><a class="header" href="#42-la-regla-de-dependencia">4.2 La Regla de Dependencia</a></h3>
+<p>La regla arquitectónica más importante de este diseño, aquella que, si se rompe, derrumba toda la estructura, es esta:</p>
+<blockquote>
+<p><strong>Las dependencias fluyen hacia adentro. El tiempo de ejecución no sabe nada sobre los complementos. Los complementos conocen la API. Nada sabe de todo.</strong></p>
+</blockquote>
+<pre><code>    zeroclaw-api          ← defines all traits (Provider, Channel, Tool, ...)
+         ▲                  no implementations, no heavy dependencies
+         │ depends on
+  foundation crates       ← zeroclaw-config, zeroclaw-providers, zeroclaw-memory,
+         ▲                  zeroclaw-infra, zeroclaw-tool-call-parser
+         │ depends on        all depend on zeroclaw-api; no cross-dependencies
+    zeroclaw-runtime      ← implements the agent loop (agent-runtime feature)
+         ▲                  depends on zeroclaw-api + foundation crates
+         │ depends on        knows nothing about specific channels or tools
+  plugin crates           ← zeroclaw-channel-discord, zeroclaw-tools-web, ...
+         ▲                  depend on zeroclaw-api (not the runtime)
+         │ depends on
+  zeroclaw binary         ← thin wiring layer
+                             reads config, registers plugins, starts runtime
+</code></pre>
+<p>Si <code>zeroclaw-runtime</code> llega a importar <code>TelegramChannel</code>, se habrá violado la arquitectura. El compilador hará cumplir esto una vez que se definan los límites de los crates.</p>
+<h3 id="43-mapa-de-componentes"><a class="header" href="#43-mapa-de-componentes">4.3 Mapa de componentes</a></h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────────┐
+│                    zeroclaw (binary crate)                          │
+│  Reads config → registers only configured components → starts       │
+│                                                                     │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │              zeroclaw-runtime  (agent-runtime feature)       │  │
+│   │                                                              │  │
+│   │  Agent Loop · CLI Channel · Security Policy                  │  │
+│   │  Plugin Host · Local IPC API                                 │  │
+│   │  Core Tools: shell, file, git, memory recall/store           │  │
+│   │                                                              │  │
+│   │  ┌──────────────────────────────────────────────────────┐    │  │
+│   │  │   Foundation  (--no-default-features)                │    │  │
+│   │  │                                                      │    │  │
+│   │  │  zeroclaw-api · zeroclaw-config · zeroclaw-infra     │    │  │
+│   │  │  zeroclaw-providers · zeroclaw-memory                │    │  │
+│   │  │  zeroclaw-tool-call-parser                           │    │  │
+│   │  │                                                      │    │  │
+│   │  │  Vision target: &lt;5 MB RAM at runtime                 │    │  │
+│   │  └──────────────────────────────────────────────────────┘    │  │
+│   └──────────────────────────────────────────────────────────────┘  │
+│                              ▲                                      │
+│                   zeroclaw-api (traits only)                        │
+│                              ▲                                      │
+│   ┌──────────────┐  ┌────────┴────────┐  ┌─────────────────────┐    │
+│   │  zeroclaw-gw │  │  Channel plugins│  │   Tool plugins      │    │
+│   │  (opt-in     │  │                 │  │                     │    │
+│   │   binary)    │  │  channel-discord│  │  tools-web          │    │
+│   │              │  │  channel-slack  │  │  tools-integrations │    │
+│   │  HTTP/WS/SSE │  │  channel-tg     │  │  tools-hardware     │    │
+│   │  Web UI      │  │  channel-email  │  │  tools-mcp          │    │
+│   │  REST API    │  │  ...            │  │  ...                │    │
+│   └──────┬───────┘  └─────────────────┘  └─────────────────────┘    │
+│          │                                                          │
+│          ▼                                                          │
+│   ┌─────────────────┐                                               │
+│   │ zeroclaw-desktop│   ← Tauri app (already exists in apps/tauri)  │
+│   │ System tray app │     bundles zeroclaw-gw as a sidecar          │
+│   │ Native GUI      │                                               │
+│   └─────────────────┘                                               │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="44-el-modelo-de-distribución"><a class="header" href="#44-el-modelo-de-distribución">4.4 El modelo de distribución</a></h3>
+<p>La arquitectura permite una distribución limpia que no requiere que los usuarios finales tengan el toolchain de Rust:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>El usuario quiere</th><th>Lo que descargan</th><th>Qué hace <code>zeroclaw onboard</code></th></tr>
+</thead>
+<tbody>
+<tr><td>Solo CLI</td><td><code>zeroclaw</code> binario de tiempo de ejecución</td><td>Configurar proveedor, hecho</td></tr>
+<tr><td>CLI + Discord</td><td><code>zeroclaw</code> binario de tiempo de ejecución</td><td>Descargar e instalar <code>channel-discord.wasm</code></td></tr>
+<tr><td>Interfaz web local</td><td><code>zeroclaw</code> + <code>zeroclaw-gw</code></td><td>Configurar ambos, abrir el navegador</td></tr>
+<tr><td>Aplicación de escritorio</td><td><code>zeroclaw-desktop</code> instalador</td><td>Bundles runtime + gateway + UI</td></tr>
+<tr><td>Todo</td><td><code>zeroclaw-desktop</code> o <code>zeroclaw --profile full</code></td><td>Descarga todos los complementos</td></tr>
+</tbody>
+</table>
+</div>
+<p>El comando <code>zeroclaw plugin install</code> (respaldado por <code>PluginHost</code>, que ya existe) se convierte en el gestor de paquetes. El asistente <code>zeroclaw onboard</code> lo integra para que los usuarios no técnicos nunca vean <code>cargo</code>.</p>
+<h4 id="441-política-de-versionado"><a class="header" href="#441-política-de-versionado">4.4.1 Política de versionado</a></h4>
+<p>A medida que ZeroClaw pasa de ser un único crate a un espacio de trabajo con múltiples crates, dos aspectos deben mantenerse separados desde el inicio:</p>
+<ul>
+<li><strong>La versión del producto</strong>: lo que reporta <code>zeroclaw --version</code>, lo que rastrean GitHub Releases, los changelogs y los gestores de paquetes (Homebrew, apt, cargo-binstall). Esta es la versión sobre la que razonan los operadores y usuarios.</li>
+<li><strong>Estabilidad de componentes</strong>: qué tan maduro y confiable es un componente determinado. Un solo número de versión no puede transmitir esta señal por sí mismo.</li>
+</ul>
+<p>Estos son ortogonales. Confundirlos genera ruido semver engañoso y erosiona la confianza en el número de versión. Esta política define ambos.</p>
+<hr>
+<h5 id="versionado-de-crates-unificado-con-excepciones-intencionales"><a class="header" href="#versionado-de-crates-unificado-con-excepciones-intencionales">Versionado de crates: unificado con excepciones intencionales</a></h5>
+<p>Todos los crates de aplicación, el kernel, el gateway, los crates de plugins de herramientas, los crates de plugins de canales y la CLI usan la herencia de paquetes del workspace de Cargo: una única versión en el <code>Cargo.toml</code> raíz es la versión autoritativa del producto. Este es el modelo correcto porque:</p>
+<ul>
+<li>Los usuarios, operadores y empaquetadores trabajan con una versión, no con doce.</li>
+<li>La automatización de lanzamientos mediante <code>release-plz</code> es sencilla: una PR, un incremento y una entrada en el registro de cambios.</li>
+<li>Refleja la identidad de ZeroClaw como un <strong>producto</strong>, no como un ecosistema de bibliotecas.</li>
+<li>La versión de la interfaz WIT, no la versión del crate de Rust, es el contrato ABI real del plugin (consulte §5.2)</li>
+</ul>
+<p>Tres clases de crates están intencionalmente excluidas de la herencia del espacio de trabajo y mantienen versiones independientes a su propio ritmo:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Caja</th><th>Razón de independencia</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-api</code></td><td>Comienza en <code>0.1.0</code>; su versión <code>1.0.0</code> es un entregable formal de hito de v1.0.0, que señala una superficie de rasgos de Rust estable para los autores del SDK de plugins.</td></tr>
+<tr><td><code>aardvark-sys</code>, <code>zeroclaw-robot-kit</code></td><td>Cajas de bibliotecas de hardware con sus propias audiencias de usuarios y ritmos de mantenimiento; no son componentes de la aplicación</td></tr>
+<tr><td>Archivos de interfaz WIT (<code>wit/*.wit</code>)</td><td>Versionado mediante las anotaciones <code>@since</code> y <code>@unstable</code> según la especificación del modelo de componentes WASI; estas son el contrato principal de la ABI del plugin y son independientes de la semántica de versiones de Cargo.</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h5 id="qué-significa-breaking-para-la-versión-del-producto"><a class="header" href="#qué-significa-breaking-para-la-versión-del-producto">Qué significa “breaking” para la versión del producto</a></h5>
+<p>Debido a que los crates de aplicación comparten una versión unificada, el equipo necesita una definición a nivel de producto de un cambio incompatible (breaking change), distinta de un cambio incompatible dentro de la implementación interna de un único crate. Un cambio incompatible dentro de un crate de plugin que no cruza ninguno de los límites indicados a continuación <strong>no</strong> es un cambio incompatible a nivel de producto y no justifica un incremento MAJOR.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Actualizar</th><th>Garantizado cuando</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>MAJOR</strong></td><td>Cambios incompatibles en la interfaz WIT (los plugins existentes deben recompilarse); cambios incompatibles en la API de IPC del kernel (el gateway o los clientes externos se romperán); el esquema del archivo de configuración requiere una migración; se eliminan o renombran comandos o indicadores de la CLI</td></tr>
+<tr><td><strong>MENOR</strong></td><td>Nuevas capacidades en cualquier parte del espacio de trabajo; nuevos complementos disponibles en el registro; nuevas APIs estables; promociones de nivel de estabilidad; anuncios de desuso (no eliminaciones)</td></tr>
+<tr><td><strong>PATCH</strong></td><td>Corrección de errores; parches de seguridad; correcciones de documentación; sin nuevas capacidades ni deprecaciones</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h5 id="niveles-de-estabilidad"><a class="header" href="#niveles-de-estabilidad">Niveles de estabilidad</a></h5>
+<p>The product version answers <em>“what release is this?”</em> A stability tier answers <em>“how much can I rely on this component?”</em> Every component, kernel, gateway, plugin crate, and WIT interface carries one of three tiers. Component-local <code>AGENTS.md</code> files and plugin registry manifests are the target ownership model. Until that migration is complete, the canonical current assignments live in <a href="../contributing/agent-guidelines.html#current-stability-assignments">Coding agent guidelines</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Nivel</th><th>Significado</th><th>Implicación</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Estable</strong></td><td>Cubierto por la política de cambios incompatibles del producto. No se realizarán cambios incompatibles sin un aumento de la versión MAYOR y una guía de migración publicada.</td><td>Kernel (objetivo: v0.8.0), interfaz WIT de <code>zeroclaw-api</code> (objetivo: v0.9.0), API IPC del kernel (objetivo: v1.0.0)</td></tr>
+<tr><td><strong>Beta</strong></td><td>Funcional y probado. Los cambios incompatibles están permitidos en las versiones MINOR, pero se anuncian en el registro de cambios con notas de actualización.</td><td><code>zeroclaw-gw</code> (v0.9.0 → v1.0.0), complementos de canal y herramientas maduros</td></tr>
+<tr><td><strong>Experimental</strong></td><td>Sin garantía de estabilidad. Puede romperse en las versiones PATCH. Debe estar claramente marcado como <code>experimental</code> en la documentación y en los manifiestos del registro de complementos.</td><td>Nuevas integraciones de herramientas, nuevas implementaciones de canales, complementos de hardware tempranos</td></tr>
+</tbody>
+</table>
+</div>
+<p>Los niveles de estabilidad se <strong>promueven, nunca se degradan</strong> mediante una decisión deliberada del equipo. Las promociones se registran en el registro de cambios y, para los componentes arquitectónicos, en un ADR. Un componente debe mantener su nivel actual durante al menos un ciclo completo de lanzamiento antes de que se considere una promoción.</p>
+<hr>
+<h5 id="automatización-de-versiones"><a class="header" href="#automatización-de-versiones">Automatización de versiones</a></h5>
+<p>Las versiones utilizan <a href="https://release-plz.eplant.org/"><code>release-plz</code></a>, que abre un PR de lanzamiento al hacer push a <code>master</code>, actualiza la versión del espacio de trabajo y genera un registro de cambios a partir de los títulos de los commits convencionales. <code>release-plz</code> comprende nativamente la herencia del espacio de trabajo y gestiona automáticamente el orden de publicación de los crates. Los crates con versiones independientes (<code>zeroclaw-api</code>, crates de la biblioteca de hardware) se gestionan por separado utilizando la configuración por crate de la misma herramienta.</p>
+<h4 id="442-artefactos-de-la-versión"><a class="header" href="#442-artefactos-de-la-versión">4.4.2 Artefactos de la versión</a></h4>
+<p>La transición al microkernel cambia la naturaleza fundamental de la pregunta “¿qué características se compilan?”. Hoy en día, esa pregunta tiene una sola respuesta: las banderas de características que pasaste a <code>cargo build</code>. Después de la transición, se divide en dos preocupaciones separadas:</p>
+<ul>
+<li><strong>Qué hay en el binario del kernel</strong>: fijado en tiempo de compilación, determinado por plataforma, publicado en GitHub Releases</li>
+<li><strong>Qué capacidades están disponibles</strong>: se determinan en tiempo de ejecución según qué plugins están instalados mediante <code>zeroclaw plugin install</code></li>
+</ul>
+<p>Estas ya no son la misma pregunta, y la sección actual <code>[features]</code> de <code>Cargo.toml</code> debe interpretarse desde esa perspectiva.</p>
+<hr>
+<h5 id="destino-de-los-flags-de-características-actuales-en-tiempo-de-compilación"><a class="header" href="#destino-de-los-flags-de-características-actuales-en-tiempo-de-compilación">Destino de los flags de características actuales en tiempo de compilación</a></h5>
+<p>Las más de 20 banderas de características en el actual <code>Cargo.toml</code> se dividen en tres categorías a medida que la arquitectura madura:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Cubo</th><th>Banderas</th><th>Resultado</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Retirar → plugin</strong></td><td><code>channel-nostr</code>, <code>channel-matrix</code>, <code>channel-lark</code>, <code>whatsapp-web</code>, <code>browser-native</code></td><td>Eliminado del núcleo. Cada uno se convierte en un crate de plugin WASM publicado en el registro de plugins. No se requiere una decisión en tiempo de compilación.</td></tr>
+<tr><td><strong>Siempre activo</strong></td><td><code>plugins-wasm</code>, <code>skill-creation</code></td><td>Compilado incondicionalmente en cada binario del kernel. <code>plugins-wasm</code> es el mecanismo central del kernel; <code>skill-creation</code> es una ruta de código sin sobrecarga. Ninguno de ellos pertenece detrás de una bandera.</td></tr>
+<tr><td><strong>Mantener → indicador de plataforma/infraestructura</strong></td><td><code>peripheral-rpi</code>, <code>hardware</code>, <code>sandbox-landlock</code>, <code>sandbox-bubblewrap</code>, <code>voice-wake</code>, <code>probe</code></td><td>Mantenerse como indicadores de compilación porque requieren vinculación de bibliotecas nativas o acceso a nivel del sistema operativo que no puede ser proporcionado por un complemento WASM. <code>peripheral-rpi</code> y <code>hardware</code> aparecen únicamente en objetivos de lanzamiento específicos de la plataforma.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>plugins-wasm</code> está siempre activado, pero no es una sola bandera: es una taxonomía de tres banderas. La maquinaria del host es incondicional; el backend de ejecución es una decisión a nivel de plataforma que se toma en tiempo de compilación. <code>plugins-wasm</code> sin una subbandera de backend no produce un entorno de ejecución de plugins utilizable, porque wasmtime necesita o bien un compilador o bien un intérprete para ejecutar un componente.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Bandera</th><th>Predeterminado</th><th>Propósito</th></tr>
+</thead>
+<tbody>
+<tr><td><code>plugins-wasm</code></td><td>Siempre activo</td><td>Habilita el host de componentes WASM; carga y ejecuta archivos de componentes <code>.wasm</code></td></tr>
+<tr><td><code>plugins-wasm-cranelift</code></td><td>En (donde se admita)</td><td>Compilación JIT de Cranelift; usado en x86_64, aarch64 y otros destinos compatibles con Cranelift</td></tr>
+<tr><td><code>plugins-wasm-pulley</code></td><td>En (donde Cranelift no está disponible)</td><td>Intérprete de Pulley; usado en ARM de 32 bits y cualquier otro destino donde no se pueda usar Cranelift</td></tr>
+</tbody>
+</table>
+</div>
+<p>Cada objetivo de lanzamiento habilita exactamente un backend: <code>cranelift</code> donde es compatible, <code>pulley</code> donde no lo es. Se mantiene la intención siempre activa: cada binario incluye el host de plugins y puede ejecutar plugins en su plataforma.</p>
+<p>Dos indicadores requieren una decisión deliberada del equipo antes de la versión v0.8.0 y se presentan aquí en lugar de resolverse unilateralmente:</p>
+<ul>
+<li><strong><code>observability-prometheus</code></strong>: actualmente en <code>default</code>. Las métricas de Prometheus añaden una sobrecarga medible en el tamaño del binario. La pregunta es si un runtime de producción debería incluir la observabilidad activada por defecto, o si los operadores deberían optar por activarla. Recomendación: mantener en <code>default</code> para la versión estándar; los operadores en entornos con restricciones severas de tamaño pueden compilar con <code>--no-default-features</code>.</li>
+<li><strong><code>observability-otel</code></strong>: La exportación OTLP conlleva una huella de dependencias mayor (opentelemetry + cliente bloqueante reqwest). Recomendación: permanece como opcional, no en <code>default</code>. Los despliegues en producción que necesiten exportación de trazas lo habilitan explícitamente.</li>
+</ul>
+<p>La metafuncionalidad <code>ci-all</code> se simplifica considerablemente a medida que se retiran las banderas de canal y herramienta. Para la versión 1.0.0, solo abarcará las banderas restantes de plataforma e infraestructura.</p>
+<hr>
+<h5 id="el-binario-del-kernel-de-la-versión-canónica"><a class="header" href="#el-binario-del-kernel-de-la-versión-canónica">El binario del kernel de la versión canónica</a></h5>
+<p>El binario publicado en GitHub Releases para cada plataforma objetivo se compila con el siguiente perfil:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Compilado en</th><th>No compilado</th></tr>
+</thead>
+<tbody>
+<tr><td>Bucle principal del agente</td><td>Cualquier implementación de canal</td></tr>
+<tr><td>10–12 herramientas principales (ver Fase 2 D2)</td><td>Cualquier herramienta no esencial</td></tr>
+<tr><td>Backends de memoria SQLite + Markdown</td><td>Automatización del navegador</td></tr>
+<tr><td>Host de complementos (<code>plugins-wasm</code>, siempre activo)</td><td><code>observability-otel</code> (selección opcional del operador)</td></tr>
+<tr><td><code>observability-prometheus</code></td><td><code>voice-wake</code> (dependencia de libasound2)</td></tr>
+<tr><td><code>skill-creation</code> (sin sobrecarga)</td><td><code>probe</code> (depuración de hardware especializado)</td></tr>
+<tr><td>Servidor IPC</td><td>Activos web (movidos a <code>zeroclaw-gw</code>)</td></tr>
+<tr><td>Entorno de prueba de la plataforma donde sea compatible</td><td><code>peripheral-rpi</code> (compilación de hardware separada)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Ya no existe un binario “build with everything”. Ese modelo mental se ha reemplazado por <code>zeroclaw plugin install --profile full</code>, que descarga el catálogo completo de complementos después de instalar el binario del núcleo ligero.</p>
+<hr>
+<h5 id="matriz-de-artefactos-de-lanzamiento"><a class="header" href="#matriz-de-artefactos-de-lanzamiento">Matriz de artefactos de lanzamiento</a></h5>
+<p>Cada versión de GitHub publica los siguientes artefactos:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artefacto</th><th>Objetivos</th><th>Notas</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw</code> binario del núcleo</td><td><code>x86_64-unknown-linux-musl</code>, <code>aarch64-unknown-linux-gnu</code>, <code>armv7-unknown-linux-gnueabihf</code>, <code>x86_64-apple-darwin</code>, <code>aarch64-apple-darwin</code>, <code>x86_64-pc-windows-msvc</code></td><td>Compilación estática de musl para Linux x86_64; GNU para objetivos ARM</td></tr>
+<tr><td><code>zeroclaw</code> binario del kernel (hardware)</td><td><code>aarch64-unknown-linux-gnu</code>, <code>armv7-unknown-linux-gnueabihf</code></td><td>Mismos objetivos, compilados con las banderas <code>peripheral-rpi</code> y <code>hardware</code> para implementaciones en Raspberry Pi</td></tr>
+<tr><td><code>zeroclaw-gw</code> binario de puerta de enlace</td><td>Misma matriz de plataforma que el kernel</td><td>Publicado junto con el kernel; los usuarios lo instalan por separado</td></tr>
+<tr><td>Archivos de complementos WASM</td><td><code>wasm32-wasip2</code></td><td>Publicado en el registro de complementos (no en GitHub Releases); instalable mediante <code>zeroclaw plugin install</code></td></tr>
+<tr><td><code>zeroclaw-desktop</code> instalador</td><td><code>x86_64</code> y <code>aarch64</code> para macOS, Windows, Linux (AppImage/deb)</td><td>Incluye el núcleo, la puerta de enlace y el conjunto completo de complementos; construido mediante el flujo de trabajo de Tauri</td></tr>
+</tbody>
+</table>
+</div>
+<p>Las compilaciones del plugin <code>wasm32-wasip2</code> se ejecutan en un job de CI separado y se publican en el registro de plugins según su propia cadencia. Una versión del plugin no requiere una versión del kernel.</p>
+<hr>
+<h3 id="45-la-separación-de-la-puerta-de-enlace"><a class="header" href="#45-la-separación-de-la-puerta-de-enlace">4.5 La separación de la puerta de enlace</a></h3>
+<p>El gateway actual confunde dos cosas que deben separarse:</p>
+<pre><code>Current (wrong):
+  zeroclaw binary
+    └── gateway
+          ├── Web UI server (serves React app)
+          ├── REST/WS/SSE API
+          ├── WhatsApp webhook handler  ← this is a channel, not a web server
+          ├── WATI webhook handler      ← this is a channel, not a web server
+          ├── Linq webhook handler      ← this is a channel, not a web server
+          ├── Nextcloud webhook handler ← this is a channel, not a web server
+          └── Gmail push handler        ← this is a channel, not a web server
+
+Target (correct):
+  zeroclaw-kernel
+    └── Local IPC API (Unix socket / 127.x HTTP)
+
+  zeroclaw-gw (separate binary, optional)
+    └── Connects to kernel IPC API
+    └── Web UI server
+    └── REST/WS/SSE API
+    └── Generic webhook proxy → routes to channel plugins
+
+  channel-whatsapp.wasm
+    └── Registers its own webhook route with the gateway
+    └── Handles WhatsApp-specific message parsing
+</code></pre>
+<p><strong>Por qué esto es importante:</strong> Cuando el gateway es un proceso separado, puede fallar, reiniciarse o estar ausente sin afectar al agente. El kernel sigue ejecutándose. Esto es especialmente importante para el caso de uso de hardware edge: una Raspberry Pi que ejecuta el kernel puede tener su interfaz web servida desde un VPS, con el kernel conectándose hacia el exterior mediante un plugin de canal. No se necesitan reglas de firewall para conexiones entrantes.</p>
+<hr>
+<h2 id="5-estándares-que-deberíamos-adoptar"><a class="header" href="#5-estándares-que-deberíamos-adoptar">5. Estándares que deberíamos adoptar</a></h2>
+<p>Los estándares son acuerdos que han sido establecidos por muchas personas inteligentes a lo largo de muchos años. Adoptarlos significa que obtenemos esos años de reflexión de forma gratuita, y que nuestro software se integra de manera natural con el resto del ecosistema. Aquí están los que se aplican directamente a ZeroClaw.</p>
+<h3 id="51-observabilidad-opentelemetry"><a class="header" href="#51-observabilidad-opentelemetry">5.1 Observabilidad: OpenTelemetry</a></h3>
+<p><strong>Qué es:</strong> OpenTelemetry (OTel) es el estándar de la industria para recopilar trazas, métricas y registros de sistemas de software. Es mantenido por la Cloud Native Computing Foundation y está respaldado por todos los principales proveedores de nube y herramientas de monitoreo.</p>
+<p><strong>Por qué es importante para ZeroClaw:</strong> Ya hemos implementado <code>OtelObserver</code> con nuestro trait <code>Observer</code>. Tenemos métricas de Prometheus y métricas DORA. El problema es que esto aún no está estandarizado en todo el código base: algunos módulos registran con <code>tracing::info!</code>, otros emiten <code>ObserverEvent</code>s, y ambos no están conectados.</p>
+<p><strong>Lo que debemos hacer:</strong></p>
+<ul>
+<li>Adoptar OpenTelemetry como la única interfaz de observabilidad para todos los componentes</li>
+<li>Asegúrate de que cada plugin emita trazas de OTel cuando se ejecute, para que un usuario pueda ver una traza completa desde “mensaje recibido en Discord” hasta “agente que llamó a la herramienta de shell” y “respuesta enviada”.</li>
+<li>Adoptar el contexto de trazado W3C (cabeceras <code>traceparent</code>/<code>tracestate</code>) para propagar los IDs de trazado a través del límite kernel ↔ gateway ↔ plugin</li>
+<li>La salida de registros estructurados debe estar en formato JSON cuando se establezca <code>ZEROCLAW_LOG_FORMAT=json</code> (ya se está utilizando el crate <code>tracing</code>, solo necesita un suscriptor JSON).</li>
+</ul>
+<p><strong>Estándares:</strong> Especificación de OpenTelemetry · W3C Trace Context (REC) · RFC 5424 (Syslog, para integración con registros del sistema)</p>
+<h3 id="52-interfaz-de-plugin-wasi-y-wit"><a class="header" href="#52-interfaz-de-plugin-wasi-y-wit">5.2 Interfaz de Plugin: WASI y WIT</a></h3>
+<p><strong>Qué es:</strong> WASI (WebAssembly System Interface) es la API estándar que los módulos de WebAssembly utilizan para interactuar con el sistema anfitrión. WIT (WebAssembly Interface Types) es el lenguaje de definición de interfaces para describir lo que un componente WASM exporta e importa: piénselo como un archivo <code>.proto</code> pero para plugins de WASM.</p>
+<p><strong>Por qué es importante para ZeroClaw:</strong> Nuestros puentes <code>WasmTool</code> y <code>WasmChannel</code> actualmente no tienen un contrato formal sobre lo que debe exportar un binario WASM de un plugin. Esto significa que el autor de un plugin tiene que adivinar. Los archivos WIT definen ese contrato con precisión y permiten la generación automática de código para los autores de plugins en cualquier lenguaje.</p>
+<p><strong>Lo que debemos hacer:</strong></p>
+<ul>
+<li>Defina archivos de interfaz WIT para los tipos de plugin <code>Tool</code>, <code>Channel</code> y <code>Memory</code> (un directorio <code>wit/</code> en la raíz del espacio de trabajo)</li>
+<li>Utiliza <code>wit-bindgen</code> para generar los enlaces del lado del host en Rust a partir de esos archivos WIT.</li>
+<li>Documentar las interfaces WIT como el SDK oficial de plugins</li>
+<li>Un autor de plugins escribe Rust (o Go, o C, o Python) contra la interfaz WIT y ejecuta <code>cargo build --target wasm32-wasip2</code>: el resultado se coloca en <code>~/.zeroclaw/plugins/</code></li>
+</ul>
+<p><strong>Estándares:</strong> WASI 0.2 · Modelo de Componentes de W3C WebAssembly · WIT IDL</p>
+<h3 id="53-api-local-openapi-31"><a class="header" href="#53-api-local-openapi-31">5.3 API local: OpenAPI 3.1</a></h3>
+<p><strong>Qué es:</strong> OpenAPI es el estándar para describir APIs HTTP. La versión 3.1 se alinea con JSON Schema Draft 2020-12.</p>
+<p><strong>Por qué es importante para ZeroClaw:</strong> La API de IPC local del kernel (el socket al que se conectan la puerta de enlace y otros componentes) necesita un contrato estable y documentado. Sin una especificación formal, la puerta de enlace y el kernel se desincronizarán silenciosamente con el tiempo.</p>
+<p><strong>Lo que debemos hacer:</strong></p>
+<ul>
+<li>Escribir una especificación OpenAPI 3.1 para la API de IPC local del kernel antes de implementarla</li>
+<li>Genera los stubs del servidor en Rust a partir de la especificación utilizando <code>utoipa</code> o <code>aide</code>.</li>
+<li>Publica la especificación como <code>docs/reference/api/kernel-ipc-api.yaml</code></li>
+<li>La API externa de la puerta de enlace también debe tener una especificación OpenAPI</li>
+</ul>
+<p><strong>Estándares:</strong> OpenAPI 3.1 · JSON Schema Draft 2020-12</p>
+<h3 id="54-seguridad-owasp-asvs"><a class="header" href="#54-seguridad-owasp-asvs">5.4 Seguridad: OWASP ASVS</a></h3>
+<p><strong>Qué es:</strong> El Estándar de Verificación de Seguridad de Aplicaciones de OWASP es una lista de requisitos de seguridad organizados por nivel de riesgo (L1 básico, L2 estándar, L3 avanzado).</p>
+<p><strong>Por qué es importante para ZeroClaw:</strong> El gateway maneja webhooks de servicios externos, procesa entrada de usuario no confiable y gestiona secretos. El sistema de emparejamiento, el soporte de WebAuthn y la limitación de tasa existen, pero no hay un framework para verificar que estén completos o sean correctos.</p>
+<p><strong>Lo que debemos hacer:</strong></p>
+<ul>
+<li>Nivel ASVS 2 para la puerta de enlace y el módulo de seguridad</li>
+<li>Revisa la lista de verificación de Nivel 2 y documenta cuáles requisitos cumplimos, cuáles cumplimos parcialmente y cuáles están fuera del alcance.</li>
+<li>Utiliza esto como base para problemas y solicitudes de extracción (PRs) relacionados con la seguridad.</li>
+</ul>
+<p><strong>Estándares:</strong> OWASP ASVS 4.0 · OWASP Top 10</p>
+<h3 id="55-modelo-de-calidad-isoiec-25010"><a class="header" href="#55-modelo-de-calidad-isoiec-25010">5.5 Modelo de Calidad: ISO/IEC 25010</a></h3>
+<p><strong>Qué es:</strong> ISO/IEC 25010 define un modelo para la calidad del producto de software con ocho características principales: adecuación funcional, eficiencia del rendimiento, compatibilidad, usabilidad, fiabilidad, seguridad, mantenibilidad y portabilidad.</p>
+<p><strong>Por qué es importante para ZeroClaw:</strong> Cuando alguien pregunta “¿es esto lo suficientemente bueno para fusionar?”, la respuesta actualmente es subjetiva. ISO 25010 nos proporciona un vocabulario para esa conversación. Los compromisos de visión se mapean directamente: “cero sobrecarga” → eficiencia de rendimiento; “cualquier hardware” → portabilidad; “sin compromisos” → seguridad + confiabilidad.</p>
+<p><strong>Lo que debemos hacer:</strong></p>
+<ul>
+<li>Utiliza las ocho características de calidad como una lente en las revisiones de PR para cambios significativos.</li>
+<li>Incluye una breve declaración sobre el impacto en la calidad en la plantilla de la solicitud de extracción (PR) para los cambios arquitectónicos (por ejemplo, “Este cambio mejora la mantenibilidad al reducir el acoplamiento entre las implementaciones de la puerta de enlace y los canales, sin afectar la eficiencia del rendimiento”).</li>
+</ul>
+<p><strong>Estándares:</strong> ISO/IEC 25010:2023</p>
+<h3 id="56-ya-adoptados-consérvelos"><a class="header" href="#56-ya-adoptados-consérvelos">5.6 Ya adoptados: consérvelos</a></h3>
+<p>Estos ya están en su lugar y deben mantenerse:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Estándar</th><th>Estado</th><th>Dónde</th></tr>
+</thead>
+<tbody>
+<tr><td>Versionado Semántico 2.0.0</td><td>✅ Adoptado</td><td><code>Cargo.toml</code>, versiones</td></tr>
+<tr><td>Commits convencionales</td><td>✅ Adoptado</td><td><code>AGENTS.md</code>, historial de commits</td></tr>
+<tr><td>Marcas de tiempo RFC 3339 / ISO 8601</td><td>✅ Adoptado</td><td><code>MemoryEntry</code>, todas las marcas de tiempo</td></tr>
+<tr><td>Especificación de Directorio Base XDG</td><td>✅ Adoptado</td><td>crate <code>directories</code> en uso</td></tr>
+<tr><td>Mantén un registro de cambios</td><td>✅ Adoptado</td><td><code>CHANGELOG.md</code></td></tr>
+<tr><td>Guías de la API de Rust</td><td>✅ Parcialmente</td><td>La configuración de Clippy aplica muchas</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="6-hoja-de-ruta-por-fases-v070--v100"><a class="header" href="#6-hoja-de-ruta-por-fases-v070--v100">6. Hoja de ruta por fases: v0.7.0 → v1.0.0</a></h2>
+<p>Cada fase sigue la jerarquía Visión → Arquitectura → Diseño → Implementación → Pruebas → Documentación → Lanzamiento. Ninguna fase comienza la implementación hasta que su diseño sea revisado y aprobado.</p>
+<p>La estrategia general de migración es el <strong>Patrón de Higuera Parásita</strong>: hacemos crecer la nueva arquitectura alrededor de los bordes del código existente, migrando de forma constante hacia el interior, hasta que la estructura antigua sea completamente reemplazada. Nunca realizamos una reescritura que detenga el mundo. La aplicación siempre es entregable.</p>
+<hr>
+<h3 id="fase-1--v070-the-seams"><a class="header" href="#fase-1--v070-the-seams">Fase 1 · v0.7.0: “The Seams”</a></h3>
+<p><strong>Tema:</strong> Hacer que la arquitectura sea visible sin cambiar ningún comportamiento. Dibuja las líneas primero.</p>
+<p><strong>Por qué esta fase:</strong> No puedes migrar a una arquitectura en capas hasta que las capas existan como límites reales. Ahora mismo, los traits definen separaciones lógicas pero el compilador no las aplica: todo está en un solo crate, por lo que cualquier cosa puede importar cualquier otra. Esta fase hace que las separaciones sean reales.</p>
+<p><strong>Alineación de la visión:</strong> Ninguna de las propiedades de la visión cambia para los usuarios. Esto es completamente interno. El valor radica en que cada contribución futura ahora tiene un lugar estructural, y los nuevos colaboradores pueden comprender la base de código por partes en lugar de todo a la vez.</p>
+<h4 id="entregables-de-la-fase-1"><a class="header" href="#entregables-de-la-fase-1">Entregables de la Fase 1</a></h4>
+<h5 id="d1-extraer-el-crate-zeroclaw-api"><a class="header" href="#d1-extraer-el-crate-zeroclaw-api">D1: Extraer el crate <code>zeroclaw-api</code></a></h5>
+<p>Crea un nuevo crate <code>crates/zeroclaw-api</code> que contenga únicamente definiciones de rasgos (traits) y sus tipos de soporte. Sin implementaciones. Sin dependencias pesadas. Este crate debe compilarse en menos de dos segundos.</p>
+<p>Moverse a este crate:</p>
+<ul>
+<li><code>src/providers/traits.rs</code> → <code>Provider</code>, <code>ChatMessage</code>, <code>ChatResponse</code>, <code>ToolCall</code>, <code>StreamChunk</code>, <code>ProviderCapabilities</code></li>
+<li><code>src/channels/traits.rs</code> → <code>Channel</code>, <code>ChannelMessage</code>, <code>SendMessage</code></li>
+<li><code>src/tools/traits.rs</code> → <code>Tool</code>, <code>ToolResult</code>, <code>ToolSpec</code></li>
+<li><code>src/memory/traits.rs</code> → <code>Memory</code>, <code>MemoryEntry</code>, <code>MemoryCategory</code></li>
+<li><code>src/observability/traits.rs</code> → <code>Observer</code>, <code>ObserverEvent</code>, <code>ObserverMetric</code></li>
+<li><code>src/runtime/traits.rs</code> → <code>RuntimeAdapter</code></li>
+<li><code>src/peripherals/traits.rs</code> → <code>Peripheral</code></li>
+</ul>
+<p>Cada otro crate en el espacio de trabajo que necesita estos tipos añade <code>zeroclaw-api</code> como dependencia. El compilador ahora garantiza que ningún crate de implementación pueda importar otro crate de implementación sin pasar por la capa de API.</p>
+<h5 id="d2-extraer-el-crate-zeroclaw-tool-call-parser"><a class="header" href="#d2-extraer-el-crate-zeroclaw-tool-call-parser">D2: Extraer el crate <code>zeroclaw-tool-call-parser</code></a></h5>
+<p>La lógica de análisis de llamadas a herramientas en <code>src/agent/loop_.rs</code> consta de aproximadamente 1.400 líneas de transformación pura de texto: toma una cadena del LLM y devuelve una lista de llamadas a herramientas estructuradas. No depende del estado del agente, la memoria, los proveedores ni los canales. Maneja una docena de formatos de salida de LLM diferentes (JSON, XML, estilo GLM, MiniMax, estilo Perl, bloques de código markdown, entre otros).</p>
+<p>Esta lógica es:</p>
+<ol>
+<li>Autocontenido: perfecto para su propio crate</li>
+<li>El código más apto para fuzz testing del proyecto: las pruebas basadas en propiedades van aquí</li>
+<li>Una contribución genuina al ecosistema de Rust: ningún otro crate hace esto de manera tan completa</li>
+</ol>
+<p>Crea <code>crates/zeroclaw-tool-call-parser</code> con una API pública aproximada de:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn parse(text: &amp;str, specs: &amp;[ToolSpec]) -&gt; ParseResult
+
+pub struct ParseResult {
+    pub calls: Vec&lt;ParsedToolCall&gt;,
+    pub remaining_text: Option&lt;String&gt;,
+}
+
+pub struct ParsedToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub tool_call_id: Option&lt;String&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Las ~300 pruebas de análisis que actualmente están en <code>loop_.rs</code> se mueven a este crate. <code>loop_.rs</code> se reduce en aproximadamente 1.400 líneas.</p>
+<h5 id="d3-adoptar-opentelemetry-como-el-estándar-de-observabilidad"><a class="header" href="#d3-adoptar-opentelemetry-como-el-estándar-de-observabilidad">D3: Adoptar OpenTelemetry como el estándar de observabilidad</a></h5>
+<p>Formalizar lo ya implementado: documentar que <code>ObserverEvent</code> y <code>ObserverMetric</code> constituyen el bus de eventos interno, y que <code>OtelObserver</code> es el backend de producción canónico. Adoptar un suscriptor de registro estructurado en JSON para <code>ZEROCLAW_LOG_FORMAT=json</code>. Adoptar el contexto de trazado W3C para el trazado futuro entre componentes.</p>
+<h5 id="d4-escribir-archivos-de-interfaz-wit"><a class="header" href="#d4-escribir-archivos-de-interfaz-wit">D4: Escribir archivos de interfaz WIT</a></h5>
+<p>Antes de implementar la ejecución de complementos WASM, definamos los contratos. Crea un directorio <code>wit/</code> en la raíz del espacio de trabajo con las definiciones de interfaz para:</p>
+<ul>
+<li><code>zeroclaw:tool/tool.wit</code>: la interfaz del plugin Tool</li>
+<li><code>zeroclaw:channel/channel.wit</code>: la interfaz del plugin Channel</li>
+</ul>
+<p>Estos se convertirán en el SDK oficial del plugin. La implementación en la versión 0.8.0 se generará a partir de estos archivos.</p>
+<h4 id="métricas-de-éxito-para-v070"><a class="header" href="#métricas-de-éxito-para-v070">Métricas de éxito para v0.7.0</a></h4>
+<ul>
+<li><code>zeroclaw-api</code> se compila en menos de 2 segundos con cero dependencias de implementación</li>
+<li><code>zeroclaw-tool-call-parser</code> tiene ≥ 95% de cobertura de pruebas (la lógica es completamente testeable de forma aislada)</li>
+<li><code>loop_.rs</code> tiene menos de 8.000 líneas</li>
+<li>Cero cambios en el comportamiento visible para el usuario</li>
+<li>Cero regresiones de rendimiento (el conjunto de pruebas de referencia pasa)</li>
+</ul>
+<hr>
+<h3 id="fase-2--v080-the-runtime"><a class="header" href="#fase-2--v080-the-runtime">Fase 2 · v0.8.0: “The Runtime”</a></h3>
+<p><strong>Tema:</strong> Formalizar el tiempo de ejecución del agente como una unidad limpia e independiente desplegable. Todo lo que no sea el tiempo de ejecución se convierte en un invitado.</p>
+<p><strong>Por qué esta fase:</strong> Una vez que existen las separaciones (v0.7.0), podemos trazar explícitamente el límite del runtime. Esta fase extrae <code>zeroclaw-runtime</code> como un crate independiente, completa el puente de ejecución de plugins WASM y conecta el cliente del registro de plugins: el mecanismo mediante el cual todo lo que está fuera del runtime se conecta a él.</p>
+<p><strong>Alineación con la visión:</strong> Aquí es donde el modelo de composición se vuelve real para los usuarios. Un usuario que solo quiere un agente CLI descarga un único binario, ejecuta <code>zeroclaw onboard</code> y listo: sin toolchain de Rust, sin compilación. El asistente <code>zeroclaw onboard</code> adquiere la capacidad de descargar componentes de plugins bajo demanda.</p>
+<h4 id="entregables-de-la-fase-2"><a class="header" href="#entregables-de-la-fase-2">Entregables de la Fase 2</a></h4>
+<h5 id="d1-formalizar-el-crate-zeroclaw-runtime"><a class="header" href="#d1-formalizar-el-crate-zeroclaw-runtime">D1: Formalizar el crate <code>zeroclaw-runtime</code></a></h5>
+<p>Extrae el bucle de orquestación del agente, el canal CLI, la política de seguridad, el host de complementos y la API de IPC en <code>crates/zeroclaw-runtime</code>, protegido por la función <code>agent-runtime</code>. Este crate depende de <code>zeroclaw-api</code> y de los crates fundamentales. No tiene conocimiento de Telegram, Discord, Anthropic ni de ninguna implementación específica de herramientas.</p>
+<p>El tiempo de ejecución exporta una API pública limpia:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Runtime { ... }
+
+pub struct Registry {
+    pub fn register_channel(&amp;mut self, ch: Arc&lt;dyn Channel&gt;);
+    pub fn register_tool(&amp;mut self, t: Box&lt;dyn Tool&gt;);
+    pub fn set_provider(&amp;mut self, p: Arc&lt;dyn Provider&gt;);
+    pub fn set_memory(&amp;mut self, m: Arc&lt;dyn Memory&gt;);
+    pub fn set_observer(&amp;mut self, o: Arc&lt;dyn Observer&gt;);
+}
+
+pub async fn run(runtime: Runtime, registry: Registry) -&gt; anyhow::Result&lt;()&gt;;
+<span class="boring">}</span></code></pre>
+<p>El crate binario se convierte en una capa de conexión delgada que lee la configuración y llama a <code>run</code>.</p>
+<h5 id="d2-completar-el-puente-de-ejecución-wasm"><a class="header" href="#d2-completar-el-puente-de-ejecución-wasm">D2: Completar el puente de ejecución WASM</a></h5>
+<p>La dependencia <code>extism</code> es incompatible con el Modelo de Componentes de WASM (archivos <code>.wit</code>) y requiere la característica <code>cranelift</code> de <code>wasmtime</code>, lo que impide que los targets ARM32 compilen. Elimine Extism y reemplácelo con el uso directo de <code>wasmtime</code>. Durante la transición, Extism debe dejarse como una opción hasta el PR final de obsolescencia.</p>
+<p>Integra <code>wasmtime</code> en <code>zeroclaw-plugins</code> con dependencias opcionales de <code>cranelift</code> (para la mayoría de los destinos de compilación) o <code>pulley</code> (para ARM32). Con las interfaces WIT definidas en la v0.7.0, usa <code>wit-bindgen</code> para generar los bindings del lado del host.</p>
+<p>Una implementación completa del puente de ejecución WASM define las funciones host WASI que los plugins WASM pueden invocar (solicitudes HTTP, acceso a memoria, registro de logs) dentro del modelo de permisos ya definido en <code>PluginPermission</code>. Cuando sea posible, se deben usar las APIs de WASI Preview 2 (<code>wasi:io</code>, <code>wasi:http</code>, <code>wasi:filesystem</code>, etc.) para proporcionar una API consistente basada en estándares para los plugins.</p>
+<h5 id="d3-cliente-del-registro-de-componentes"><a class="header" href="#d3-cliente-del-registro-de-componentes">D3: Cliente del registro de componentes</a></h5>
+<p>Agrega un subcomando <code>zeroclaw plugin</code> respaldado por un cliente de registro simple:</p>
+<pre><code>zeroclaw plugin list              # list installed plugins
+zeroclaw plugin search &lt;query&gt;    # search the component registry
+zeroclaw plugin install &lt;name&gt;    # download, verify, and install a plugin
+zeroclaw plugin remove &lt;name&gt;     # remove an installed plugin
+zeroclaw plugin update            # update all installed plugins
+</code></pre>
+<p>El registro es un archivo de índice JSON que se sirve desde una URL conocida (por ejemplo, <code>https://plugins.zeroclawlabs.ai/index.json</code>). Cada entrada incluye el nombre, la versión, la URL de descarga, la suma de comprobación SHA-256 y la clave pública Ed25519 del editor. La verificación de la firma de <code>PluginHost</code> ya maneja el modelo de seguridad.</p>
+<h5 id="d4-integrar-zeroclaw-onboard-con-el-sistema-de-plugins"><a class="header" href="#d4-integrar-zeroclaw-onboard-con-el-sistema-de-plugins">D4: Integrar <code>zeroclaw onboard</code> con el sistema de plugins</a></h5>
+<p>El asistente de configuración debe preguntar al usuario qué canales e integraciones desea, y luego llamar a <code>PluginRegistry::install</code> para cada uno. No se requiere compilación. El usuario descarga un binario, ejecuta <code>zeroclaw onboard</code> y tiene un agente configurado y funcional en menos de dos minutos.</p>
+<h5 id="d5-reducir-all_tools_with_runtime-solo-a-las-herramientas-principales"><a class="header" href="#d5-reducir-all_tools_with_runtime-solo-a-las-herramientas-principales">D5: Reducir <code>all_tools_with_runtime</code> solo a las herramientas principales</a></h5>
+<p>El núcleo incluye exactamente las herramientas que un usuario necesita para un agente útil sin plugins instalados: <code>shell</code>, <code>file_read</code>, <code>file_write</code>, <code>file_edit</code>, <code>git_operations</code>, <code>glob_search</code>, <code>content_search</code>, <code>memory_recall</code>, <code>memory_store</code>, <code>memory_forget</code> y <code>web_fetch</code>. Todo lo demás se registra mediante los plugins instalados.</p>
+<h4 id="métricas-de-éxito-para-v080"><a class="header" href="#métricas-de-éxito-para-v080">Métricas de éxito para v0.8.0</a></h4>
+<ul>
+<li><code>zeroclaw-runtime</code> se compila de forma independiente sin código de implementación de canales ni de herramientas</li>
+<li><code>zeroclaw plugin install channel-discord</code> funciona de extremo a extremo</li>
+<li><code>zeroclaw onboard</code> instala complementos sin necesidad de un entorno de herramientas de Rust.</li>
+<li>El tamaño binario en tiempo de ejecución se <strong>rastrea y reporta</strong> en las notas de la versión; la aspiración es lograr un progreso descendente hacia el objetivo visionado (véase §7).</li>
+<li>Un complemento de herramienta WASM escrito en Rust utilizando la interfaz WIT se ejecuta correctamente</li>
+</ul>
+<hr>
+<h3 id="fase-3--v090-the-gateway"><a class="header" href="#fase-3--v090-the-gateway">Fase 3 · v0.9.0: “The Gateway”</a></h3>
+<p><strong>Tema:</strong> Separar la superficie web del núcleo del agente.</p>
+<p><strong>Por qué esta fase:</strong> El gateway es actualmente el mayor acoplamiento estructural en el código base. Incrusta una aplicación React compilada, maneja la lógica de webhooks específica de cada canal y se compila en cada binario, incluidos los binarios destinados a hardware perimetral de $10 que nunca servirán una página web.</p>
+<p><strong>Alineación de la visión:</strong> Esta fase cumple completamente con la promesa de “cero requisitos externos”. Un usuario en una Raspberry Pi obtiene un binario del kernel sin servidor web, sin aplicación React y sin oyente HTTP. Un usuario que desea el panel de control web instala <code>zeroclaw-gw</code> por separado.</p>
+<h4 id="entregables-de-la-fase-3"><a class="header" href="#entregables-de-la-fase-3">Entregables de la Fase 3</a></h4>
+<h5 id="d1-definir-la-api-de-ipc-del-kernel"><a class="header" href="#d1-definir-la-api-de-ipc-del-kernel">D1: Definir la API de IPC del kernel</a></h5>
+<p>Antes de extraer la puerta de enlace, define la especificación OpenAPI 3.1 para la API local que el kernel expone en un socket Unix o un puerto de bucle invertido. Esta API es a la que se conectan la puerta de enlace, la aplicación Tauri y cualquier cliente futuro. Es el contrato estable entre el kernel y el mundo exterior.</p>
+<p>Los endpoints incluyen: enviar un mensaje, recibir una respuesta en streaming, listar sesiones activas, listar plugins instalados, obtener el estado del agente, gestionar la memoria, activar trabajos cron. Este es ante todo un documento de diseño: la especificación debe revisarse y acordarse antes de escribir una sola línea de implementación.</p>
+<h5 id="d2-implementar-el-servidor-ipc-del-kernel"><a class="header" href="#d2-implementar-el-servidor-ipc-del-kernel">D2: Implementar el servidor IPC del kernel</a></h5>
+<p>Agregue el servidor IPC a <code>zeroclaw-kernel</code> detrás de una marca de función (<code>--features ipc</code>). En las plataformas que lo admiten, el kernel escucha en un socket Unix en <code>~/.zeroclaw/kernel.sock</code>. En Windows, use un pipe con nombre. El comando <code>zeroclaw gateway</code> (el punto de entrada actual del servidor web) se convierte en <code>zeroclaw-gw</code> conectándose a este socket.</p>
+<h5 id="d3-extraer-zeroclaw-gw-como-un-binario-independiente"><a class="header" href="#d3-extraer-zeroclaw-gw-como-un-binario-independiente">D3: Extraer <code>zeroclaw-gw</code> como un binario independiente</a></h5>
+<p>Mueve <code>src/gateway/</code> a un nuevo crate <code>crates/zeroclaw-gw/</code> con su propio binario. Depende de <code>zeroclaw-api</code> y se conecta al kernel mediante la API de IPC. La aplicación React embebida mediante <code>rust-embed</code> se traslada por completo a este crate: el binario del kernel ya no contiene ningún recurso web.</p>
+<h5 id="d4-migrar-los-manejadores-de-webhooks-de-canal-fuera-del-gateway"><a class="header" href="#d4-migrar-los-manejadores-de-webhooks-de-canal-fuera-del-gateway">D4: Migrar los manejadores de webhooks de canal fuera del gateway</a></h5>
+<p>Los controladores de webhook de WhatsApp, WATI, Linq, Nextcloud Talk y Gmail que actualmente se encuentran en <code>gateway/mod.rs</code> se trasladan a sus respectivos plugins de canal. El gateway proporciona una API genérica de registro de webhook: un plugin de canal, al cargarse, registra su prefijo de ruta de webhook y su función de manejo. El gateway enruta los webhooks entrantes hacia el controlador registrado. El gateway ya no tiene conocimiento de WhatsApp.</p>
+<h5 id="d5-formalizar-la-relación-de-sidecar-de-tauri"><a class="header" href="#d5-formalizar-la-relación-de-sidecar-de-tauri">D5: Formalizar la relación de sidecar de Tauri</a></h5>
+<p>Actualiza <code>apps/tauri/</code> para empaquetar <code>zeroclaw-gw</code> como un binario sidecar de Tauri. La aplicación Tauri se convierte en la distribución “completa”: inicia automáticamente el kernel y la pasarela, y abre la interfaz web. Los usuarios que descargan la aplicación Tauri obtienen todo funcionando sin necesidad de tocar una terminal.</p>
+<h4 id="métricas-de-éxito-para-v090"><a class="header" href="#métricas-de-éxito-para-v090">Métricas de éxito para v0.9.0</a></h4>
+<ul>
+<li>El binario del kernel (versión de lanzamiento) no contiene activos web ni código de servidor HTTP.</li>
+<li><code>zeroclaw-gw</code> se inicia, se conecta al kernel a través de IPC y sirve el panel de control web.</li>
+<li>Eliminar <code>zeroclaw-gw</code> no rompe el kernel ni ningún plugin de canal</li>
+<li>El código de los canales de WhatsApp, WATI, Linq, Nextcloud Talk y Gmail se ha movido a los crates de plugins</li>
+<li>Los paquetes de la aplicación de escritorio de Tauri inician y ejecutan correctamente ambos binarios.</li>
+</ul>
+<hr>
+<h3 id="fase-4--v100-la-plataforma"><a class="header" href="#fase-4--v100-la-plataforma">Fase 4 · v1.0.0: “La Plataforma”</a></h3>
+<p><strong>Tema:</strong> ZeroClaw se convierte en una plataforma componible, no en una aplicación monolítica.</p>
+<p><strong>Por qué esta fase:</strong> Con el núcleo estable, la puerta de enlace separada y el sistema de complementos funcionando, la versión 1.0.0 es la versión en la que la arquitectura se convierte en el producto. Los desarrolladores externos pueden escribir y publicar complementos. Los usuarios pueden ensamblar exactamente el ZeroClaw que deseen. El binario puede reclamar con credibilidad el perfil ligero que la visión promete.</p>
+<h4 id="entregables-de-la-fase-4"><a class="header" href="#entregables-de-la-fase-4">Entregables de la Fase 4</a></h4>
+<h5 id="d1-migrar-todos-los-canales-restantes-a-plugins"><a class="header" href="#d1-migrar-todos-los-canales-restantes-a-plugins">D1: Migrar todos los canales restantes a plugins</a></h5>
+<p>Cada una de las 27+ implementaciones de canales se convierte en un crate de plugin WASM independiente. Se publican en el registro de componentes con versiones firmadas. El binario del kernel no contiene ninguna implementación de canales, excepto la CLI.</p>
+<h5 id="d2-migrar-herramientas-de-cola-larga-a-plugins"><a class="header" href="#d2-migrar-herramientas-de-cola-larga-a-plugins">D2: Migrar herramientas de cola larga a plugins</a></h5>
+<p>Aproximadamente 60 de las más de 70 herramientas se trasladan a crates de plugins, agrupadas por dominio: <code>zeroclaw-tools-web</code> (navegador, búsqueda, captura de pantalla, PDF), <code>zeroclaw-tools-integrations</code> (Jira, Notion, Google Workspace, MS365, LinkedIn), <code>zeroclaw-tools-hardware</code> (información de la placa, GPIO) y <code>zeroclaw-tools-cloud</code> (operaciones en la nube, operaciones de seguridad). El núcleo conserva únicamente las 10–12 herramientas principales identificadas en v0.8.0.</p>
+<h5 id="d3-sdk-de-plugins-y-documentación-para-desarrolladores"><a class="header" href="#d3-sdk-de-plugins-y-documentación-para-desarrolladores">D3: SDK de plugins y documentación para desarrolladores</a></h5>
+<p>Publica una guía de desarrollo de plugins. Un desarrollador debería poder escribir un nuevo plugin de herramienta en una tarde:</p>
+<ol>
+<li>Agrega <code>zeroclaw-plugin-sdk</code> como dependencia</li>
+<li>Implementa el rasgo generado por WIT</li>
+<li><code>cargo build --target wasm32-wasip2</code></li>
+<li><code>zeroclaw plugin install ./my-plugin/</code></li>
+</ol>
+<p>El SDK gestiona las vinculaciones de funciones del host, el formato del manifiesto y el modelo de permisos.</p>
+<h5 id="d4-estabilizar-la-api-de-ipc-del-kernel-en-la-v10"><a class="header" href="#d4-estabilizar-la-api-de-ipc-del-kernel-en-la-v10">D4: Estabilizar la API de IPC del kernel en la v1.0</a></h5>
+<p>La API de IPC del kernel recibe un prefijo de versión (<code>/v1/</code>) y una garantía de estabilidad. No se permiten cambios incompatibles en v1.x para esta API. Este es el contrato en el que dependen los clientes de terceros y la puerta de enlace.</p>
+<h5 id="d5-extraer-la-política-de-versionado-y-las-definiciones-de-niveles-de-estabilidad-a-docsbooksrcmaintainersstability-tiersmd"><a class="header" href="#d5-extraer-la-política-de-versionado-y-las-definiciones-de-niveles-de-estabilidad-a-docsbooksrcmaintainersstability-tiersmd">D5: Extraer la política de versionado y las definiciones de niveles de estabilidad a <code>docs/book/src/maintainers/stability-tiers.md</code></a></h5>
+<p>La política de versionado y la tabla de niveles de estabilidad definidos en §4.4.1 de este RFC se convierten en un documento de referencia permanente para los colaboradores en <code>docs/book/src/maintainers/stability-tiers.md</code>. Este documento es la referencia diaria que utilizan los colaboradores al asignar un nivel a un nuevo crate de plugin, y la que consultan los mantenedores al tomar decisiones de lanzamiento. El propio RFC sigue siendo el registro histórico de <em>por qué</em> se tomaron estas decisiones; el documento extraído es <em>qué</em> consultan los colaboradores.</p>
+<h4 id="métricas-de-éxito-para-v100"><a class="header" href="#métricas-de-éxito-para-v100">Métricas de éxito para v1.0.0</a></h4>
+<ul>
+<li>El tamaño binario en tiempo de ejecución se <strong>monitorea en relación con el objetivo de visión</strong> (ver §7); se espera un pase de optimización dedicado a través de cada crate como parte del flujo de trabajo de la versión 1.0.0</li>
+<li>Un desarrollador de terceros puede publicar un complemento funcional utilizando únicamente la documentación pública.</li>
+<li>Todas las implementaciones de los 27+ canales están disponibles como complementos descargables en el registro</li>
+<li><code>zeroclaw onboard</code> completa una configuración completa en menos de 2 minutos en una Raspberry Pi Zero 2W sin ninguna herramienta de Rust instalada</li>
+<li>El catálogo completo de complementos se puede instalar con <code>zeroclaw plugin install --profile full</code></li>
+</ul>
+<hr>
+<h2 id="7-métricas-de-código-y-complejidad"><a class="header" href="#7-métricas-de-código-y-complejidad">7. Métricas de código y complejidad</a></h2>
+<p>Estas son estimaciones basadas en el análisis directo del código de la base de código actual. Están destinadas a dar una idea de la escala, no a ser predicciones exactas.</p>
+<h3 id="líneas-de-código-que-salen-del-entorno-de-ejecución"><a class="header" href="#líneas-de-código-que-salen-del-entorno-de-ejecución">Líneas de código que salen del entorno de ejecución</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Qué se mueve</th><th>Líneas aproximadas</th><th>Destino</th></tr>
+</thead>
+<tbody>
+<tr><td>Analizador de llamadas de herramientas (desde <code>loop_.rs</code>)</td><td>~1.400</td><td><code>zeroclaw-tool-call-parser</code> crate</td></tr>
+<tr><td>Más de 60 implementaciones de herramientas no principales</td><td>~30.000</td><td>Cajas de complementos</td></tr>
+<tr><td>Más de 24 implementaciones de canales no principales</td><td>~7.200</td><td>Cajas de complementos</td></tr>
+<tr><td>Servidor HTTP de la puerta de enlace</td><td>~2.260</td><td>crate <code>zeroclaw-gw</code></td></tr>
+<tr><td>Aplicación React embebida (peso binario)</td><td>N/A</td><td>crate <code>zeroclaw-gw</code></td></tr>
+<tr><td>Manejadores de webhook de canal desde el gateway</td><td>~500</td><td>Cajas de complementos de canal</td></tr>
+<tr><td><strong>Total estimado eliminado del tiempo de ejecución</strong></td><td><strong>~41.000 líneas</strong></td><td>N/A</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="reducción-de-la-complejidad-a-nivel-de-archivo"><a class="header" href="#reducción-de-la-complejidad-a-nivel-de-archivo">Reducción de la complejidad a nivel de archivo</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Archivo</th><th>Líneas actuales</th><th>Objetivo después de la migración</th><th>Reducción</th></tr>
+</thead>
+<tbody>
+<tr><td><code>src/agent/loop_.rs</code></td><td>~9.500</td><td>~5.000</td><td>~47%</td></tr>
+<tr><td><code>src/gateway/mod.rs</code></td><td>~2.260</td><td>Se mueve a <code>zeroclaw-gw</code></td><td>100%</td></tr>
+<tr><td><code>src/tools/mod.rs</code></td><td><code>all_tools_with_runtime</code> tiene aproximadamente 680 líneas</td><td>~80 líneas (solo herramientas principales)</td><td>~88%</td></tr>
+<tr><td><code>src/providers/mod.rs</code></td><td>~3.750</td><td>~1.200 (proveedores de registro propio)</td><td>~68%</td></tr>
+<tr><td><code>src/channels/mod.rs</code></td><td>~200 + 44 archivos de canales</td><td>Canal solo CLI</td><td>~90%</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tamaño-del-binario-progreso-medido-y-objetivo-de-la-visión"><a class="header" href="#tamaño-del-binario-progreso-medido-y-objetivo-de-la-visión">Tamaño del binario: progreso medido y objetivo de la visión</a></h3>
+<p>La visión del proyecto se expresa en términos de ejecución: <strong>&lt;5 MB de RAM</strong> en hardware de $10. El tamaño del binario en disco y la huella de memoria en tiempo de ejecución (RSS) están relacionados, pero no son idénticos: la paginación bajo demanda implica que solo las rutas de código ejecutadas residen en memoria. Ambos se monitorizan.</p>
+<blockquote>
+<p><strong>Modelo de dos fases:</strong> La descomposición arquitectónica (Fases 1–3) y la optimización del tamaño binario son flujos de trabajo independientes. La descomposición <em>permite</em> la optimización al aislar las dependencias en sus crates correspondientes. Maximizar la eficiencia crate por crate es la segunda fase esperada, no un entregable del trabajo estructural en sí.</p>
+</blockquote>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Configuración</th><th>Pre-descomposición (v0.6.x)</th><th>Resultado de la fase 1 (v0.7.0)</th><th>Objetivo de visión</th></tr>
+</thead>
+<tbody>
+<tr><td>Binario monolítico completo</td><td>~8,8 MB</td><td>N/A (reemplazado por el modelo de complementos)</td><td>N/A</td></tr>
+<tr><td>Solo la base (<code>--no-default-features</code>)</td><td>N/A</td><td><strong>6.6 MB</strong> <em>(medido, sin símbolos)</em></td><td>TBD después de la pasada de optimización</td></tr>
+<tr><td>Binario de ejecución (fundación + <code>agent-runtime</code>)</td><td>N/A</td><td>rastreado</td><td>aspiración: ≤ 5 MB de RAM en tiempo de ejecución</td></tr>
+<tr><td>Tiempo de ejecución + puerta de enlace</td><td>N/A</td><td>rastreado</td><td>~5–7 MB en disco</td></tr>
+<tr><td>Tiempo de ejecución + puerta de enlace + los 5 principales canales</td><td>N/A</td><td>rastreado</td><td>~8–10 MB (los complementos son archivos separados)</td></tr>
+<tr><td>Aplicación de escritorio Tauri (incluye todo)</td><td>N/A</td><td>rastreado</td><td>~20–25 MB de instalador</td></tr>
+</tbody>
+</table>
+</div>
+<p>La compilación base de la Fase 1 de 6.6 MB representa un progreso real respecto al monolito de 8.8 MB y demuestra que la descomposición está funcionando. Alcanzar el objetivo previsto requiere una pasada dedicada de auditoría de dependencias y optimización en cada crate una vez completada la descomposición estructural: revisar el <code>Cargo.toml</code> de cada crate en busca de dependencias innecesarias o con demasiadas características habilitadas, validar los perfiles de LTO y strip, y auditar qué feature flags de tokio/serde son realmente necesarias.</p>
+<p>El cambio estructural clave: el tamaño del binario deja de ser una función de las “características compiladas en tiempo de compilación” y se convierte en una función de los “plugins instalados en tiempo de ejecución”, que el usuario controla. Ese cambio es el objetivo arquitectónico de las Fases 1–3. Los números de tamaño son el objetivo de optimización de la fase que sigue.</p>
+<h3 id="mejora-del-tiempo-de-compilación"><a class="header" href="#mejora-del-tiempo-de-compilación">Mejora del tiempo de compilación</a></h3>
+<p>Actualmente, una compilación completa con <code>cargo build --release</code> en esta base de código compila todos los canales, todas las herramientas, todos los proveedores y la aplicación React integrada en una única unidad de compilación. La descomposición de crates significa:</p>
+<ul>
+<li>El kernel se compila de forma independiente y su salida compilada se almacena en caché.</li>
+<li>Un cambio en <code>channel-discord</code> no recompila el kernel</li>
+<li>Los colaboradores que trabajan en un complemento solo recompilan su complemento</li>
+<li>CI puede paralelizar la compilación de crates entre trabajos</li>
+</ul>
+<p>Mejora estimada del tiempo de ejecución para compilaciones incrementales: reducción del 60–75% para cambios que no tocan el kernel.</p>
+<hr>
+<h2 id="8-qué-significa-esto-para-los-colaboradores"><a class="header" href="#8-qué-significa-esto-para-los-colaboradores">8. Qué significa esto para los colaboradores</a></h2>
+<h3 id="para-nuevos-colaboradores"><a class="header" href="#para-nuevos-colaboradores">Para nuevos colaboradores</a></h3>
+<p>La queja más común de los nuevos colaboradores en grandes bases de código es: “No sé por dónde empezar”. Con la arquitectura actual, la respuesta a “¿a dónde va un mensaje de Discord?” requiere rastrear a través de <code>channels/discord.rs</code> → <code>channels/mod.rs</code> → <code>gateway/mod.rs</code> → <code>agent/loop_.rs</code> → docenas de otros archivos.</p>
+<p>Con la arquitectura de microkernel, la respuesta es: “va al receptor <code>Channel</code> del kernel, a través del plugin <code>channel-discord</code>”. Un nuevo colaborador puede comprender completamente el canal de Discord leyendo un solo crate de plugin. Puede entender el bucle completo del agente leyendo <code>zeroclaw-kernel</code> sin tener en cuenta ningún código de canal o herramienta.</p>
+<p><strong>Una buena regla general para nuevos colaboradores:</strong> si puedes describir tu cambio en una oración sin mencionar más de un componente, estás trabajando en el nivel correcto. “Corregir un error en cómo el canal de Discord maneja las respuestas en hilos” es un componente. “Refactorizar el bucle del agente y actualizar el canal de Discord y además corregir el backend de memoria” son tres componentes: deberían ser tres PRs.</p>
+<h3 id="para-los-mantenedores"><a class="header" href="#para-los-mantenedores">Para los mantenedores</a></h3>
+<p>Cada informe de error tendrá un lugar claro. “El agente está llamando a las herramientas incorrectamente” → <code>zeroclaw-tool-call-parser</code> o <code>zeroclaw-runtime</code>. “La integración de Discord está rota” → plugin <code>channel-discord</code>. “El panel web no se está cargando” → <code>zeroclaw-gw</code>. Ahora mismo, cualquiera de esos errores podría estar en cualquier lugar de más de 50.000 líneas.</p>
+<h3 id="para-el-proceso-de-lanzamiento"><a class="header" href="#para-el-proceso-de-lanzamiento">Para el proceso de lanzamiento</a></h3>
+<p>El modelo de plugins permite que los canales y las herramientas tengan ciclos de lanzamiento independientes. Una corrección de errores en el canal de Telegram no requiere un nuevo lanzamiento del kernel. La estabilidad del kernel se convierte en la base sobre la que se construye todo lo demás. La iteración rápida en los plugins no pone en riesgo la estabilidad del kernel.</p>
+<h3 id="para-la-comunidad"><a class="header" href="#para-la-comunidad">Para la comunidad</a></h3>
+<p>Una interfaz WIT publicada y un SDK de plugins significan que cualquiera puede extender ZeroClaw sin necesidad de bifurcarlo. Una empresa que necesite una integración específica puede escribir un plugin basado en la interfaz pública. Así es como se construyen los ecosistemas.</p>
+<hr>
+<h2 id="apéndice-a-glosario"><a class="header" href="#apéndice-a-glosario">Apéndice A: Glosario</a></h2>
+<p>Términos utilizados en este documento que pueden ser desconocidos:</p>
+<p><strong>Big Ball of Mud</strong>: Una arquitectura (o ausencia de ella) en la que la base de código ha crecido de forma orgánica sin planificación estructural. El nombre proviene de un artículo de 1997 de Brian Foote y Joseph Yoder. Es la arquitectura más común en el software, no porque alguien la elija, sino porque es lo que se obtiene por defecto.</p>
+<p><strong>Ley de Conway</strong>: “Cualquier organización que diseña un sistema producirá un diseño cuya estructura es una imagen espejo de la estructura de comunicación de la organización.” (Mel Conway, 1968) Si los colaboradores trabajan en silos aislados sin hablar entre sí, el código lo reflejará. Si los colaboradores colaboran con interfaces claras entre su trabajo, el código también lo reflejará.</p>
+<p><strong>Principio de Inversión de Dependencias</strong>: Los módulos de alto nivel no deben depender de módulos de bajo nivel. Ambos deben depender de abstracciones. Por eso <code>zeroclaw-runtime</code> depende de <code>zeroclaw-api</code> (abstracciones) y no de <code>channel-discord</code> (una implementación específica).</p>
+<p><strong>Microkernel</strong>: Una arquitectura en la que el sistema central contiene únicamente la funcionalidad mínima necesaria, y todas las demás capacidades son proporcionadas por componentes separados que se comunican con el núcleo a través de interfaces bien definidas.</p>
+<p><strong>Patrón Strangler Fig</strong>: Una estrategia de migración en la que reemplazas incrementalmente partes de un sistema existente construyendo nuevos componentes junto a los antiguos. Recibe su nombre de la planta higuera estranguladora, que crece alrededor de un árbol existente hasta que el árbol original ha sido completamente reemplazado. La propiedad clave: el sistema siempre está en funcionamiento y siempre es desplegable durante la migración.</p>
+<p><strong>Deuda técnica</strong>: El costo acumulado de tomar atajos en el diseño de software. Como la deuda financiera, una pequeña cantidad puede ser productiva (entregas más rápido ahora). Una cantidad grande se vuelve paralizante (pasas todo tu tiempo pagando intereses, es decir, corrigiendo errores y aplicando soluciones provisionales, en lugar de desarrollar nuevas funcionalidades).</p>
+<p><strong>WIT (WebAssembly Interface Types)</strong>: Un lenguaje de definición de interfaces para describir lo que los componentes WASM exportan e importan. Piénselo como un contrato: “un plugin Tool debe exportar una función llamada <code>execute</code> que recibe JSON y devuelve JSON.” WIT hace que ese contrato sea preciso y legible por máquina.</p>
+<hr>
+<h2 id="apéndice-b-lecturas-adicionales"><a class="header" href="#apéndice-b-lecturas-adicionales">Apéndice B: Lecturas adicionales</a></h2>
+<p>Estos son recursos que el equipo puede encontrar valiosos. No son lecturas obligatorias, pero cada uno ha influido directamente en esta propuesta.</p>
+<ul>
+<li>
+<p><strong>“A Philosophy of Software Design”</strong>: John Ousterhout. El mejor libro breve sobre la gestión de la complejidad en el software. Su concepto de “módulos profundos” (interfaces simples, implementaciones potentes) es exactamente lo que busca el modelo de microkernel.</p>
+</li>
+<li>
+<p><strong>“Clean Architecture”</strong>: Robert C. Martin. La Regla de Dependencia descrita en la Sección 4.2 de este documento proviene de este libro.</p>
+</li>
+<li>
+<p><strong>“Release It!”</strong>: Michael Nygard. Patrones prácticos para construir software que se mantiene en funcionamiento en producción. Los patrones de separación de gateway y circuit-breaker que se analizan aquí provienen de este libro.</p>
+</li>
+<li>
+<p><a href="https://rust-lang.github.io/api-guidelines/">The Rust API Guidelines</a>: La guía oficial para diseñar bibliotecas idiomáticas de Rust. Nuestras interfaces de traits deben seguir estas convenciones.</p>
+</li>
+<li>
+<p><a href="https://component-model.bytecodealliance.org/">El Modelo de Componentes de WebAssembly</a>: La base técnica para el sistema de plugins propuesto en este RFC.</p>
+</li>
+<li>
+<p><a href="https://opentelemetry.io/docs/specs/">Especificación de OpenTelemetry</a>: La especificación completa del estándar de observabilidad que estamos adoptando.</p>
+</li>
+</ul>
+<hr>
+<p><em>Esta propuesta se desarrolló a partir de un análisis detallado de la base de código de ZeroClaw en la versión v0.6.8. Las métricas de código citadas se basan en la medición directa de los archivos fuente. Las recomendaciones arquitectónicas reflejan patrones establecidos en el diseño de software de sistemas aplicados a las restricciones y objetivos específicos del proyecto ZeroClaw.</em></p>
+<p><em>Los comentarios, las correcciones y las contrapropuestas son bienvenidos. La mejor arquitectura es la que el equipo comprende y en la que cree, no la que una sola persona dictó.</em></p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-002-documentation-standards.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-002-documentation-standards.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PeerPacket"],"fn":["evict_stale_peers","handle_datagram","is_advertisable_gateway_addr","run_peer_discovery"],"struct":["Announcement","Bye","MdnsAdvertisedGateway","MdnsPeer","MdnsPeerRegistry","MdnsPeerSnapshot"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["GEMINI_UNSUPPORTED_KEYWORDS"],"enum":["CleaningStrategy"],"struct":["SchemaCleanr"]};

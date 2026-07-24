@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BOOTSTRAP_MAX_CHARS","NATIVE_TOOLS_TASK_FRAMING","NO_TOOLS_TASK_FRAMING"],"fn":["build_system_prompt","build_system_prompt_with_mode","build_system_prompt_with_mode_and_autonomy","build_system_prompt_with_tool_calls"]};

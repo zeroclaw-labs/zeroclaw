@@ -1,0 +1,774 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>工程基础设施 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a22b4832.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-004工程基础设施cicd-流水线与发布自动化"><a class="header" href="#fnd-004工程基础设施cicd-流水线与发布自动化">FND-004：工程基础设施：CI/CD 流水线与发布自动化</a></h1>
+<blockquote>
+<p>支持 v0.7.0 → v1.0.0 · 类型：架构 · 修订版 1</p>
+<p><strong>规范参考</strong> · 团队已批准 · 修订版 1 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5579">#5579</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
+<p>本文档讨论的是围绕代码的脚手架：那些用于构建、测试、审计和发布代码的自动化机制。这些脚手架在运行良好时无人察觉，出问题时却令人头疼。大多数团队在它出问题之前都不会去考虑它，而到那时它已经膨胀成了无人能够完全理解的东西。本 RFC 正是试图防患于未然。如果你此前从未深入思考过 CI/CD，这是一个很好的起点；如果你思考过，你会认出其中的模式。无论哪种情况，目标都是一致的：打造一条既能让团队充满信心、又不会碍手碍脚的流水线。</p>
+</blockquote>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li><a href="#1-context-pipelines-are-architecture">上下文：管道即架构</a></li>
+<li><a href="#2-honest-assessment-where-we-are-today">诚实评估：我们目前的状况</a></li>
+<li><a href="#3-the-target-pipeline-design">目标管道设计</a></li>
+<li><a href="#4-security-scanning-as-a-lifecycle">作为生命周期的安全扫描</a></li>
+<li><a href="#5-release-automation-aligned-to-the-distribution-model">与分发模型对齐的发布自动化</a></li>
+<li><a href="#6-standards-we-should-adopt">我们应采用的标准</a></li>
+<li><a href="#7-phased-roadmap">分阶段路线图</a></li>
+<li><a href="#8-这对贡献者的影响">这对贡献者的影响</a></li>
+</ol>
+<hr>
+<h2 id="修订历史"><a class="header" href="#修订历史">修订历史</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>修订</th><th>日期</th><th>摘要</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月9日</td><td>初始草稿</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="1-上下文管道即架构"><a class="header" href="#1-上下文管道即架构">1. 上下文：管道即架构</a></h2>
+<p>架构 RFC（#5574）确立了一项原则：<em>依赖向内流动，结构由编译器强制保证。</em> 同样的原则也适用于围绕代码的流水线。流水线不仅仅是自动化：它是一组架构决策，决定了你信任什么、验证什么、何时验证以及如何发布。</p>
+<p>这些决策会带来后果。为单体应用设计的流水线会主动抵制微内核架构。没有分类处理流程的安全网关要么会阻止一切，要么会被绕过。围绕单一二进制文件构建的发布流程无法适应包含五种制品类型的分发模型。这些不是配置问题，而是设计问题，它们值得像代码架构一样得到有意的处理。</p>
+<p>当前的流水线是被动演化而来的，就像 <code>loop_.rs</code> 增长到 9,500 行那样。没有人主动选择了现在的状态，它只是不断累积。PR #5559 作为微内核迁移的第一个重要步骤，暴露出了流水线中若干不再成立的假设。这是一个有用的信号，它意味着现在正是停下来、评估并进行有意设计的最佳时机。</p>
+<p>本 RFC 对流水线的作用，类似于架构 RFC 对代码库的作用：明确现有命名、识别结构性问题，并提出与项目发展方向一致的前进路径。</p>
+<hr>
+<h2 id="2-诚实评估我们目前的状况"><a class="header" href="#2-诚实评估我们目前的状况">2. 诚实评估：我们目前的状况</a></h2>
+<p>本节内容并非批评，而是诊断。当前的流水线反映了当时看来合理的决策。我们的目标是充分理解它，以便对其进行改进。</p>
+<h3 id="21-执行相同工作的两种工作流"><a class="header" href="#21-执行相同工作的两种工作流">2.1 执行相同工作的两种工作流</a></h3>
+<p>该仓库目前有两个独立的工作流，它们会在针对 <code>master</code> 分支的拉取请求（Pull Request）时触发：</p>
+<ul>
+<li><code>checks-on-pr.yml</code>，品牌名称为 “Quality Gate”</li>
+<li><code>ci-run.yml</code>，品牌名称为 “CI”</li>
+</ul>
+<p>每个 PR 都会独立运行 Lint、Build、Test 和 Security 作业。这意味着每个 PR 会并行触发两次完整的流水线运行。对于具有单个编译单元的单体项目来说，这种做法虽然成本较高，但尚可接受。而对于多 crate 工作区而言，这会使原本就显著的 CI 预算翻倍，却并未带来任何额外的信号价值。</p>
+<p>重复带来的代价不仅限于计算时间：当一个检查在一个工作流中失败而在另一个中通过时，贡献者无法确定应信任哪个结果。当需要添加新的检查时，必须在两个地方都添加。当行为需要更改时，必须在两个地方都进行更改。存在两个真相源的问题与代码中存在两个真相源的问题是一样的。</p>
+<h3 id="22-单二进制假设无处不在"><a class="header" href="#22-单二进制假设无处不在">2.2 单二进制假设无处不在</a></h3>
+<p>发布自动化流程（<code>release-stable-manual.yml</code>、<code>release-beta-on-push.yml</code>、<code>publish-crates.yml</code>、<code>pub-aur.yml</code>、<code>pub-homebrew-core.yml</code>、<code>pub-scoop.yml</code>、<code>discord-release.yml</code>、<code>tweet-release.yml</code>）的设计基于一个假设：一次发布只包含一个二进制文件。你构建它、签名、推送到包管理器并发布公告。</p>
+<p>架构 RFC 定义了一种包含五种不同制品类型的分发模型：内核二进制文件（多个平台目标）、硬件变体内核二进制文件、网关二进制文件、WASM 插件文件以及 Tauri 桌面安装程序。当前的发布工作流均未考虑这种结构。当架构迁移进入第 3 阶段和第 4 阶段时，除非现在就按照该模型重新设计，否则这些工作流中的每一个都将需要更改。</p>
+<h3 id="23-无生命周期安全扫描"><a class="header" href="#23-无生命周期安全扫描">2.3 无生命周期安全扫描</a></h3>
+<p>安全作业以 <code>cargo audit</code> 作为硬性检查。如果依赖树中存在任何安全公告，该检查将失败，PR 无法合并。其意图是正确的，但实现存在结构性问题。</p>
+<p><code>cargo audit</code> 会报告依赖树中的所有安全建议：活跃漏洞、未维护的 crate 以及信息性通知。它不会区分：</p>
+<ul>
+<li>项目主动调用的一个 crate 中存在严重漏洞</li>
+<li>可选功能中第三层传递依赖项存在漏洞</li>
+<li>项目通过第三方库间接依赖的一个 crate 的“未维护”通知</li>
+<li>在打开此 PR 之前已存在的现有建议</li>
+</ul>
+<p>当所有这些情况都导致相同的硬性失败时，门禁机制就会变成噪音。对噪音的合理应对方式是降低门禁标准、忽略失败或禁用检查。这三种做法都会使项目安全性降低，而非提升。无法维护的安全门禁最终将不会被维护。</p>
+<p>PR #5559 同时暴露了十二个 RUSTSEC-2026 安全公告。由于缺乏工具来区分“本 PR 引入的新安全公告”与“master 分支上已存在的安全公告”，PR 作者和审查者无法判断该 PR 是否使安全态势恶化。</p>
+<h3 id="24-严格差异检查脚本"><a class="header" href="#24-严格差异检查脚本">2.4 严格差异检查脚本</a></h3>
+<p><code>ci-run.yml</code> 包含一个运行 <code>scripts/ci/rust_strict_delta_gate.sh</code> 的作业，这是一个自定义脚本，用于将 clippy 输出与 PR 的基准 SHA 进行比较。其理念是合理的：你想知道这个 PR 是否引入了新的警告，而不仅仅是代码库中是否存在警告。该实现对于针对单体 crate 的小型、聚焦的 PR 效果很好。</p>
+<p>一个 PR 移动了 260,000 行代码，分布在 10 个新 crate 中，涉及数百个文件，这让此脚本进入了它未曾设计应对的领域。变更文件的覆盖面过大，增量比较无法产生有意义的信号。此脚本需要理解工作区结构：具体来说，对 <code>crates/zeroclaw-channels/</code> 中某个文件的变更，应当在该 crate 的上下文中进行评估，而非在根目录的上下文中。</p>
+<h3 id="25-无工作区感知缓存或作用域"><a class="header" href="#25-无工作区感知缓存或作用域">2.5 无工作区感知缓存或作用域</a></h3>
+<p>当前的 Rust 缓存配置（<code>Swatinem/rust-cache</code>）对于单个 crate 来说已经足够。对于多 crate 工作区，缓存的有效性取决于理解哪些 crate 发生了变化，以及哪些编译产物可以复用。如果没有明确的工作区范围，对任何 crate 的更改都可能导致其他 crate 依赖的缓存失效，从而在每次 PR 时触发完全重新编译。</p>
+<p>更重要的是，目前缺乏仅针对给定变更所影响的 crate 运行 CI 的机制。修复 <code>zeroclaw-tool-call-parser</code> 中拼写错误的 PR 无需重新构建和测试 gateway。随着工作区向架构 RFC 所设想的 30+ crate 模型扩展，在每次 PR 上运行完整流水线所带来的成本将成为贡献的显著障碍。</p>
+<h3 id="26-操作固定是个好做法但缺乏文档说明"><a class="header" href="#26-操作固定是个好做法但缺乏文档说明">2.6 操作固定是个好做法：但缺乏文档说明</a></h3>
+<p>现有的工作流确实将 actions 固定到完整的 commit SHA，这是正确的安全实践，值得肯定。但目前没有任何文档化的策略来解释为什么要这样做，没有审查这些 SHA 何时应当更新的流程，也没有保持它们处于最新状态的自动化机制。缺乏策略支撑的良好行为是脆弱的：下一位添加工作流步骤的贡献者可能并不了解 SHA 固定为何重要，转而使用可变的 tag。</p>
+<hr>
+<h2 id="3-目标管道设计"><a class="header" href="#3-目标管道设计">3. 目标管道设计</a></h2>
+<h3 id="31-一个管道一个数据源"><a class="header" href="#31-一个管道一个数据源">3.1 一个管道，一个数据源</a></h3>
+<p>这两个并行的工作流应当整合为单个结构良好的流水线。“Quality Gate” 与 “CI” 之间的区分对贡献者而言并无实际意义：两者都是 PR 必须通过的检查。整合后将提供一个统一的位置来查看检查结果、一个统一的位置在行为变更时进行更新，以及一个统一的位置来记录每项检查的作用及其原因。</p>
+<p>合并后的流水线采用分阶段结构：先运行成本极低的格式检查，然后大量 Rust 相关任务并行展开。Lint 仍然是必需的，但当目标是缩短绿色关键路径时，它不应不必要地阻碍构建和测试缓存的预热：</p>
+<pre><code>Stage 1: Format (cheap serial gate)
+  └── cargo fmt --check
+
+Post-format quality gate (parallel, required)
+  └── cargo clippy --workspace --all-targets -- -D warnings
+  └── Docs quality gate
+
+Post-format Build + Check (parallel, 5–15 min)
+  └── Build matrix (Linux x86_64, macOS ARM, Windows)
+  └── cargo check --features ci-all
+  └── cargo check --no-default-features (kernel profile)
+  └── cargo check --target i686 (32-bit)
+
+Post-format Test (parallel, 10–30 min)
+  └── cargo nextest run --workspace
+
+Post-format Security (parallel)
+  └── cargo deny check (licenses, sources, advisories)
+  └── Advisory triage gate (see §4)
+
+Required Gate
+  └── Composite status — branch protection requires only this job
+</code></pre>
+<p>格式化作业完成后，post-format 作业会并行运行。这意味着格式化错误能够快速失败，而不会在最终会被丢弃的构建上浪费算力；与此同时，clippy、build、test 和 security 可以在格式正确的 PR 上同时推进。Required Gate 作业会汇总所有结果，因此分支保护只需跟踪一个作业名称即可——这一模式在当前的两个工作流中均已存在。</p>
+<h3 id="32-工作区感知的-clippy"><a class="header" href="#32-工作区感知的-clippy">3.2 工作区感知的 Clippy</a></h3>
+<p>当前的 clippy 调用针对根 crate 的默认功能集运行。对于多 crate 工作区，正确的调用方式是：</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">cargo clippy --workspace --all-targets -- -D warnings
+</code></pre>
+</div>
+
+<p><code>--workspace</code> 标志确保对工作区中的每个 crate 进行 lint，而不仅仅是根 crate。<code>--all-targets</code> 标志包括测试、基准测试和示例。结合用于特性门控检查的 <code>--features ci-all</code>，这提供了完整的视图。</p>
+<p>严格增量 lint 的理念——即检查本 PR 是否引入了新的警告，而非检查是否存在任何警告——值得保留。其实现应当从一个比较 diff 输出的 shell 脚本，转变为一种合理的、可感知 workspace 的调用方式，对每个受影响的 crate 进行独立评估。一种更简单、更可靠的方法是：要求 <code>--workspace -D warnings</code> 始终干净通过，从而使增量理念隐式成立。如果基线始终是干净的，那么任何引入警告的 PR 都会失败。这样便完全无需自定义的比较脚本。</p>
+<h3 id="33-变更检测"><a class="header" href="#33-变更检测">3.3 变更检测</a></h3>
+<p>对于包含 30 多个 crate 的工作区，无论代码有何变更，都在每个 PR 中运行完整的测试套件是一种浪费。流水线应检测 PR 影响了哪些 crate，并相应地限定测试执行的范围。</p>
+<p>该机制非常简单：将 PR 中更改的文件与工作区成员列表进行比较，识别包含更改文件的 crate，并将该集合扩展为包含所有依赖于任何已更改 crate 的 crate（下游影响），然后仅对该集合运行测试。</p>
+<pre><code>PR changes: crates/zeroclaw-tool-call-parser/src/lib.rs
+
+Affected crates:
+  zeroclaw-tool-call-parser     ← directly changed
+  zeroclaw-misc                 ← depends on it
+  zeroclawlabs (root)           ← depends on it
+
+Not affected:
+  zeroclaw-channels             ← no dependency path
+  zeroclaw-memory               ← no dependency path
+  zeroclaw-providers            ← no dependency path
+</code></pre>
+<p>这是通过 <code>cargo metadata</code> 提取依赖图，并配合一个简短的脚本来遍历该图实现的。完整的测试套件在推送到 <code>master</code> 分支以及发布分支时继续运行。对于 PR，则仅运行受影响的 crate 子集。</p>
+<h3 id="34-缓存策略"><a class="header" href="#34-缓存策略">3.4 缓存策略</a></h3>
+<p><code>Swatinem/rust-cache</code> 通过其 <code>workspaces</code> 配置支持工作区感知的缓存。缓存密钥应包含工作区成员列表，以便在添加新 crate 时能够正确使缓存失效，而不会影响其他无关 crate 的缓存。</p>
+<pre><code class="language-yaml">- 使用: Swatinem/rust-cache@&lt;sha&gt;
+  与:
+    工作区: |
+      . -&gt; target
+    cache-on-failure: true
+    save-if: ${{ github.ref == 'refs/heads/master' }}
+</code></pre>
+<p>由于缓存保存仅限于 <code>refs/heads/master</code>，因此该工作流必须在受信任的 <code>master</code> 推送时运行。PR 会读取由 master 填充的缓存，但不会写入相互竞争的分支产物。这样可以避免在多个 PR 同时打开时发生缓存抖动，同时仍允许合并后的运行为下一轮评审预热 Linux、macOS 和 Windows 的构建缓存。</p>
+<hr>
+<h2 id="4-将安全扫描作为生命周期的一部分"><a class="header" href="#4-将安全扫描作为生命周期的一部分">4. 将安全扫描作为生命周期的一部分</a></h2>
+<h3 id="41-二进制门的问题"><a class="header" href="#41-二进制门的问题">4.1 二进制门的问题</a></h3>
+<p>一个在任何安全建议下都进行阻断的安全门，缺乏上下文，会让团队将安全失败视为噪音。这与预期效果恰恰相反。目标是实现一个具备以下特点的安全门：</p>
+<ul>
+<li><strong>高信号</strong>：失败意味着此 PR 影响了某些真实的内容</li>
+<li><strong>可操作</strong>：贡献者知道该做什么以及为什么这样做</li>
+<li><strong>可持续</strong>：该关卡无需持续的人工干预即可维护</li>
+</ul>
+<p>仅使用 <code>cargo audit</code> 无法实现此目的。<code>cargo deny</code> 可以。</p>
+<h3 id="42-将-cargo-deny-作为主要的安全工具"><a class="header" href="#42-将-cargo-deny-作为主要的安全工具">4.2 将 cargo-deny 作为主要的安全工具</a></h3>
+<p><code>cargo deny</code> 是 <code>cargo audit</code> 的更强大的继任者，用于项目级别的依赖策略。它强制执行：</p>
+<ul>
+<li><strong>安全公告</strong>：RUSTSEC 数据库，支持拒绝、警告或在提供书面理由的情况下显式忽略特定的安全公告</li>
+<li><strong>许可证</strong>：确保所有依赖项使用可接受的许可证（随着工作区的增长和新贡献者添加依赖项，这一点尤为重要）</li>
+<li><strong>来源</strong>：确保依赖仅来自已批准的注册表（crates.io、path、指定主机的 git）</li>
+<li><strong>重复项</strong>：当依赖树中出现同一 crate 的多个版本时发出警告</li>
+</ul>
+<p>关键能力在于 <code>deny.toml</code> 的 <code>[advisories]</code> 部分，它允许显式且有正当理由的忽略。这种方法将安全扫描从二元的通过/失败转变为有文档记录、可审计的策略。每一条被忽略的安全公告都有书面的正当理由和一个跟踪问题。审查者可以清楚地看到哪些安全公告被抑制以及原因。当某个被抑制的安全公告升级时（发现了新的漏洞利用、有了修复方案），跟踪问题就是提醒。</p>
+<h3 id="43-建议分类流程"><a class="header" href="#43-建议分类流程">4.3 建议分类流程</a></h3>
+<p>当依赖树中出现新的安全公告时，无论是来自 PR 还是每日安全公告数据库更新，处理流程如下：</p>
+<ol>
+<li><strong>分类该安全建议</strong>：受影响的 crate 是直接依赖还是传递依赖？ZeroClaw 是否调用了存在漏洞的代码路径？是否有可用的修复版本？</li>
+<li><strong>确定响应</strong>：
+<ul>
+<li><em>直接依赖中存在漏洞且已有修复方案</em> → 更新该依赖，无需忽略</li>
+<li><em>传递依赖中存在漏洞且已有修复方案</em> → 锁定传递依赖的版本，或等待直接依赖更新；并创建一个跟踪问题</li>
+<li><em>未维护通知，无活跃漏洞利用</em> → 将以下内容添加到 <code>deny.toml</code> 的忽略列表中，并附上理由和跟踪问题</li>
+<li><em>无修复方案的关键漏洞</em> → 评估变通方案；可能会阻止 PR</li>
+</ul>
+</li>
+<li>在 <code>deny.toml</code> 中记录该决策，包含 advisory ID、简要理由以及指向跟踪问题的链接。</li>
+</ol>
+<p>这意味着，像 #5559 这样暴露了十二个已有安全公告的 PR，在没有上下文的情况下不会导致门禁失败。这些安全公告会被分类处理，已有的公告会被记录，而门禁仅报告由该 PR 引入的、尚未分类的新安全公告。</p>
+<h3 id="44-每日建议扫描"><a class="header" href="#44-每日建议扫描">4.4 每日建议扫描</a></h3>
+<p>安全公告会持续发布。一个在合并时通过安全审查的 PR，可能在下一周包含新发布的安全漏洞。流水线应包含一个针对 <code>master</code> 分支的每日定时运行任务，用于检查安全公告数据库，并在发现新的未分类安全公告时自动创建 GitHub Issue。</p>
+<pre><code class="language-yaml">on:
+  计划:
+    - cron: '0 9 * * *'  # 每天 UTC 09:00
+</code></pre>
+<p>这将建议审查周期与 PR 合并周期分离开来。贡献者不会因在其 PR 编写之后出现的建议而被阻塞。安全团队（或轮值人员）将每日扫描输出作为常规维护任务来处理。</p>
+<hr>
+<h2 id="5-与分发模型对齐的发布自动化"><a class="header" href="#5-与分发模型对齐的发布自动化">5. 与分发模型对齐的发布自动化</a></h2>
+<h3 id="51-当前的不匹配"><a class="header" href="#51-当前的不匹配">5.1 当前的不匹配</a></h3>
+<p>架构 RFC §4.4.2 定义了以下发布制品：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>工件</th><th>构建目标</th><th>发布到</th></tr>
+</thead>
+<tbody>
+<tr><td>内核二进制文件（标准）</td><td>x86_64-linux-musl, aarch64-linux-gnu, armv7-linux-gnueabihf, x86_64-darwin, aarch64-darwin, x86_64-windows</td><td>GitHub 发布</td></tr>
+<tr><td>内核二进制文件（硬件）</td><td>aarch64-linux-gnu, armv7-linux-gnueabihf</td><td>GitHub 发布</td></tr>
+<tr><td>网关二进制文件</td><td>相同的平台矩阵</td><td>GitHub 发布</td></tr>
+<tr><td>WASM 插件文件</td><td>wasm32-wasip2</td><td>插件注册表</td></tr>
+<tr><td>桌面安装程序</td><td>x86_64 + aarch64，macOS/Windows/Linux</td><td>GitHub 发布版本，平台商店</td></tr>
+</tbody>
+</table>
+</div>
+<p>当前的发布工作流只知道其中之一：标准二进制文件。其余的尚未存在于自动化中。这在目前是合适的：插件系统尚未完成。但发布工作流的设计应当考虑到这一模型，以便在每种新工件类型引入时无需重写。</p>
+<h3 id="52-发布管道结构"><a class="header" href="#52-发布管道结构">5.2 发布管道结构</a></h3>
+<p>目标发布流水线是一个由作业组成的有向图，而非一个单体工作流：</p>
+<pre><code>version-bump (release-plz PR merged)
+    │
+    ├── build-kernel-standard (matrix: 6 targets)
+    ├── build-kernel-hardware (matrix: 2 ARM targets + hardware flags)
+    ├── build-gateway (matrix: 6 targets)
+    ├── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip2)
+    └── build-desktop (matrix: macOS, Windows, Linux AppImage/deb)
+            │
+            ├── publish-github-release (attaches all kernel + gateway binaries)
+            ├── publish-plugin-registry (uploads WASM files)
+            ├── publish-aur (kernel binary for Arch Linux)
+            ├── publish-homebrew (kernel binary for macOS)
+            ├── publish-scoop (kernel binary for Windows)
+            └── announce (Discord, social)
+</code></pre>
+<p>每个构建作业都是独立的，可以针对热修复版本单独触发。发布作业依赖于所有相关构建作业的成功。公告作业最后运行。</p>
+<p>此结构意味着仅包含插件的发布（即 <code>channel-discord.wasm</code> 的新版本）可以仅运行 <code>build-plugins-wasm</code> 和 <code>publish-plugin-registry</code> 作业，而无需触发完整的内核重建。内核补丁发布则运行 <code>build-kernel-*</code> 及下游的发布作业，而不触及插件注册表。</p>
+<h3 id="53-release-plz-用于工作区感知版本管理"><a class="header" href="#53-release-plz-用于工作区感知版本管理">5.3 Release-plz 用于工作区感知版本管理</a></h3>
+<p>架构 RFC §4.4.1 指定 <code>release-plz</code> 作为发布自动化工具。<code>release-plz</code> 直接与此流水线模型集成：</p>
+<ul>
+<li>在推送到 <code>master</code> 分支时，<code>release-plz</code> 会打开一个“发布 PR”，该 PR 会提升工作区版本，根据常规提交历史更新变更日志，并列出自上次发布以来所有发生变化的 crate。</li>
+<li>当发布 PR 合并时，发布流水线会自动触发</li>
+<li>使用 <code>version.workspace = true</code> 的 crate 会一起更新；独立版本管理的 crate（如 <code>zeroclaw-api</code>、硬件库 crate）则根据版本管理策略单独处理。</li>
+</ul>
+<p>发布拉取请求（PR）作为审查检查点：团队在发布之前可以清楚地看到将要发布的版本以及更新日志的内容。这取代了手动更新版本号和使用 <code>version-sync.yml</code> 工作流的做法。</p>
+<h3 id="54-操作固定策略"><a class="header" href="#54-操作固定策略">5.4 操作固定策略</a></h3>
+<p>当前的工作流已将操作固定到完整的提交 SHA。这是正确的，应将其形式化为明确的政策，以确保在人员更替时得以延续：</p>
+<p><strong>策略：</strong> 工作流文件中的所有 <code>uses:</code> 引用必须固定到完整的提交 SHA，并附带版本注释。不允许使用可变标签（如 <code>@v4</code>、<code>@main</code>、<code>@latest</code>）。无例外。</p>
+<pre><code class="language-yaml"># 正确
+- 使用: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+# 不允许
+- 使用: actions/checkout@v4
+- 使用: actions/checkout@main
+</code></pre>
+<p><strong>理由：</strong> 可变标签（mutable tag）是第三方对操作行为不会变更的承诺。然而，在 GitHub Actions 生态系统中，这一承诺已被多次打破。使用 SHA 固定版本意味着工作流将严格运行经审核的代码，无论操作作者后续做出何种更改。这对于具有写入权限或访问密钥的操作尤为重要。</p>
+<p>更新流程：使用为 GitHub Actions 配置的 <code>dependabot</code> 或 <code>renovate</code>，在可用新的 SHA 版本时自动创建 PR。团队负责审查并合并这些 PR，从而无需手动监控即可保持 Actions 的更新。</p>
+<hr>
+<h2 id="6-我们应该采用的标准"><a class="header" href="#6-我们应该采用的标准">6. 我们应该采用的标准</a></h2>
+<h3 id="61-slsa供应链安全框架"><a class="header" href="#61-slsa供应链安全框架">6.1 SLSA：供应链安全框架</a></h3>
+<p>SLSA（软件制品的供应链级别，发音为“salsa”）是由 Google 开发并在整个行业采用的框架，用于保护软件供应链。它定义了四个级别的构建完整性，从基础到完全隔离。</p>
+<p>对于 ZeroClaw 当前的规模和团队规模，<strong>SLSA Level 2</strong> 是合适的目标：</p>
+<ul>
+<li>构建在托管的 CI 平台上运行（已实现，GitHub Actions）</li>
+<li>构建脚本已纳入版本控制（已实现）</li>
+<li>构建溯源信息会生成并附加到发布制品中（添加该步骤）</li>
+</ul>
+<p>SLSA Level 2 的溯源信息意味着每个发布制品都附带了经过密码学签名的证明，记录了：生成它的源代码提交、生成它的构建工作流，以及该工作流是否在预期的平台上运行。用户和包管理器可以验证此证明。它弥合了“我们声称此二进制文件来自此源代码”与“此二进制文件可证明来自此源代码”之间的差距。</p>
+<p>GitHub Actions 通过 <code>actions/attest-build-provenance</code> 操作原生支持 SLSA 2 级溯源生成。添加它的成本是每个构建作业增加一个步骤。</p>
+<h3 id="62-约定式提交已隐含正式化它"><a class="header" href="#62-约定式提交已隐含正式化它">6.2 约定式提交（已隐含，正式化它）</a></h3>
+<p>架构 RFC 的版本控制策略和 release-plz 集成都依赖于约定式提交格式来生成变更日志。治理 RFC 已经引用了 PR 标题的约定。本 RFC 正式确立了这一联系：提交消息和 PR 标题中的约定式提交格式是一项要求，而非建议，因为它是驱动自动化变更日志生成的输入。</p>
+<p>对 ZeroClaw 的更新日志重要的类别：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>前缀</th><th>更新日志部分</th><th>版本影响</th></tr>
+</thead>
+<tbody>
+<tr><td><code>feat:</code></td><td>新功能</td><td>次要</td></tr>
+<tr><td><code>修复：</code></td><td>错误修复</td><td>补丁</td></tr>
+<tr><td><code>feat!:</code> 或 <code>fix!:</code></td><td>破坏性变更</td><td>主要</td></tr>
+<tr><td><code>chore:</code></td><td>维护</td><td>没有发布条目</td></tr>
+<tr><td><code>docs:</code></td><td>文档</td><td>没有发布条目</td></tr>
+<tr><td><code>perf:</code></td><td>性能</td><td>补丁</td></tr>
+<tr><td><code>security:</code></td><td>安全修复</td><td>PATCH（至少）</td></tr>
+</tbody>
+</table>
+</div>
+<p>CI 通过 PR 标题的 lint 作业强制执行此要求，该作业会在任何其他检查运行之前验证标题是否符合常规提交格式。</p>
+<h3 id="63-可重用工作流"><a class="header" href="#63-可重用工作流">6.3 可重用工作流</a></h3>
+<p>随着 crate 数量和制品类型的增长，工作流的重复会成为一个维护难题。GitHub Actions 支持可重用工作流：一种可以像函数一样从另一个工作流中调用的工作流。构建矩阵、安全扫描和测试运行器都应当被提取为可重用工作流。</p>
+<pre><code>.github/
+  workflows/
+    ci.yml               ← PR checks (calls reusable workflows)
+    release.yml          ← Release pipeline (calls reusable workflows)
+    daily-audit.yml      ← Scheduled security scan
+  _workflows/            ← Reusable workflow definitions
+    build-rust.yml       ← Parameterised build job
+    test-workspace.yml   ← Parameterised test job
+    security-scan.yml    ← cargo-deny invocation + triage
+    publish-release.yml  ← Parameterised publish job
+</code></pre>
+<p>可重用工作流通过参数调用：</p>
+<pre><code class="language-yaml">任务:
+  构建内核:
+    使用: ./.github/_workflows/build-rust.yml
+    与:
+      目标: x86_64-unknown-linux-musl
+      功能: ""
+      个人资料: dist
+</code></pre>
+<p>这意味着 CI 工作流和发布工作流共享同一个构建定义。对构建流程的修复会立即在所有地方生效。</p>
+<hr>
+<h2 id="7-分阶段路线图"><a class="header" href="#7-分阶段路线图">7. 分阶段路线图</a></h2>
+<p>管道迁移遵循与代码迁移相同的绞杀榕（Strangler Fig）模式：并行构建，逐步迁移，始终确保现有网关不受影响。</p>
+<hr>
+<h3 id="阶段-1--v070合理化"><a class="header" href="#阶段-1--v070合理化">阶段 1 · v0.7.0：“合理化”</a></h3>
+<p><strong>主题：</strong> 一个管道，清晰的信号，无重复。</p>
+<p><strong>为什么选择此阶段：</strong> 架构转型已经正在进行中。管道需要停止与之对抗，以免使实现工作变得比实际需要更复杂。</p>
+<h4 id="阶段-1-交付物"><a class="header" href="#阶段-1-交付物">阶段 1 交付物</a></h4>
+<h5 id="d1将-checks-on-pryml-和-ci-runyml-合并为单个工作流"><a class="header" href="#d1将-checks-on-pryml-和-ci-runyml-合并为单个工作流">D1：将 <code>checks-on-pr.yml</code> 和 <code>ci-run.yml</code> 合并为单个工作流</a></h5>
+<p>将两个 PR 工作流合并为一个。合并后的工作流保留了 §3.1 中定义的阶段性结构。<code>Quality Gate</code> 和 <code>CI</code> 的命名区分不再存在。现在只有一个工作流、一组结果、一个查看位置。</p>
+<p>复合门控作业（<code>CI Required Gate</code>）被保留。分支保护继续仅要求该单个作业。这意味着管道的内部结构可以更改，而无需更新分支保护规则。</p>
+<h5 id="d2用-cargo-deny-替换-cargo-audit"><a class="header" href="#d2用-cargo-deny-替换-cargo-audit">D2：用 <code>cargo deny</code> 替换 <code>cargo audit</code></a></h5>
+<p>在仓库根目录添加 <code>deny.toml</code>。配置 <code>[advisories]</code>、<code>[licenses]</code> 和 <code>[sources]</code> 部分。对 <code>master</code> 分支上所有当前的 RUSTSEC 安全公告进行分类处理：更新可以更新的项，对于无法更新的项，需记录理由及跟踪问题。在此阶段完成之前，<code>master</code> 分支上的安全门禁应通过检查。</p>
+<h5 id="d3修复工作区感知的-clippy-调用"><a class="header" href="#d3修复工作区感知的-clippy-调用">D3：修复工作区感知的 clippy 调用</a></h5>
+<p>在合并后的工作流中，将 <code>cargo clippy --all-targets -- -D warnings</code> 改为 <code>cargo clippy --workspace --all-targets -- -D warnings</code>。移除 <code>rust_strict_delta_gate.sh</code> 脚本：由于始终强制执行 <code>--workspace -D warnings</code> 保持代码整洁，delta 概念已隐含其中。</p>
+<h5 id="d4正式确立操作固定策略"><a class="header" href="#d4正式确立操作固定策略">D4：正式确立操作固定策略</a></h5>
+<p>添加 <code>SECURITY.md</code> 说明以及 CI 检查，确保工作流文件中所有 <code>uses:</code> 引用均通过 SHA 固定。添加用于 GitHub Actions 更新的 <code>dependabot</code> 配置。</p>
+<h5 id="d5添加每日咨询扫描工作流"><a class="header" href="#d5添加每日咨询扫描工作流">D5：添加每日咨询扫描工作流</a></h5>
+<p>将 <code>daily-audit.yml</code> 添加为定时工作流，在 UTC 时间 09:00 对 <code>master</code> 分支运行 <code>cargo deny check advisories</code>。如果失败，则使用 <code>gh issue create</code> 打开一个包含漏洞详情的 GitHub Issue。</p>
+<h4 id="第一阶段的成功指标"><a class="header" href="#第一阶段的成功指标">第一阶段的成功指标</a></h4>
+<ul>
+<li>单个 PR 工作流文件，无重复</li>
+<li>安全门控在 <code>master</code> 分支上通过，所有现有安全漏洞均已记录并分类处理。</li>
+<li><code>cargo clippy --workspace</code> 运行并通过检查</li>
+<li>在任何工作流文件中都没有可变的动作标签引用</li>
+<li>日常建议扫描已运行</li>
+</ul>
+<hr>
+<h3 id="阶段-2--v080工作区感知"><a class="header" href="#阶段-2--v080工作区感知">阶段 2 · v0.8.0：“工作区感知”</a></h3>
+<p><strong>主题：</strong> 管道了解工作区。针对特定更改的快速反馈。</p>
+<p><strong>为何需要此阶段：</strong> 到 v0.8.0 版本时，工作区规模将进一步扩大。在每次 PR 上运行完整流水线将变得日益昂贵。<code>zeroclaw-tool-call-parser</code> 的贡献者不应再等待 30 分钟来重建网关。</p>
+<h4 id="第二阶段交付物"><a class="header" href="#第二阶段交付物">第二阶段交付物</a></h4>
+<h5 id="d1变更包检测"><a class="header" href="#d1变更包检测">D1：变更包检测</a></h5>
+<p>添加一个 <code>scripts/ci/affected_crates.sh</code> 脚本，该脚本使用 <code>cargo metadata</code> 构建依赖图，并返回由 PR 中更改的文件所影响的 crate 集合。CI 工作流将使用此输出来限定测试执行的范围。</p>
+<h5 id="d2按-crate-划分的测试范围"><a class="header" href="#d2按-crate-划分的测试范围">D2：按 crate 划分的测试范围</a></h5>
+<p>根据受影响的 crate 输出，为 <code>cargo nextest</code> 添加 <code>--package</code> 标志。在 <code>master</code> 推送和夜间构建中，整个工作区的测试仍会继续运行。PR 则仅运行受影响的子集。</p>
+<h5 id="d3工作区感知的缓存配置"><a class="header" href="#d3工作区感知的缓存配置">D3：工作区感知的缓存配置</a></h5>
+<p>更新 <code>Swatinem/rust-cache</code> 配置，添加显式的工作区范围限定，并设置 <code>save-if: ${{ github.ref == 'refs/heads/master' }}</code>，以防止并发 PR 导致的缓存抖动问题。</p>
+<h5 id="d4提取可复用的工作流定义"><a class="header" href="#d4提取可复用的工作流定义">D4：提取可复用的工作流定义</a></h5>
+<p>将构建、测试和安全作业提取到 <code>.github/_workflows/</code> 下的可重用工作流文件中。更新 <code>ci.yml</code> 和新创建的 <code>release.yml</code> 骨架以调用它们。</p>
+<h4 id="第二阶段的成功指标"><a class="header" href="#第二阶段的成功指标">第二阶段的成功指标</a></h4>
+<ul>
+<li>仅修改 <code>zeroclaw-tool-call-parser</code> 的 PR 会运行该 crate 及其依赖项的测试，而不是整个工作区的测试。</li>
+<li>增量构建的 CI 缓存命中率超过 80%</li>
+<li>已为构建、测试和安全作业设置了可重用的工作流</li>
+</ul>
+<hr>
+<h3 id="第三阶段--v090发布流水线"><a class="header" href="#第三阶段--v090发布流水线">第三阶段 · v0.9.0：“发布流水线”</a></h3>
+<p><strong>主题：</strong> 与分发模型相匹配的发布自动化。</p>
+<p><strong>为什么选择此阶段：</strong> 架构 RFC 的第 3 阶段将 <code>zeroclaw-gw</code> 提取为一个独立的二进制文件。这是首次多工件发布，发布管道必须在此阶段就绪，以便后续使用。</p>
+<h4 id="第-3-阶段交付物"><a class="header" href="#第-3-阶段交付物">第 3 阶段交付物</a></h4>
+<h5 id="d1引入-release-plz-并移除-version-syncyml"><a class="header" href="#d1引入-release-plz-并移除-version-syncyml">D1：引入 <code>release-plz</code> 并移除 <code>version-sync.yml</code></a></h5>
+<p>为工作区配置 <code>release-plz</code>。工作区中的应用 crate 使用 <code>version.workspace = true</code>。<code>zeroclaw-api</code> 和硬件库 crate 配置了独立的发布设置。<code>version-sync.yml</code> 工作流已废弃。</p>
+<h5 id="d2在-releaseyml-中构建结构化的发布流水线"><a class="header" href="#d2在-releaseyml-中构建结构化的发布流水线">D2：在 <code>release.yml</code> 中构建结构化的发布流水线</a></h5>
+<p>实现 §5.2 中的有向发布图：<code>build-kernel-standard</code>、<code>build-kernel-hardware</code>、<code>build-gateway</code>，以及下游的发布作业。插件构建作业暂以桩代码实现：在第 4 阶段之前，它们以无操作（no-op）的方式直接成功。</p>
+<h5 id="d3添加-slsa-level-2-来源证明"><a class="header" href="#d3添加-slsa-level-2-来源证明">D3：添加 SLSA Level 2 来源证明</a></h5>
+<p>在每个构建作业中添加 <code>actions/attest-build-provenance</code>。完整性证明将附加到 GitHub Release 资产中。在 <code>SECURITY.md</code> 中记录验证说明。</p>
+<h5 id="d4淘汰冗余的发布工作流"><a class="header" href="#d4淘汰冗余的发布工作流">D4：淘汰冗余的发布工作流</a></h5>
+<p>将 <code>release-stable-manual.yml</code>、<code>release-beta-on-push.yml</code>、<code>pub-aur.yml</code>、<code>pub-homebrew-core.yml</code>、<code>pub-scoop.yml</code>、<code>discord-release.yml</code> 和 <code>tweet-release.yml</code> 整合到结构化的 <code>release.yml</code> 流水线中。这些工作流是独立发展的；新的结构化流水线将它们替换为单一、可审计的流程。</p>
+<h4 id="第三阶段的成功指标"><a class="header" href="#第三阶段的成功指标">第三阶段的成功指标</a></h4>
+<ul>
+<li><code>release-plz</code> 在 <code>master</code> 分支上创建并管理发布拉取请求（Release PRs）。</li>
+<li>内核和网关二进制文件是从单个 <code>release.yml</code> 工作流构建并发布的。</li>
+<li>所有发布资产均附带 SLSA 2 级溯源信息</li>
+<li>已停用冗余的发布工作流</li>
+</ul>
+<hr>
+<h3 id="第-4-阶段--v100平台流水线"><a class="header" href="#第-4-阶段--v100平台流水线">第 4 阶段 · v1.0.0：“平台流水线”</a></h3>
+<p><strong>主题：</strong> 流水线交付的是平台，而不仅仅是二进制文件。</p>
+<p><strong>为什么选择此阶段：</strong> v1.0.0 是 WASM 插件可发布的版本。该流水线必须将插件发布、注册表上传以及 Tauri 桌面安装程序作为一等公民的发布制品进行处理。</p>
+<h4 id="第-4-阶段交付物"><a class="header" href="#第-4-阶段交付物">第 4 阶段交付物</a></h4>
+<h5 id="d1启用-wasm-插件构建作业"><a class="header" href="#d1启用-wasm-插件构建作业">D1：启用 WASM 插件构建作业</a></h5>
+<p>在发布流水线中实现 <code>build-plugins-wasm</code>。每个插件 crate 都在独立的作业中构建为 <code>wasm32-wasip2</code>。会生成并签名插件清单。<code>publish-plugin-registry</code> 作业将已签名的 WASM 文件上传到插件注册表。</p>
+<h5 id="d2桌面安装程序构建与发布"><a class="header" href="#d2桌面安装程序构建与发布">D2：桌面安装程序构建与发布</a></h5>
+<p>完成 macOS、Windows 和 Linux 的 Tauri 构建作业。安装程序会捆绑内核和网关二进制文件。macOS 和 Windows 的代码签名凭证作为必需的仓库密钥记录，并附有设置指南。</p>
+<h5 id="d3将-cicd-标准发布到-docsbooksrcmaintainersci-and-actionsmd"><a class="header" href="#d3将-cicd-标准发布到-docsbooksrcmaintainersci-and-actionsmd">D3：将 CI/CD 标准发布到 <code>docs/book/src/maintainers/ci-and-actions.md</code></a></h5>
+<p>本 RFC 中定义的 <strong>操作固定策略</strong>、<strong>建议性分类流程</strong>、<strong>常规提交要求</strong> 以及 <strong>发布流水线结构</strong> 已提取至 <code>docs/book/src/maintainers/ci-and-actions.md</code>，作为长期参考文档。本 RFC 仍保留为决策的历史记录，而提取出的文档则是贡献者日常查阅的内容。</p>
+<h5 id="d4流水线的贡献者入门指南"><a class="header" href="#d4流水线的贡献者入门指南">D4：流水线的贡献者入门指南</a></h5>
+<p>在贡献文档中添加一个“本地运行 CI”部分，展示贡献者如何在推送代码之前在自己的机器上复现 CI 检查：</p>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh"># CI 会运行哪些任务 — 在推送代码前请确保通过
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace
+cargo deny check
+</code></pre>
+</div>
+
+<h4 id="第四阶段的成功指标"><a class="header" href="#第四阶段的成功指标">第四阶段的成功指标</a></h4>
+<ul>
+<li>WASM 插件文件作为发布流程的一部分发布到注册表中</li>
+<li>Tauri 桌面安装程序在发布时会自动构建并发布。</li>
+<li><code>docs/book/src/maintainers/ci-and-actions.md</code> 文件存在，涵盖了操作固定、安全公告分类以及约定式提交。</li>
+<li>贡献者可以通过四条命令在本地复现所有 CI 检查</li>
+</ul>
+<hr>
+<h2 id="8-这对贡献者意味着什么"><a class="header" href="#8-这对贡献者意味着什么">8. 这对贡献者意味着什么</a></h2>
+<h3 id="对于提交-pr-的贡献者"><a class="header" href="#对于提交-pr-的贡献者">对于提交 PR 的贡献者</a></h3>
+<p>合并后的流水线意味着只需在一个地方查看结果。阶段 1（格式化和 lint）会快速失败：如果出现格式化错误，你能在两分钟内得知，而无需等待构建完成。如果阶段 1 通过，构建和测试阶段将并行运行，对于大多数变更，你能在 30 分钟内获得完整结果。</p>
+<p>CI 会强制要求 PR 标题遵循约定式提交规范。如果你的标题不符合该格式，lint 任务会立即失败并给出清晰的提示信息。这并非繁文缛节：它是自动生成变更日志的输入来源，这意味着发布可以更快完成、且无需太多手动操作。</p>
+<h3 id="对于添加依赖项的贡献者"><a class="header" href="#对于添加依赖项的贡献者">对于添加依赖项的贡献者</a></h3>
+<p>每个新依赖项都会经过 <code>cargo deny</code> 的检查。如果该依赖项存在已知漏洞、包含不可接受的许可证，或来自不受信任的来源，安全门禁将失败并告知原因。这是设计使然。正确的做法是调查该依赖项，而不是禁用检查。</p>
+<p>如果某个依赖项附带了一个无法修复的漏洞建议（即一个没有可用更新的传递性依赖项），那么 §4.3 中的分类流程就是记录该情况的正确方式。请创建一个跟踪问题，在 <code>deny.toml</code> 中添加忽略条目并附上你的理由，然后继续推进。通过文档来维护安全态势，而不是指望漏洞建议会自动消失。</p>
+<h3 id="对于添加工作流文件的贡献者"><a class="header" href="#对于添加工作流文件的贡献者">对于添加工作流文件的贡献者</a></h3>
+<p>新的工作流文件必须遵循以下三条规则，没有任何例外：</p>
+<ol>
+<li>所有 <code>uses:</code> 引用均使用 SHA 固定版本，并附有版本注释</li>
+<li>如果新作业重复了现有作业中的逻辑，则将其提取为可重用的工作流。</li>
+<li>新的与发布相关的作业已添加到 <code>release.yml</code> 中，而不是作为新的工作流文件。</li>
+</ol>
+<p>如有疑问，请先咨询再添加。工作流文件属于高风险变更：它们在 CI 基础设施上以提升的权限运行，可能影响供应链安全。它们应当遵循与 <code>src/security/</code> 相同的审查标准。</p>
+<h3 id="对于维护者"><a class="header" href="#对于维护者">对于维护者</a></h3>
+<p>每日的 advisory 扫描意味着安全是一项常规维护任务，而非危机。当新的 advisory 触发时，分诊流程有明确定义，结果记录在 <code>deny.toml</code> 和跟踪问题中。审查者可以在 git 历史中审计 advisory 决策的完整历史。</p>
+<p>来自 <code>release-plz</code> 的发布 PR 是发布审查的关键节点。在发布任何内容之前，团队会查看版本号、变更日志以及已更改的 crate 列表。发布不会偶然发生。</p>
+<hr>
+<h2 id="附录-a术语表"><a class="header" href="#附录-a术语表">附录 A：术语表</a></h2>
+<p><strong>SLSA（软件制品供应链等级，Supply-chain Levels for Software Artifacts）</strong>：一种安全框架，定义了从基本来源溯源到完全密封构建的各个构建完整性等级。由 Google 开发并被 OpenSSF 采纳。等级 2 是大多数开源项目的实际目标：托管式构建平台、受版本控制的构建脚本、附加到制品上的已签名来源证明。</p>
+<p><strong>来源证明（Provenance）</strong>：一份经过加密签名的记录，用于说明构建产物的来源：来自哪个源代码提交、哪个工作流、哪个平台。它使用户和包管理器能够验证某个二进制文件确实是由所声称的源代码、通过所声称的流程生成的。</p>
+<p><strong><code>cargo deny</code></strong>：一个 Cargo 插件，从三个维度强制实施依赖策略：安全公告（来自 RustSec 数据库）、软件许可证（针对已定义的允许列表）以及源注册表（确保依赖仅来自已批准的位置）。它比 <code>cargo audit</code> 更具可配置性，更适合大规模的策略管理。</p>
+<p><strong><code>release-plz</code></strong>：一款 Rust 生态系统的发布自动化工具，在推送到默认分支时创建“Release PR“，提升版本号并根据 conventional commit 历史生成变更日志。具备工作区感知能力；能够识别哪些 crate 发生了变更以及哪些需要发布新版本。</p>
+<p><strong>可重用工作流</strong>：一种可作为作业从其他工作流中调用并支持传参的 GitHub Actions 工作流。它允许只定义一次构建、测试和安全逻辑，并同时从 PR 流水线和发布流水线中调用。</p>
+<p><strong>约定式提交</strong>：一种提交消息约定（<code>feat:</code>、<code>fix:</code>、<code>chore:</code> 等），可实现自动生成变更日志和确定版本号。它是 <code>release-plz</code> 等工具用于判断发布属于补丁版本、次要版本还是主要版本升级的依据。</p>
+<p><strong>绞杀者无花果模式（在流水线场景中）</strong>：将相同的迁移策略应用于工作流：在现有流水线旁构建新的流水线结构，逐个迁移作业，仅在新结构完成并验证后才停用旧文件。</p>
+<hr>
+<h2 id="附录-b延伸阅读"><a class="header" href="#附录-b延伸阅读">附录 B：延伸阅读</a></h2>
+<ul>
+<li>
+<p><a href="https://slsa.dev">SLSA Framework</a>：供应链安全级别的完整规范和实现指南。</p>
+</li>
+<li>
+<p><a href="https://embarkstudios.github.io/cargo-deny/"><code>cargo deny</code> 文档</a>：<code>deny.toml</code> 策略文件的配置参考，包括所有 advisory、license 和 source 选项。</p>
+</li>
+<li>
+<p><a href="https://release-plz.eplant.org"><code>release-plz</code> 文档</a>：工作区配置、变更日志格式自定义以及 GitHub Actions 集成指南。</p>
+</li>
+<li>
+<p><a href="https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions">GitHub Actions 安全加固</a>：关于 SHA 锁定、令牌权限以及 Actions 工作流中供应链风险的官方指南。</p>
+</li>
+<li>
+<p><a href="https://www.conventionalcommits.org">约定式提交规范</a>：提交消息格式及其与语义化版本关系的完整规范。</p>
+</li>
+<li>
+<p><a href="https://securityscorecards.dev">OpenSSF Scorecard</a>：一款自动化工具，可针对依赖固定、分支保护、代码审查要求等安全实践对开源项目进行评分。可用作基线评估和持续的健康度指标。</p>
+</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-003-governance.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-005-contribution-culture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-003-governance.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-005-contribution-culture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

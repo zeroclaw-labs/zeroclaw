@@ -1,0 +1,703 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Core memory trait — implement for any persistence backend"><title>Memory in zeroclaw::memory - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Memory</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw/index.html">zeroclaw</a><span class="version">0.8.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Memory</a></h2><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.count" title="count">count</a></li><li><a href="#tymethod.forget" title="forget">forget</a></li><li><a href="#tymethod.forget_for_agent" title="forget_for_agent">forget_for_agent</a></li><li><a href="#tymethod.get" title="get">get</a></li><li><a href="#tymethod.health_check" title="health_check">health_check</a></li><li><a href="#tymethod.list" title="list">list</a></li><li><a href="#tymethod.name" title="name">name</a></li><li><a href="#tymethod.recall" title="recall">recall</a></li><li><a href="#tymethod.recall_for_agents" title="recall_for_agents">recall_for_agents</a></li><li><a href="#tymethod.store" title="store">store</a></li><li><a href="#tymethod.store_with_agent" title="store_with_agent">store_with_agent</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.count_agent" title="count_agent">count_agent</a></li><li><a href="#method.count_in_scope" title="count_in_scope">count_in_scope</a></li><li><a href="#method.ensure_agent_uuid" title="ensure_agent_uuid">ensure_agent_uuid</a></li><li><a href="#method.export" title="export">export</a></li><li><a href="#method.export_agent" title="export_agent">export_agent</a></li><li><a href="#method.get_for_agent" title="get_for_agent">get_for_agent</a></li><li><a href="#method.purge_agent" title="purge_agent">purge_agent</a></li><li><a href="#method.purge_namespace" title="purge_namespace">purge_namespace</a></li><li><a href="#method.purge_session" title="purge_session">purge_session</a></li><li><a href="#method.purge_session_for_agent" title="purge_session_for_agent">purge_session_for_agent</a></li><li><a href="#method.recall_namespaced" title="recall_namespaced">recall_namespaced</a></li><li><a href="#method.refresh_embedder" title="refresh_embedder">refresh_embedder</a></li><li><a href="#method.reindex" title="reindex">reindex</a></li><li><a href="#method.rename_agent" title="rename_agent">rename_agent</a></li><li><a href="#method.stats" title="stats">stats</a></li><li><a href="#method.store_procedural" title="store_procedural">store_procedural</a></li><li><a href="#method.store_with_metadata" title="store_with_metadata">store_with_metadata</a></li><li><a href="#method.store_with_options" title="store_with_options">store_with_options</a></li><li><a href="#method.store_with_options_and_agent" title="store_with_options_and_agent">store_with_options_and_agent</a></li><li><a href="#method.supersede" title="supersede">supersede</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In zeroclaw::<wbr>memory</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw</a>::<wbr><a href="index.html">memory</a></div><h1>Trait <span class="trait">Memory</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><pre class="rust item-decl"><code>pub trait Memory:
+    <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a>
+    + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a>
+    + <a class="trait" href="../../zeroclaw_api/attribution/trait.Attributable.html" title="trait zeroclaw_api::attribution::Attributable">Attributable</a> {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 31 methods</span></summary>    // Required methods
+    fn <a href="#tymethod.name" class="fn">name</a>(&amp;self) -&gt; &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.store" class="fn">store</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.recall" class="fn">recall</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait&gt;(
+        &amp;'life0 self,
+        query: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        limit: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        since: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        until: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             'life4: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.get" class="fn">get</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.list" class="fn">list</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        category: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life1 <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>&gt;,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.forget" class="fn">forget</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.forget_for_agent" class="fn">forget_for_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        agent_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.count" class="fn">count</a>&lt;'life0, 'async_trait&gt;(
+        &amp;'life0 self,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.health_check" class="fn">health_check</a>&lt;'life0, 'async_trait&gt;(
+        &amp;'life0 self,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a>&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.store_with_agent" class="fn">store_with_agent</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        namespace: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        importance: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f64.html">f64</a>&gt;,
+        agent_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life5 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             'life4: 'async_trait,
+             'life5: 'async_trait,
+             Self: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.recall_for_agents" class="fn">recall_for_agents</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'life6, 'async_trait&gt;(
+        &amp;'life0 self,
+        allowed_agent_ids: &amp;'life1 [&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>],
+        query: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        limit: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        since: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life5 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        until: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life6 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             'life4: 'async_trait,
+             'life5: 'async_trait,
+             'life6: 'async_trait,
+             Self: 'async_trait</span>;
+
+    // Provided methods
+    fn <a href="#method.get_for_agent" class="fn">get_for_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        agent_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.purge_namespace" class="fn">purge_namespace</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _namespace: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.purge_session" class="fn">purge_session</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _session_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.purge_session_for_agent" class="fn">purge_session_for_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _session_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        _agent_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.purge_agent" class="fn">purge_agent</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _agent_alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.export_agent" class="fn">export_agent</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _agent_alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.rename_agent" class="fn">rename_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _from: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        _to: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.count_agent" class="fn">count_agent</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        _agent_alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.supersede" class="fn">supersede</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _superseded_ids: &amp;'life1 [<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>],
+        _new_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.store_procedural" class="fn">store_procedural</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _messages: &amp;'life1 [<a class="struct" href="struct.ProceduralMessage.html" title="struct zeroclaw::memory::ProceduralMessage">ProceduralMessage</a>],
+        _session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.count_in_scope" class="fn">count_in_scope</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        _namespace: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        _category: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u64.html">u64</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.stats" class="fn">stats</a>&lt;'life0, 'async_trait&gt;(
+        &amp;'life0 self,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="traits/struct.MemoryStats.html" title="struct zeroclaw::memory::traits::MemoryStats">MemoryStats</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.reindex" class="fn">reindex</a>&lt;'life0, 'async_trait&gt;(
+        &amp;'life0 self,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.refresh_embedder" class="fn">refresh_embedder</a>(
+        &amp;self,
+        _model_provider: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        _api_key: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        _model: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        _dimensions: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.recall_namespaced" class="fn">recall_namespaced</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait&gt;(
+        &amp;'life0 self,
+        namespace: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        query: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        limit: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        since: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        until: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life5 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             'life4: 'async_trait,
+             'life5: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.export" class="fn">export</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        filter: &amp;'life1 <a class="struct" href="struct.ExportFilter.html" title="struct zeroclaw::memory::ExportFilter">ExportFilter</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.store_with_metadata" class="fn">store_with_metadata</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        _namespace: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        _importance: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f64.html">f64</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             'life4: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.store_with_options" class="fn">store_with_options</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        options: <a class="struct" href="traits/struct.StoreOptions.html" title="struct zeroclaw::memory::traits::StoreOptions">StoreOptions</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.store_with_options_and_agent" class="fn">store_with_options_and_agent</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait&gt;(
+        &amp;'life0 self,
+        key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+        category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+        session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+        options: <a class="struct" href="traits/struct.StoreOptions.html" title="struct zeroclaw::memory::traits::StoreOptions">StoreOptions</a>,
+        agent_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait,
+             'life3: 'async_trait,
+             'life4: 'async_trait,
+             Self: 'async_trait</span> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.ensure_agent_uuid" class="fn">ensure_agent_uuid</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where 'life0: 'async_trait,
+             'life1: 'async_trait,
+             Self: 'async_trait</span> { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Core memory trait — implement for any persistence backend</p>
+</div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.name" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#247">Source</a><h4 class="code-header">fn <a href="#tymethod.name" class="fn">name</a>(&amp;self) -&gt; &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a></h4></section></summary><div class="docblock"><p>Backend name</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.store" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#250-256">Source</a><h4 class="code-header">fn <a href="#tymethod.store" class="fn">store</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Store a memory entry, optionally scoped to a session</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.recall" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#263-270">Source</a><h4 class="code-header">fn <a href="#tymethod.recall" class="fn">recall</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait&gt;(
+    &amp;'life0 self,
+    query: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    limit: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    since: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    until: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    'life4: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Recall memories matching a query (keyword search), optionally scoped to a session
+and time range. Empty, whitespace-only, and bare “<em>” queries return recent/time-only
+entries. Non-bare wildcard terms such as “wild</em>” remain keyword queries.
+Time bounds use RFC 3339 / ISO 8601 format
+(e.g. “2025-03-01T00:00:00Z”); inclusive (created_at &gt;= since, created_at &lt;= until).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.get" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#278">Source</a><h4 class="code-header">fn <a href="#tymethod.get" class="fn">get</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Get a specific memory by key.</p>
+<p>After composite uniqueness landed, multiple rows may share a <code>key</code>
+(one per agent). This method returns <em>some</em> matching row without an
+agent filter; callers that need an agent-scoped lookup use
+<a href="trait.Memory.html#method.get_for_agent" title="method zeroclaw::memory::Memory::get_for_agent"><code>get_for_agent</code></a>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.list" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#299-303">Source</a><h4 class="code-header">fn <a href="#tymethod.list" class="fn">list</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    category: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life1 <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>&gt;,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>List all memory keys, optionally filtered by category and/or session</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.forget" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#308">Source</a><h4 class="code-header">fn <a href="#tymethod.forget" class="fn">forget</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove a memory by key. Deletes every row matching <code>key</code>, regardless
+of agent attribution. Agent-scoped callers (the <code>AgentScopedMemory</code>
+wrapper) use <a href="trait.Memory.html#tymethod.forget_for_agent" title="method zeroclaw::memory::Memory::forget_for_agent"><code>forget_for_agent</code></a> instead.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.forget_for_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#315">Source</a><h4 class="code-header">fn <a href="#tymethod.forget_for_agent" class="fn">forget_for_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    agent_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove the row matching <code>(key, agent_id)</code>. Siblings of the same key
+under other agents are untouched. Returns <code>true</code> if a row was
+removed. Required: no safe default exists for backends or wrappers
+that can hold more than one row per <code>key</code> — the unscoped <code>forget</code>
+would destroy sibling rows.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.count" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#391">Source</a><h4 class="code-header">fn <a href="#tymethod.count" class="fn">count</a>&lt;'life0, 'async_trait&gt;(
+    &amp;'life0 self,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Count total memories</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.health_check" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#394">Source</a><h4 class="code-header">fn <a href="#tymethod.health_check" class="fn">health_check</a>&lt;'life0, 'async_trait&gt;(
+    &amp;'life0 self,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a>&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Health check</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.store_with_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#619-628">Source</a><h4 class="code-header">fn <a href="#tymethod.store_with_agent" class="fn">store_with_agent</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    namespace: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    importance: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f64.html">f64</a>&gt;,
+    agent_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life5 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    'life4: 'async_trait,
+    'life5: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Store a memory entry attributed to an explicit agent UUID.
+Every backend must implement this explicitly so the agent_id
+is never silently dropped at storage time. Backends with
+native agent_id columns (SqliteMemory, PostgresMemory,
+LucidMemory) persist the attribution in SQL; MarkdownMemory
+attributes via the per-agent directory path; QdrantMemory
+persists in the vector payload; NoneMemory is a no-op stub.
+<code>AgentScopedMemory</code> is the canonical caller.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.recall_for_agents" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#649-657">Source</a><h4 class="code-header">fn <a href="#tymethod.recall_for_agents" class="fn">recall_for_agents</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'life6, 'async_trait&gt;(
+    &amp;'life0 self,
+    allowed_agent_ids: &amp;'life1 [&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>],
+    query: &amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    limit: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    since: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life5 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    until: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life6 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    'life4: 'async_trait,
+    'life5: 'async_trait,
+    'life6: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Recall memory entries scoped to a specific set of agent UUIDs.
+When <code>allowed_agent_ids</code> is non-empty, the backend filters its
+result set to rows whose <code>agent_id</code> matches one of the listed
+UUIDs (or is NULL, for legacy rows written before the agent_id
+column existed). Every backend must implement this explicitly
+so the allowlist is never silently dropped at read time.</p>
+<p>For SQL-backed stores the filter is <code>WHERE agent_id IN (...)</code>.
+For Markdown the implementation walks the allowed agents’
+per-agent directories. For Qdrant it’s a payload filter on
+the <code>agent_id</code> field. For None it returns an empty list.
+<code>AgentScopedMemory</code> is the canonical caller; direct invocation
+is also valid for read-only cross-agent queries that bypass
+the wrapper.</p>
+<p>Cross-backend allowlist entries are rejected at config load
+(<code>agents.&lt;alias&gt;.workspace.read_memory_from</code> cannot point at a
+sibling on a different memory backend); backends therefore
+never need to handle a cross-backend recall.</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.get_for_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.get_for_agent" class="fn">get_for_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    agent_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Get the memory row matching <code>(key, agent_id)</code>. Siblings of the same
+key under other agents are invisible.</p>
+<p>The default implementation composes <a href="trait.Memory.html#tymethod.get" title="method zeroclaw::memory::Memory::get"><code>get</code></a> with an
+<code>agent_id</code> filter and is only correct for backends whose storage
+layout cannot hold more than one row per <code>key</code> (markdown’s
+per-agent dir scheme, the <code>none</code> stub). Backends that can hold
+multiple rows per <code>key</code> (SQL with composite unique, Qdrant)
+override this with a native composite lookup.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.purge_namespace" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.purge_namespace" class="fn">purge_namespace</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _namespace: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove all memories whose <code>namespace</code> field equals the given value.
+Returns the number of deleted entries.
+Default: returns unsupported error. Backends that support bulk deletion override this.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.purge_session" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.purge_session" class="fn">purge_session</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _session_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove all memories in a session.
+Returns the number of deleted entries.
+Default: returns unsupported error. Backends that support bulk deletion override this.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.purge_session_for_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.purge_session_for_agent" class="fn">purge_session_for_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _session_id: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    _agent_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove all memories in a session for one agent.
+Returns the number of deleted entries.
+Default: returns unsupported error. Backends with per-agent storage
+override this; agent-scoped wrappers use it instead of composing a
+session list with key-only deletes.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.purge_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.purge_agent" class="fn">purge_agent</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _agent_alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Remove every memory row attributed to the given agent alias.
+Returns the number of deleted entries. Called when an agent alias is
+removed from <code>[agents.&lt;alias&gt;]</code> so the database doesn’t accumulate
+rows for retired aliases.
+Default: returns unsupported error. Backends with per-agent storage
+(sqlite, postgres) override this; backends without (markdown, none)
+keep the default and the caller logs a warning.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.export_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.export_agent" class="fn">export_agent</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _agent_alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Export every memory row attributed to <code>agent_alias</code>, for the agent-
+deletion archive (export-then-delete,). Pairs with
+<a href="trait.Memory.html#method.purge_agent" title="method zeroclaw::memory::Memory::purge_agent"><code>Self::purge_agent</code></a>: the surface exports these rows to the archive,
+then purges. Default: empty (backends without per-agent export).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.rename_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.rename_agent" class="fn">rename_agent</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _from: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    _to: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Re-point every memory row from the <code>from</code> alias to the <code>to</code> alias,
+returning the number of rows re-pointed. Called when an alias is renamed.
+For the SQL backends (sqlite/postgres) memory rows ride the
+agent’s UUID, so this is a single <code>UPDATE agents SET alias</code> and the count
+is the agents-row count (0 or 1); payload-keyed backends (qdrant) rewrite
+the alias on every matching memory point and return that count.
+Default: unsupported error; backends with per-agent storage override.
+Markdown/none keep the default and the caller logs a warning.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.count_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.count_agent" class="fn">count_agent</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    _agent_alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Read-only residue probe for the agent-rename cascade: the count
+of state <a href="trait.Memory.html#method.rename_agent" title="method zeroclaw::memory::Memory::rename_agent"><code>Self::rename_agent</code></a> WOULD re-point for <code>agent_alias</code>, without
+mutating anything. Used by the gateway to tell a genuine post-persist
+partial failure (state still lagging at the old alias) apart from an
+unrelated request, so a resume only fires on real residue.</p>
+<p>MUST mirror exactly what <code>rename_agent</code> moves: for the SQL backends that
+is the <code>agents</code> row (alias presence), NOT the memory-row count - an agent
+with an <code>agents</code> row but zero memory rows still gets re-pointed, so a
+memory-row probe would be a false negative. Default 0 (markdown/none have
+no DB rows and their <code>rename_agent</code> is a no-op).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.supersede" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.supersede" class="fn">supersede</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _superseded_ids: &amp;'life1 [<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>],
+    _new_id: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Mark entries as superseded by a newer row.</p>
+<p>Default: no-op. SQL backends can override this with reversible
+soft-hide behavior; non-SQL backends remain source-compatible.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.store_procedural" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.store_procedural" class="fn">store_procedural</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _messages: &amp;'life1 [<a class="struct" href="struct.ProceduralMessage.html" title="struct zeroclaw::memory::ProceduralMessage">ProceduralMessage</a>],
+    _session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Store a procedural “how to” trace from a tool-calling turn.</p>
+<p>Default: no-op. Backends that support procedural storage can override.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.count_in_scope" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.count_in_scope" class="fn">count_in_scope</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    _namespace: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    _category: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life2 <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u64.html">u64</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Count rows within a namespace/category scope.</p>
+<p>Default is zero so quota enforcement remains opt-in until a backend
+provides an efficient implementation.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.stats" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.stats" class="fn">stats</a>&lt;'life0, 'async_trait&gt;(
+    &amp;'life0 self,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="traits/struct.MemoryStats.html" title="struct zeroclaw::memory::traits::MemoryStats">MemoryStats</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Read-side memory store telemetry.</p>
+<p>Default is empty telemetry so status consumers can be introduced before
+every backend has native stats support.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.reindex" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.reindex" class="fn">reindex</a>&lt;'life0, 'async_trait&gt;(
+    &amp;'life0 self,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Rebuild backend indexes: FTS tables and any missing embedding vectors.</p>
+<p>Intended as a manual fixup after bulk writes that didn’t go through
+the normal <code>store()</code> path (e.g. <code>zeroclaw migrate openclaw</code>, which
+uses <code>NoopEmbedding</code> for speed and leaves <code>embedding = NULL</code> behind).
+Returns the number of entries that were re-embedded; backends
+without a vector index or with nothing to fill in return 0.</p>
+<p>Default: no-op. Overridden by backends that maintain separate
+derived indexes (e.g. <code>SqliteMemory</code>).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.refresh_embedder" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#461-467">Source</a><h4 class="code-header">fn <a href="#method.refresh_embedder" class="fn">refresh_embedder</a>(
+    &amp;self,
+    _model_provider: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    _api_key: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    _model: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    _dimensions: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+)</h4></section></summary><div class="docblock"><p>Hot-swap the embedding provider after a <code>config/set</code> provider-profile
+change, so a long-lived memory handle (e.g. the install-wide RPC memory
+handle) stops using stale endpoint/key values without a daemon restart.</p>
+<p>The arguments are the already-resolved embedding settings — the literal
+provider (<code>openai</code> / <code>openrouter</code> / <code>custom:&lt;url&gt;</code>), key, model, and
+dimensions produced by the memory crate’s embedding resolver from the
+canonical config. The impl rebuilds its embedder from them and swaps it
+in place; no provider state is duplicated into a separate cache.</p>
+<p>Default: no-op. Backends that do not embed, or cannot swap their
+embedder in place, keep the default.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.recall_namespaced" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.recall_namespaced" class="fn">recall_namespaced</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'async_trait&gt;(
+    &amp;'life0 self,
+    namespace: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    query: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    limit: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    since: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    until: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life5 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    'life4: 'async_trait,
+    'life5: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Recall memories scoped to a specific namespace.</p>
+<p>Default implementation delegates to <code>recall()</code> and filters by namespace.
+Backends with native namespace support should override for efficiency.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.export" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.export" class="fn">export</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    filter: &amp;'life1 <a class="struct" href="struct.ExportFilter.html" title="struct zeroclaw::memory::ExportFilter">ExportFilter</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="struct.MemoryEntry.html" title="struct zeroclaw::memory::MemoryEntry">MemoryEntry</a>&gt;, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Bulk-export memories matching the given filter criteria.</p>
+<p>Intended for GDPR Art. 20 data portability. Returns entries ordered by
+creation time (ascending). Embeddings are excluded.</p>
+<p>Default implementation delegates to <code>list()</code> and post-filters on
+namespace and time range. Backends with native query support should
+override for efficiency.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.store_with_metadata" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.store_with_metadata" class="fn">store_with_metadata</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    _namespace: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    _importance: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f64.html">f64</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    'life4: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Store a memory entry with namespace and importance.</p>
+<p>Default implementation delegates to <code>store()</code>. Backends with native
+namespace/importance support should override.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.store_with_options" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.store_with_options" class="fn">store_with_options</a>&lt;'life0, 'life1, 'life2, 'life3, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    options: <a class="struct" href="traits/struct.StoreOptions.html" title="struct zeroclaw::memory::traits::StoreOptions">StoreOptions</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Store a memory entry with the full additive metadata surface.</p>
+<p>Default delegates through the existing metadata method for namespace and
+importance only. Backends that do not override this must fail explicitly
+when callers pass typed/full metadata, rather than silently discarding
+data needed by later typed-memory readers.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.store_with_options_and_agent" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.store_with_options_and_agent" class="fn">store_with_options_and_agent</a>&lt;'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait&gt;(
+    &amp;'life0 self,
+    key: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    content: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    category: <a class="enum" href="enum.MemoryCategory.html" title="enum zeroclaw::memory::MemoryCategory">MemoryCategory</a>,
+    session_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life3 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+    options: <a class="struct" href="traits/struct.StoreOptions.html" title="struct zeroclaw::memory::traits::StoreOptions">StoreOptions</a>,
+    agent_id: <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;&amp;'life4 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>&gt;,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,
+    'life3: 'async_trait,
+    'life4: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Store a memory entry with full metadata and an explicit agent UUID.</p>
+<p>The compatibility default preserves agent attribution through the
+established <code>store_with_agent</code> path for namespace and importance only.
+Backends that persist the full <code>StoreOptions</code> surface override this
+method so wrappers do not have to choose between attribution and typed
+metadata.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.ensure_agent_uuid" class="method"><a class="src rightside" href="../../src/zeroclaw_api/memory_traits.rs.html#244">Source</a><h4 class="code-header">fn <a href="#method.ensure_agent_uuid" class="fn">ensure_agent_uuid</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    alias: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://docs.rs/anyhow/1.0.103/anyhow/struct.Error.html" title="struct anyhow::Error">Error</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    Self: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Look up (or create) the identifier the backend uses to refer
+to the agent named by <code>alias</code>.</p>
+<p>Backends with an <code>agents</code> table (SqliteMemory, PostgresMemory,
+LucidMemory) return the row’s UUID, inserting if absent.
+Backends without (MarkdownMemory, QdrantMemory, NoneMemory)
+return the alias verbatim — there is no UUID indirection at
+the storage layer, so the alias serves as the agent_id.
+Default impl returns the alias unchanged; SQL backends
+override to do the real lookup.</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"><div class="negative-marker"></div><section id="impl-Memory-for-AgentScopedMarkdownMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/agent_scoped_markdown.rs.html#67">Source</a><a href="#impl-Memory-for-AgentScopedMarkdownMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.AgentScopedMarkdownMemory.html" title="struct zeroclaw::memory::AgentScopedMarkdownMemory">AgentScopedMarkdownMemory</a></h3></section><section id="impl-Memory-for-AgentScopedMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/agent_scoped.rs.html#51">Source</a><a href="#impl-Memory-for-AgentScopedMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.AgentScopedMemory.html" title="struct zeroclaw::memory::AgentScopedMemory">AgentScopedMemory</a></h3></section><section id="impl-Memory-for-LucidMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/lucid.rs.html#359">Source</a><a href="#impl-Memory-for-LucidMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.LucidMemory.html" title="struct zeroclaw::memory::LucidMemory">LucidMemory</a></h3></section><section id="impl-Memory-for-MarkdownMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/markdown.rs.html#176">Source</a><a href="#impl-Memory-for-MarkdownMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.MarkdownMemory.html" title="struct zeroclaw::memory::MarkdownMemory">MarkdownMemory</a></h3></section><section id="impl-Memory-for-NoneMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/none.rs.html#30">Source</a><a href="#impl-Memory-for-NoneMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.NoneMemory.html" title="struct zeroclaw::memory::NoneMemory">NoneMemory</a></h3></section><section id="impl-Memory-for-QdrantMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/qdrant.rs.html#544">Source</a><a href="#impl-Memory-for-QdrantMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.QdrantMemory.html" title="struct zeroclaw::memory::QdrantMemory">QdrantMemory</a></h3></section><section id="impl-Memory-for-RetrievalPipeline" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/retrieval.rs.html#306">Source</a><a href="#impl-Memory-for-RetrievalPipeline" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.RetrievalPipeline.html" title="struct zeroclaw::memory::RetrievalPipeline">RetrievalPipeline</a></h3></section><section id="impl-Memory-for-SqliteMemory" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/sqlite.rs.html#1456">Source</a><a href="#impl-Memory-for-SqliteMemory" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.SqliteMemory.html" title="struct zeroclaw::memory::SqliteMemory">SqliteMemory</a></h3></section><section id="impl-Memory-for-AuditedMemory%3CM%3E" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/audit.rs.html#239">Source</a><a href="#impl-Memory-for-AuditedMemory%3CM%3E" class="anchor">§</a><h3 class="code-header">impl&lt;M&gt; <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.AuditedMemory.html" title="struct zeroclaw::memory::AuditedMemory">AuditedMemory</a>&lt;M&gt;<div class="where">where
+    M: <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a>,</div></h3></section><section id="impl-Memory-for-ScannedMemory%3CM%3E" class="impl"><a class="src rightside" href="../../src/zeroclaw_memory/scanned.rs.html#302">Source</a><a href="#impl-Memory-for-ScannedMemory%3CM%3E" class="anchor">§</a><h3 class="code-header">impl&lt;M&gt; <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a> for <a class="struct" href="struct.ScannedMemory.html" title="struct zeroclaw::memory::ScannedMemory">ScannedMemory</a>&lt;M&gt;<div class="where">where
+    M: <a class="trait" href="trait.Memory.html" title="trait zeroclaw::memory::Memory">Memory</a>,</div></h3></section></div><script src="../../trait.impl/zeroclaw_api/memory_traits/trait.Memory.js" data-ignore-extern-crates="zeroclaw_memory" async></script></section></div></main></body></html>

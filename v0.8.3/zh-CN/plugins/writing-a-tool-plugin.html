@@ -1,0 +1,674 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>编写工具插件 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a22b4832.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="编写工具插件"><a class="header" href="#编写工具插件">编写工具插件</a></h1>
+<p>这是本系列的入门指南：从空 crate 到模型在对话中调用的工具的完整实操路径。这里构建的工具是 <code>redact</code>，它会对文本中的电子邮件、已知凭据前缀以及由操作员提供的模式进行掩码处理。它刻意采用配置驱动，因为读取自己的受限配置部分是每个非平凡插件都需要做的事情，也是最容易出错的事情。</p>
+<p>本页上的所有内容都根据契约源代码进行了核对：<code>wit/v0/tool.wit</code> 中的 <code>tool-plugin</code> world、<code>crates/zeroclaw-plugins/src/runtime.rs</code> 和 <code>wasm_tool.rs</code> 中的宿主侧调用路径，以及 <code>host.rs</code> 中的清单校验。源路径是指向 ZeroClaw 仓库的引用，用于验证；插件本身是你自己的仓库中的你自己的 crate。构建插件时，你完全不需要检出 ZeroClaw，只需要 <code>wit/</code> 契约文件（在第 1 步获取）以及一个已安装、并已编译进插件宿主的 <code>zeroclaw</code> 二进制来运行它。</p>
+<blockquote>
+<p><strong>发布二进制文件并不是那个二进制文件。</strong> 安装程序附带的预构建二进制文件不包含插件宿主（<code>zeroclaw plugin …</code> 是未识别的子命令），而且 <code>plugins-wasm</code> 不在 crate 的默认功能集里。从源码构建宿主端，并注意后端功能<strong>不会</strong>自动包含总开关：仅使用 <code>--features plugins-wasm-cranelift</code> 可以正常构建，但仍然生成不含插件的二进制文件，因为运行时集成是由 <code>plugins-wasm</code> 本身控制的。可用的调用方式是：</p>
+<pre><code class="language-bash">cargo build --release --features plugins-wasm,plugins-wasm-cranelift
+</code></pre>
+<p><a href="../developing/plugin-protocol.html#build-features">协议页面</a> 记录了后端选项。</p>
+</blockquote>
+<h2 id="工具调用的流程如何运作"><a class="header" href="#工具调用的流程如何运作">工具调用的流程如何运作</a></h2>
+<p>在编写代码之前先了解运行时形状：</p>
+<ol>
+<li>在启动时，发现机制会找到你的插件目录，验证清单，并执行签名策略。通过校验的内容会成为 <code>WasmTool</code> 实例。</li>
+<li>在注册时，宿主会实例化该组件一次，以读取 <code>name</code>、<code>description</code> 和 <code>parameters-schema</code>。这些内容会被缓存；之后不会再次询问。如果该探测失败，工具将以其清单中的名称和描述注册，并使用通用的单个 <code>input</code> 回退 schema，同时记录该失败。</li>
+<li>每次调用，<code>WasmTool::execute</code> 都会创建一个<strong>全新的存储</strong>（新的 WASI 上下文、新的 fuel 预算、没有上一次调用的状态），实例化该组件，将你的配置注入到 <code>__config</code> 下，并调用 <code>execute</code>。</li>
+</ol>
+<p>fresh-store-per-call 模型是最重要的设计约束：工具插件在设计上是无状态的。任何你想在调用之间持久保存的内容，都必须存在于插件之外（在你返回的文本中，或在 operator 配置中）。</p>
+<h2 id="1-crate-设置"><a class="header" href="#1-crate-设置">1. Crate 设置</a></h2>
+<!-- Canonical plugin crate scaffold. Edit here; reuse via {{#include}}. -->
+<p>创建 crate 并添加 guest 端依赖项：</p>
+<pre><code class="language-bash">cargo new --lib my-plugin
+cd my-plugin
+cargo add wit-bindgen@0.46
+cargo add serde --features derive
+cargo add serde_json
+</code></pre>
+<p>然后对包清单进行两处手动编辑：</p>
+<ol>
+<li>将库的 <code>crate-type</code> 设置为 <code>["cdylib", "rlib"]</code>。<code>cdylib</code> 是组件构建生成的内容；<code>rlib</code> 允许同一个 crate 的纯逻辑模块在主机上原生编译并进行单元测试。</li>
+<li>在发布配置中，设置 <code>opt-level = "s"</code>、<code>lto = true</code> 和 <code>strip = true</code>。组件大小就是下载和加载时间；没有理由在插件边界传递调试符号。</li>
+</ol>
+<p>将 ZeroClaw 仓库中的 <code>wit/v0/</code> 目录复制到 crate 根目录下的 <code>wit/</code>。你不需要完整检出；只需从与你的目标主机版本匹配的 tag 中获取该目录：</p>
+<pre><code class="language-bash">git clone --depth 1 --filter=blob:none --sparse \
+  https://github.com/zeroclaw-labs/zeroclaw /tmp/zeroclaw-wit
+git -C /tmp/zeroclaw-wit sparse-checkout set wit
+cp -r /tmp/zeroclaw-wit/wit .
+</code></pre>
+<p>WIT 文件就是 ABI：宿主是根据这些精确的文件生成其绑定的，因此你的 guest 绑定也必须来自同一组文件。请锁定版本：WIT world 会随宿主演进，而基于比宿主绑定更高版本的 world 构建的组件将无法实例化。</p>
+<h2 id="2-将逻辑与胶水代码分离"><a class="header" href="#2-将逻辑与胶水代码分离">2. 将逻辑与胶水代码分离</a></h2>
+<p>将实际行为放在一个没有 wit-bindgen 导入的普通 Rust 模块中，并保持组件胶水层尽量薄。原因是可测试性：组件目标不能原生运行 <code>cargo test</code>，因此被困在胶水层中的逻辑只能通过 wasm 主机进行端到端验证。胶水层应当薄到不太可能出错。</p>
+<p><code>src/redact.rs</code> 保存了一个配置结构体和一个纯函数：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use std::collections::HashMap;
+
+pub const DEFAULT_REPLACEMENT: &amp;str = "[REDACTED]";
+
+/// 脱敏策略根据插件自身的配置段解析。
+pub struct RedactConfig {
+    pub replacement: String,
+    pub redact_emails: bool,
+    pub patterns: Vec&lt;String&gt;,
+}
+
+impl RedactConfig {
+    /// 从宿主注入的扁平字符串映射构建。缺失或为空的键
+    /// 回退到默认值，这也是未获特权的插件
+    ///（没有 config_read）所看到的。
+    pub fn from_section(section: &amp;HashMap&lt;String, String&gt;) -&gt; Self {
+        let replacement = section
+            .get("替换")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_REPLACEMENT.to_string());
+        let redact_emails = section
+            .get("redact_emails")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        let patterns = section
+            .get("patterns")
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { replacement, redact_emails, patterns }
+    }
+}
+
+/// 对输入进行脱敏。返回输出以及被遮蔽片段的数量。
+pub fn redact(input: &amp;str, cfg: &amp;RedactConfig) -&gt; (String, usize) {
+    // 当 cfg.redact_emails、凭据前缀
+    //（sk-、ghp_、AKIA、xoxb-）以及 cfg.patterns 中的每个字面量匹配时进行掩码，
+    // 用 cfg.replacement 替换每个命中项。
+    // ...
+}
+<span class="boring">}</span></code></pre>
+<p>注意 config 形状：宿主向你提供的是一个扁平的 <code>string -&gt; string</code> 映射，因此每个有类型的字段都必须采用“解析并带默认值”的方式。请把默认值设计成使 <strong>空映射产生安全行为</strong>。空映射不是边缘情况；当运维人员尚未配置它时，以及当清单中完全缺少 <code>config_read</code> 时，你的插件收到的正是空映射（宿主会替换为空映射，参见 <code>runtime.rs</code> 中的 <code>effective_config</code>）。</p>
+<h2 id="3-实现-world"><a class="header" href="#3-实现-world">3. 实现 world</a></h2>
+<p><code>wit/v0/tool.wit</code> 定义了你必须导出的接口面。world 是：</p>
+<pre><code class="language-wit">world tool-plugin {
+    import logging;
+    export plugin-info;
+    export tool;
+}
+</code></pre>
+<p>而 <code>tool</code> 接口包含四个函数：</p>
+<pre><code class="language-wit">record tool-result {
+    success: bool,
+    output: string,
+    error: option&lt;string&gt;,
+}
+
+name: func() -&gt; string;
+description: func() -&gt; string;
+parameters-schema: func() -&gt; json-string;
+execute: func(args: json-string) -&gt; result&lt;tool-result, string&gt;;
+</code></pre>
+<p><code>src/lib.rs</code> 生成 guest 绑定并实现这两个导出：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub mod redact;
+
+#[cfg(target_family = "wasm")]
+mod component {
+    wit_bindgen::generate!({
+        path: "wit/v0",
+        world: "tool-plugin",
+        features: ["plugins-wit-v0"],
+    });
+
+    use std::collections::HashMap;
+
+    use crate::redact::{redact, RedactConfig};
+    use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
+    use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
+    use zeroclaw::plugin::logging::{
+        log_record, LogLevel, PluginAction, PluginEvent, PluginOutcome,
+    };
+
+    struct RedactPlugin;
+
+    #[derive(serde::Deserialize)]
+    struct ExecuteArgs {
+        text: String,
+        #[serde(rename = "__config", default)]
+        config: HashMap&lt;String, String&gt;,
+    }
+
+    impl PluginInfo for RedactPlugin {
+        fn plugin_name() -&gt; String {
+            "my-redact-plugin".to_string()
+        }
+        fn plugin_version() -&gt; String {
+            "0.1.0".to_string()
+        }
+    }
+
+    impl Tool for RedactPlugin {
+        fn name() -&gt; String {
+            "redact".to_string()
+        }
+
+        fn description() -&gt; String {
+            "在文本到达日志、通道或模型之前，对其中的机密和 PII 进行编辑。屏蔽电子邮件、凭据前缀以及运维人员配置的字面模式。"
+                .to_string()
+        }
+
+        fn parameters_schema() -&gt; String {
+            serde_json::json!({
+                类型: 对象,
+                属性: {
+                    "文本": {
+                        类型: "字符串",
+                        "描述": “要遮盖的文本。”
+                    }
+                },
+                “required”: ["文本"]
+            })
+            .to_string()
+        }
+
+        fn execute(args: String) -&gt; Result&lt;ToolResult, String&gt; {
+            let parsed: ExecuteArgs = match serde_json::from_str(&amp;args) {
+                Ok(a) =&gt; a,
+                Err(e) =&gt; {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("无效参数：{e}")),
+                    });
+                }
+            };
+
+            let cfg = RedactConfig::from_section(&amp;parsed.config);
+            let (output, count) = redact(&amp;parsed.text, &amp;cfg);
+
+            log_record(
+                LogLevel::Info,
+                &amp;PluginEvent {
+                    function_name: "my_redact_plugin::tool::execute".into(),
+                    action: PluginAction::Complete,
+                    outcome: Some(PluginOutcome::Success),
+                    duration_ms: None,
+                    attrs: Some(format!("{{\"redactions\":{count}}}")),
+                    message: "redacted input".into(),
+                },
+            );
+
+            Ok(ToolResult { success: true, output, error: None })
+        }
+    }
+
+    export!(RedactPlugin);
+}
+<span class="boring">}</span></code></pre>
+<p>契约点，每个都锚定在宿主源中：</p>
+<ul>
+<li><strong><code>plugin-info</code> 是每个 world 的必需导出。</strong> 它会报告组件自身的名称和版本。请使二者与清单保持同步。</li>
+<li><strong>元数据只读取一次。</strong> <code>call_tool_metadata</code> 在 <code>runtime.rs</code> 中于注册时读取 <code>name</code>、<code>description</code> 和 <code>parameters-schema</code>，并将它们缓存。不要从任何动态内容计算它们；它们之后不会被重新观察到。</li>
+<li><strong>模式是模型对你的工具的全部视图。</strong> 主机在加载时将其解析为 JSON（<code>tool parameters-schema is not valid JSON</code> 是硬性注册失败），并将其逐字转发给 LLM。描述每个属性。绝不要在其中声明 <code>__config</code>：该键由主机保留，主机会在注入前精确地剥离任何调用方提供的值，以免模型冒充你的操作员。</li>
+<li><strong><code>success: false</code> 与 <code>Err</code>。</strong> <code>success: false</code> 的 <code>ToolResult</code> 会作为普通工具响应返回给模型，模型可以据此作出反应（使用修正后的参数重试、道歉、选择另一个工具）。<code>Err(String)</code> 会作为插件故障跨越边界：宿主会将其包装为 <code>plugin execute returned error</code>，并使调用失败。请将 <code>Err</code> 保留给真正损坏的状态，并通过 <code>success: false</code> 报告错误输入。</li>
+<li><strong>始终通过导入的 <code>logging</code> 接口记录日志，绝不要使用 <code>wasi:logging</code>。</strong> <code>log-record</code> 是即发即弃的；宿主会吸收所有错误，因此失败的日志写入绝不会让你的调用崩溃，而且事件会进入 <code>zeroclaw_log</code> 写入的每个目标，并携带你的调用所运行于其下的宿主 span 的 <a href="../ops/observability.html#zeroclaw-attribution"><code>zeroclaw.*</code> 归因</a>（<code>agent_alias</code>、<code>session_key</code>、provider、channel）。请注意 <code>plugin-event</code> 上的 <code>attrs</code> 字段<strong>不是</strong>归因：它是日志行的自由形式 <code>attributes</code> 载荷。归因与别名绑定，继承自宿主侧的环境 tracing span，插件发送的任何内容都不能设置或覆盖它。<code>PluginAction</code> 和 <code>PluginOutcome</code> 是与宿主分类法对应的封闭枚举；刻意不提供自由形式变体。请选择最接近的项。</li>
+</ul>
+<h2 id="4-__config-沙箱"><a class="header" href="#4-__config-沙箱">4. <code>__config</code> 沙箱</a></h2>
+<p>插件从不读取进程环境变量，也不会看到全局配置。只有当清单声明了 <code>config_read</code> 时，宿主才会解析存储在你的插件名称下的 config 部分，并将其合并到 <code>execute</code> 参数中的保留 <code>__config</code> 键下。其机制（<code>runtime.rs</code> 中的 <code>inject_config</code> / <code>effective_config</code>）：</p>
+<ul>
+<li>模型提供的参数中任何已存在的 <code>__config</code> 都会先被删除。伪造在结构上是不可能的。</li>
+<li>如果没有 <code>config_read</code>，注入的 section 就是空映射，因此参数根本不携带任何 <code>__config</code> 键。这就是为什么字段上的 <code>#[serde(default)]</code> 以及第 2 步中“从空映射获取默认值”的设计是承重的，而不是防御性的装饰。</li>
+<li>值会在到达时已解密。运维人员通过 zerocode、网关或 CLI（<code>zeroclaw config set</code>）按插件名称设置它们，并在静态存储时使用配置的 secret key 加密。哪些键存在完全取决于你的契约；请在你的插件 README 中将它们文档化。</li>
+</ul>
+<p>对于此工具，该部分包含三个键，均为可选：<code>replacement</code>（掩码字符串，默认 <code>[REDACTED]</code>）、<code>redact_emails</code>（<code>true</code>/<code>false</code> 字符串，默认 true）、<code>patterns</code>（逗号分隔的字面量，默认为空）。</p>
+<h2 id="5-清单"><a class="header" href="#5-清单">5. 清单</a></h2>
+<!-- Canonical plugin manifest field reference. Edit here; reuse via {{#include}}. -->
+<p>manifest 是插件目录中名为 <code>manifest.toml</code> 的文件。其字段是 <code>crates/zeroclaw-plugins/src/lib.rs</code> 中 <code>PluginManifest</code> 的 serde 表面，这是唯一的事实来源：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>是</td><td>唯一的插件标识符。此外，还包括用于配置该插件的键运算符，以及目录名称约定。</td></tr>
+<tr><td><code>version</code></td><td>是</td><td>版本字符串，例如 <code>0.1.0</code>。</td></tr>
+<tr><td><code>description</code></td><td>不</td><td>由 <code>zeroclaw plugin list</code> 显示的人类可读描述。</td></tr>
+<tr><td><code>author</code></td><td>不</td><td>作者姓名或组织。</td></tr>
+<tr><td><code>wasm_path</code></td><td>用于 WASM 能力</td><td>组件文件名，相对于插件目录。除非唯一的 capability 是 <code>skill</code>，否则为必填。如果指定的文件不存在，发现过程会跳过该插件。</td></tr>
+<tr><td><code>capabilities</code></td><td>是，非空</td><td>插件类型：<code>tool</code>、<code>channel</code>、<code>memory</code>、<code>observer</code>、<code>skill</code> 中的任意一个（<code>PluginCapability</code>，序列化为 snake_case）。</td></tr>
+<tr><td><code>permissions</code></td><td>不</td><td>代码可能访问的主机服务：<code>http_client</code>、<code>config_read</code>、<code>file_read</code>、<code>file_write</code>、<code>memory_read</code>、<code>memory_write</code>（<code>PluginPermission</code>）。目前仅前两个会被强制执行；其余已被接受，但不生效。</td></tr>
+<tr><td><code>signature</code></td><td>不</td><td>对规范化清单字节进行的 Base64url Ed25519 签名。用于发布签名时设置。</td></tr>
+<tr><td><code>publisher_key</code></td><td>不</td><td>签名者的十六进制编码 Ed25519 公钥。</td></tr>
+</tbody>
+</table>
+</div>
+<p>只声明代码实际使用的权限。未声明的权限是组件无法触达的宿主表面；不必要声明的权限则是你主动增加的攻击面，也是审查你的插件的人需要承担的审核负担。</p>
+<p>对于这个插件：<code>name</code> 和 <code>version</code> 需与 <code>plugin-info</code> 报告的内容一致，<code>wasm_path</code> 命名你将随之一起发布的组件文件，<code>capabilities</code> 只包含 <code>tool</code>，并且 <code>permissions</code> 只包含 <code>config_read</code>。仅当你的工具会发起外向 HTTP 调用时才添加 <code>http_client</code>；该权限会将 <code>wasi:http</code> 上下文附加到你的 store，而没有它就完全没有网络面。</p>
+<h3 id="调用网络的工具"><a class="header" href="#调用网络的工具">调用网络的工具</a></h3>
+<p>从实际情况看，最常见的工具形态并不是像 <code>redact</code> 那样的纯转换，而是连接外部 API 的桥梁：在清单中声明 <code>http_client</code>，从 <code>__config</code> 读取凭据，然后发起出站请求。相对于本指南，缺少的是一个能在组件内部工作的 HTTP 客户端：<code>reqwest</code> 及其同类库都不行，因为这里没有套接字接口，只有 <code>wasi:http</code>。已知可在此宿主上工作的客户端是 <a href="https://crates.io/crates/waki"><code>waki</code></a>，它是阻塞式的，因此可以直接适配 <code>execute</code> 的同步签名。将其按组件目标进行条件启用，这样你的纯逻辑模块就仍然可以在本地原生测试：</p>
+<pre><code class="language-bash">cargo add waki --target 'cfg(target_family = "wasm")'
+</code></pre>
+<p>在 <code>execute</code> 中，在解析 <code>__config</code> 之后的调用形状：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let resp = waki::Client::new()
+    .get("https://api.example.com/search")
+    .query([("q", term.as_str())])
+    .header(授权, format!("Bearer {api_key}"))
+    .connect_timeout(std::time::Duration::from_secs(5))
+    .send()
+    .map_err(|e| format!("请求失败：{e}"))?;
+<span class="boring">}</span></code></pre>
+<p>两个看起来像破坏性变更但实际上不是的版本事实：waki 随自身 vendored 的 wit-bindgen（0.34）一起提供，而你的 world bindings 使用的是 0.46；两者可以并存，各自生成自己的 bindings。并且 waki 发出的是 <code>wasi:http@0.2.4</code> imports，而当前工具链基线是 <code>@0.2.6</code>；host 可以无问题地同时链接两者。两者都无需处理。</p>
+<p>记住 <a href="./index.html">概述</a> 中的信任框架：<code>http_client</code> 要么全部允许，要么全部禁止。沙箱不会限制已授予的插件将数据发送到哪里，因此运行 <code>strict</code> 签名策略的操作者信任的是你的代码，而不是 URL 允许列表。</p>
+<h2 id="6-原生测试逻辑"><a class="header" href="#6-原生测试逻辑">6. 原生测试逻辑</a></h2>
+<p>因为 <code>redact.rs</code> 没有 wasm 依赖，普通的 <code>cargo test</code> 会在主机上覆盖它：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>#[test]
+fn empty_config_falls_back_to_defaults() {
+    let cfg = RedactConfig::from_section(&amp;HashMap::new());
+    let (out, n) = redact("mail me at a@b.example", &amp;cfg);
+    assert_eq!(n, 1);
+    assert!(out.contains("[REDACTED]"));
+}
+<span class="boring">}</span></code></pre>
+<p>至少涵盖：jail 情况（空节）、已配置情况，以及没有任何需要屏蔽内容时文本的透明透传。粘合层转发的每一种行为都应能在这里得到证明，而且完全不需要看到 wasm 工具链。</p>
+<h2 id="7-构建"><a class="header" href="#7-构建">7. 构建</a></h2>
+<!-- Canonical plugin component build steps. Edit here; reuse via {{#include}}. -->
+<p>先安装一次 WASI Preview 2 目标，然后构建组件：</p>
+<pre><code class="language-bash">rustup target add wasm32-wasip2
+cargo build --release --target wasm32-wasip2
+</code></pre>
+<p>该组件位于 <code>target/wasm32-wasip2/release/&lt;crate_name&gt;.wasm</code>（crate 名称中的连字符会变成下划线）。在组装插件目录时，请将其重命名为你的清单中 <code>wasm_path</code> 声明的名称。</p>
+<!-- Canonical warning about committing WASM artifacts. Edit here; reuse via {{#include}}. -->
+<blockquote>
+<p>[!IMPORTANT] 编译后的 <code>.wasm</code> 和 <code>.cwasm</code> 文件是二进制构件，通常每个都有数 MB。不要在没有 <a href="https://git-lfs.com">Git LFS</a> 的情况下将它们提交到 git 源树中：每次重建都作为普通 blob 提交，会永久膨胀仓库历史，并且 <code>git diff</code>/审查工具会因此卡住。把它们当作其他构建输出一样处理：将 <code>target/</code> 和 <code>*.wasm</code>/<code>*.cwasm</code> 添加到 <code>.gitignore</code>，并改为通过发布构件或插件注册表归档分发。如果某个构件确实必须留在树中，请在首次提交之前使用 LFS 跟踪该模式（<code>git lfs track "*.wasm"</code>）。</p>
+</blockquote>
+<p>如果目标主机是仅运行时构建（未编译 JIT 后端），它在加载时无法编译 <code>.wasm</code>；而是反序列化预编译的 <code>.cwasm</code>。请使用与主机版本匹配的 wasmtime CLI 进行预编译，并将 <code>.cwasm</code> 作为 <code>wasm_path</code> 构件分发。版本不匹配的构件会被 wasmtime 的反序列化检查拒绝，而不会被静默错误加载。</p>
+<h2 id="8-安装并验证"><a class="header" href="#8-安装并验证">8. 安装并验证</a></h2>
+<!-- Canonical plugin install/verify steps. Edit here; reuse via {{#include}}. -->
+<p>每个插件都位于 plugins 目录的各自子目录中（默认 <code>~/.zeroclaw/plugins/</code>，通过 <code>plugins.plugins_dir</code> 解析），其中包含清单以及与清单的 <code>wasm_path</code> 匹配的组件：</p>
+<pre><code class="language-text">~/.zeroclaw/plugins/
+└── my-plugin/
+    ├── manifest.toml
+    └── my-plugin.wasm
+</code></pre>
+<p>从本地目录安装（这会在复制任何内容之前验证清单形状并运行签名策略）：</p>
+<pre><code class="language-bash">zeroclaw plugin install ./my-plugin/
+</code></pre>
+<p>启用插件系统并确认发现：</p>
+<pre><code class="language-bash">zeroclaw config set plugins.enabled true
+zeroclaw plugin list
+zeroclaw plugin info my-plugin
+</code></pre>
+<p><code>zeroclaw plugin list</code> 中缺失的插件在发现时已被跳过：请检查启动日志中的跳过警告（清单格式错误、缺少 <code>wasm_path</code> 文件，或签名策略拒绝）。</p>
+<h2 id="9-运行它"><a class="header" href="#9-运行它">9. 运行它</a></h2>
+<p>请让代理使用该工具：</p>
+<pre><code class="language-text">&gt; redact this before you log it: key sk-live-abc123, mail ops@example.com
+</code></pre>
+<p>模型会在其目录中看到带有你的 schema 的 <code>redact</code>，调用它后，宿主会在一个新的 store 中，在配置的 fuel 和内存限制下运行该组件。插件工具不在内置的只读自动批准集合中，因此在非完全自治模式下，这次调用会像其他特权工具一样弹出操作员批准提示；请在你的工具描述中预料到这一点，而不是对此感到意外。你的 <code>log-record</code> 事件会以宿主调用点的 <a href="../ops/observability.html#zeroclaw-attribution">span attribution</a> 形式出现在结构化日志中。</p>
+<p>来自 <a href="./index.html">插件概览</a> 的两个操作约束值得再次强调：</p>
+<ul>
+<li><strong>工具名称不得与内置项冲突。</strong> 内置工具会先注册，调度按首个匹配项解析（运行时中的 <code>find_tool</code>），因此名字与内置工具相同的插件工具永远不会被选中。不会报错；只会静默失败。请选一个唯一名称。</li>
+<li><strong>每个组件一个工具。</strong> <code>tool-plugin</code> 世界导出一个单一的 <code>tool</code> 接口。一个工具箱由多个插件目录组成，每个组件一个。</li>
+</ul>
+<h2 id="故障排除"><a class="header" href="#故障排除">故障排除</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>症状</th><th>可能的原因</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw plugin list</code> 中缺少插件</td><td>插件系统已禁用；manifest 格式错误；<code>wasm_path</code> 文件缺失；签名策略拒绝了它。启动日志中包含具体的跳过警告。</td></tr>
+<tr><td>工具已注册，但 schema 是一个通用的 <code>input</code> 对象，名称来自 manifest</td><td>注册时元数据探测失败（主机会替换清单名称、描述，以及一个回退的单个<code>input</code>架构；<code>wasm_tool.rs</code>）。检查日志中的探测错误；通常是某个组件是基于不匹配的 WIT 构建的。</td></tr>
+<tr><td>模型从未选择该工具</td><td>名称与内置项冲突，或描述/schema 没有告知模型该工具何时适用。</td></tr>
+<tr><td><code>__config</code> 即使已配置该部分仍然缺失</td><td>清单缺少 <code>config_read</code>，或者条目名称与清单 <code>name</code> 不匹配。</td></tr>
+<tr><td>调用陷阱</td><td>已达到燃料或内存上限。提高 <code>plugins.limits.call_fuel</code> / <code>plugins.limits.max_memory_mb</code>，或者减少每次调用的工作量。</td></tr>
+<tr><td>仅运行时主机上加载失败</td><td>您将 <code>.wasm</code> 部署到了一个没有 JIT 的主机上；请改为部署与版本匹配的 <code>.cwasm</code>。</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="下一个"><a class="header" href="#下一个">下一个</a></h2>
+<ul>
+<li><a href="./writing-a-channel-plugin.html">编写 channel 插件</a>，用于 warm-store 生命周期、capability 标志以及由宿主提供的 inbound。</li>
+<li><a href="./distributing-plugins.html">分发插件</a> 适用于此工具应该离开你的机器时。</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../plugins/index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../plugins/writing-a-channel-plugin.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../plugins/index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../plugins/writing-a-channel-plugin.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

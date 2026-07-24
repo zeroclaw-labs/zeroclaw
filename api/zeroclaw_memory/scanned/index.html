@@ -1,0 +1,28 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Write- and read-boundary content screening for durable memory."><title>zeroclaw_memory::scanned - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_memory" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module scanned</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_memory/index.html">zeroclaw_<wbr>memory</a><span class="version">0.8.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module scanned</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate zeroclaw_<wbr>memory</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_memory</a></div><h1>Module <span>scanned</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Write- and read-boundary content screening for durable memory.</p>
+<p><a href="struct.ScannedMemory.html" title="struct zeroclaw_memory::scanned::ScannedMemory"><code>ScannedMemory</code></a> is a transparent decorator applied to every backend
+by the memory factory. It enforces <code>[memory.policy]</code> at the two
+places content crosses the persistence boundary:</p>
+<ul>
+<li><strong>Write path</strong> (<code>store*</code>, <code>store_procedural</code>): when
+<code>redact_on_write</code> is enabled, configured categories
+(<a href="../redact/index.html" title="mod zeroclaw_memory::redact"><code>crate::redact</code></a>) are rewritten to placeholders before
+persistence; then the content that would actually be stored is
+scanned (<a href="../threat/index.html" title="mod zeroclaw_memory::threat"><code>crate::threat</code></a>). If unsafe content remains, the write is
+rejected before it reaches the backend (<code>reject</code>) or persisted and
+withheld at read time (<code>block-on-read</code>). Namespace/category policy
+(<a href="../policy_gate/index.html" title="mod zeroclaw_memory::policy_gate"><code>crate::policy_gate</code></a>) is validated last; any failure aborts the
+write (fail-closed).</li>
+<li><strong>Read path</strong> (<code>recall*</code>, <code>get*</code>, <code>list</code>): when
+<code>threat_scan_load_time</code> is enabled, stored entries are re-scanned
+and flagged entries are withheld from results. This covers rows
+written before scanning was enabled and rows persisted under
+<code>block-on-read</code>.</li>
+</ul>
+<p><code>export</code> / <code>export_agent</code> are data-portability and archive surfaces:
+they return stored rows verbatim so backups and the agent-deletion
+archive stay complete, and so an operator can inspect withheld rows
+before deleting them with <code>forget</code>.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.ScannedMemory.html" title="struct zeroclaw_memory::scanned::ScannedMemory">Scanned<wbr>Memory</a></dt><dd>Decorator that scans, redacts, and policy-gates durable memory
+content at the write and recall boundaries.</dd></dl></section></div></main></body></html>
