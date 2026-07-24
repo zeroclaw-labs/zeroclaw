@@ -32,6 +32,9 @@ pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
+pub use zeroclaw_tools::a2a_client::{
+    A2aCancelTool, A2aDiscoverTool, A2aGetTaskTool, A2aHttpClient, A2aSendTool,
+};
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
@@ -846,6 +849,45 @@ pub fn all_tools_with_runtime(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "http_request: failed to construct tool, skipping registration"
+                );
+            }
+        }
+    }
+
+    // A2A outbound client (conditionally registered; opt-in via [a2a.client] enabled).
+    // The four a2a_* tools share one client holding the live config handle, so
+    // peer/credential/security resolution happens at call time (no stored peer Vec).
+    if root_config.a2a.client.enabled {
+        let live = live_config
+            .clone()
+            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        match A2aHttpClient::new(live, root_config.a2a.client.request_timeout_secs) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                tool_arcs.push(Arc::new(RateLimitedTool::new(
+                    A2aDiscoverTool::new(Arc::clone(&client)),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(RateLimitedTool::new(
+                    A2aSendTool::new(Arc::clone(&client)),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(RateLimitedTool::new(
+                    A2aGetTaskTool::new(Arc::clone(&client)),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(RateLimitedTool::new(
+                    A2aCancelTool::new(Arc::clone(&client)),
+                    security.clone(),
+                )));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "a2a_client: failed to construct client, skipping registration of a2a_* tools"
                 );
             }
         }

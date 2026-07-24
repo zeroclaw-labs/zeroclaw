@@ -405,8 +405,8 @@ pub fn build_spec() -> serde_json::Value {
     #[cfg(feature = "a2a")]
     augment_spec_with_a2a(
         &mut spec,
-        schema_value::<crate::a2a::JsonRpcRequest>(),
-        schema_value::<crate::a2a::OutTask>(),
+        schema_value::<zeroclaw_api::a2a_wire::JsonRpcRequest>(),
+        schema_value::<zeroclaw_api::a2a_wire::Task>(),
     );
     flatten_defs_into_components(&mut spec);
     spec

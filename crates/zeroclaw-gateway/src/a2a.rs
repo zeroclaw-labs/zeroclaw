@@ -10,7 +10,7 @@ use axum::{
 };
 #[cfg(feature = "schema-export")]
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use zeroclaw_config::schema::Config;
@@ -31,54 +31,12 @@ const CATALOG_CARD_PREFIXED_PATH: &str = "/a2a/.well-known/agents-card.json";
 /// per-alias base where a conforming single-agent card is served.
 const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
-/// A single declared transport interface (A2A `AgentInterface`). The first
-/// entry of `supportedInterfaces` is the preferred one.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentInterface {
-    pub url: String,
-    pub protocol_binding: String,
-    pub protocol_version: String,
-}
-
-/// A2A capability flags. All optional; only `Some` values serialize.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCapabilities {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub streaming: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub push_notifications: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extended_agent_card: Option<bool>,
-}
-
-/// A2A `AgentSkill`. `id`/`name`/`description`/`tags` are spec-required.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-}
-
-/// A2A `AgentCard`. Serializes to the protobuf-JSON wire shape. Used for both
-/// the per-alias spec-conforming cards and the ZeroClaw discovery catalog
-/// card (the catalog uses `skills: []` and a synthetic catalog interface).
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCard {
-    pub name: String,
-    pub description: String,
-    pub supported_interfaces: Vec<AgentInterface>,
-    pub version: String,
-    pub capabilities: AgentCapabilities,
-    pub default_input_modes: Vec<String>,
-    pub default_output_modes: Vec<String>,
-    pub skills: Vec<AgentSkill>,
-}
+// Card DTOs (`AgentInterface`/`AgentCapabilities`/`AgentSkill`/`AgentCard`)
+// and Task/Message DTOs live in the shared wire-model source
+// `zeroclaw_api::a2a_wire`, used by both this inbound surface and the
+// outbound client in `zeroclaw-tools`. Re-exported here so the gateway's
+// existing construction sites keep working under `crate::a2a::AgentCard`.
+pub use zeroclaw_api::a2a_wire::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill};
 
 /// Runtime gateway endpoint used for A2A advertisement when the operator starts
 /// the gateway with CLI host/port overrides. This is created from the listener
@@ -359,6 +317,11 @@ async fn handle_alias_card(
 
 /// JSON-RPC 2.0 request envelope for the A2A task endpoint. Only `message/send`
 /// is handled on this build; other methods return a JSON-RPC method-not-found.
+///
+/// This is the router-side request parser (fields private to this module).
+/// The shared `zeroclaw_api::a2a_wire::JsonRpcRequest` is the outbound
+/// construction shape; they are intentionally separate so the router keeps
+/// its parse-only surface.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(JsonSchema))]
 pub(crate) struct JsonRpcRequest {
@@ -370,67 +333,16 @@ pub(crate) struct JsonRpcRequest {
     params: serde_json::Value,
 }
 
-/// A2A `message/send` params. The message carries ordered `parts`; we accept
-/// the text parts and join them as the agent prompt.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct MessageSendParams {
-    message: A2aMessage,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct A2aMessage {
-    #[serde(default)]
-    parts: Vec<A2aPart>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct A2aPart {
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    text: String,
-}
-
-/// A2A `TextPart` on the outbound artifact.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutTextPart {
-    kind: String,
-    text: String,
-}
-
-/// A2A `Artifact` carrying the agent's reply.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutArtifact {
-    artifact_id: String,
-    parts: Vec<OutTextPart>,
-}
-
-/// A2A `TaskStatus`.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutTaskStatus {
-    state: String,
-}
-
-/// A2A `Task` returned by a completed `message/send`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutTask {
-    id: String,
-    context_id: String,
-    status: OutTaskStatus,
-    artifacts: Vec<OutArtifact>,
-    kind: String,
-}
+// Task/Message DTOs (`MessageSendParams`/`Message`/`TextPart`/`Artifact`/
+// `TaskStatus`/`Task`) come from the shared wire-model `zeroclaw_api::a2a_wire`.
+// Inbound constructs responses from them; outbound deserializes peer
+// responses from the same types. Re-exported under `crate::a2a::` aliases
+// matching the old outbound names so the construction sites below compile
+// unchanged: `OutTask` → `Task`, `OutArtifact` → `Artifact`,
+// `OutTextPart` → `TextPart`, `OutTaskStatus` → `TaskStatus`.
+pub use zeroclaw_api::a2a_wire::{
+    Artifact, Message, MessageSendParams, Task, TaskStatus, TextPart,
+};
 
 fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
     serde_json::json!({
@@ -543,15 +455,15 @@ async fn handle_alias_task(
     let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
     match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
         Ok(outcome) => {
-            let task = OutTask {
+            let task = Task {
                 id: Uuid::new_v4().to_string(),
                 context_id: session_id,
-                status: OutTaskStatus {
+                status: TaskStatus {
                     state: "completed".to_string(),
                 },
-                artifacts: vec![OutArtifact {
+                artifacts: vec![Artifact {
                     artifact_id: Uuid::new_v4().to_string(),
-                    parts: vec![OutTextPart {
+                    parts: vec![TextPart {
                         kind: "text".to_string(),
                         text: outcome.response,
                     }],
@@ -907,15 +819,15 @@ mod tests {
 
     #[test]
     fn out_task_serializes_to_camelcase_wire_shape() {
-        let task = OutTask {
+        let task = Task {
             id: "task-1".to_string(),
             context_id: "ctx-1".to_string(),
-            status: OutTaskStatus {
+            status: TaskStatus {
                 state: "completed".to_string(),
             },
-            artifacts: vec![OutArtifact {
+            artifacts: vec![Artifact {
                 artifact_id: "art-1".to_string(),
-                parts: vec![OutTextPart {
+                parts: vec![TextPart {
                     kind: "text".to_string(),
                     text: "done".to_string(),
                 }],
