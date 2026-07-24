@@ -1059,6 +1059,24 @@ mod tests {
         assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
         assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
         assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+            assert!(manual.contains(&format!(
+                "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
+            )));
+        }
+        assert!(manual.contains(
+            "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: cargo install cross --version 0.2.5 --locked"
+        ));
+        assert!(manual.contains(
+            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build\""
+        ));
+        assert!(manual.contains("echo \"BUILD_CMD=cargo build\""));
+        assert!(manual.contains(
+            "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+        ));
+        assert!(manual.contains(
+            "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
+        ));
         assert_eq!(
             manual
                 .matches("if: matrix.target != 'aarch64-linux-android'")

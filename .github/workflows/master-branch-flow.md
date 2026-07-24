@@ -110,7 +110,9 @@ for the full procedure. In summary:
 | Target | `ci.yml` | `cross-platform-build-manual.yml` | `release-stable-manual.yml` |
 |---|:---:|:---:|:---:|
 | `x86_64-unknown-linux-gnu` | ✓ | ✓ | ✓ |
+| `x86_64-unknown-linux-musl` | | ✓ | ✓ |
 | `aarch64-unknown-linux-gnu` | | ✓ | ✓ |
+| `aarch64-unknown-linux-musl` | | ✓ | ✓ |
 | `armv7-unknown-linux-gnueabihf` | | ✓ | ✓ |
 | `arm-unknown-linux-gnueabihf` | | ✓ | ✓ |
 | `aarch64-apple-darwin` | ✓ | ✓ | ✓ |
