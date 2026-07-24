@@ -703,6 +703,9 @@ jobs:
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
+      - name: Run turn-stream regressions
+        working-directory: web
+        run: npm run test:contexts
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
