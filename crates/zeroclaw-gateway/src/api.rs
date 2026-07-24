@@ -314,6 +314,10 @@ pub async fn handle_api_status(
         "memory_backend": memory_backend,
         "paired": state.pairing.is_paired(),
         "channels": channels,
+        "nodes": {
+            "connected": state.node_registry.node_ids(),
+            "mdns_peers": state.mdns_peer_registry.snapshots(),
+        },
         "health": health,
         "agent_alias": agent_alias,
         "process": process,
@@ -2044,7 +2048,7 @@ pub(crate) mod tests {
     #[cfg(feature = "channel-linq")]
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -2247,6 +2251,7 @@ pub(crate) mod tests {
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
@@ -2283,6 +2288,55 @@ pub(crate) mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn api_status_includes_connected_nodes_and_mdns_peers() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(1);
+        assert!(state.node_registry.register(nodes::NodeInfo {
+            node_id: "connected-node".into(),
+            capabilities: Vec::new(),
+            invoke_tx,
+        }));
+        state.mdns_peer_registry.insert(
+            "peer-1".into(),
+            nodes::mdns::MdnsPeer {
+                name: "peer-one".into(),
+                addr: "10.0.0.2".into(),
+                port: 42617,
+                version: "0.8.2".into(),
+                path_prefix: Some("/peer".into()),
+                last_seen: Instant::now(),
+            },
+        );
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(
+            json["nodes"]["connected"],
+            serde_json::json!(["connected-node"])
+        );
+        assert_eq!(
+            json["nodes"]["mdns_peers"],
+            serde_json::json!([{
+                "id": "peer-1",
+                "name": "peer-one",
+                "addr": "10.0.0.2",
+                "port": 42617,
+                "version": "0.8.2",
+                "path_prefix": "/peer",
+                "base_url": "http://10.0.0.2:42617/peer",
+            }])
+        );
     }
 
     #[test]

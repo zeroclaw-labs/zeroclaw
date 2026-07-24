@@ -1310,6 +1310,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: std::sync::Arc::new(crate::nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: crate::nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
