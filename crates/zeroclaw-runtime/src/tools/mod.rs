@@ -196,6 +196,13 @@ impl Tool for ArcToolRef {
         self.0.param_domains()
     }
 
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.0.spec()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -241,6 +248,13 @@ impl Tool for ArcDelegatingTool {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2938,5 +2952,103 @@ mod todo_registration_tests {
     fn todo_write_tool_name_is_stable() {
         use zeroclaw_api::tool::Tool;
         assert_eq!(super::todo_write::TodoWriteTool::new().name(), "TodoWrite");
+    }
+}
+
+#[cfg(test)]
+mod wrapper_spec_forwarding_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use zeroclaw_api::tool::ToolSpec;
+
+    /// Stand-in for `McpToolWrapper`: stores its schema once and overrides
+    /// `spec()` to hand out `Arc::clone`, so tests can assert wrappers
+    /// preserve `Arc` identity instead of falling back to the trait
+    /// default (which would deep-clone via `parameters_schema()`).
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ArcSchemaTool {
+        fn new() -> Self {
+            Self {
+                schema: Arc::new(serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                })),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn arc_tool_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool::new());
+        let inner_params = inner.spec().parameters;
+        let wrapped = ArcToolRef(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ArcToolRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
+        );
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &wrapped.spec().parameters),
+            "repeated spec() calls must hand out the same allocation"
+        );
+    }
+
+    #[test]
+    fn arc_delegating_tool_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool::new());
+        let inner_params = inner.spec().parameters;
+        let boxed = ArcDelegatingTool::boxed(inner);
+
+        assert!(
+            Arc::ptr_eq(&boxed.spec().parameters, &inner_params),
+            "ArcDelegatingTool must forward spec() so the inner Arc-shared \
+             schema survives; the trait default deep-clones it every call"
+        );
     }
 }

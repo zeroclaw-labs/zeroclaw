@@ -112,23 +112,37 @@ struct NativeMessage {
     reasoning_content: Option<String>,
 }
 
+/// OpenAI chat-completions native tool entry. Shared with the
+/// OpenAI-compatible provider (`compatible.rs`), which emits the same wire
+/// shape.
 #[derive(Debug, Serialize, Deserialize)]
-struct NativeToolSpec {
+pub(crate) struct NativeToolSpec {
     #[serde(rename = "type")]
-    kind: String,
-    function: NativeToolFunctionSpec,
+    pub(crate) kind: String,
+    pub(crate) function: NativeToolFunctionSpec,
+    /// Unknown sibling fields from parsed caller-supplied specs, preserved
+    /// verbatim so the `chat_with_tools` round-trip validates without
+    /// silently altering the payload. Empty (serializes nothing) for
+    /// internally built specs.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct NativeToolFunctionSpec {
-    name: String,
-    description: String,
+pub(crate) struct NativeToolFunctionSpec {
+    pub(crate) name: String,
+    pub(crate) description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
     /// transparently, never deep-cloned per request
-    parameters: std::sync::Arc<serde_json::Value>,
+    pub(crate) parameters: std::sync::Arc<serde_json::Value>,
+    /// Unknown sibling fields (e.g. OpenAI `strict`) from parsed
+    /// caller-supplied specs, preserved verbatim. Empty for internally
+    /// built specs.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
-fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
+pub(crate) fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
     let spec: NativeToolSpec = serde_json::from_value(value).map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
@@ -324,7 +338,9 @@ impl OpenAiModelProvider {
                 .iter()
                 .map(|tool| NativeToolSpec {
                     kind: "function".to_string(),
+                    extra: serde_json::Map::new(),
                     function: NativeToolFunctionSpec {
+                        extra: serde_json::Map::new(),
                         name: tool.name.clone(),
                         description: tool.description.clone(),
                         parameters: std::sync::Arc::clone(&tool.parameters),

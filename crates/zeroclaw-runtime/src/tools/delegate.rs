@@ -2764,6 +2764,13 @@ impl Tool for ToolArcRef {
         self.inner.param_domains()
     }
 
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
@@ -8086,6 +8093,76 @@ command = "echo hi"
             !result.output.contains("forbidden_tool_seen"),
             "target policy should have filtered out file_write, but got: {}",
             result.output
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_arc_ref_spec_tests {
+    use super::*;
+    use zeroclaw_api::tool::ToolSpec;
+
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool {
+            schema: Arc::new(serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            })),
+        });
+        let inner_params = inner.spec().parameters;
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ToolArcRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
         );
     }
 }
