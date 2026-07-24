@@ -13,6 +13,15 @@ tool-browser-delegate = Delegate browser-based tasks to a browser-capable CLI fo
 
 tool-browser-open = Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping.
 
+tool-browser-screenshot-error-path-not-allowed = Screenshot path not allowed: { $path }
+tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' is outside the allowed workspace: { $canonical }
+tool-browser-screenshot-error-parent-not-exist = Parent directory for screenshot path '{ $path }' does not exist: { $parent }
+tool-browser-screenshot-error-missing-filename = Screenshot path '{ $path }' is missing a file name
+tool-browser-screenshot-error-runtime-config-target = Screenshot path '{ $path }' targets a runtime config file: { $target }
+tool-browser-screenshot-error-symlink-target = Refusing to write screenshot through symlink: { $target }
+tool-browser-screenshot-error-computeruse-non-string-path = ComputerUse screenshot `path` must be a string when present; got a non-string value
+tool-browser-screenshot-error-computeruse-remote-endpoint = ComputerUse screenshot `path` is not supported when browser.computer_use.endpoint resolves to a remote host; omit `path` to return the screenshot inline
+
 tool-channel-room = Create rooms and invite users through an active channel. Provide a channel key such as 'matrix.default', action 'create_room' or 'invite_user', and the action-specific room fields.
 tool-channel-room-param-action = Room-management action to perform.
 tool-channel-room-param-channel = Active channel key such as 'matrix.default'.

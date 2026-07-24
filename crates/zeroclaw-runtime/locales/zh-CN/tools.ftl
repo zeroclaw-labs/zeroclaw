@@ -2,6 +2,16 @@ tool-backup = 创建、列出、验证和恢复工作区备份
 tool-browser = 使用可插拔后端（agent-browser、rust-native、computer_use）进行网页/浏览器自动化。支持 DOM 操作以及通过 computer-use 边车进行的可选系统级操作（mouse_move、mouse_click、mouse_drag、key_type、key_press、screen_capture）。使用 'snapshot' 将交互元素映射到引用（@e1、@e2）。对 open 操作强制执行 browser.allowed_domains。
 tool-browser-delegate = 将基于浏览器的任务委托给具备浏览器能力的 CLI，用于与 Teams、Outlook、Jira、Confluence 等 Web 应用进行交互
 tool-browser-open = 在系统浏览器中打开经批准的 HTTPS URL。安全约束：仅限允许列表中的域名，不允许本地/私有主机，不允许抓取。
+
+tool-browser-screenshot-error-path-not-allowed = 截图路径不允许：{ $path }
+tool-browser-screenshot-error-path-outside-workspace = 截图路径 '{ $path }' 超出允许的工作区：{ $canonical }
+tool-browser-screenshot-error-parent-not-exist = 截图路径 '{ $path }' 的父目录不存在：{ $parent }
+tool-browser-screenshot-error-missing-filename = 截图路径 '{ $path }' 缺少文件名
+tool-browser-screenshot-error-runtime-config-target = 截图路径 '{ $path }' 目标是运行时配置文件：{ $target }
+tool-browser-screenshot-error-symlink-target = 拒绝通过符号链接写入截图：{ $target }
+tool-browser-screenshot-error-computeruse-non-string-path = ComputerUse 截图 `path` 必须是字符串；收到非字符串值
+tool-browser-screenshot-error-computeruse-remote-endpoint = 当 browser.computer_use.endpoint 解析到远程主机时不支持 ComputerUse 截图 `path`；省略 `path` 以内联返回截图
+
 tool-channel-room = 通过活动频道创建房间并邀请用户。提供频道键（如 'matrix.default'）、操作 'create_room' 或 'invite_user'，以及特定操作的房间字段。
 tool-channel-room-param-action = 要执行的房间管理操作。
 tool-channel-room-param-channel = 活动频道键，如 'matrix.default'。

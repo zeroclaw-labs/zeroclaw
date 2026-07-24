@@ -6,6 +6,7 @@
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use crate::helpers::domain_guard;
+use crate::i18n;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -826,6 +827,233 @@ impl BrowserTool {
             }
         }
         Ok(())
+    }
+
+    /// Validate a screenshot destination path before any backend processes it.
+    ///
+    /// When the path is `None` (PNG embedded in the response), this is a no-op.
+    /// When a path is provided, it is resolved against the workspace directory,
+    /// its parent directory is canonicalized, and the result is checked against
+    /// the security policy's path allowlist. The file name is then checked
+    /// against the runtime-config guard and the target's existing symlink
+    /// status, mirroring the `file_write` / `file_edit` target-level checks.
+    /// The raw user-supplied path is replaced with the resolved+validated
+    /// path so the backends write the same string that was checked.
+    ///
+    /// This applies the current workspace policy at validation time and rejects
+    /// an already-existing target symlink; it does not by itself close any
+    /// TOCTOU window between this call and the eventual write.
+    async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
+        let BrowserAction::Screenshot { path, .. } = action else {
+            return Ok(());
+        };
+        let Some(path_str) = path.as_ref() else {
+            return Ok(());
+        };
+
+        // String-level reject (null bytes, .. traversal, URL-encoded traversal)
+        if !self.security.is_path_allowed(path_str) {
+            let msg = i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-not-allowed",
+                &[("path", path_str)],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Resolve relative / tilde paths against the workspace directory.
+        let full = self.security.resolve_tool_path(path_str);
+
+        // The file does not exist yet, so canonicalize the *parent* directory
+        // to verify it is inside the workspace allowlist.
+        let parent = full.parent().unwrap_or(&full);
+        let canonical = tokio::fs::canonicalize(parent).await.with_context(|| {
+            i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-parent-not-exist",
+                &[
+                    ("path", path_str),
+                    ("parent", &parent.display().to_string()),
+                ],
+            )
+        })?;
+
+        if !self.security.is_resolved_path_allowed(&canonical) {
+            let msg = i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-outside-workspace",
+                &[
+                    ("path", path_str),
+                    ("canonical", &canonical.display().to_string()),
+                ],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Build the final *target* path (parent + file name) so we can apply
+        // the same target-level guards the file_write / file_edit tools use:
+        // runtime-config protection and existing-symlink rejection. This
+        // closes the gap where a screenshot path inside an allowed workspace
+        // could still overwrite a protected config/state file or write
+        // through a symlink to a location outside the workspace.
+        let Some(file_name) = full.file_name() else {
+            let msg = i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-missing-filename",
+                &[("path", path_str)],
+            );
+            anyhow::bail!("{msg}");
+        };
+        let resolved_target = canonical.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            let msg = i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-runtime-config-target",
+                &[
+                    ("path", path_str),
+                    ("target", &resolved_target.display().to_string()),
+                ],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // If the target already exists and is a symlink, refuse to follow it
+        // — the backends' write call would land wherever the symlink points,
+        // which is not the same as `resolved_target`.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
+            && meta.file_type().is_symlink()
+        {
+            let msg = i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-symlink-target",
+                &[("target", &resolved_target.display().to_string())],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Replace the raw user path with the canonical target so the write
+        // always uses the same string we checked.
+        *path = Some(resolved_target.to_string_lossy().to_string());
+
+        Ok(())
+    }
+
+    /// ComputerUse backend dispatches to a sidecar before `parse_browser_action`
+    /// runs, so `execute_action`'s `validate_screenshot_path` call would
+    /// never see the screenshot `path`. This hook applies the same workspace
+    /// policy / runtime-config / symlink guards to the *raw* `args` JSON
+    /// before any of its params cross the sidecar boundary, and substitutes
+    /// the canonical resolved path back into the args so the sidecar
+    /// receives the same hardened string the other backends use.
+    ///
+    /// Non-screenshot actions pass through unchanged. Screenshot actions
+    /// with no `path` and screenshot actions with `path: ""` are treated as
+    /// inline PNG return and pass through unchanged.
+    ///
+    /// Screenshot actions with `path: <non-string>` (e.g. an integer) are
+    /// rejected at the hook with a typed error: `parse_browser_action`
+    /// would otherwise drop the value to `None` and forward the raw
+    /// non-string to the sidecar unverified.
+    ///
+    /// When the configured ComputerUse endpoint resolves to a remote host
+    /// (i.e. `allow_remote_endpoint = true` and the host is not private /
+    /// local), any `path` is rejected because local-filesystem
+    /// canonicalization is meaningless across hosts. Inline PNG screenshots
+    /// (no `path`) continue to work in that configuration.
+    async fn validate_screenshot_path_for_computer_use(
+        &self,
+        action_str: &str,
+        mut args: Value,
+    ) -> anyhow::Result<Value> {
+        if action_str != "screenshot" {
+            return Ok(args);
+        }
+
+        // Classify the path up front so non-string and empty cases never
+        // reach the workspace validator (which only accepts string paths).
+        let path_kind = args
+            .as_object()
+            .and_then(|obj| obj.get("path"))
+            .map(|v| match v {
+                Value::Null => PathKind::Absent,
+                Value::String(s) if s.is_empty() => PathKind::Absent,
+                Value::String(_) => PathKind::String,
+                _ => PathKind::NonString,
+            })
+            .unwrap_or(PathKind::Absent);
+
+        if matches!(path_kind, PathKind::Absent) {
+            return Ok(args);
+        }
+
+        if matches!(path_kind, PathKind::NonString) {
+            let msg = i18n::get_required_tool_string(
+                "tool-browser-screenshot-error-computeruse-non-string-path",
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Refuse destination paths against remote sidecars. Local-filesystem
+        // canonicalization is meaningless across hosts, and the sidecar would
+        // either ignore the path or write to a location we cannot verify.
+        if self.endpoint_is_remote() {
+            let msg = i18n::get_required_tool_string(
+                "tool-browser-screenshot-error-computeruse-remote-endpoint",
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Parse a BrowserAction so we can reuse the same validator that
+        // `execute_action` calls for agent-browser / rust-native. The
+        // borrow on `args` ends here.
+        let mut action = match parse_browser_action("screenshot", &args) {
+            Ok(a) => a,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: computer_use screenshot args failed to parse"
+                );
+                return Err(e);
+            }
+        };
+
+        self.validate_screenshot_path(&mut action).await?;
+
+        // Substitute the canonical path back into the args so the sidecar
+        // sees the same string we just verified. Drop `action` before
+        // borrowing `args` mutably.
+        let rewritten_path = if let BrowserAction::Screenshot { path: Some(p), .. } = action {
+            Some(p)
+        } else {
+            None
+        };
+        if let Some(p) = rewritten_path
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("path".to_string(), Value::String(p));
+        }
+        Ok(args)
+    }
+
+    /// True when the configured ComputerUse endpoint resolves to a remote
+    /// host (i.e. `allow_remote_endpoint = true` and the host is not private
+    /// / local). Returns `true` conservatively when the endpoint URL cannot
+    /// be parsed — refusing destination paths is safer than forwarding them
+    /// when we cannot prove the sidecar is on this host.
+    ///
+    /// This uses `domain_guard::is_private_or_local_host` to classify the
+    /// endpoint host. RFC1918 private addresses (10.x.x.x, 172.16-31.x,
+    /// 192.168.x) and local addresses (127.x.x.x, ::1, etc.) are treated as
+    /// local, meaning the sidecar is assumed to share the same filesystem.
+    /// Public hosts or unparseable endpoints are treated as remote.
+    fn endpoint_is_remote(&self) -> bool {
+        if !self.computer_use.allow_remote_endpoint {
+            return false;
+        }
+        match reqwest::Url::parse(&self.computer_use.endpoint) {
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => !domain_guard::is_private_or_local_host(host),
+                None => true,
+            },
+            Err(_) => true,
+        }
     }
 
     fn read_required_i64(
@@ -3772,4 +4000,5 @@ mod tests {
             "no request must reach the sidecar when the hook rejects"
         );
     }
+
 }
