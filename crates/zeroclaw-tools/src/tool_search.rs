@@ -362,7 +362,11 @@ mod tests {
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
-        DeferredMcpToolSet { stubs, registry }
+        DeferredMcpToolSet {
+            stubs,
+            registry,
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        }
     }
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {

@@ -1,6 +1,8 @@
 //! Channel subsystem for messaging platform integrations.
 
 #[cfg(feature = "channel-acp-server")]
+pub mod acp_embedded;
+#[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
@@ -10076,7 +10078,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             }
             ChannelHealthState::Timeout => {
                 timeout += 1;
-                println!("  ⏱️  {:<9} timed out (>10s)", configured.display_name);
+                println!("  ❱️  {:<9} timed out (>10s)", configured.display_name);
             }
         }
     }

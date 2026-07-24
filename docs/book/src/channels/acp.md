@@ -25,7 +25,7 @@ Handshake. Returns server capabilities.
     "protocolVersion": 1,
     "agentCapabilities": {
       "loadSession": true,
-      "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
+      "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
       "mcpCapabilities": {"http": false, "sse": false},
       "sessionCapabilities": {"resume": {}, "close": {}}
     },
@@ -48,6 +48,8 @@ Handshake. Returns server capabilities.
 `loadSession: true` and `sessionCapabilities: {"resume": {}, "close": {}}` indicate that session persistence is active. If the SQLite store could not be opened at startup, all three are absent or false and `session/load`, `session/resume`, and `session/close` will return `SESSION_NOT_FOUND` errors.
 
 `_meta.zeroclaw` carries ZeroClaw-specific extension fields not in the base ACP spec. Clients that only implement the base spec can ignore this object.
+
+`promptCapabilities.embeddedContext: true` means clients may send embedded `resource` blocks with a base64 `blob` in `session/prompt` (see below). `image` and `audio` remain `false` for now. Native ACP Image/Audio ContentBlocks are not advertised yet.
 
 The server always responds `protocolVersion: 1`. If you send a client-side `protocolVersion: 0`, you still get `1` back, v0 clients will see parse errors on the new message shapes; see [version compatibility](#version-compatibility) below.
 
@@ -91,7 +93,11 @@ Send a prompt. The response is a sequence of `session/update` notifications stre
 The `prompt` parameter accepts either a plain string or an array of content parts:
 
 - **String:** `"prompt": "Summarise the changes in the last commit."`
-- **Array:** each element is a text part `{"text": "..."}` or an ACP resource block `{"type": "resource", "resource": {"uri": "file:///path/to/file.rs", "text": "<file contents>"}}`. Resource blocks carry `@`-notation file attachments from the editor. Parts are joined with double newlines in the order they appear.
+- **Array:** each element is a text part `{"text": "..."}` or an ACP resource block:
+  - **Text resource:** `{"type": "resource", "resource": {"uri": "file:///path/to/file.rs", "text": "<file contents>"}}`. Editor `@`-notation attachments with inline text.
+  - **Blob resource:** `{"type": "resource", "resource": {"uri": "file:///path/to/report.pdf", "mimeType": "application/pdf", "blob": "<base64>"}}`. Binary embeds (PDF, DOCX, images, etc.). ZeroClaw decodes the blob, writes it under `{session.workspaceDir}/uploads/` (SHA-named), and surfaces a marker in the agent prompt (`[Document: …]` or `[IMAGE: …]` for `image/*`). Maximum decoded size is **10 MB**; invalid base64 or oversize blobs return `INVALID_PARAMS`.
+
+Parts are joined with double newlines in the order they appear. Blob intake is store-agnostic (it does not call RPC `file/attach`). The same materialization helper is used when MCP tool results contain `resource`+`blob` content (see [MCP embedded resource blobs](../tools/mcp.md#embedded-resource-blobs-in-tool-results)).
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
@@ -144,6 +150,28 @@ ZeroClaw sends four kinds of `session/update` notification during a prompt turn.
 `toolCallId` on `tool_call` and `tool_call_update` are stable and correlated, the update completing a call carries the same `toolCallId` as the one that opened it.
 
 The `name` field on `tool_call_update` is a ZeroClaw extension (not required by the base ACP spec). Clients can use it for display; it's safe to ignore.
+
+#### Delivering files to the client (`deliver_file`)
+
+When the agent should hand a workspace file back for download or preview, it calls the **`deliver_file`** tool (`path`, optional `mimeType`, optional `title`). On completion, ZeroClaw emits a normal `tool_call_update` whose `rawOutput` / `body` stay small (a short human summary, **no** base64 dump and **no** machine trailer; every delivery field travels structurally on the typed tool artifact). The standard `tool_call_update.title` carries a human-readable chat label: the caller's `title` (any prose, e.g. `"Quarterly report"`) or the filename by default. The `content` array additionally includes a standard ACP embedded resource:
+
+```json
+{
+  "type": "content",
+  "content": {
+    "type": "resource",
+    "resource": {
+      "uri": "attachment://deliver/9f2c1a7b0e4d5f6a.pdf",
+      "mimeType": "application/pdf",
+      "blob": "<base64>"
+    }
+  }
+}
+```
+
+The `uri` is an opaque, content-addressed identity: `attachment://deliver/<sha16>.<ext>`, the first 16 hex chars of the file's SHA-256. It is URI-safe and collision-free across same-named files, and is never derived from the caller-supplied filename. The same `uri` is carried structurally on the tool result (JSON field `uri`) and on the typed tool artifact; there is no machine trailer in the model-facing text. Before embedding the blob, the ACP layer re-reads the file and recomputes this hash, refusing to attach when it no longer matches; a swap between the tool's validation and delivery is detected, not trusted. Clients such as Thunderbolt materialize the outbound blob and build a citation ref-map keyed by that uri; agents must copy the returned `uri` into `<widget:document-result fileId="…">` / `[N]` citations and must not invent prefixes. The **chat display name** is the standard `tool_call_update.title` (the caller's `title`, else the filename). There is **no** `filename` field on the ACP `resource` object, and the `title` is display-only, never the on-disk name.
+
+The file must stay inside the session workspace (same jail as `file_read`); oversize files (>10 MB) are rejected by the tool.
 
 ### `session/request_permission` (agent → client, outbound request)
 

@@ -5,13 +5,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::embedded_resource::format_mcp_tool_result_for_model;
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
+use zeroclaw_config::policy::SecurityPolicy;
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
 /// The `prefixed_name` (e.g. `filesystem__read_file`) is what the agent loop
 /// sees. The registry knows how to route it to the correct server.
+///
+/// `security` is the execution-scope [`SecurityPolicy`] snapshot (source of truth
+/// for `workspace_dir`) — an immutable `Arc`, not a reloadable live handle. The
+/// workspace path is resolved from it at execute time, not cached.
 pub struct McpToolWrapper {
     /// Prefixed name: `<server_name>__<tool_name>`.
     prefixed_name: String,
@@ -24,16 +30,24 @@ pub struct McpToolWrapper {
     input_schema: Arc<serde_json::Value>,
     /// Shared registry — used to dispatch actual tool calls.
     registry: Arc<McpRegistry>,
+    /// Security policy handle — workspace for embedded blob materialization.
+    security: Arc<SecurityPolicy>,
 }
 
 impl McpToolWrapper {
-    pub fn new(prefixed_name: String, def: McpToolDef, registry: Arc<McpRegistry>) -> Self {
+    pub fn new(
+        prefixed_name: String,
+        def: McpToolDef,
+        registry: Arc<McpRegistry>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
         let description = def.description.unwrap_or_else(|| "MCP tool".to_string());
         Self {
             prefixed_name,
             description,
             input_schema: Arc::new(def.input_schema),
             registry,
+            security,
         }
     }
 }
@@ -77,11 +91,20 @@ impl Tool for McpToolWrapper {
             other => other,
         };
         match self.registry.call_tool(&self.prefixed_name, args).await {
-            Ok(output) => Ok(ToolResult {
-                success: true,
-                output: output.into(),
-                error: None,
-            }),
+            Ok(result) => {
+                match format_mcp_tool_result_for_model(&result, &self.security.workspace_dir) {
+                    Ok(output) => Ok(ToolResult {
+                        success: true,
+                        output: output.into(),
+                        error: None,
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    }),
+                }
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -104,6 +127,10 @@ mod tests {
         }
     }
 
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
+
     async fn empty_registry() -> Arc<McpRegistry> {
         Arc::new(
             McpRegistry::connect_all(&[])
@@ -118,7 +145,12 @@ mod tests {
     async fn name_returns_prefixed_name() {
         let registry = empty_registry().await;
         let def = make_def("read_file", Some("Reads a file"), json!({}));
-        let wrapper = McpToolWrapper::new("filesystem__read_file".to_string(), def, registry);
+        let wrapper = McpToolWrapper::new(
+            "filesystem__read_file".to_string(),
+            def,
+            registry,
+            test_security(),
+        );
         assert_eq!(wrapper.name(), "filesystem__read_file");
     }
 
@@ -126,7 +158,12 @@ mod tests {
     async fn description_returns_def_description() {
         let registry = empty_registry().await;
         let def = make_def("navigate", Some("Navigate browser"), json!({}));
-        let wrapper = McpToolWrapper::new("playwright__navigate".to_string(), def, registry);
+        let wrapper = McpToolWrapper::new(
+            "playwright__navigate".to_string(),
+            def,
+            registry,
+            test_security(),
+        );
         assert_eq!(wrapper.description(), "Navigate browser");
     }
 
@@ -134,7 +171,8 @@ mod tests {
     async fn description_falls_back_to_mcp_tool_when_none() {
         let registry = empty_registry().await;
         let def = make_def("mystery", None, json!({}));
-        let wrapper = McpToolWrapper::new("srv__mystery".to_string(), def, registry);
+        let wrapper =
+            McpToolWrapper::new("srv__mystery".to_string(), def, registry, test_security());
         assert_eq!(wrapper.description(), "MCP tool");
     }
 
@@ -147,7 +185,8 @@ mod tests {
             "required": ["path"]
         });
         let def = make_def("read_file", Some("Read"), schema.clone());
-        let wrapper = McpToolWrapper::new("fs__read_file".to_string(), def, registry);
+        let wrapper =
+            McpToolWrapper::new("fs__read_file".to_string(), def, registry, test_security());
         assert_eq!(wrapper.parameters_schema(), schema);
     }
 
@@ -156,7 +195,8 @@ mod tests {
         let registry = empty_registry().await;
         let schema = json!({ "type": "object", "properties": {} });
         let def = make_def("list_dir", Some("List directory"), schema.clone());
-        let wrapper = McpToolWrapper::new("fs__list_dir".to_string(), def, registry);
+        let wrapper =
+            McpToolWrapper::new("fs__list_dir".to_string(), def, registry, test_security());
         let spec = wrapper.spec();
         assert_eq!(spec.name, "fs__list_dir");
         assert_eq!(spec.description, "List directory");
@@ -174,7 +214,8 @@ mod tests {
             "properties": { "path": { "type": "string" } }
         });
         let def = make_def("read_file", Some("Read"), schema);
-        let wrapper = McpToolWrapper::new("fs__read_file".to_string(), def, registry);
+        let wrapper =
+            McpToolWrapper::new("fs__read_file".to_string(), def, registry, test_security());
         let spec_a = wrapper.spec();
         let spec_b = wrapper.spec();
         assert!(
@@ -195,7 +236,8 @@ mod tests {
         // rather than propagating an Err (non-fatal by design).
         let registry = empty_registry().await;
         let def = make_def("ghost", Some("Ghost tool"), json!({}));
-        let wrapper = McpToolWrapper::new("nowhere__ghost".to_string(), def, registry);
+        let wrapper =
+            McpToolWrapper::new("nowhere__ghost".to_string(), def, registry, test_security());
         let result = wrapper
             .execute(json!({}))
             .await
@@ -232,7 +274,8 @@ mod tests {
         // assertion is that the call does not fail due to an unexpected `approved` arg.
         let registry = empty_registry().await;
         let def = make_def("do_thing", Some("Do a thing"), json!({}));
-        let wrapper = McpToolWrapper::new("srv__do_thing".to_string(), def, registry);
+        let wrapper =
+            McpToolWrapper::new("srv__do_thing".to_string(), def, registry, test_security());
         // With `approved` present the call must not propagate an Err — non-fatal.
         let result = wrapper
             .execute(json!({ "approved": true, "param": "value" }))
@@ -254,7 +297,7 @@ mod tests {
         // or returning an Err — the registry error path covers the failure case.
         let registry = empty_registry().await;
         let def = make_def("noop", None, json!({}));
-        let wrapper = McpToolWrapper::new("srv__noop".to_string(), def, registry);
+        let wrapper = McpToolWrapper::new("srv__noop".to_string(), def, registry, test_security());
         for non_obj in [json!(null), json!("a string"), json!([1, 2, 3])] {
             let result = wrapper
                 .execute(non_obj.clone())

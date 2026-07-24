@@ -157,6 +157,18 @@ empty, so servers without it are unaffected.
 Pinned content is read once per run (no live refresh) and is labeled
 `trust="untrusted-external"` so the model treats it as data, not instructions.
 
+### Embedded resource blobs in tool results
+
+When an MCP `tools/call` result includes a content item shaped as
+`type: "resource"` with a nested `blob` (base64), ZeroClaw does **not** dump that
+base64 into the model context. Instead it materializes the bytes under the
+session workspace `uploads/` directory (same shared helper and 10 MB limit as
+ACP inbound `resource.blob`) and replaces the model-facing tool output with
+non-blob provenance text plus a `[Document: …]` or `[IMAGE:…]` marker. This is
+gated by content shape, not by tool name. Materialization does not auto-deliver
+the file to ACP clients; the agent still calls `deliver_file` when outbound
+delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
+
 ### Security
 
 Resource and prompt content originates from the configured MCP server and is
