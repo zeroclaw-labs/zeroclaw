@@ -270,3 +270,254 @@ impl StreamThinkTagStripper {
         std::mem::take(&mut self.pending)
     }
 }
+
+/// Streaming-safe stripper for **trailing** provider/model end-of-message
+/// markers (issue #9006 — `<eom>` and `<|eom|>` leaking into transcripts).
+///
+/// Peels complete markers from the input tail on every chunk and withholds a
+/// small suffix that could still become a marker on the next chunk. Mid-text
+/// markers are left intact — the issue explicitly demands "narrowly scoped"
+/// normalization so prose like "literal <eom> in code" stays untouched.
+#[derive(Debug, Default)]
+pub(crate) struct StreamTerminalMarkerStripper {
+    pending: String,
+}
+
+impl StreamTerminalMarkerStripper {
+    const MARKERS: &'static [&'static str] = &["<|eom|>", "<eom>"];
+
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        let old_pending = std::mem::take(&mut self.pending);
+        let old_pending_was_complete_marker = Self::MARKERS.contains(&old_pending.as_str());
+
+        // If the previous call held a complete candidate marker and the new
+        // chunk is non-empty, the marker was inline. Release it into the
+        // visible output before processing the new text.
+        let mut input = String::with_capacity(old_pending.len() + chunk.len());
+        let mut visible = String::new();
+        if old_pending_was_complete_marker {
+            visible.push_str(&old_pending);
+            input.push_str(chunk);
+        } else {
+            input.push_str(&old_pending);
+            input.push_str(chunk);
+        }
+
+        loop {
+            let Some(start) = input.find('<') else {
+                visible.push_str(&input);
+                self.pending.clear();
+                return visible;
+            };
+
+            visible.push_str(&input[..start]);
+            let tail = &input[start..];
+
+            // Case 1: `tail` is exactly a complete marker. Hold it
+            // provisionally until either the next chunk proves it inline or
+            // `finish()` confirms it terminal.
+            if let Some(marker) = Self::MARKERS.iter().find(|m| tail == **m).copied() {
+                self.pending.clear();
+                self.pending.push_str(marker);
+                return visible;
+            }
+
+            // Case 2: `tail` starts with a complete marker but has more text
+            // after it within this same chunk. The marker is inline.
+            if let Some(marker) = Self::MARKERS
+                .iter()
+                .find(|m| tail.starts_with(**m))
+                .copied()
+            {
+                visible.push_str(marker);
+                input = tail[marker.len()..].to_string();
+                continue;
+            }
+
+            // Case 3: `tail` is a strict prefix of some marker. Keep it
+            // pending. `longest_suffix_matching_prefix` is safe here because
+            // `pattern[..len]` walks byte offsets within an ASCII marker; the
+            // returned `len` is at most `tail.len()`, and the slice boundary
+            // sits at a known ASCII prefix so the resulting split is a valid
+            // UTF-8 boundary.
+            let keep_len = Self::MARKERS
+                .iter()
+                .map(|m| longest_suffix_matching_prefix(tail, m))
+                .max()
+                .unwrap_or(0);
+            if keep_len > 0 && keep_len == tail.len() {
+                self.pending.clear();
+                self.pending.push_str(tail);
+                return visible;
+            }
+
+            // Case 4: `tail` begins with `<` but is not a marker prefix.
+            // Consume the `<` and continue scanning.
+            visible.push('<');
+            input = tail[1..].to_string();
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        let final_pending = std::mem::take(&mut self.pending);
+        // If the held suffix is itself a complete marker, the stream ended
+        // before any further text arrived — discard it. Otherwise emit the
+        // held text verbatim (it may be a partial marker prefix or ordinary
+        // trailing bytes that the loop above chose to retain).
+        if Self::MARKERS.contains(&final_pending.as_str()) {
+            String::new()
+        } else {
+            final_pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_marker_stripper_tests {
+    use super::StreamTerminalMarkerStripper;
+
+    /// Drive the stripper to completion and concatenate the result.
+    /// Per-call emissions are intentionally not asserted: the stripper holds
+    /// a bounded suffix for streaming safety, so an intermediate `push`
+    /// return value may include only the safe-to-emit prefix. The aggregate
+    /// (visible text + finish flush) is the contract that matters.
+    fn drain(chunks: &[&str]) -> String {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&stripper.push(chunk));
+        }
+        out.push_str(&stripper.finish());
+        out
+    }
+
+    #[test]
+    fn strips_complete_trailing_eom() {
+        assert_eq!(drain(&["Summary<eom>"]), "Summary");
+    }
+
+    #[test]
+    fn strips_complete_trailing_pipe_eom() {
+        assert_eq!(drain(&["Summary<|eom|>"]), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_eom_when_more_text_follows() {
+        // Audacity88 round-2 Blocking 1: a marker followed by more text in a
+        // later chunk must be preserved verbatim.
+        assert_eq!(
+            drain(&["literal <eom>", " in code"]),
+            "literal <eom> in code"
+        );
+    }
+
+    #[test]
+    fn preserves_inline_pipe_eom_when_more_text_follows() {
+        assert_eq!(
+            drain(&["literal <|eom|>", " in code"]),
+            "literal <|eom|> in code"
+        );
+    }
+
+    #[test]
+    fn splits_eom_across_chunks() {
+        // Marker fragmented across four chunks. The split must not leak any
+        // piece of `<eom>` into the visible transcript.
+        assert_eq!(drain(&["Summary", "<", "eom", ">"]), "Summary");
+    }
+
+    #[test]
+    fn splits_pipe_eom_across_chunks() {
+        assert_eq!(drain(&["Summary", "<|", "eom|", ">"]), "Summary");
+    }
+
+    #[test]
+    fn preserves_inline_marker_after_complete_chunk_boundary() {
+        // The original over-eager-strip regression: chunk ends with the
+        // complete marker, more text arrives in a later chunk. The marker
+        // must be emitted verbatim, not stripped.
+        assert_eq!(
+            drain(&["Summary<eom>", " more text"]),
+            "Summary<eom> more text"
+        );
+    }
+
+    #[test]
+    fn holds_partial_marker_prefix_across_chunks() {
+        assert_eq!(drain(&["hello<", "world"]), "hello<world");
+    }
+
+    #[test]
+    fn handles_multibyte_text_adjacent_to_marker_prefix() {
+        // Audacity88 round-2 Blocking 2: a multibyte scalar immediately
+        // before a `<` marker prefix must not panic on byte slicing.
+        assert_eq!(drain(&["你<", "world"]), "你<world");
+    }
+
+    #[test]
+    fn handles_multibyte_text_alone() {
+        assert_eq!(drain(&["你好世界"]), "你好世界");
+    }
+
+    #[test]
+    fn handles_empty_chunk() {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        assert_eq!(stripper.push(""), "");
+        // State must remain untouched.
+        assert_eq!(stripper.push("hello"), "hello");
+        assert_eq!(stripper.finish(), "");
+    }
+
+    #[test]
+    fn preserves_plain_text_without_markers() {
+        assert_eq!(
+            drain(&["plain answer with no tag"]),
+            "plain answer with no tag"
+        );
+    }
+
+    #[test]
+    fn finish_returns_held_suffix_when_stream_ends_with_partial_marker() {
+        // `push("hello<")` returns `"hello"` (held the `<`); `finish()`
+        // returns the held `<`.
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        let first = stripper.push("hello<");
+        let tail = stripper.finish();
+        assert_eq!(first + &tail, "hello<");
+    }
+
+    #[test]
+    fn finish_returns_empty_when_nothing_held() {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        assert_eq!(stripper.finish(), "");
+        // Idempotency: second call still empty.
+        assert_eq!(stripper.finish(), "");
+    }
+
+    #[test]
+    fn finish_is_idempotent() {
+        let mut stripper = StreamTerminalMarkerStripper::default();
+        stripper.push("hello<");
+        let first = stripper.finish();
+        let second = stripper.finish();
+        // First call drained the held suffix; second must be empty.
+        assert_eq!(first, "<");
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn does_not_strip_marker_like_text() {
+        // Trailing character invalidates the marker — must not strip.
+        assert_eq!(drain(&["Summary<eomx>"]), "Summary<eomx>");
+    }
+
+    #[test]
+    fn marker_inside_word_is_inline() {
+        // `<eom` mid-word with no closing `>` is not a complete marker.
+        assert_eq!(drain(&["see<eomfile"]), "see<eomfile");
+    }
+}
