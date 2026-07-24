@@ -823,7 +823,9 @@ fn strip_fd_merge_redirects(command: &str) -> String {
     use std::sync::OnceLock;
     // Matches patterns like: 2>&1, 1>&2, >&2, <&0, 2<&-, >&-
     static FD_MERGE_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = FD_MERGE_RE.get_or_init(|| regex::Regex::new(r"\d*[><]&[\d-]").unwrap());
+    let re = FD_MERGE_RE.get_or_init(|| {
+        regex::Regex::new(r"\d*[><]&[\d-]").expect("FD_MERGE_RE regex must compile")
+    });
     re.replace_all(command, "").to_string()
 }
 
@@ -959,8 +961,9 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
     use std::sync::OnceLock;
 
     static SAFE_INPUT_RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        SAFE_INPUT_RE.get_or_init(|| Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").unwrap());
+    let re = SAFE_INPUT_RE.get_or_init(|| {
+        Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
+    });
 
     let safe = command.replace("<<<", "").replace("<<", "");
     let safe = re.replace_all(&safe, "$2").to_string();

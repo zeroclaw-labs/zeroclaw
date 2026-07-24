@@ -25,6 +25,7 @@ pub enum SectionShape {
     BackendPicker,
 }
 
+/// Display group for a curated or schema-derived configuration section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +136,7 @@ macro_rules! sections {
             }
         ),+ $(,)?
     ) => {
+        /// One configuration section exposed by the curated section registry.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[cfg_attr(feature = "clap", derive(clap::Subcommand))]

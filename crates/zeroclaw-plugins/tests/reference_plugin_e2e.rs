@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use zeroclaw_config::schema::Config;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::host::PluginHost;
+use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::{PluginCapability, PluginPermission};
 
@@ -98,10 +99,16 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
         Some("<MASK>")
     );
 
-    let permissions = manifest.permissions.clone();
+    let scope = PluginInstanceScope::from_manifest(
+        manifest,
+        PluginCapability::Tool,
+        manifest.name.clone(),
+        manifest.permissions.iter().copied(),
+    )
+    .expect("discovered manifest admits its requested tool grants");
     let mut plugin = runtime::create_plugin(
         wasm_path,
-        &permissions,
+        &scope,
         PluginLimits {
             call_fuel: 1_000_000_000,
             max_memory_bytes: 256 * 1024 * 1024,
@@ -121,7 +128,6 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
         &mut plugin,
         br#"{"text":"mail bob@corp.com about project-zeus, key sk-abcdef0123456789"}"#,
         &section,
-        &permissions,
     )
     .await
     .expect("execute discovered tool");

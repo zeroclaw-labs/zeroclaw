@@ -44,6 +44,9 @@ pub struct PropPutBody {
     pub comment: Option<String>,
 }
 
+/// One JSON Patch operation. Supports `add`, `remove`, `replace`, `test`, and
+/// ZeroClaw's `comment` extension. Every operation requires `path`; `add`,
+/// `replace`, and `test` require `value`, while `comment` requires `comment`.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PatchOp {
@@ -80,6 +83,7 @@ pub struct PatchOpResult {
 pub struct PatchResponse {
     pub saved: bool,
     pub results: Vec<PatchOpResult>,
+    /// Non-fatal validation warnings against the saved configuration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
@@ -181,6 +185,7 @@ pub struct SecretResponse {
     pub populated: bool,
 }
 
+/// Single entry in the list response for configuration properties.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ListEntry {
@@ -253,6 +258,7 @@ pub struct ListResponse {
     pub drifted: Vec<DriftEntry>,
 }
 
+/// One drift entry surfaced when in-memory Config diverges from the on-disk file.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DriftEntry {
@@ -884,6 +890,8 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
+    /// Whether any config write has landed since the last admin reload and may
+    /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
 }
 

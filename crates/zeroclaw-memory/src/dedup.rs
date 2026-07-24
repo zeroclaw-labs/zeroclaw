@@ -98,4 +98,91 @@ mod tests {
         );
         assert_eq!(action, DedupAction::Reject { dup_of: "a".into() });
     }
+
+    #[test]
+    fn near_duplicate_above_threshold_rejects_via_jaccard() {
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            dedup_jaccard_threshold: 0.5,
+            ..MemoryConfig::default()
+        };
+        // Word sets {alpha,beta,gamma} vs {alpha,beta,gamma,delta}:
+        // jaccard = 3/4 = 0.75 > 0.5, and the contents are not identical,
+        // so this exercises the similarity branch, not the exact-match one.
+        let action = dedup_gate(
+            &[entry("a", "alpha beta gamma")],
+            "alpha beta gamma delta",
+            &cfg,
+        );
+        assert_eq!(action, DedupAction::Reject { dup_of: "a".into() });
+    }
+
+    #[test]
+    fn jaccard_at_exact_threshold_inserts() {
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            dedup_jaccard_threshold: 0.5,
+            ..MemoryConfig::default()
+        };
+        // Word sets {alpha,beta} vs {alpha,beta,gamma,delta}:
+        // jaccard = 2/4 = 0.5 exactly. The gate requires similarity
+        // strictly above the threshold, so the boundary inserts.
+        let action = dedup_gate(&[entry("a", "alpha beta")], "alpha beta gamma delta", &cfg);
+        assert_eq!(action, DedupAction::Insert);
+    }
+
+    #[test]
+    fn below_threshold_inserts() {
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            dedup_jaccard_threshold: 0.5,
+            ..MemoryConfig::default()
+        };
+        // jaccard = 1/3, well under the threshold.
+        let action = dedup_gate(&[entry("a", "alpha beta")], "alpha gamma", &cfg);
+        assert_eq!(action, DedupAction::Insert);
+    }
+
+    #[test]
+    fn merge_action_targets_the_survivor() {
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            dedup_jaccard_threshold: 0.5,
+            dedup_action: MemoryDedupAction::Merge,
+            ..MemoryConfig::default()
+        };
+        let action = dedup_gate(
+            &[entry("a", "alpha beta gamma")],
+            "alpha beta gamma delta",
+            &cfg,
+        );
+        assert_eq!(action, DedupAction::Merge { into: "a".into() });
+    }
+
+    #[test]
+    fn exact_duplicate_short_circuits_the_jaccard_threshold() {
+        let cfg = MemoryConfig {
+            dedup_on_write: true,
+            // Jaccard can never be strictly greater than 1.0, so only the
+            // exact-content branch can fire under this config.
+            dedup_jaccard_threshold: 1.0,
+            ..MemoryConfig::default()
+        };
+        let action = dedup_gate(&[entry("a", "alpha beta")], "alpha beta", &cfg);
+        assert_eq!(action, DedupAction::Reject { dup_of: "a".into() });
+    }
+
+    #[test]
+    fn core_candidates_keeps_only_live_core_entries() {
+        let live_core = entry("live", "kept");
+        let mut superseded_core = entry("superseded", "hidden");
+        superseded_core.superseded_by = Some("live".into());
+        let mut daily = entry("daily", "log line");
+        daily.category = MemoryCategory::Daily;
+
+        let filtered = core_candidates(vec![live_core, superseded_core, daily]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "live");
+    }
 }

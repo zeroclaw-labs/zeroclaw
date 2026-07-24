@@ -259,6 +259,34 @@ impl McpServer {
         self.inner.lock().await.capabilities.clone()
     }
 
+    /// Health-check the underlying transport without sending a real request.
+    /// Returns `true` when the transport is alive, `false` otherwise.
+    ///
+    /// Uses `try_lock` instead of `blocking_lock` because this method may be
+    /// called from async contexts (e.g. `health_check_all` during heartbeat
+    /// retries inside an async test or the tokio-based heartbeat worker).
+    pub fn health_check(&self) -> bool {
+        self.inner
+            .try_lock()
+            .map(|mut inner| inner.transport.health_check())
+            .unwrap_or(true) // assume healthy if lock is contended
+    }
+
+    /// Identity comparison on the underlying transport handle. Two
+    /// `McpServer` values share the same connection iff `ptr_eq`
+    /// returns `true` — i.e. their inner `Arc<Mutex<McpServerInner>>`
+    /// points to the same allocation. Cheap Arc-level comparison, no
+    /// async, no lock.
+    ///
+    /// Used by the daemon's reconciliation layer to verify that a
+    /// "preserved" healthy server's live connection survives a
+    /// recovery tick without being silently disconnected and
+    /// respawned (the additive merge contract: a healthy handle
+    /// covers its name and is reused verbatim via `Arc::clone`).
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Call a tool on this server. Returns the raw JSON result.
     pub async fn call_tool(
         &self,
@@ -585,6 +613,215 @@ impl McpRegistry {
         })
     }
 
+    /// Build a registry with `n` placeholder servers, each backed by a no-op
+    /// transport. The server names are `stub_0`, `stub_1`, ..., `stub_{n-1}`.
+    ///
+    /// Test-only: gated behind the `test-helpers` feature so it is NOT
+    /// available in production builds. Downstream test suites (e.g.
+    /// `zeroclaw-runtime::daemon`) enable the feature via their
+    /// `[dev-dependencies]` declaration and use this helper to build an
+    /// `Arc<McpRegistry>` whose `server_count() == n` without spawning a
+    /// real stdio child, so unit tests can exercise
+    /// "registry-completeness" decisions purely on `server_count()`. The
+    /// transport is a local no-op so the registry is safe to drop in tests
+    /// without leaking any OS resources — but it MUST NOT be used in
+    /// production code: any real MCP tool call on the resulting registry
+    /// will panic in the `unreachable!()` branch.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_count(n: usize) -> Self {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        /// No-op transport: never contacted in the daemon-side tests that
+        /// exercise `server_count`-driven decisions. Returning `Err` would
+        /// panic any caller that actually tries to use the registry; the
+        /// daemon tests only read `server_count` and compare Arc pointers,
+        /// so the unreachable body is acceptable.
+        struct NoopTransport;
+
+        #[async_trait]
+        impl McpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &mut self,
+                _request: &JsonRpcRequest,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_with_server_count registry is only used for server_count/Arc equality"
+                )
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn stub_server(name: &str) -> McpServer {
+            let inner = McpServerInner {
+                config: McpServerConfig {
+                    name: name.to_string(),
+                    ..McpServerConfig::default()
+                },
+                transport: Box::new(NoopTransport),
+                #[cfg(target_has_atomic = "64")]
+                next_id: AtomicU64::new(0),
+                #[cfg(not(target_has_atomic = "64"))]
+                next_id: AtomicU32::new(0),
+                tools: Vec::new(),
+                capabilities: McpServerCapabilities::default(),
+            };
+            McpServer {
+                inner: Arc::new(Mutex::new(inner)),
+            }
+        }
+
+        let mut servers = Vec::with_capacity(n);
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index = HashMap::new();
+        for i in 0..n {
+            let name = format!("stub_{i}");
+            let server_idx = servers.len();
+            server_index.insert(name.clone(), server_idx);
+            servers.push(stub_server(&name));
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Snapshot the live `(server_name, McpServer)` pairs registered
+    /// in this registry. Returned pairs are sorted by `server_name`
+    /// for deterministic ordering across ticks. Each `McpServer` is
+    /// a cheap `Arc` clone of the registered handle — re-inserting it
+    /// into another `McpRegistry` shares the underlying transport
+    /// (no disconnect, no new stdio child).
+    ///
+    /// Used by the daemon heartbeat's additive reconciliation layer
+    /// to preserve a healthy live connection across recovery ticks:
+    /// when `current` has a healthy server whose
+    /// identity still matches `fresh`, the daemon re-uses that
+    /// handle instead of forcing `connect_all` to spawn a duplicate
+    /// stdio child for the same endpoint.
+    pub fn server_handles(&self) -> Vec<(String, McpServer)> {
+        let mut out: Vec<(String, McpServer)> = self
+            .server_index
+            .iter()
+            .map(|(name, &idx)| (name.clone(), self.servers[idx].clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Build a new registry from a list of pre-existing `McpServer`
+    /// handles. The handles are cheaply Arc-cloned; transports
+    /// remain alive across the move. The internal `tool_index` and
+    /// `server_index` are rebuilt from each handle's advertised
+    /// capabilities (synchronous `tools()` call).
+    ///
+    /// Companion to [`Self::server_handles`]: callers wanting to
+    /// carry a healthy live connection into a fresh registry (the
+    /// additive recovery path) read the handle via `server_handles`
+    /// and rebuild via `from_servers`.
+    pub async fn from_servers(servers: Vec<McpServer>) -> Self {
+        let mut tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index: HashMap<String, usize> = HashMap::with_capacity(servers.len());
+        for (idx, server) in servers.iter().enumerate() {
+            let name = server.name().await;
+            let tools = server.tools().await;
+            for tool in &tools {
+                let prefixed = format!("{}__{}", name, tool.name);
+                tool_index.insert(prefixed, (idx, tool.name.clone()));
+            }
+            server_index.insert(name, idx);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Test-only: build a registry from pre-existing `(name, handle)`
+    /// pairs. Used by regression tests that need to assert the
+    /// daemon's reconciliation layer preserves a healthy server's
+    /// `McpServer` identity (cheap Arc pointer) across a recovery
+    /// tick. The handles are not re-validated — caller is responsible
+    /// for ensuring each `McpServer`'s `inner.config.name` matches the
+    /// paired name.
+    ///
+    /// Tool index is left empty: callers in regression tests
+    /// exercise identity / `server_count` / `server_names` only,
+    /// never tool lookup. Use [`Self::from_servers`] in production
+    /// paths where tool routing must remain valid.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_handles(handles: Vec<(String, McpServer)>) -> Self {
+        let mut servers: Vec<McpServer> = Vec::with_capacity(handles.len());
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index: HashMap<String, usize> = HashMap::with_capacity(handles.len());
+        for (idx, (name, server)) in handles.into_iter().enumerate() {
+            server_index.insert(name, idx);
+            servers.push(server);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Test-only: build a single stub `McpServer` handle with the
+    /// given `name`. The transport is a no-op (any actual call
+    /// panics in `unreachable!()`); only safe to use in regression
+    /// tests that exercise identity (`ptr_eq`) / `server_count` /
+    /// `server_names` / `health_check_all` and never make a real
+    /// tool call.
+    ///
+    /// Used to construct test registries where two registry builders
+    /// share a server handle — e.g. a healthy A handle that must
+    /// survive across a recovery tick into a freshly-merged registry.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_make_stub_server(name: &str) -> McpServer {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        struct NoopTransport;
+
+        #[async_trait]
+        impl McpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &mut self,
+                _request: &JsonRpcRequest,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_make_stub_server is only used for identity / \
+                     ptr_eq / server_count assertions — never for actual tool calls"
+                )
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: name.to_string(),
+                ..McpServerConfig::default()
+            },
+            transport: Box::new(NoopTransport),
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(0),
+            tools: Vec::new(),
+            capabilities: McpServerCapabilities::default(),
+        };
+        McpServer {
+            inner: std::sync::Arc::new(Mutex::new(inner)),
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()
@@ -634,6 +871,69 @@ impl McpRegistry {
 
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
+    }
+
+    /// Names of all connected servers.
+    pub fn server_names(&self) -> Vec<String> {
+        self.server_index.keys().cloned().collect()
+    }
+
+    /// Check health of every connected server. Returns names of dead servers.
+    pub fn health_check_all(&self) -> Vec<String> {
+        let names = self.server_names();
+        let mut dead = Vec::new();
+        for name in names {
+            if let Some(&idx) = self.server_index.get(&name)
+                && !self.servers[idx].health_check()
+            {
+                dead.push(name);
+            }
+        }
+        dead
+    }
+
+    /// Remove servers whose transport is dead.
+    /// Returns the names of servers that were removed.
+    ///
+    /// This is a no-op for the `for_test_with_server_count` registries used in
+    /// unit tests — those have no-op transports that always report alive, so
+    /// no server will ever be removed.
+    pub async fn kill_dead_connections(&mut self) -> Vec<String> {
+        let dead = self.health_check_all();
+        if dead.is_empty() {
+            return dead;
+        }
+
+        // Rebuild the registry without dead servers, updating indices
+        // so tool_index references remain valid.
+        let dead_set: std::collections::HashSet<_> = dead.iter().cloned().collect();
+
+        let mut new_servers = Vec::with_capacity(self.servers.len());
+        let mut new_server_index = HashMap::with_capacity(self.server_index.len());
+        let mut old_to_new_idx = HashMap::with_capacity(self.server_index.len());
+
+        for (name, &old_idx) in &self.server_index {
+            if dead_set.contains(name) {
+                continue;
+            }
+            let new_idx = new_servers.len();
+            new_servers.push(self.servers[old_idx].clone());
+            old_to_new_idx.insert(old_idx, new_idx);
+            new_server_index.insert(name.clone(), new_idx);
+        }
+
+        let mut new_tool_index = HashMap::with_capacity(self.tool_index.len());
+        for (prefixed, (old_srv_idx, tool_name)) in &self.tool_index {
+            if let Some(&new_srv_idx) = old_to_new_idx.get(old_srv_idx) {
+                new_tool_index.insert(prefixed.clone(), (new_srv_idx, tool_name.clone()));
+            }
+        }
+
+        self.servers = new_servers;
+        self.server_index = new_server_index;
+        self.tool_index = new_tool_index;
+
+        dead
     }
 
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.

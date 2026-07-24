@@ -7,6 +7,8 @@
 # Build: cargo build --release
 # Flash: cargo espflash flash --monitor
 
+[workspace]
+
 [package]
 name = "esp32"
 version = "0.1.0"
@@ -24,8 +26,8 @@ esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc" }
 esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc" }
 log = "0.4"
 anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+heapless = { version = "0.9", default-features = false }
+zeroclaw-fw-protocol = { path = "../zeroclaw-fw-protocol" }
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

@@ -516,7 +516,7 @@ fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerO
 struct ChannelDraft {
     channel_type: String,
     alias: String,
-    token: Option<String>,
+    fields: std::collections::HashMap<String, String>,
     mode: SelectorMode,
 }
 
@@ -711,7 +711,7 @@ impl FormState {
                     SelectorMode::Fresh => SelectorChoice::Fresh(ChannelQuickStart {
                         channel_type: c.channel_type.clone(),
                         alias: c.alias.clone(),
-                        token: c.token.clone(),
+                        fields: c.fields.clone(),
                     }),
                     SelectorMode::Existing => {
                         SelectorChoice::Existing(format!("{}.{}", c.channel_type, c.alias))
@@ -865,6 +865,16 @@ struct FieldFormRow {
     descriptor: QuickstartFieldDescriptor,
     /// User-typed buffer. Pre-filled from `descriptor.default`.
     buf: String,
+}
+
+fn channel_fields_from_rows(rows: &[FieldFormRow]) -> std::collections::HashMap<String, String> {
+    rows.iter()
+        .filter_map(|row| {
+            let value = row.buf.trim();
+            (!value.is_empty() && value != UNSET_DISPLAY)
+                .then(|| (row.descriptor.key.clone(), value.to_string()))
+        })
+        .collect()
 }
 
 struct ChannelListModal {
@@ -2089,7 +2099,7 @@ impl QuickstartPane {
             self.form.channels.push(ChannelDraft {
                 channel_type: ty.to_string(),
                 alias: alias.to_string(),
-                token: None,
+                fields: std::collections::HashMap::new(),
                 mode: SelectorMode::Existing,
             });
         }
@@ -2334,29 +2344,10 @@ impl QuickstartPane {
                     .apply_provider_runtime_default(runtime_default.as_deref());
             }
             Selector::Channels => {
-                let pick = |key: &str| {
-                    f.fields
-                        .iter()
-                        .find(|r| r.descriptor.key == key)
-                        .map(|r| r.buf.trim().to_string())
-                        .unwrap_or_default()
-                };
-                // `bot-token` covers Telegram / Discord; `token` is the
-                // generic fallback for any channel kind that just needs
-                // one secret.
-                let token = {
-                    let v = pick("bot-token");
-                    if v.is_empty() {
-                        let alt = pick("token");
-                        if alt.is_empty() { None } else { Some(alt) }
-                    } else {
-                        Some(v)
-                    }
-                };
                 self.form.channels.push(ChannelDraft {
                     channel_type: f.type_key.clone(),
                     alias: f.alias.clone(),
-                    token,
+                    fields: channel_fields_from_rows(&f.fields),
                     mode: SelectorMode::Fresh,
                 });
             }
@@ -3116,10 +3107,10 @@ fn draw_modal(
                         Span::styled(glyph, theme::accent_style()),
                         Span::styled(format!("{}.{}", c.channel_type, c.alias), style),
                         Span::styled(
-                            if c.token.is_some() {
-                                "  (token set)"
-                            } else {
+                            if c.fields.is_empty() {
                                 ""
+                            } else {
+                                "  (configured)"
                             },
                             theme::dim_style(),
                         ),
@@ -3492,6 +3483,22 @@ fn draw_modal(
 mod tests {
     use super::*;
 
+    fn field_row(key: &str, value: &str) -> FieldFormRow {
+        FieldFormRow {
+            descriptor: QuickstartFieldDescriptor {
+                key: key.to_string(),
+                label: key.to_string(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: key == "bot_token",
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            buf: value.to_string(),
+        }
+    }
+
     /// A FormState with every real selector satisfied.
     fn complete_form() -> FormState {
         let mut f = FormState::default_form();
@@ -3708,6 +3715,21 @@ mod tests {
     }
 
     #[test]
+    fn channel_form_preserves_all_schema_field_keys() {
+        let rows = vec![
+            field_row("bot_token", " 123:ABC "),
+            field_row("allowed_users", "[\"42\"]"),
+            field_row("unused", UNSET_DISPLAY),
+        ];
+
+        let fields = channel_fields_from_rows(&rows);
+
+        assert_eq!(fields["bot_token"], "123:ABC");
+        assert_eq!(fields["allowed_users"], "[\"42\"]");
+        assert!(!fields.contains_key("unused"));
+    }
+
+    #[test]
     fn submit_is_excluded_from_completeness() {
         // Regression: can_create walked Selector::ALL including Submit,
         // and is_satisfied(Submit) is always false, so Create could
@@ -3764,7 +3786,7 @@ mod tests {
         f.channels.push(ChannelDraft {
             channel_type: "telegram".into(),
             alias: "chat".into(),
-            token: None,
+            fields: std::collections::HashMap::new(),
             mode: SelectorMode::Fresh,
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {

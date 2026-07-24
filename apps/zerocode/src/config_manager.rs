@@ -15,7 +15,6 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
@@ -23,13 +22,33 @@ use ratatui::{
 };
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
+use crate::terminal_backend::WideCellCleanupBackend;
 use crate::theme;
 
-pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
+fn type_template_label(template: &ConfigTemplateEntry) -> String {
+    template
+        .path
+        .rsplit('.')
+        .next()
+        .unwrap_or(&template.path)
+        .to_string()
+}
+
+fn is_direct_child_path(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .is_some_and(|relative| !relative.is_empty() && !relative.contains('.'))
+}
+
+fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
+    fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
 
 pub(crate) fn init_terminal() -> Result<Term> {
@@ -47,7 +66,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    Ok(Terminal::new(WideCellCleanupBackend::new(stdout))?)
 }
 
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
@@ -400,42 +419,6 @@ impl App {
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
-        Ok(())
-    }
-
-    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
-        self.section = ConfigSection::Zeroclaw;
-        self.zeroclaw_pane = ZeroclawPane::Detail;
-        self.deactivate_filter();
-
-        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
-            return Ok(());
-        };
-
-        self.section_cursor = section_idx;
-        self.loaded_section = Some(section_idx);
-        self.load_aliases("agents").await?;
-
-        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
-            self.alias_cursor = 0;
-            self.screen = Screen::AliasList {
-                section_idx,
-                map_path: "agents".to_string(),
-                breadcrumb: vec!["agents".to_string()],
-            };
-            self.status_msg = None;
-            return Ok(());
-        };
-
-        self.alias_cursor = alias_idx;
-        let prefix = format!("agents.{alias}");
-        self.load_fields(&prefix).await?;
-        self.screen = Screen::FieldList {
-            section_idx,
-            prefix,
-            breadcrumb: vec!["agents".to_string(), alias.to_string()],
-        };
-        self.status_msg = None;
         Ok(())
     }
 
@@ -941,12 +924,8 @@ impl App {
                 let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
                 self.filtered_indices(&labels).len()
             }
-            Screen::TypeList { .. } => {
-                let names: Vec<String> = self
-                    .types
-                    .iter()
-                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-                    .collect();
+            Screen::TypeList { section_idx } => {
+                let names = self.type_list_labels(*section_idx);
                 self.filtered_indices(&names).len()
             }
             Screen::AliasList { .. } => {
@@ -1047,15 +1026,11 @@ impl App {
                         .unwrap_or(0)
                 }
             }
-            Screen::TypeList { .. } => {
+            Screen::TypeList { section_idx } => {
                 if self.filter.is_some() {
                     self.filter_cursor
                 } else {
-                    let names: Vec<String> = self
-                        .types
-                        .iter()
-                        .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-                        .collect();
+                    let names = self.type_list_labels(*section_idx);
                     self.filtered_indices(&names)
                         .iter()
                         .position(|&i| i == self.type_cursor)
@@ -1120,12 +1095,8 @@ impl App {
                     self.section_cursor = orig;
                 }
             }
-            Screen::TypeList { .. } => {
-                let names: Vec<String> = self
-                    .types
-                    .iter()
-                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-                    .collect();
+            Screen::TypeList { section_idx } => {
+                let names = self.type_list_labels(*section_idx);
                 let visible = self.filtered_indices(&names);
                 if self.filter.is_some() {
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
@@ -1192,6 +1163,20 @@ impl App {
         }
     }
 
+    fn selected_type_row(&self) -> Option<usize> {
+        let Screen::TypeList { section_idx } = &self.screen else {
+            return None;
+        };
+        let names = self.type_list_labels(*section_idx);
+        let visible = self.filtered_indices(&names);
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible.iter().position(|&i| i == self.type_cursor)?
+        };
+        visible.get(cursor).copied()
+    }
+
     /// Activate the currently selected item (double-click equivalent of Enter).
     async fn activate_mouse(&mut self, term: &mut Term) -> Result<()> {
         match &self.screen {
@@ -1200,8 +1185,9 @@ impl App {
                 self.enter_section(idx).await?;
             }
             Screen::TypeList { .. } => {
-                let idx = self.type_cursor;
-                self.enter_type(idx).await?;
+                if let Some(idx) = self.selected_type_row() {
+                    self.enter_type(idx).await?;
+                }
             }
             Screen::AliasList { .. } => {
                 if self.alias_list_has_tabs() && self.alias_tab == 1 {
@@ -1251,6 +1237,43 @@ impl App {
             .filter(|t| t.path.starts_with(&prefix))
             .cloned()
             .collect()
+    }
+
+    fn section_has_root_settings_row(&self, section_idx: usize) -> bool {
+        self.sections.get(section_idx).is_some_and(|section| {
+            section.shape == Some(SectionShape::TypedFamilyMap) && section.key == "channels"
+        })
+    }
+
+    fn type_list_labels(&self, section_idx: usize) -> Vec<String> {
+        let has_root_row = self.section_has_root_settings_row(section_idx);
+        let root_count = usize::from(has_root_row);
+        let mut labels = Vec::with_capacity(self.types.len() + root_count);
+        if has_root_row {
+            labels.push(format!("[{}]", self.sections[section_idx].key));
+        }
+        labels.extend(self.types.iter().map(type_template_label));
+        labels
+    }
+
+    fn type_list_len(&self, section_idx: usize) -> usize {
+        self.types.len() + usize::from(self.section_has_root_settings_row(section_idx))
+    }
+
+    fn template_idx_for_type_row(&self, section_idx: usize, row_idx: usize) -> Option<usize> {
+        if self.section_has_root_settings_row(section_idx) {
+            row_idx.checked_sub(1).filter(|&idx| idx < self.types.len())
+        } else if row_idx < self.types.len() {
+            Some(row_idx)
+        } else {
+            None
+        }
+    }
+
+    fn is_typed_family_root_field_list(&self, section_idx: usize, prefix: &str) -> bool {
+        self.sections.get(section_idx).is_some_and(|section| {
+            section.shape == Some(SectionShape::TypedFamilyMap) && section.key == prefix
+        })
     }
 
     async fn load_type_alias_counts(&mut self) -> Result<()> {
@@ -1405,6 +1428,9 @@ impl App {
 
     async fn load_fields(&mut self, prefix: &str) -> Result<()> {
         self.fields = self.rpc.config_list(Some(prefix)).await?;
+        if prefix == "channels" {
+            retain_direct_children(&mut self.fields, prefix);
+        }
         self.field_cursor = 0;
         // Compute distinct tab names in field-declaration order.
         let mut tabs = Vec::new();
@@ -1476,6 +1502,9 @@ impl App {
         // fields so tab_field_indices() keeps finding them.
         let has_settings_tab = self.tab_names.contains(&ConfigTab::Settings);
         let mut new_fields = new_fields;
+        if prefix == "channels" {
+            retain_direct_children(&mut new_fields, prefix);
+        }
         if has_settings_tab {
             for f in &mut new_fields {
                 if f.tab == ConfigTab::None {
@@ -1641,8 +1670,8 @@ impl App {
     /// clamped to the loaded list length.
     fn restore_top_cursor(&mut self, pos: usize) {
         match &self.screen {
-            Screen::TypeList { .. } => {
-                self.type_cursor = pos.min(self.types.len().saturating_sub(1));
+            Screen::TypeList { section_idx } => {
+                self.type_cursor = pos.min(self.type_list_len(*section_idx).saturating_sub(1));
             }
             Screen::AliasList { breadcrumb, .. } if breadcrumb.len() <= 1 => {
                 self.alias_cursor = pos.min(self.aliases.len().saturating_sub(1));
@@ -1741,11 +1770,11 @@ impl App {
     // ── Type list (TypedFamilyMap) ───────────────────────────────
 
     async fn handle_type_list(&mut self, key: KeyEvent) -> Result<()> {
-        let type_names: Vec<String> = self
-            .types
-            .iter()
-            .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-            .collect();
+        let section_idx = match &self.screen {
+            Screen::TypeList { section_idx } => *section_idx,
+            _ => return Ok(()),
+        };
+        let type_names = self.type_list_labels(section_idx);
         let visible = self.filtered_indices(&type_names);
 
         match self.handle_filter_key(key, visible.len()) {
@@ -1770,7 +1799,9 @@ impl App {
             Some(ConfigTabAction::Up) => {
                 self.type_cursor = self.type_cursor.saturating_sub(1);
             }
-            Some(ConfigTabAction::Down) if self.type_cursor + 1 < self.types.len() => {
+            Some(ConfigTabAction::Down)
+                if self.type_cursor + 1 < self.type_list_len(section_idx) =>
+            {
                 self.type_cursor += 1;
             }
             Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
@@ -1782,13 +1813,28 @@ impl App {
     }
 
     async fn enter_type(&mut self, orig_idx: usize) -> Result<()> {
-        if let (Some(tmpl), Screen::TypeList { section_idx }) =
-            (self.types.get(orig_idx), &self.screen)
-        {
+        if let Screen::TypeList { section_idx } = &self.screen {
             let section_idx = *section_idx;
-            let map_path = tmpl.path.clone();
-            let type_name = map_path.rsplit('.').next().unwrap_or(&map_path).to_string();
             let section_key = self.sections[section_idx].key.clone();
+            if self.section_has_root_settings_row(section_idx) && orig_idx == 0 {
+                self.load_fields(&section_key).await?;
+                self.screen = Screen::FieldList {
+                    section_idx,
+                    prefix: section_key.clone(),
+                    breadcrumb: vec![section_key.clone(), format!("[{section_key}]")],
+                };
+                self.status_msg = None;
+                return Ok(());
+            }
+
+            let Some(template_idx) = self.template_idx_for_type_row(section_idx, orig_idx) else {
+                return Ok(());
+            };
+            let Some(tmpl) = self.types.get(template_idx) else {
+                return Ok(());
+            };
+            let map_path = tmpl.path.clone();
+            let type_name = type_template_label(tmpl);
             self.load_aliases(&map_path).await?;
             self.screen = Screen::AliasList {
                 section_idx,
@@ -2282,13 +2328,17 @@ impl App {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
                     section_idx,
+                    prefix,
                     breadcrumb,
                     ..
                 } = screen
-                    && breadcrumb.len() >= 2
                 {
-                    self.restore_alias_list_from_field_back(section_idx, breadcrumb)
-                        .await?;
+                    if self.is_typed_family_root_field_list(section_idx, &prefix) {
+                        self.screen = Screen::TypeList { section_idx };
+                    } else if breadcrumb.len() >= 2 {
+                        self.restore_alias_list_from_field_back(section_idx, breadcrumb)
+                            .await?;
+                    }
                 }
                 self.status_msg = None;
             }
@@ -3459,18 +3509,17 @@ impl App {
             );
         }
 
-        let type_names: Vec<String> = self
-            .types
-            .iter()
-            .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-            .collect();
+        let type_names = self.type_list_labels(section_idx);
         let visible = self.filtered_indices(&type_names);
 
         let items: Vec<ListItem> = visible
             .iter()
             .map(|&i| {
                 let name = &type_names[i];
-                let count = self.type_alias_counts.get(i).copied().unwrap_or(0);
+                let count = self
+                    .template_idx_for_type_row(section_idx, i)
+                    .and_then(|template_idx| self.type_alias_counts.get(template_idx).copied())
+                    .unwrap_or(0);
                 let mut spans = vec![Span::styled(name.to_string(), theme::body_style())];
                 if count > 0 {
                     spans.push(Span::styled(format!("  ({count})"), theme::accent_style()));
@@ -4737,6 +4786,112 @@ mod tests {
             shape: None,
             cost_category: cost_category.to_string(),
         }
+    }
+
+    fn typed_section(key: &str) -> ConfigSectionEntry {
+        ConfigSectionEntry {
+            key: key.to_string(),
+            label: key.to_string(),
+            help: String::new(),
+            completed: false,
+            group: String::new(),
+            shape: Some(SectionShape::TypedFamilyMap),
+            cost_category: String::new(),
+        }
+    }
+
+    fn field(path: &str) -> ConfigFieldEntry {
+        ConfigFieldEntry {
+            path: path.to_string(),
+            category: String::new(),
+            kind: PropKind::String,
+            type_hint: String::new(),
+            value: None,
+            populated: false,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: None,
+            tab: ConfigTab::None,
+            alias_source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn channels_type_list_reserves_a_global_settings_row() {
+        let mut mgr = test_manager();
+        mgr.sections = vec![typed_section("channels")];
+        mgr.screen = Screen::TypeList { section_idx: 0 };
+        mgr.types = vec![
+            ConfigTemplateEntry {
+                path: "channels.telegram".to_string(),
+            },
+            ConfigTemplateEntry {
+                path: "channels.whatsapp".to_string(),
+            },
+        ];
+
+        assert_eq!(mgr.visible_count(), 3);
+        assert_eq!(
+            mgr.type_list_labels(0),
+            vec!["[channels]", "telegram", "whatsapp"]
+        );
+        assert_eq!(mgr.template_idx_for_type_row(0, 0), None);
+        assert_eq!(mgr.template_idx_for_type_row(0, 1), Some(0));
+        assert_eq!(mgr.template_idx_for_type_row(0, 2), Some(1));
+    }
+
+    #[tokio::test]
+    async fn non_channel_type_list_does_not_reserve_global_settings_row() {
+        let mut mgr = test_manager();
+        mgr.sections = vec![typed_section("providers.models")];
+        mgr.screen = Screen::TypeList { section_idx: 0 };
+        mgr.types = vec![ConfigTemplateEntry {
+            path: "providers.models.anthropic".to_string(),
+        }];
+
+        assert_eq!(mgr.type_list_labels(0), vec!["anthropic"]);
+        assert_eq!(mgr.template_idx_for_type_row(0, 0), Some(0));
+    }
+
+    #[test]
+    fn channels_root_settings_keep_only_direct_children() {
+        let mut fields = vec![
+            field("channels.show_tool_calls"),
+            field("channels.ack_reactions"),
+            field("channels.matrix.default.enabled"),
+            field("channels.whatsapp.personal.session_path"),
+            field("agents.default.model"),
+        ];
+
+        retain_direct_children(&mut fields, "channels");
+
+        let paths: Vec<&str> = fields.iter().map(|field| field.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["channels.show_tool_calls", "channels.ack_reactions"]
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_type_list_selected_row_tracks_filter_cursor() {
+        let mut mgr = test_manager();
+        mgr.sections = vec![typed_section("channels")];
+        mgr.screen = Screen::TypeList { section_idx: 0 };
+        mgr.types = vec![
+            ConfigTemplateEntry {
+                path: "channels.telegram".to_string(),
+            },
+            ConfigTemplateEntry {
+                path: "channels.whatsapp".to_string(),
+            },
+        ];
+        mgr.type_cursor = 2;
+        mgr.filter = Some("chan".to_string());
+        mgr.filter_cursor = 0;
+
+        assert_eq!(mgr.selected_type_row(), Some(0));
     }
 
     #[tokio::test]

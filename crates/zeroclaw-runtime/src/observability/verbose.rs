@@ -27,6 +27,7 @@ impl Observer for VerboseObserver {
                 messages_count,
                 channel: _,
                 agent_alias: _,
+                parent_agent_alias: _,
                 turn_id: _,
             } => {
                 eprintln!("> Thinking");
@@ -86,6 +87,7 @@ mod tests {
     fn verbose_events_do_not_panic() {
         let obs = VerboseObserver::new();
         obs.record_event(&ObserverEvent::LlmRequest {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude".into(),
             messages_count: 3,
@@ -94,6 +96,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude".into(),
             duration: Duration::from_millis(12),
@@ -107,6 +110,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             arguments: None,
@@ -115,6 +119,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(2),

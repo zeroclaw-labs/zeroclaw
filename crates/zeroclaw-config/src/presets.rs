@@ -307,6 +307,7 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
 
 pub use crate::multi_agent::MemoryBackendKind as MemoryChoice;
 
+/// Model provider selection submitted by the Quickstart builder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelProviderChoice {
@@ -328,6 +329,7 @@ pub struct ModelProviderChoice {
     pub fields: std::collections::HashMap<String, String>,
 }
 
+/// One channel selection submitted by the Quickstart builder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChannelQuickStart {
@@ -338,9 +340,12 @@ pub struct ChannelQuickStart {
     /// `channel_type` in the UI; users override when stacking
     /// multiple aliases of the same channel type.
     pub alias: String,
-    /// Bot token / shared secret if the channel needs one
-    /// (Telegram, Discord). `None` for channels that don't.
-    pub token: Option<String>,
+    /// Round-trip of every field the daemon described in
+    /// `quickstart/fields`. Surfaces echo back exactly what was
+    /// emitted; the daemon writes each entry under `<prefix>.<key>`
+    /// using its own schema knowledge.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 /// Agent identity payload from the Agent step. Personality file
@@ -381,6 +386,7 @@ pub struct QuickstartPersonalityFile {
     pub content: String,
 }
 
+/// Complete builder submission consumed by the shared Quickstart apply path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct BuilderSubmission {
@@ -431,6 +437,7 @@ pub struct QuickstartPeerGroup {
     pub ignore: Vec<String>,
 }
 
+/// Selects either an existing configured value or a fresh builder value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", tag = "mode", content = "value")]
@@ -749,7 +756,7 @@ mod tests {
             channels: vec![SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "cli".into(),
                 alias: "cli".into(),
-                token: None,
+                fields: std::collections::HashMap::new(),
             })],
             peer_groups: vec![],
             agent: AgentIdentity {
@@ -762,5 +769,36 @@ mod tests {
         let json = serde_json::to_string(&submission).expect("serialize");
         let parsed: BuilderSubmission = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, submission);
+    }
+
+    #[test]
+    fn channel_quickstart_round_trips_schema_fields() {
+        let channel = ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "ops".into(),
+            fields: std::collections::HashMap::from([(
+                "bot_token".to_string(),
+                "123:ABC".to_string(),
+            )]),
+        };
+
+        let value = serde_json::to_value(&channel).expect("serialize channel");
+        assert_eq!(value["fields"]["bot_token"], "123:ABC");
+        assert!(value.get("token").is_none());
+        assert_eq!(
+            serde_json::from_value::<ChannelQuickStart>(value).expect("deserialize channel"),
+            channel
+        );
+    }
+
+    #[test]
+    fn channel_quickstart_defaults_missing_fields_to_empty() {
+        let channel: ChannelQuickStart = serde_json::from_value(serde_json::json!({
+            "channel_type": "cli",
+            "alias": "cli"
+        }))
+        .expect("deserialize legacy channel without fields");
+
+        assert!(channel.fields.is_empty());
     }
 }

@@ -29,20 +29,49 @@ pub struct KiloCliModelProvider {
     binary_path: PathBuf,
 }
 
-impl KiloCliModelProvider {
-    /// Create a new `KiloCliModelProvider`. Pass `None` to use the default
-    /// `"kilo"` (PATH lookup); pass an explicit path to override.
-    pub fn new(alias: &str, binary_path: Option<&str>) -> Self {
-        let binary_path = binary_path
+/// Typed builder for [`KiloCliModelProvider`].
+///
+/// Only `alias` is required; the binary path defaults to
+/// `DEFAULT_KILO_CLI_BINARY` (PATH lookup) when unset.
+#[must_use]
+pub struct KiloCliBuilder {
+    alias: String,
+    binary_path: Option<String>,
+}
+
+impl KiloCliBuilder {
+    /// Override the `kilo` CLI binary path. Whitespace-only inputs fall
+    /// back to the default (PATH lookup).
+    pub fn binary_path(mut self, path: Option<&str>) -> Self {
+        self.binary_path = path
             .map(str::trim)
             .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> KiloCliModelProvider {
+        let binary_path = self
+            .binary_path
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_KILO_CLI_BINARY));
-        Self {
-            alias: alias.to_string(),
+        KiloCliModelProvider {
+            alias: self.alias,
             binary_path,
         }
     }
+}
+
+impl KiloCliModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`KiloCliBuilder`].
+    pub fn builder(alias: &str) -> KiloCliBuilder {
+        KiloCliBuilder {
+            alias: alias.to_string(),
+            binary_path: None,
+        }
+    }
+
     /// Returns true if the model argument should be forwarded to the CLI.
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
@@ -272,19 +301,25 @@ mod tests {
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = KiloCliModelProvider::new("test", Some("/usr/local/bin/kilo"));
+        let p = KiloCliModelProvider::builder("test")
+            .binary_path(Some("/usr/local/bin/kilo"))
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("/usr/local/bin/kilo"));
     }
 
     #[test]
     fn new_defaults_to_kilo() {
-        let p = KiloCliModelProvider::new("test", None);
+        let p = KiloCliModelProvider::builder("test")
+            .binary_path(None)
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("kilo"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = KiloCliModelProvider::new("test", Some("   "));
+        let p = KiloCliModelProvider::builder("test")
+            .binary_path(Some("   "))
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("kilo"));
     }
 
