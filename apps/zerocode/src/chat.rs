@@ -961,6 +961,7 @@ impl Chat {
                     sessions,
                     list_state,
                     crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
                 );
             }
             ChatPhase::PickCwd { explorer, .. } => {
@@ -2650,6 +2651,7 @@ impl crate::widgets::HelpContext for Chat {
                             .chain(action_key_labels(C::NewSession)),
                         crate::i18n::t("zc-chat-help-new-session"),
                     ),
+                    E::desc(crate::i18n::t("zc-chat-help-acp-memory")),
                 ])
             }
             ChatPhase::Error(_) => {
@@ -3103,6 +3105,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
                 sessions,
                 list_state,
                 crate::i18n::t("zc-chat-session-list-switch-title"),
+                None,
             );
         }
         SessionOverlay::None => {}
@@ -4187,12 +4190,29 @@ fn session_list_overlay_area(area: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+/// Rows to reserve for the dim footer `note` so it renders in full when
+/// wrapped at `inner_width`. ratatui wraps the note on word boundaries; for the
+/// session-list disclosure copy that tracks `ceil(display_width / inner_width)`.
+/// Capped at [`MAX_NOTE_ROWS`] so the note can never swallow the whole list.
+fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+
+    const MAX_NOTE_ROWS: u16 = 3;
+
+    if inner_width == 0 {
+        return 1;
+    }
+    let width = UnicodeWidthStr::width(note) as u16;
+    width.div_ceil(inner_width).clamp(1, MAX_NOTE_ROWS)
+}
+
 fn render_session_list_overlay(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionEntry],
     list_state: &ListState,
     title: String,
+    note: Option<String>,
 ) {
     let overlay_area = session_list_overlay_area(area);
 
@@ -4207,6 +4227,27 @@ fn render_session_list_overlay(
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
 
+    // Reserve enough dim footer rows for the note (if any) to render in full at
+    // the current inner width, so narrow terminals (e.g. the 80x24 default)
+    // don't silently drop the second wrapped line of the memory-isolation
+    // disclosure. The reserve is capped so it never eats the whole list, and is
+    // only carved out when at least one list row survives.
+    let (list_area, note_area) = match &note {
+        Some(text) => {
+            let reserved = note_reserved_rows(text, inner.width);
+            if inner.height > reserved {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(reserved)])
+                    .split(inner);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                (inner, None)
+            }
+        }
+        None => (inner, None),
+    };
+
     let items: Vec<ListItem> = sessions
         .iter()
         .map(|s| {
@@ -4220,7 +4261,13 @@ fn render_session_list_overlay(
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     // Copy state to pass as mutable.
     let mut ls = *list_state;
-    f.render_stateful_widget(list, inner, &mut ls);
+    f.render_stateful_widget(list, list_area, &mut ls);
+
+    if let (Some(text), Some(note_area)) = (note, note_area) {
+        let note_line =
+            Paragraph::new(Span::styled(text, theme::dim_style())).wrap(Wrap { trim: true });
+        f.render_widget(note_line, note_area);
+    }
 }
 
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
@@ -9017,6 +9064,7 @@ mod tests {
                     &sessions,
                     &list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
                 );
             })
             .expect("draw session list overlay");
@@ -9039,6 +9087,207 @@ mod tests {
             selected_text_cell.style().bg,
             Some(expected_bg),
             "selected session row must keep the themed fill background"
+        );
+    }
+
+    /// Collects every row of `area` in `terminal`'s buffer into a single
+    /// newline-joined string, for substring assertions on rendered text.
+    fn overlay_text(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        area: Rect,
+    ) -> String {
+        let buf = terminal.backend().buffer();
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn session_list_overlay_renders_memory_isolation_note() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // Mirrors the Code (ACP) pre-session picker call site: the
+                // resume title plus the memory-isolation note.
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
+                );
+            })
+            .expect("draw session list overlay with note");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            text.contains("resumable"),
+            "Code session picker must state history is saved & resumable: {text:?}"
+        );
+        assert!(
+            text.contains("isolated"),
+            "Code session picker must state persistent memory is isolated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_list_overlay_renders_full_memory_note_on_narrow_terminal() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Regression guard: at the ubiquitous 80-column default the centered
+        // overlay is narrow enough that the note wraps to a second line. A
+        // single reserved row would drop the "isolated" half; the reservation
+        // must grow to keep the full disclosure visible.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
+                );
+            })
+            .expect("draw session list overlay with note at 80 cols");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            text.contains("resumable"),
+            "80-col Code session picker must state history is saved & resumable: {text:?}"
+        );
+        assert!(
+            text.contains("isolated"),
+            "80-col Code session picker must show the full note incl. persistent \
+             memory isolation (second wrapped line must not be dropped): {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_switch_overlay_omits_memory_isolation_note() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // Mirrors the in-session switch overlay call site (shared by
+                // both panes): no `note`, so the Code-only copy must not
+                // leak into this Chat-reachable path.
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
+                );
+            })
+            .expect("draw session switch overlay without note");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            !text.contains("resumable") && !text.contains("isolated"),
+            "in-session switch overlay must not render the Code memory-isolation note: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_session_help_context_states_memory_isolation() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickSession {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+            agents: Vec::new(),
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help
+            .entries
+            .iter()
+            .any(|e| e.action.contains("resumable") && e.action.contains("isolated"));
+        assert!(
+            has_memory_note,
+            "Code session picker help must explain history is saved & resumable while \
+             persistent memory is isolated: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_agent_help_context_omits_memory_isolation_note() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        // Default phase is PickAgent — not the Code session picker — for
+        // both Chat and Acp panes, so the memory-isolation entry must not
+        // appear here.
+        let chat = Chat::new(client, PaneKind::Chat);
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
+        assert!(
+            !has_memory_note,
+            "non-PickSession help (e.g. Chat pane) must not surface the Code-only \
+             memory-isolation note: {help:?}"
         );
     }
 
