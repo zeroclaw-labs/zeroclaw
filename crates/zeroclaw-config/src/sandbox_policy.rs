@@ -20,6 +20,17 @@ pub struct EffectiveSandboxInputs {
     pub allow_read: Vec<String>,
     /// See [`Self::from_profile`] for the full `allow_write` precedence rules.
     pub allow_write: Vec<String>,
+    /// Whether `allow_write` came from an operator-supplied `sandbox_policy.allow_write
+    /// = Some(_)` (`true`) rather than the omitted-field `None` fallback (`false`).
+    /// `DEFAULT_ALLOW_WRITE` (`[".", "/tmp"]`) exists to satisfy OS-sandbox bind-mount
+    /// needs for the fallback case, not as an app-layer grant — `sandbox_derived_tiers`
+    /// (`crate::policy`) uses this flag to tell an explicit `allow_write = ["/tmp"]`
+    /// apart from the same value arriving via fallback, so an explicit grant is not
+    /// silently stripped from the app-layer write-only tier. `workspace_only = true`
+    /// forcing `allow_write` to `[workspace]` does not set this — that path is a
+    /// deliberate override of whatever `allow_write` held, not an operator grant this
+    /// flag protects.
+    pub allow_write_is_explicit: bool,
     /// `sandbox_policy.deny_write.unwrap_or_default()` plus the
     /// [`MANDATORY_DENY_WRITE`] guardrail list when
     /// `mandatory_deny_write_enabled` is true.
@@ -59,6 +70,7 @@ impl EffectiveSandboxInputs {
             .allow_read
             .clone()
             .unwrap_or_else(|| profile.allowed_roots.clone());
+        let allow_write_is_explicit = sp.allow_write.is_some();
         let allow_write = resolve_allow_write(sp, profile, workspace);
         let deny_write = resolve_deny_write(sp);
 
@@ -66,6 +78,7 @@ impl EffectiveSandboxInputs {
             deny_read,
             allow_read,
             allow_write,
+            allow_write_is_explicit,
             deny_write,
             mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
             allowed_domains: sp.allowed_domains.clone(),
@@ -81,7 +94,8 @@ impl EffectiveSandboxInputs {
     /// `SandboxPolicy::default()`, which has no `RiskProfileConfig` to fall
     /// back to.
     fn from_bare_config(sp: &SandboxPolicyConfig, workspace: &Path) -> Self {
-        let allow_write = if sp.allow_write.is_some() {
+        let allow_write_is_explicit = sp.allow_write.is_some();
+        let allow_write = if allow_write_is_explicit {
             sp.allow_write.clone().unwrap_or_default()
         } else {
             DEFAULT_ALLOW_WRITE
@@ -94,6 +108,7 @@ impl EffectiveSandboxInputs {
             deny_read: sp.deny_read.clone().unwrap_or_default(),
             allow_read: sp.allow_read.clone().unwrap_or_default(),
             allow_write,
+            allow_write_is_explicit,
             deny_write: resolve_deny_write(sp),
             mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
             allowed_domains: sp.allowed_domains.clone(),

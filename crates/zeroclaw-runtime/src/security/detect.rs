@@ -265,54 +265,58 @@ pub fn create_sandbox(
 
     // If explicitly disabled, return noop
     if matches!(backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
-        warn_if_denials_unenforced(policy, "none");
+        warn_if_denials_unenforced(policy);
         return Arc::new(super::traits::NoopSandbox);
     }
 
     match backend {
         SandboxBackend::Auto | SandboxBackend::None => {
             let sandbox = detect_best_sandbox(runtime_kind, workspace_dir);
-            warn_if_denials_unenforced(policy, sandbox.name());
+            warn_if_denials_unenforced(policy);
             sandbox
         }
         requested => {
             let selected = configured_backend_selection(requested, runtime_kind, workspace_dir);
             if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
-                warn_if_denials_unenforced(policy, sandbox.name());
+                warn_if_denials_unenforced(policy);
                 return sandbox;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
-            warn_if_denials_unenforced(policy, "none");
+            warn_if_denials_unenforced(policy);
             Arc::new(super::traits::NoopSandbox)
         }
     }
 }
 
 /// Whether `policy`'s `deny_write`/`deny_read` denials are NOT enforced by
-/// the active sandbox backend. `true` whenever the resolved backend is
-/// `"none"` (`NoopSandbox`, application-layer security only) and the policy
-/// carries at least one denial — file-tool enforcement (`SecurityPolicy`,
-/// `zeroclaw-config`) still applies in that case, but arbitrary shell/script
-/// child-process I/O does not honor these lists until per-backend OS sandbox
-/// wiring lands (RFC 6996 Phase 2). Pure predicate, split out from
+/// any active sandbox backend. Currently always `true` whenever any denial
+/// is configured: `create_selected_sandbox` does not forward `policy` to any
+/// backend constructor (Landlock/Bubblewrap/Seatbelt/Docker/Firejail), so
+/// enforcement against arbitrary shell/script child-process I/O is
+/// application-layer-only (`SecurityPolicy`, `zeroclaw-config`) regardless of
+/// which backend is selected, until per-backend OS sandbox wiring lands (RFC
+/// 6996 Phase 2). Deliberately backend-name-agnostic — a backend that merely
+/// *activates* does not yet *enforce* these fields; once a backend PR wires
+/// `policy` through to its constructor, that backend should gain a real
+/// capability signal here, not before. Pure predicate, split out from
 /// [`warn_if_denials_unenforced`] so it is unit-testable without a logging
 /// harness.
 #[must_use]
-fn sandbox_denials_unenforced(policy: &SandboxPolicy, active_backend_name: &str) -> bool {
-    active_backend_name == "none" && (!policy.deny_write.is_empty() || !policy.deny_read.is_empty())
+fn sandbox_denials_unenforced(policy: &SandboxPolicy) -> bool {
+    !policy.deny_write.is_empty() || !policy.deny_read.is_empty()
 }
 
 /// Emit a one-time-per-call WARN naming the enforcement gap when denials are
-/// configured but the active backend cannot enforce them against shell/script
+/// configured but no active backend can enforce them against shell/script
 /// child-process I/O. See [`sandbox_denials_unenforced`].
-fn warn_if_denials_unenforced(policy: &SandboxPolicy, active_backend_name: &str) {
-    if sandbox_denials_unenforced(policy, active_backend_name) {
+fn warn_if_denials_unenforced(policy: &SandboxPolicy) {
+    if sandbox_denials_unenforced(policy) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "sandbox_policy denials are enforced for file tools only; shell child processes \
-             are not confined (no OS sandbox backend active)"
+             are not confined (no OS sandbox backend forwards this policy yet)"
         );
     }
 }
@@ -657,39 +661,35 @@ mod tests {
     // predicate IS the enforcement-owner contract this WARN exists to name.
 
     #[test]
-    fn sandbox_denials_unenforced_when_backend_none_and_deny_write_configured() {
+    fn sandbox_denials_unenforced_when_deny_write_configured() {
         let policy = default_policy();
         assert!(
             !policy.deny_write.is_empty(),
             "default profile carries the mandatory deny_write guardrail list"
         );
-        assert!(sandbox_denials_unenforced(&policy, "none"));
+        assert!(sandbox_denials_unenforced(&policy));
     }
 
     #[test]
-    fn sandbox_denials_unenforced_when_backend_none_and_deny_read_configured() {
+    fn sandbox_denials_unenforced_when_deny_read_configured() {
         let mut policy = default_policy();
         policy.deny_write = Vec::new();
         policy.deny_read = vec![std::path::PathBuf::from("/secret")];
-        assert!(sandbox_denials_unenforced(&policy, "none"));
+        assert!(sandbox_denials_unenforced(&policy));
     }
 
     #[test]
-    fn sandbox_denials_enforced_when_backend_is_active() {
+    fn sandbox_denials_unenforced_true_regardless_of_backend_name() {
+        // No backend constructor receives `policy` today (`create_selected_sandbox`
+        // takes only workspace_dir: landlock/bubblewrap/sandbox-exec/docker/
+        // firejail all wire the same as "none" here), so the predicate takes
+        // no backend argument at all — an active-looking backend must not
+        // suppress the warning. A prior revision of this test asserted the
+        // opposite and was itself the bug: it treated backend presence as
+        // proof of enforcement.
         let policy = default_policy();
         assert!(!policy.deny_write.is_empty());
-        for backend in [
-            "landlock",
-            "bubblewrap",
-            "sandbox-exec",
-            "docker",
-            "firejail",
-        ] {
-            assert!(
-                !sandbox_denials_unenforced(&policy, backend),
-                "backend {backend} claims active enforcement; predicate must not warn"
-            );
-        }
+        assert!(sandbox_denials_unenforced(&policy));
     }
 
     #[test]
@@ -697,7 +697,7 @@ mod tests {
         let mut policy = default_policy();
         policy.deny_write = Vec::new();
         policy.deny_read = Vec::new();
-        assert!(!sandbox_denials_unenforced(&policy, "none"));
+        assert!(!sandbox_denials_unenforced(&policy));
     }
 
     #[test]
