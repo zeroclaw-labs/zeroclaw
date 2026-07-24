@@ -11710,7 +11710,10 @@ pub struct RuntimeProfileConfig {
     pub max_delegation_depth: u32,
     /// Delegate call timeout in seconds. `None` inherits global delegate timeout.
     pub delegation_timeout_secs: Option<u64>,
-    /// Agentic delegate run timeout in seconds. `None` inherits global.
+    /// Agentic run deadline in seconds. Bounds both agentic delegate runs
+    /// (`None` inherits the global delegate timeout) and this agent's cron
+    /// jobs (`None` or `0` falls back to the scheduler's own agent-job
+    /// default; delegate runs pass `0` through as-is).
     pub agentic_timeout_secs: Option<u64>,
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.

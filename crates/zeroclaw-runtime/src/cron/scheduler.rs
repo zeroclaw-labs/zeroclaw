@@ -22,6 +22,11 @@ use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+// Far higher than the shell cap because multi-turn agent runs with tool calls
+// legitimately run long; this bound exists to free the in-flight lock on a hung
+// run, not to police normal agent runtime.
+const AGENT_JOB_TIMEOUT_SECS: u64 = 1800;
+const AGENT_JOB_TIMEOUT_PREFIX: &str = "agent job timed out after ";
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -562,8 +567,12 @@ async fn execute_job_with_retry(
             return (true, last_output);
         }
 
-        if last_output.starts_with("blocked by security policy:") {
-            // Deterministic policy violations are not retryable.
+        if last_output.starts_with("blocked by security policy:")
+            || last_output.starts_with(AGENT_JOB_TIMEOUT_PREFIX)
+        {
+            // Deterministic policy violations and agent-run timeouts are not
+            // retryable: a hung provider/tool will hang again, and retrying
+            // would occupy the job's slot for `retries + 1` full timeouts.
             return (false, last_output);
         }
 
@@ -712,11 +721,69 @@ async fn execute_and_persist_job(
     (job.id.clone(), success, output)
 }
 
+/// Resolve the wall-clock deadline for an agent cron job's `agent::run`
+/// call: the owning agent's runtime profile `agentic_timeout_secs` override,
+/// falling back to `AGENT_JOB_TIMEOUT_SECS`.
+fn resolve_agent_job_timeout(config: &Config, agent_alias: &str) -> Duration {
+    Duration::from_secs(
+        config
+            .runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.agentic_timeout_secs)
+            // Config does not validate this per-profile field; a 0 override
+            // would time every job out instantly and non-retryably, so treat
+            // it as unset and fall back to the default.
+            .filter(|&secs| secs > 0)
+            .unwrap_or(AGENT_JOB_TIMEOUT_SECS),
+    )
+}
+
+/// Best-effort purge of an Isolated cron run's per-run memory session. The
+/// Isolated session path (`cron-{run_session_id}`) is unique per run, so a
+/// timed-out run whose dropped agent future may still have an in-flight
+/// blocking sqlite write races only its own abandoned rows; a no-op for
+/// Main-target runs (they share the stable `main` session).
+async fn purge_isolated_session(
+    config: &Config,
+    job: &CronJob,
+    agent_alias: &str,
+    session_path: &std::path::Path,
+) {
+    if !matches!(job.session_target, SessionTarget::Isolated) {
+        return;
+    }
+    let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+        "cli:{}",
+        session_path.display()
+    ));
+    if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+        config,
+        agent_alias,
+        config
+            .model_provider_for_agent(agent_alias)
+            .and_then(|e| e.api_key.as_deref()),
+    )
+    .await
+    {
+        let _ = mem.purge_session(&mem_session_key).await;
+    }
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+) -> (bool, String) {
+    let timeout = resolve_agent_job_timeout(config, agent_alias);
+    run_agent_job_with_timeout(config, security, agent_alias, job, timeout).await
+}
+
+async fn run_agent_job_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    job: &CronJob,
+    timeout: Duration,
 ) -> (bool, String) {
     let subagent_ctx = match crate::subagent::SubAgentSpawn::for_agent(config, agent_alias)
         .and_then(|spawn| spawn.build(crate::subagent::SubAgentOverrides::default()))
@@ -791,26 +858,46 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
-                )
-                .instrument(subagent_span),
+            match time::timeout(
+                timeout,
+                Box::pin(
+                    crate::agent::run(
+                        cron_config,
+                        agent_alias,
+                        Some(prefixed_prompt),
+                        None,
+                        model_override,
+                        config
+                            .model_provider_for_agent(agent_alias)
+                            .and_then(|e| e.temperature),
+                        vec![],
+                        false,
+                        Some(session_path.clone()),
+                        job.allowed_tools.clone(),
+                        zeroclaw_api::ingress::TurnOrigin::Cron,
+                        run_overrides,
+                    )
+                    .instrument(subagent_span),
+                ),
             )
             .await
+            {
+                Ok(run_result) => run_result,
+                Err(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": timeout.as_secs()})),
+                        "Cron job: agent run timed out"
+                    );
+                    purge_isolated_session(config, job, agent_alias, &session_path).await;
+                    return (
+                        false,
+                        format!("{AGENT_JOB_TIMEOUT_PREFIX}{}s", timeout.as_secs()),
+                    );
+                }
+            }
         }
     };
 
@@ -824,23 +911,7 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
-            if matches!(job.session_target, SessionTarget::Isolated) {
-                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                    "cli:{}",
-                    session_path.display()
-                ));
-                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                    config,
-                    agent_alias,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.api_key.as_deref()),
-                )
-                .await
-                {
-                    let _ = mem.purge_session(&mem_session_key).await;
-                }
-            }
+            purge_isolated_session(config, job, agent_alias, &session_path).await;
             (false, format!("agent job failed: {e}"))
         }
     }
@@ -1795,6 +1866,238 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
+    }
+
+    /// Bind a loopback listener that accepts connections but never writes a
+    /// response, simulating a provider whose HTTP request hangs forever.
+    /// Each accepted connection is held open (not reset) well past the
+    /// timeouts under test below, so the client observes a genuine hang
+    /// rather than a fast connection-refused/reset error. The returned
+    /// counter records how many connections were accepted, so a test can
+    /// assert the exact number of provider HTTP attempts.
+    async fn spawn_hanging_server() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_task = std::sync::Arc::clone(&accepts);
+        ::zeroclaw_spawn::spawn!(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ::zeroclaw_spawn::spawn!(async move {
+                    let _stream = stream;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (addr, accepts)
+    }
+
+    /// `test_config` with `TEST_AGENT` repointed at a `custom` (openai-compatible)
+    /// model_provider whose `uri` targets `addr`. `openrouter`'s family factory
+    /// hardcodes its base URL and ignores the config `uri` override, so the
+    /// `custom` family is used here specifically because it is the one slot
+    /// that honors `uri` end to end — this is what lets a hung listener stand
+    /// in for a hung provider HTTP call in `agent::run`.
+    async fn test_config_with_hanging_provider(
+        tmp: &TempDir,
+        addr: std::net::SocketAddr,
+    ) -> Config {
+        let mut config = test_config(tmp).await;
+        config.providers.models.custom.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some(format!("http://{addr}")),
+                    api_key: Some("test-key".to_string()),
+                    model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider =
+            format!("custom.{TEST_AGENT}").into();
+        config
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_with_timeout_reports_timeout_for_hung_provider() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let config = test_config_with_hanging_provider(&tmp, addr).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = test_security(&config);
+
+        // 750ms is generous enough to survive loaded mac/arm64 CI without
+        // preempting a fast-failing run, while keeping the test short.
+        let started = std::time::Instant::now();
+        let (success, output) = Box::pin(run_agent_job_with_timeout(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            Duration::from_millis(750),
+        ))
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "run_agent_job_with_timeout did not return promptly: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_releases_lock_after_agent_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("agent-timeout-release");
+        let (job_id, success, output) = Box::pin(execute_and_persist_job(
+            &config, &security, TEST_AGENT, &job, &component,
+        ))
+        .await;
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+
+        // The lock claimed for this run must be released once the timed-out
+        // run completes, so the job is selectable again on the next poll
+        // instead of being wedged until process restart.
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released after an agent-run timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_job_with_retry_does_not_retry_agent_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+        // Retries would otherwise occupy the job's slot for `retries + 1`
+        // full timeouts; a non-retryable timeout must attempt exactly once.
+        config.reliability.scheduler_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = test_security(&config);
+
+        let (success, output) =
+            Box::pin(execute_job_with_retry(&config, &security, TEST_AGENT, &job)).await;
+
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        // Exactly one provider HTTP attempt: `scheduler_retries = 2` would
+        // drive three connections if the timeout were retried.
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "agent timeout must not be retried"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_job_timeout_honors_runtime_profile_override() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                agentic_timeout_secs: Some(7),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_agent_job_timeout(&config, TEST_AGENT),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn resolve_agent_job_timeout_falls_back_to_default_without_override() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_agent_job_timeout(&config, TEST_AGENT),
+            Duration::from_secs(AGENT_JOB_TIMEOUT_SECS)
+        );
     }
 
     #[tokio::test]
