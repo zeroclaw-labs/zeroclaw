@@ -976,6 +976,12 @@ impl TelegramChannel {
                             .cloned()
                             .collect::<Vec<_>>()
                             .concat();
+                        // A partial failure still physically sent `e.delivered`
+                        // chunks; record it so the next pace (finalize / approval
+                        // prompt) spaces off the real last send.
+                        if e.delivered > 0 {
+                            draft.last_sent_at = Some(std::time::Instant::now());
+                        }
                     }
                 }
                 ::zeroclaw_log::record!(
@@ -1018,14 +1024,61 @@ impl TelegramChannel {
         // Wait out any in-flight turn flush so the final send cannot interleave
         // with an intermediate one for the same draft.
         let _flush_guard = flush_lock.lock().await;
-        let (thread_id, last_sent_at) = {
+        let (thread_id, mut last_sent_at, pending) = {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.remove(&key) else {
                 return Ok(());
             };
-            (draft.thread_id.or(parsed_thread), draft.last_sent_at)
+            // Any intermediate narration a partial flush left undelivered must be
+            // sent before the final turn, otherwise removing the draft here loses
+            // it. `strip_prefix` yields the unsent suffix; `None` (sanitization
+            // rewrote already-delivered text) skips the resend, matching
+            // `flush_unsent`'s own resync behavior.
+            let pending = draft
+                .latest_visible
+                .strip_prefix(draft.sent_text.as_str())
+                .map(|unsent| {
+                    (
+                        unsent.to_string(),
+                        draft.delivered_chunks,
+                        draft.delivered_prefix.clone(),
+                    )
+                });
+            (
+                draft.thread_id.or(parsed_thread),
+                draft.last_sent_at,
+                pending,
+            )
         };
         self.last_draft_edit.lock().remove(&chat_id);
+
+        // Deliver the pending intermediate suffix before the final turn, resuming
+        // past already-accepted physical chunks (validated prefix, same guard as
+        // `flush_unsent`) so nothing is duplicated, and record the successful send
+        // so the final turn still paces off it.
+        if let Some((unsent, delivered_chunks, delivered_prefix)) = pending {
+            let cleaned = strip_tool_call_tags(unsent.trim());
+            let cleaned = cleaned.trim();
+            if !cleaned.is_empty() {
+                let chunks = split_message_for_telegram(cleaned);
+                let skip = if delivered_chunks > 0
+                    && chunks.len() >= delivered_chunks
+                    && chunks[..delivered_chunks].concat() == delivered_prefix
+                {
+                    delivered_chunks
+                } else {
+                    0
+                };
+                self.pace_multi_message_send(last_sent_at).await;
+                if self
+                    .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
+                    .await
+                    .is_ok()
+                {
+                    last_sent_at = Some(std::time::Instant::now());
+                }
+            }
+        }
 
         let (text_without_markers, attachments) = parse_attachment_markers(&text);
         // `finalize_draft` receives the final agent-turn text (`delivered_response`),
@@ -5879,6 +5932,74 @@ mod tests {
         ch.finalize_draft("123", &draft_id, "Final answer", false)
             .await
             .expect("finalize sends unsent remainder");
+    }
+
+    /// Regression: a partial physical failure on an intermediate turn leaves an
+    /// undelivered narration suffix in the draft state. If the next lifecycle
+    /// event is finalization, that suffix must still be delivered (resuming past
+    /// the already-accepted chunk, never re-sending it) before the final turn, so
+    /// no narration is lost and no accepted chunk is duplicated.
+    #[tokio::test]
+    async fn finalize_delivers_pending_intermediate_suffix_and_skips_accepted_chunk() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+        let recipient = "123";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+
+        // Two-chunk intermediate narration; chunk 0 (all 'A') was accepted by a
+        // prior partial flush that then failed, leaving the 'B' suffix unsent.
+        let narration = format!(
+            "{}{}",
+            "A".repeat(TELEGRAM_MAX_MESSAGE_LENGTH),
+            "B".repeat(500)
+        );
+        let chunks = split_message_for_telegram(&narration);
+        assert!(chunks.len() >= 2, "narration must span multiple chunks");
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut st = MultiDraftState::new(None);
+            st.latest_visible = narration.clone();
+            st.sent_text = String::new();
+            st.delivered_chunks = 1;
+            st.delivered_prefix = chunks[..1].concat();
+            drafts.insert(TelegramChannel::multi_draft_key(recipient, &draft_id), st);
+        }
+
+        ch.finalize_draft(recipient, &draft_id, "Final answer", false)
+            .await
+            .expect("finalize delivers the pending suffix then the final turn");
+
+        let reqs = mock_server.received_requests().await.unwrap();
+        let bodies: Vec<String> = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            !bodies.iter().any(|b| b.contains(&"A".repeat(200))),
+            "the already-accepted chunk 0 must not be re-sent"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains(&"B".repeat(200))),
+            "the pending intermediate suffix must be delivered on finalize"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("Final answer")),
+            "the final turn must still be delivered"
+        );
     }
 
     #[tokio::test]
