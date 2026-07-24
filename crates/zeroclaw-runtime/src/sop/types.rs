@@ -150,7 +150,7 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
-    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
+    /// Inbound HTTP request. Live: gateway `/sop/*` and SOP-first `/webhook` routes.
     #[trigger(display = "path")]
     Webhook {
         /// Request path matched exactly against the event path.
