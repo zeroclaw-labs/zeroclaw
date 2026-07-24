@@ -9588,4 +9588,174 @@ mod tests {
             "session_end must fire when a real session is closed"
         );
     }
+
+    /// Regression: Usage event carries vision provider's context_window when
+    /// image triggers vision routing. Base provider A = 128k, vision provider B = 1M.
+    /// The Usage event's provider_ref must be B and model_context_window = 1M.
+    #[tokio::test]
+    async fn context_usage_vision_routing_carries_vision_provider_window() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig, MultimodalConfig};
+        use zeroclaw_providers::ChatRequest;
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_api::attribution::{Attributable, Role, ProviderKind, ModelProviderKind};
+        use async_trait::async_trait;
+        use crate::rpc::session::SessionStore;
+        use crate::rpc::turn::execute_turn;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::NoopObserver;
+        use crate::cost::CostTracker;
+        use crate::agent::agent::Agent;
+        use zeroclaw_memory::Memory;
+        use tokio::sync::{Mutex, mpsc};
+        use tokio_util::sync::CancellationToken;
+        use zeroclaw_api::agent::{TurnEvent, TurnAttribution, TurnOutcome};
+
+        // Base provider (text-only) - 128k window
+        struct BaseProvider;
+        #[async_trait]
+        impl ModelProvider for BaseProvider {
+            async fn chat_with_system(&self, _sys: Option<&str>, _msg: &str, _mdl: &str, _tmp: Option<f64>) -> anyhow::Result<String> {
+                Ok("base response".into())
+            }
+            async fn chat(&self, _req: ChatRequest<'_>, _mdl: &str, _tmp: Option<f64>) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("base".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(50), cached_input_tokens: None, output_tokens: Some(25),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl Attributable for BaseProvider {
+            fn role(&self) -> Role { Role::Provider(ProviderKind::Model(ModelProviderKind::Custom)) }
+            fn alias(&self) -> &str { "base-provider" }
+        }
+
+        // Vision provider (multimodal) - 1M window
+        struct VisionProvider;
+        #[async_trait]
+        impl ModelProvider for VisionProvider {
+            async fn chat_with_system(&self, _sys: Option<&str>, _msg: &str, _mdl: &str, _tmp: Option<f64>) -> anyhow::Result<String> {
+                Ok("vision response".into())
+            }
+            async fn chat(&self, _req: ChatRequest<'_>, _mdl: &str, _tmp: Option<f64>) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("vision".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(200), cached_input_tokens: None, output_tokens: Some(100),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl Attributable for VisionProvider {
+            fn role(&self) -> Role { Role::Provider(ProviderKind::Model(ModelProviderKind::Custom)) }
+            fn alias(&self) -> &str { "vision-provider" }
+        }
+
+        // Config with multimodal.vision_model_provider = "custom.vision-provider"
+        let mut config = Config {
+            config_path: tempfile::TempDir::new().unwrap().path().join("config.toml"),
+            data_dir: tempfile::TempDir::new().unwrap().path().join("data"),
+            ..Default::default()
+        };
+
+        // Base provider A (static binding)
+        let base_p = config.providers.models.ensure("custom", "base-provider").unwrap();
+        base_p.api_key = Some("key-a".into());
+        base_p.uri = Some("http://base".into());
+        base_p.model = Some("model-a".into());
+        base_p.context_window = Some(128_000);
+
+        // Vision provider B
+        let vision_p = config.providers.models.ensure("custom", "vision-provider").unwrap();
+        vision_p.api_key = Some("key-b".into());
+        vision_p.uri = Some("http://vision".into());
+        vision_p.model = Some("model-b".into());
+        vision_p.context_window = Some(1_000_000);
+
+        config.agents = HashMap::from([(
+            "vision-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.base-provider".into(), // Static = A
+                runtime_profile: "test-profile".into(),
+                risk_profile: "default".into(),
+                multimodal: Some(MultimodalConfig {
+                    vision_model_provider: Some("custom.vision-provider".into()), // Vision = B
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )]);
+        config.runtime_profiles.insert("test-profile".into(), RuntimeProfileConfig::default());
+        config.risk_profiles.insert("default".into(), Default::default());
+
+        // Create session + agent via RPC dispatcher
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let workspace_dir = tempfile::TempDir::new().unwrap();
+        let session_res = dispatcher.handle_session_new_for_test(&json!({
+            "agent_alias": "vision-agent",
+            "cwd": workspace_dir.path(),
+        })).await.expect("session/new");
+        let session_id = session_res.get("session_id").and_then(|v| v.as_str()).unwrap().to_string();
+
+        // Get the agent and send a turn with image marker (triggers vision routing)
+        let agent = dispatcher.ctx.sessions.get_agent(&session_id).await.expect("agent exists");
+
+        // Capture events via callback (production pattern: closure returning async block)
+        let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(10);
+        let capturing_callback = move |event: TurnEvent| {
+            let tx = event_tx.clone();
+            async move { tx.send(event).await.ok(); }
+        };
+
+        // Execute turn with image content - data URI format works in-memory
+        let outcome = execute_turn(
+            agent,
+            "analyze this image ![image](data:image/png;base64,iVBORw0KGgo=)".to_string(), // image marker triggers vision
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some(session_id.clone()),
+                agent_alias: "vision-agent".into(),
+                model_provider: "custom.base-provider".into(),
+                model: "model-a".into(),
+                channel: "rpc",
+            },
+            None,
+            capturing_callback,
+        ).await.expect("turn should complete");
+
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+
+        // Collect events
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+
+        // Find Usage event - must have vision provider's ref and window
+        let usage = events.iter().find_map(|e| match e {
+            TurnEvent::Usage { provider_ref, .. } if provider_ref == "custom.vision-provider" => Some(e),
+            _ => None,
+        }).expect("Usage event with vision provider_ref must be emitted");
+
+        // Verify the provider_ref is the vision provider (not base provider)
+        let provider_ref = match usage {
+            TurnEvent::Usage { provider_ref, .. } => provider_ref,
+            _ => unreachable!(),
+        };
+        assert_eq!(provider_ref, "custom.vision-provider",
+            "Usage.provider_ref must be vision provider (B), not base provider (A)");
+
+        // Verify model_context_window resolution via callback path
+        let cfg = dispatcher.ctx.config.read();
+        let window = crate::agent::resolve_live_model_context_window(&cfg, provider_ref);
+        assert_eq!(window, Some(1_000_000),
+            "Usage event from vision routing must resolve to vision provider's context_window (1M)");
+    }
 }
