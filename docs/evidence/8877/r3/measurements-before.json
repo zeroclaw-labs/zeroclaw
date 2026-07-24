@@ -1,0 +1,32 @@
+{
+  "url": "http://127.0.0.1:5273/",
+  "viewport": "1440x900",
+  "timestamp": "2026-07-15T09:08:36.335Z",
+  "measurements": {
+    "nav": {
+      "scrollWidth": 55,
+      "clientWidth": 55,
+      "overflowX": "hidden",
+      "overflowY": "auto",
+      "hasHorizontalOverflow": false
+    },
+    "tooltip": {
+      "left": 64,
+      "top": 75,
+      "width": 79,
+      "height": 26,
+      "gapFromRailRight": 8
+    },
+    "rail": {
+      "right": 56,
+      "width": 56
+    }
+  },
+  "pageErrors": [],
+  "assertion": {
+    "navNoHorizontalOverflow": true,
+    "tooltipRendered": true,
+    "tooltipGapMatchesExpected": true
+  },
+  "pass": true
+}
