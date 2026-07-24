@@ -57,32 +57,88 @@ struct ToolCallRecord {
     result_hash: u64,
 }
 
-/// Produce a deterministic hash for a JSON value by recursively sorting
-/// object keys before serialisation.  This ensures `{"a":1,"b":2}` and
-/// `{"b":2,"a":1}` hash identically.
+/// Produce a deterministic hash for a JSON value that is invariant under
+/// object-key reordering.  Implemented as a streaming walker that feeds
+/// structural tags + sorted keys + leaves directly to a [`Hasher`], so the
+/// only allocations along the path are the per-vector key slices plus a
+/// short owned `String` per numeric leaf for the canonical-text form.
+///
+/// The hot path is `record()` in `collect_tool_results`, called once per
+/// successful tool call inside the agent loop.  The previous implementation
+/// (`canonicalise` + `serde_json::to_string`) deep-cloned the entire args
+/// tree and then serialised it, so on long tool-heavy turns each call added
+/// one tree-sized `Value` clone plus one proportional owned `String`.
+/// This streaming form avoids both: code review of the walker establishes
+/// the changed allocation shape; the regression suite in this module
+/// (see `streaming_hash_matches_legacy_canonicalise_equivalence`) pins the
+/// resulting equality classes and confirms the walker does not panic on
+/// large inputs. RSS / monotonic-arena behavior is not measured here.
 fn hash_value(value: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    let canonical = serde_json::to_string(&canonicalise(value)).unwrap_or_default();
-    canonical.hash(&mut hasher);
+    hash_value_into(value, &mut hasher);
     hasher.finish()
 }
 
-/// Return a clone of `value` with all object keys sorted recursively.
-fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
+/// Walker backing [`hash_value`].  Emits a deterministic byte stream keyed by
+/// structure: structural tags disambiguate `"123"` (string) from `123`
+/// (number), `true` from `"true"`, `null` from `"null"`.  Object keys are
+/// sorted on the fly; the key→value boundary is marked so two objects with
+/// the same keys and leaves hash identically regardless of insertion order.
+fn hash_value_into<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
     match value {
-        serde_json::Value::Object(map) => {
-            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-            sorted.sort_by_key(|(k, _)| *k);
-            let new_map: serde_json::Map<String, serde_json::Value> = sorted
-                .into_iter()
-                .map(|(k, v)| (k.clone(), canonicalise(v)))
-                .collect();
-            serde_json::Value::Object(new_map)
+        serde_json::Value::Null => {
+            "null".hash(hasher);
+        }
+        serde_json::Value::Bool(b) => {
+            "bool".hash(hasher);
+            b.hash(hasher);
+        }
+        serde_json::Value::Number(n) => {
+            "num".hash(hasher);
+            // Hash the canonical serialized text instead of `Number::hash`.
+            // `serde_json::Number`'s `Hash` impl routes integer `0` and float
+            // `0.0` through `0.0f64.to_bits()` and they collide, and it
+            // normalizes `+0.0` / `-0.0`. The legacy `canonicalise` +
+            // `serde_json::to_string` path produced `"0"`, `"0.0"`, and
+            // `"-0.0"` as distinct tokens; this preserves that equality
+            // classification per the reference oracle.
+            let text = n.to_string();
+            text.len().hash(hasher);
+            text.hash(hasher);
+        }
+        serde_json::Value::String(s) => {
+            "str".hash(hasher);
+            // Length-prefix the string content so that, e.g. ["ab", "c"] and
+            // ["a", "bc"] (different leaf structure) cannot collide.
+            s.len().hash(hasher);
+            s.hash(hasher);
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(canonicalise).collect())
+            "arr".hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_value_into(item, hasher);
+            }
         }
-        other => other.clone(),
+        serde_json::Value::Object(map) => {
+            "obj".hash(hasher);
+            map.len().hash(hasher);
+            // Sort keys on the fly. `Vec<(&String, &Value)>` is the only
+            // allocation; the values themselves are borrowed, so a 1 MB
+            // payload costs (key references + Vec overhead) rather than a
+            // second tree-sized clone.
+            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            for (k, v) in sorted {
+                // Mark the key→value boundary so, e.g. `{"ab":"c"}` and
+                // `{"a":"bc"}` cannot collide on a shared suffix.
+                0u8.hash(hasher);
+                k.len().hash(hasher);
+                k.hash(hasher);
+                1u8.hash(hasher);
+                hash_value_into(v, hasher);
+            }
+        }
     }
 }
 
@@ -684,6 +740,245 @@ mod tests {
             hash_value(&b),
             "nested objects must also be key-order independent"
         );
+    }
+
+    #[test]
+    fn hash_value_distinguishes_string_from_number_and_bool() {
+        // The streaming walker tags leaves by JSON type, so a number `1`,
+        // the string `"1"`, and the bool `true` must all produce distinct
+        // hashes (this used to fall out of serde_json::to_string).
+        let num = json!(1);
+        let str_num = json!("1");
+        let truthy = json!(true);
+        assert_ne!(hash_value(&num), hash_value(&str_num));
+        assert_ne!(hash_value(&num), hash_value(&truthy));
+        assert_ne!(hash_value(&str_num), hash_value(&truthy));
+        assert_ne!(hash_value(&json!(null)), hash_value(&json!("null")));
+    }
+
+    #[test]
+    fn hash_value_distinguishes_array_ordering() {
+        // Arrays are order-sensitive; [1, 2] and [2, 1] must hash differently.
+        assert_ne!(
+            hash_value(&json!([1, 2])),
+            hash_value(&json!([2, 1])),
+            "array ordering is part of the value and must affect the hash"
+        );
+    }
+
+    #[test]
+    fn hash_value_handles_large_args_without_panicking() {
+        // Pin the streaming walker on a payload that would have triggered
+        // a multi-MB transient allocation in the legacy canonicalise +
+        // serde_json::to_string path. We do not assert on allocation count
+        // (test-only instrumentation is brittle on glibc arenas) — we just
+        // assert the hash is stable and the call returns.
+        let big_payload = "x".repeat(1024 * 1024);
+        let args = json!({ "body": big_payload, "kind": "echo" });
+        let h1 = hash_value(&args);
+        let h2 = hash_value(&args);
+        assert_eq!(h1, h2, "hash must be deterministic for the same input");
+
+        // And a permuted key order over the same payload must match.
+        let args_permuted = json!({ "kind": "echo", "body": big_payload });
+        assert_eq!(
+            h1,
+            hash_value(&args_permuted),
+            "key-order independence must hold for large payloads too"
+        );
+    }
+
+    // ── Legacy equivalence oracle ─────────────────────────────────
+
+    /// Legacy canonicalisation: deep-clone with object keys sorted recursively.
+    /// Retained as a **test-only oracle** so the streaming `hash_value` can be
+    /// compared against the old `canonicalise` + `serde_json::to_string` + hash
+    /// path on representative inputs.
+    #[cfg(test)]
+    fn legacy_canonicalise(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                sorted.sort_by_key(|(k, _)| *k);
+                let new_map: serde_json::Map<String, serde_json::Value> = sorted
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), legacy_canonicalise(v)))
+                    .collect();
+                serde_json::Value::Object(new_map)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(legacy_canonicalise).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Legacy hash path: canonicalise → `serde_json::to_string` → `DefaultHasher`.
+    fn legacy_hash(value: &serde_json::Value) -> u64 {
+        use std::hash::Hasher;
+        let canonical = serde_json::to_string(&legacy_canonicalise(value)).unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Equivalence battery: the streaming `hash_value` must classify the same
+    /// value pairs as equal or different as the legacy `canonicalise` +
+    /// `serde_json::to_string` + hash path across nested objects, arrays of
+    /// objects, large and escaped strings, numbers, booleans, nulls, and mixed
+    /// values.
+    #[test]
+    fn streaming_hash_matches_legacy_canonicalise_equivalence() {
+        let cases: &[(&str, serde_json::Value, serde_json::Value, bool)] = &[
+            // Same logical content, different key order → equal
+            (
+                "key-order",
+                json!({"alpha": 1, "beta": 2}),
+                json!({"beta": 2, "alpha": 1}),
+                true,
+            ),
+            // Nested objects, key-order invariant
+            (
+                "nested-objects",
+                json!({"outer": {"inner": {"a": 1, "b": 2}}}),
+                json!({"outer": {"inner": {"b": 2, "a": 1}}}),
+                true,
+            ),
+            // Arrays of objects
+            (
+                "array-of-objects",
+                json!({"items": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]}),
+                json!({"items": [{"y": 2, "x": 1}, {"y": 4, "x": 3}]}),
+                true,
+            ),
+            // Mixed values: null, bool, number, string
+            (
+                "mixed-leaves",
+                json!({"n": null, "b": true, "num": 42, "s": "hello"}),
+                json!({"s": "hello", "b": true, "n": null, "num": 42}),
+                true,
+            ),
+            // Different string values → not equal
+            (
+                "different-string",
+                json!({"x": "a"}),
+                json!({"x": "b"}),
+                false,
+            ),
+            // Different number → not equal
+            ("different-number", json!({"x": 1}), json!({"x": 2}), false),
+            // Different boolean → not equal
+            (
+                "different-bool",
+                json!({"x": true}),
+                json!({"x": false}),
+                false,
+            ),
+            // null vs string → not equal
+            (
+                "null-vs-string",
+                json!({"x": null}),
+                json!({"x": "null"}),
+                false,
+            ),
+            // Nested difference → not equal
+            (
+                "nested-diff",
+                json!({"a": {"b": 1}}),
+                json!({"a": {"b": 2}}),
+                false,
+            ),
+            // Array ordering matters → not equal
+            ("array-ordering", json!([1, 2, 3]), json!([3, 2, 1]), false),
+            // Large escaped string
+            (
+                "large-string",
+                json!({"data": "x".repeat(10000) + "\"escaped\"\n\t\\"}),
+                json!({"data": "x".repeat(10000) + "\"escaped\"\n\t\\"}),
+                true,
+            ),
+            // Large string differs at end
+            (
+                "large-string-diff",
+                json!({"data": "x".repeat(10000) + "a"}),
+                json!({"data": "x".repeat(10000) + "b"}),
+                false,
+            ),
+            // Numeric equivalence battery. The legacy path serialised
+            // numbers via serde_json, so `0`, `0.0`, and `-0.0` produced
+            // distinct tokens `0`, `0.0`, `-0.0`. The previous
+            // `Number::hash` impl routed integer 0 and float 0.0 through
+            // `0.0f64.to_bits()` (colliding) and normalized `+0.0` /
+            // `-0.0`. After the number-text fix above these cases
+            // reclassify in line with legacy equality.
+            (
+                "int-zero-vs-float-zero",
+                json!({"x": 0}),
+                json!({"x": 0.0}),
+                false,
+            ),
+            (
+                "positive-zero-vs-negative-zero",
+                json!({"x": 0.0}),
+                json!({"x": -0.0}),
+                false,
+            ),
+            (
+                "int-zero-vs-negative-zero",
+                json!({"x": 0}),
+                json!({"x": -0.0}),
+                false,
+            ),
+            (
+                "same-float-text",
+                json!({"x": 1.5}),
+                json!({"x": 1.5}),
+                true,
+            ),
+            (
+                "different-float-text",
+                json!({"x": 1.5}),
+                json!({"x": 2.5}),
+                false,
+            ),
+            (
+                "int-vs-float-one",
+                json!({"x": 1}),
+                json!({"x": 1.0}),
+                false,
+            ),
+            (
+                "int-vs-negative-float",
+                json!({"x": -1}),
+                json!({"x": -1.0}),
+                false,
+            ),
+            (
+                "large-int-vs-large-float",
+                json!({"x": 123456789012345_i64}),
+                json!({"x": 123456789012345.0}),
+                false,
+            ),
+        ];
+
+        for (label, a, b, expect_equal) in cases {
+            let stream_a = hash_value(a);
+            let stream_b = hash_value(b);
+            let legacy_a = legacy_hash(a);
+            let legacy_b = legacy_hash(b);
+
+            let stream_eq = stream_a == stream_b;
+            let legacy_eq = legacy_a == legacy_b;
+
+            assert_eq!(
+                stream_eq, legacy_eq,
+                "{label}: streaming ({stream_a} vs {stream_b}) and legacy ({legacy_a} vs {legacy_b}) must agree on equality"
+            );
+            assert_eq!(
+                stream_eq, *expect_equal,
+                "{label}: expected equal={expect_equal}, got streaming_eq={stream_eq}"
+            );
+        }
     }
 
     // ── Escalation order tests ───────────────────────────────────
