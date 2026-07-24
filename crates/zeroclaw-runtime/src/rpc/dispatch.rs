@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 method dispatch. Transport-agnostic.
 
-use super::context::RpcContext;
+use super::context::{ConfigWriteGuard, RpcContext};
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
@@ -533,23 +533,64 @@ impl RpcDispatcher {
         }
     }
 
-    /// Flush dirty config paths to disk. Clone the config out of the
-    /// lock (parking_lot guards are !Send), save to disk, then write
-    /// the clone (with cleared dirty set) back.
-    async fn flush_config(&self) -> Result<(), JsonRpcError> {
+    /// Flush dirty config paths to disk.
+    ///
+    /// `_guard` is never read — it is a witness reminding the caller to
+    /// serialize on `ctx.config_write_lock` for the whole read-mutate-flush
+    /// critical section. It is NOT compile-time proof of holding *that*
+    /// mutex (a guard is not statically tied to a specific instance); the
+    /// `debug_assert!` below catches a caller holding a look-alike guard
+    /// from the wrong mutex. The invariant lives on
+    /// [`RpcContext::config_write_lock`]: every mutation of `ctx.config`
+    /// must hold it, and a bypassing writer that re-dirties a just-saved
+    /// path during a flush loses disk persistence of that write.
+    ///
+    /// Clone the config out of the lock (parking_lot guards are !Send, so
+    /// the clone can't be held across `snapshot.save_dirty().await`), save
+    /// the clone to disk, then remove only the paths that were actually
+    /// saved from the LIVE config's dirty set. This must NOT swap the live
+    /// config wholesale: a write landed on `ctx.config` while this method
+    /// awaits disk I/O would otherwise be overwritten by the stale snapshot
+    /// on write-back, silently erasing an in-memory change that was never
+    /// given a chance to be saved.
+    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "flush_config caller must hold ctx.config_write_lock"
+        );
         let mut snapshot = self.ctx.config.read().clone();
+        let saved_paths = snapshot.dirty_paths.clone();
         snapshot
             .save_dirty()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        *self.ctx.config.write() = snapshot;
+        self.ctx
+            .config
+            .write()
+            .dirty_paths
+            .retain(|path| !saved_paths.contains(path));
         Ok(())
     }
 
+    /// Save `snapshot` to disk, then install it as the live config.
+    ///
+    /// `_guard` is the same serialization witness as in
+    /// [`Self::flush_config`] (a reminder, not compile-time proof — see
+    /// there). Unlike `flush_config`, this deliberately swaps: callers pass
+    /// a clone that was itself mutated beyond just `dirty_paths` (e.g. an
+    /// alias rename), and installing that mutated snapshot wholesale is the
+    /// point. Holding `config_write_lock` is what makes the swap safe — no
+    /// other handler can land a concurrent `config` write while this is in
+    /// flight.
     async fn save_and_swap_config(
         &self,
         mut snapshot: zeroclaw_config::schema::Config,
+        _guard: &ConfigWriteGuard,
     ) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "save_and_swap_config caller must hold ctx.config_write_lock"
+        );
         snapshot
             .save_dirty()
             .await
@@ -2645,6 +2686,7 @@ impl RpcDispatcher {
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         {
             let mut config = self.ctx.config.write();
             if config.ensure_map_key_for_path(&req.prop) {
@@ -2693,7 +2735,7 @@ impl RpcDispatcher {
                 .set_prop_persistent(&req.prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
         }
-        self.flush_config().await?;
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -2988,13 +3030,14 @@ impl RpcDispatcher {
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         {
             let mut config = self.ctx.config.write();
             config
                 .set_prop_persistent(&req.prop, "")
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         }
-        self.flush_config().await?;
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -3032,6 +3075,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let created = {
             let mut config = self.ctx.config.write();
             // Shared guarded boundary: enforces the reserved-agent rule (the
@@ -3049,7 +3093,7 @@ impl RpcDispatcher {
             created
         };
         if created {
-            self.flush_config().await?;
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -3060,6 +3104,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let deleted = {
             let mut config = self.ctx.config.write();
             let deleted = config
@@ -3071,7 +3116,7 @@ impl RpcDispatcher {
             deleted
         };
         if deleted {
-            self.flush_config().await?;
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -3085,11 +3130,20 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
-        if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
-            return self.handle_config_alias_rename(req, kind);
-        }
 
         Box::pin(async move {
+            // Acquired once here, not inside `handle_config_alias_rename`:
+            // the alias-kind branch below delegates into it, and the tokio
+            // Mutex is not reentrant. The guard moves by value into the
+            // alias-rename path so it can be released at that handler's
+            // commit point, before its slow post-commit side effects.
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
+                return self
+                    .handle_config_alias_rename(req, kind, config_write_guard)
+                    .await;
+            }
+
             let renamed = {
                 let mut config = self.ctx.config.write();
                 let renamed = config
@@ -3102,7 +3156,7 @@ impl RpcDispatcher {
                 renamed
             };
             if renamed {
-                self.flush_config().await?;
+                self.flush_config(&config_write_guard).await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -3118,6 +3172,7 @@ impl RpcDispatcher {
         &'a self,
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
+        config_write_guard: ConfigWriteGuard,
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
             let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
@@ -3164,8 +3219,15 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                self.save_and_swap_config(working.clone()).await?;
+                self.save_and_swap_config(working.clone(), &config_write_guard)
+                    .await?;
             }
+            // Config is committed (saved + swapped, or already committed by a
+            // prior crashed run). Release before the post-commit side effects
+            // below: workspace moves and the memory/cron/ACP/session-backend
+            // cascade can be slow or wedge, and holding the lock across them
+            // would stall every config-mutating RPC daemon-wide.
+            drop(config_write_guard);
             let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
 
             let mut warnings = Vec::new();
@@ -4432,9 +4494,15 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
+        // Serializes with every other config-mutating handler for the whole
+        // clone-apply-save-swap below, so the install on success can't race
+        // a concurrent config write (see `ctx.config_write_lock`).
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         // Clone out of the lock to satisfy `&mut Config`. On success
-        // write the mutated snapshot back, mirroring `flush_config`
-        // and the gateway's `handle_apply`.
+        // install the mutated snapshot, mirroring the gateway's
+        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
+        // the clone, so `save_and_swap_config` performs no second disk
+        // write (empty dirty set short-circuits) — just the guarded swap.
         let mut working = self.ctx.config.read().clone();
         let result = crate::quickstart::apply_with_surface(
             req.submission,
@@ -4444,7 +4512,8 @@ impl RpcDispatcher {
         .await;
         let body = match result {
             Ok(agent) => {
-                *self.ctx.config.write() = working;
+                self.save_and_swap_config(working, &config_write_guard)
+                    .await?;
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
                     agent,
@@ -7932,6 +8001,86 @@ mod tests {
         cfg
     }
 
+    // `make_config_set_test_dispatcher` takes the `Config` by value and adds no
+    // isolation of its own, and a successful `config/set` falls through to
+    // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
+    // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[tokio::test]
+    async fn config_set_does_not_materialize_resource_keyed_rate_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-5.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_err(), "unknown rate path must not be auto-created");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("cost.rates.providers.models.openai", "gpt-4.1")
+            .expect("create the dotted resource id");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_ok(), "editing a real dotted rate must work: {res:?}");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .get_map_keys("cost.rates.providers.models.openai")
+                .expect("known section"),
+            vec!["gpt-4.1".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_still_materializes_operator_chosen_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "channels.telegram.newbot.bot_token",
+                "value": "tok"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "operator-chosen alias must still vivify: {res:?}"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .channels
+                .telegram
+                .contains_key("newbot")
+        );
+    }
+
     #[tokio::test]
     async fn config_set_writes_real_secret_through_set_prop() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9073,6 +9222,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -9115,6 +9265,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -9214,6 +9365,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -9241,6 +9393,280 @@ mod tests {
             end_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "session_end must fire when a real session is closed"
+        );
+    }
+
+    // ── config_write_lock races ─────────────────────────────────
+
+    fn make_two_provider_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg
+    }
+
+    fn provider_model(config: &zeroclaw_config::schema::Config, provider: &str) -> Option<String> {
+        match provider {
+            "anthropic" => config
+                .providers
+                .models
+                .anthropic
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            "openai" => config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            other => panic!("unexpected provider {other}"),
+        }
+    }
+
+    /// Regression test: `flush_config` used to clone the live config,
+    /// await `save_dirty()` on the clone, then swap the clone back over the
+    /// live config wholesale. A write landed on `ctx.config` while that save
+    /// was in flight was silently erased by the swap even though it was
+    /// never given a chance to reach disk.
+    ///
+    /// This drives `flush_config` to its first real yield point (inside
+    /// `save_dirty`'s disk I/O) with a single manual poll, proving the
+    /// snapshot has already been cloned out from under the live lock, lands
+    /// a second write directly on the live config, then lets the flush
+    /// finish. Against the old swap-based body this fails: P2 disappears
+    /// from live config when the stale snapshot lands on top of it. It was
+    /// confirmed to fail this way by temporarily reverting `flush_config` to
+    /// the swap-based body and re-running this test.
+    #[tokio::test]
+    async fn flush_config_preserves_write_landed_during_save() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_two_provider_test_config(&tmp);
+        cfg.set_prop_persistent("providers.models.anthropic.default.model", "p1-value")
+            .expect("mark P1 dirty");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let guard = Arc::clone(&dispatcher.ctx.config_write_lock)
+            .lock_owned()
+            .await;
+        let mut flush_fut = Box::pin(dispatcher.flush_config(&guard));
+
+        // Single manual poll: past the synchronous clone-and-capture prefix
+        // of `flush_config`, into `save_dirty`'s disk I/O, which must
+        // suspend rather than resolve synchronously.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first_poll = std::future::Future::poll(flush_fut.as_mut(), &mut cx);
+        assert!(
+            first_poll.is_pending(),
+            "flush must suspend on save_dirty's disk I/O for this test to interleave"
+        );
+
+        // P2: lands directly on the live config while the flush above is
+        // mid-save over its own (now stale) snapshot.
+        {
+            let mut live = dispatcher.ctx.config.write();
+            live.set_prop_persistent("providers.models.openai.default.model", "p2-value")
+                .expect("mark P2 dirty");
+        }
+
+        flush_fut.await.expect("flush of P1 must still succeed");
+        drop(guard);
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("p2-value"),
+            "P2, written while the flush was mid-save, must survive in live config"
+        );
+        assert!(
+            live.dirty_paths
+                .contains("providers.models.openai.default.model"),
+            "P2 must still be dirty -- this flush never saved it"
+        );
+        assert!(
+            !live
+                .dirty_paths
+                .contains("providers.models.anthropic.default.model"),
+            "P1 was actually saved, so it must no longer be dirty"
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("p1-value"),
+            "P1 must have reached disk; on-disk file:\n{on_disk}"
+        );
+    }
+
+    /// Shared blocking scaffold: hold `config_write_lock`, spawn the RPC
+    /// call, assert it stays parked across a bounded sleep-free yield loop,
+    /// release, and return the task's result for caller-specific asserts.
+    async fn assert_rpc_blocks_on_config_write_lock<F>(
+        ctx: Arc<RpcContext>,
+        rpc_call: F,
+        blocked_msg: &'static str,
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+
+        // Bounded, sleep-free: the handler must not race ahead of the
+        // externally held guard no matter how many times it's polled.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "{blocked_msg}");
+        }
+
+        drop(guard);
+        task.await.expect("blocked RPC task must not panic")
+    }
+
+    #[tokio::test]
+    async fn config_set_blocks_while_config_write_lock_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "blocked-value"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move { dispatcher.handle_config_set(&params).await },
+            "config/set must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "config/set must succeed once the guard is released: {result:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("blocked-value"),
+            "config/set must persist once unblocked; on-disk file:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_sets_both_persist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let (dispatcher_a, dispatcher_b, _sessions) = make_two_dispatchers_sharing_context(cfg);
+
+        let params_a = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "concurrent-a"
+        });
+        let params_b = json!({
+            "prop": "providers.models.openai.default.model",
+            "value": "concurrent-b"
+        });
+
+        let (result_a, result_b) = tokio::join!(
+            dispatcher_a.handle_config_set(&params_a),
+            dispatcher_b.handle_config_set(&params_b),
+        );
+        assert!(
+            result_a.is_ok(),
+            "first config/set must succeed: {result_a:?}"
+        );
+        assert!(
+            result_b.is_ok(),
+            "second config/set must succeed: {result_b:?}"
+        );
+
+        let live = dispatcher_a.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "anthropic").as_deref(),
+            Some("concurrent-a")
+        );
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("concurrent-b")
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("concurrent-a"),
+            "provider a's set must have reached disk:\n{on_disk}"
+        );
+        assert_eq!(
+            provider_model(&reparsed, "openai").as_deref(),
+            Some("concurrent-b"),
+            "provider b's set must have reached disk:\n{on_disk}"
+        );
+    }
+
+    /// Same blocking pattern as `config_set_blocks_while_config_write_lock_held`,
+    /// but for the `save_and_swap_config` path used by alias rename: proves
+    /// alias rename and config/set share the same `config_write_lock` and so
+    /// can never interleave their read-mutate-flush critical sections.
+    #[tokio::test]
+    async fn alias_rename_serializes_with_config_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let config_path = config.config_path.clone();
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut rename_dispatcher =
+            RpcDispatcher::new(Arc::clone(&ctx), tx, "test-peer-rename".into());
+        rename_dispatcher.authenticated = true;
+        let params = json!({
+            "path": "agents",
+            "from": "alpha",
+            "to": "beta"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move {
+                rename_dispatcher
+                    .handle_config_map_key_rename(&params)
+                    .await
+            },
+            "alias rename must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "alias rename must succeed once the guard is released: {result:?}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert!(!live.agents.contains_key("alpha"));
+        assert!(live.agents.contains_key("beta"));
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("[agents.beta]"),
+            "renamed alias must persist:\n{on_disk}"
+        );
+        assert!(
+            !on_disk.contains("[agents.alpha]"),
+            "old alias must not survive on disk:\n{on_disk}"
         );
     }
 }

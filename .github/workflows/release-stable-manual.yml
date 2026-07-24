@@ -1227,16 +1227,6 @@ jobs:
       dry_run: false
     secrets: inherit
 
-  homebrew:
-    name: Update Homebrew Core
-    needs: [validate, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    uses: ./.github/workflows/pub-homebrew-core.yml
-    with:
-      release_tag: ${{ needs.validate.outputs.tag }}
-      dry_run: false
-    secrets: inherit
-
   # ── Post-publish: announce after release + website are live ───────────
   # Docker push can be slow; don't let it block announcements.
   tweet:

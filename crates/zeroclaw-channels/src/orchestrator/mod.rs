@@ -12045,6 +12045,98 @@ temperature = 0.3
         })
     }
 
+    #[test]
+    fn stamp_session_routing_context_persists_message_metadata() {
+        struct Case {
+            history_key: &'static str,
+            channel: &'static str,
+            alias: Option<&'static str>,
+            thread: Option<&'static str>,
+            reply_target: &'static str,
+            sender: &'static str,
+            expected_channel: Option<&'static str>,
+            expected_room: Option<&'static str>,
+            expected_sender: Option<&'static str>,
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let ctx = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            ..(*router_test_ctx()).clone()
+        };
+        let cases = [
+            Case {
+                history_key: "threaded",
+                channel: "discord",
+                alias: Some("primary"),
+                thread: Some("thread-987654"),
+                reply_target: "channel-123",
+                sender: "thread-user",
+                expected_channel: Some("discord.primary"),
+                expected_room: Some("thread-987654"),
+                expected_sender: Some("thread-user"),
+            },
+            Case {
+                history_key: "reply-target",
+                channel: "discord",
+                alias: Some("secondary"),
+                thread: None,
+                reply_target: "dm-channel-555",
+                sender: "user42",
+                expected_channel: Some("discord.secondary"),
+                expected_room: Some("dm-channel-555"),
+                expected_sender: Some("user42"),
+            },
+            Case {
+                history_key: "no-alias",
+                channel: "cli",
+                alias: None,
+                thread: None,
+                reply_target: "stdin",
+                sender: "cli-user",
+                expected_channel: None,
+                expected_room: Some("stdin"),
+                expected_sender: Some("cli-user"),
+            },
+            Case {
+                history_key: "empty-sender",
+                channel: "matrix",
+                alias: Some("default"),
+                thread: None,
+                reply_target: "!room:matrix.org",
+                sender: "",
+                expected_channel: Some("matrix.default"),
+                expected_room: Some("!room:matrix.org"),
+                expected_sender: None,
+            },
+        ];
+
+        for case in cases {
+            let msg = ChannelMessage {
+                id: "msg-1".into(),
+                sender: case.sender.into(),
+                reply_target: case.reply_target.into(),
+                content: "hi".into(),
+                channel: case.channel.into(),
+                channel_alias: case.alias.map(String::from),
+                timestamp: 0,
+                thread_ts: case.thread.map(String::from),
+                ..Default::default()
+            };
+
+            stamp_session_routing_context(&ctx, &msg, case.history_key);
+
+            let metadata = session_store
+                .get_session_metadata(case.history_key)
+                .unwrap();
+            assert_eq!(metadata.channel_id.as_deref(), case.expected_channel);
+            assert_eq!(metadata.room_id.as_deref(), case.expected_room);
+            assert_eq!(metadata.sender_id.as_deref(), case.expected_sender);
+        }
+    }
+
     #[tokio::test]
     async fn resolve_classifier_route_returns_none_for_empty_ref() {
         let ctx = router_test_ctx();
