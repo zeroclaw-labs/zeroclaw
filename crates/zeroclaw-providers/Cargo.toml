@@ -41,3 +41,9 @@ hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
 scopeguard = "1.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }

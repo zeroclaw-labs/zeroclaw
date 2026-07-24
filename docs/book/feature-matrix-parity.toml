@@ -248,6 +248,10 @@ hermes = "supported"
 openclaw = "supported"
 hermes = "none"
 
+[providers.grok_cli]
+openclaw = "none"
+hermes = "none"
+
 [providers.bedrock]
 openclaw = "supported"
 hermes = "supported"

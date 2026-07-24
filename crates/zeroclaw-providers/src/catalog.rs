@@ -22,6 +22,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "bedrock" => (Some("amazon-bedrock"), None),
         "gemini" => (Some("google"), Some("google")),
         "gemini_cli" => (Some("google"), Some("google")),
+        "grok_cli" => (Some("xai"), Some("x-ai")),
         "openrouter" => (Some("openrouter"), Some("openrouter")),
         "copilot" => (Some("github-copilot"), None),
         "minimax" => (Some("minimax"), Some("minimax")),
@@ -278,6 +279,13 @@ mod tests {
     #[test]
     fn known_family_with_dual_sources_returns_both() {
         let (md, or) = catalog_source_for("xai").expect("xai is canonical");
+        assert_eq!(md, Some("xai"));
+        assert_eq!(or, Some("x-ai"));
+    }
+
+    #[test]
+    fn grok_cli_family_uses_xai_openrouter_prefix() {
+        let (md, or) = catalog_source_for("grok_cli").expect("grok_cli is registered");
         assert_eq!(md, Some("xai"));
         assert_eq!(or, Some("x-ai"));
     }

@@ -36,6 +36,201 @@ Google's Gemini API. Supports vision and pre-executed grounded search (see [Stre
 
 Shells out to the `gemini` CLI; uses the CLI's existing auth.
 
+### Grok Build CLI: slot `grok_cli`
+
+Shells out to the Grok Build CLI through the documented **`grok agent stdio`**
+ACP surface and uses the CLI's login cache by default. Run `grok login`, or use
+the explicit API-key bridge shown below. The typed alias `api_key` is not used,
+and ambient `XAI_API_KEY` is not inherited unless the alias opts in, so the Grok
+CLI remains the authentication owner. This is the only transport: initialize →
+authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
+Small and large prompts both travel on stdin and never appear in argv or a
+prompt file.
+
+```toml
+[providers.models.grok_cli.default]
+model = "grok-4.5"
+working_directory = "/srv/zeroclaw/grok-workspace"
+env_passthrough = ["XAI_API_KEY"]
+```
+
+Export `XAI_API_KEY` into the daemon environment before starting ZeroClaw. The
+ACP client selects `xai.api_key` only when that exact name is listed and a
+non-empty value is copied to the child; otherwise it falls back to the CLI login
+cache. The key value remains owned by the daemon environment and is not stored
+in provider config.
+
+An existing absolute `working_directory` is required. It is canonicalized and
+used for both the child cwd and ACP session boundary, so the provider never
+falls back to the daemon cwd. Optional `binary_path` selects a non-`PATH`
+binary. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
+
+The child environment is cleared before spawn. Process-runtime, locale, proxy,
+and CA variables on the built-in allowlist remain available; all other names
+are blocked unless that provider alias lists them in `env_passthrough`. This
+field is for the explicit `XAI_API_KEY` authentication bridge and environment
+variables required by explicitly enabled Grok tools, such as cloud CLI
+credentials. Values are read from the ZeroClaw process environment at spawn
+time and are not stored in provider config. The default list is empty. Keep it
+narrow because every listed secret is exposed to Grok and any tools enabled for
+that alias. Other provider-owned `XAI_*` names and all `GROK_*` names are
+rejected. Grok's discovered user and project configuration, together with alias
+`extra_args`, owns Grok tool policy.
+
+The default argv adds `--no-auto-update`, `--no-plan`, `--sandbox strict`,
+`--permission-mode dontAsk`, and `--tools ""`. The ACP client never approves a
+permission request. When the request supplies a `reject_once` option, the
+client selects that option instead of cancelling the complete agent turn;
+otherwise it cancels the request. The requested tool still fails closed,
+while Grok can consume the rejection and produce a final answer or retry with
+an operation its policy allows. Grok evaluates permission rules discovered from
+its user and project configuration before asking the ACP client. Those files
+are therefore trusted operator policy: an `allow` rule may pre-authorize a tool,
+and project MCP servers, plugins, or hooks may add capabilities. Use a dedicated,
+reviewed `working_directory` for channel agents. Operators can also grant tools
+or relax sandbox/permission policy with alias `extra_args`; both surfaces are
+explicit opt-ins to a wider subprocess boundary. Transport, prompt, model,
+session, cwd, and update flags remain provider-owned and are rejected in
+`extra_args`. Positional and short arguments are also rejected. Known
+value-taking options accept either `["--flag", "value"]` or `--flag=value`;
+unknown option shapes require the inline form so they cannot consume the
+trailing ACP command.
+
+Grok may emit progress as an `agent_message_chunk` before a plan, tool call, or
+permission request. The provider discards the preceding message segment at
+those ACP boundaries and returns only the latest answer segment, so planning
+or tool-gathering narration is not delivered as the channel reply. Explicit
+`--no-plan` also keeps the default one-shot channel alias out of Grok's plan
+mode; tool/MCP configuration remains an operator-controlled capability.
+
+ACP stdout frames, aggregate stdout, assistant text, and stderr processing are
+bounded while the child is running. Stderr is drained but its content is never
+stored, logged, or returned. The process tree is terminated after every
+one-shot request, including success, timeout, cancellation, and protocol error.
+
+#### Recommended pattern: default channel chatbot
+
+Use a **dedicated provider alias** for the messaging agent (for example
+`agents.default`). The default alias grants no Grok built-in tools. Grok still
+loads its normal user and project configuration, so use a dedicated workspace
+whose permission rules, MCP servers, plugins, and hooks have been reviewed for
+the channel trust boundary. Use a separate alias and workspace for an
+operator-approved coding/ops agent.
+
+**Reply-intent precheck (classifier):** ZeroClaw runs a short REPLY /
+`NO_REPLY[*]` classification before the full agent loop. Prefer a **stable
+chat-completions API** for that precheck (for example the HTTP/OAuth
+`xai` slot, or any other non-CLI model alias), and keep **`grok_cli` only for
+`model_provider`** (the full answer). CLI agent backends often emit planning
+prose instead of a single sentinel token; that prose can be delivered as the
+channel message (“staying silent” / “no Slack reply”). Empty
+`classifier_provider` reuses `model_provider`: fine for API models, not for
+CLI channel bots. ACP channels skip the classifier entirely.
+
+```toml
+# Full answers: ACP, strict sandbox, no built-in tools, reviewed Grok config
+[providers.models.grok_cli.default]
+model = "grok-4.5"
+binary_path = "/home/you/.grok/bin/grok"
+working_directory = "/path/to/agents/default/workspace"
+
+# REPLY / NO_REPLY precheck — API (format-stable). Reuse an existing xAI
+# HTTP alias if you already have one; do not point this at grok_cli.
+[providers.models.xai.default]
+model = "grok-4.5"
+# uri / auth as for the normal xAI provider (OAuth session or api_key)
+
+# Ops / coding agents: explicit policy and tool opt-in
+[providers.models.grok_cli.ops]
+model = "grok-4.5"
+binary_path = "/home/you/.grok/bin/grok"
+working_directory = "/path/to/agents/ops/workspace"
+env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+extra_args = ["--tools=Read,Grep", "--allow=Read", "--allow=Grep"]
+
+[agents.default]
+model_provider = "grok_cli.default"
+classifier_provider = "xai.default"
+channels = ["slack.default"]   # example
+
+[agents.dependabot]
+model_provider = "grok_cli.ops"
+```
+
+| Layer | Where | Purpose |
+| ----- | ----- | ------- |
+| Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
+| Full answer | `model_provider` → `grok_cli.default` | Grok Build ACP; prompt only on stdin |
+| OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
+| App permissions | Empty built-in tool set + ACP permission rejection | Discovered Grok permission rules remain operator-owned and may pre-authorize configured tools |
+| Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
+| Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |
+
+Keep channel-facing aliases at the defaults and give them dedicated, reviewed
+workspaces. Permission rules, MCP servers, plugins, and hooks discovered by
+Grok, along with permission/sandbox/tool flags in `extra_args`, are trusted
+operator policy and can widen the subprocess boundary.
+
+#### Grok CLI OS sandbox (how to use it from ZeroClaw)
+
+This is **Grok Build’s process sandbox** (Landlock / Seatbelt / seccomp on the
+`grok` subprocess). It is **not** ZeroClaw’s tool sandbox on
+`[risk_profiles.*.sandbox_*]`: that wraps ZeroClaw tools after native tool
+calls. If an operator opts a provider alias into Grok tools, Grok's
+`--sandbox` is the effective confinement for that work. See also
+[Sandboxing](../security/sandboxing.md) for ZeroClaw’s risk-profile sandbox.
+
+ZeroClaw always supplies an explicit sandbox flag. The default is `strict`.
+Set `--sandbox=<profile>` in that provider alias's `extra_args` to choose a
+different profile; ambient Grok config or `GROK_SANDBOX` cannot silently relax
+the provider-owned default.
+
+Project `.grok/config.toml` can hold MCP / plugins / **`[permission]`**. Grok
+loads that file as trusted operator policy; matching allow rules may authorize
+tools without an ACP permission request. It does **not** select the active
+sandbox profile by itself. Profile **names** and custom profile **bodies** can
+live in project `<workspace>/.grok/sandbox.toml`; pass
+`--sandbox=<name>` through `extra_args` to turn that profile on.
+
+**Built-in profiles** (from Grok’s sandbox docs):
+
+| Profile | FS read | FS write | Child process network (Linux) | Typical use |
+| ------- | ------- | -------- | ----------------------------- | ----------- |
+| `off` (default) | unrestricted | unrestricted | unrestricted | Full access |
+| `workspace` | everywhere | CWD + `~/.grok` + tmp | allowed | Everyday coding |
+| `read-only` | everywhere (includes home / `~/.ssh`) | `~/.grok` + tmp only | blocked | Review when broad reads are OK |
+| `strict` | CWD + system paths (not home / `~/.ssh`) | CWD + `~/.grok` + tmp | blocked | **Default channel chatbot (recommended)** |
+| `devbox` | everywhere | most of the tree | allowed | Disposable VMs |
+
+Child-network blocking applies to **shell children** on Linux only; in-process
+Grok tools (LLM, built-in web search) still need network. Prefer **`strict`**
+for messaging bots so home-directory secrets stay out of reach; use
+`read-only` only when the agent must read outside the workspace without
+writing project files.
+
+**Custom profile example** (define in workspace, select from ZeroClaw):
+
+```toml
+# <agent-workspace>/.grok/sandbox.toml
+[profiles.channel-bot]
+extends = "strict"
+# Optional kernel deny paths (needs bubblewrap on Linux when non-empty):
+# deny = ["**/.env", "**/*.pem"]
+```
+
+```toml
+# ZeroClaw config.toml
+[providers.models.grok_cli.default]
+working_directory = "/path/to/agents/default/workspace"
+extra_args = ["--sandbox=channel-bot"]
+```
+
+**Per-agent sandbox:** use **separate provider aliases** with different,
+explicit `extra_args` and dedicated working directories. Keep channel aliases
+on the strict/no-built-in-tools default, review the Grok configuration
+discovered for each workspace, and point each agent at the matching
+`model_provider` alias.
+
 ### Azure OpenAI: slot `azure`
 
 `resource`, `deployment`, and `api_version` live in this typed config, they are not read from environment variables.

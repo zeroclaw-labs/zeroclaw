@@ -383,22 +383,22 @@ use zeroclaw_config::schema::{
     DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
     FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
+    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
+    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
+    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 /// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
@@ -1375,6 +1375,35 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     }
 }
 
+impl FamilyProviderFactory for GrokCliModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        _api_url: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if has_api_key(key) {
+            anyhow::bail!(
+                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
+            );
+        }
+        Ok(Box::new(
+            crate::grok_cli::GrokCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .env_passthrough(self.env_passthrough.clone())
+                .extra_args(self.extra_args.clone())
+                .timeout_secs(self.base.timeout_secs)
+                .build()?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
     fn create_provider(
         &self,
@@ -1618,6 +1647,25 @@ mod tests {
             KiloEndpoint::default().uri(),
             "https://api.kilo.ai/api/gateway"
         );
+    }
+
+    #[test]
+    fn grok_cli_factory_rejects_typed_api_key_instead_of_ignoring_it() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            Some("typed-test-key"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("grok_cli api_key must not be silently ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not accept api_key"));
     }
 
     #[test]

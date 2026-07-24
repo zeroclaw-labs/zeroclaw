@@ -7475,6 +7475,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-wrap"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e5fd83ab7fa55fd06f5e665e3fc52b8bca451c0486b8ea60ad649cd1c10a5da"
+dependencies = [
+ "futures",
+ "indexmap 2.14.0",
+ "nix 0.30.1",
+ "tokio",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "prometheus"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13395,7 +13408,9 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hyper",
+ "nix 0.30.1",
  "parking_lot",
+ "process-wrap",
  "rand 0.10.1",
  "regex",
  "reqwest 0.12.28",

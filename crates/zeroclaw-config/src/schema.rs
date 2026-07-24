@@ -2660,6 +2660,43 @@ pub struct GeminiCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Grok Build CLI (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.grok_cli"]
+pub struct GrokCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Required absolute working directory for the `grok` subprocess and ACP
+    /// session boundary. The directory must exist when the provider is built.
+    /// Project-scoped Grok config is resolved relative to this path.
+    pub working_directory: String,
+    /// Extra environment variable names inherited by the `grok`
+    /// subprocess. Values are resolved from the ZeroClaw process environment
+    /// at spawn time. The default is empty so unrelated daemon secrets remain
+    /// blocked. `XAI_API_KEY` is the sole supported provider-owned name and
+    /// enables API-key authentication when explicitly listed and non-empty;
+    /// other `XAI_*` and all `GROK_*` names are rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Extra global Grok long flags inserted before `agent stdio`. Known
+    /// options may put their value in the next token; other value-taking
+    /// options use `--flag=value`. Positional and short arguments are rejected.
+    /// ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`,
+    /// and an empty built-in tool set. Providing the corresponding flags here
+    /// is an explicit per-alias opt-in to relax those defaults. ACP transport,
+    /// prompt/model/session, cwd, debug-file, and update-policy flags are
+    /// reserved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+}
+
 // ── LMStudio (local default) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3291,6 +3328,7 @@ impl_default_family_endpoint! {
     BaichuanModelProviderConfig,
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
+    GrokCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,
     SglangModelProviderConfig,
@@ -24610,6 +24648,30 @@ auto_save = true
         assert!(parsed.num_ctx.is_none());
         assert!(parsed.num_predict.is_none());
         assert!(parsed.temperature_override.is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_requires_working_directory() {
+        let error = toml::from_str::<GrokCliModelProviderConfig>("model = \"grok-4.5\"")
+            .expect_err("missing ACP session boundary must fail");
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_deserializes_explicit_working_directory() {
+        let parsed: GrokCliModelProviderConfig = toml::from_str(
+            r#"
+                model = "grok-4.5"
+                working_directory = "/srv/zeroclaw/workspace"
+                env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+            "#,
+        )
+        .expect("explicit Grok ACP cwd");
+        assert_eq!(parsed.working_directory, "/srv/zeroclaw/workspace");
+        assert_eq!(
+            parsed.env_passthrough,
+            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        );
     }
 
     #[test]

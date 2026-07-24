@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
+pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
 pub mod model_pin;
@@ -1064,6 +1065,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "volcengine" | "ark" | "doubao-cn" => "doubao",
         // Gemini CLI is its own typed slot (subprocess runtime).
         "gemini-cli" => "gemini_cli",
+        // Grok Build CLI is its own typed slot (subprocess runtime).
+        "grok-cli" | "grokcli" => "grok_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -1907,6 +1910,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
+            ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("lmstudio", "LM Studio", true),
@@ -2992,6 +2996,15 @@ mod tests {
     fn factory_gemini_cli() {}
 
     #[test]
+    fn factory_grok_cli() {
+        let error = match create_model_provider("grok_cli", None) {
+            Ok(_) => panic!("unscoped grok_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
     }
@@ -3325,6 +3338,13 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
+        // Canonical family names only — legacy synonyms are collapsed by
+        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
+        // the runtime. `azure` is excluded (typed-config required, see
+        // `listed_model_providers_are_constructible` skip list); `custom` is
+        // excluded (URI required); `grok_cli` is excluded because ACP requires
+        // an explicit absolute working_directory. Dedicated factory tests cover
+        // each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -3414,6 +3434,11 @@ mod tests {
             // The custom slot requires a uri (no family-default endpoint);
             // covered by dedicated factory tests.
             if model_provider.name == "custom" {
+                continue;
+            }
+            // Grok ACP deliberately refuses the daemon cwd as an implicit
+            // trust boundary; a typed alias must provide working_directory.
+            if model_provider.name == "grok_cli" {
                 continue;
             }
             assert!(

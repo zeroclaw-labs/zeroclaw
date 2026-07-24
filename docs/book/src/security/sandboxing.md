@@ -4,6 +4,14 @@ The runtime can wrap tool invocations in an OS-level sandbox that restricts file
 
 Sandbox settings live on a risk profile. Each agent points at a risk profile via `agents.<alias>.risk_profile`; the agent's sandbox enable/backend are read from that profile.
 
+**CLI model providers (for example `grok_cli`):** the external CLI is outside
+ZeroClaw's native tool-approval path. Risk-profile sandboxing above does not
+confine it. The `grok_cli` ACP provider therefore injects `--sandbox strict`,
+`--permission-mode dontAsk`, and an empty built-in tool set by default, and it
+cancels ACP permission requests. A corresponding `extra_args` flag is an
+explicit per-alias opt-in to relax those defaults. See
+[Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli).
+
 `sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
