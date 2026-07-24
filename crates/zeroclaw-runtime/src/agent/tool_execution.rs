@@ -1,4 +1,8 @@
 //! Tool execution helpers extracted from `loop_`.
+//!
+//! Contains the functions responsible for invoking tools (single, parallel,
+//! sequential) and the decision logic for choosing between parallel and
+//! sequential execution.
 
 use anyhow::Result;
 use std::time::{Duration, Instant};
@@ -42,6 +46,11 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub tools_registry: &'a [Box<dyn Tool>],
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
+    /// Per-request tool allow-set (chat-completions `tools` parameter). When
+    /// set, tools found in the registry but absent from this set are rejected
+    /// as unavailable for this request. `None` for default (non-chat-completions)
+    /// paths where the full agent tool set is available.
+    pub request_tool_names: Option<&'a std::collections::HashSet<String>>,
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
@@ -193,6 +202,37 @@ pub(crate) async fn execute_one_tool(
             output_data: None,
         });
     };
+
+    // Request-scoped tool gate: when a chat-completions request narrows the
+    // tool set with `tools: [...]`, reject tools that are in the agent's
+    // registry but outside the request scope. On default (non-scoped) paths
+    // this is `None` — the full agent tool set is available.
+    if let Some(request_tools) = dispatch.request_tool_names
+        && !request_tools.contains(&call_name.to_ascii_lowercase())
+    {
+        let reason = format!("Tool not available: {call_name}");
+        let duration = start.elapsed();
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: call_name.to_string(),
+            tool_call_id: tool_call_id_owned.clone(),
+            duration,
+            success: false,
+            arguments: Some(full_args.clone()),
+            result: Some(scrub_credentials(&reason)),
+            channel: Some(meta.channel_name.to_string()),
+            agent_alias: meta.agent_alias.map(|s| s.to_string()),
+            parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+            turn_id: Some(meta.turn_id.to_string()),
+        });
+        return Ok(ToolExecutionOutcome {
+            output: reason.clone(),
+            success: false,
+            error_reason: Some(reason),
+            duration,
+            receipt: None,
+            output_data: None,
+        });
+    }
 
     if is_excluded_tool(tool.name(), dispatch.excluded_tools) {
         return Ok(unavailable_tool_outcome(
@@ -633,6 +673,7 @@ mod tests {
                 tools_registry: &[], // no static tools - force activated-tools path
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                request_tool_names: None,
             },
             &meta,
             &NoopObserver,
@@ -688,6 +729,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
+                request_tool_names: None,
             },
             &meta,
             &NoopObserver,
@@ -704,6 +746,97 @@ mod tests {
             "Tool not available in this turn: extract_text"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Regression: request_tool_names gate rejects out-of-scope tools ──
+
+    #[tokio::test]
+    async fn request_tool_names_gate_rejects_tool_outside_scope() {
+        // Chat-completions with `tools: [weather_query]` must reject native
+        // calls for tools in the registry but outside the request scope.
+        // `find_tool` locates the tool but the gate returns "Tool not available".
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool: Box<dyn Tool> = Box::new(CountingTool::new("shell", invocations.clone()));
+        let meta = crate::agent::turn::TurnMeta {
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "http",
+        };
+        let mut allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        allowed.insert("weather_query".to_string());
+        let outcome = execute_one_tool(
+            "shell",
+            serde_json::json!({"cmd": "rm -rf /"}),
+            Some("call-1"),
+            ToolDispatchContext {
+                tools_registry: &[tool],
+                activated_tools: None,
+                excluded_tools: &[],
+                request_tool_names: Some(&allowed),
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("request_tool_names gate should return an outcome, not panic");
+
+        assert!(!outcome.success, "shell outside scope must be rejected");
+        assert!(
+            outcome.output.contains("Tool not available"),
+            "gate must produce 'Tool not available', got: {}",
+            outcome.output
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "rejected tool must not have executed"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_tool_names_none_allows_all_registry_tools() {
+        // Default paths (WS/A2A/webhook) pass None — the full registry is
+        // available and any configured tool can execute.
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool: Box<dyn Tool> = Box::new(CountingTool::new("shell", invocations.clone()));
+        let meta = crate::agent::turn::TurnMeta {
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "wss",
+        };
+        let outcome = execute_one_tool(
+            "shell",
+            serde_json::json!({"cmd": "echo hello"}),
+            Some("call-1"),
+            ToolDispatchContext {
+                tools_registry: &[tool],
+                activated_tools: None,
+                excluded_tools: &[],
+                request_tool_names: None, // default path
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("default path should allow any registered tool");
+
+        assert!(
+            outcome.success,
+            "shell in registry must execute on default path"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "allowed tool must have executed exactly once"
+        );
     }
 
     use super::should_execute_tools_in_parallel;

@@ -1082,6 +1082,7 @@ pub async fn handle_section_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
 
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
@@ -1279,7 +1280,7 @@ mod tests {
                 &[],
             )),
             trust_forwarded_headers: false,
-            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: std::sync::Arc::new(crate::IdempotencyStore::new(
                 std::time::Duration::from_secs(300),
@@ -1316,14 +1317,14 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
-            cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            cancel_tokens: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: std::sync::Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

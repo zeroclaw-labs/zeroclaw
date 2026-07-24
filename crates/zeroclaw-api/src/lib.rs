@@ -38,4 +38,9 @@ tokio::task_local! {
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
+
+    /// Per-request tool-specs override. When set, the turn loop uses these
+    /// specs instead of rebuilding from `tools_registry` each iteration.
+    /// `Some(Vec::new())` means "no tools" (tool_choice: "none").
+    pub static TOOL_SPECS_OVERRIDE: Option<Vec<crate::tool::ToolSpec>>;
 }

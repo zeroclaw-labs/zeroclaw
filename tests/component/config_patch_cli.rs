@@ -62,7 +62,7 @@ fn test_state(config: Config) -> AppState {
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(false, &[])),
         trust_forwarded_headers: false,
-        rate_limiter: Arc::new(gateway::GatewayRateLimiter::new(100, 100, 100)),
+        rate_limiter: Arc::new(gateway::GatewayRateLimiter::new(100, 100, 100, 100)),
         auth_limiter: Arc::new(gateway::auth_rate_limit::AuthRateLimiter::new()),
         idempotency_store: Arc::new(gateway::IdempotencyStore::new(
             Duration::from_secs(300),
@@ -102,7 +102,9 @@ fn test_state(config: Config) -> AppState {
         canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
         #[cfg(feature = "webauthn")]
         webauthn: None,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cancel_tokens: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        ws_connections: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry: None,
         sop_engine: None,

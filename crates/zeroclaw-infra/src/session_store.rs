@@ -11,6 +11,15 @@ pub struct SessionStore {
     sessions_dir: PathBuf,
 }
 
+/// Sidecar metadata stored alongside a session's JSONL file.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SessionMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
 impl SessionStore {
     /// Create a new session store, ensuring the sessions directory exists.
     pub fn new(workspace_dir: &Path) -> std::io::Result<Self> {
@@ -23,6 +32,13 @@ impl SessionStore {
     fn session_path(&self, session_key: &str) -> PathBuf {
         self.sessions_dir
             .join(format!("{}.jsonl", sanitize_session_key(session_key)))
+    }
+
+    /// Compute the sidecar metadata path for a session key.
+    fn meta_path(&self, session_key: &str) -> std::path::PathBuf {
+        let mut p = self.session_path(session_key);
+        p.set_extension("meta.json");
+        p
     }
 
     /// Load all messages for a session from its JSONL file.
@@ -106,14 +122,26 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a session's JSONL file. Returns `true` if the file existed.
+    /// Delete a session's JSONL file and its sidecar metadata. Returns `true`
+    /// if either file existed (i.e., the session had any on-disk state).
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let path = self.session_path(session_key);
-        if !path.exists() {
-            return Ok(false);
+        let jsonl_path = self.session_path(session_key);
+        let meta_path = self.meta_path(session_key);
+
+        let jsonl_existed = jsonl_path.exists();
+        let meta_existed = meta_path.exists();
+
+        if jsonl_existed {
+            std::fs::remove_file(&jsonl_path)?;
         }
-        std::fs::remove_file(&path)?;
-        Ok(true)
+        // Always clean up the sidecar, even for meta-only sessions.
+        // Without this, meta-only sessions (where a WS handshake wrote
+        // .meta.json but no messages followed) become invisible-to-listing /
+        // invisible-to-delete tombstones that permanently block the
+        // session key for other agents.
+        let _ = std::fs::remove_file(&meta_path);
+
+        Ok(jsonl_existed || meta_existed)
     }
 
     /// Return the modification time of a session's JSONL file.
@@ -130,13 +158,20 @@ impl SessionStore {
             Err(_) => return Vec::new(),
         };
 
-        entries
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let name = entry.file_name().into_string().ok()?;
-                name.strip_suffix(".jsonl").map(String::from)
-            })
-            .collect()
+        let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if let Some(key) = name.strip_suffix(".jsonl") {
+                sessions.insert(key.to_string());
+            } else if let Some(key) = name.strip_suffix(".meta.json") {
+                sessions.insert(key.to_string());
+            }
+        }
+        let mut result: Vec<String> = sessions.into_iter().collect();
+        result.sort();
+        result
     }
 }
 
@@ -166,7 +201,7 @@ impl SessionBackend for SessionStore {
                     .session_mtime(&key)
                     .map(DateTime::<Utc>::from)
                     .unwrap_or_else(Utc::now);
-                crate::session_backend::SessionMetadata {
+                let mut meta = crate::session_backend::SessionMetadata {
                     name: None,
                     created_at: last_activity,
                     last_activity,
@@ -176,7 +211,15 @@ impl SessionBackend for SessionStore {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                };
+                // Hydrate agent_alias and name from the sidecar .meta.json.
+                if let Ok(json) = std::fs::read_to_string(self.meta_path(&meta.key))
+                    && let Ok(sidecar) = serde_json::from_str::<SessionMeta>(&json)
+                {
+                    meta.agent_alias = sidecar.agent_alias;
+                    meta.name = sidecar.name;
                 }
+                meta
             })
             .collect()
     }
@@ -193,11 +236,54 @@ impl SessionBackend for SessionStore {
         self.delete_session(session_key)
     }
 
-    /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk Checking file presence is the same
-    /// O(1) `stat` that `delete_session` itself performs.
+    /// Quick existence probe. A session exists if either the JSONL data file
+    /// or the sidecar metadata file is present on disk. This prevents
+    /// meta-only sessions (handshake with no messages) from becoming
+    /// invisible tombstones.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        self.session_path(session_key).exists() || self.meta_path(session_key).exists()
+    }
+
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
+        let mut meta: SessionMeta = match std::fs::read_to_string(self.meta_path(session_key)) {
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "file": self.meta_path(session_key).display().to_string(),
+                                "error": format!("{e}"),
+                            })),
+                        "Corrupted session metadata file"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "corrupted session metadata",
+                    ));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => SessionMeta::default(),
+            Err(e) => return Err(e),
+        };
+        meta.agent_alias = Some(agent_alias.to_string());
+        let json = serde_json::to_string(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(self.meta_path(session_key), json)
+    }
+
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        match std::fs::read_to_string(self.meta_path(session_key)) {
+            Ok(json) => {
+                let meta: SessionMeta = serde_json::from_str(&json)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(meta.agent_alias)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -532,5 +618,84 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    // ── agent_alias sidecar (.meta.json) tests ──────────────────────
+
+    #[test]
+    fn agent_alias_roundtrip_through_meta_json() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend.set_session_agent_alias("gw_test", "sales").unwrap();
+        assert_eq!(
+            backend.get_session_agent_alias("gw_test").unwrap(),
+            Some("sales".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_alias_missing_meta_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        assert_eq!(
+            backend.get_session_agent_alias("no_such_session").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_alias_corrupt_meta_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        // Write garbage to the meta.json sidecar
+        std::fs::write(store.meta_path("gw_corrupt"), b"not valid json {{{").unwrap();
+
+        assert!(store.get_session_agent_alias("gw_corrupt").is_err());
+    }
+
+    #[test]
+    fn delete_session_cleans_up_meta_json() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .append("gw_cleanup", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_cleanup", "sales")
+            .unwrap();
+        assert!(store.meta_path("gw_cleanup").exists());
+
+        backend.delete_session("gw_cleanup").unwrap();
+        // After delete, .meta.json should also be gone
+        assert!(!store.meta_path("gw_cleanup").exists());
+    }
+
+    #[test]
+    fn list_sessions_with_metadata_includes_agent_alias_from_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // Create a gateway session and stamp its alias
+        backend
+            .append("gw_test_visible", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_test_visible", "sales")
+            .unwrap();
+
+        // The session must appear in the listing with its alias
+        let listed = backend.list_sessions_with_metadata();
+        let row = listed
+            .iter()
+            .find(|m| m.key == "gw_test_visible")
+            .expect("gateway session should appear in metadata listing");
+        assert_eq!(row.agent_alias.as_deref(), Some("sales"));
     }
 }
