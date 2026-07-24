@@ -13436,7 +13436,9 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
-    /// Send the response as multiple separate messages at paragraph boundaries.
+    /// Send the response as multiple separate messages. The boundary between
+    /// messages is channel-specific (for example, Telegram splits at completed
+    /// agent turns).
     #[serde(rename = "multi_message")]
     MultiMessage,
 }
