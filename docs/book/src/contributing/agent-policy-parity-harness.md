@@ -124,17 +124,19 @@ other path applied the plain `apply_policy_tool_filter`. #8701 retired that
 variant, so every path now applies the same plain filter (ledger A4, backed
 by an in-file positive parity test rather than a divergence characterization).
 
-The remaining hand-rolled sites - the channels orchestrator (`start_channels`),
-`Agent::from_config`, and the delegate independent-target builder
+The sites that were hand-rolled when this was written have since migrated:
+`Agent::from_config` (#8711), the channels orchestrator's `start_channels`
+startup assembly (#8830), and the delegate independent-target builder
 (`independent_agentic_tools_for_target`, added by #8239 while this program was
-in flight - the recurrence the seal exists to end) - migrate in follow-up PRs.
-Once all sites mint through `assemble`, the engine's tools field
-seals to `ScopedToolRegistry` (a private-field newtype only `assemble` constructs),
-and handing the engine an unscoped registry - or quietly re-inlining a construction
-site, as a cross-merge did to the channel path once already - becomes a compile
-error instead of a review catch. Until that seal, cross-site parity for the
-not-yet-migrated sites remains by convention; what the seam guarantees today is
-that every path routed through it shares one implementation.
+in flight - the recurrence the seal exists to end; #8744/#8761). Every
+production site now mints its registry through `assemble`. The remaining step
+is the seal: the engine's tools field seals to `ScopedToolRegistry` (a
+private-field newtype only `assemble` constructs), so handing the engine an
+unscoped registry - or quietly re-inlining a construction site, as a cross-merge
+did to the channel path once already - becomes a compile error instead of a
+review catch. Until that seal, cross-site parity remains by convention; what the
+seam guarantees today is that every path routed through it shares one
+implementation.
 
 ## The harness
 

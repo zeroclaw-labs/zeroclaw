@@ -54,12 +54,24 @@ const MATRIX: &[ParityRow] = &[
         surface: "A",
         setting: "built-in filter minted through the one assemble() seam on every path",
         owner_epic: "A",
-        tracking: "gateway + loop_::run + process_message route through assemble(); \
-                   remaining sites cut over one PR at a time",
+        tracking: "every production path routes through assemble() (gateway, loop_::run, \
+                   process_message, from_config #8711, channels startup #8830, \
+                   independent-delegate #8744/#8761); the engine-field seal is the last step",
+        // Every production tool-assembly path now mints its registry through the
+        // one ScopedToolRegistry::assemble seam - the "remaining cut-overs" this
+        // row used to track have all landed. It stays a TrackedDivergence rather
+        // than Tested because uniformity is still CONVENTION-enforced, not
+        // compiler-enforced: the engine field is a raw `&[Box<dyn Tool>]`, so
+        // nothing at the type level stops a future path from hand-rolling a
+        // registry and passing it in (the #8011-style silent un-routing). Only
+        // the engine-field seal (Epic A P2 - making the field type
+        // ScopedToolRegistry) makes that divergence a compile error, at which
+        // point this row converges to a single seam and becomes Tested.
         status: RowStatus::TrackedDivergence,
-        evidence: "gateway/loop_::run/process_message route through assemble(); \
-                   from_config/orchestrator/delegate still hand-roll the same filter, \
-                   tracked by the remaining Epic A cut-overs + the seal",
+        evidence: "all production paths now mint their registry through the one \
+                   ScopedToolRegistry::assemble seam; cross-path uniformity is \
+                   convention-enforced until the engine field seals to ScopedToolRegistry \
+                   (Epic A P2), which makes a hand-rolled registry a compile error",
     },
     ParityRow {
         surface: "A",
