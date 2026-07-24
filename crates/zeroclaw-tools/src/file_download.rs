@@ -177,9 +177,13 @@ fn extract_download_url_host(url: &str) -> anyhow::Result<String> {
         anyhow::bail!("IPv6 hosts are not supported in file_download endpoint URLs");
     }
 
-    // Strip trailing dot (FQDN root label) so "example.com." classifies the
-    // same as "example.com". reqwest's transport treats them equivalently.
-    Ok(host_str.trim_end_matches('.').to_ascii_lowercase())
+    // Preserve trailing dot (FQDN root label) because reqwest's
+    // `resolve_to_addrs` override lookup requires an exact hostname match.
+    // While reqwest's transport treats "example.com." and "example.com" as
+    // equivalent, the override keyed by the hostname will not bind if the
+    // request hostname differs from the override key. Keeping the dot ensures
+    // the validated address set binds to the exact transport-canonical form.
+    Ok(host_str.to_ascii_lowercase())
 }
 
 /// Parse the configured `[file_download].url` into a canonical
@@ -354,6 +358,12 @@ static NORMALIZE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 /// because the configured `[file_download].url` is operator-approved and
 /// a 3xx must surface as a status, not silently rehome the request.
 ///
+/// **Proxy disabled**: The runtime proxy is explicitly NOT applied here.
+/// With a proxy enabled, reqwest connects to the proxy and sends
+/// `CONNECT <host>:<port>` for HTTPS, allowing the proxy to resolve the
+/// target independently. That would bypass the validated address set.
+/// Failing closed on proxy support is the only SSRF-safe choice.
+///
 /// This helper is intentionally a free function (not an instance method)
 /// so the wire-up contract can be unit-tested directly: callers can
 /// supply a hand-crafted `(host, resolved_addrs)` and assert that a real
@@ -364,13 +374,20 @@ async fn build_secure_download_client(
     resolved_addrs: &[std::net::SocketAddr],
     timeout_secs: u64,
 ) -> Result<reqwest::Client, String> {
+    // Fail closed: disable proxy to prevent target re-resolution at the
+    // proxy side. The validated address set must be the only connection
+    // target - a proxy could otherwise resolve the hostname to a private
+    // address even though local DNS validated a public IP.
     let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, resolved_addrs);
-    let builder =
-        zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.file_download");
+        .resolve_to_addrs(host, resolved_addrs)
+        .no_proxy();
+
+    // Explicitly do NOT call `apply_runtime_proxy_to_builder` - that would
+    // re-enable proxy and reopen the SSRF window via proxy-side DNS.
+
     builder.build().map_err(|e| {
         tool_msg_with_args(
             "tool-file-download-error-client-build",
@@ -1735,10 +1752,10 @@ mod tests {
         // request would hit the mock.
         let bogus_addrs = [std::net::SocketAddr::from(([192, 0, 2, 1], mock_port))];
 
-        // Exercise the production helper directly — this is the test
-        // Audacity88 requested in round 3. If `build_secure_download_client`
-        // drops the `resolve_to_addrs` call, real DNS for `localhost`
-        // lands on the wiremock and `expect(0)` fails.
+        // Exercise the production helper directly. If
+        // `build_secure_download_client` drops the `resolve_to_addrs` call,
+        // real DNS for `localhost` lands on the wiremock and `expect(0)`
+        // fails.
         let client = build_secure_download_client("localhost", &bogus_addrs, 30)
             .await
             .expect("client build must succeed");
