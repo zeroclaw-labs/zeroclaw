@@ -19,6 +19,92 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 
+[features]
+# ── Multi-database session backend series ─────────────────────────
+#
+# Each backend has its own Cargo feature on this crate. The
+# follow-up PR for a given backend flips its feature from an empty
+# placeholder (kept cargo-clean during the foundation PR) into a
+# real `dep:`-style optional dependency and replaces the matching
+# `#[cfg(not(feature = "backend-<name>"))]` fail-fast arm in
+# `make_session_backend` with a real `#[cfg(feature =
+# "backend-<name>")]` ctor. Backends still pending: oracle (db2 landed in PR 4 of the series).
+#
+# MySQL and MariaDB speak the same wire protocol and accept the
+# same SQL for the operations we use (CREATE TABLE / INSERT /
+# SELECT … WHERE … / MATCH … AGAINST …), so the `backend-mysql`
+# and `backend-mariadb` features both pull in the same `mysql`
+# crate. We deliberately do NOT pull in `r2d2_mysql` — the
+# `mysql` crate ships its own connection pool (`mysql::Pool`),
+# and adding a second pooler would just be double-pooling for
+# no benefit. `mysql` is built with `default-features = false`
+# to skip the upstream CLI / bigdecimal / native-tls helpers we
+# don't need for session persistence, and `chrono` is enabled so
+# the row-decoding path matches `SessionMetadata`'s
+# `DateTime<Utc>` typing without manual re-formatting.
+#
+# The two features remain independently toggleable so an
+# operator can ship a binary that supports MySQL but not
+# MariaDB (or vice versa), even though the two implementations
+# live in the same workspace and share most of their underlying
+# crate graph.
+backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
+backend-mysql = ["dep:mysql"]
+backend-mariadb = ["dep:mysql"]
+backend-oracle = []
+backend-db2 = ["dep:odbc-api"]
+
+[dependencies.mysql]
+version = "25"
+# `default-features = false` skips the upstream CLI /
+# bigdecimal / native-tls / time helpers we don't need for
+# session persistence. We re-enable `chrono` (for
+# NaiveDateTime <-> DateTime<Utc> decoding parity with
+# `SessionMetadata`) and `minimal` (which forces the
+# `flate2/zlib` backend that `mysql_common`'s compression
+# helpers require — without a flate2 backend the workspace
+# fails to resolve with "You need to choose a zlib backend").
+default-features = false
+features = ["chrono", "minimal"]
+optional = true
+
+[dependencies.postgres]
+version = "0.19"
+default-features = false
+features = ["with-chrono-0_4"]
+optional = true
+
+[dependencies.r2d2]
+version = "0.8"
+optional = true
+
+[dependencies.r2d2_postgres]
+version = "0.18"
+optional = true
+
+[dependencies.odbc-api]
+# Db2 ODBC client wrapper. Pulled in only by the `backend-db2`
+# feature. No first-party IBM Db2 wire-protocol crate exists on
+# crates.io, so the only realistic Rust path is `odbc-api` against
+# the IBM Db2 CLI ODBC driver (`clidriver/` shipped with Db2 12.x).
+# `odbc-api` ships its own ODBC-level connection pool managed by
+# unixODBC / the Windows ODBC driver manager, so we do not pull in
+# a second pooler on top. The crate is synchronous, matching the
+# `spawn_blocking` model this crate uses for every other backend.
+#
+# We keep `odbc-api` on its DEFAULT features: that retains the
+# `odbc_version_3_80` feature upstream uses to expose ODBC 3.8
+# structs (the IBM Db2 12.1 driver is ODBC 3.8 compliant) and is
+# what makes `Environment::new()` compile cleanly. We deliberately
+# do NOT enable the `iodbc` feature, which switches the crate to
+# iODBC instead of unixODBC / Windows-ODBC -- iODBC does not bundle
+# the same Db2-client-friendly defaults and complicates operator
+# setups. We also do NOT use the `narrow` feature, which strips
+# `wchar` support: Db2 stores very long agent names / sender
+# identifiers where wide-char roundtripping helps.
+version = "2.2"
+optional = true
+
 [dev-dependencies]
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

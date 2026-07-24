@@ -10,6 +10,35 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::session_backend::SessionBackend;
 
+/// Run a synchronous `SessionBackend` operation through
+/// `tokio::task::spawn_blocking` so a slow/wedged remote backend
+/// (Postgres/MySQL/MariaDB/Oracle/Db2 — the upcoming drivers in this
+/// series) cannot stall the async task's executor worker. Today's
+/// local drivers (sqlite/jsonl) complete in microseconds, so this
+/// wraps to a single-shot blocking thread; the foundation cost is
+/// tiny and the contract stays correct for every remote backend that
+/// follows.
+///
+/// The helper is intentionally infallible at the async boundary: any
+/// `std::io::Error` the backend raised inside `op` is bubbled out;
+/// any join error from the blocking pool is converted back to a
+/// `std::io::Error::Other("session backend worker panicked")`. Tools
+/// already translate the `std::io::Result<T>` they receive into a
+/// `ToolResult`, so this matches the call sites without adding a new
+/// error type at this layer.
+async fn spawn_blocking_session_op<F, T>(op: F) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(op).await {
+        Ok(result) => result,
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "session backend worker panicked: {join_err}"
+        ))),
+    }
+}
+
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +197,9 @@ impl Tool for SessionsListTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(50, |v| v as usize);
 
-        let metadata = self.backend.list_sessions_with_metadata();
+        let backend = self.backend.clone();
+        let metadata =
+            spawn_blocking_session_op(move || Ok(backend.list_sessions_with_metadata())).await?;
 
         if metadata.is_empty() {
             return Ok(ToolResult {
@@ -275,7 +306,11 @@ impl Tool for SessionsHistoryTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |v| v as usize);
 
-        let messages = self.backend.load(session_id);
+        let messages = {
+            let backend = self.backend.clone();
+            let session_id = session_id.to_string();
+            spawn_blocking_session_op(move || Ok(backend.load(&session_id))).await?
+        };
 
         if messages.is_empty() {
             return Ok(ToolResult {
@@ -414,7 +449,12 @@ impl Tool for SessionsSendTool {
 
         let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
 
-        match self.backend.append(&target_session_key, &chat_msg) {
+        let append_result = {
+            let backend = self.backend.clone();
+            let target_session_key = target_session_key.clone();
+            spawn_blocking_session_op(move || backend.append(&target_session_key, &chat_msg)).await
+        };
+        match append_result {
             Ok(()) => {
                 let output = if target_session_key == session_id.trim() {
                     format!("Message sent to session '{target_session_key}'.")
@@ -487,7 +527,13 @@ impl Tool for SessionsCurrentTool {
         };
 
         let mut output = format!("Current session: {key}\n");
-        if let Some(meta) = self.backend.get_session_metadata(&key) {
+        let metadata = {
+            let backend = self.backend.clone();
+            let key_for_blocking = key.clone();
+            spawn_blocking_session_op(move || Ok(backend.get_session_metadata(&key_for_blocking)))
+                .await?
+        };
+        if let Some(meta) = metadata {
             if let Some(name) = meta.name.filter(|name| !name.is_empty()) {
                 let _ = writeln!(output, "Name: {name}");
             }
@@ -605,7 +651,12 @@ impl Tool for SessionResetTool {
                 .unwrap_or_else(|| session_id.trim().to_string()),
         };
 
-        match self.backend.clear_messages(&target_session_key) {
+        let clear_result = {
+            let backend = self.backend.clone();
+            let target = target_session_key.clone();
+            spawn_blocking_session_op(move || backend.clear_messages(&target)).await
+        };
+        match clear_result {
             Ok(0) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{target_session_key}' is already empty.").into(),
@@ -726,9 +777,19 @@ impl Tool for SessionDeleteTool {
                 .unwrap_or_else(|| session_id.trim().to_string()),
         };
 
-        let existed = !self.backend.load(&target_session_key).is_empty();
+        let existed = {
+            let backend = self.backend.clone();
+            let target = target_session_key.clone();
+            spawn_blocking_session_op(move || Ok(backend.load(&target))).await?
+        };
+        let existed = !existed.is_empty();
 
-        match self.backend.delete_session(&target_session_key) {
+        let delete_result = {
+            let backend = self.backend.clone();
+            let target = target_session_key.clone();
+            spawn_blocking_session_op(move || backend.delete_session(&target)).await
+        };
+        match delete_result {
             Ok(true) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{target_session_key}' deleted.").into(),
