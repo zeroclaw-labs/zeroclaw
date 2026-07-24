@@ -1308,7 +1308,9 @@ mod tests {
 
         let mut agent = Agent::builder()
             .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![file_read_tool],
+            ))
             .memory(make_memory())
             .observer(make_observer())
             .tool_dispatcher(Box::new(NativeToolDispatcher))

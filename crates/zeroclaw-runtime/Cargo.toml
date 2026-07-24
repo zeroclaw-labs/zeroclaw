@@ -108,6 +108,12 @@ browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
+# Exposes the test-only `ScopedToolRegistry::from_raw_for_test` constructor to
+# OTHER crates' test builds (e.g. zeroclaw-channels dev-tests, which must mint a
+# sealed registry for `ChannelRuntimeContext` fixtures). Off by default and never
+# enabled by any production dependency edge, so the assemble()-only seal on
+# `ScopedToolRegistry` remains intact in shipped builds.
+test-util = []
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

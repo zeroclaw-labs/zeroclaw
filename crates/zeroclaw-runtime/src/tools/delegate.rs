@@ -200,7 +200,7 @@ impl DelegateAction {
 }
 
 struct IndependentTargetTools {
-    tools: Vec<Box<dyn Tool>>,
+    tools: crate::tools::scoped::ScopedToolRegistry,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
     /// the target has granted MCP bundles under deferred loading).
     deferred_section: String,
@@ -784,14 +784,16 @@ impl DelegateTool {
         // destructure could (see `ScopedAssembled::combined_mcp_prompt_section`).
         let deferred_section = assembled.combined_mcp_prompt_section();
         let crate::tools::scoped::ScopedAssembled {
-            registry,
+            mut registry,
             activated_handle,
             ..
         } = assembled;
-        let mut tools = registry.into_inner();
-        tools.retain(|tool| tool.name() != Self::NAME);
+        // Strip the delegate tool from the ALREADY-sealed registry via the
+        // `retain` mutator - no unseal/reseal round-trip through a raw `Vec`.
+        // Same set removed as before (`tool.name() != Self::NAME`).
+        registry.retain(|tool| tool.name() != Self::NAME);
         Ok(IndependentTargetTools {
-            tools,
+            tools: registry,
             deferred_section,
             activated_handle,
             workspace_dir: target_workspace,
@@ -2500,7 +2502,7 @@ impl DelegateTool {
         // describes exactly the assembled skill tools rather than the local bundle resolver's
         // narrower view. None for bounded delegation (local resolution).
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
-        let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
+        let sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
@@ -2555,18 +2557,60 @@ impl DelegateTool {
                     HashMap::new()
                 };
 
-                let parent_tools = self.parent_tools.read();
-                parent_tools
-                    .iter()
-                    .filter(|tool| tool.name() != Self::NAME)
-                    .filter(|tool| self.security.is_tool_allowed(tool.name()))
-                    .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
-                    .map(|tool| {
-                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                            Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                // Build the bounded tool set exactly as before: the parent's
+                // tools, filtered by the caller's own `is_tool_allowed` +
+                // `delegate_admits_with_mcp`, with the target's memory tools
+                // substituted in. The `parent_tools` read guard is scoped to
+                // this block so it drops BEFORE the `assemble().await` below - a
+                // parking_lot guard held across an await would make the delegate
+                // future `!Send`.
+                let filtered: Vec<Box<dyn Tool>> = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools
+                        .iter()
+                        .filter(|tool| tool.name() != Self::NAME)
+                        .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                        .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                        .map(|tool| {
+                            target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
+                                Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                            })
                         })
-                    })
-                    .collect()
+                        .collect()
+                };
+                // Seal the already-filtered set through the one assembly seam.
+                // The policy is `SecurityPolicy::default()` (no allow/deny
+                // lists), so `assemble`'s built-in filter is a provable identity
+                // over `filtered`: it drops nothing the delegate filter kept.
+                // Re-applying `self.security` here would double-filter and could
+                // REGRESS delegate scoping, so it is deliberately NOT reused. No
+                // peripherals / MCP / skills / memory-strip, so `config` /
+                // `agent_alias` are never read beyond satisfying the signature.
+                let bounded_default_config = Config::default();
+                let bounded_config_ref = self
+                    .root_config
+                    .as_deref()
+                    .unwrap_or(&bounded_default_config);
+                let bounded_security = Arc::new(SecurityPolicy::default());
+                let assembled_bounded = crate::tools::scoped::ScopedToolRegistry::assemble(
+                    crate::tools::scoped::ScopedAssembly {
+                        config: bounded_config_ref,
+                        agent_alias: agent_name,
+                        security: &bounded_security,
+                        built: crate::tools::AllToolsResult::from_prebuilt_tools(filtered),
+                        skills: &[],
+                        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                        caller_allowed: None,
+                        connect_mcp: false,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: None,
+                    },
+                )
+                .await;
+                assembled_bounded.registry
             }
         };
 

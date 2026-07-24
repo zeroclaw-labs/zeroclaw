@@ -1276,7 +1276,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's own configured provider temperature — the same source
     /// the headless driver hands `crate::agent::run`.
     temperature: Option<f64>,
-    pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
+    /// The step agent's sealed tool set. A [`crate::tools::scoped::ScopedToolRegistry`]
+    /// so the nested loop's `ResolvedIo.tools_registry` can be fed the scoped
+    /// registry directly (coerces to `&[Box<dyn Tool>]` at leaf sites via `Deref`).
+    pub(crate) tools_registry: crate::tools::scoped::ScopedToolRegistry,
     approval: crate::approval::ApprovalManager,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     /// The step agent's fully-resolved config (identity + every runtime-profile
@@ -1411,7 +1414,8 @@ pub(crate) async fn assemble_owned_execution(
         mcp_tool_names,
         ..
     } = assembled;
-    let tools_registry = registry.into_inner();
+    // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
+    let tools_registry = registry;
 
     let provider_ref = config
         .resolved_model_provider_for_agent(alias)
@@ -1507,7 +1511,7 @@ async fn drive_live_sop_actions(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
-    tools_registry: &[Box<dyn crate::tools::Tool>],
+    tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
@@ -1660,7 +1664,7 @@ async fn drive_live_sop_actions(
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
                                 o.model.as_str(),
-                                o.tools_registry.as_slice(),
+                                &o.tools_registry,
                                 Some(&o.approval),
                                 o.activated_tools.as_ref(),
                             ),
@@ -2684,7 +2688,7 @@ mod sop_step_reassembly_tests {
             provider_name: "capture".into(),
             model: "capture-model".into(),
             temperature,
-            tools_registry: tools,
+            tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             approval: crate::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             ),
@@ -2766,7 +2770,7 @@ mod sop_step_reassembly_tests {
         engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         action: crate::sop::types::SopRunAction,
         parent_provider: &dyn ModelProvider,
-        parent_tools: &[Box<dyn crate::tools::Tool>],
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
         observer: &dyn crate::observability::Observer,
         history: &mut Vec<ChatMessage>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
@@ -2871,7 +2875,7 @@ mod sop_step_reassembly_tests {
         );
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("parent system prompt"),
             ChatMessage::user(PARENT_MARKER.to_string()),
@@ -2980,9 +2984,12 @@ mod sop_step_reassembly_tests {
         let parent_provider = TextProvider;
         // Parent scope carries a sensitive tool the child must never be offered.
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3057,7 +3064,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3101,7 +3108,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut exec_cache = std::collections::HashMap::new();
 
@@ -3156,9 +3163,12 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly { config: &config };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3200,9 +3210,12 @@ mod sop_step_reassembly_tests {
         let shell_calls = Arc::new(AtomicUsize::new(0));
         // Parent/delegate scope: a sensitive tool the cross-agent step must never
         // reach.
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();

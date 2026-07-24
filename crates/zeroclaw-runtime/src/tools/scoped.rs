@@ -46,7 +46,24 @@ impl ScopedToolRegistry {
         self.0
     }
 
-    #[cfg(test)]
+    /// Narrow an ALREADY-sealed registry in place. A passthrough to
+    /// [`Vec::retain`] on the private inner vector. This is a mutator on an
+    /// existing sealed registry (it removes tools, never adds), so it cannot
+    /// mint a scope from raw tools and does not weaken the seal - the only way
+    /// to obtain a `ScopedToolRegistry` to call this on is still
+    /// [`Self::assemble`] (or the test-only constructor).
+    pub(crate) fn retain(&mut self, f: impl FnMut(&Box<dyn Tool>) -> bool) {
+        self.0.retain(f);
+    }
+
+    /// Test-only constructor that mints a registry directly from raw tools,
+    /// bypassing [`Self::assemble`]. Gated to `test` (this crate's own unit
+    /// tests) OR the `test-util` feature (so OTHER crates' test builds -
+    /// notably `zeroclaw-channels`, whose `ChannelRuntimeContext` fixtures need
+    /// a sealed registry - can construct one). The `test-util` feature is never
+    /// enabled by a production dependency edge, so this raw mint does not exist
+    /// in shipped builds and the seal holds where it matters.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
         Self(tools)
     }

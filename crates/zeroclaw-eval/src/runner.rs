@@ -75,9 +75,38 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     let replay_handle = replay.handle();
     let provider: Box<dyn ModelProvider> = Box::new(replay);
 
+    // The engine's tool registry is sealed (`ScopedToolRegistry`), mintable only
+    // through the one assembly seam. Route the eval harness's fixed tool set
+    // through it with a permissive default policy so `assemble` is an identity
+    // over `default_tools()` (nothing added, nothing dropped): the eval agent
+    // sees exactly the same tools as before the seal. Every assembly divergence
+    // is off (no peripherals / MCP / skills / memory-strip), so the config,
+    // alias, and runtime are never read beyond satisfying the signature.
+    let eval_config = zeroclaw_config::schema::Config::default();
+    let eval_security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+    let eval_registry = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
+        zeroclaw_runtime::tools::scoped::ScopedAssembly {
+            config: &eval_config,
+            agent_alias: "eval",
+            security: &eval_security,
+            built: zeroclaw_runtime::tools::AllToolsResult::from_prebuilt_tools(default_tools()),
+            skills: &[],
+            runtime: Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        },
+    )
+    .await
+    .registry;
+
     let mut agent = Agent::builder()
         .model_provider(provider)
-        .tools(default_tools())
+        .tools(eval_registry)
         .memory(memory)
         .observer(observer.clone())
         .tool_dispatcher(Box::new(NativeToolDispatcher))

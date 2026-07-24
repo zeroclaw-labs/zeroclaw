@@ -367,7 +367,9 @@ mod tests {
 
         crate::agent::agent::Agent::builder()
             .model_provider(Box::new(StubProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(std::sync::Arc::new(crate::observability::NoopObserver {})
                 as std::sync::Arc<dyn crate::observability::Observer>)

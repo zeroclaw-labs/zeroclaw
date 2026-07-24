@@ -335,7 +335,9 @@ fn build_agent_with(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(dispatcher)
@@ -352,7 +354,9 @@ fn build_agent_with_memory(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -369,7 +373,9 @@ fn build_agent_with_config(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -1104,7 +1110,9 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 #[tokio::test]
 async fn builder_fails_without_provider() {
     let result = Agent::builder()
-        .tools(vec![])
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))

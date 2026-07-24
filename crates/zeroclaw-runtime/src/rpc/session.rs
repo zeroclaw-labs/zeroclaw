@@ -522,7 +522,9 @@ mod tests {
 
         Agent::builder()
             .model_provider(Box::new(StubProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(Arc::new(NoopObserver {}) as Arc<dyn crate::observability::Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))

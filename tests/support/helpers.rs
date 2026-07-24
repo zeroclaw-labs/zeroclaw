@@ -50,7 +50,7 @@ pub fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
 pub fn build_agent(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -63,7 +63,7 @@ pub fn build_agent(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn To
 pub fn build_agent_xml(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -80,7 +80,7 @@ pub fn build_recording_agent(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(memory.unwrap_or_else(make_memory))
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -102,7 +102,7 @@ pub fn build_agent_with_sqlite_memory(
     let mem = Arc::from(memory::create_memory(&cfg, temp_dir, None).unwrap());
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))

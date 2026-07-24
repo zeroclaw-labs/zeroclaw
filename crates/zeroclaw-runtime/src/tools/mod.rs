@@ -454,6 +454,33 @@ pub struct AllToolsResult {
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
 }
 
+impl AllToolsResult {
+    /// Wrap an already-built tool vector as `assemble` INPUT, with every
+    /// side-channel handle empty. This mints an `AllToolsResult` (the input to
+    /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
+    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
+    /// fields are all `pub`, so a caller could already hand-roll this literal;
+    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// paths that already own a fixed / pre-filtered tool set (the skill-review
+    /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
+    /// route it through `assemble` only to seal it: they pass `skills: &[]`,
+    /// `connect_mcp: false`, `connect_peripherals: false`, so the empty handles
+    /// here are never read by the assembly. `pub` (not `pub(crate)`) so the
+    /// out-of-crate `zeroclaw-eval` harness can reach it.
+    pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        Self {
+            tools,
+            delegate_handle: None,
+            ask_user_handle: None,
+            channel_room_handle: None,
+            reaction_handle: Arc::new(RwLock::new(HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+        }
+    }
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
