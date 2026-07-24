@@ -8,8 +8,8 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TransportError {
     /// Operation timed out.
-    #[error("transport timeout after {0}s")]
-    Timeout(u64),
+    #[error("transport timeout after {secs}s: {detail}")]
+    Timeout { secs: u64, detail: String },
 
     /// Transport is disconnected or device was removed.
     #[error("transport disconnected")]
@@ -86,8 +86,14 @@ mod tests {
 
     #[test]
     fn transport_error_display() {
-        let err = TransportError::Timeout(5);
-        assert_eq!(err.to_string(), "transport timeout after 5s");
+        let err = TransportError::Timeout {
+            secs: 5,
+            detail: "deadline has elapsed".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transport timeout after 5s: deadline has elapsed"
+        );
 
         let err = TransportError::Disconnected;
         assert_eq!(err.to_string(), "transport disconnected");
@@ -103,5 +109,20 @@ mod tests {
     fn transport_kind_equality() {
         assert_eq!(TransportKind::Serial, TransportKind::Serial);
         assert_ne!(TransportKind::Serial, TransportKind::Swd);
+    }
+
+    /// Regression: a serial deadline must keep the `Timeout` classification
+    /// so callers can still match on it. Evolving the variant to carry detail
+    /// must not turn it into catch-all `Other`.
+    #[test]
+    fn timeout_variant_preserves_typed_classification() {
+        let err = TransportError::Timeout {
+            secs: 3,
+            detail: "test detail".into(),
+        };
+        assert!(
+            matches!(err, TransportError::Timeout { .. }),
+            "Timeout must remain matchable as Timeout, got {err:?}"
+        );
     }
 }

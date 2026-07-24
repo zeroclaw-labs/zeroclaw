@@ -21,15 +21,15 @@ async fn bridge_request(cmd: &str, args: &[String]) -> anyhow::Result<String> {
     let addr = format!("{}:{}", BRIDGE_HOST, BRIDGE_PORT);
     let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
         .await
-        .map_err(|_| {
+        .map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"addr": addr, "phase": "connect"})),
+                    .with_attrs(::serde_json::json!({"addr": addr, "phase": "connect", "error": e.to_string()})),
                 "uno-q bridge connect timed out"
             );
-            anyhow::Error::msg("Bridge connection timed out")
+            anyhow::Error::new(e).context("Bridge connection timed out")
         })??;
 
     let msg = format!("{} {}\n", cmd, args.join(" "));
@@ -38,7 +38,7 @@ async fn bridge_request(cmd: &str, args: &[String]) -> anyhow::Result<String> {
     let mut buf = vec![0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
         .await
-        .map_err(|_| {
+        .map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
@@ -46,10 +46,11 @@ async fn bridge_request(cmd: &str, args: &[String]) -> anyhow::Result<String> {
                     .with_attrs(::serde_json::json!({
                         "command": cmd,
                         "phase": "response",
+                        "error": e.to_string(),
                     })),
                 "uno-q bridge response timed out"
             );
-            anyhow::Error::msg("Bridge response timed out")
+            anyhow::Error::new(e).context("Bridge response timed out")
         })??;
     let resp = String::from_utf8_lossy(&buf[..n]).trim().to_string();
     Ok(resp)
@@ -339,5 +340,21 @@ mod tests {
     #[test]
     fn bridge_port_is_9999() {
         assert_eq!(BRIDGE_PORT, 9999);
+    }
+
+    /// Regression: tokio::time::Elapsed must remain recoverable from the
+    /// anyhow error chain after being wrapped with `.context()`. The Uno Q
+    /// bridge timeout handlers use `anyhow::Error::new(e).context(...)` and
+    /// callers that inspect error sources may need to detect deadline expiry.
+    #[tokio::test]
+    async fn timeout_error_chain_preserves_elapsed() {
+        let elapsed = tokio::time::timeout(Duration::from_nanos(1), std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let err = anyhow::Error::new(elapsed).context("Bridge connection timed out");
+        assert!(
+            err.downcast_ref::<tokio::time::error::Elapsed>().is_some(),
+            "should preserve Elapsed in anyhow error chain"
+        );
     }
 }

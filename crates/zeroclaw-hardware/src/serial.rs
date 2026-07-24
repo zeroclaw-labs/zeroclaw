@@ -98,7 +98,10 @@ impl Transport for HardwareSerialTransport {
             do_send(&self.port_path, self.baud_rate, &json),
         )
         .await
-        .map_err(|_| TransportError::Timeout(SEND_TIMEOUT_SECS))?
+        .map_err(|e| TransportError::Timeout {
+            secs: SEND_TIMEOUT_SECS,
+            detail: e.to_string(),
+        })?
     }
 
     fn kind(&self) -> TransportKind {
@@ -252,7 +255,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TransportError::Disconnected | TransportError::Timeout(_))
+                Err(TransportError::Disconnected | TransportError::Timeout { .. })
             ),
             "expected Disconnected or Timeout, got {result:?}"
         );
