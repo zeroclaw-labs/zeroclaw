@@ -215,7 +215,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // At Full autonomy the user has explicitly opted into letting the model
     // act without per-call approval. The generic Safety block alone isn't
     // enough to overcome model safety-priors that produce simulated
-    // refusal text without ever dispatching a tool call (see issue #6434).
+    // refusal text without ever dispatching a tool call.
     // Name the power tools the autonomy policy authorizes and tell the model
     // it is authorized to *call/attempt* them (not that they are exempt from
     // policy): command policy, forbidden_commands, forbidden_paths, and OS
