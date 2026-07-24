@@ -4878,6 +4878,35 @@ mod tests {
         assert_eq!(manager.edit_cursor, "alpha ".len());
     }
 
+    #[tokio::test]
+    async fn pane_navigation_claims_only_scalar_field_edits() {
+        let mut manager = test_manager();
+        manager.fields = vec![field("example.name")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+
+        assert!(manager.claims_pane_navigation(&word_left));
+
+        manager.select_items = vec!["first".into(), "second".into()];
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.select_items.clear();
+        manager.fields[0].kind = PropKind::StringArray;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+        };
+        assert!(!manager.claims_pane_navigation(&word_left));
+    }
+
     #[test]
     fn scalar_field_cursor_display_masks_by_grapheme_without_losing_position() {
         let text = "e\u{301}x";

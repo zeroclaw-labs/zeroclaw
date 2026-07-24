@@ -10462,6 +10462,76 @@ mod tests {
         (Chat::new(client, PaneKind::Chat), rx)
     }
 
+    fn chat_with_active_input(kind: PaneKind) -> Chat {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let mut chat = Chat::new(client, kind);
+        let mut active = state();
+        active.input_bar.insert_text("alpha beta");
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat
+    }
+
+    fn active_state(chat: &mut Chat) -> &mut ChatState {
+        let ChatPhase::Active(active) = &mut chat.phase else {
+            unreachable!();
+        };
+        active
+    }
+
+    #[tokio::test]
+    async fn pane_navigation_claims_only_unobstructed_active_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let chat = chat_with_active_input(kind);
+            assert!(chat.claims_pane_navigation(&word_left));
+        }
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).input_bar.clear_input();
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).pending_elicitation = Some(single_elicitation());
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        assert!(!chat.claims_pane_navigation(&word_left));
+
+        let (mut chat, _rx) = test_chat();
+        chat.phase = ChatPhase::PickSession {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+            agents: Vec::new(),
+        };
+        assert!(!chat.claims_pane_navigation(&word_left));
+    }
+
     #[tokio::test]
     async fn elicitation_matching_active_session_installs_modal() {
         let (mut chat, mut rx) = test_chat();
