@@ -4791,14 +4791,95 @@ async fn process_channel_message_body(
         clear_sender_history(ctx.as_ref(), &history_key);
     }
 
-    let had_prior_history = if force_fresh_session {
+    // Record whether the session had prior history BEFORE any TTL-based clearing.
+    // This ensures stale-session detection doesn't corrupt the had_prior_history
+    // flag used for downstream metrics and routing decisions.
+    let had_prior_history_before_ttl = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&history_key)
+        .is_some_and(|turns| !turns.is_empty());
+
+    // Track whether a TTL-based reset occurred this turn.
+    // This is distinct from `force_fresh_session` which comes from the /new command.
+    let mut ttl_reset_this_turn = false;
+
+    // Check if the session is stale based on configured TTL
+    // If so, clear the cached history and delete the persisted session.
+    // This happens in the same turn without marking pending_new_session,
+    // unlike the /new command which schedules a fresh start for the next turn.
+    if let Some(ref store) = ctx.session_store {
+        // Use channels.session_ttl_hours config (default 0 = disabled)
+        let ttl_hours = ctx.prompt_config.channels.session_ttl_hours;
+        if ttl_hours > 0
+            && let Some(last_activity) = store.last_message_at(&history_key)
+        {
+            let ttl_cutoff = chrono::Utc::now() - chrono::Duration::hours(ttl_hours as i64);
+            if last_activity < ttl_cutoff {
+                // TTL-based stale session handling: clear the cached history and
+                // delete the persisted session, but do NOT mark pending_new_session.
+                // The current message should start fresh without scheduling another
+                // reset for the next turn (contrast with /new command responses).
+                clear_sender_history(ctx.as_ref(), &history_key);
+                let persist_delete_ok = match store.delete_session(&history_key) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "history_key": history_key,
+                                "error": e.to_string()
+                            })),
+                            "failed to delete stale session during TTL reset"
+                        );
+                        false
+                    }
+                };
+                // Success-path signal so operators can tell "TTL cleanup" apart
+                // from accidental memory loss: cached history was cleared, and
+                // the persisted session was either removed (the common case) or
+                // left behind (a separate ERROR above). Never includes message
+                // content — only routing identifiers and timing context.
+                let age_seconds = (chrono::Utc::now() - last_activity).num_seconds();
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                        .with_outcome(if persist_delete_ok {
+                            ::zeroclaw_log::EventOutcome::Success
+                        } else {
+                            ::zeroclaw_log::EventOutcome::Failure
+                        })
+                        .with_attrs(::serde_json::json!({
+                            "history_key": history_key,
+                            "channel": msg.channel,
+                            "channel_alias": msg.channel_alias,
+                            "ttl_hours": ttl_hours,
+                            "last_activity": last_activity.to_rfc3339(),
+                            "ttl_cutoff": ttl_cutoff.to_rfc3339(),
+                            "age_seconds": age_seconds,
+                            "persist_delete_ok": persist_delete_ok,
+                        })),
+                    "channel session reset by TTL"
+                );
+                ttl_reset_this_turn = true;
+            }
+        }
+    }
+
+    // Determine had_prior_history:
+    // - /new command (force_fresh_session) => false
+    // - TTL reset this turn => false (session was just cleared)
+    // - Otherwise, use the pre-TTL value
+    let had_prior_history = if force_fresh_session || ttl_reset_this_turn {
         false
     } else {
-        ctx.conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .peek(&history_key)
-            .is_some_and(|turns| !turns.is_empty())
+        had_prior_history_before_ttl
     };
 
     // Preserve the dated user turn verbatim before the LLM call so interrupted
@@ -22110,6 +22191,263 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message.contains(&new_session_reply))
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_ttl_stale_session_with_fresh_prompt() {
+        use std::io::Write;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = true;
+        // Enable TTL with 1 hour - sessions older than this will be considered stale
+        config.channels.session_ttl_hours = 1;
+
+        // Note: We don't need to create actual skills here because the key assertion
+        // is that the fresh-session prompt path is used (checked via <available_skills>
+        // in the system prompt during message processing below).
+        // The open_skills_enabled=true flag ensures refreshed_new_session_system_prompt()
+        // will include the <available_skills> section when had_prior_history=false.
+
+        let default_identity = zeroclaw_config::schema::IdentityConfig::default();
+        // Build a baseline system prompt (won't have <available_skills> since we're not
+        // loading skills here, but that's OK - we'll check the runtime prompt below)
+        let initial_skills = vec![];
+        let initial_system_prompt = build_system_prompt_with_mode(
+            workspace.path(),
+            "test-model",
+            &[],
+            &initial_skills,
+            Some(&default_identity),
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            AutonomyLevel::default(),
+        );
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+
+        // Create a session store and populate it with a stale session
+        let session_store = Arc::new(SessionStore::new(workspace.path()).unwrap());
+        let history_key = "telegram_chat-ttl_alice";
+
+        // Use the SessionStore's internal method to get the correct session path
+        // This ensures we're using the same key sanitization as the store
+        let session_path = workspace.path().join("sessions").join(format!(
+            "{}.jsonl",
+            zeroclaw_api::session_keys::sanitize_session_key(history_key)
+        ));
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+
+        // Create the file with an old mtime by:
+        // 1. Creating it
+        // 2. Setting mtime to 2 hours ago
+        // 3. Writing content (which would normally update mtime, but we'll set it again)
+        let mut file = std::fs::File::create(&session_path).unwrap();
+        writeln!(file, r#"{{"role":"user","content":"old message"}}"#).unwrap();
+        drop(file);
+
+        // Set the file modification time to 2 hours ago
+        // Use a calculation that's guaranteed to be in the past
+        let now_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old_unix_secs = now_unix_secs - 7200; // 2 hours ago
+        let old_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(old_unix_secs);
+        filetime::set_file_mtime(
+            &session_path,
+            filetime::FileTime::from_system_time(old_time),
+        )
+        .unwrap();
+
+        // Verify the session appears stale via last_message_at (BEFORE processing)
+        let last_activity_before = session_store.last_message_at(history_key);
+        assert!(
+            last_activity_before.is_some(),
+            "session should have a last_message_at timestamp"
+        );
+        let ttl_cutoff_before = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(
+            last_activity_before.unwrap() < ttl_cutoff_before,
+            "session should be stale (older than 1 hour) before processing"
+        );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new(initial_system_prompt),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(config.data_dir.clone()),
+            prompt_config: Arc::new(config.clone()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: Some(session_store.clone()),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        // Process a message - this should trigger TTL reset because the session is stale
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-stale".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-ttl".to_string(),
+                content: "hello after TTL".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                passive_context: false,
+                conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Assert 1: The stale session was deleted and only the current turn remains
+        // After TTL reset, the session file should exist (because append_sender_turn re-creates it)
+        // but it should contain only the current user turn, not the old "old message"
+        let session_content = std::fs::read_to_string(session_path).unwrap();
+        assert!(
+            !session_content.contains("old message"),
+            "TTL reset should remove old session content, got: {}",
+            session_content
+        );
+        assert!(
+            session_content.contains("hello after TTL"),
+            "Session should contain the current message, got: {}",
+            session_content
+        );
+
+        // Assert 2: No pending reset for next turn (unlike /new command)
+        {
+            let pending_new_sessions = runtime_ctx
+                .pending_new_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !pending_new_sessions.contains("telegram_chat-ttl_alice"),
+                "TTL reset should NOT mark pending_new_session for next turn"
+            );
+        }
+
+        // Assert 3: The system prompt used the fresh-session path (refreshed_new_session_system_prompt)
+        // This is proven by checking that the LLM was called with a prompt containing
+        // the <available_skills> section (which only happens when had_prior_history=false)
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!calls.is_empty(), "should have made at least one LLM call");
+        let first_system_prompt = &calls[0][0].1;
+        assert!(
+            first_system_prompt.contains("<available_skills>"),
+            "TTL-reset should use fresh-session prompt path with available_skills section, got: {}",
+            first_system_prompt
+        );
+
+        // Assert 4: History contains only the current turn (stale history was cleared)
+        {
+            let histories = runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = histories
+                .peek("telegram_chat-ttl_alice")
+                .expect("history should exist for sender after TTL reset");
+            // After TTL reset, old history is cleared. The current message processing
+            // adds the user turn, and the agent response adds an assistant turn.
+            // We should have at least the user turn, and possibly an assistant turn
+            // if the agent responded.
+            assert!(
+                !turns.is_empty(),
+                "should have at least the user turn after TTL reset"
+            );
+            // First turn should be the user message
+            assert_eq!(turns[0].role, "user");
+            assert!(turns[0].content.contains("hello after TTL"));
+            // If there's a second turn, it should be the assistant's response
+            if turns.len() > 1 {
+                assert_eq!(turns[1].role, "assistant");
+            }
+        }
     }
 
     #[tokio::test]

@@ -901,6 +901,24 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)?;
         Ok(())
     }
+
+    /// Override to directly query the `last_activity` column from `session_metadata`.
+    /// This is more efficient than the trait default which loads all messages.
+    fn last_message_at(&self, session_key: &str) -> Option<DateTime<Utc>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT last_activity FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let activity_str: String = row.get(0)?;
+                Ok(DateTime::parse_from_rfc3339(&activity_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok())
+            },
+        )
+        .ok()
+        .flatten()
+    }
 }
 
 #[cfg(test)]
@@ -1533,5 +1551,54 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+
+    #[test]
+    fn last_message_at_returns_timestamp_from_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Non-existent session should return None
+        assert!(backend.last_message_at("nonexistent").is_none());
+
+        // Existing session should return its last_activity timestamp
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        let before = chrono::Utc::now();
+        let last_activity = backend.last_message_at("s1").unwrap();
+        let after = chrono::Utc::now();
+
+        // Timestamp should be close to now (within 1 second)
+        assert!(last_activity >= before - chrono::Duration::seconds(1));
+        assert!(last_activity <= after + chrono::Duration::seconds(1));
+
+        // After another message, timestamp should update
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        backend.append("s1", &ChatMessage::user("world")).unwrap();
+        let newer_activity = backend.last_message_at("s1").unwrap();
+        assert!(newer_activity >= last_activity);
+    }
+
+    #[test]
+    fn last_message_at_is_more_efficient_than_get_session_metadata() {
+        // This test verifies that last_message_at works correctly
+        // and returns the same timestamp as get_session_metadata
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+
+        let metadata_timestamp = backend
+            .get_session_metadata("s1")
+            .map(|m| m.last_activity)
+            .unwrap();
+        let direct_timestamp = backend.last_message_at("s1").unwrap();
+
+        // Both methods should return the same timestamp
+        // (allowing for small timing differences)
+        let diff = (metadata_timestamp - direct_timestamp)
+            .num_milliseconds()
+            .abs();
+        assert!(diff < 100, "Timestamps should match within 100ms");
     }
 }

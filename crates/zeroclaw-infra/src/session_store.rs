@@ -199,6 +199,39 @@ impl SessionBackend for SessionStore {
     fn session_exists(&self, session_key: &str) -> bool {
         self.session_path(session_key).exists()
     }
+
+    /// Override to use file modification time as last_activity instead of Utc::now().
+    fn get_session_metadata(
+        &self,
+        session_key: &str,
+    ) -> Option<crate::session_backend::SessionMetadata> {
+        let messages = self.load(session_key);
+        if messages.is_empty() {
+            return None;
+        }
+        let last_activity: chrono::DateTime<chrono::Utc> = self
+            .session_mtime(session_key)
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(chrono::Utc::now);
+        Some(crate::session_backend::SessionMetadata {
+            key: session_key.to_string(),
+            name: self.get_session_name(session_key).ok().flatten(),
+            created_at: last_activity,
+            last_activity,
+            message_count: messages.len(),
+            agent_alias: None,
+            channel_id: None,
+            room_id: None,
+            sender_id: None,
+        })
+    }
+
+    /// Override to use file modification time as the last message timestamp.
+    /// This is more efficient than loading messages to derive the timestamp.
+    fn last_message_at(&self, session_key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.session_mtime(session_key)
+            .map(chrono::DateTime::<chrono::Utc>::from)
+    }
 }
 
 #[cfg(test)]
@@ -532,5 +565,93 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    #[test]
+    fn get_session_metadata_uses_file_mtime_for_last_activity() {
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // Create session and record time before append
+        let before = chrono::Utc::now();
+        std::thread::sleep(Duration::from_millis(10));
+
+        backend
+            .append("mtime_test", &ChatMessage::user("hello"))
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let after = chrono::Utc::now();
+
+        let meta = backend.get_session_metadata("mtime_test").unwrap();
+
+        // last_activity should be close to the file mtime, not Utc::now()
+        assert!(meta.last_activity >= before - Duration::from_secs(1));
+        assert!(meta.last_activity <= after + Duration::from_secs(1));
+
+        // Verify it's using file mtime by checking created_at == last_activity
+        // (since we only have one timestamp source - the file mtime)
+        assert_eq!(meta.created_at, meta.last_activity);
+    }
+
+    #[test]
+    fn last_message_at_uses_file_mtime() {
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // Non-existent session should return None
+        assert!(backend.last_message_at("nonexistent").is_none());
+
+        // Existing session should return its file mtime as timestamp
+        let before = chrono::Utc::now();
+        std::thread::sleep(Duration::from_millis(10));
+
+        backend
+            .append("mtime_test", &ChatMessage::user("hello"))
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let after = chrono::Utc::now();
+
+        let last_activity = backend.last_message_at("mtime_test").unwrap();
+
+        // Timestamp should be close to the file mtime, not Utc::now()
+        assert!(last_activity >= before - Duration::from_secs(1));
+        assert!(last_activity <= after + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn last_message_at_matches_get_session_metadata() {
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .append("test_session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .append("test_session", &ChatMessage::assistant("hi"))
+            .unwrap();
+
+        // Wait a bit to ensure file mtime is updated
+        std::thread::sleep(Duration::from_millis(10));
+
+        let metadata_timestamp = backend
+            .get_session_metadata("test_session")
+            .map(|m| m.last_activity)
+            .unwrap();
+        let direct_timestamp = backend.last_message_at("test_session").unwrap();
+
+        // Both methods should return the same timestamp (file mtime)
+        // They should be identical since both use session_mtime()
+        assert_eq!(metadata_timestamp, direct_timestamp);
     }
 }

@@ -245,6 +245,18 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Get the last activity timestamp for a session.
+    ///
+    /// Returns `None` if the session doesn't exist or the backend doesn't track timestamps.
+    /// Used by channel orchestrators for TTL-based session cleanup decisions.
+    ///
+    /// Default impl falls back to `get_session_metadata` and extracts `last_activity`.
+    /// Backends with direct timestamp access (e.g. SQLite) should override for efficiency.
+    fn last_message_at(&self, session_key: &str) -> Option<DateTime<Utc>> {
+        self.get_session_metadata(session_key)
+            .map(|meta| meta.last_activity)
+    }
 }
 
 /// Session state information.
@@ -284,5 +296,68 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn last_message_at_trait_default_falls_back_to_metadata() {
+        // Test the trait default implementation using a mock backend
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        struct MockBackend {
+            sessions: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+        }
+
+        impl MockBackend {
+            fn new() -> Self {
+                Self {
+                    sessions: Arc::new(Mutex::new(HashMap::new())),
+                }
+            }
+        }
+
+        impl SessionBackend for MockBackend {
+            fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .get(session_key)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+
+            fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .entry(session_key.to_string())
+                    .or_default()
+                    .push(message.clone());
+                Ok(())
+            }
+
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+
+            fn list_sessions(&self) -> Vec<String> {
+                self.sessions.lock().unwrap().keys().cloned().collect()
+            }
+        }
+
+        let backend = MockBackend::new();
+
+        // Non-existent session should return None
+        assert!(backend.last_message_at("nonexistent").is_none());
+
+        // Existing session should return a timestamp (trait default uses Utc::now())
+        backend.append("test", &ChatMessage::user("hello")).unwrap();
+        let before = chrono::Utc::now();
+        let last_activity = backend.last_message_at("test").unwrap();
+        let after = chrono::Utc::now();
+
+        // Trait default uses Utc::now() at call time
+        assert!(last_activity >= before - chrono::Duration::seconds(1));
+        assert!(last_activity <= after + chrono::Duration::seconds(1));
     }
 }
