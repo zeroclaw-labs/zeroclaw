@@ -11,7 +11,7 @@ See [RFC process](./rfcs.md) for larger changes that need design discussion befo
 For anything larger than a typo fix:
 
 1. **Check the issue tracker.** Someone may already be working on it or have filed a related discussion.
-2. **Read `AGENTS.md`.** The repo's root `AGENTS.md` is the canonical source of convention: risk tiers, PR discipline, anti-patterns, and review standards live there.
+2. **Read `AGENTS.md`.** The repo root contains the compact, always-loaded contract. Use [Coding agent guidelines](./agent-guidelines.md) for detailed risk, stability, source-of-truth, and skill-discovery references.
 3. **Use the [Architecture and contribution map](./architecture-map.md)** for anything that touches architecture, config, security, workflow, governance, CI, release behavior, or AI-assisted contribution policy.
 4. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
 
@@ -40,6 +40,24 @@ The key checkpoints:
 - Security by default: allowlists, not blocklists. New external surface defaults closed
 - Inline unit tests: `#[cfg(test)] mod tests {}` at the bottom of the file or a sibling `tests.rs`
 - Don't commit secrets, personal data, or real-user identities: the [Privacy & PII discipline](./privacy.md) page is the merge gate
+
+### Comments and drift
+
+Comments should explain durable intent, invariants, hazards, or source ownership. Do not add comments that restate nearby control flow, duplicate schema or config field lists, mirror enum variants, or describe runtime behavior that the code and tests do not enforce. Those comments become drift surfaces: future contributors and tools may trust the prose after the source has changed.
+
+If a comment needs to mention behavior owned elsewhere, point to the owner instead of copying it. Prefer comments that say why a branch is safe, which contract owns a rule, or which source must change first.
+
+Prefer:
+
+- `The config schema owns accepted aliases; keep this resolver generic.`
+- `This panic is unreachable because the parser rejects empty tool names earlier.`
+
+Avoid:
+
+- `Supported variants are A, B, and C.`
+- `This flag always enables vector search.`
+
+If the statement can only stay true by manually editing the comment whenever code, config, WIT, schema, or tests change, make the source clearer or add a source pointer instead.
 
 ## Testing
 

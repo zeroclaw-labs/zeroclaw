@@ -84,17 +84,26 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
     let canvas_store = state.canvas_store.clone();
     let server = if let Some(store) = store {
         Arc::new(
-            AcpServer::new_with_writer_and_store(config, acp_config, output_tx, store)
-                .with_canvas_store(canvas_store)
-                .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
-                .with_connection_default_agent(default_agent),
+            AcpServer::new_with_live_config_and_writer_and_store(
+                Arc::clone(&state.config),
+                acp_config,
+                output_tx,
+                store,
+            )
+            .with_canvas_store(canvas_store)
+            .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
+            .with_connection_default_agent(default_agent),
         )
     } else {
         Arc::new(
-            AcpServer::new_with_writer(config, acp_config, output_tx)
-                .with_canvas_store(canvas_store)
-                .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
-                .with_connection_default_agent(default_agent),
+            AcpServer::new_with_live_config_and_writer(
+                Arc::clone(&state.config),
+                acp_config,
+                output_tx,
+            )
+            .with_canvas_store(canvas_store)
+            .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
+            .with_connection_default_agent(default_agent),
         )
     };
 

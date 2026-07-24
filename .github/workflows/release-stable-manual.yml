@@ -975,6 +975,19 @@ jobs:
             --ref master \
             -f tag="$TAG"
 
+  docker-matrix:
+    name: Publish Docker Variant Matrix
+    needs: [validate, publish, docker]
+    if: ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.publish.result == 'success' && needs.docker.result == 'success' }}
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      release_ref: ${{ needs.validate.outputs.tag }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+
   docker:
     name: Push Docker Image
     needs: [validate, build]
@@ -1209,16 +1222,6 @@ jobs:
     needs: [validate, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/pub-aur.yml
-    with:
-      release_tag: ${{ needs.validate.outputs.tag }}
-      dry_run: false
-    secrets: inherit
-
-  homebrew:
-    name: Update Homebrew Core
-    needs: [validate, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    uses: ./.github/workflows/pub-homebrew-core.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       dry_run: false

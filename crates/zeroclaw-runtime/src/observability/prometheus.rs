@@ -15,6 +15,7 @@ pub struct PrometheusObserver {
     tokens_output_total: IntCounterVec,
     tool_calls: IntCounterVec,
     channel_messages: IntCounterVec,
+    memory_audits: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
     cache_hits: IntCounterVec,
@@ -24,6 +25,7 @@ pub struct PrometheusObserver {
     // Histograms
     agent_duration: HistogramVec,
     tool_duration: HistogramVec,
+    memory_audit_duration: HistogramVec,
     request_latency: Histogram,
 
     // Gauges
@@ -93,6 +95,15 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
+        let memory_audits = IntCounterVec::new(
+            prometheus::Opts::new(
+                "zeroclaw_memory_audit_total",
+                "Total memory audit trail actions",
+            ),
+            &["backend", "action", "success"],
+        )
+        .expect("valid metric");
+
         let heartbeat_ticks =
             prometheus::IntCounter::new("zeroclaw_heartbeat_ticks_total", "Total heartbeat ticks")
                 .expect("valid metric");
@@ -141,6 +152,16 @@ impl PrometheusObserver {
             )
             .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
             &["tool"],
+        )
+        .expect("valid metric");
+
+        let memory_audit_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "zeroclaw_memory_audit_duration_seconds",
+                "Memory audit trail action duration in seconds",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            &["backend", "action", "success"],
         )
         .expect("valid metric");
 
@@ -218,6 +239,7 @@ impl PrometheusObserver {
             .ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
+        registry.register(Box::new(memory_audits.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
         registry.register(Box::new(cache_hits.clone())).ok();
@@ -225,6 +247,9 @@ impl PrometheusObserver {
         registry.register(Box::new(cache_tokens_saved.clone())).ok();
         registry.register(Box::new(agent_duration.clone())).ok();
         registry.register(Box::new(tool_duration.clone())).ok();
+        registry
+            .register(Box::new(memory_audit_duration.clone()))
+            .ok();
         registry.register(Box::new(request_latency.clone())).ok();
         registry.register(Box::new(tokens_used.clone())).ok();
         registry.register(Box::new(active_sessions.clone())).ok();
@@ -247,6 +272,7 @@ impl PrometheusObserver {
             tokens_output_total,
             tool_calls,
             channel_messages,
+            memory_audits,
             heartbeat_ticks,
             errors,
             cache_hits,
@@ -254,6 +280,7 @@ impl PrometheusObserver {
             cache_tokens_saved,
             agent_duration,
             tool_duration,
+            memory_audit_duration,
             request_latency,
             tokens_used,
             active_sessions,
@@ -349,6 +376,20 @@ impl Observer for PrometheusObserver {
             | ObserverEvent::MemoryRecall { .. }
             | ObserverEvent::MemoryStore { .. }
             | ObserverEvent::RagRetrieve { .. } => {}
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                let success_str = if *success { "true" } else { "false" };
+                self.memory_audits
+                    .with_label_values(&[backend.as_str(), action.as_str(), success_str])
+                    .inc();
+                self.memory_audit_duration
+                    .with_label_values(&[backend.as_str(), action.as_str(), success_str])
+                    .observe(duration.as_secs_f64());
+            }
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -504,6 +545,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -515,6 +557,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "file_read".into(),
             tool_call_id: None,
             duration: Duration::from_millis(5),
@@ -533,6 +576,12 @@ mod tests {
         obs.record_event(&ObserverEvent::Error {
             component: "model_provider".into(),
             message: "timeout".into(),
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(20),
+            success: true,
         });
     }
 
@@ -557,6 +606,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(100),
@@ -569,12 +619,22 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "purge".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(4),
+            success: true,
+        });
 
         let output = obs.encode();
         assert!(output.contains("zeroclaw_agent_starts_total"));
         assert!(output.contains("zeroclaw_tool_calls_total"));
         assert!(output.contains("zeroclaw_heartbeat_ticks_total"));
         assert!(output.contains("zeroclaw_request_latency_seconds"));
+        assert!(output.contains(
+            r#"zeroclaw_memory_audit_total{action="purge",backend="sqlite",success="true"} 1"#
+        ));
+        assert!(output.contains("zeroclaw_memory_audit_duration_seconds"));
     }
 
     #[test]
@@ -594,6 +654,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -605,6 +666,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -616,6 +678,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -668,6 +731,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
@@ -681,6 +745,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(300),
@@ -711,6 +776,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "ollama".into(),
             model: "llama3".into(),
             duration: Duration::from_millis(100),

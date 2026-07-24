@@ -92,6 +92,8 @@ The schema-mirror grammar is the canonical way to inject values, but `ANTHROPIC_
 
 Substitute the alias name in place of `home` to match your config. For multiple aliases on the same family, repeat the line with each alias.
 
+These lines are shell bridges into typed config, not a general rule that constructors read provider-native env vars. Runtime code should receive the resolved value from `Config` unless the integration family explicitly documents a native env bridge.
+
 ## OAuth and CLI-path fields
 
 A handful of fields live as schema fields, reachable via the standard mapping:

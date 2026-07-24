@@ -433,6 +433,7 @@ pub enum Action {
     Save,
     Migrate,
     Validate,
+    MemoryAudit,
     Note,
 }
 

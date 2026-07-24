@@ -327,6 +327,22 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
     (!items.is_empty()).then_some(items)
 }
 
+/// Build a single Responses-API `function_call` input item from a parsed
+/// `ProviderToolCall`. The `arguments` field is routed through the shared
+/// `sanitize_tool_arguments` helper so the openai_codex call site inherits
+/// the same malformed-JSON → `"{}"` contract as the other four typed
+/// providers. Factored out so the call-site behavior is testable without
+/// running the full input builder.
+pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
+    let name = call.name;
+    serde_json::json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": name,
+        "arguments": crate::compatible::sanitize_tool_arguments(&name, &call.arguments),
+    })
+}
+
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -411,12 +427,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                     }
 
                     for call in parsed_calls {
-                        input.push(serde_json::json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments,
-                        }));
+                        input.push(build_function_call_item(call));
                     }
                 } else if !msg.content.trim().is_empty() {
                     input.push(response_message_item(
@@ -2511,5 +2522,38 @@ data: [DONE]
 
         assert!(provider.supports_streaming());
         assert!(provider.supports_streaming_tool_events());
+    }
+
+    #[test]
+    fn build_function_call_item_sanitizes_invalid_arguments_to_empty_object() {
+        // Pins that the openai_codex call site of `sanitize_tool_arguments`
+        // is wired in. The helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
+        let call = ProviderToolCall {
+            id: "call_bad".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"rm -rf"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["call_id"], "call_bad");
+        assert_eq!(item["name"], "shell");
+        assert_eq!(item["arguments"], "{}");
+    }
+
+    #[test]
+    fn build_function_call_item_passes_through_valid_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        let call = ProviderToolCall {
+            id: "call_ok".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["arguments"], r#"{"command":"pwd"}"#);
     }
 }

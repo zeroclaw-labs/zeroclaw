@@ -3,6 +3,13 @@
 /// into persisted config.
 pub const UNSET_DISPLAY: &str = "<unset>";
 
+/// Return whether a submitted display value represents no configured value.
+#[must_use]
+pub fn is_unset_display_value(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value == UNSET_DISPLAY
+}
+
 /// Describes a single secret field discovered via `#[derive(Configurable)]`.
 #[derive(Debug, Clone)]
 pub struct SecretFieldInfo {

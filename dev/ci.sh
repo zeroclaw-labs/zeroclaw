@@ -18,6 +18,10 @@ run_in_ci() {
   "${compose_cmd[@]}" run --rm local-ci bash -c "$cmd"
 }
 
+run_firmware_protocol_gate() {
+  run_in_ci "./scripts/ci/firmware_protocol_gate.sh"
+}
+
 build_smoke_image() {
   if docker buildx version >/dev/null 2>&1; then
     mkdir -p "$SMOKE_CACHE_DIR"
@@ -48,6 +52,7 @@ Commands:
   shell         Open an interactive shell inside the CI container
   lint          Run rustfmt + clippy correctness gate (container only)
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
+  firmware-protocol Run standalone firmware protocol host gate (container only)
   test          Run cargo test (container only)
   test-component  Run component tests only
   test-integration Run integration tests only
@@ -59,7 +64,7 @@ Commands:
   deny          Run cargo deny check (container only)
   security      Run cargo audit + cargo deny (container only)
   docker-smoke  Build and verify runtime image (host docker daemon)
-  all           Run lint, test, build, security, docker-smoke
+  all           Run lint, firmware-protocol, test, build, security, docker-smoke
   clean         Remove local CI containers and volumes
 EOF
 }
@@ -84,6 +89,10 @@ case "$1" in
 
   lint-strict)
     run_in_ci "./scripts/ci/rust_quality_gate.sh --strict"
+    ;;
+
+  firmware-protocol)
+    run_firmware_protocol_gate
     ;;
 
   test)
@@ -145,6 +154,7 @@ case "$1" in
     # for why this differs from required CI. If you change the runner here,
     # update that comment in lockstep.
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
+    run_firmware_protocol_gate
     run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"

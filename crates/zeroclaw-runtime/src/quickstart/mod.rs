@@ -591,6 +591,31 @@ fn build_channel_type_options(
         .collect()
 }
 
+fn resolve_channel_quickstart_type(channel_type: &str) -> (&str, bool) {
+    match channel_type {
+        "whatsapp-web" | "whatsapp_web" => ("whatsapp", true),
+        other => (other, false),
+    }
+}
+
+fn canonical_quickstart_channel_ref(reference: &str) -> Option<String> {
+    let (channel_type, alias) = split_ref(reference.trim())?;
+    let (config_channel_type, _) = resolve_channel_quickstart_type(channel_type);
+    Some(format!("{config_channel_type}.{alias}"))
+}
+
+fn default_whatsapp_web_session_path(config: &Config, alias: &str) -> String {
+    config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("state")
+        .join("whatsapp-web")
+        .join(format!("{alias}.db"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Walk the serialised form of `value` and yield `<type>.<alias>` refs
 /// for every `HashMap<String, _>`-shaped subsection. Schema-driven —
 /// adding a new channel or storage slot in the schema lights up here
@@ -1398,6 +1423,11 @@ fn apply_memory(
 
 // ── Channels ───────────────────────────────────────────────────────
 
+fn usable_quickstart_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!zeroclaw_config::traits::is_unset_display_value(value)).then_some(value)
+}
+
 fn apply_channels(
     config: &mut Config,
     channels: &[SelectorChoice<ChannelQuickStart>],
@@ -1447,7 +1477,9 @@ fn apply_channels(
                 }
             }
             SelectorChoice::Fresh(entry) => {
-                if entry.channel_type.trim().is_empty() || entry.alias.trim().is_empty() {
+                let submitted_channel_type = entry.channel_type.trim();
+                let alias = entry.alias.trim();
+                if submitted_channel_type.is_empty() || alias.is_empty() {
                     errors.push(QuickstartError::for_surface(
                         ctx,
                         QuickstartStep::Channels,
@@ -1458,8 +1490,10 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                if channel_exists(config, &entry.channel_type, &entry.alias) {
-                    let alias_ref = format!("{}.{}", entry.channel_type, entry.alias);
+                let (config_channel_type, is_whatsapp_web) =
+                    resolve_channel_quickstart_type(submitted_channel_type);
+                if channel_exists(config, config_channel_type, alias) {
+                    let alias_ref = format!("{config_channel_type}.{alias}");
                     errors.push(QuickstartError::for_surface(
                         ctx,
                         QuickstartStep::Channels,
@@ -1470,8 +1504,30 @@ fn apply_channels(
                     ));
                     continue;
                 }
+                let advertised: std::collections::HashSet<String> =
+                    field_shape(FieldSection::Channel, &entry.channel_type)
+                        .into_iter()
+                        .map(|field| field.key)
+                        .collect();
+                if let Some(key) = entry
+                    .fields
+                    .keys()
+                    .filter(|key| !advertised.contains(*key))
+                    .min()
+                {
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.{key}"),
+                        format!("channel field `{key}` is not available in Quickstart"),
+                        "cli-quickstart-error-channel-field-not-advertised",
+                        &[("field", key.as_str())],
+                    ));
+                    continue;
+                }
+                let mut staged = config.clone();
                 if let Err(err) =
-                    config.create_map_key(&format!("channels.{}", entry.channel_type), &entry.alias)
+                    staged.create_map_key(&format!("channels.{config_channel_type}"), alias)
                 {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Channels,
@@ -1480,34 +1536,80 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                let token_path =
-                    format!("channels.{}.{}.bot_token", entry.channel_type, entry.alias);
-                if let Some(tok) = &entry.token {
-                    if let Err(err) = config.set_prop_persistent(&token_path, tok) {
+                let prefix = format!("channels.{config_channel_type}.{alias}");
+                let mut fields: Vec<_> = entry
+                    .fields
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        usable_quickstart_value(value).map(|value| (key, value))
+                    })
+                    .collect();
+                fields.sort_by_key(|(left, _)| *left);
+
+                let mut failed = false;
+                for (key, value) in fields {
+                    if let Err(err) = staged.set_prop_persistent(&format!("{prefix}.{key}"), value)
+                    {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
-                            format!("channels[{idx}].token"),
+                            format!("channels[{idx}].fields.{key}"),
                             err.to_string(),
                         ));
-                        continue;
-                    }
-                } else {
-                    // No creds — still need to materialize the entry so the agent
-                    // record can reference it. Set `enabled = true` as the minimum
-                    // schema-recognised field; channels without creds will fail
-                    // their own bootstrap loudly, which is the desired behaviour.
-                    let enabled_path =
-                        format!("channels.{}.{}.enabled", entry.channel_type, entry.alias);
-                    if let Err(err) = config.set_prop_persistent(&enabled_path, "true") {
-                        errors.push(QuickstartError::new(
-                            QuickstartStep::Channels,
-                            format!("channels[{idx}]"),
-                            err.to_string(),
-                        ));
-                        continue;
+                        failed = true;
+                        break;
                     }
                 }
-                refs.push(format!("{}.{}", entry.channel_type, entry.alias));
+                if !failed && is_whatsapp_web {
+                    let default_path = default_whatsapp_web_session_path(config, alias);
+                    if let Err(err) =
+                        staged.set_prop_persistent(&format!("{prefix}.session_path"), &default_path)
+                    {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].channel_type"),
+                            err.to_string(),
+                        ));
+                        failed = true;
+                    }
+                }
+                if !failed
+                    && let Err(err) =
+                        staged.set_prop_persistent(&format!("{prefix}.enabled"), "true")
+                {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.enabled"),
+                        err.to_string(),
+                    ));
+                    failed = true;
+                }
+                if !failed
+                    && config_channel_type == "telegram"
+                    && let Some(telegram) = staged.channels.telegram.get(alias)
+                    && let Err(err) = telegram.validate_bot_token(alias)
+                {
+                    let structured =
+                        zeroclaw_config::api_error::ConfigApiError::from_validation(err);
+                    let terminal = structured
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.rsplit('.').next())
+                        .unwrap_or("credential");
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.{terminal}"),
+                        structured.message,
+                        "cli-quickstart-error-channel-token-required",
+                        &[],
+                    ));
+                    failed = true;
+                }
+                if failed {
+                    continue;
+                }
+                *config = staged;
+                refs.push(format!("{config_channel_type}.{alias}"));
             }
         }
     }
@@ -1552,10 +1654,21 @@ fn apply_peer_groups(
             ));
             continue;
         }
+        let Some(channel_ref) = canonical_quickstart_channel_ref(&pg.channel) else {
+            errors.push(QuickstartError::for_surface(
+                ctx,
+                QuickstartStep::Channels,
+                format!("peer_groups[{idx}].channel"),
+                format!("`{}` is not a `<type>.<alias>` reference", pg.channel),
+                "cli-quickstart-error-not-type-alias-ref",
+                &[("reference", &pg.channel)],
+            ));
+            continue;
+        };
         // Channel ref must resolve to either a channel already in config
         // OR a channel staged in this same submission.
-        let staged_match = staged_channel_refs.iter().any(|r| r == &pg.channel);
-        let configured_match = match split_ref(&pg.channel) {
+        let staged_match = staged_channel_refs.iter().any(|r| r == &channel_ref);
+        let configured_match = match split_ref(&channel_ref) {
             Some((family, alias)) => channel_exists(config, family, alias),
             None => false,
         };
@@ -1595,7 +1708,7 @@ fn apply_peer_groups(
             continue;
         }
         let prefix = format!("peer_groups.{}", pg.name);
-        if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &pg.channel) {
+        if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &channel_ref) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].channel"),
@@ -2107,6 +2220,21 @@ mod tests {
                 personality_file: None,
                 personality_files: vec![],
             },
+        }
+    }
+
+    fn fresh_channel(
+        channel_type: &str,
+        alias: &str,
+        fields: &[(&str, &str)],
+    ) -> ChannelQuickStart {
+        ChannelQuickStart {
+            channel_type: channel_type.into(),
+            alias: alias.into(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
         }
     }
 
@@ -2644,16 +2772,8 @@ mod tests {
     async fn multiple_channels_all_bind_to_agent() {
         let mut submission = fresh_submission("bot");
         submission.channels = vec![
-            SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: "telegram".into(),
-                alias: "tg".into(),
-                token: Some("tok-a".into()),
-            }),
-            SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: "discord".into(),
-                alias: "dc".into(),
-                token: Some("tok-b".into()),
-            }),
+            SelectorChoice::Fresh(fresh_channel("telegram", "tg", &[("bot_token", "tok-a")])),
+            SelectorChoice::Fresh(fresh_channel("discord", "dc", &[("bot_token", "tok-b")])),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
         let reloaded = reload(&dir);
@@ -2668,16 +2788,215 @@ mod tests {
             "second channel must also be bound; got {bound:?}"
         );
         assert_eq!(bound.len(), 2, "both channels bound, not just the last");
+        let store = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(
+            store
+                .decrypt(&reloaded.channels.telegram["tg"].bot_token)
+                .unwrap(),
+            "tok-a"
+        );
+        assert!(reloaded.channels.telegram["tg"].enabled);
+        assert_eq!(
+            store
+                .decrypt(&reloaded.channels.discord["dc"].bot_token)
+                .unwrap(),
+            "tok-b"
+        );
+        assert!(reloaded.channels.discord["dc"].enabled);
+    }
+
+    #[tokio::test]
+    async fn telegram_channel_fields_persist_canonical_bot_token() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "telegram",
+            "ops",
+            &[("bot_token", " 123:ABC ")],
+        ))];
+
+        let (dir, _) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let store = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(
+            store
+                .decrypt(&reloaded.channels.telegram["ops"].bot_token)
+                .unwrap(),
+            "123:ABC"
+        );
+        assert!(reloaded.channels.telegram["ops"].enabled);
+    }
+
+    #[test]
+    fn telegram_channel_fields_reject_unusable_bot_token_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
+            let cfg = Config::default();
+            let mut submission = fresh_submission("bot");
+            let fields = value.map_or_else(Vec::new, |value| vec![("bot_token", value)]);
+            submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+                "telegram", "ops", &fields,
+            ))];
+
+            let errors = validate_only(&submission, &cfg).expect_err("token must be rejected");
+            assert!(errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.bot_token"
+                    && error.message.contains("required")
+            }));
+        }
+    }
+
+    #[test]
+    fn channel_fields_reject_unknown_keys_without_exposing_values() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).expect("serialize config");
+        let before_dirty_paths = cfg.dirty_paths.clone();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "discord",
+            "ops",
+            &[("unknown_secret", "super-secret-value")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &submission.channels, &mut errors, None);
+
+        assert!(refs.is_empty());
+        let error = errors
+            .iter()
+            .find(|error| error.field == "channels[0].fields.unknown_secret")
+            .expect("structured unknown-field error");
+        assert!(!error.message.contains("super-secret-value"));
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config"),
+            before
+        );
+        assert_eq!(cfg.dirty_paths, before_dirty_paths);
+    }
+
+    #[test]
+    fn channel_fields_reject_valid_but_unadvertised_schema_keys() {
+        let mut cfg = Config::default();
+        let before = serde_json::to_value(&cfg).expect("serialize config");
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "telegram",
+            "ops",
+            &[
+                ("bot_token", "123:ABC"),
+                ("api_base_url", "https://example.invalid"),
+            ],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &submission.channels, &mut errors, None);
+
+        assert!(refs.is_empty());
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.api_base_url"
+                && error.message.contains("not available in Quickstart")
+        }));
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config"),
+            before
+        );
+    }
+
+    #[test]
+    fn channel_fields_materialize_credential_free_channel() {
+        let mut cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "imessage",
+            "local",
+            &[],
+        ))];
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply_into errors: {errors:?}");
+        assert!(applied.is_some());
+        assert!(channel_exists(&cfg, "imessage", "local"));
+    }
+
+    #[tokio::test]
+    async fn fresh_whatsapp_web_channel_persists_under_whatsapp_config_family() {
+        for submitted_type in ["whatsapp-web", "whatsapp_web"] {
+            let mut submission = fresh_submission("bot");
+            submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+                submitted_type,
+                "personal",
+                &[],
+            ))];
+            submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
+                name: "self_chat".into(),
+                channel: format!("{submitted_type}.personal"),
+                external_peers: vec!["*".into()],
+                ignore: vec![],
+            }];
+
+            let (dir, _applied) = apply_to_temp(submission).await;
+            let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+            assert!(
+                raw.contains("[channels.whatsapp.personal]"),
+                "WhatsApp Web quickstart must persist under the canonical WhatsApp config family:\n{raw}"
+            );
+            assert!(
+                !raw.contains("[channels.whatsapp-web.personal]")
+                    && !raw.contains("[channels.whatsapp_web.personal]"),
+                "Quickstart must not write a non-schema WhatsApp Web table:\n{raw}"
+            );
+
+            let reloaded = reload(&dir);
+            let whatsapp = reloaded
+                .channels
+                .whatsapp
+                .get("personal")
+                .expect("canonical WhatsApp alias persisted");
+            let expected_session = dir
+                .path()
+                .join("state")
+                .join("whatsapp-web")
+                .join("personal.db")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                whatsapp.session_path.as_deref(),
+                Some(expected_session.as_str())
+            );
+            assert!(
+                whatsapp.is_web_config(),
+                "fresh WhatsApp Web entry must seed a Web selector"
+            );
+            let agent = reloaded.agents.get("bot").expect("agent persisted");
+            let bound: Vec<String> = agent.channels.iter().map(|c| c.to_string()).collect();
+            assert_eq!(
+                bound,
+                vec!["whatsapp.personal".to_string()],
+                "agent must bind the canonical channel ref"
+            );
+            let group = reloaded
+                .peer_groups
+                .get("self_chat")
+                .expect("peer group persisted");
+            assert_eq!(group.channel, "whatsapp.personal");
+        }
     }
 
     #[tokio::test]
     async fn peer_groups_persist_to_canonical_section() {
         let mut submission = fresh_submission("bot");
-        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
-            channel_type: "telegram".into(),
-            alias: "tg".into(),
-            token: Some("tok-a".into()),
-        })];
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "telegram",
+            "tg",
+            &[("bot_token", "tok-a")],
+        ))];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),
             channel: "telegram.tg".into(),

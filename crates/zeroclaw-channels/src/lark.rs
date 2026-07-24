@@ -5668,33 +5668,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_card_action_event_routes_approve_to_pending_sender() {
+    async fn handle_card_action_event_routes_committed_fixtures() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let ch = make_channel();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let approval_id = "test-approval-1".to_string();
-        ch.pending_approvals.lock().await.insert(
-            approval_id.clone(),
-            PendingApproval {
-                sender: tx,
-                message_id: String::new(),
-                tool_name: String::new(),
-                arguments_summary: String::new(),
-            },
-        );
+        let fixtures = [
+            (
+                "approve",
+                include_str!("../tests/fixtures/lark/card_action_approve.json"),
+                ChannelApprovalResponse::Approve,
+            ),
+            (
+                "deny",
+                include_str!("../tests/fixtures/lark/card_action_deny.json"),
+                ChannelApprovalResponse::Deny,
+            ),
+            (
+                "always",
+                include_str!("../tests/fixtures/lark/card_action_always.json"),
+                ChannelApprovalResponse::AlwaysApprove,
+            ),
+        ];
 
-        let event = serde_json::json!({
-            "action": {
-                "value": { "approval_id": approval_id, "decision": "approve" },
-                "tag": "button"
-            }
-        });
-        ch.handle_card_action_event(&event)
-            .await
-            .expect("handler ok");
-        let result = rx.await.expect("oneshot delivered");
-        assert_eq!(result, ChannelApprovalResponse::Approve);
+        for (name, raw, expected) in fixtures {
+            let ch = make_channel();
+            let event: serde_json::Value =
+                serde_json::from_str(raw).unwrap_or_else(|e| panic!("parse {name} fixture: {e}"));
+            let approval_id = event
+                .pointer("/action/value/approval_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| panic!("{name} fixture must contain an approval id"));
+            assert!(
+                !approval_id.is_empty(),
+                "{name} approval id must be non-empty"
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ch.pending_approvals.lock().await.insert(
+                approval_id.to_string(),
+                PendingApproval {
+                    sender: tx,
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+
+            ch.handle_card_action_event(&event)
+                .await
+                .unwrap_or_else(|e| panic!("route {name} fixture: {e}"));
+            let result = rx
+                .await
+                .unwrap_or_else(|e| panic!("receive {name} decision: {e}"));
+            assert_eq!(result, expected, "fixture {name}");
+        }
     }
 
     #[tokio::test]

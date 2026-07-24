@@ -223,7 +223,7 @@ async fn run_cli_check(version: Option<&str>) -> anyhow::Result<CliCheck> {
         .context("failed to parse `update --check --json` output")
 }
 
-/// GET /api/version/check[?force=true][&version=X]
+/// `GET /api/version/check[?force=true][&version=X]`
 ///
 /// Never fails the dashboard: on any error it returns 200 with
 /// `{ is_newer: false, error }` so the version tag degrades gracefully.
@@ -284,7 +284,7 @@ impl UpgradeState {
 }
 
 /// Wire-format lifecycle state for `GET /api/version/upgrade/status`. Mirrors
-/// [`UpgradeState`] plus `Idle` (no upgrade started this process), and is the
+/// `UpgradeState` plus `Idle` (no upgrade started this process), and is the
 /// serializable enum the OpenAPI schema and generated web client derive from.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]

@@ -112,8 +112,23 @@ pub struct ToolLoop<'a> {
     pub memory: Option<crate::agent::memory_inject::TurnMemory<'a>>,
     /// Observer metadata: agent alias and turn id, stamped onto every
     /// turn-level observer event so OTel spans correlate across the loop.
+    /// This is the EFFECTIVE agent — the one whose policy/tools/provider this
+    /// loop actually runs with. A nested cross-agent SOP step runs its
+    /// sub-loop with the step agent here, never the delegating parent's.
     pub agent_alias: Option<&'a str>,
+    /// The delegating agent's alias when this loop is a nested cross-agent
+    /// execution (a live SOP step naming a different agent). Stamped next to
+    /// `agent_alias` on observer records so security/audit consumers see both
+    /// the acting authority and its parent. `None` for ordinary turns.
+    pub parent_agent_alias: Option<&'a str>,
     pub turn_id: &'a str,
+    /// Handle the live SOP driver uses to re-assemble a nested step's execution
+    /// context when the step delegates to a different agent (see
+    /// [`SopStepReassembly`]). `None` on every path that cannot reach `Config`
+    /// or that never drives nested SOP steps; when `None`, a cross-agent step
+    /// FAILS CLOSED (the step errors rather than running with the parent
+    /// agent's broader context).
+    pub sop_reassembly: Option<SopStepReassembly<'a>>,
 }
 
 async fn enforce_reported_budget(
@@ -178,7 +193,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         ingress,
         memory,
         agent_alias,
+        parent_agent_alias,
         turn_id,
+        sop_reassembly,
     } = p;
     let ResolvedAgentExecution {
         model_access:
@@ -193,6 +210,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         silent,
         approval,
         multimodal_config,
+        config,
         max_tool_iterations,
         hooks,
         excluded_tools,
@@ -259,6 +277,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 &scopes,
                 &turn_memory.cfg,
                 exclude_conversation,
+                TurnMeta {
+                    agent_alias,
+                    parent_agent_alias,
+                    turn_id,
+                    channel_name,
+                },
             )
             .await;
             if !context.is_empty() {
@@ -317,7 +341,15 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         channel,
         turn_id,
         agent_alias,
+        parent_agent_alias,
     };
+
+    // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
+    // `exec_cache` parameter on `drive_live_sop_actions`): a step agent's
+    // MCP-connecting re-assembly runs at most once per turn even when queued
+    // steps drain across several iterations.
+    let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
+        std::collections::HashMap::new();
 
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
@@ -493,20 +525,25 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (vision_model_provider_box, degrade_strip_images) =
-            resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
+        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
+            config,
+            model_provider,
+            history,
+            multimodal_config,
+            provider_name,
+            model,
+        )?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,
             &str,
             &str,
-        ) = if let Some(ref vp_box) = vision_model_provider_box {
-            let vp_name = multimodal_config
-                .vision_model_provider
-                .as_deref()
-                .unwrap_or(provider_name);
-            let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
-            (vp_box.as_ref(), vp_name, vm)
+        ) = if let Some(ref resolved) = vision_model_provider_box {
+            (
+                resolved.provider.as_ref(),
+                resolved.provider_name.as_str(),
+                resolved.model.as_str(),
+            )
         } else {
             (model_provider, provider_name, model)
         };
@@ -1025,7 +1062,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
         if !queued_sop_actions.is_empty() {
-            drive_live_sop_actions(
+            // Box the drive future: it inlines the full per-agent re-assembly
+            // (a large async fn), which would otherwise inflate this loop's
+            // stack-allocated future for every turn, SOP or not.
+            Box::pin(drive_live_sop_actions(
                 queued_sop_actions,
                 history,
                 model_provider,
@@ -1037,6 +1077,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 silent,
                 approval,
                 multimodal_config,
+                config,
                 max_tool_iterations,
                 hooks,
                 excluded_tools,
@@ -1061,7 +1102,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 new_messages_out.as_deref_mut(),
                 image_cache.as_deref_mut(),
                 agent_alias,
-            )
+                parent_agent_alias,
+                sop_reassembly,
+                &mut sop_exec_cache,
+            ))
             .await?;
         }
 
@@ -1179,6 +1223,282 @@ fn sop_step_excluded_tools(
     scoped
 }
 
+/// Config handle the live SOP driver needs to re-assemble a nested step's agent
+/// when the step delegates to a different agent than the one running the turn.
+///
+/// The live nested-step driver otherwise reuses the parent turn's assembled
+/// execution context; when a step names a different agent it must run AS that
+/// agent — with that agent's own gated tools, policy, and MCP scope — not the
+/// parent's. This carries the one handle needed to rebuild that context in
+/// flight; the runtime adapter is created from `config.runtime` so the nested
+/// context is assembled the way a fresh agent turn would be. `Copy` so the
+/// handle survives being re-read on every drained action and forwarded into
+/// each nested turn.
+///
+/// This handle is either `Some` on every frame of a recursion tree or `None` on
+/// every frame: it is introduced only at the top entry points and forwarded
+/// unchanged into each nested step. Because a re-assembled sub-loop runs with
+/// the step agent as its own `agent_alias` (the effective identity, which
+/// attribution follows), the loop's `agent_alias` IS the re-assembly baseline
+/// at every depth — no separate baseline field is needed: a depth >= 2 step
+/// naming the outer agent compares against the re-assembled child's alias and
+/// re-assembles correctly instead of inheriting the child's scope.
+#[derive(Clone, Copy)]
+pub struct SopStepReassembly<'a> {
+    pub config: &'a zeroclaw_config::schema::Config,
+}
+
+/// The re-assembly gate: a step needs its own agent context re-assembled when
+/// it names an agent different from the one the current loop is running as
+/// (`agent_alias` — the effective identity, which a re-assembled sub-loop
+/// carries as its own alias, so the comparison is correct at every nesting
+/// depth). A step with no explicit agent inherits the current one and never
+/// re-assembles.
+fn step_needs_reassembly(current_alias: Option<&str>, step_alias: Option<&str>) -> bool {
+    matches!(step_alias, Some(s) if current_alias != Some(s))
+}
+
+/// A nested SOP step's owned per-agent execution surface, assembled for a step
+/// that delegates to a different agent. Owns the complete per-agent execution
+/// contract: provider binding with the step agent's own configured
+/// temperature, gated tool registry, approval policy (the step agent's risk
+/// profile under the PARENT surface's interactivity mode, so a live approval
+/// route survives delegation), the deferred-MCP activation set, the step
+/// agent's resolved runtime controls (`ResolvedRuntime`: iteration/result/
+/// context limits, strict parsing, parallelism, dedup exemptions, tool filter
+/// groups), and the inputs to build the step agent's own system prompt.
+/// `LoopKnobs` deliberately stays parent-threaded: it encodes the calling
+/// surface's shape, not agent policy.
+pub(crate) struct OwnedAgentExecution {
+    model_provider: Box<dyn ModelProvider>,
+    provider_name: String,
+    model: String,
+    /// The step agent's own configured provider temperature — the same source
+    /// the headless driver hands `crate::agent::run`.
+    temperature: Option<f64>,
+    pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
+    approval: crate::approval::ApprovalManager,
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// The step agent's fully-resolved config (identity + every runtime-profile
+    /// knob baked in via `Config::resolved_agent_config`) — the one canonical
+    /// per-agent knob surface, so the nested loop's runtime controls follow
+    /// the effective agent instead of the delegating parent.
+    agent: zeroclaw_config::schema::AliasedAgentConfig,
+    /// The step agent's risk profile (also baked into `approval`); retained
+    /// because system-prompt construction renders autonomy guidance from it.
+    risk_profile: zeroclaw_config::schema::RiskProfileConfig,
+    /// The step agent's own skills, for its system prompt.
+    skills: Vec<crate::skills::Skill>,
+    /// MCP-origin ground truth for the per-turn `tool_filter_groups` gate.
+    mcp_tool_names: std::collections::HashSet<String>,
+    /// The step agent's deferred+pinned MCP prompt section (single-block
+    /// shape, same as `run` / `process_message`).
+    mcp_prompt_section: String,
+}
+
+/// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
+/// would: the agent's security policy, memory, gated tool registry (through the
+/// one [`crate::tools::scoped::ScopedToolRegistry::assemble`] seam, connecting
+/// the agent's own granted MCP scope), skills, provider binding with the
+/// agent's own temperature, resolved runtime controls, and approval policy
+/// (the agent's risk profile under `parent_approval`'s interactivity mode; no
+/// parent manager means non-interactive auto-deny, matching the headless
+/// driver). The live SOP engine/audit handles are threaded from the running
+/// SOP so the nested step keeps its SOP tools bound to the same engine. This
+/// connects MCP servers, so the driver memoizes the result per alias across a
+/// drain and re-assembles only on an alias change.
+pub(crate) async fn assemble_owned_execution(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    parent_approval: Option<&crate::approval::ApprovalManager>,
+) -> Result<OwnedAgentExecution> {
+    let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
+    // The one canonical per-agent runtime-knob surface: identity plus every
+    // runtime-profile override baked in. Fail closed on an unknown alias —
+    // never run a delegated step under the parent's controls.
+    let agent = config.resolved_agent_config(alias).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "SOP step agent '{alias}' is not a configured agent"
+        ))
+    })?;
+    let risk_profile = config
+        .risk_profile_for_agent(alias)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SOP step agent '{alias}' has no configured risk profile"
+            ))
+        })?;
+    let resolved_key = config
+        .resolved_model_provider_for_agent(alias)
+        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    let memory =
+        zeroclaw_memory::create_memory_for_agent(config, alias, resolved_key.as_deref()).await?;
+
+    // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
+    // tools via `crate::agent::run`, which builds its runtime from
+    // `config.runtime`. Creating it here (rather than reusing the parent's) is
+    // read-only — a shell-existence check plus struct construction — and only
+    // happens on the cross-agent path, which is memoized per alias.
+    let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+        Arc::from(crate::platform::create_runtime(&config.runtime)?);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let built = crate::tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        &risk_profile,
+        alias,
+        runtime.clone(),
+        memory,
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.data_dir,
+        &config.agents,
+        resolved_key.as_deref(),
+        config,
+        None,
+        false,
+        None,
+        Some(sop_engine),
+        sop_audit,
+        None,
+    );
+    let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // The same gated seam run(), process_message, and independent delegation use:
+    // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
+    // this agent's MCP bundles, and its skills register as tools. Peripherals stay
+    // disconnected — a nested SOP sub-loop must not seize the serial hardware the
+    // live daemon holds exclusively.
+    let assembled =
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            config,
+            agent_alias: alias,
+            security: &security,
+            built,
+            skills: &skills,
+            runtime,
+            caller_allowed: None,
+            connect_mcp: true,
+            // A nested SOP step re-assembly is per turn (memoized per alias);
+            // it has no cross-turn reuse contract, so the per-call
+            // `connect_all` path inside `assemble` is the correct choice
+            // (same as `process_message`).
+            mcp_registry: None,
+            connect_peripherals: false,
+            exclude_memory: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+    let mcp_prompt_section = assembled.combined_mcp_prompt_section();
+    let crate::tools::scoped::ScopedAssembled {
+        registry,
+        activated_handle,
+        mcp_tool_names,
+        ..
+    } = assembled;
+    let tools_registry = registry.into_inner();
+
+    let provider_ref = config
+        .resolved_model_provider_for_agent(alias)
+        .map(|(ty, al, _)| format!("{ty}.{al}"))
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SOP step agent '{alias}' has no resolved model provider"
+            ))
+        })?;
+    let (model_provider, provider_name, model) =
+        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
+    // The step agent's own configured temperature — the same source the
+    // headless driver reads for `crate::agent::run`.
+    let temperature = config
+        .model_provider_for_agent(alias)
+        .and_then(|e| e.temperature);
+
+    // The step agent's risk profile under the PARENT surface's interactivity
+    // mode: an operator approval route available to the outer turn stays
+    // available to the delegated step instead of degrading to auto-denial.
+    let approval = match parent_approval {
+        Some(parent) => parent.derive_for_risk_profile(&risk_profile),
+        None => crate::approval::ApprovalManager::for_non_interactive(&risk_profile),
+    };
+
+    Ok(OwnedAgentExecution {
+        model_provider,
+        provider_name,
+        model,
+        temperature,
+        tools_registry,
+        approval,
+        activated_tools: activated_handle,
+        agent,
+        risk_profile,
+        skills,
+        mcp_tool_names,
+        mcp_prompt_section,
+    })
+}
+
+/// Build the step agent's own system prompt for a re-assembled nested step,
+/// through the same construction a fresh turn for that agent uses
+/// (`build_system_prompt_for_turn`): registry-derived tool descriptions, the
+/// agent's own MCP prompt section, skills, identity, risk profile, and its
+/// resolved prompt knobs. Built per step (not memoized per alias) because the
+/// effective tool surface keys on the step's excluded-tool set, which the
+/// `tool_filter_groups` gate derives from the step context.
+fn build_owned_step_system_prompt(
+    owned: &OwnedAgentExecution,
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    excluded_tools: &[String],
+) -> Result<String> {
+    let tool_descs: Vec<(&str, &str)> = owned
+        .tools_registry
+        .iter()
+        .map(|t| (t.name(), t.description()))
+        .collect();
+    let bootstrap_max_chars = if owned.agent.resolved.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    crate::agent::loop_::build_system_prompt_for_turn(
+        &config.agent_workspace_dir(alias),
+        &owned.model,
+        &tool_descs,
+        &owned.mcp_prompt_section,
+        &owned.skills,
+        Some(&owned.agent.identity),
+        bootstrap_max_chars,
+        &owned.risk_profile,
+        owned.model_provider.as_ref(),
+        &owned.tools_registry,
+        excluded_tools,
+        owned.activated_tools.as_ref(),
+        owned.agent.resolved.strict_tool_parsing,
+        owned.agent.resolved.prompt_injection_mode,
+        owned.agent.resolved.compact_context,
+        owned.agent.resolved.max_system_prompt_chars,
+        true,
+        config.channels.show_tool_calls,
+        None,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
@@ -1192,6 +1512,9 @@ async fn drive_live_sop_actions(
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    // Full config so the live-SOP sub-turn's vision route resolves the configured
+    // `vision_model_provider`'s alias options, exactly as the enclosing turn does.
+    config: Option<&zeroclaw_config::schema::Config>,
     max_tool_iterations: usize,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
@@ -1216,6 +1539,14 @@ async fn drive_live_sop_actions(
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     agent_alias: Option<&str>,
+    parent_agent_alias: Option<&str>,
+    sop_reassembly: Option<SopStepReassembly<'_>>,
+    // Per-agent execution contexts re-assembled in flight for steps that
+    // delegate to a different agent, memoized by alias. Owned by the caller
+    // (the turn loop) so the memo spans every drain of a turn's queued steps:
+    // `assemble_owned_execution` connects MCP, so it runs at most once per
+    // distinct step agent per turn, never per step.
+    exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
 ) -> Result<()> {
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
@@ -1234,72 +1565,324 @@ async fn drive_live_sop_actions(
                         out.push(user_message);
                     }
 
-                    let sop_excluded_tools = sop_step_excluded_tools(
-                        &queued,
-                        &run_id,
-                        &step,
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                    );
+                    // A step that delegates to a different agent must run AS that
+                    // agent — with that agent's own gated tools, policy, MCP
+                    // scope, provider binding, and runtime controls — not the
+                    // parent turn's. When the step names a different agent and a
+                    // reassembly handle is available, re-assemble (and memoize)
+                    // that agent's execution context; same-agent steps keep the
+                    // parent context unchanged.
+                    let step_alias = step.agent.as_deref();
+                    // `agent_alias` is this loop's EFFECTIVE identity: a
+                    // re-assembled sub-loop runs with its step agent as its own
+                    // alias, so this comparison is correct at every nesting
+                    // depth — a depth >= 2 step naming the outer agent compares
+                    // against the re-assembled child's alias and re-assembles
+                    // instead of inheriting the child's scope.
+                    let needs_reassembly = step_needs_reassembly(agent_alias, step_alias);
+                    let mut assembly_error: Option<anyhow::Error> = None;
+                    if needs_reassembly {
+                        let alias =
+                            step_alias.expect("needs_reassembly implies a step agent alias");
+                        if let Some(reassembly) = sop_reassembly {
+                            if !exec_cache.contains_key(alias) {
+                                match assemble_owned_execution(
+                                    reassembly.config,
+                                    alias,
+                                    Arc::clone(&queued.engine),
+                                    queued.audit.clone(),
+                                    approval,
+                                )
+                                .await
+                                {
+                                    Ok(owned) => {
+                                        exec_cache.insert(alias.to_string(), owned);
+                                    }
+                                    Err(e) => assembly_error = Some(e),
+                                }
+                            }
+                        } else {
+                            // This construction path provides no per-agent re-assembly
+                            // handle (e.g. a bounded delegate sub-loop that carries a live
+                            // SOP tool). Running a cross-agent step here would inherit the
+                            // parent/delegate agent's broader tools/policy/MCP surface —
+                            // the exact escalation this whole seam exists to prevent. Fail
+                            // the step CLOSED, the same as an assembly error below, rather
+                            // than under-enforce in silence (omission is not a grant).
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                &format!(
+                                    "SOP step delegates to agent '{alias}' but this run path \
+                                     provides no per-agent re-assembly handle; refusing the step \
+                                     (fail-closed) rather than run it with the parent agent's \
+                                     context (per-agent isolation cannot be applied here)"
+                                )
+                            );
+                            assembly_error = Some(anyhow::Error::msg(format!(
+                                "SOP step delegates to agent '{alias}' but this run path provides \
+                                 no per-agent re-assembly handle; refusing to run the step with \
+                                 the parent agent's context (per-agent isolation cannot be applied)"
+                            )));
+                        }
+                    }
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
                     let step_call_sink = crate::sop::executor::new_step_call_sink();
-                    let step_output = crate::sop::executor::scope_step_call_sink(
-                        step_call_sink.clone(),
-                        Box::pin(run_tool_call_loop(ToolLoop {
-                            exec: ResolvedAgentExecution::resolve(
-                                ResolvedModelAccess {
-                                    model_provider,
-                                    provider_name,
-                                    model,
-                                    temperature,
-                                },
-                                ResolvedIo {
-                                    tools_registry,
-                                    observer,
-                                    silent,
-                                    approval,
-                                    multimodal_config,
-                                    hooks,
-                                    activated_tools,
-                                    model_switch_callback: model_switch_callback.clone(),
-                                    receipt_generator,
-                                },
-                                ResolvedRuntimeKnobs {
-                                    max_tool_iterations,
-                                    excluded_tools: &sop_excluded_tools,
-                                    dedup_exempt_tools,
-                                    pacing,
-                                    strict_tool_parsing,
-                                    parallel_tools,
-                                    max_tool_result_chars,
-                                    context_token_budget,
-                                    knobs,
-                                },
+                    let step_output = if let Some(err) = assembly_error {
+                        // Fail closed: never run a delegated step with the parent
+                        // agent's broader context when the step agent's own
+                        // context could not be assembled.
+                        Err(err)
+                    } else {
+                        // Select the effective per-agent execution surface: the
+                        // re-assembled step agent when reassembly applied,
+                        // otherwise the parent turn's (byte-identical to today).
+                        let owned = if needs_reassembly {
+                            exec_cache.get(
+                                step_alias.expect("needs_reassembly implies a step agent alias"),
+                            )
+                        } else {
+                            None
+                        };
+                        let (
+                            eff_model_provider,
+                            eff_provider_name,
+                            eff_model,
+                            eff_registry,
+                            eff_approval,
+                            eff_activated,
+                        ) = match owned {
+                            Some(o) => (
+                                o.model_provider.as_ref(),
+                                o.provider_name.as_str(),
+                                o.model.as_str(),
+                                o.tools_registry.as_slice(),
+                                Some(&o.approval),
+                                o.activated_tools.as_ref(),
                             ),
-                            history,
-                            channel_name,
-                            channel_reply_target,
-                            cancellation_token: cancellation_token.clone(),
-                            on_delta: on_delta.clone(),
-                            shared_budget: shared_budget.clone(),
-                            channel,
-                            collected_receipts,
-                            event_tx: event_tx.clone(),
-                            steering: None,
-                            new_messages_out: new_messages_out.as_deref_mut(),
-                            image_cache: image_cache.as_deref_mut(),
-                            memory: None,
-                            ingress: IngressContext::sub_turn(),
-                            agent_alias,
-                            turn_id: &nested_turn_id,
-                        })),
-                    )
-                    .await;
+                            None => (
+                                model_provider,
+                                provider_name,
+                                model,
+                                tools_registry,
+                                approval,
+                                activated_tools,
+                            ),
+                        };
+                        // The step agent's resolved runtime controls when
+                        // re-assembled — the same `ResolvedRuntime` a fresh
+                        // turn for that agent resolves. Pacing is the
+                        // agent-independent global section, read from the same
+                        // config the context was assembled from. Same-agent
+                        // steps keep the parent's values verbatim.
+                        let (
+                            eff_temperature,
+                            eff_max_tool_iterations,
+                            eff_strict_tool_parsing,
+                            eff_parallel_tools,
+                            eff_max_tool_result_chars,
+                            eff_context_token_budget,
+                            eff_dedup_exempt_tools,
+                            eff_pacing,
+                        ) = match owned {
+                            Some(o) => (
+                                o.temperature,
+                                o.agent.resolved.max_tool_iterations,
+                                o.agent.resolved.strict_tool_parsing,
+                                o.agent.resolved.parallel_tools,
+                                o.agent.resolved.max_tool_result_chars,
+                                o.agent.resolved.effective_context_budget(),
+                                o.agent.resolved.tool_call_dedup_exempt.as_slice(),
+                                &sop_reassembly
+                                    .expect("owned implies a reassembly handle")
+                                    .config
+                                    .pacing,
+                            ),
+                            None => (
+                                temperature,
+                                max_tool_iterations,
+                                strict_tool_parsing,
+                                parallel_tools,
+                                max_tool_result_chars,
+                                context_token_budget,
+                                dedup_exempt_tools,
+                                pacing,
+                            ),
+                        };
+
+                        // Exclusions for a cross-agent step derive from the
+                        // STEP agent: its own `tool_filter_groups` gate over
+                        // the step context. The parent's turn-level exclusion
+                        // list encodes the parent profile/prompt and does not
+                        // cross the agent boundary; the SOP-recursion guard and
+                        // the step's declared scope are added for both paths by
+                        // `sop_step_excluded_tools`.
+                        let child_base_excluded: Vec<String> = match owned {
+                            Some(o) => crate::agent::loop_::compute_excluded_mcp_tools(
+                                &o.tools_registry,
+                                &o.agent.resolved.tool_filter_groups,
+                                &context,
+                                &o.mcp_tool_names,
+                            ),
+                            None => Vec::new(),
+                        };
+                        let base_excluded: &[String] = if owned.is_some() {
+                            &child_base_excluded
+                        } else {
+                            excluded_tools
+                        };
+                        let sop_excluded_tools = sop_step_excluded_tools(
+                            &queued,
+                            &run_id,
+                            &step,
+                            eff_registry,
+                            eff_activated,
+                            base_excluded,
+                        );
+
+                        // Cross-agent steps run on an EXPLICIT child transcript
+                        // — the step agent's own system prompt plus the
+                        // delegated step context — never the parent turn's
+                        // history, which would disclose the parent conversation
+                        // to the step agent's provider (a different trust and
+                        // data-handling boundary). The parent transcript keeps
+                        // the step-context message pushed above and receives
+                        // the step's final output below; intermediate child
+                        // tool-chatter stays out of it. Same-agent steps keep
+                        // sharing the turn history unchanged.
+                        let mut child_history: Vec<ChatMessage> = Vec::new();
+                        let mut child_setup_error: Option<anyhow::Error> = None;
+                        if let Some(o) = owned {
+                            match build_owned_step_system_prompt(
+                                o,
+                                sop_reassembly
+                                    .expect("owned implies a reassembly handle")
+                                    .config,
+                                step_alias.expect("needs_reassembly implies a step agent alias"),
+                                &sop_excluded_tools,
+                            ) {
+                                Ok(prompt) => {
+                                    child_history.push(ChatMessage::system(&prompt));
+                                    child_history.push(ChatMessage::user(context.clone()));
+                                }
+                                // Fail closed, same as an assembly error: never
+                                // fall back to the parent transcript.
+                                Err(e) => child_setup_error = Some(e),
+                            }
+                        }
+
+                        if let Some(err) = child_setup_error {
+                            Err(err)
+                        } else {
+                            let nested_history: &mut Vec<ChatMessage> = match owned {
+                                Some(_) => &mut child_history,
+                                None => &mut *history,
+                            };
+                            crate::sop::executor::scope_step_call_sink(
+                                step_call_sink.clone(),
+                                Box::pin(run_tool_call_loop(ToolLoop {
+                                    exec: ResolvedAgentExecution::resolve(
+                                        ResolvedModelAccess {
+                                            model_provider: eff_model_provider,
+                                            provider_name: eff_provider_name,
+                                            model: eff_model,
+                                            temperature: eff_temperature,
+                                        },
+                                        ResolvedIo {
+                                            tools_registry: eff_registry,
+                                            observer,
+                                            silent,
+                                            approval: eff_approval,
+                                            multimodal_config,
+                                            config,
+                                            hooks,
+                                            activated_tools: eff_activated,
+                                            model_switch_callback: model_switch_callback.clone(),
+                                            receipt_generator,
+                                        },
+                                        ResolvedRuntimeKnobs {
+                                            max_tool_iterations: eff_max_tool_iterations,
+                                            excluded_tools: &sop_excluded_tools,
+                                            dedup_exempt_tools: eff_dedup_exempt_tools,
+                                            pacing: eff_pacing,
+                                            strict_tool_parsing: eff_strict_tool_parsing,
+                                            parallel_tools: eff_parallel_tools,
+                                            max_tool_result_chars: eff_max_tool_result_chars,
+                                            context_token_budget: eff_context_token_budget,
+                                            knobs,
+                                        },
+                                    ),
+                                    history: nested_history,
+                                    channel_name,
+                                    channel_reply_target,
+                                    cancellation_token: cancellation_token.clone(),
+                                    on_delta: on_delta.clone(),
+                                    shared_budget: shared_budget.clone(),
+                                    channel,
+                                    collected_receipts,
+                                    event_tx: event_tx.clone(),
+                                    steering: None,
+                                    // A cross-agent child transcript is not part
+                                    // of the parent's persisted conversation;
+                                    // only its final output flows back (below).
+                                    new_messages_out: if owned.is_some() {
+                                        None
+                                    } else {
+                                        new_messages_out.as_deref_mut()
+                                    },
+                                    image_cache: image_cache.as_deref_mut(),
+                                    memory: None,
+                                    ingress: IngressContext::sub_turn(),
+                                    // Attribution follows the EFFECTIVE agent:
+                                    // the step agent's identity is stamped on
+                                    // observer/receipt/OTel records for the
+                                    // sub-loop, with the delegating agent kept
+                                    // alongside as the parent correlation.
+                                    agent_alias: if owned.is_some() {
+                                        step_alias
+                                    } else {
+                                        agent_alias
+                                    },
+                                    parent_agent_alias: if owned.is_some() {
+                                        agent_alias
+                                    } else {
+                                        parent_agent_alias
+                                    },
+                                    turn_id: &nested_turn_id,
+                                    sop_reassembly,
+                                })),
+                            )
+                            .await
+                        }
+                    };
+                    // A cross-agent step's final output flows back into the
+                    // parent transcript (and new-message capture) so the outer
+                    // conversation stays coherent; the reverse direction — the
+                    // parent's prior history flowing to the child — never
+                    // happens.
+                    if needs_reassembly && let Ok(output) = &step_output {
+                        let assistant = ChatMessage::assistant(output.clone());
+                        history.push(assistant.clone());
+                        if let Some(out) = new_messages_out.as_deref_mut() {
+                            out.push(assistant);
+                        }
+                    }
 
                     let step_calls = crate::sop::executor::drain_step_calls(&step_call_sink);
                     let completed_at = crate::sop::engine::now_iso8601();
+                    // The acting authority for the audit record: the step
+                    // agent when the step delegated (including a failed
+                    // assembly — the record names who SHOULD have run it),
+                    // otherwise this loop's own agent.
+                    let effective_agent = if needs_reassembly {
+                        step_alias.map(str::to_string)
+                    } else {
+                        agent_alias.map(str::to_string)
+                    };
                     let step_result = match step_output {
                         Ok(output) => crate::sop::SopStepResult {
                             step_number: step.number,
@@ -1307,6 +1890,7 @@ async fn drive_live_sop_actions(
                             output,
                             started_at,
                             completed_at: Some(completed_at),
+                            effective_agent,
                             tool_calls: step_calls,
                         },
                         Err(e) => crate::sop::SopStepResult {
@@ -1315,6 +1899,7 @@ async fn drive_live_sop_actions(
                             output: e.to_string(),
                             started_at,
                             completed_at: Some(completed_at),
+                            effective_agent,
                             tool_calls: step_calls,
                         },
                     };
@@ -1578,5 +2163,1077 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+/// Live SOP nested-step re-assembly gate, isolation, and fail-closed regressions.
+///
+/// Privilege-scope properties of the live driver:
+///
+/// - **Gate on the effective alias.** The re-assembly gate compares a step's
+///   agent against the loop's own `agent_alias`, which IS the effective agent
+///   at every depth (a re-assembled sub-loop runs with its step agent as its
+///   own alias). A depth >= 2 step naming the outer agent therefore compares
+///   against the re-assembled child's alias and re-assembles.
+/// - **Child transcript isolation.** A cross-agent step runs on an explicit
+///   child transcript (the step agent's own system prompt + the step context);
+///   the parent turn's history never reaches the step agent's provider.
+/// - **Effective-agent contract.** The nested loop runs with the step agent's
+///   own provider binding (incl. temperature), registry, and runtime controls,
+///   and its records stamp the step agent as the acting identity with the
+///   delegating agent as parent correlation.
+/// - **Fail-closed.** A cross-agent step with no re-assembly handle, or whose
+///   agent context cannot be assembled, FAILS rather than running with the
+///   parent agent's broader context.
+#[cfg(test)]
+mod sop_step_reassembly_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    // ── Gate: pure decision properties ───────────────────────────────────────
+
+    #[test]
+    fn gate_reassembles_only_on_agent_change() {
+        assert!(
+            !step_needs_reassembly(Some("a"), Some("a")),
+            "same agent must not re-assemble"
+        );
+        assert!(
+            step_needs_reassembly(Some("a"), Some("b")),
+            "a different agent must re-assemble"
+        );
+        assert!(
+            !step_needs_reassembly(Some("a"), None),
+            "a step with no explicit agent inherits the current one"
+        );
+        assert!(
+            step_needs_reassembly(None, Some("b")),
+            "an unnamed baseline still re-assembles a named step"
+        );
+        assert!(!step_needs_reassembly(None, None));
+    }
+
+    /// The depth-2 escalation scenario stays covered under the simplified
+    /// mechanism: root `A` -> step names `B` -> the nested sub-loop runs with
+    /// `agent_alias = Some("B")` (attribution follows the effective agent, see
+    /// the driver's nested `ToolLoop` construction) -> `B`'s nested step naming
+    /// root `A` compares "A" against the loop's own alias "B" and re-assembles,
+    /// running with `A`'s scope instead of inheriting `B`'s.
+    #[test]
+    fn depth2_step_naming_outer_agent_still_reassembles() {
+        // Depth 1: root loop runs as A; step names B -> re-assemble.
+        assert!(step_needs_reassembly(Some("A"), Some("B")));
+        // Depth 2: the sub-loop's own alias IS "B" (effective agent); a step
+        // naming the outer "A" re-assembles instead of inheriting B's scope.
+        assert!(
+            step_needs_reassembly(Some("B"), Some("A")),
+            "a depth-2 step naming the outer agent must re-assemble that agent's scope"
+        );
+        // The historical escalation: comparing against an alias pinned to the
+        // OUTER agent at depth 2 would skip re-assembly. The invariant that
+        // prevents it now is alias-follows-effective-agent, so this comparison
+        // never happens with "A" on the left inside B's sub-loop.
+        assert!(!step_needs_reassembly(Some("A"), Some("A")));
+    }
+
+    fn tool_names(tools: &[Box<dyn crate::tools::Tool>]) -> Vec<String> {
+        tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Real-scope tie: re-assembling a step's named agent yields THAT agent's
+    /// own gated tool set, and distinct agents resolve distinct scopes — so the
+    /// gate decision is load-bearing (choosing to re-assemble genuinely changes
+    /// which tools the step can reach).
+    #[tokio::test]
+    async fn reassembly_yields_the_named_agents_own_scope() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-sop-depth2-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        // Two agents whose per-agent policy allowlists exactly one, DIFFERENT
+        // built-in each: their assembled scopes must not coincide.
+        config.risk_profiles.insert(
+            "reader".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "writer".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_write".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        for (alias, profile) in [("reader", "reader"), ("writer", "writer")] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: "ollama.p".into(),
+                    risk_profile: profile.into(),
+                    memory: AgentMemoryConfig {
+                        backend: MemoryBackendKind::Markdown,
+                    },
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None)
+            .await
+            .expect("reader assembles");
+        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None)
+            .await
+            .expect("writer assembles");
+        let reader_names = tool_names(&reader.tools_registry);
+        let writer_names = tool_names(&writer.tools_registry);
+
+        assert!(
+            reader_names.contains(&"file_read".to_string())
+                && !reader_names.contains(&"file_write".to_string()),
+            "reader gets only its own allowlisted tool: {reader_names:?}"
+        );
+        assert!(
+            writer_names.contains(&"file_write".to_string())
+                && !writer_names.contains(&"file_read".to_string()),
+            "writer gets only its own allowlisted tool: {writer_names:?}"
+        );
+        // The gate re-assembles when a step names the other agent, so a
+        // cross-agent step lands in the named agent's scope, not the baseline's.
+        assert!(step_needs_reassembly(Some("reader"), Some("writer")));
+        // With no parent approval manager the child is non-interactive
+        // (auto-deny), matching the headless driver.
+        assert!(reader.approval.is_non_interactive());
+    }
+
+    /// A parent approval manager with a live back-channel survives delegation:
+    /// the derived child manager keeps the interactivity mode while enforcing
+    /// the CHILD's risk profile.
+    #[tokio::test]
+    async fn reassembly_preserves_parent_approval_backchannel() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, SopConfig,
+        };
+
+        let root = std::env::temp_dir().join(format!("zeroclaw-sop-appr-{}", uuid::Uuid::new_v4()));
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "restricted".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "restricted".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "restricted".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        // Parent surface: non-interactive WITH an operator back-channel
+        // (ACP / dashboard WS shape).
+        let parent = crate::approval::ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let owned = assemble_owned_execution(
+            &config,
+            "restricted",
+            Arc::clone(&engine),
+            None,
+            Some(&parent),
+        )
+        .await
+        .expect("restricted assembles");
+        // Mode preserved: still non-interactive, but shell routes through the
+        // back-channel (Prompt) instead of the plain non-interactive
+        // short-circuit (NotRequired).
+        assert!(owned.approval.is_non_interactive());
+        assert_eq!(
+            owned.approval.approval_requirement("shell"),
+            crate::approval::ApprovalRequirement::Prompt,
+            "a live approval back-channel must survive delegation"
+        );
+        // The plain non-interactive parent keeps the auto-deny shape.
+        let plain_parent = crate::approval::ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let plain_child = plain_parent
+            .derive_for_risk_profile(&zeroclaw_config::schema::RiskProfileConfig::default());
+        assert_eq!(
+            plain_child.approval_requirement("shell"),
+            crate::approval::ApprovalRequirement::NotRequired,
+            "a plain non-interactive parent derives a plain non-interactive child"
+        );
+    }
+
+    // ── Shared test doubles ──────────────────────────────────────────────────
+
+    /// A provider that, if the nested loop ever ran, would drive the parent's
+    /// sensitive tool. Under the fail-closed guard the nested loop never runs,
+    /// so `chat` is never polled.
+    struct ShellCallingProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ShellCallingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ShellCallingProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ShellCallingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// The parent/delegate agent's sensitive tool; counts executions so tests
+    /// can prove a cross-agent step never reaches it.
+    struct ShellProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    ::zeroclaw_api::tool_attribution!(ShellProbe, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ShellProbe {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "shell"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "shell-out".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A provider that returns plain text (no tool call), so a nested step loop
+    /// completes in a single iteration without needing any assembled tools.
+    struct TextProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for TextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TextProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for TextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// One captured child-provider request: transcript, offered tool-spec
+    /// names, and the temperature the loop passed.
+    type CapturedRequest = (Vec<ChatMessage>, Vec<String>, Option<f64>);
+
+    /// The CHILD side of the distinct-providers regression: records every
+    /// request the nested loop sends so tests can prove what did (and did not)
+    /// reach the step agent's provider. Declares native tool support so the
+    /// loop offers tool specs on the request (observable at this boundary).
+    struct CaptureProvider {
+        requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CaptureProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CaptureProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("child-done".into())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            let tool_names = request
+                .tools
+                .map(|specs| specs.iter().map(|t| t.name.clone()).collect())
+                .unwrap_or_default();
+            self.requests.lock().expect("capture lock").push((
+                request.messages.to_vec(),
+                tool_names,
+                temperature,
+            ));
+            Ok(ChatResponse {
+                text: Some("child-done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Observer capture of `(agent_alias, parent_agent_alias)` on LlmRequest
+    /// records — the audit-identity pair for the nested loop.
+    #[derive(Default)]
+    struct IdentityCapture {
+        pairs: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    impl crate::observability::Observer for IdentityCapture {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            if let crate::observability::ObserverEvent::LlmRequest {
+                agent_alias,
+                parent_agent_alias,
+                ..
+            } = event
+            {
+                self.pairs
+                    .lock()
+                    .expect("pairs lock")
+                    .push((agent_alias.clone(), parent_agent_alias.clone()));
+            }
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "identity-capture"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A trivially registrable tool for seeding a child registry.
+    struct NamedTool(&'static str);
+
+    ::zeroclaw_api::tool_attribution!(NamedTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Seed a step agent's owned execution context directly (the memo cache is
+    /// caller-owned precisely so tests can drive the REAL nested loop with a
+    /// scripted child provider — `assemble_owned_execution` binds providers
+    /// from config and cannot yield a capture double).
+    fn seeded_owned(
+        requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+        tools: Vec<Box<dyn crate::tools::Tool>>,
+        mcp_tool_names: std::collections::HashSet<String>,
+        tool_filter_groups: Vec<zeroclaw_config::schema::ToolFilterGroup>,
+        temperature: Option<f64>,
+    ) -> OwnedAgentExecution {
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent.resolved.tool_filter_groups = tool_filter_groups;
+        agent.resolved.max_tool_iterations = 3;
+        OwnedAgentExecution {
+            model_provider: Box::new(CaptureProvider { requests }),
+            provider_name: "capture".into(),
+            model: "capture-model".into(),
+            temperature,
+            tools_registry: tools,
+            approval: crate::approval::ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            ),
+            activated_tools: None,
+            agent,
+            risk_profile: zeroclaw_config::schema::RiskProfileConfig::default(),
+            skills: Vec::new(),
+            mcp_tool_names,
+            mcp_prompt_section: String::new(),
+        }
+    }
+
+    /// Build a single-step SOP whose step delegates to `step_agent`, start it in a
+    /// fresh engine, and return the shared engine handle plus the first
+    /// `ExecuteStep` action (already resolved to a cross-agent step).
+    fn start_single_cross_agent_step(
+        step_agent: &str,
+    ) -> (
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        crate::sop::types::SopRunAction,
+    ) {
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopTrigger,
+            SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        let sop = Sop {
+            name: "cross-agent".to_string(),
+            description: "x".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "delegate".to_string(),
+                body: "run".to_string(),
+                agent: Some(step_agent.to_string()),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-07-16T00:00:00Z".to_string(),
+        };
+        let action = engine.start_run("cross-agent", event).expect("run starts");
+        let run_id = match &action {
+            SopRunAction::ExecuteStep { run_id, step, .. } => {
+                assert_eq!(
+                    step.agent.as_deref(),
+                    Some(step_agent),
+                    "the step must resolve to a cross-agent delegation"
+                );
+                run_id.clone()
+            }
+            other => panic!("expected ExecuteStep, got {other:?}"),
+        };
+        (Arc::new(std::sync::Mutex::new(engine)), run_id, action)
+    }
+
+    /// Drive one queued action through `drive_live_sop_actions` with a
+    /// plain-text PARENT provider, the given identity/handle/cache, and return
+    /// the engine for assertions.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_step(
+        engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+        parent_provider: &dyn ModelProvider,
+        parent_tools: &[Box<dyn crate::tools::Tool>],
+        observer: &dyn crate::observability::Observer,
+        history: &mut Vec<ChatMessage>,
+        new_messages_out: Option<&mut Vec<ChatMessage>>,
+        agent_alias: Option<&str>,
+        sop_reassembly: Option<SopStepReassembly<'_>>,
+        exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
+    ) {
+        use crate::sop::executor::QueuedSopAction;
+
+        let queued = QueuedSopAction {
+            engine: Arc::clone(&engine),
+            audit: None,
+            action,
+        };
+        drive_live_sop_actions(
+            vec![queued],
+            history,
+            parent_provider,
+            "mock",
+            "mock-model",
+            None,
+            parent_tools,
+            observer,
+            true,
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            None,
+            5,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false,
+            30_000,
+            100_000,
+            None,
+            &LoopKnobs::default(),
+            "cli",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            new_messages_out,
+            None,
+            agent_alias,
+            None,
+            sop_reassembly,
+            exec_cache,
+        )
+        .await
+        .expect("drive returns Ok");
+    }
+
+    fn step1_result(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> crate::sop::types::SopStepResult {
+        let guard = engine.lock().expect("engine lock");
+        guard
+            .get_run(run_id)
+            .expect("run present after drive")
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .expect("step 1 result recorded")
+            .clone()
+    }
+
+    // ── Blocker regressions: the REAL nested loop with distinct providers ────
+
+    const PARENT_MARKER: &str = "PARENT-ONLY-SECRET-7f3a";
+
+    /// Cross-agent steps run on an isolated child transcript: the parent
+    /// history (distinct provider, marker message) never reaches the child
+    /// provider; the child sees its own system prompt + the step context; the
+    /// parent transcript gains the step context and the child's final output
+    /// only.
+    #[tokio::test]
+    async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".to_string(),
+            seeded_owned(
+                Arc::clone(&requests),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                Some(0.42),
+            ),
+        );
+
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("parent system prompt"),
+            ChatMessage::user(PARENT_MARKER.to_string()),
+        ];
+        let mut new_out: Vec<ChatMessage> = Vec::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            Some(&mut new_out),
+            Some("outer"),
+            Some(handle),
+            &mut exec_cache,
+        )
+        .await;
+
+        // The child provider received at least one request, and NO request
+        // contained the parent-only marker or the parent system prompt.
+        let captured = requests.lock().expect("capture lock");
+        assert!(
+            !captured.is_empty(),
+            "the seeded child provider must have run the step"
+        );
+        for (messages, _tools, temperature) in captured.iter() {
+            assert!(
+                messages.iter().all(|m| !m.content.contains(PARENT_MARKER)
+                    && !m.content.contains("parent system prompt")),
+                "parent-only history must never reach the child provider: {messages:?}"
+            );
+            // The child transcript is its OWN system prompt + the step context.
+            assert_eq!(messages.first().map(|m| m.role.as_str()), Some("system"));
+            assert_eq!(messages.last().map(|m| m.role.as_str()), Some("user"));
+            // The child runs with the step agent's own configured temperature,
+            // not the parent turn's (None here).
+            assert_eq!(*temperature, Some(0.42));
+        }
+        drop(captured);
+
+        // Parent transcript: step context + the child's FINAL output only —
+        // no child system prompt, no intermediate child chatter.
+        assert!(
+            history
+                .iter()
+                .all(|m| !m.content.contains("You are") || m.role == "system"),
+            "no child system prompt may leak into the parent transcript"
+        );
+        assert_eq!(
+            history
+                .last()
+                .map(|m| (m.role.as_str(), m.content.as_str())),
+            Some(("assistant", "child-done")),
+            "the child's final output flows back into the parent transcript"
+        );
+        assert_eq!(
+            new_out.last().map(|m| m.content.as_str()),
+            Some("child-done"),
+            "the final output is captured for persistence too"
+        );
+
+        let result = step1_result(&engine, &run_id);
+        assert_eq!(result.status, crate::sop::types::SopStepStatus::Completed);
+        assert_eq!(result.output, "child-done");
+        assert_eq!(result.effective_agent.as_deref(), Some("stepper"));
+    }
+
+    /// The child registry and the child's own `tool_filter_groups` govern the
+    /// tool specs the nested loop offers the child provider — through the
+    /// loop's final filters, not just at assembly.
+    #[tokio::test]
+    async fn cross_agent_step_offers_child_tools_filtered_by_child_profile() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Child registry: one plain tool and two MCP-origin tools; the child
+        // profile's filter group admits only `srv__allowed`, so the child's
+        // OWN policy must drop `srv__blocked` inside the nested loop.
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(NamedTool("plain_tool")),
+            Box::new(NamedTool("srv__allowed")),
+            Box::new(NamedTool("srv__blocked")),
+        ];
+        let mcp_names: std::collections::HashSet<String> =
+            ["srv__allowed".to_string(), "srv__blocked".to_string()]
+                .into_iter()
+                .collect();
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["srv__allowed".to_string()],
+            keywords: Vec::new(),
+        }];
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".to_string(),
+            seeded_owned(Arc::clone(&requests), tools, mcp_names, groups, None),
+        );
+
+        let parent_provider = TextProvider;
+        // Parent scope carries a sensitive tool the child must never be offered.
+        let shell_calls = Arc::new(AtomicUsize::new(0));
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
+            calls: Arc::clone(&shell_calls),
+        })];
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            &mut exec_cache,
+        )
+        .await;
+
+        let captured = requests.lock().expect("capture lock");
+        assert!(!captured.is_empty(), "the child provider must have run");
+        let (_msgs, offered, _temp) = &captured[0];
+        assert!(
+            offered.contains(&"plain_tool".to_string())
+                && offered.contains(&"srv__allowed".to_string()),
+            "the child's own admitted tools are offered: {offered:?}"
+        );
+        assert!(
+            !offered.contains(&"srv__blocked".to_string()),
+            "the child profile's filter groups must gate the offered specs: {offered:?}"
+        );
+        assert!(
+            !offered.contains(&"shell".to_string()),
+            "the parent's tools must never be offered to the child: {offered:?}"
+        );
+        assert!(
+            !offered.iter().any(|t| t.starts_with("sop_")),
+            "the SOP recursion guard applies to the child too: {offered:?}"
+        );
+        drop(captured);
+
+        assert_eq!(
+            shell_calls.load(Ordering::SeqCst),
+            0,
+            "the parent's sensitive tool must never execute during a cross-agent step"
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+    }
+
+    /// Audit identity: nested-loop records stamp the step agent as the acting
+    /// identity and the delegating agent as the parent correlation; the SOP
+    /// step result names the effective agent.
+    #[tokio::test]
+    async fn cross_agent_step_stamps_effective_identity_with_parent_correlation() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".to_string(),
+            seeded_owned(
+                Arc::clone(&requests),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                None,
+            ),
+        );
+
+        let observer = IdentityCapture::default();
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &observer,
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            &mut exec_cache,
+        )
+        .await;
+
+        let pairs = observer.pairs.lock().expect("pairs lock");
+        assert!(
+            pairs
+                .iter()
+                .any(|(alias, parent)| alias.as_deref() == Some("stepper")
+                    && parent.as_deref() == Some("outer")),
+            "nested records must stamp the effective agent with parent correlation: {pairs:?}"
+        );
+        drop(pairs);
+
+        assert_eq!(
+            step1_result(&engine, &run_id).effective_agent.as_deref(),
+            Some("stepper"),
+            "the SOP audit record names the acting authority"
+        );
+    }
+
+    /// Same-agent control: a step naming the CURRENT agent keeps today's inline
+    /// behavior — shared parent history, parent identity, no re-assembly.
+    #[tokio::test]
+    async fn same_agent_step_keeps_shared_history_and_identity() {
+        let (engine, run_id, action) = start_single_cross_agent_step("outer");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let observer = IdentityCapture::default();
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &observer,
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            &mut exec_cache,
+        )
+        .await;
+
+        assert!(
+            exec_cache.is_empty(),
+            "a same-agent step must not re-assemble anything"
+        );
+        // Shared history: the step context and the loop's own messages land in
+        // the parent transcript (inline behavior unchanged).
+        assert!(
+            history.iter().any(|m| m.content == "done"),
+            "the same-agent nested loop appends to the shared history: {history:?}"
+        );
+        let pairs = observer.pairs.lock().expect("pairs lock");
+        assert!(
+            pairs
+                .iter()
+                .all(|(alias, parent)| alias.as_deref() == Some("outer") && parent.is_none()),
+            "same-agent steps keep the outer identity with no parent correlation: {pairs:?}"
+        );
+        drop(pairs);
+        assert_eq!(
+            step1_result(&engine, &run_id).effective_agent.as_deref(),
+            Some("outer")
+        );
+    }
+
+    // ── Fail-closed guards ───────────────────────────────────────────────────
+
+    /// A cross-agent step whose agent context cannot be assembled (unknown
+    /// agent in the handle's config) fails CLOSED at driver level: the step is
+    /// recorded Failed and the parent's tools never execute.
+    #[tokio::test]
+    async fn unassemblable_cross_agent_step_fails_closed() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        // Bare config: no "stepper" agent exists, so assembly must fail.
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let shell_calls = Arc::new(AtomicUsize::new(0));
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
+            calls: Arc::clone(&shell_calls),
+        })];
+        let provider = ShellCallingProvider;
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            Some("outer"),
+            Some(handle),
+            &mut exec_cache,
+        )
+        .await;
+
+        assert_eq!(
+            shell_calls.load(Ordering::SeqCst),
+            0,
+            "an unassemblable cross-agent step must not run with the parent's tools"
+        );
+        let result = step1_result(&engine, &run_id);
+        assert_eq!(result.status, crate::sop::types::SopStepStatus::Failed);
+        assert_eq!(
+            result.effective_agent.as_deref(),
+            Some("stepper"),
+            "the record names the agent that SHOULD have run the failed step"
+        );
+    }
+
+    /// A driver path with NO re-assembly handle must fail a cross-agent step
+    /// closed, never run it with the parent/delegate agent's tools.
+    #[tokio::test]
+    async fn no_handle_cross_agent_step_fails_closed_not_parent_scope() {
+        let (engine, run_id, action) = start_single_cross_agent_step("other-agent");
+
+        let shell_calls = Arc::new(AtomicUsize::new(0));
+        // Parent/delegate scope: a sensitive tool the cross-agent step must never
+        // reach.
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
+            calls: Arc::clone(&shell_calls),
+        })];
+        let provider = ShellCallingProvider;
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            Some("outer"),
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        // Security property: the parent's sensitive tool never executed — the
+        // cross-agent step did not run with the parent/delegate scope.
+        assert_eq!(
+            shell_calls.load(Ordering::SeqCst),
+            0,
+            "a no-handle cross-agent step must not run with the parent agent's tools"
+        );
+
+        // And the step is recorded FAILED (fail-closed), not Completed.
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Failed,
+            "the no-handle cross-agent step must fail closed"
+        );
     }
 }

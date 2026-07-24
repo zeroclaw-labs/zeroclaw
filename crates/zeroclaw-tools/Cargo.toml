@@ -56,6 +56,13 @@ webpki-roots = "1.0.6"
 default = []
 browser-native = ["dep:fantoccini"]
 probe = ["dep:probe-rs"]
+# Exposes cross-crate test-only constructors (e.g.
+# `McpRegistry::for_test_with_server_count`) so downstream test
+# suites can build registry fixtures without spawning real stdio
+# children. Intentionally not part of the default surface — the
+# constructors panic on real use and exist purely to keep
+# daemon-side tests self-contained.
+test-helpers = []
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true

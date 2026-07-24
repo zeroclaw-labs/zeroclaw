@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{Chord, overrides::OverrideTable};
+use crate::keymap::{Chord, GlobalAction, overrides::OverrideTable};
 use crate::theme::{self, Theme};
 
 const FILE_NAME: &str = "zerocode-config.toml";
@@ -20,7 +20,7 @@ const ENV_SEP: &str = "__";
 
 /// One or more chords bound to an action. Accepts a bare string (one
 /// chord) or an array on the wire; always serialized back as an array.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ChordSpec {
     One(Chord),
@@ -28,12 +28,39 @@ enum ChordSpec {
 }
 
 impl ChordSpec {
+    fn as_slice(&self) -> &[Chord] {
+        match self {
+            Self::One(c) => std::slice::from_ref(c),
+            Self::Many(cs) => cs,
+        }
+    }
+
     fn into_vec(self) -> Vec<Chord> {
         match self {
             Self::One(c) => vec![c],
             Self::Many(cs) => cs,
         }
     }
+}
+
+fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let key = GlobalAction::Help.action_key();
+    let legacy = [
+        Chord::char('?'),
+        Chord::key(KeyCode::F(1)),
+        Chord::with(KeyCode::F(1), KeyModifiers::CONTROL),
+    ];
+    let Some(spec) = rows.get(&key) else {
+        return false;
+    };
+    if spec.as_slice() != legacy {
+        return false;
+    }
+
+    rows.insert(key, ChordSpec::Many(GlobalAction::Help.default_chords()));
+    true
 }
 
 /// The `[theme]` section.
@@ -225,8 +252,9 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             .with_context(|| format!("writing default {}", path.display()))?;
     }
 
-    let doc = load_document(&path)?;
+    let mut doc = load_document(&path)?;
     let mut config = ZerocodeConfig::default();
+    let mut migrated_keybindings = false;
     if let Some(v) = doc.get("locale").and_then(|v| v.as_str()) {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
@@ -253,12 +281,32 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     }
     if let Some(v) = doc.get("keybindings") {
         match v.clone().try_into::<HashMap<String, ChordSpec>>() {
-            Ok(rows) => config.keybindings = rows,
+            Ok(mut rows) => {
+                if migrate_legacy_help_binding(&mut rows) {
+                    let key = GlobalAction::Help.action_key();
+                    let value = toml::Value::try_from(
+                        rows.get(&key)
+                            .expect("migrated Help binding remains present")
+                            .clone(),
+                    )
+                    .context("serializing migrated Help binding")?;
+                    doc.get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .expect("parsed keybindings remain a table")
+                        .insert(key, value);
+                    migrated_keybindings = true;
+                }
+                config.keybindings = rows;
+            }
             Err(e) => eprintln!(
                 "zerocode: ignoring [keybindings] in {} ({e}); using defaults",
                 path.display()
             ),
         }
+    }
+
+    if migrated_keybindings {
+        write_document(&path, &doc)?;
     }
 
     apply_env_overrides(&mut config)?;
@@ -794,6 +842,48 @@ mod tests {
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert_eq!(cfg.theme.name, theme::DEFAULT_THEME_NAME);
         assert!(cfg.keybindings.contains_key("dashboard.up"));
+    }
+
+    #[test]
+    fn legacy_help_defaults_migrate_without_touching_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"global.help\" = [\"?\", \"f1\", \"ctrl+f1\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![Chord::char('?'), Chord::ctrl('g')]
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        let help: Vec<Chord> = doc["keybindings"]["global.help"]
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(help, vec![Chord::char('?'), Chord::ctrl('g')]);
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_help_binding_is_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"global.help\" = [\"?\", \"ctrl+h\"]\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![Chord::char('?'), Chord::ctrl('h')]
+        );
+        assert!(read(dir.path()).contains("ctrl+h"));
     }
 
     #[test]
