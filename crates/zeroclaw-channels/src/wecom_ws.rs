@@ -317,9 +317,14 @@ impl WeComWsChannel {
         policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync>,
         workspace_dir: &Path,
     ) -> Result<Self> {
-        if config.stream_mode == StreamMode::MultiMessage {
+        let unsupported_stream_mode = match config.stream_mode {
+            StreamMode::MultiMessage => Some("multi_message"),
+            StreamMode::Off | StreamMode::Partial => None,
+        };
+        if let Some(mode) = unsupported_stream_mode {
             anyhow::bail!(
-                "WeCom WebSocket stream_mode=multi_message is not supported; use partial or off"
+                "WeCom WebSocket stream_mode={} is not supported; use partial or off",
+                mode
             );
         }
 

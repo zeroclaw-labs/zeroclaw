@@ -679,6 +679,23 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Show a batch of progress/status updates as one coalesced draft update.
+    ///
+    /// Channels with expensive edit APIs should override this so an upstream
+    /// burst does not turn into one awaited network edit per progress item.
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> anyhow::Result<()> {
+        for text in texts {
+            self.update_draft_progress(recipient, message_id, text)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     /// `suppress_voice` forces text delivery even on voice-only peers.
     async fn finalize_draft(

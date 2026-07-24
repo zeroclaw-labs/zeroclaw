@@ -14,6 +14,7 @@ pub(crate) mod max_iter;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
+pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
@@ -29,7 +30,11 @@ pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use events::{
+    DRAFT_PLACEHOLDER, DraftEvent, PROGRESS_MIN_INTERVAL_MS, REASONING_FULL_PREFIX, StreamDelta,
+    THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
+};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
@@ -339,6 +344,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         pacing,
         strict_tool_parsing,
         channel,
+        draft_reasoning: knobs.draft_reasoning,
         turn_id,
         agent_alias,
         parent_agent_alias,
@@ -882,8 +888,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            stream_calls,
         } = prepare_tool_calls(
             &ctx,
+            tools_registry,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,
@@ -944,16 +952,19 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, (call_idx, call)) in executed_slots.into_iter().zip(
+        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
             executable_indices
                 .iter()
                 .copied()
-                .zip(executable_calls.iter()),
+                .zip(executable_calls.iter())
+                .zip(stream_calls),
         ) {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
         }
@@ -962,6 +973,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
             iteration,

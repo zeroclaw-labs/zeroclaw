@@ -144,7 +144,7 @@ static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
 /// for real-time threaded notifications.
 struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
-    tx: tokio::sync::mpsc::Sender<String>,
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
     tools_used: AtomicBool,
 }
 
@@ -157,6 +157,10 @@ impl Observer for ChannelNotifyObserver {
         } = event
         {
             self.tools_used.store(true, Ordering::Relaxed);
+            let Some(tx) = self.tx.as_ref() else {
+                self.inner.record_event(event);
+                return;
+            };
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
@@ -179,7 +183,7 @@ impl Observer for ChannelNotifyObserver {
                 }
                 _ => String::new(),
             };
-            let _ = self.tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
+            let _ = tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
         }
         self.inner.record_event(event);
     }
@@ -4293,6 +4297,10 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+fn scrub_typing_error(error: &anyhow::Error) -> String {
+    zeroclaw_runtime::security::scrub(&error.to_string())
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -4309,7 +4317,7 @@ fn spawn_scoped_typing_task(
                 () = stop_signal.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(e) = channel.start_typing(&recipient).await {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "failed to start typing");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})), "failed to start typing");
                     }
                 }
             }
@@ -4319,11 +4327,60 @@ fn spawn_scoped_typing_task(
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
                 "failed to stop typing"
             );
         }
     })
+}
+
+/// Matrix `single_message` drafts are externally visible. This carries typing
+/// from accepted input through pre-delivery work and stops it before the draft.
+/// A proper general lifecycle still requires event-subsystem ownership.
+struct MatrixSingleMessageTypingScope {
+    cancellation: CancellationToken,
+    started: tokio::sync::oneshot::Receiver<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+fn start_matrix_single_message_typing_scope(
+    channel: Arc<dyn Channel>,
+    recipient: String,
+) -> MatrixSingleMessageTypingScope {
+    let cancellation = CancellationToken::new();
+    let stop_signal = cancellation.clone();
+    let (started_tx, started) = tokio::sync::oneshot::channel();
+    let handle = zeroclaw_spawn::spawn!(async move {
+        if let Err(e) = channel.start_typing(&recipient).await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                "failed to start typing"
+            );
+        }
+        let _ = started_tx.send(());
+        stop_signal.cancelled().await;
+        if let Err(e) = channel.stop_typing(&recipient).await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                "failed to stop typing"
+            );
+        }
+    });
+    MatrixSingleMessageTypingScope {
+        cancellation,
+        started,
+        handle,
+    }
+}
+
+async fn stop_matrix_single_message_typing_scope(scope: MatrixSingleMessageTypingScope) {
+    let _ = scope.started.await;
+    scope.cancellation.cancel();
+    log_worker_join_result(scope.handle.await);
 }
 
 async fn process_channel_message(
@@ -4356,6 +4413,756 @@ async fn process_channel_message(
     .await;
 }
 
+/// Resolve whether this inbound message uses Matrix `single_message`
+/// streaming. This is the only Matrix-specific branch the orchestrator needs:
+/// the channel still owns draft rendering, while the orchestrator avoids
+/// sending duplicate standalone tool-notification messages.
+fn matrix_single_message_streaming_enabled_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    matrix_config_for_message(config, msg).is_some_and(|config| {
+        config.stream_mode == zeroclaw_config::schema::MatrixStreamMode::SingleMessage
+    })
+}
+
+fn matrix_config_for_message<'a>(
+    config: &'a zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<&'a zeroclaw_config::schema::MatrixConfig> {
+    if msg.channel != "matrix" {
+        return None;
+    }
+    config.channels.matrix.get(msg.channel_alias.as_ref()?)
+}
+
+fn matrix_single_message_streaming_enabled(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    matrix_single_message_streaming_enabled_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_stream_reasoning_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    matrix_config_for_message(config, msg).map_or(
+        zeroclaw_config::schema::StreamReasoningMode::default(),
+        |config| config.stream_reasoning,
+    )
+}
+
+fn matrix_stream_reasoning(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    matrix_stream_reasoning_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_draft_update_interval_ms_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> u64 {
+    let default_interval = zeroclaw_config::schema::MatrixConfig::default()
+        .draft_update_interval_ms
+        .max(50);
+    matrix_config_for_message(config, msg).map_or(default_interval, |config| {
+        config.draft_update_interval_ms.max(50)
+    })
+}
+
+fn matrix_draft_update_interval_ms(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> u64 {
+    matrix_draft_update_interval_ms_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_stream_draft_lines_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    let default_lines = zeroclaw_config::schema::MatrixConfig::default().stream_draft_lines;
+    matrix_config_for_message(config, msg).map_or(default_lines, |config| config.stream_draft_lines)
+}
+
+fn matrix_stream_draft_lines(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    matrix_stream_draft_lines_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_message_max_bytes_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    let default_bytes = zeroclaw_config::schema::MatrixConfig::default()
+        .message_max_bytes
+        .max(1);
+    matrix_config_for_message(config, msg)
+        .map_or(default_bytes, |config| config.message_max_bytes.max(1))
+}
+
+fn matrix_message_max_bytes(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    matrix_message_max_bytes_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn single_message_pending_has_prefix(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+fn single_message_pending_thinking_round(text: &str) -> Option<usize> {
+    zeroclaw_runtime::agent::loop_::thinking_status_round(text)
+}
+
+fn single_message_pending_is_thinking_status(text: &str) -> bool {
+    single_message_pending_thinking_round(text).is_some()
+}
+
+fn single_message_pending_is_reasoning(text: &str) -> bool {
+    single_message_pending_has_prefix(text, zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+        && !single_message_pending_is_thinking_status(text)
+}
+
+fn single_message_pending_visible_lines(text: &str) -> usize {
+    if single_message_pending_is_reasoning(text) {
+        text.trim_end_matches(&['\r', '\n'][..])
+            .split('\n')
+            .count()
+            .max(1)
+    } else {
+        1
+    }
+}
+
+fn removing_pending_line_merges_reasoning(pending: &[String], idx: usize) -> bool {
+    idx > 0
+        && idx + 1 < pending.len()
+        && single_message_pending_is_reasoning(&pending[idx - 1])
+        && single_message_pending_is_reasoning(&pending[idx + 1])
+}
+
+fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+    if remove_lines == 0 {
+        return text.to_string();
+    }
+
+    let rendered = text.trim_end_matches(&['\r', '\n'][..]);
+    let total = single_message_pending_visible_lines(rendered);
+    if remove_lines >= total {
+        return String::new();
+    }
+
+    let retained = rendered
+        .split('\n')
+        .skip(remove_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if single_message_pending_is_reasoning(text)
+        && !retained.starts_with(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+    {
+        format!(
+            "{}{retained}",
+            zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX
+        )
+    } else {
+        retained
+    }
+}
+
+fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usize) {
+    if max_lines == 0 {
+        return;
+    }
+    let mut total_lines = pending
+        .iter()
+        .map(|line| single_message_pending_visible_lines(line))
+        .sum::<usize>();
+    while total_lines > max_lines {
+        let remove_lines = total_lines - max_lines;
+        let newest = pending.len().saturating_sub(1);
+        let remove_at = pending
+            .iter()
+            .enumerate()
+            .position(|(idx, line)| {
+                idx != newest
+                    && !single_message_pending_is_reasoning(line)
+                    && !single_message_pending_is_thinking_status(line)
+                    && !removing_pending_line_merges_reasoning(pending, idx)
+            })
+            .unwrap_or(0);
+        let line_count = single_message_pending_visible_lines(&pending[remove_at]);
+        if remove_lines >= line_count {
+            pending.remove(remove_at);
+            total_lines = total_lines.saturating_sub(line_count);
+        } else {
+            pending[remove_at] =
+                trim_pending_visible_lines_from_front(&pending[remove_at], remove_lines);
+            break;
+        }
+    }
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn truncate_utf8_bytes_owned(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    truncate_utf8_bytes(&text, max_bytes)
+}
+
+fn push_matrix_single_message_pending(
+    pending: &mut Vec<String>,
+    text: String,
+    max_lines: usize,
+    max_bytes: usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let text = truncate_utf8_bytes_owned(text, max_bytes);
+
+    if let Some(incoming_round) = single_message_pending_thinking_round(&text)
+        && let Some(existing) = pending.last_mut()
+        && single_message_pending_is_thinking_status(existing)
+    {
+        if incoming_round >= single_message_pending_thinking_round(existing).unwrap_or(0) {
+            *existing = text;
+        }
+        trim_matrix_single_message_pending(pending, max_lines);
+        return;
+    }
+
+    if let Some(fragment) = text.strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+        && let Some(existing) = pending.last_mut()
+        && single_message_pending_is_reasoning(existing)
+    {
+        existing.push_str(fragment);
+        if existing.len() > max_bytes {
+            *existing = truncate_utf8_bytes(existing, max_bytes);
+        }
+        trim_matrix_single_message_pending(pending, max_lines);
+        return;
+    }
+
+    pending.push(text);
+    trim_matrix_single_message_pending(pending, max_lines);
+}
+
+const RUNTIME_ONLY_TOOL_ARGUMENTS: &[&str] = &["approved", "__config"];
+
+/// Matrix's canonical safe-display policy for native standard tools. WASM and
+/// unresolved events never use this table, even when their public name collides.
+///
+/// A schema-annotation alternative could mark displayable properties in each
+/// provider-facing `ToolSpec` and recursively traverse nested schemas. It is
+/// deliberately deferred: provider compatibility for custom schema keywords is
+/// not established, nested-path configuration broadens this feature, and safe
+/// mode intentionally omits composite values. A follow-up PR may introduce
+/// that general metadata model above this Matrix-local policy.
+const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (&["shell"], &["command"]),
+    (&["file_read"], &["path", "offset", "limit", "encoding"]),
+    (&["file_write"], &["path", "encoding"]),
+    (&["file_edit"], &["path"]),
+    (&["glob_search"], &["pattern"]),
+    (
+        &["content_search"],
+        &[
+            "pattern",
+            "path",
+            "output_mode",
+            "include",
+            "case_sensitive",
+            "max_results",
+        ],
+    ),
+    (&["git_operations"], &["action", "path", "branch"]),
+    (&["cron_add"], &["name", "job_type"]),
+    (&["cron_remove", "cron_run", "cron_update"], &[]),
+    (&["cron_runs"], &["limit"]),
+    (&["schedule"], &["action", "expression", "delay", "run_at"]),
+    (&["send_message_to_peer", "send_via"], &[]),
+    (&["ask_user"], &["timeout_secs"]),
+    (
+        &["escalate_to_human"],
+        &["urgency", "wait_for_response", "timeout_secs"],
+    ),
+    (&["reaction"], &["action", "emoji"]),
+    (&["poll"], &["duration_minutes", "multi_select"]),
+    (
+        &["channel_room"],
+        &["action", "name", "visibility", "encryption"],
+    ),
+    (&["sessions_list"], &["limit"]),
+    (&["sessions_history"], &["limit"]),
+    (&["sessions_send"], &[]),
+    (&["memory_store"], &["category"]),
+    (&["memory_recall"], &["query", "limit"]),
+    (&["memory_forget"], &[]),
+    (
+        &["memory_export"],
+        &["namespace", "category", "since", "until"],
+    ),
+    (&["memory_purge"], &["namespace"]),
+    (
+        &["model_routing_config"],
+        &["action", "model_provider", "model"],
+    ),
+    (&["model_switch"], &["action", "model_provider", "model"]),
+    (&["proxy_config"], &["action", "scope"]),
+    (&["browser"], &["action"]),
+    (&["http_request"], &["method"]),
+    (&["web_search_tool"], &["query"]),
+    (&["image_info"], &["path"]),
+    (&["canvas"], &["action"]),
+    (&["backup"], &[]),
+    (
+        &[
+            "cron_list",
+            "spawn_subagent",
+            "sessions_current",
+            "browser_open",
+            "web_fetch",
+            "screenshot",
+            "weather",
+            "pushover",
+            "calculator",
+        ],
+        &[],
+    ),
+];
+
+// These are configured or feature-gated standard tools. They are part of the
+// same presentation policy, but the default registry used by the drift test
+// intentionally does not construct them.
+const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (
+        &["delegate"],
+        &["action", "agent", "background", "timeout_ms"],
+    ),
+    (&["sessions_reset", "sessions_delete"], &[]),
+    (&["read_skill", "skill_view"], &["name"]),
+    (&["skills_list"], &["source"]),
+    (&["skill_manage"], &["action", "name"]),
+    (
+        &["sop_execute", "sop_advance", "sop_approve", "sop_status"],
+        &["action"],
+    ),
+    (&["sop_workshop"], &["action", "name"]),
+    (&["sop_list"], &[]),
+    (&["browser_delegate", "text_browser"], &["action"]),
+    (&["tool_search"], &["query", "max_results"]),
+    (
+        &["file_upload", "file_upload_bundle", "file_download"],
+        &["path"],
+    ),
+    (&["security_ops"], &["action"]),
+    (&["data_management"], &[]),
+    (&["image_gen"], &["model", "size", "quality"]),
+    (
+        &[
+            "cloud_ops",
+            "cloud_patterns",
+            "project_intel",
+            "report_template",
+        ],
+        &["action", "provider", "path", "name", "format"],
+    ),
+    (
+        &[
+            "notion",
+            "jira",
+            "microsoft365",
+            "google_workspace",
+            "linkedin",
+            "composio",
+        ],
+        &["action"],
+    ),
+    (&["email_search"], &["folder", "limit"]),
+    (&["email_read"], &["folder"]),
+    (&["discord_search"], &["limit"]),
+    (&["hardware_board_info"], &["board"]),
+    (
+        &["hardware_memory_map", "hardware_memory_read"],
+        &["board", "address", "length"],
+    ),
+    (&["mcp_resources", "mcp_prompts"], &["action"]),
+    (
+        &[
+            "execute_pipeline",
+            "knowledge",
+            "llm_task",
+            "vi_verify",
+            "claude_code",
+            "claude_code_runner",
+            "codex_cli",
+            "gemini_cli",
+            "opencode_cli",
+        ],
+        &[],
+    ),
+];
+
+fn matrix_safe_tool_arguments(tool: &str) -> Option<&'static [&'static str]> {
+    MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+        .iter()
+        .chain(MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS)
+        .find_map(|(tools, arguments)| tools.contains(&tool).then_some(*arguments))
+}
+
+fn matrix_tool_progress(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+) -> Option<String> {
+    let settings = config
+        .channels
+        .matrix
+        .get(matrix_alias)
+        .map_or(&[][..], |matrix| matrix.stream_tool_arguments.as_slice());
+    match event {
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolStart {
+            tool,
+            arguments,
+            tool_role,
+        } => {
+            let subject = matrix_tool_subject(tool, arguments, *tool_role, settings);
+            Some(format!("\u{23f3} {subject}\n"))
+        }
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolComplete {
+            tool,
+            arguments,
+            tool_role,
+            secs,
+            success,
+            error,
+        } => {
+            let subject = matrix_tool_subject(tool, arguments, *tool_role, settings);
+            if *success {
+                Some(format!("\u{2705} {subject} ({secs}s)\n"))
+            } else if let Some(error) = error {
+                Some(format!(
+                    "\u{274c} {subject} ({secs}s): {}\n",
+                    truncate_with_ellipsis(&matrix_scrub_display(error), 200)
+                ))
+            } else {
+                Some(format!("\u{274c} {subject} ({secs}s)\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn matrix_tool_subject(
+    tool: &str,
+    arguments: &serde_json::Value,
+    tool_role: Option<zeroclaw_api::attribution::Role>,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> String {
+    matrix_tool_argument_hint(tool, arguments, tool_role, settings)
+        .map_or_else(|| tool.to_string(), |hint| format!("{tool}: {hint}"))
+}
+
+fn matrix_tool_argument_hint(
+    tool: &str,
+    arguments: &serde_json::Value,
+    tool_role: Option<zeroclaw_api::attribution::Role>,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> Option<String> {
+    use zeroclaw_config::schema::{
+        DEFAULT_STREAM_TOOL_ARGUMENT_CHARS, StreamToolArgumentBase, StreamToolArgumentEntry,
+    };
+
+    let serde_json::Value::Object(map) = arguments else {
+        return None;
+    };
+    let (default_base, default_chars) = settings
+        .iter()
+        .find_map(|entry| match entry {
+            StreamToolArgumentEntry::Defaults {
+                default_base,
+                argument_chars,
+            } => Some((
+                *default_base,
+                argument_chars.unwrap_or(DEFAULT_STREAM_TOOL_ARGUMENT_CHARS),
+            )),
+            StreamToolArgumentEntry::Tool { .. } => None,
+        })
+        .unwrap_or((
+            StreamToolArgumentBase::Safe,
+            DEFAULT_STREAM_TOOL_ARGUMENT_CHARS,
+        ));
+    let rule = settings.iter().find_map(|entry| match entry {
+        StreamToolArgumentEntry::Tool {
+            tool: rule_tool,
+            base,
+            include,
+            exclude,
+            argument_chars,
+        } if rule_tool == tool => Some((base, include, exclude, argument_chars)),
+        _ => None,
+    });
+    let (base, include, exclude, max_chars) = rule.map_or(
+        (default_base, &[][..], &[][..], default_chars),
+        |(base, include, exclude, argument_chars)| {
+            (
+                base.unwrap_or(default_base),
+                include.as_slice(),
+                exclude.as_slice(),
+                argument_chars.unwrap_or(default_chars),
+            )
+        },
+    );
+    let mut keys: Vec<(&str, bool)> = match base {
+        StreamToolArgumentBase::None => Vec::new(),
+        StreamToolArgumentBase::Safe => {
+            if matrix_safe_display_tool(tool_role) {
+                matrix_safe_tool_arguments(tool).unwrap_or_default()
+            } else {
+                &[]
+            }
+        }
+        .iter()
+        .copied()
+        .filter(|key| map.get(*key).is_some_and(matrix_is_scalar))
+        .map(|key| (key, false))
+        .collect(),
+        StreamToolArgumentBase::All => map.keys().map(|key| (key.as_str(), true)).collect(),
+    };
+    for key in include {
+        if map.contains_key(key) {
+            if let Some(existing) = keys.iter_mut().find(|(name, _)| *name == key) {
+                existing.1 = true;
+            } else {
+                keys.push((key, true));
+            }
+        }
+    }
+    keys.retain(|(key, _)| {
+        !exclude.iter().any(|excluded| excluded == key)
+            && !RUNTIME_ONLY_TOOL_ARGUMENTS.contains(key)
+    });
+    let parts: Vec<String> = keys
+        .into_iter()
+        .filter_map(|(key, explicit)| {
+            matrix_render_argument(key, map.get(key)?, max_chars, explicit)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Matrix owns this disclosure policy. Only a resolved non-WASM `Tool` role
+/// may use its reviewed safe argument list; every other role is name-only.
+fn matrix_safe_display_tool(tool_role: Option<zeroclaw_api::attribution::Role>) -> bool {
+    matches!(
+        tool_role,
+        Some(zeroclaw_api::attribution::Role::Tool(kind))
+            if kind != zeroclaw_api::attribution::ToolKind::WasmPlugin
+    )
+}
+
+fn matrix_render_argument(
+    key: &str,
+    value: &serde_json::Value,
+    max_chars: usize,
+    explicit: bool,
+) -> Option<String> {
+    if value.is_null() || (!explicit && !matrix_is_scalar(value)) {
+        return None;
+    }
+    let rendered = if zeroclaw_runtime::approval::looks_like_secret_key(key) {
+        "[redacted]".to_string()
+    } else {
+        let rendered = match value {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+            }
+            serde_json::Value::Null => return None,
+        };
+        matrix_scrub_display(&rendered)
+    };
+    if rendered.is_empty() {
+        None
+    } else if max_chars == 0 {
+        Some(format!("{key}={rendered}"))
+    } else {
+        Some(format!(
+            "{key}={}",
+            truncate_with_ellipsis(&rendered, max_chars)
+        ))
+    }
+}
+
+fn matrix_is_scalar(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::String(_) | serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+    )
+}
+
+fn matrix_scrub_display(value: &str) -> String {
+    scrub_credentials(&zeroclaw_runtime::security::scrub(value))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn matrix_progress_text(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+) -> Option<String> {
+    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+    match event {
+        StreamDelta::Status(text) => Some(strip_think_tags_inline(text)),
+        StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
+            matrix_tool_progress(event, config, matrix_alias)
+        }
+        StreamDelta::Reasoning(text) => Some(strip_think_tags_inline(&format!(
+            "{REASONING_FULL_PREFIX}{text}"
+        ))),
+        StreamDelta::Text(_) => None,
+    }
+}
+
+async fn run_matrix_single_message_draft_updater(
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    interval_ms: u64,
+    stream_draft_lines: usize,
+    message_max_bytes: usize,
+    matrix_config: Arc<Config>,
+    matrix_alias: String,
+) {
+    let interval = Duration::from_millis(interval_ms.max(50));
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    let mut pending = Vec::<String>::new();
+    let mut rx_open = true;
+    let mut flush_in_flight = false;
+
+    macro_rules! queue_progress {
+        ($event:expr) => {
+            if let Some(text) = matrix_progress_text(&$event, &matrix_config, &matrix_alias) {
+                push_matrix_single_message_pending(
+                    &mut pending,
+                    text,
+                    stream_draft_lines,
+                    message_max_bytes,
+                );
+            }
+        };
+    }
+
+    macro_rules! drain_ready {
+        () => {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => queue_progress!(event),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        rx_open = false;
+                        break;
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! start_flush {
+        () => {
+            if !flush_in_flight && !pending.is_empty() {
+                let batch = std::mem::take(&mut pending);
+                let channel = Arc::clone(&channel);
+                let reply_target = reply_target.clone();
+                let draft_id = draft_id.clone();
+                let flush_tx = flush_tx.clone();
+                flush_in_flight = true;
+                zeroclaw_spawn::spawn!(async move {
+                    let result = channel
+                        .update_draft_progress_batch(&reply_target, &draft_id, &batch)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = flush_tx.send(result.err()).await;
+                });
+            }
+        };
+    }
+
+    loop {
+        if !rx_open && !flush_in_flight {
+            start_flush!();
+            if pending.is_empty() && !flush_in_flight {
+                break;
+            }
+        }
+
+        tokio::select! {
+            maybe_event = rx.recv(), if rx_open => {
+                match maybe_event {
+                    Some(event) => {
+                        queue_progress!(event);
+                        drain_ready!();
+                    }
+                    None => {
+                        rx_open = false;
+                    }
+                }
+            }
+            _ = ticker.tick(), if !flush_in_flight && !pending.is_empty() => {
+                start_flush!();
+            }
+            maybe_error = flush_rx.recv(), if flush_in_flight => {
+                flush_in_flight = false;
+                if let Some(Some(error)) = maybe_error {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_attrs(::serde_json::json!({"error": error})),
+                        "Coalesced draft progress update failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the effective `ack_reactions` value for a channel message.
+///
+/// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
+/// take precedence over the global `[channels].ack_reactions` setting.
+/// This mirrors the resolution performed during channel construction
+/// (see `with_ack_reactions`), so the orchestrator's reaction gates
+/// agree with the channel's own internal gate.
 fn resolve_channel_ack_reactions(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -4913,6 +5720,16 @@ async fn process_channel_message_body(
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
+    let matrix_single_message_streaming =
+        matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
+    let mut matrix_single_message_typing_scope = if matrix_single_message_streaming {
+        target_channel.as_ref().map(|channel| {
+            start_matrix_single_message_typing_scope(Arc::clone(channel), msg.reply_target.clone())
+        })
+    } else {
+        None
+    };
+
     // ── Reply-intent precheck ────────────────────────────────────────
     let direct_message = target_channel
         .as_ref()
@@ -5057,6 +5874,9 @@ async fn process_channel_message_body(
     };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
+        if let Some(scope) = matrix_single_message_typing_scope.take() {
+            stop_matrix_single_message_typing_scope(scope).await;
+        }
         let history_response = AssistantChannelOutcome::NoReply {
             kind,
             reason: reason.clone(),
@@ -5127,9 +5947,18 @@ async fn process_channel_message_body(
     // Partial mode: send an initial draft message for progressive editing.
     let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
+            if matrix_single_message_streaming
+                && let Some(scope) = matrix_single_message_typing_scope.take()
+            {
+                stop_matrix_single_message_typing_scope(scope).await;
+            }
             match channel
                 .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    &SendMessage::new(
+                        zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
                 )
                 .await
             {
@@ -5162,49 +5991,118 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
-            Some(zeroclaw_spawn::spawn!(async move {
-                use zeroclaw_runtime::agent::loop_::StreamDelta;
-                let mut accumulated = String::new();
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        StreamDelta::Status(text) => {
-                            let visible = strip_think_tags_inline(&text);
-                            if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &visible)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft progress update failed"
-                                );
+            if matrix_single_message_streaming {
+                let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
+                let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
+                let message_max_bytes = matrix_message_max_bytes(ctx.as_ref(), &msg);
+                let matrix_config = Arc::clone(&ctx.prompt_config);
+                let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
+                Some(zeroclaw_spawn::spawn!(async move {
+                    run_matrix_single_message_draft_updater(
+                        rx,
+                        channel,
+                        reply_target,
+                        draft_id,
+                        interval_ms,
+                        stream_draft_lines,
+                        message_max_bytes,
+                        matrix_config,
+                        matrix_alias,
+                    )
+                    .await;
+                }))
+            } else {
+                Some(zeroclaw_spawn::spawn!(async move {
+                    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+                    let mut accumulated = String::new();
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            StreamDelta::Status(text) => {
+                                let visible = strip_think_tags_inline(&text);
+                                if let Err(e) = channel
+                                    .update_draft_progress(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft progress update failed"
+                                    );
+                                }
                             }
-                        }
-                        StreamDelta::Text(text) => {
-                            accumulated.push_str(&text);
-                            let visible = strip_think_tags_inline(&accumulated);
-                            if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &visible)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft update failed"
-                                );
+                            StreamDelta::Reasoning(text) => {
+                                let visible = strip_think_tags_inline(&format!(
+                                    "{REASONING_FULL_PREFIX}{text}"
+                                ));
+                                if let Err(e) = channel
+                                    .update_draft_progress(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft reasoning update failed"
+                                    );
+                                }
+                            }
+                            StreamDelta::Text(text) => {
+                                accumulated.push_str(&text);
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .update_draft(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft update failed"
+                                    );
+                                }
+                            }
+                            tool_event @ (StreamDelta::ToolStart { .. }
+                            | StreamDelta::ToolComplete { .. }) => {
+                                if let Some(text) = tool_event.legacy_status() {
+                                    let visible = strip_think_tags_inline(&text);
+                                    if let Err(e) = channel
+                                        .update_draft_progress(&reply_target, &draft_id, &visible)
+                                        .await
+                                    {
+                                        ::zeroclaw_log::record!(
+                                            DEBUG,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_attrs(
+                                                ::serde_json::json!({"error": format!("{e}")})
+                                            ),
+                                            "Draft tool progress update failed"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }))
+                }))
+            }
         } else {
             None
         }
@@ -5212,17 +6110,19 @@ async fn process_channel_message_body(
         None
     };
 
-    // Skip typing only for Partial mode — the draft message itself provides
-    // visual feedback. MultiMessage and Off both keep typing active.
+    // Preserve the existing typing task placement and lifecycle for all other
+    // modes. Matrix single-message has already completed its short typing
+    // scope before its first visible draft delivery.
     let is_partial_draft = target_channel
         .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming());
+        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming())
+        || matrix_single_message_streaming;
     let typing_cancellation = if is_partial_draft {
         None
     } else {
         target_channel.as_ref().map(|_| CancellationToken::new())
     };
-    let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
+    let mut typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
         (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
             Arc::clone(channel),
             msg.reply_target.clone(),
@@ -5231,46 +6131,44 @@ async fn process_channel_message_body(
         _ => None,
     };
 
-    // Wrap observer to forward tool events as live thread messages
+    // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
     // without bound. See `ChannelNotifyObserver::record_event` for the
     // drop-on-full contract.
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+    let (notify_tx, notify_task) = if matrix_single_message_streaming {
+        (None, None)
+    } else {
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+        let notify_channel = target_channel.clone();
+        let notify_reply_target = msg.reply_target.clone();
+        let notify_thread_root = followup_thread_id(&msg);
+        let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
+            Some(zeroclaw_spawn::spawn!(async move {
+                while notify_rx.recv().await.is_some() {}
+            }))
+        } else {
+            Some(zeroclaw_spawn::spawn!(async move {
+                let thread_ts = notify_thread_root;
+                while let Some(text) = notify_rx.recv().await {
+                    if let Some(ref ch) = notify_channel {
+                        let _ = ch
+                            .send(
+                                &SendMessage::new(&text, &notify_reply_target)
+                                    .in_thread(thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            }))
+        };
+        (Some(notify_tx), notify_task)
+    };
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
-    let notify_channel = target_channel.clone();
-    let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
-    // Tool-call notifications go out as SEPARATE messages below, which is right
-    // for chat channels (Discord/Telegram threads) but wrong for partial-draft
-    // channels like the git forge, where every message is a PERMANENT comment on
-    // a third-party issue/PR: each tool call became its own comment (issue spam),
-    // duplicating the progress the draft stream already folds into the single
-    // edited comment. Partial-draft channels drain-and-drop here; their draft
-    // stream remains the (single-message) tool-activity surface.
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
-        Some(zeroclaw_spawn::spawn!(async move {
-            while notify_rx.recv().await.is_some() {}
-        }))
-    } else {
-        Some(zeroclaw_spawn::spawn!(async move {
-            let thread_ts = notify_thread_root;
-            while let Some(text) = notify_rx.recv().await {
-                if let Some(ref ch) = notify_channel {
-                    let _ = ch
-                        .send(
-                            &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
-        }))
-    };
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -5317,7 +6215,10 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
-    let loop_knobs = LoopKnobs::default();
+    let mut loop_knobs = LoopKnobs::default();
+    if matrix_single_message_streaming {
+        loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
+    }
     let turn_id = uuid::Uuid::new_v4().to_string();
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
@@ -5606,10 +6507,13 @@ async fn process_channel_message_body(
         "LLM call completed"
     );
 
+    if let Some(scope) = matrix_single_message_typing_scope.take() {
+        stop_matrix_single_message_typing_scope(scope).await;
+    }
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
     }
-    if let Some(handle) = typing_task {
+    if let Some(handle) = typing_task.take() {
         log_worker_join_result(handle.await);
     }
 
@@ -11603,6 +12507,28 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    struct CountingObserver {
+        events: Arc<AtomicUsize>,
+    }
+
+    impl Observer for CountingObserver {
+        fn record_event(&self, _event: &ObserverEvent) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn flush(&self) {}
+
+        fn name(&self) -> &str {
+            "counting-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
         // The "no channels configured" message must point operators at the
@@ -11616,6 +12542,611 @@ mod tests {
         assert!(
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_streaming_resolves_from_matrix_alias_only() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                stream_tool_arguments: vec![
+                    zeroclaw_config::schema::StreamToolArgumentEntry::Defaults {
+                        default_base: zeroclaw_config::schema::StreamToolArgumentBase::None,
+                        argument_chars: Some(240),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        config.channels.matrix.insert(
+            "partial".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::Partial,
+                ..Default::default()
+            },
+        );
+
+        let single_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("single".to_string()),
+            ..Default::default()
+        };
+        let partial_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("partial".to_string()),
+            ..Default::default()
+        };
+        let unknown_alias_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("missing".to_string()),
+            ..Default::default()
+        };
+        let slack_msg = ChannelMessage {
+            channel: "slack".to_string(),
+            channel_alias: Some("single".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &single_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &partial_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &unknown_alias_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config, &slack_msg
+        ));
+        let single_policy = config
+            .channels
+            .matrix
+            .get("single")
+            .expect("configured Matrix alias")
+            .stream_tool_arguments
+            .as_slice();
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "delegate",
+                &serde_json::json!({"agent": "ops"}),
+                Some(zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )),
+                single_policy
+            ),
+            None,
+            "the configured base=none policy must be resolved only by Matrix rendering"
+        );
+    }
+
+    #[test]
+    fn matrix_tool_argument_policy_keeps_safe_defaults_and_honors_explicit_opt_in() {
+        use zeroclaw_config::schema::{
+            StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+
+        let arguments = serde_json::json!({
+            "action": "start",
+            "agent": "sysadmin",
+            "background": true,
+            "task_id": "task-7",
+            "timeout_ms": 30_000,
+            "prompt": "inspect secrets",
+            "metadata": { "room": "private" },
+            "token": "should-never-leak",
+        });
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "delegate",
+                &arguments,
+                Some(zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )),
+                &[],
+            )
+            .as_deref(),
+            Some("action=start, agent=sysadmin, background=true, timeout_ms=30000"),
+        );
+
+        let policy = vec![Entry::Tool {
+            tool: "delegate".to_string(),
+            base: Some(Base::None),
+            include: vec![
+                "prompt".to_string(),
+                "metadata".to_string(),
+                "token".to_string(),
+            ],
+            exclude: Vec::new(),
+            argument_chars: Some(0),
+        }];
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "delegate",
+                &arguments,
+                Some(zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )),
+                &policy,
+            )
+            .as_deref(),
+            Some("prompt=inspect secrets, metadata={\"room\":\"private\"}, token=[redacted]"),
+        );
+    }
+
+    #[test]
+    fn matrix_tool_argument_policy_keeps_unknown_tools_name_only_by_default() {
+        let arguments = serde_json::json!({"path": "/private", "count": 3});
+        assert_eq!(
+            matrix_tool_argument_hint("mcp-private", &arguments, None, &[],),
+            None
+        );
+    }
+
+    #[test]
+    fn matrix_safe_policy_keeps_wasm_and_unresolved_name_collisions_name_only() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_config::schema::{
+            StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+
+        let arguments = serde_json::json!({"action": "navigate"});
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(Role::Tool(ToolKind::WasmPlugin)),
+                &[],
+            ),
+            None,
+            "a WASM extension named like a standard tool stays name-only in safe mode"
+        );
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(Role::Tool(ToolKind::Plugin)),
+                &[],
+            )
+            .as_deref(),
+            Some("action=navigate"),
+            "the canonical standard tool keeps its reviewed safe field"
+        );
+        assert_eq!(
+            matrix_tool_argument_hint("browser", &arguments, None, &[]),
+            None,
+            "an unresolved tool named like a standard tool stays name-only"
+        );
+        let explicit_policy = [Entry::Tool {
+            tool: "browser".to_string(),
+            base: Some(Base::None),
+            include: vec!["action".to_string()],
+            exclude: Vec::new(),
+            argument_chars: None,
+        }];
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(Role::Tool(ToolKind::WasmPlugin)),
+                &explicit_policy,
+            )
+            .as_deref(),
+            Some("action=navigate"),
+            "an operator can explicitly disclose extension fields"
+        );
+    }
+
+    #[test]
+    fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        let temp = TempDir::new().expect("temporary workspace");
+        let config = Arc::new(Config::default());
+        let security = Arc::new(SecurityPolicy::default());
+        let registry = tools::all_tools(
+            Arc::clone(&config),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NoopMemory),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            temp.path(),
+            &HashMap::new(),
+            None,
+            config.as_ref(),
+            None,
+            false,
+            None,
+        );
+        let schemas: HashMap<String, Arc<serde_json::Value>> = registry
+            .tools
+            .iter()
+            .map(|tool| {
+                let spec = tool.spec();
+                (spec.name, spec.parameters)
+            })
+            .collect();
+        let mut checked_tools = 0;
+        let mut policy_tools = HashSet::new();
+        let mut absent_required_tools = Vec::new();
+
+        for (groups, required) in [
+            (MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS, true),
+            (MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS, false),
+        ] {
+            for (tools, fields) in groups {
+                for tool in *tools {
+                    assert!(
+                        policy_tools.insert(*tool),
+                        "Matrix safe policy lists tool {tool:?} more than once"
+                    );
+                    let Some(schema) = schemas.get(*tool) else {
+                        if required {
+                            absent_required_tools.push(*tool);
+                        }
+                        continue;
+                    };
+                    checked_tools += 1;
+                    let properties = schema
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                        .unwrap_or_else(|| panic!("{tool} must expose an object parameter schema"));
+                    for field in *fields {
+                        assert!(
+                            properties.contains_key(*field),
+                            "Matrix safe policy references missing field {field:?} for tool {tool:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked_tools >= 20,
+            "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
+        );
+        assert!(
+            absent_required_tools.is_empty(),
+            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let config = Config::default();
+        let arguments = serde_json::json!({"agent": "sysadmin", "prompt": "private"});
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments.clone()),
+                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments),
+                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        assert_eq!(start, "⏳ delegate: agent=sysadmin\n");
+        assert_eq!(completion, "✅ delegate: agent=sysadmin (4s)\n");
+    }
+
+    #[test]
+    fn matrix_tool_progress_treats_carried_wasm_or_missing_roles_as_untrusted() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let config = Config::default();
+        let arguments = serde_json::json!({"action": "navigate"});
+        for tool_role in [Some(Role::Tool(ToolKind::WasmPlugin)), None] {
+            let progress = matrix_tool_progress(
+                &StreamDelta::ToolStart {
+                    tool: "browser".to_string(),
+                    arguments: Arc::new(arguments.clone()),
+                    tool_role,
+                },
+                &config,
+                "missing",
+            )
+            .expect("tool start renders");
+            assert_eq!(
+                progress, "⏳ browser\n",
+                "WASM and unresolved roles must cross the event boundary without revealing safe arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_single_message_pending_splits_reasoning_after_tool_progress() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        for idx in 0..10 {
+            let fragment = if idx == 0 {
+                format!("{REASONING_FULL_PREFIX}Thinking (round 2) r{idx}")
+            } else {
+                format!("{REASONING_FULL_PREFIX} r{idx}")
+            };
+            push_matrix_single_message_pending(&mut pending, fragment, 3, usize::MAX);
+            push_matrix_single_message_pending(
+                &mut pending,
+                format!("tool-{idx}\n"),
+                3,
+                usize::MAX,
+            );
+        }
+
+        assert!(
+            pending.len() <= 3,
+            "bounded pending buffer should honor stream_draft_lines, got {pending:?}"
+        );
+        assert!(
+            pending.iter().all(|line| !line.contains("r7 r8")),
+            "reasoning after tool progress must start a new entry, got {pending:?}"
+        );
+        assert!(
+            !pending.iter().any(|line| line == "tool-0\n"),
+            "old non-reasoning progress should be trimmed first: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_keeps_separator_between_reasoning_entries() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}before tool"),
+            2,
+            usize::MAX,
+        );
+        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2, usize::MAX);
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}after tool"),
+            2,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            pending,
+            vec![
+                "tool call".to_string(),
+                format!("{REASONING_FULL_PREFIX}after tool")
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_caps_reasoning_to_message_budget() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}abcd"),
+            3,
+            max_bytes,
+        );
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}efgh"),
+            3,
+            max_bytes,
+        );
+
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcd")]);
+        assert!(pending.iter().all(|line| line.len() <= max_bytes));
+    }
+
+    #[test]
+    fn matrix_single_message_pending_limit_counts_visible_lines_not_events() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+            2,
+            usize::MAX,
+        );
+
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}two\nthree")]);
+
+        push_matrix_single_message_pending(
+            &mut pending,
+            "tool line\nwith detail\n".to_string(),
+            2,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            pending,
+            vec![
+                format!("{REASONING_FULL_PREFIX}three"),
+                "tool line\nwith detail\n".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_does_not_downgrade_thinking_round() {
+        use zeroclaw_runtime::agent::loop_::thinking_status_text;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3, usize::MAX);
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3, usize::MAX);
+
+        assert_eq!(pending, vec![thinking_status_text(1)]);
+
+        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3, usize::MAX);
+
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3, usize::MAX);
+
+        assert_eq!(
+            pending,
+            vec![
+                thinking_status_text(1),
+                "tool\n".to_string(),
+                thinking_status_text(2)
+            ]
+        );
+    }
+
+    struct SlowBatchChannel {
+        batches: Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+        delay: Duration,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SlowBatchChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "slow-batch"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SlowBatchChannel {
+        fn name(&self) -> &str {
+            "slow-batch"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_draft_progress_batch(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            texts: &[String],
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.batches.lock().await.push(texts.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_progress_coalesces_slow_flush() {
+        use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+        let batches = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let channel: Arc<dyn Channel> = Arc::new(SlowBatchChannel {
+            batches: Arc::clone(&batches),
+            delay: Duration::from_millis(150),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let updater = zeroclaw_spawn::spawn!(run_matrix_single_message_draft_updater(
+            rx,
+            channel,
+            "room".to_string(),
+            "draft".to_string(),
+            50,
+            5,
+            128,
+            Arc::new(Config::default()),
+            "test".to_string(),
+        ));
+
+        for idx in 0..20 {
+            tx.send(StreamDelta::Reasoning(format!(" pre{idx}")))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        for idx in 0..80 {
+            tx.send(StreamDelta::Text(format!("answer-{idx}")))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Reasoning(format!(" post{idx}")))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Status(format!("tool-{idx}\n")))
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_secs(3), updater)
+            .await
+            .expect("single-message updater should finish")
+            .expect("single-message updater task should not panic");
+
+        let batches = batches.lock().await.clone();
+        assert!(
+            (2..=4).contains(&batches.len()),
+            "slow flush should coalesce many deltas into a few batch edits, got {batches:?}"
+        );
+        assert!(
+            batches.iter().all(|batch| batch.len() <= 5),
+            "batch staging should be bounded by stream_draft_lines, got {batches:?}"
+        );
+        assert!(
+            batches.iter().flatten().all(|line| line.len() <= 128),
+            "batch staging should honor Matrix message_max_bytes, got {batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .filter(|line| line.starts_with(REASONING_FULL_PREFIX))
+                .count()
+                > batches.len(),
+            "interleaved tool progress should keep reasoning split into multiple entries, got {batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .any(|line| line.starts_with("tool-")),
+            "latest tool progress should remain available as a boundary line, got {batches:?}"
+        );
+        assert!(
+            !batches
+                .iter()
+                .flatten()
+                .any(|line| line.starts_with("answer-")),
+            "single-message progress updater must ignore assistant Text deltas: {batches:?}"
         );
     }
 
@@ -13587,21 +15118,36 @@ api_key = "anthropic-key"
     }
 
     struct DraftRecordingChannel {
+        channel_name: &'static str,
+        supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
+        delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
     }
 
     impl DraftRecordingChannel {
         fn new(finalize_should_fail: bool, fallback_send_should_fail: bool) -> Self {
             Self {
+                channel_name: "test-channel",
+                supports_multi_message_streaming: false,
                 finalize_should_fail,
                 fallback_send_should_fail,
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
+                delivery_events: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn matrix(stream_mode: zeroclaw_config::schema::MatrixStreamMode) -> Self {
+            Self {
+                channel_name: "matrix",
+                supports_multi_message_streaming: stream_mode
+                    == zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Self::new(false, false)
             }
         }
     }
@@ -13804,7 +15350,7 @@ api_key = "anthropic-key"
     #[async_trait::async_trait]
     impl Channel for DraftRecordingChannel {
         fn name(&self) -> &str {
-            "test-channel"
+            self.channel_name
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -13829,12 +15375,27 @@ api_key = "anthropic-key"
             true
         }
 
+        fn supports_multi_message_streaming(&self) -> bool {
+            self.supports_multi_message_streaming
+        }
+
         async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.delivery_events.lock().await.push("draft");
             self.draft_messages
                 .lock()
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
             Ok(Some("draft-1".to_string()))
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.delivery_events.lock().await.push("typing-start");
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.delivery_events.lock().await.push("typing-stop");
+            Ok(())
         }
 
         async fn finalize_draft(
@@ -19196,6 +20757,105 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn matrix_single_message_typing_stops_before_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "typing-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "matrix".into(),
+                channel_alias: Some("single".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            *channel_impl.delivery_events.lock().await,
+            ["typing-start", "typing-stop", "draft"]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_multi_message_preserves_draft_before_typing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "multi".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Default::default()
+            },
+        );
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(20),
+            }),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "multi-typing-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "matrix".into(),
+                channel_alias: Some("multi".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.delivery_events.lock().await;
+        assert_eq!(events.first(), Some(&"draft"));
+        assert!(events.contains(&"typing-start"));
+        assert!(events.contains(&"typing-stop"));
+    }
+
+    #[test]
+    fn typing_error_log_attributes_are_scrubbed() {
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let error = anyhow::Error::msg(format!("typing failed with {token}"));
+        let scrubbed = scrub_typing_error(&error);
+
+        assert!(!scrubbed.contains(token));
+    }
+
+    #[tokio::test]
     async fn process_channel_message_adds_and_swaps_reactions() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -20162,7 +21822,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -20194,7 +21854,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -20235,12 +21895,39 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn channel_notify_observer_without_sender_marks_tools_without_emitting() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(CountingObserver {
+                events: Arc::clone(&events),
+            }),
+            tx: None,
+            tools_used: AtomicBool::new(false),
+        };
+
+        observer.record_event(
+            &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
+                tool: "file_read".to_string(),
+                tool_call_id: None,
+                arguments: Some(r#"{"path":"/a"}"#.to_string()),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        );
+
+        assert!(observer.tools_used.load(Ordering::Relaxed));
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn channel_notify_observer_drops_on_full_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 

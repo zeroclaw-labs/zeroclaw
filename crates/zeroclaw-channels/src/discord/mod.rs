@@ -3349,7 +3349,11 @@ impl Channel for DiscordChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != zeroclaw_config::schema::StreamMode::Off
+        matches!(
+            self.stream_mode,
+            zeroclaw_config::schema::StreamMode::Partial
+                | zeroclaw_config::schema::StreamMode::MultiMessage
+        )
     }
 
     fn supports_multi_message_streaming(&self) -> bool {

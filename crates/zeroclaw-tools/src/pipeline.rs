@@ -71,6 +71,8 @@ pub struct PipelineTool {
 }
 
 impl PipelineTool {
+    pub const NAME: &'static str = "execute_pipeline";
+
     pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
@@ -221,7 +223,7 @@ impl PipelineTool {
 #[async_trait]
 impl Tool for PipelineTool {
     fn name(&self) -> &str {
-        "execute_pipeline"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
