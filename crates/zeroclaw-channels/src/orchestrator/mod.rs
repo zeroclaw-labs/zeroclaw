@@ -4541,25 +4541,19 @@ async fn process_channel_message_body(
     }
 
     if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
-        let wants = engine
-            .lock()
-            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
-            .unwrap_or(false);
-        if wants {
-            let topic = match &msg.channel_alias {
-                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
-                _ => msg.channel.clone(),
-            };
-            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
-                engine,
-                audit,
+        let topic = match &msg.channel_alias {
+            Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+            _ => msg.channel.clone(),
+        };
+        zeroclaw_runtime::sop::dispatch::SopIngress::new(Some(engine), Some(audit.as_ref()))
+            .dispatch(
                 zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
                 Some(&topic),
                 Some(&msg.content),
                 None,
+                None,
             )
             .await;
-        }
     }
 
     let history_key = conversation_history_key(&msg);
@@ -6760,48 +6754,19 @@ async fn dispatch_channel_sop_event(
         return false;
     };
 
-    let Some(engine) = router.sop_engine.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP engine is not available"
-        );
-        return true;
-    };
-    let Some(audit) = router.sop_audit.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP audit logger is not available"
-        );
-        return true;
-    };
-
-    let event = zeroclaw_runtime::sop::types::SopEvent {
-        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-        topic: Some(topic.to_string()),
-        payload: Some(msg.content.clone()),
-        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
-    };
     let target_sop = channel_sop_target(msg);
-    let results = if let Some(sop_name) = target_sop.as_deref() {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
-    } else {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
-    };
-    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    zeroclaw_runtime::sop::dispatch::SopIngress::new(
+        router.sop_engine.as_ref(),
+        router.sop_audit.as_deref(),
+    )
+    .dispatch(
+        zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        Some(topic),
+        Some(&msg.content),
+        target_sop.as_deref(),
+        None,
+    )
+    .await;
     true
 }
 
