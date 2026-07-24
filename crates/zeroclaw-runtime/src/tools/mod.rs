@@ -9,6 +9,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod deliver_file;
 pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
@@ -127,6 +128,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use deliver_file::{DeliverFileTool, MAX_DELIVER_FILE_BYTES, attachment_deliver_uri};
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -276,6 +278,10 @@ pub fn default_tools_with_runtime(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -579,6 +585,10 @@ pub fn all_tools_with_runtime(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
@@ -1617,7 +1627,7 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
     #[cfg(feature = "plugins-wasm")]
@@ -2504,6 +2514,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"deliver_file"));
         assert!(names.contains(&"file_write"));
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob_search"));
