@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::pairing::constant_time_eq;
 use zeroclaw_config::schema::StreamMode;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -3486,7 +3487,7 @@ impl LarkChannel {
                 let token_ok = payload
                     .get("token")
                     .and_then(|t| t.as_str())
-                    .is_none_or(|t| t == state.verification_token);
+                    .is_none_or(|t| constant_time_eq(t, &state.verification_token));
 
                 if !token_ok {
                     return (StatusCode::FORBIDDEN, "invalid token").into_response();
@@ -3946,6 +3947,14 @@ mod tests {
             ),
             "ou_bot",
         )
+    }
+
+    #[test]
+    fn lark_verification_token_comparison_is_constant_time() {
+        let token = "test_verification_token";
+        assert!(constant_time_eq(token, token));
+        assert!(!constant_time_eq("wrong_token", token));
+        assert!(!constant_time_eq("", token));
     }
 
     #[test]
