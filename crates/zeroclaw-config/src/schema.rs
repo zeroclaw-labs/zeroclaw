@@ -1348,6 +1348,22 @@ mod crusoe_tests {
         assert!(cfg.base.api_key.is_none());
         assert!(cfg.base.model.is_none());
     }
+
+    #[test]
+    fn crusoe_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.crusoe.default]
+model = "zai/GLM-5.2"
+"#;
+        let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .crusoe
+            .get("default")
+            .expect("crusoe.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("zai/GLM-5.2"));
+    }
 }
 
 // ── Mistral ──

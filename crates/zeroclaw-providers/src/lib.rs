@@ -1852,6 +1852,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("groq", "Groq", false),
             ("mistral", "Mistral", false),
             ("xai", "xAI (Grok)", false),
+            ("crusoe", "Crusoe Managed Inference", false),
             ("deepseek", "DeepSeek", false),
             ("together", "Together AI", false),
             ("fireworks", "Fireworks AI", false),
