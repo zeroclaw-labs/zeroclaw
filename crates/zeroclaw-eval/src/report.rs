@@ -45,6 +45,12 @@ impl SuiteReport {
         self.cases.iter().all(CaseReport::passed)
     }
 
+    /// Process exit code for a completed run: 0 iff every case passed.
+    /// Kept as a pure function so the CLI gate is testable at its real boundary.
+    pub fn exit_code(&self) -> i32 {
+        if self.all_passed() { 0 } else { 1 }
+    }
+
     /// Render a human-readable table. Failing checks are listed beneath their case.
     pub fn render_table(&self) -> String {
         let mut s = String::new();
@@ -168,6 +174,27 @@ mod tests {
         assert_eq!(suite.passed_count(), 1);
         assert_eq!(suite.failed_count(), 2);
         assert!(!suite.all_passed());
+    }
+
+    #[test]
+    fn exit_code_is_zero_when_all_cases_pass() {
+        let suite = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert!(suite.all_passed());
+        assert_eq!(suite.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_is_one_when_any_case_fails() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        assert!(!suite.all_passed());
+        assert_eq!(suite.exit_code(), 1);
     }
 
     #[test]
