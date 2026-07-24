@@ -714,8 +714,8 @@ cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de comp
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clave de configuración ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
