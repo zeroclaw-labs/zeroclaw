@@ -18787,6 +18787,7 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_context_compression_inert_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
@@ -18807,6 +18808,32 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface `context_compression.enabled = true` on any runtime profile as
+    /// inert. The runtime compressor was removed and no production path consumes
+    /// `ContextCompressionConfig` today, so an operator who turns it on learns
+    /// it has no effect instead of assuming a summarizer is active.
+    ///
+    /// A change that wires a runtime consumer for context compression must drop
+    /// this check in the same change; it mirrors what is inert on the tree.
+    fn collect_context_compression_inert_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (name, profile) in &self.runtime_profiles {
+            if profile.context_compression.enabled {
+                let path = format!("runtime_profiles.{name}.context_compression.enabled");
+                warnings.push(crate::validation_warnings::ValidationWarning::new(
+                    "context_compression_inert",
+                    format!(
+                        "{path} is set to true but context compression has no runtime consumer \
+                         (the compressor was removed); this setting currently has no effect."
+                    ),
+                    path,
+                ));
+            }
+        }
     }
 
     /// Surface sqlite semantic/hybrid search with no effective embedder. The
@@ -35580,6 +35607,58 @@ allowed_users = []
         assert_eq!(
             warnings[0].path,
             "providers.models.openai.primary.fallback[0]"
+        );
+    }
+
+    #[test]
+    async fn context_compression_disabled_by_default() {
+        // The runtime compressor was removed; the default config must not claim
+        // compression is enabled when nothing consumes it.
+        assert!(
+            !crate::scattered_types::ContextCompressionConfig::default().enabled,
+            "context_compression must default to inactive"
+        );
+    }
+
+    #[test]
+    async fn context_compression_enabled_profile_warns_inert() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+
+        let mut profile = RuntimeProfileConfig::default();
+        profile.context_compression.enabled = true;
+        config.runtime_profiles.insert("fast".to_string(), profile);
+
+        let inert: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "context_compression_inert")
+            .collect();
+        assert_eq!(
+            inert.len(),
+            1,
+            "one profile with enabled=true → one warning"
+        );
+        assert_eq!(
+            inert[0].path,
+            "runtime_profiles.fast.context_compression.enabled"
+        );
+    }
+
+    #[test]
+    async fn context_compression_default_profile_is_silent() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config
+            .runtime_profiles
+            .insert("fast".to_string(), RuntimeProfileConfig::default());
+
+        assert!(
+            !config
+                .collect_warnings()
+                .into_iter()
+                .any(|w| w.code == "context_compression_inert"),
+            "a profile left at the inactive default must not warn"
         );
     }
 
