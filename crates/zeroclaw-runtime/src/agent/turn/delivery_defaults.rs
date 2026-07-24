@@ -60,8 +60,8 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
         None => {
             args.insert("delivery".to_string(), default_delivery());
         }
-        Some(serde_json::Value::Null) => {
-            *args.get_mut("delivery").expect("delivery key exists") = default_delivery();
+        Some(delivery) if delivery.is_null() => {
+            *delivery = default_delivery();
         }
         Some(serde_json::Value::Object(delivery)) => {
             if delivery
@@ -99,5 +99,34 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
             }
         }
         Some(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_inject_channel_delivery_defaults;
+
+    #[test]
+    fn null_delivery_is_replaced_with_channel_defaults() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "delivery": null,
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "discord",
+            Some("channel-42"),
+        );
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "discord",
+                "to": "channel-42",
+            })
+        );
     }
 }

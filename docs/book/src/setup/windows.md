@@ -87,12 +87,11 @@ cargo install --locked --path .
 zeroclaw quickstart
 ```
 
-### Option 4: Scoop (verify before use)
+### Option 4: Scoop
 
-> ⚠️ **Verify the Scoop manifest before use.** The checked-in manifest can declare the current package version while retaining an older static download URL. Until release automation keeps both fields aligned, prefer the manual prebuilt path above or build from source.
-
-```
-scoop install zeroclaw     # verify the resolved release URL first; see warning above
+```cmd
+scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
+scoop install zeroclaw
 zeroclaw quickstart
 ```
 
@@ -225,8 +224,8 @@ zeroclaw service restart
 
 ### Scoop
 
-```
-scoop update zeroclaw       # subject to the staleness caveat above
+```cmd
+scoop update zeroclaw
 zeroclaw service restart
 ```
 
