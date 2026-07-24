@@ -1701,12 +1701,14 @@ mod inbound {
                 } else {
                     MediaCategory::Audio
                 };
-                Some(MediaInfo::new(
-                    m.source.clone(),
-                    m.body.clone(),
-                    m.info.as_ref().and_then(|i| i.mimetype.clone()),
-                    kind,
-                ))
+                let mime = m.info.as_ref().and_then(|i| i.mimetype.clone());
+                let file_name = m
+                    .filename
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or(&m.body)
+                    .to_string();
+                Some(MediaInfo::new(m.source.clone(), file_name, mime, kind))
             }
             _ => None,
         };
@@ -1909,7 +1911,12 @@ mod inbound {
 
                 if should_transcribe(&info.kind, transcription) {
                     let t = transcription.expect("should_transcribe guarantees Some");
-                    match transcribe_from_disk(t, &path, &info.file_name).await {
+                    let transcribe_name = transcription_safe_filename(
+                        &info.file_name,
+                        info.mime.as_deref(),
+                        &info.kind,
+                    );
+                    match transcribe_from_disk(t, &path, &transcribe_name).await {
                         Ok(text) if !text.trim().is_empty() => {
                             content = format!("[voice transcript]: {text}\n\n{content}");
                         }
@@ -1956,16 +1963,20 @@ mod inbound {
             "m.file" => MediaCategory::File,
             _ => return None,
         };
-        let file_name = content
+        let body_str = content
             .get("body")
             .and_then(|b| b.as_str())
-            .unwrap_or("attachment")
-            .to_string();
+            .unwrap_or("attachment");
+        let filename_field = content.get("filename").and_then(|f| f.as_str());
         let mime = content
             .get("info")
             .and_then(|i| i.get("mimetype"))
-            .and_then(|m| m.as_str())
-            .map(String::from);
+            .and_then(|m| m.as_str());
+        let file_name = filename_field
+            .filter(|f| !f.is_empty())
+            .unwrap_or(body_str)
+            .to_string();
+        let mime = mime.map(String::from);
         let source = if let Some(file) = content.get("file") {
             // Encrypted media: rebuild MediaSource::Encrypted from JSON.
             let encrypted: matrix_sdk::ruma::events::room::EncryptedFile =
@@ -2116,6 +2127,9 @@ mod inbound {
     }
 
     fn default_extension(kind: &MediaCategory, mime: Option<&str>) -> &'static str {
+        // Some Matrix clients append codec params (e.g. "audio/ogg; codecs=opus");
+        // match on the primary type only, mirroring `mime_for_audio` in transcription.rs.
+        let mime = mime.map(|m| m.split(';').next().unwrap_or(m).trim());
         if let Some(m) = mime {
             match m {
                 "image/png" => return "png",
@@ -2126,6 +2140,10 @@ mod inbound {
                 "audio/ogg" => return "ogg",
                 "audio/mpeg" | "audio/mp3" => return "mp3",
                 "audio/wav" => return "wav",
+                "audio/flac" => return "flac",
+                "audio/opus" => return "opus",
+                "audio/webm" => return "webm",
+                "audio/mp4" | "audio/x-m4a" => return "m4a",
                 "application/pdf" => return "pdf",
                 _ => {}
             }
@@ -2136,6 +2154,39 @@ mod inbound {
             MediaCategory::Audio | MediaCategory::Voice => "ogg",
             MediaCategory::File => "bin",
         }
+    }
+
+    /// Internal name for `transcribe()` only — never stored or shown.
+    pub(super) fn transcription_safe_filename(
+        file_name: &str,
+        mime: Option<&str>,
+        kind: &MediaCategory,
+    ) -> String {
+        let accepted = file_name
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| is_transcription_accepted_extension(ext));
+        if accepted {
+            return file_name.to_string();
+        }
+        format!("attachment.{}", default_extension(kind, mime))
+    }
+
+    // Mirrors `mime_for_audio`'s accepted set in transcription.rs.
+    fn is_transcription_accepted_extension(ext: &str) -> bool {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "flac"
+                | "mp3"
+                | "mpeg"
+                | "mpga"
+                | "mp4"
+                | "m4a"
+                | "ogg"
+                | "oga"
+                | "opus"
+                | "wav"
+                | "webm"
+        )
     }
 
     fn format_media_marker(info: &MediaInfo, path: &std::path::Path) -> String {
@@ -2174,8 +2225,24 @@ mod inbound {
             );
             anyhow::Error::msg(format!("read {}: {e}", path.display()))
         })?;
-        let manager = TranscriptionManager::new(config)?;
+        let manager = build_transcription_manager(config)?;
         manager.transcribe(&bytes, file_name).await
+    }
+
+    /// Binds the sole registered provider as the agent alias when exactly one
+    /// is configured; multi-provider setups keep the alias empty (unsupported).
+    pub(super) fn build_transcription_manager(
+        config: &TranscriptionConfig,
+    ) -> anyhow::Result<TranscriptionManager> {
+        let manager = TranscriptionManager::new(config)?;
+        let sole_provider = match manager.available_providers().as_slice() {
+            [only] => Some((*only).to_string()),
+            _ => None,
+        };
+        Ok(match sole_provider {
+            Some(alias) => manager.with_agent_transcription_provider(alias),
+            None => manager,
+        })
     }
 }
 
@@ -3779,6 +3846,279 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    mod transcription_provider_resolution {
+        use super::super::inbound::build_transcription_manager;
+        use zeroclaw_config::schema::TranscriptionConfig;
+
+        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
+            zeroclaw_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        #[tokio::test]
+        async fn binds_alias_when_exactly_one_provider_is_configured() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = build_transcription_manager(&config).unwrap();
+            assert_eq!(
+                manager.available_providers(),
+                vec!["local_whisper"],
+                "fixture must register exactly one provider"
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                api_key: Some("test-groq-key".to_string()),
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = build_transcription_manager(&config).unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.ogg")
+                .await
+                .expect_err("an unbound alias must fail");
+            assert!(
+                err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected the empty-alias bail, got: {err}"
+            );
+        }
+    }
+
+    mod media_filename_resolution {
+        use super::super::inbound::MediaCategory;
+        use super::super::inbound::{build_transcription_manager, transcription_safe_filename};
+        use zeroclaw_config::schema::TranscriptionConfig;
+
+        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
+            zeroclaw_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        #[test]
+        fn unaccepted_extension_with_supported_mime_uses_mime_derived_name() {
+            let resolved = transcription_safe_filename(
+                "recording.bin",
+                Some("audio/ogg"),
+                &MediaCategory::Audio,
+            );
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_preserved_even_when_mime_differs() {
+            let resolved = transcription_safe_filename(
+                "recording.mp3",
+                Some("audio/ogg"),
+                &MediaCategory::Audio,
+            );
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn accepted_extension_matching_mime_is_passed_through_unchanged() {
+            let resolved = transcription_safe_filename(
+                "recording.ogg",
+                Some("audio/ogg"),
+                &MediaCategory::Audio,
+            );
+            assert_eq!(resolved, "recording.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_matched_case_insensitively() {
+            let resolved = transcription_safe_filename(
+                "recording.OGG",
+                Some("audio/ogg"),
+                &MediaCategory::Audio,
+            );
+            assert_eq!(resolved, "recording.OGG");
+        }
+
+        #[test]
+        fn oga_extension_is_accepted_and_preserved() {
+            let resolved =
+                transcription_safe_filename("note.oga", Some("audio/ogg"), &MediaCategory::Voice);
+            assert_eq!(resolved, "note.oga");
+        }
+
+        #[test]
+        fn no_mime_with_an_accepted_extension_is_passed_through() {
+            let resolved =
+                transcription_safe_filename("recording.mp3", None, &MediaCategory::Audio);
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn unaccepted_extension_with_no_mime_falls_back_to_kind_default() {
+            let resolved =
+                transcription_safe_filename("recording.bin", None, &MediaCategory::Audio);
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[test]
+        fn no_mime_and_no_extension_falls_back_to_kind_default() {
+            let resolved =
+                transcription_safe_filename("Meeting recap", None, &MediaCategory::Audio);
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[test]
+        fn synthesizes_extension_from_mime_when_no_extension_at_all() {
+            let resolved = transcription_safe_filename(
+                "Voice message",
+                Some("audio/ogg"),
+                &MediaCategory::Voice,
+            );
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[tokio::test]
+        async fn caption_only_body_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename(
+                "Voice message",
+                Some("audio/ogg"),
+                &MediaCategory::Voice,
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected a resolved .ogg filename to pass format validation, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unaccepted_extension_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename(
+                "recording.bin",
+                Some("audio/ogg"),
+                &MediaCategory::Voice,
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected the unaccepted .bin extension to be replaced with the MIME-derived .ogg, got: {err}"
+            );
+        }
+
+        // attach_media only inserts non-empty transcripts.
+        #[tokio::test]
+        async fn caption_only_body_transcript_is_produced_for_insertion() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"text": "this is the transcribed voice message"}),
+                ))
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename(
+                "Voice message",
+                Some("audio/ogg"),
+                &MediaCategory::Voice,
+            );
+
+            let text = manager.transcribe(b"fake-audio", &file_name).await.unwrap();
+            assert_eq!(text, "this is the transcribed voice message");
+            assert!(!text.trim().is_empty());
+        }
+
+        #[test]
+        fn transcription_only_name_may_diverge_from_the_real_filename() {
+            let real_filename = "recording.bin";
+            let transcribe_name = transcription_safe_filename(
+                real_filename,
+                Some("audio/ogg"),
+                &MediaCategory::Audio,
+            );
+            assert_ne!(transcribe_name, real_filename);
+            assert_eq!(transcribe_name, "attachment.ogg");
+        }
+    }
+
     mod markers {
         use super::super::markers::{MarkerKind, parse};
 
@@ -5358,6 +5698,37 @@ mod tests {
                 info.kind,
                 super::super::inbound::MediaCategory::Audio
             ));
+        }
+
+        #[test]
+        fn parent_audio_real_filename_survives_even_with_unrecognized_extension() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Meeting recap.",
+                    "filename": "recording.bin",
+                    "url": "mxc://example.org/m",
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "recording.bin");
+        }
+
+        #[test]
+        fn parent_voice_filename_preferred_over_caption_body() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.ogg",
+                    "url": "mxc://example.org/v",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "voice.ogg");
         }
 
         #[test]
