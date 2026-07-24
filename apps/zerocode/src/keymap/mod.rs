@@ -34,6 +34,13 @@ pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
         .any(|chord| chord_bypasses_text_input(chord) && chord.matches(event))
 }
 
+pub fn input_bar_claims_pane_navigation(event: &KeyEvent) -> bool {
+    matches!(
+        InputBarAction::from_chord(event),
+        Some(InputBarAction::CursorWordLeft | InputBarAction::CursorWordRight)
+    )
+}
+
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
 /// resolved chords without knowing the concrete enum.
@@ -149,6 +156,34 @@ mod tests {
         assert_eq!(
             InputBarAction::from_chord(&ev),
             Some(InputBarAction::Submit)
+        );
+    }
+
+    #[test]
+    fn input_bar_word_navigation_claims_global_pane_chords() {
+        for event in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            assert!(matches!(
+                GlobalAction::from_chord(&event),
+                Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
+            ));
+            assert!(input_bar_claims_pane_navigation(&event));
+        }
+    }
+
+    #[test]
+    fn config_cursor_actions_use_config_editor_registry_keys() {
+        assert_eq!(
+            ConfigEditorAction::CursorWordLeft.action_key(),
+            "config_editor.cursor_word_left"
+        );
+        assert_eq!(
+            ConfigEditorAction::CursorWordRight.action_key(),
+            "config_editor.cursor_word_right"
         );
     }
 

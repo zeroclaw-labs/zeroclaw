@@ -58,6 +58,10 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_pane_navigation(key)
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }

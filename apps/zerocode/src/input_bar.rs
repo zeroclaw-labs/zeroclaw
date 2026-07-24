@@ -14,7 +14,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -404,35 +403,6 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
-fn is_word_character(character: char) -> bool {
-    character == '_' || character.is_alphanumeric()
-}
-
-fn previous_word_boundary(text: &str, cursor: usize) -> Option<usize> {
-    let mut chars = text[..cursor].char_indices().rev();
-
-    let mut target_is_word = None;
-    for (_, character) in chars.by_ref() {
-        if character.is_whitespace() {
-            continue;
-        }
-        target_is_word = Some(is_word_character(character));
-        break;
-    }
-
-    let Some(target_is_word) = target_is_word else {
-        return (cursor > 0).then_some(0);
-    };
-
-    for (index, character) in chars {
-        if character.is_whitespace() || is_word_character(character) != target_is_word {
-            return Some(index + character.len_utf8());
-        }
-    }
-
-    Some(0)
-}
-
 /// Decide which overflow arrows to show for `(up, down)` given the total
 /// content rows, the visible window, and the current scroll offset. Arrows
 /// only appear when content exceeds the window.
@@ -796,6 +766,7 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
         self.update_autocomplete();
     }
 
@@ -807,11 +778,8 @@ impl InputBarState {
             return;
         }
         if self.cursor > 0 {
-            let prev_grapheme = self.input[..self.cursor]
-                .graphemes(true)
-                .next_back()
-                .unwrap_or("");
-            let prev_start = self.cursor - prev_grapheme.len();
+            let prev_start =
+                crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
             self.input.replace_range(prev_start..self.cursor, "");
             self.cursor = prev_start;
             self.update_autocomplete();
@@ -824,9 +792,10 @@ impl InputBarState {
             self.update_autocomplete();
             return;
         }
-        let Some(delete_from) = previous_word_boundary(&self.input, self.cursor) else {
+        if self.cursor == 0 {
             return;
-        };
+        }
+        let delete_from = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
         self.input.replace_range(delete_from..self.cursor, "");
         self.cursor = delete_from;
         self.update_autocomplete();
@@ -834,24 +803,22 @@ impl InputBarState {
 
     pub fn move_cursor_left(&mut self) {
         self.clear_selection();
-        if self.cursor > 0 {
-            let prev_grapheme = self.input[..self.cursor]
-                .graphemes(true)
-                .next_back()
-                .unwrap_or("");
-            self.cursor -= prev_grapheme.len();
-        }
+        self.cursor = crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
     }
 
     pub fn move_cursor_right(&mut self) {
         self.clear_selection();
-        if self.cursor < self.input.len() {
-            let next_grapheme = self.input[self.cursor..]
-                .graphemes(true)
-                .next()
-                .unwrap_or("");
-            self.cursor += next_grapheme.len();
-        }
+        self.cursor = crate::text_navigation::next_grapheme_boundary(&self.input, self.cursor);
+    }
+
+    pub fn move_cursor_word_left(&mut self) {
+        self.clear_selection();
+        self.cursor = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
+    }
+
+    pub fn move_cursor_word_right(&mut self) {
+        self.clear_selection();
+        self.cursor = crate::text_navigation::next_word_boundary(&self.input, self.cursor);
     }
 
     /// Move cursor up one visual row. Returns false if already on row 0.
@@ -899,7 +866,14 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
         self.update_autocomplete();
+    }
+
+    pub fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.file_explorer.is_none()
+            && !self.input.is_empty()
+            && crate::keymap::input_bar_claims_pane_navigation(key)
     }
 
     // ── Attachment management ────────────────────────────────
@@ -1113,6 +1087,14 @@ impl InputBarState {
             }
             Some(IbWidgetAction::CursorRight) => {
                 self.move_cursor_right();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::CursorWordLeft) => {
+                self.move_cursor_word_left();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::CursorWordRight) => {
+                self.move_cursor_word_right();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::Backspace) => {
@@ -1753,6 +1735,65 @@ mod tests {
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "hello ");
         assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn alt_arrows_move_by_word_without_changing_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("alpha  beta");
+
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "alpha  beta");
+        assert_eq!(bar.cursor(), 7);
+
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn alt_b_and_f_move_by_unicode_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello 世界");
+
+        bar.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(bar.cursor(), "hello ".len());
+        bar.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(bar.cursor(), bar.input().len());
+        assert_eq!(bar.input(), "hello 世界");
+    }
+
+    #[test]
+    fn insertion_normalizes_cursor_after_joining_emoji_graphemes() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("👩👩");
+        bar.move_cursor_left();
+        bar.push_input_char('\u{200d}');
+
+        assert_eq!(bar.input(), "👩\u{200d}👩");
+        assert_eq!(bar.cursor(), bar.input().len());
+        bar.pop_input_char();
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
+    }
+
+    #[test]
+    fn file_explorer_does_not_claim_word_navigation_chords() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("alpha beta");
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        assert!(bar.claims_pane_navigation(&word_left));
+
+        bar.file_explorer = Some(FileExplorerState::new(std::path::PathBuf::from("/tmp")));
+        assert!(!bar.claims_pane_navigation(&word_left));
     }
 
     #[test]

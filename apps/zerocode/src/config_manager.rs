@@ -20,6 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
 use crate::terminal_backend::WideCellCleanupBackend;
@@ -304,6 +305,7 @@ pub(crate) struct App {
     field_cursor: usize,
     // Edit state
     edit_buf: String,
+    edit_cursor: usize,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -376,6 +378,7 @@ impl App {
             fields: Vec::new(),
             field_cursor: 0,
             edit_buf: String::new(),
+            edit_cursor: 0,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
@@ -2257,13 +2260,14 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.edit_buf.pop();
             }
-            _ => {
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.edit_buf.push(c);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -2687,13 +2691,14 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.personality_content.pop();
             }
-            _ => {
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.personality_content.push(c);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -2893,13 +2898,14 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.skills_body.pop();
             }
-            _ => {
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.skills_body.push(c);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -3026,6 +3032,7 @@ impl App {
                 self.edit_buf = value.unwrap_or_default();
             }
         }
+        self.edit_cursor = self.edit_buf.len();
     }
 
     fn is_select_edit(&self) -> bool {
@@ -3116,6 +3123,47 @@ impl App {
 
     // ── Field edit ───────────────────────────────────────────────
 
+    fn insert_scalar_edit_text(&mut self, text: &str) {
+        self.edit_buf.insert_str(self.edit_cursor, text);
+        self.edit_cursor += text.len();
+        self.edit_cursor =
+            crate::text_navigation::normalize_grapheme_cursor(&self.edit_buf, self.edit_cursor);
+    }
+
+    fn backspace_scalar_edit(&mut self) {
+        let previous =
+            crate::text_navigation::previous_grapheme_boundary(&self.edit_buf, self.edit_cursor);
+        self.edit_buf.replace_range(previous..self.edit_cursor, "");
+        self.edit_cursor = previous;
+    }
+
+    fn move_scalar_edit_cursor(&mut self, action: crate::keymap::ConfigEditorAction) {
+        use crate::keymap::ConfigEditorAction;
+        self.edit_cursor = match action {
+            ConfigEditorAction::CursorLeft => {
+                crate::text_navigation::previous_grapheme_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorRight => {
+                crate::text_navigation::next_grapheme_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorWordLeft => {
+                crate::text_navigation::previous_word_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorWordRight => {
+                crate::text_navigation::next_word_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorStart => 0,
+            ConfigEditorAction::CursorEnd => self.edit_buf.len(),
+            _ => self.edit_cursor,
+        };
+    }
+
+    fn is_scalar_field_edit(&self) -> bool {
+        matches!(&self.screen, Screen::FieldEdit { field_idx, .. }
+            if !self.is_select_edit()
+                && self.fields.get(*field_idx).is_some_and(|field| field.kind != PropKind::StringArray))
+    }
+
     async fn handle_field_edit(&mut self, key: KeyEvent) -> Result<()> {
         if self.is_select_edit() {
             return self.handle_select_edit(key).await;
@@ -3173,13 +3221,14 @@ impl App {
                         }
                     }
                 }
-                _ => {
+                None => {
                     if let KeyCode::Char(c) = key.code
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         self.edit_buf.push(c);
                     }
                 }
+                _ => {}
             }
             return Ok(());
         }
@@ -3222,15 +3271,27 @@ impl App {
                 }
             }
             Some(ConfigEditorAction::Backspace) => {
-                self.edit_buf.pop();
+                self.backspace_scalar_edit();
             }
-            _ => {
+            Some(
+                action @ (ConfigEditorAction::CursorLeft
+                | ConfigEditorAction::CursorRight
+                | ConfigEditorAction::CursorWordLeft
+                | ConfigEditorAction::CursorWordRight
+                | ConfigEditorAction::CursorStart
+                | ConfigEditorAction::CursorEnd),
+            ) => {
+                self.move_scalar_edit_cursor(action);
+            }
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    self.edit_buf.push(c);
+                    let mut encoded = [0; 4];
+                    self.insert_scalar_edit_text(c.encode_utf8(&mut encoded));
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -4195,11 +4256,8 @@ impl App {
                 return;
             }
 
-            let input_display = if field.is_secret {
-                format!("{}█", "•".repeat(self.edit_buf.len()))
-            } else {
-                format!("{}█", self.edit_buf)
-            };
+            let input_display =
+                scalar_edit_display(&self.edit_buf, self.edit_cursor, field.is_secret);
 
             let input = Paragraph::new(vec![
                 Line::from(Span::styled(&kind_hint, theme::dim_style())),
@@ -4268,12 +4326,8 @@ impl App {
                     self.edit_buf.push_str(&cleaned);
                 } else {
                     // Scalar fields: strip newlines.
-                    for c in cleaned.chars() {
-                        if c == '\n' {
-                            continue;
-                        }
-                        self.edit_buf.push(c);
-                    }
+                    let scalar: String = cleaned.chars().filter(|c| *c != '\n').collect();
+                    self.insert_scalar_edit_text(&scalar);
                 }
             }
             Screen::FieldList { .. } => {
@@ -4303,6 +4357,36 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.is_scalar_field_edit()
+            && matches!(
+                crate::keymap::ConfigEditorAction::from_chord(key),
+                Some(
+                    crate::keymap::ConfigEditorAction::CursorWordLeft
+                        | crate::keymap::ConfigEditorAction::CursorWordRight
+                )
+            )
+    }
+}
+
+fn scalar_edit_display(text: &str, cursor: usize, secret: bool) -> String {
+    let cursor = crate::text_navigation::normalize_grapheme_cursor(text, cursor);
+    if secret {
+        let before = text[..cursor].graphemes(true).count();
+        let after = text[cursor..].graphemes(true).count();
+        let mut display = String::with_capacity((before + after + 1) * '•'.len_utf8());
+        for _ in 0..before {
+            display.push('•');
+        }
+        display.push('█');
+        for _ in 0..after {
+            display.push('•');
+        }
+        display
+    } else {
+        format!("{}█{}", &text[..cursor], &text[cursor..])
     }
 }
 
@@ -4757,6 +4841,97 @@ mod tests {
             Some("zc-config-status-invalid-float")
         );
         assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
+    }
+
+    #[tokio::test]
+    async fn scalar_field_edit_supports_cursor_insertion_and_word_navigation() {
+        let mut manager = test_manager();
+        let mut editable = field("example.name");
+        editable.value = Some(serde_json::Value::String("alpha beta".into()));
+        manager.fields = vec![editable];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+            .await
+            .unwrap();
+        assert_eq!(manager.edit_cursor, "alpha ".len());
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.edit_buf, "alpha Xbeta");
+        assert_eq!(manager.edit_cursor, "alpha X".len());
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.edit_buf, "alpha beta");
+        assert_eq!(manager.edit_cursor, "alpha ".len());
+    }
+
+    #[tokio::test]
+    async fn pane_navigation_claims_only_scalar_field_edits() {
+        let mut manager = test_manager();
+        manager.fields = vec![field("example.name")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+
+        assert!(manager.claims_pane_navigation(&word_left));
+
+        manager.select_items = vec!["first".into(), "second".into()];
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.select_items.clear();
+        manager.fields[0].kind = PropKind::StringArray;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+        };
+        assert!(!manager.claims_pane_navigation(&word_left));
+    }
+
+    #[test]
+    fn scalar_field_cursor_display_masks_by_grapheme_without_losing_position() {
+        let text = "e\u{301}x";
+        let cursor = "e\u{301}".len();
+        assert_eq!(scalar_edit_display(text, cursor, false), "e\u{301}█x");
+        assert_eq!(scalar_edit_display(text, cursor, true), "•█•");
+    }
+
+    #[tokio::test]
+    async fn scalar_field_insertion_normalizes_zwj_cursor_and_backspace() {
+        let mut manager = test_manager();
+        manager.edit_buf = "👩👩".into();
+        manager.edit_cursor = "👩".len();
+
+        manager.insert_scalar_edit_text("\u{200d}");
+        assert_eq!(manager.edit_buf, "👩\u{200d}👩");
+        assert_eq!(manager.edit_cursor, manager.edit_buf.len());
+        assert_eq!(
+            scalar_edit_display(&manager.edit_buf, manager.edit_cursor, true),
+            "•█"
+        );
+
+        manager.backspace_scalar_edit();
+        assert_eq!(manager.edit_buf, "");
+        assert_eq!(manager.edit_cursor, 0);
     }
 
     #[test]
