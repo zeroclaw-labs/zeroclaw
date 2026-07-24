@@ -1699,7 +1699,6 @@ async fn drive_live_sop_actions(
                         // agent-independent global section, read from the same
                         // config the context was assembled from. Same-agent
                         // steps keep the parent's values verbatim.
-                        let local_model_context_window = model_context_window;
                         let (
                             eff_temperature,
                             eff_max_tool_iterations,
@@ -1734,7 +1733,7 @@ async fn drive_live_sop_actions(
                                 context_token_budget,
                                 dedup_exempt_tools,
                                 pacing,
-                                local_model_context_window,
+                                model_context_window,
                             ),
                         };
 
