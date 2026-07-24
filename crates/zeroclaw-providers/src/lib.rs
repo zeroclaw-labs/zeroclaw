@@ -1753,9 +1753,9 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
         ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
         BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
-        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
-        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
-        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
+        CohereModelProviderConfig, CrusoeModelProviderConfig, DeepinfraModelProviderConfig,
+        DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
+        FireworksModelProviderConfig, FriendliModelProviderConfig, GithubModelsModelProviderConfig,
         HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
         InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
         LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
@@ -1813,6 +1813,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "crusoe" => Some(<CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -3107,6 +3108,10 @@ mod tests {
         assert_eq!(
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("crusoe"),
+            Some("https://api.inference.crusoecloud.com/v1")
         );
     }
 
