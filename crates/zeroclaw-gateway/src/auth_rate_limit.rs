@@ -1,8 +1,4 @@
 //! Sliding-window rate limiter for authentication attempts.
-//!
-//! Protects pairing and bearer-token validation endpoints against
-//! brute-force attacks.  Tracks per-IP attempt timestamps and enforces
-//! a lockout period after too many failures within the sliding window.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -61,7 +57,6 @@ impl AuthRateLimiter {
     }
 
     /// Check whether the client identified by `key` is allowed to attempt auth.
-    ///
     /// Does **not** record a new attempt — call `record_attempt` after
     /// verifying the attempt actually happened (regardless of success/failure).
     pub fn check_rate_limit(&self, key: &str) -> Result<(), RateLimitError> {

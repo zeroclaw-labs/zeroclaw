@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --dist | --default | --all | --dry-run | --help]
 :: ============================================================================
 
-set "VERSION=0.8.2"
+set "VERSION=0.8.3"
 set "RUST_MIN_VERSION=1.87"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
@@ -139,7 +139,7 @@ echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary - Download pre-compiled release (fastest)
 echo   2) minimal build - core only, no default features
-echo   3) dist build - all channels, no heavyweight extras (recommended)
+echo   3) dist build - lean standard distribution (recommended)
 echo   4) default build - default feature set
 echo   5) all build - every feature including hardware and browser
 echo.
@@ -216,8 +216,8 @@ set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :build_dist
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-filesystem,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
-set "BUILD_DESC=dist (all channels, no heavyweight extras (recommended))"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+set "BUILD_DESC=dist (lean standard distribution (recommended))"
 goto :do_build
 
 :build_default
@@ -226,7 +226,7 @@ set "BUILD_DESC=default (default feature set)"
 goto :do_build
 
 :build_all
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
 set "BUILD_DESC=all (every feature including hardware and browser)"
 goto :do_build
 :: >>> end generated:presets <<<
@@ -324,7 +324,7 @@ if %ERRORLEVEL% EQU 0 (
     if %ERRORLEVEL% EQU 0 (
         if exist "web\dist\index.html" (
             mkdir "%LOCALAPPDATA%\zeroclaw\web\dist" 2>nul
-            xcopy /E /I /Y "web\dist" "%LOCALAPPDATA%\zeroclaw\web\dist" >nul
+            robocopy "web\dist" "%LOCALAPPDATA%\zeroclaw\web\dist" /MIR /NFL /NDL /NJH /NJS >nul
             echo   %GREEN%OK%RESET% Web dashboard installed to %LOCALAPPDATA%\zeroclaw\web\dist
         )
     ) else (
@@ -395,7 +395,7 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build core only ^(--no-default-features^)
-echo   --dist        Build all channels, no heavyweight extras (recommended)
+echo   --dist        Build lean standard distribution (recommended)
 echo   --default     Build the default feature set
 echo   --all         Build every feature including hardware and browser
 echo   --dry-run     Show what would happen without building or installing

@@ -1,13 +1,6 @@
 //! Integration coverage for `reply_min_interval_secs` + bounded queue
 //! against the recipient shapes used by Telegram and WhatsApp Web — the
-//! two channels #6345 calls out by name.
-//!
-//! These tests live at the pacing layer rather than inside each channel's
-//! HTTP/WS protocol mocks because pacing is a `PacedChannel` wrapper
-//! concern, not channel-internal logic. The recipient-key shape
-//! (Telegram numeric chat_id, WA Web LID/JID) is exercised explicitly so
-//! the assertion is anchored to the same identifier the production
-//! channels would receive.
+//! two channelscalls out by name.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -75,9 +68,6 @@ impl Channel for RecordingChannel {
     }
 }
 
-/// Telegram-shaped recipient: numeric chat_id string. Asserts the pacing
-/// floor holds between consecutive replies to the same chat_id, and that
-/// a different chat_id is independent.
 #[tokio::test]
 async fn telegram_shape_pacing_floor_holds_between_consecutive_sends() {
     let events: Arc<Mutex<Vec<(String, String, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -148,11 +138,6 @@ async fn telegram_shape_pacing_floor_holds_between_consecutive_sends() {
     );
 }
 
-/// WhatsApp Web-shaped recipient: JID with `@s.whatsapp.net` suffix.
-/// Asserts the pacing floor + queue overflow contract on a recipient
-/// shape Audacity flagged in #6622 (LID vs phone reconciliation lives
-/// in a different layer; pacing operates on whatever recipient string
-/// the inner channel receives).
 #[tokio::test]
 async fn whatsapp_web_shape_queue_overflow_drops_newest() {
     let events: Arc<Mutex<Vec<(String, String, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -206,9 +191,6 @@ async fn whatsapp_web_shape_queue_overflow_drops_newest() {
     assert!(!contents.contains(&"overflow"));
 }
 
-/// Zero interval is a true passthrough — verified at the integration
-/// layer so the assertion holds whether the inner channel is Telegram,
-/// WhatsApp Web, or any other `Channel` impl.
 #[tokio::test]
 async fn zero_interval_passthrough_at_integration_layer() {
     let events: Arc<Mutex<Vec<(String, String, Instant)>>> = Arc::new(Mutex::new(Vec::new()));

@@ -90,12 +90,6 @@ pub fn strip_tool_call_tags(message: &str) -> String {
         }
     }
 
-    // Does the tag structure run to the end of the message? A *real* truncated
-    // tool call is the model getting cut off, so the unterminated structure is
-    // the last thing in the message. If natural-language prose resumes after the
-    // tags, this is an inline *example* (the model is discussing tool calls), not
-    // a truncation — so we should keep it. Bias toward keeping: a little leaked
-    // XML beats eating the user's text.
     fn tool_structure_runs_to_end(inner: &str) -> bool {
         let mut rest = inner.trim_start();
         // Consume a run of `<...>` tags (and whitespace between them).
@@ -171,14 +165,6 @@ pub fn strip_tool_call_tags(message: &str) -> String {
             continue;
         }
 
-        // Unterminated open tag with no parseable JSON body. Drop the broken
-        // tail ONLY when it looks like tool-call structure (`<invoke>` /
-        // `<parameter>` / `<tool*>` / `<function*>` / `{` / `[`) AND that
-        // structure runs to the end of the message — i.e. a real truncation
-        // where the model was cut off mid-call. If prose resumes after the
-        // structure, the model is showing an *example*, not making a call, so
-        // keep it verbatim (a little leaked XML beats eating the user's reply).
-        // Text that merely mentions a tag is likewise kept.
         let inner = after_open.trim_start();
         let inner_lower = inner.to_ascii_lowercase();
         let looks_like_tool_structure = inner_lower.starts_with("<invoke")
@@ -213,12 +199,19 @@ pub fn strip_tool_call_tags(message: &str) -> String {
 
 /// Recognized attachment marker kinds (e.g. `[IMAGE:/path]`, `[DOCUMENT:url]`).
 const ATTACHMENT_KINDS: &[&str] = &[
-    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE",
+    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE", "LOCATION",
 ];
 
 /// Parse `[KIND:target]` attachment markers out of a message.
 /// Returns cleaned text (markers removed) and a vec of `(kind, target)` pairs.
 pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>) {
+    parse_attachment_markers_of_kinds(message, ATTACHMENT_KINDS)
+}
+
+pub(crate) fn parse_attachment_markers_of_kinds(
+    message: &str,
+    kinds: &[&str],
+) -> (String, Vec<(String, String)>) {
     let mut cleaned = String::with_capacity(message.len());
     let mut attachments = Vec::new();
     let mut cursor = 0usize;
@@ -238,7 +231,7 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
         let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
             let kind_upper = kind.trim().to_ascii_uppercase();
             let target = target.trim();
-            if target.is_empty() || !ATTACHMENT_KINDS.contains(&kind_upper.as_str()) {
+            if target.is_empty() || !kinds.contains(&kind_upper.as_str()) {
                 return None;
             }
             Some((kind_upper, target.to_string()))
@@ -260,12 +253,80 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
     (cleaned.trim().to_string(), attachments)
 }
 
-/// Generate a short 6-character lowercase alphanumeric approval token.
-///
-/// Uses the full `[a-z0-9]` alphabet (36 options per position, 36^6 ≈ 2.2B
-/// combinations) — not UUID hex (which would give only 16^6 ≈ 16.7M and
-/// would materially weaken the WhatsApp no-per-sender-check design
-/// described in the PR #6010 security note).
+/// A native location pin parsed from a `[LOCATION:...]` marker. Shared by
+/// both WhatsApp backends (web protobuf send and Cloud API JSON send).
+#[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WhatsAppLocation {
+    pub(crate) lat: f64,
+    pub(crate) lng: f64,
+    pub(crate) name: Option<String>,
+    pub(crate) address: Option<String>,
+}
+
+#[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
+impl WhatsAppLocation {
+    pub(crate) fn parse(target: &str) -> Option<Self> {
+        // Extract the next field.  If the trimmed input starts with `"` the
+        // field runs to the closing `"` and may contain commas; otherwise the
+        // field ends at the first `,`.  Returns `(field, rest)` — `rest` has
+        // already been trimmed and stripped of the separating comma.
+        fn next_field(s: &str) -> (&str, &str) {
+            let s = s.trim();
+            if let Some(inner) = s.strip_prefix('"') {
+                if let Some(end) = inner.find('"') {
+                    // Quoted field: grab everything up to the closing quote.
+                    let field = &inner[..end];
+                    let rest = inner[end + 1..].trim();
+                    let rest = match rest.strip_prefix(',') {
+                        Some(s) => s.trim(),
+                        None => "",
+                    };
+                    return (field, rest);
+                }
+                // Unclosed quote — treat the rest as one field.
+                return (inner, "");
+            }
+            // Plain field: split on the first comma.
+            match s.find(',') {
+                Some(pos) => (s[..pos].trim(), s[pos + 1..].trim()),
+                None => (s, ""),
+            }
+        }
+
+        let (lat_str, rest) = next_field(target);
+        let lat: f64 = lat_str.parse().ok()?;
+        let (lng_str, rest) = next_field(rest);
+        let lng: f64 = lng_str.parse().ok()?;
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+            return None;
+        }
+
+        let (name_raw, rest) = next_field(rest);
+        let name = (!name_raw.is_empty()).then(|| name_raw.to_string());
+
+        let address = (!rest.is_empty()).then(|| rest.to_string());
+
+        Some(Self {
+            lat,
+            lng,
+            name,
+            address,
+        })
+    }
+}
+
+/// Render an inbound static location as chat text, e.g.
+/// `[Location: 40.712800, -74.006000 — NYC]`. Shared by both WhatsApp
+/// backends so inbound pins read identically regardless of transport.
+#[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
+pub(crate) fn format_location_content(lat: f64, lng: f64, name: Option<&str>) -> String {
+    match name.filter(|n| !n.is_empty()) {
+        Some(name) => format!("[Location: {lat:.6}, {lng:.6} — {name}]"),
+        None => format!("[Location: {lat:.6}, {lng:.6}]"),
+    }
+}
+
 #[cfg(any(
     feature = "channel-discord",
     feature = "channel-signal",
@@ -283,11 +344,6 @@ pub(crate) fn new_approval_token() -> String {
         .collect()
 }
 
-/// Parse an approval reply of the form `"TOKEN yes|no|always ..."`.
-///
-/// Returns `Some((token, response))` when the text begins with a 6-character
-/// alphanumeric token followed by a recognised action word. Returns `None`
-/// for any other input so normal messages are not intercepted.
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -422,6 +478,104 @@ mod tests {
         let (_, attachments) = parse_attachment_markers("[image:/tmp/a.png]");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].0, "IMAGE");
+    }
+
+    #[test]
+    fn parse_attachment_markers_of_kinds_leaves_other_kinds_in_text() {
+        let (cleaned, attachments) = parse_attachment_markers_of_kinds(
+            "Pin [LOCATION:40.7,-74.0] pic [IMAGE:/tmp/a.png]",
+            &["LOCATION"],
+        );
+        assert_eq!(cleaned, "Pin  pic [IMAGE:/tmp/a.png]");
+        assert_eq!(
+            attachments,
+            vec![("LOCATION".to_string(), "40.7,-74.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn location_marker_parses_coordinates_name_and_address() {
+        // Bare coordinates.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060"),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: None,
+                address: None,
+            })
+        );
+        // Coordinates + name, with surrounding whitespace trimmed.
+        assert_eq!(
+            WhatsAppLocation::parse(" 40.7128 , -74.0060 , Statue of Liberty "),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("Statue of Liberty".to_string()),
+                address: None,
+            })
+        );
+        // The address is the trailing field and may contain commas.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060,Liberty Island,New York, NY 10004"),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("Liberty Island".to_string()),
+                address: Some("New York, NY 10004".to_string()),
+            })
+        );
+        // Double-quoted name may contain commas.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060,\"ACME, Inc.\",New York, NY 10004"),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("ACME, Inc.".to_string()),
+                address: Some("New York, NY 10004".to_string()),
+            })
+        );
+        // Quoted name without trailing address.
+        assert_eq!(
+            WhatsAppLocation::parse("40.7128,-74.0060,\"ACME, Inc.\""),
+            Some(WhatsAppLocation {
+                lat: 40.7128,
+                lng: -74.0060,
+                name: Some("ACME, Inc.".to_string()),
+                address: None,
+            })
+        );
+    }
+
+    #[test]
+    fn location_marker_rejects_out_of_range_coordinates() {
+        assert_eq!(WhatsAppLocation::parse("91.0,0.0"), None);
+        assert_eq!(WhatsAppLocation::parse("-91.0,0.0"), None);
+        assert_eq!(WhatsAppLocation::parse("0.0,181.0"), None);
+        assert_eq!(WhatsAppLocation::parse("0.0,-181.0"), None);
+    }
+
+    #[test]
+    fn location_marker_rejects_malformed_input() {
+        assert_eq!(WhatsAppLocation::parse("not-a-number,0.0"), None);
+        assert_eq!(WhatsAppLocation::parse("40.7128"), None);
+        assert_eq!(WhatsAppLocation::parse(""), None);
+    }
+
+    #[test]
+    fn format_location_content_omits_empty_name() {
+        assert_eq!(
+            format_location_content(40.7128, -74.0060, Some("NYC")),
+            "[Location: 40.712800, -74.006000 — NYC]"
+        );
+        assert_eq!(
+            format_location_content(40.7128, -74.0060, Some("")),
+            "[Location: 40.712800, -74.006000]"
+        );
+        assert_eq!(
+            format_location_content(40.7128, -74.0060, None),
+            "[Location: 40.712800, -74.006000]"
+        );
     }
 
     #[test]

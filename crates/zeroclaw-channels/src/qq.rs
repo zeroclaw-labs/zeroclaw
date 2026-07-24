@@ -31,11 +31,6 @@ enum QQMediaFileType {
     Image = 1,
     /// Video (mp4, mov, etc.)
     Video = 2,
-    /// Voice — only natively supported formats (.wav, .mp3, .silk).
-    /// Non-native audio formats degrade to `File` instead.
-    /// Note: The TS openclaw-qqbot uses silk-wasm + ffmpeg for full format
-    /// transcoding; Rust version avoids heavyweight dependencies and only
-    /// passes through natively supported formats.
     Voice = 3,
     /// File (pdf, zip, or any non-native audio format)
     File = 4,
@@ -114,7 +109,6 @@ fn voice_wav_filename(url: &str) -> String {
 }
 
 /// Map a `[TYPE:target]` marker kind string to `QQMediaFileType`.
-///
 /// For AUDIO/VOICE types, the target's extension determines whether it's
 /// sent as `Voice` (native formats only) or degrades to `File`.
 fn marker_kind_to_qq_file_type(marker: &str, target: &str) -> Option<QQMediaFileType> {
@@ -156,7 +150,6 @@ fn find_matching_close(s: &str) -> Option<usize> {
 }
 
 /// Parse `[TYPE:target]` attachment markers from message content.
-///
 /// Returns the cleaned text (markers removed) and a list of parsed attachments.
 /// Uses the same bracket-matching logic as `telegram.rs::parse_attachment_markers`.
 fn parse_qq_attachment_markers(content: &str) -> (String, Vec<QQMediaAttachment>) {
@@ -469,13 +462,6 @@ impl QQChannel {
         Ok((token, expiry))
     }
 
-    /// Fetch an access token with retry and exponential backoff.
-    ///
-    /// Transient failures (network errors, 5xx responses) during reconnection
-    /// can cause the entire recovery loop to fail. This method retries up to
-    /// `AUTH_RETRY_MAX_ATTEMPTS` times with exponential backoff + jitter so
-    /// that a single transient error doesn't permanently break the reconnect
-    /// flow.
     async fn fetch_access_token_with_retry(&self) -> anyhow::Result<(String, u64)> {
         let mut backoff_ms = AUTH_RETRY_INITIAL_BACKOFF_MS;
         let mut last_err = None;
@@ -821,11 +807,6 @@ impl QQChannel {
         }
     }
 
-    /// Upload media to QQ API and return file_info for sending.
-    ///
-    /// Supports two modes:
-    /// - URL upload: pass `url = Some(...)`, `file_data = None`
-    /// - Base64 upload: pass `file_data = Some(...)`, `url = None`
     async fn upload_media(
         &self,
         recipient: &str,
@@ -1411,20 +1392,9 @@ impl Channel for QQChannel {
 
         let mut sequence: i64 = stored_seq.unwrap_or(-1);
 
-        // Track consecutive missed heartbeat ACKs.  The previous logic
-        // killed the connection on the *first* missed ACK which is overly
-        // aggressive -- transient network hiccups or brief server-side GC
-        // pauses can cause a single ACK to be delayed.  We now allow up to
-        // `MAX_MISSED_ACKS` consecutive misses before declaring the
-        // connection dead.
         const MAX_MISSED_ACKS: u32 = 3;
         let mut missed_ack_count: u32 = 0;
 
-        // Spawn heartbeat timer.
-        //
-        // We add a small grace period (10% of the server-provided interval,
-        // capped at 5s) so that a slightly-delayed ACK does not immediately
-        // count as missed.
         let hb_interval = heartbeat_interval;
         let grace_ms: u64 = (hb_interval / 10).min(5_000);
         let effective_interval = hb_interval.saturating_add(grace_ms);

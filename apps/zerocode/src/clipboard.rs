@@ -1,15 +1,10 @@
 //! Platform clipboard image reading and text reading.
-//!
-//! Shells out to system clipboard tools to read image data from the
-//! clipboard and read text from the clipboard. Gracefully degrades —
-//! returns `None` if no tool is available or no image/text is present.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 /// Try to read image data from the system clipboard.
-///
 /// Returns `Some((bytes, mime_type))` on success, `None` if no image
 /// is present or no clipboard tool is available.
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
@@ -21,12 +16,6 @@ pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     Some((output, tool.mime_type().to_string()))
 }
 
-/// Try to read UTF-8 text from the system clipboard.
-///
-/// This is the fallback path for terminals that do not deliver bracketed
-/// paste (`Event::Paste`) — notably the legacy Windows console — where a
-/// Ctrl+V press is the only paste signal the TUI receives. Returns `None`
-/// when no text tool is available or the clipboard holds no text.
 pub(crate) fn read_clipboard_text() -> Option<String> {
     let tool = which_text_tool()?;
     let output = run_text_tool(&tool)?;

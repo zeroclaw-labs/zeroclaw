@@ -1,10 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// How much autonomy the agent has.
-///
-/// Variants are ordered from least to most autonomous so that
-/// [`Ord`] / [`PartialOrd`] compare a child's level against a
-/// parent's during SubAgent escalation checks (`child <= parent`).
+/// The agent's autonomy level, ordered from least to most autonomous.
 #[derive(
     Debug,
     Clone,
@@ -46,15 +42,7 @@ impl crate::config::HasPropKind for DelegationMode {
     const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
 }
 
-/// Whether a risk profile may delegate work to other agents.
-///
-/// `Forbidden` (the default) means a profile cannot delegate at all; `Allow`
-/// permits delegation. The set of reachable targets is *not* an explicit
-/// allow-list — delegation is gated on the caller and target sharing a risk
-/// profile, so the shared profile determines who is reachable.
-///
-/// Wire format: `{ mode = "forbidden" }` or `{ mode = "allow" }`. The struct
-/// shape lets the prop layer expose `mode` as an editable enum leaf.
+/// Risk-profile delegation policy for work sent to agents that share it.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::Configurable,
 )]
@@ -93,20 +81,7 @@ fn default_approval_timeout_secs() -> u64 {
     120
 }
 
-/// Route a risk profile's tool approvals to a DISTINCT approver channel instead of the
-/// channel that triggered the run — closing the cross-channel-HITL gap (an agent's gated
-/// actions can be approved by a separate ops channel / a different principal).
-///
-/// `Option<ApprovalRoute>` on a risk profile: ABSENT ⇒ today's behavior (the originating
-/// channel approves). Present ⇒ the gate asks `approver_channel` (a channel registry key,
-/// platform-qualified `<channel>.<alias>` such as `matrix.ops`, NOT the originator),
-/// bounded by `timeout_secs`, fail-closed by default.
-///
-/// Consulted on both the interactive channel-driven path and the non-interactive turn path
-/// (gateway chat/webhook dispatch and agent-to-agent peer messages, which run without an
-/// originating channel). The non-interactive path resolves `approver_channel` from the live
-/// daemon channel registry; with no live registry/approver it keeps the non-interactive
-/// default (fail-closed deny under the default `on_no_approver`).
+/// Routes tool approvals to a distinct approver channel with fail-closed defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ApprovalRoute {

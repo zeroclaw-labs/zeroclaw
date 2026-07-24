@@ -98,6 +98,14 @@ pub trait McpTransportConn: Send + Sync {
         Ok(())
     }
 
+    /// Check whether the underlying transport is still alive without sending a
+    /// real request.  The HTTP and SSE transports always return `Ok(true)` —
+    /// connection drops surface through `send_and_recv` errors.  The stdio
+    /// transport verifies the child process is still running via `try_wait()`.
+    fn health_check(&mut self) -> bool {
+        true
+    }
+
     /// Close the connection.
     async fn close(&mut self) -> Result<()>;
 }
@@ -230,6 +238,14 @@ impl McpTransportConn for StdioTransport {
         let _ = self.stdin.shutdown().await;
         Ok(())
     }
+
+    fn health_check(&mut self) -> bool {
+        // Verify the child process is still running via try_wait().
+        // Returns true only when the process is alive (has not exited).
+        self._child
+            .try_wait()
+            .map_or(true, |status| status.is_none())
+    }
 }
 
 // ── HTTP Transport ───────────────────────────────────────────────────────
@@ -336,11 +352,6 @@ impl McpTransportConn for HttpTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // A 404/410 only means "stale session" when this request carried an
-            // `Mcp-Session-Id` the server no longer recognizes (MCP spec 2025-06-18,
-            // Session Management). Without a session id, a 404 is just a missing
-            // endpoint (typo'd `url`, wrong path, proxy misroute) — surface it as a
-            // plain error so `call_tool` doesn't burn a reconnect on it.
             if self.session_id.is_some()
                 && (status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE)
             {

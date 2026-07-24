@@ -14,6 +14,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
 | Risk is high or unclear | Treat as `risk:high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
+| Diff adds a parallel interpretive surface | Verify it is derived from, or explicitly points to, the canonical source | [Drift-surface review](#drift-surface-review) |
 | Automation output is wrong or noisy | Apply the override protocol | [Automation override](#automation-override) |
 | Need to hand off to another maintainer | Use the handoff template | [Handoff](#handoff) |
 
@@ -21,7 +22,7 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 
 | Risk label | Typical paths | Minimum depth | Required evidence |
 |---|---|---|---|
-| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent local validation, no behavior ambiguity |
+| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
 | `risk:medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
 | `risk:high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
 
@@ -48,13 +49,60 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 ### Fast-lane checklist (every PR)
 
 - Scope boundary is explicit and believable.
-- Validation commands are present and the results are coherent.
+- Behavior changes are checked against the controlling contract: architecture docs, source-of-truth modules, trait boundaries, existing tests, public API shape, source comments, or explicit maintainer decisions.
+- PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
+- Validation evidence names the checks being relied on and why they cover the changed behavior.
+- Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
+- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.
 - Compatibility and migration impact is clear.
+- MSRV, pinned toolchain, or other version-floor changes are called out as compatibility-impacting: the PR explains who must upgrade, CI and installer baselines agree, and release notes name the new floor when the change can affect source-build users.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
-- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Extension examples](../developing/extension-examples.md)).
+- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Architecture overview](../architecture/overview.md#core-traits)).
+
+### Drift-surface review
+
+Treat new duplicate interpretive surfaces as review risk. A PR should not add
+comments, examples, generated snapshots, mapping tables, configuration mirrors,
+or parallel registries that restate behavior already owned by code, schemas,
+tests, WIT, config, or runtime dispatch unless the new surface is mechanically
+derived from that owner or clearly points back to it.
+
+Block or request changes when the new surface can drift and future readers,
+reviewers, or automation might treat it as more authoritative than the source.
+Common examples include comments that describe behavior not enforced by code,
+docs that duplicate an enum or schema list by hand, tests that snapshot an
+implementation detail rather than user-observable behavior, and registries that
+copy a key space already owned by another module.
+
+Prefer one of these resolutions:
+
+- Remove the duplicate surface and make the canonical owner easier to read.
+- Generate the secondary surface from the canonical owner.
+- Replace the restatement with a source pointer plus the reason that the
+  pointer belongs there.
+
+`why` comments are still welcome when they capture non-obvious invariants,
+hazards, or tradeoffs that the type system and tests cannot express. They
+should explain intent, not restate the nearby control flow or become a second
+contract.
+
+#### Typed dispatch for shared key spaces
+
+For shared key spaces such as wire method names, compiled channel type keys,
+provider slots, or frontend/backend registry keys, apply this rule by resolving
+raw strings at the API or config boundary. Downstream code should dispatch
+through an enum, macro-generated table, trait/factory registry, or another
+canonical owner. Do not add parallel string `match` arms, hand-typed dispatch
+tables, or duplicate lists that must be kept in sync by reviewer memory.
+
+This does not ban string constants at API boundaries. It prevents a second
+dispatch surface where adding a new variant can compile while silently skipping
+one consumer. Good examples are the RPC `Method` registry for wire method names
+and `CHANNEL_COMPILE_SPECS` for channel compile keys, where one canonical owner
+drives downstream coverage.
 
 ### Deep-review checklist (high-risk only)
 
@@ -63,6 +111,9 @@ For `risk:high` PRs, verify a concrete example in each category. One concrete in
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
 - **Contract stability**: CLI, config, or API compatibility preserved or migration documented.
+- **Diff shape**: large or new-integration PRs are coherent, merge-justified now, not easily split, and not mostly duplicated machinery.
+- **Generated artifacts**: generated files that affect policy, schema, routes, migrations, lockfiles, release artifacts, capabilities, packages, runtime behavior, or reviewer evidence are reviewed like source.
+- **Toolchain compatibility**: MSRV or pinned-toolchain changes are intentional, aligned across CI/Docker/install surfaces, and documented for downstream/source-build users.
 - **Observability**: failures diagnosable without leaking secrets.
 - **Rollback safety**: revert path and blast radius clear.
 
@@ -92,6 +143,7 @@ Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk
 | `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
 | `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and routing evidence using the contributor-visible sources in the [Project board contract](./pr-workflow.md#issue-routing-evidence). Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active. |
+| `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Use only when the live label exists; do not substitute `roadmap` or `type:roadmap`. This is a finder/routing marker, not stale protection by itself. |
 | `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
 | `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
 
@@ -127,11 +179,13 @@ When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
 2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
-3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the RFC stale policy.
+3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the canonical [issue stale policy](./labels.md#issue-stale-policy).
+
+When a maintainer submits a request-changes review and the next step is on the PR author, apply `needs-author-action` in the same review/label packet. Do not add it when the requested change is maintainer-fixable and a maintainer intends to push the cleanup, when another maintainer or owner is taking over the branch, or when the block is waiting on a maintainer decision rather than author work.
 
 | State | When to use | Required public note | Follow-up |
 |---|---|---|---|
-| `needs-author-action` | The next PR step is on the author: rebase, conflict fix, scope split, review answer, requested code change, or refreshed validation. | A review or comment names the concrete action. | Continue normal review when the author responds. This is not a closure warning by itself. |
+| `needs-author-action` | The next PR step is on the author: rebase, conflict fix, scope split, review answer, requested code change, or refreshed validation. | A review or comment names the concrete action. Request-changes reviews should apply this label when they leave the next action with the author. | Remove the label when the author pushes a substantive update or provides requested information, then continue normal review. This is not a closure warning by itself. |
 | `stale-candidate` | A prior author-action request has sat unanswered and the PR now blocks useful review, or the branch is clearly stale, dirty, or obsolete against current `master`. Do not stale-escalate work that is parked under a visible maintainer plan, explicit dependency, active owner, or recorded revisit date. | A comment names the requested action and a follow-up date, normally 7-10 days out unless a maintainer chooses a longer window. It should distinguish a stale branch from a still-valid bug or feature request. | At the follow-up date, re-check live state. If the author responded or the branch became reviewable, remove or keep off `stale-candidate`. If there is still no response and no maintainer takeover or replacement path, close with a backlog-hygiene rationale and a clear reopening or replacement path. |
 
 If the underlying bug or feature is still valid, preserve it in an issue, tracker row, replacement PR, or takeover plan instead of implying that the idea was rejected. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.

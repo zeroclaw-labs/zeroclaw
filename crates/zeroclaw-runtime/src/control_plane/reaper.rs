@@ -47,14 +47,6 @@ pub async fn recovery_pass(store: &dyn TaskRegistry, boot_id: &str) -> anyhow::R
     Ok(reclaimed)
 }
 
-/// The periodic supervision loop. Runs until `cancel` is triggered. Each tick:
-///   * prior-boot `Running` records → `Lost` (orphan recovery, authority-guarded);
-///   * same-boot `Running` records whose heartbeat is older than `max_runtime_secs`
-///     → `TimedOut` (the daemon's own hung task — we own it, so we may time it out);
-///   * fresh same-boot records → skipped.
-///
-/// Errors are logged, never propagated: a reaper panic must not take down the daemon
-/// (mirrors the ACP idle-reaper's detached-task discipline).
 pub async fn reaper_loop(
     store: Arc<dyn TaskRegistry>,
     boot_id: String,
@@ -93,11 +85,6 @@ pub async fn sweep(
             // Prior-boot orphan — reclaim (authority-guarded inside reconcile_lost).
             let _ = store.reconcile_lost(&rec.id, boot_id).await?;
         } else {
-            // Our own boot: the owning daemon (this process) is alive, so the only
-            // legitimate reason to terminate is a task that USES heartbeats and has gone
-            // silent past the grace window. A task with NO heartbeat is NOT timed out on
-            // `started_at` — a legitimately long-running task must not be killed merely
-            // for running a while (review finding #6). Unparseable heartbeat ⇒ skip (#9).
             if let Some(beat) = rec.heartbeat_at.as_deref()
                 && age_secs(beat, now).is_some_and(|age| age > max_runtime_secs)
             {

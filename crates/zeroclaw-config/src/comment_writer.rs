@@ -2,20 +2,9 @@
 //! handlers and the CLI `zeroclaw config set --comment` / `zeroclaw config patch`
 //! flow. Walks a `toml_edit::DocumentMut` to a leaf key by dotted path and
 //! decorates its leading whitespace with `# {comment}\n`. Empty comment string
-//! strips comment lines from the existing prefix.
-//!
-//! Single source of truth — neither the gateway nor the CLI should re-implement
-//! this logic.
 
 use std::path::Path;
 
-/// Apply a batch of `(dotted_path, comment)` annotations to the on-disk TOML
-/// file at `config_path`. Comments are written to the leaf key's leading decor
-/// (the line above `key = value`), preserving blank lines and stripping any
-/// prior `#`-prefixed lines.
-///
-/// Best-effort: silently skips paths that don't resolve to a leaf key. Fails
-/// only on I/O errors.
 pub async fn apply_comments(
     config_path: &Path,
     annotations: &[(String, String)],

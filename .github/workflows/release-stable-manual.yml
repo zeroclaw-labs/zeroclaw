@@ -88,7 +88,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -202,7 +202,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # 90 min: the x86_64-apple-darwin leg needs ~45-50 min on GitHub's slower
+    # Intel macOS runners (v0.8.3 hit the old 40-min ceiling twice, killing the
+    # cache save each time and compounding the slowdown). Fast legs are
+    # unaffected; this is a ceiling, not an allocation.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -237,7 +241,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: ubuntu-22.04
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
@@ -245,7 +248,6 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
-            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -269,7 +271,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: runner.os != 'Windows'
@@ -311,16 +313,11 @@ jobs:
           fi
           # Resolve the feature set from the canonical registry
           # (`cargo generate features`), the single source of truth that
-          # install.sh and packaging surfaces also consume. `dist` is the
-          # full-channel, no-heavyweight distribution set; it is self-contained
-          # (carries the default leaves), so every target builds with
-          # --no-default-features against the explicit list, no implicit drift.
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist)"
-          # skip_prometheus targets (ARMv6/ARMv7) drop observability-prometheus,
-          # which pulls a backtrace path that segfaults on those devices.
-          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            FEATURES="$(printf '%s' "$FEATURES" | tr ',' '\n' | grep -vx 'observability-prometheus' | paste -sd,)"
-          fi
+          # install.sh and packaging surfaces also consume. `dist` is the lean
+          # standard distribution set and carries the default leaves, so every
+          # target builds with --no-default-features against the explicit list,
+          # with no implicit feature drift.
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           # MUSL targets build via cross-rs (cross-compiled in a container);
           # all other targets use the host cargo toolchain directly.
@@ -340,7 +337,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB cap for standard release builds
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -377,9 +374,321 @@ jobs:
           path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
+  build-desktop:
+    name: Build Desktop App (macOS Universal)
+    needs: [validate, web]
+    runs-on: macos-14
+    # Two kernel release builds (arm64 + x86_64) feed the universal sidecar,
+    # then the universal app build on top.
+    timeout-minutes: 180
+    env:
+      MACOS_DMG_PATH: desktop-assets/ZeroClaw.dmg
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: macos-tauri
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Sync Tauri version with Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          cd apps/tauri
+          if command -v jq >/dev/null 2>&1; then
+            jq --arg v "$VERSION" '.version = $v' tauri.conf.json > tmp.json && mv tmp.json tauri.conf.json
+          else
+            sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" tauri.conf.json
+          fi
+          echo "Tauri version set to: $VERSION"
+
+      - name: Stage bundled kernel sidecar (universal)
+        run: scripts/desktop/prepare-kernel.sh --target universal-apple-darwin --features embedded-web
+
+      - name: Smoke test embedded dashboard from an empty directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel="$GITHUB_WORKSPACE/apps/tauri/binaries/zeroclaw-universal-apple-darwin"
+          smoke_root="$RUNNER_TEMP/zeroclaw-desktop-smoke"
+          smoke_cwd="$smoke_root/cwd"
+          smoke_home="$smoke_root/home"
+          xdg_data_home="$smoke_root/xdg-data"
+          config_dir="$smoke_root/config"
+          daemon_log="$smoke_root/daemon.log"
+          host="127.0.0.1"
+          port="42618"
+          origin="http://$host:$port"
+          rm -rf "$smoke_root"
+          mkdir -p "$smoke_cwd" "$smoke_home" "$xdg_data_home" "$config_dir"
+
+          daemon_pid=""
+          cleanup() {
+            exit_code=$?
+            if [[ -n "$daemon_pid" ]]; then
+              kill "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+            fi
+            if [[ "$exit_code" -ne 0 ]]; then
+              echo "::group::Embedded dashboard daemon log"
+              cat "$daemon_log" || true
+              echo "::endgroup::"
+            fi
+            exit "$exit_code"
+          }
+          trap cleanup EXIT
+
+          cd "$smoke_cwd"
+          HOME="$smoke_home" XDG_DATA_HOME="$xdg_data_home" \
+            "$kernel" --config-dir "$config_dir" daemon \
+            --host "$host" --port "$port" >"$daemon_log" 2>&1 &
+          daemon_pid=$!
+
+          dashboard=""
+          ready=false
+          for _ in {1..60}; do
+            if dashboard="$(curl --fail --silent --connect-timeout 1 --max-time 2 "$origin/")"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              echo "::error::Embedded dashboard daemon exited before serving the SPA."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [[ "$ready" != true ]]; then
+            echo "::error::Embedded dashboard did not become ready within 60 seconds."
+            exit 1
+          fi
+          if ! grep -Fq 'id="root"' <<<"$dashboard"; then
+            echo "::error::Gateway root did not return the embedded dashboard."
+            exit 1
+          fi
+
+      # Code-signing + notarization are optional: when the APPLE_* secrets are
+      # configured the Tauri bundler picks them up from the environment and
+      # signs/notarizes the app; when absent the build stays unsigned (ad-hoc),
+      # exactly as before. Secrets never gate the build itself.
+      - name: Enable macOS signing (when secrets are configured)
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            } >> "$GITHUB_ENV"
+            echo "macOS code signing enabled."
+          else
+            echo "APPLE_CERTIFICATE secret not set — building unsigned."
+          fi
+          if [ -n "$APPLE_ID" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+            echo "macOS notarization enabled."
+          fi
+
+      - name: Build Tauri app (universal binary, bundled kernel)
+        working-directory: apps/tauri
+        run: cargo tauri build --target universal-apple-darwin --config tauri.bundled.conf.json
+
+      - name: Prepare desktop release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop-assets
+          dmg_dir="target/universal-apple-darwin/release/bundle/dmg"
+          shopt -s nullglob
+          dmg_candidates=("$dmg_dir"/*.dmg)
+          shopt -u nullglob
+          if [ "${#dmg_candidates[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one final macOS DMG in $dmg_dir; found ${#dmg_candidates[@]}."
+            exit 1
+          fi
+          mv "${dmg_candidates[0]}" "$MACOS_DMG_PATH"
+          find target -name '*.app.tar.gz' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz \; 2>/dev/null || true
+          find target -name '*.app.tar.gz.sig' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz.sig \; 2>/dev/null || true
+          echo "--- Desktop assets ---"
+          ls -lh desktop-assets/
+
+      # Tauri notarizes + staples the .app, then wraps it in a signed .dmg — but
+      # the .dmg container carries no notarization ticket of its own, so it only
+      # validates online (Gatekeeper must reach Apple on first open). Notarize
+      # the .dmg too and staple the ticket into it so the downloaded installer
+      # validates fully offline. Guarded on APPLE_ID so unsigned builds skip
+      # cleanly — secrets never gate the build.
+      - name: Notarize and staple the .dmg (offline-valid installer)
+        if: ${{ env.APPLE_ID != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Notarizing .dmg for offline validation: $MACOS_DMG_PATH"
+          xcrun notarytool submit "$MACOS_DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$MACOS_DMG_PATH"
+          xcrun stapler validate "$MACOS_DMG_PATH"
+          echo "Stapled — the .dmg now validates offline."
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-macos
+          path: |
+            ${{ env.MACOS_DMG_PATH }}
+            desktop-assets/*.app.tar.gz
+            desktop-assets/*.app.tar.gz.sig
+          retention-days: 14
+
+  # New desktop platforms. continue-on-error keeps them non-blocking for the
+  # release while they bed in — the macOS dmg remains the only required
+  # desktop asset. Promote by removing continue-on-error and adding their
+  # assets to the required list in `publish`.
+  build-desktop-linux:
+    name: Build Desktop App (Linux x86_64)
+    needs: [validate]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Linux desktop toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.96.1
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: linux-tauri
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Sync Tauri version with Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          cd apps/tauri
+          jq --arg v "$VERSION" '.version = $v' tauri.conf.json > tmp.json && mv tmp.json tauri.conf.json
+          echo "Tauri version set to: $VERSION"
+
+      - name: Stage bundled kernel sidecar
+        run: scripts/desktop/prepare-kernel.sh --target x86_64-unknown-linux-gnu
+
+      - name: Build Tauri app (bundled kernel)
+        working-directory: apps/tauri
+        run: cargo tauri build --config tauri.bundled.conf.json
+
+      - name: Prepare desktop release assets
+        run: |
+          mkdir -p desktop-assets
+          find target -name '*.deb' -exec cp {} desktop-assets/ZeroClaw-linux-amd64.deb \; 2>/dev/null || true
+          find target -name '*.AppImage' -exec cp {} desktop-assets/ZeroClaw-linux-x86_64.AppImage \; 2>/dev/null || true
+          echo "--- Desktop assets ---"
+          ls -lh desktop-assets/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-linux
+          path: desktop-assets/*
+          retention-days: 14
+
+  build-desktop-windows:
+    name: Build Desktop App (Windows x86_64)
+    needs: [validate]
+    runs-on: windows-latest
+    timeout-minutes: 150
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.96.1
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: windows-tauri
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Sync Tauri version with Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          cd apps/tauri
+          jq --arg v "$VERSION" '.version = $v' tauri.conf.json > tmp.json && mv tmp.json tauri.conf.json
+          echo "Tauri version set to: $VERSION"
+
+      - name: Stage bundled kernel sidecar
+        shell: bash
+        run: scripts/desktop/prepare-kernel.sh --target x86_64-pc-windows-msvc
+
+      - name: Build Tauri app (bundled kernel)
+        working-directory: apps/tauri
+        run: cargo tauri build --config tauri.bundled.conf.json
+
+      - name: Prepare desktop release assets
+        shell: bash
+        run: |
+          mkdir -p desktop-assets
+          find target -name '*.msi' -exec cp {} desktop-assets/ZeroClaw-windows-x64.msi \; 2>/dev/null || true
+          find target -name '*-setup.exe' -exec cp {} desktop-assets/ZeroClaw-windows-x64-setup.exe \; 2>/dev/null || true
+          echo "--- Desktop assets ---"
+          ls -lh desktop-assets/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-windows
+          path: desktop-assets/*
+          retention-days: 14
+
   publish:
     name: Publish Stable Release
-    needs: [validate, release-notes, build]
+    # The Linux/Windows desktop jobs are continue-on-error: listing them in
+    # needs only sequences the download; their failure cannot block publish.
+    needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -398,6 +707,25 @@ jobs:
           pattern: zeroclaw-*
           path: artifacts
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-macos
+          path: artifacts/desktop-macos
+
+      # Optional platforms — the artifact may not exist when the
+      # continue-on-error bundle job failed; never block publish on it.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: desktop-linux
+          path: artifacts/desktop-linux
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: desktop-windows
+          path: artifacts/desktop-windows
+
       - name: Verify required release assets
         shell: bash
         run: |
@@ -412,6 +740,7 @@ jobs:
             "zeroclaw-x86_64-apple-darwin.tar.gz"
             "zeroclaw-aarch64-linux-android.tar.gz"
             "zeroclaw-x86_64-pc-windows-msvc.zip"
+            "ZeroClaw.dmg"
           )
           missing=0
           for asset in "${required_assets[@]}"; do
@@ -429,13 +758,13 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
           cat SHA256SUMS
 
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
           cp install.sh release-assets/
           echo "--- Assets ---"
           ls -lh release-assets/
@@ -465,7 +794,7 @@ jobs:
 
           artifact_count=0
           bundle_count=0
-          for artifact in *.tar.gz *.zip *.dmg SHA256SUMS install.sh; do
+          for artifact in *.tar.gz *.zip *.dmg *.deb *.AppImage *.msi *-setup.exe SHA256SUMS install.sh; do
             [ -f "$artifact" ] || continue
             artifact_count=$((artifact_count + 1))
             digest=$(sha256sum "$artifact" | awk '{print $1}')
@@ -488,7 +817,7 @@ jobs:
               --source-digest "$GITHUB_SHA" \
               --bundle "$tmp_dir/$target" \
               --custom-trusted-root "$tmp_dir/trusted_root.jsonl"
-            printf '`%s` | `%s` | `%s`\n' "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
+            printf "\`%s\` | \`%s\` | \`%s\`\n" "$artifact" "$digest" "$target" >> "$tmp_dir/ATTESTATION-BUNDLES.md"
             bundle_count=$((bundle_count + 1))
           done
 
@@ -497,7 +826,7 @@ jobs:
           mv "$tmp_dir"/* .
 
           echo "--- Attestation bundles ---"
-          ls -lh *.attestation.jsonl trusted_root.jsonl ATTESTATION-BUNDLES.md
+          ls -lh ./*.attestation.jsonl ./trusted_root.jsonl ./ATTESTATION-BUNDLES.md
 
       - name: Write release notes
         env:
@@ -520,27 +849,27 @@ jobs:
           Release artifacts have GitHub artifact provenance attestations.
 
           **Online**
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
             --source-digest ${SOURCE_DIGEST}
-          ```
+          \`\`\`
           VERIFY_EOF
 
             if [[ "$BUNDLE_OUTCOME" == "success" ]]; then
               cat >> release-notes.md <<VERIFY_EOF
 
           **Offline**
-          Download `<artifact>`, `<artifact>.attestation.jsonl`, and `trusted_root.jsonl` from the release assets, then run:
-          ```bash
-          gh attestation verify <artifact> \
-            --repo zeroclaw-labs/zeroclaw \
-            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
-            --source-digest ${SOURCE_DIGEST} \
-            --bundle <artifact>.attestation.jsonl \
+          Download \`<artifact>\`, \`<artifact>.attestation.jsonl\`, and \`trusted_root.jsonl\` from the release assets, then run:
+          \`\`\`bash
+          gh attestation verify <artifact> \\
+            --repo zeroclaw-labs/zeroclaw \\
+            --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \\
+            --source-digest ${SOURCE_DIGEST} \\
+            --bundle <artifact>.attestation.jsonl \\
             --custom-trusted-root trusted_root.jsonl
-          ```
+          \`\`\`
           VERIFY_EOF
             else
               cat >> release-notes.md <<VERIFY_EOF
@@ -606,6 +935,58 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
             -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
+
+  deploy-docs:
+    name: Deploy Versioned Docs
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # workflow_dispatch of docs-deploy.yml
+      contents: read
+    steps:
+      # The release tag (needs.validate.outputs.tag) is created by the publish
+      # job via `gh release create` using GITHUB_TOKEN. GitHub does NOT fire
+      # another workflow run from a GITHUB_TOKEN-created tag push
+      # (https://docs.github.com/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow),
+      # so docs-deploy.yml's `tags: [v*]` trigger never sees this tag. Dispatch
+      # it explicitly instead: workflow_dispatch IS the documented exception
+      # that runs even when invoked with GITHUB_TOKEN. docs-deploy checks out the
+      # tag input internally and builds /<tag>/ on gh-pages.
+      #
+      # Ordering: the version-bump PR merges BEFORE Release Stable runs, so its
+      # `master` docs deploy normally runs first, while /<tag>/ does not yet
+      # exist; that master deploy therefore defers the stable-pointer flip by
+      # design (see docs-deploy.yml). This job then creates /<tag>/, and a LATER
+      # `master` deploy publishes the flip once /<tag>/ is live. This step only
+      # DISPATCHES the tag build; a green job here means the dispatch was
+      # accepted, not that the downstream docs run finished. To advance the
+      # stable pointer after /<tag>/ is live, re-run docs-deploy.yml with
+      # tag=master (see the release runbook, Step 7).
+      - name: Dispatch docs-deploy for the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching docs-deploy.yml for ${TAG} (ref master)..."
+          gh workflow run docs-deploy.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f tag="$TAG"
+
+  docker-matrix:
+    name: Publish Docker Variant Matrix
+    needs: [validate, publish, docker]
+    if: ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.publish.result == 'success' && needs.docker.result == 'success' }}
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      release_ref: ${{ needs.validate.outputs.tag }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
 
   docker:
     name: Push Docker Image
@@ -693,7 +1074,7 @@ jobs:
   # ── Post-publish: signing, SBOM, and SLSA provenance ─────────────────
   hash-artifacts:
     name: Hash Release Artifacts
-    needs: [validate, build]
+    needs: [validate, build, build-desktop, build-desktop-linux, build-desktop-windows]
     runs-on: ubuntu-latest
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
@@ -703,13 +1084,31 @@ jobs:
           pattern: zeroclaw-*
           path: artifacts/bins
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-macos
+          path: artifacts/desktop
+
+      # Optional platforms — may be absent when their bundle job failed.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: desktop-linux
+          path: artifacts/desktop-linux
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: desktop-windows
+          path: artifacts/desktop-windows
+
       - name: Compute SHA256 hashes (base64, SLSA input format)
         id: hash
         run: |
           set -euo pipefail
           cd artifacts
-          # Collect all release archives; strip leading directory
-          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+          # Collect all release archives and desktop artifacts; strip leading directory
+          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' \) \
             -exec sha256sum {} + \
             | sed 's|  \./[^/]*/|  |' \
             | base64 -w0)
@@ -769,7 +1168,7 @@ jobs:
         # verify with: cosign verify-blob --bundle <file>.bundle <file>
         # The Rekor log URL is printed to stdout for each signature.
         run: |
-          for f in release-assets/*.tar.gz release-assets/*.zip release-assets/*.dmg; do
+          for f in release-assets/*.tar.gz release-assets/*.zip release-assets/*.dmg release-assets/*.deb release-assets/*.AppImage release-assets/*.msi release-assets/*-setup.exe; do
             [ -f "$f" ] || continue
             cosign sign-blob --yes --bundle "${f}.bundle" "$f"
             echo "Signed: $(basename "$f")"
@@ -823,16 +1222,6 @@ jobs:
     needs: [validate, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/pub-aur.yml
-    with:
-      release_tag: ${{ needs.validate.outputs.tag }}
-      dry_run: false
-    secrets: inherit
-
-  homebrew:
-    name: Update Homebrew Core
-    needs: [validate, publish]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    uses: ./.github/workflows/pub-homebrew-core.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       dry_run: false

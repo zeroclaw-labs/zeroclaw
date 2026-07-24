@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{ClassificationRule, Config, DelegateTargetConfig, ModelRouteConfig};
 use zeroclaw_providers::ProviderDispatch;
@@ -66,7 +66,7 @@ impl ModelRoutingConfigTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -74,7 +74,7 @@ impl ModelRoutingConfigTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -474,7 +474,7 @@ impl ModelRoutingConfigTool {
         let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?,
+            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?.into(),
             error: None,
         })
     }
@@ -519,7 +519,8 @@ impl ModelRoutingConfigTool {
                         "priority": 50
                     }
                 }
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -619,11 +620,6 @@ impl ModelRoutingConfigTool {
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback: restore the previous entry's baseline fields for
-                // this type.alias slot. Family-specific extras on the typed
-                // family config are NOT touched — they survive the modify+
-                // restore cycle because we only ever mutated baseline fields
-                // (model, temperature, api_key) above.
                 if let Some(prev_entry) = previous_provider_entry
                     && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
@@ -635,7 +631,7 @@ impl ModelRoutingConfigTool {
                     success: false,
                     output: format!(
                         "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
-                    ),
+                    ).into(),
                     error: None,
                 });
             }
@@ -649,7 +645,8 @@ impl ModelRoutingConfigTool {
             output: serde_json::to_string_pretty(&json!({
                 "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -821,7 +818,8 @@ impl ModelRoutingConfigTool {
                 "message": "Scenario route upserted",
                 "hint": hint,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -866,7 +864,8 @@ impl ModelRoutingConfigTool {
                 "routes_removed": routes_removed,
                 "classification_rules_removed": rules_removed,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -992,7 +991,8 @@ impl ModelRoutingConfigTool {
                 "message": "Delegate agent upserted",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -1013,7 +1013,8 @@ impl ModelRoutingConfigTool {
                 "message": "Aliased agent removed",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -1198,7 +1199,7 @@ impl Tool for ModelRoutingConfigTool {
             Ok(outcome) => Ok(outcome),
             Err(error) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             }),
         }

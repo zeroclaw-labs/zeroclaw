@@ -4,21 +4,10 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileUploadBundleConfig;
 
-/// Read at most `limit` bytes from a response body via streaming,
-/// then lossily convert to UTF-8. This avoids loading an unbounded
-/// response into memory.
-///
-/// Returns the captured (lossy-UTF-8) body together with a
-/// `was_truncated` flag that is `true` when reading stopped because the
-/// byte limit was reached while more body remained. Callers must rely on
-/// this flag rather than the captured length: a clean ASCII or otherwise
-/// valid-UTF-8 body that overruns the limit is clipped to exactly `limit`
-/// bytes, so its length alone is indistinguishable from a complete
-/// response that happens to be exactly `limit` bytes long.
 async fn read_response_bounded(response: reqwest::Response, limit: usize) -> (String, bool) {
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
@@ -234,7 +223,7 @@ impl Tool for FileUploadBundleTool {
         else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "file_upload_bundle is disabled: [file_upload_bundle].url is not configured"
                         .into(),
@@ -246,7 +235,7 @@ impl Tool for FileUploadBundleTool {
         if method != "POST" && method != "PUT" {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unsupported HTTP method '{method}'. Only POST and PUT are allowed."
                 )),
@@ -256,7 +245,7 @@ impl Tool for FileUploadBundleTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -264,7 +253,7 @@ impl Tool for FileUploadBundleTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -277,14 +266,14 @@ impl Tool for FileUploadBundleTool {
         if raw_paths.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("file_paths must not be empty".into()),
             });
         }
         if raw_paths.len() as u64 > self.config.max_files as u64 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Too many files: {} (limit: {})",
                     raw_paths.len(),
@@ -319,7 +308,7 @@ impl Tool for FileUploadBundleTool {
             if !self.security.is_path_allowed(p) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Path not allowed by security policy: {p}")),
                 });
             }
@@ -329,7 +318,7 @@ impl Tool for FileUploadBundleTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
@@ -345,7 +334,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to resolve file path {path}: {e}")),
                     });
                 }
@@ -354,7 +343,7 @@ impl Tool for FileUploadBundleTool {
             if !self.security.is_resolved_path_allowed(&resolved_path) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
                         self.security
                             .resolved_path_violation_message(&resolved_path),
@@ -367,7 +356,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to read file metadata for {path}: {e}")),
                     });
                 }
@@ -376,7 +365,7 @@ impl Tool for FileUploadBundleTool {
             if !metadata.is_file() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Not a regular file: {}", resolved_path.display())),
                 });
             }
@@ -386,7 +375,7 @@ impl Tool for FileUploadBundleTool {
             if metadata.len() > self.config.max_file_size_bytes {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "File too large: {} is {} bytes (per-file limit: {} bytes)",
                         resolved_path.display(),
@@ -404,7 +393,7 @@ impl Tool for FileUploadBundleTool {
             if !seen_names.insert(file_name.clone()) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Duplicate file name in bundle: {file_name} (filenames must be unique)"
                     )),
@@ -416,7 +405,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to read {}: {e}", resolved_path.display())),
                     });
                 }
@@ -428,7 +417,7 @@ impl Tool for FileUploadBundleTool {
             if actual_len > self.config.max_file_size_bytes {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "File too large: {} is {} bytes (per-file limit: {} bytes)",
                         resolved_path.display(),
@@ -442,7 +431,7 @@ impl Tool for FileUploadBundleTool {
             if total_bytes > self.config.max_total_size_bytes {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Bundle too large: cumulative {} bytes exceeds limit {} bytes",
                         total_bytes, self.config.max_total_size_bytes
@@ -463,7 +452,7 @@ impl Tool for FileUploadBundleTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "entry_file_name '{name}' does not match any file in file_paths"
                 )),
@@ -480,7 +469,7 @@ impl Tool for FileUploadBundleTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to build multipart part: {e}")),
                     });
                 }
@@ -515,21 +504,13 @@ impl Tool for FileUploadBundleTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Bundle upload request failed: {e}")),
                 });
             }
         };
 
         let status = response.status();
-        // Bounded streaming read — never buffers more than the limit.
-        // `read_response_bounded` returns lossy UTF-8 so the result is
-        // always a valid String, and `truncate_utf8` never splits a
-        // multi-byte char. We gate the truncation marker on the reader's
-        // `was_truncated` flag rather than the captured length, because a
-        // clean ASCII/valid-UTF-8 body that overruns the limit is clipped
-        // to exactly `body_limit` bytes and would otherwise be reported as
-        // complete.
         let body_limit = self.config.max_response_body_bytes;
         let (raw_body, was_truncated) = read_response_bounded(response, body_limit).await;
         let truncated = if was_truncated {
@@ -545,13 +526,14 @@ impl Tool for FileUploadBundleTool {
                 success: true,
                 output: format!(
                     "Uploaded bundle of {file_count} files ({status}). Response: {truncated}"
-                ),
+                )
+                .into(),
                 error: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
-                output: truncated,
+                output: truncated.into(),
                 error: Some(format!(
                     "Upload endpoint returned status {status} for bundle of {file_count} files"
                 )),
@@ -1053,16 +1035,6 @@ mod tests {
         // without allocating megabytes.
         let body_limit: usize = 64;
 
-        // Build a response body that exceeds the limit and places a
-        // multi-byte UTF-8 character ("é" = 2 bytes, 0xC3 0xA9) right
-        // at the cut point so read_response_bounded slices mid-character.
-        //
-        // Layout: 63 bytes of ASCII padding + "é" (2 bytes) + more ASCII.
-        // read_response_bounded reads the first 64 raw bytes, which cuts
-        // the "é" after its first byte. from_utf8_lossy replaces the
-        // dangling 0xC3 with U+FFFD (3 bytes), making the String 66
-        // bytes — exceeding the 64-byte limit and triggering the
-        // truncate_utf8 + "[truncated]" path.
         let padding = "A".repeat(63);
         let oversized_body = format!("{padding}é{}", "B".repeat(200));
         assert!(
@@ -1106,11 +1078,6 @@ mod tests {
             result.output
         );
 
-        // The output (minus the "Uploaded bundle…" prefix and the
-        // "... [truncated]" suffix) must be valid UTF-8 and must not
-        // exceed the body limit.  We don't assert the exact byte count
-        // because the prefix is implementation detail, but we verify the
-        // response portion is bounded.
         let response_part = result
             .output
             .split("Response: ")
@@ -1131,13 +1098,6 @@ mod tests {
 
     #[tokio::test]
     async fn execute_marks_over_limit_ascii_response_as_truncated() {
-        // Regression: a clean ASCII (valid-UTF-8) response that overruns
-        // the limit is clipped by read_response_bounded to exactly
-        // `body_limit` bytes. The earlier `raw_body.len() > body_limit`
-        // gate was then false, so the tool returned a clipped body with no
-        // "[truncated]" marker — hiding from the agent that the receiver
-        // body was cut. The reader's `was_truncated` flag must drive the
-        // marker instead.
         let body_limit: usize = 64;
 
         // Pure ASCII, no multi-byte char near the cut point, so

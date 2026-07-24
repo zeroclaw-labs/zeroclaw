@@ -14,14 +14,6 @@ use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispat
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
     pub(crate) response_text: String,
-    /// Accumulated reasoning/thinking content from streaming deltas.
-    ///
-    /// Captured separately from `response_text` so it can be threaded into
-    /// `ChatResponse.reasoning_content` and ultimately persisted on the
-    /// `AssistantToolCalls` history entry. Required for model_providers like
-    /// DeepSeek V4 that reject follow-up requests when the assistant's
-    /// prior `reasoning_content` is missing from replayed tool-call turns
-    ///.
     pub(crate) reasoning_content: String,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) forwarded_live_deltas: bool,
@@ -72,11 +64,6 @@ pub(crate) async fn consume_provider_streaming_response(
     // surfaces, so a non-streaming retry after a stream error overwrites
     // rather than duplicates.
     let mut visible_event_output = false;
-    // Exactly the text forwarded as `TurnEvent::Chunk` — what an event_tx
-    // consumer actually SAW. On interruption this (never the raw
-    // accumulated `response_text`, which includes guard-withheld and
-    // suppression-buffered text) is the partial that may be persisted as
-    // already-delivered output.
     let mut forwarded_text = String::new();
 
     macro_rules! forward_visible {
@@ -195,15 +182,6 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::TextDelta(chunk) => {
-                // Reasoning/thinking deltas arrive on the same `TextDelta`
-                // event as plain text but populate `chunk.reasoning` instead
-                // of `chunk.delta`. They must be captured into the outcome
-                // even when `chunk.delta` is empty — otherwise model_providers
-                // that require reasoning to round-trip on subsequent turns
-                // (DeepSeek V4 thinking mode; see #6059) reject the next
-                // request with a 400. Reasoning is never forwarded as a
-                // visible response delta — it is the model's internal
-                // monologue, kept for replay only.
                 if let Some(reasoning) = chunk.reasoning.as_deref()
                     && !reasoning.is_empty()
                 {

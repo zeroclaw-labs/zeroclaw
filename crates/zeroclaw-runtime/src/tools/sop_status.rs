@@ -123,13 +123,13 @@ impl Tool for SopStatusTool {
                     self.append_gate_status(&mut output, include_gate_status);
                     Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     })
                 }
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("No run found with ID '{run_id}'."),
+                    output: format!("No run found with ID '{run_id}'.").into(),
                     error: None,
                 }),
             };
@@ -198,7 +198,7 @@ impl Tool for SopStatusTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -270,6 +270,9 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
         }
     }
 
@@ -382,14 +385,18 @@ mod tests {
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "done".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         collector.record_run_complete(&run);
 
@@ -419,14 +426,18 @@ mod tests {
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Failed,
                 output: "fail".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         collector.record_run_complete(&run);
 

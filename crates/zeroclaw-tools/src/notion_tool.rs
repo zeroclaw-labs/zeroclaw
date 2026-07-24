@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 const NOTION_API_BASE: &str = "https://api.notion.com/v1";
@@ -227,7 +227,7 @@ impl Tool for NotionTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: action".into()),
                 });
             }
@@ -240,7 +240,7 @@ impl Tool for NotionTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Unknown action: {action}. Valid actions: query_database, read_page, create_page, update_page, search"
                     )),
@@ -251,7 +251,7 @@ impl Tool for NotionTool {
         if let Err(error) = self.security.enforce_tool_operation(operation, "notion") {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -263,7 +263,7 @@ impl Tool for NotionTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("query_database requires database_id parameter".into()),
                         });
                     }
@@ -277,7 +277,7 @@ impl Tool for NotionTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("read_page requires page_id parameter".into()),
                         });
                     }
@@ -290,7 +290,7 @@ impl Tool for NotionTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("create_page requires properties parameter".into()),
                         });
                     }
@@ -304,7 +304,7 @@ impl Tool for NotionTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("update_page requires page_id parameter".into()),
                         });
                     }
@@ -314,7 +314,7 @@ impl Tool for NotionTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("update_page requires properties parameter".into()),
                         });
                     }
@@ -331,12 +331,14 @@ impl Tool for NotionTool {
         match result {
             Ok(value) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                output: serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string())
+                    .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }

@@ -73,21 +73,8 @@ impl Clone for ActionTracker {
     }
 }
 
-/// Per-sender sliding-window rate limiter.
-///
-/// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
-/// its own independent [`ActionTracker`] bucket. When no sender is in scope
-/// (cron jobs, CLI), the `GLOBAL_KEY` bucket is used.
-///
-/// The bucket map is shared via `Arc` so a `SubAgent` policy that clones
-/// from its parent observes the same live counts. SubAgent budget
-/// inheritance relies on this: a child run consuming an action sees the
-/// shared bucket update, so the parent's `max_actions_per_hour` ceiling
-/// applies across both runs rather than each getting a fresh allocation.
-///
-/// Note: sender buckets accumulate for the daemon lifetime with no eviction.
-/// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
-/// consider periodic cleanup.
+/// Per-sender sliding-window rate limiter. The bucket map is Arc-shared
+/// so cloned policies (SubAgents) consume from the same budgets.
 #[derive(Debug)]
 pub struct PerSenderTracker {
     buckets: std::sync::Arc<parking_lot::Mutex<HashMap<String, ActionTracker>>>,
@@ -135,12 +122,6 @@ impl PerSenderTracker {
         self.is_exhausted(&key, max)
     }
 
-    /// Check if `key` is at or over `max` (without recording).
-    /// Does NOT insert a bucket for unseen keys.
-    /// A max of 0 is always exhausted (zero budget means no actions allowed).
-    /// Returns true when count has reached or exceeded max. Note: acquires write lock
-    /// because ActionTracker::count prunes stale entries internally. Also note: returns
-    /// true one count earlier than record_within would block.
     pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
         if max == 0 {
             return true;
@@ -154,11 +135,6 @@ impl PerSenderTracker {
 }
 
 impl Clone for PerSenderTracker {
-    /// Cloning a `PerSenderTracker` shares the bucket map by `Arc`.
-    /// SubAgent runs consume from the same buckets as their parent
-    /// so per-hour and per-day budgets are not bypassed by spawning
-    /// children. Tests that need an isolated tracker construct a
-    /// fresh one via [`Self::new`] rather than cloning.
     fn clone(&self) -> Self {
         Self {
             buckets: std::sync::Arc::clone(&self.buckets),
@@ -172,27 +148,6 @@ impl Default for PerSenderTracker {
     }
 }
 
-/// Security policy enforced on all tool executions.
-///
-/// Three cross-agent allowlist tiers drive the multi-agent design:
-///
-/// - `allowed_roots`: read AND write. Populated from
-///   `RiskProfileConfig.allowed_roots` and from
-///   `AccessMode::ReadWrite` grants in `agent.workspace.access`.
-/// - `allowed_roots_read_only`: read but NOT write. Populated from
-///   `AccessMode::Read` grants.
-/// - `allowed_roots_write_only`: write but NOT read. Populated from
-///   `AccessMode::Write` grants. The bot can append/overwrite under
-///   the path but `file_read` / `pdf_read` / `glob_search` /
-///   `content_search` reject it.
-///
-/// Read-side tools call [`SecurityPolicy::is_resolved_path_readable`],
-/// which sees `allowed_roots` ∪ `allowed_roots_read_only` plus the
-/// universal POSIX device files. Write-side tools call
-/// [`SecurityPolicy::is_resolved_path_allowed`], which sees
-/// `allowed_roots` ∪ `allowed_roots_write_only`. The two tiers stay
-/// disjoint by construction so `AccessMode::Write` and
-/// `AccessMode::Read` grant exactly what they say.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
@@ -203,13 +158,8 @@ pub struct SecurityPolicy {
     /// Whether and to which agents this profile may delegate.
     pub delegation_policy: crate::autonomy::DelegationPolicy,
     pub workspace_dir: PathBuf,
-    /// Absolute path to the active `config.toml`. Used to protect the
-    /// runtime config from agent self-modification regardless of how
-    /// deeply the per-agent workspace is nested under the install root
-    /// (the config lives at the install root, not at
-    /// `workspace_dir.parent()`). `None` falls back to the legacy
-    /// `workspace_dir.parent()` location.
     pub config_path: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
@@ -224,11 +174,8 @@ pub struct SecurityPolicy {
     /// is configured.
     pub allowed_roots_read_only: Vec<PathBuf>,
     /// Directories the agent can write but NOT read under. Populated
-    /// from cross-agent `AccessMode::Write` grants at policy
-    /// construction time. Empty when no write-only cross-agent access
-    /// is configured. Read-side tools (`file_read`, `pdf_read`,
-    /// `glob_search`, `content_search`) ignore this list; write-side
-    /// tools (`file_write`, `file_edit`, `git_operations`) honor it.
+    /// from cross-agent `AccessMode::Write` grants; read-side tools
+    /// ignore this list.
     pub allowed_roots_write_only: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
@@ -265,7 +212,6 @@ pub struct SecurityPolicy {
 
 impl SecurityPolicy {
     /// True when `name` is admissible under the current policy.
-    ///
     /// `allowed_tools = None` is unrestricted; `Some(list)` is the
     /// allowlist. `excluded_tools` always subtracts.
     pub fn is_tool_allowed(&self, name: &str) -> bool {
@@ -273,11 +219,13 @@ impl SecurityPolicy {
             .allowed_tools
             .as_ref()
             .is_none_or(|list| list.iter().any(|t| t == name));
-        let excluded = self
-            .excluded_tools
+        allowed && !self.is_tool_excluded(name)
+    }
+
+    pub fn is_tool_excluded(&self, name: &str) -> bool {
+        self.excluded_tools
             .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name));
-        allowed && !excluded
+            .is_some_and(|list| list.iter().any(|t| t == name))
     }
 }
 
@@ -316,7 +264,6 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
 }
 
 /// Default allowed commands for Windows platforms.
-///
 /// Includes both native Windows commands and their Unix equivalents
 /// (available via Git for Windows, WSL, etc.).
 #[cfg(target_os = "windows")]
@@ -396,11 +343,6 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
     ]
 }
 
-/// Shared helper for the two `is_under_*_allowed_root` checks: returns
-/// `true` when `expanded` falls under any entry of `roots`. Each entry
-/// is canonicalized when possible so symlinked roots match the on-disk
-/// shape, and the literal path is also tried as a fallback for cases
-/// where canonicalization fails (missing parent dir, permission, etc.).
 fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
     roots.iter().any(|root| {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
@@ -408,14 +350,6 @@ fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
     })
 }
 
-/// Subset check on two filesystem paths: returns `true` when `child`
-/// is the same as `parent` or a descendant of it. Used by the SubAgent
-/// escalation validator so a child can legitimately narrow `/srv` to
-/// `/srv/app` without the validator rejecting the narrowing as if it
-/// were a foreign path. Tries the canonical form first to handle
-/// symlinks consistently, then falls back to the literal path so
-/// not-yet-existing per-agent dirs (which do not canonicalize) still
-/// match.
 fn path_contains(parent: &Path, child: &Path) -> bool {
     let canonical_parent = parent
         .canonicalize()
@@ -548,6 +482,7 @@ impl Default for SecurityPolicy {
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
             config_path: None,
+            data_dir: None,
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
@@ -601,11 +536,6 @@ fn expand_user_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Returns `true` if `path` is exactly the OS null device.
-///
-/// `/dev/null` is unconditionally permitted because redirecting output
-/// there is a common, harmless shell pattern. The rest of `/dev` remains
-/// blocked by the default forbidden-path list.
 fn is_null_device(path: &Path) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
@@ -695,12 +625,6 @@ fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Opti
         .map(|suffix| PathBuf::from(suffix.replace('/', std::path::MAIN_SEPARATOR_STR)))
 }
 
-// ── Shell Command Parsing Utilities ───────────────────────────────────────
-// These helpers implement a minimal quote-aware shell lexer. They exist
-// because security validation must reason about the *structure* of a
-// command (separators, operators, quoting) rather than treating it as a
-// flat string — otherwise an attacker could hide dangerous sub-commands
-// inside quoted arguments or chained operators.
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
 fn skip_env_assignments(s: &str) -> &str {
@@ -731,21 +655,6 @@ enum QuoteState {
     Double,
 }
 
-/// Remove heredoc body lines from a single command segment, keeping the
-/// opener line and anything after the terminator. Body content is stdin
-/// data, never an argv path argument, so the path guard must not inspect it.
-/// Split a shell command into sub-commands by unquoted separators.
-///
-/// Separators:
-/// - `;` and newline
-/// - `|`
-/// - `&&`, `||`
-///
-/// Characters inside single or double quotes are treated as literals, so
-/// `sqlite3 db "SELECT 1; SELECT 2;"` remains a single segment.
-///
-/// Heredoc bodies (`<<WORD ... WORD`) are kept as part of the same segment
-/// as the command that opens them; newlines inside the body do not split.
 fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -834,11 +743,6 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     continue;
                 }
 
-                // Inside a heredoc body: don't split on newlines, and drop the
-                // body content so the segment carries only the opener line and
-                // the command. This is the single source of heredoc-parsing
-                // truth — it is quote-aware, so quoted `<<WORD` text never opens
-                // a heredoc and cannot hide later real path arguments.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
                     if ch == '\n' {
                         if heredoc_line_buf.trim() == delim {
@@ -906,14 +810,15 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
-///
 /// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
 /// so their `&` doesn't get flagged as a background operator.
 fn strip_fd_merge_redirects(command: &str) -> String {
     use std::sync::OnceLock;
     // Matches patterns like: 2>&1, 1>&2, >&2, <&0, 2<&-, >&-
     static FD_MERGE_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = FD_MERGE_RE.get_or_init(|| regex::Regex::new(r"\d*[><]&[\d-]").unwrap());
+    let re = FD_MERGE_RE.get_or_init(|| {
+        regex::Regex::new(r"\d*[><]&[\d-]").expect("FD_MERGE_RE regex must compile")
+    });
     re.replace_all(command, "").to_string()
 }
 
@@ -1027,11 +932,6 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
     static SAFE_OUTPUT_RE: OnceLock<Regex> = OnceLock::new();
     let re = SAFE_OUTPUT_RE.get_or_init(|| {
-        // Match >SPACE?/dev/{null,zero,stdout,stderr} followed by whitespace,
-        // end-of-string, or a shell operator. A dot, slash, or any other
-        // non-operator character after the device name prevents the match —
-        // blocking bypasses like `2>/dev/stderr.log` or `>/dev/zero/path`.
-        // The terminator is captured and preserved in the replacement.
         Regex::new(&format!(
             r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
             safe_device_redirect_names_pattern()
@@ -1054,8 +954,9 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
     use std::sync::OnceLock;
 
     static SAFE_INPUT_RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        SAFE_INPUT_RE.get_or_init(|| Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").unwrap());
+    let re = SAFE_INPUT_RE.get_or_init(|| {
+        Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
+    });
 
     let safe = command.replace("<<<", "").replace("<<", "");
     let safe = re.replace_all(&safe, "$2").to_string();
@@ -1065,7 +966,6 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
-///
 /// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
 /// treated as literals and therefore ignored.
 fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
@@ -1416,17 +1316,6 @@ impl SecurityPolicy {
         }
     }
 
-    // ── Command Execution Policy Gate ──────────────────────────────────────
-    // Validation follows a strict precedence order:
-    //   1. Allowlist check (is the base command permitted at all?)
-    //   2. Risk classification (high / medium / low)
-    //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
-    //      — explicit allowlist entries exempt a command from the high-risk block,
-    //        but the wildcard "*" does NOT grant an exemption.
-    //   4. Autonomy level × approval status (supervised requires explicit approval)
-    // This ordering ensures deny-by-default: unknown commands are rejected
-    // before any risk or autonomy logic runs.
-
     /// Validate full command execution policy (allowlist + risk gate).
     pub fn validate_command_execution(
         &self,
@@ -1464,14 +1353,6 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
-    /// Check whether **every** segment of a command is explicitly listed in
-    /// `allowed_commands` — i.e., matched by a concrete entry rather than by
-    /// the wildcard `"*"`.
-    ///
-    /// This is used to exempt explicitly-allowlisted high-risk commands from
-    /// the `block_high_risk_commands` gate. The wildcard entry intentionally
-    /// does **not** qualify as an explicit allowlist match, so that operators
-    /// who set `allowed_commands = ["*"]` still get the high-risk safety net.
     fn is_command_explicitly_allowed(&self, command: &str) -> bool {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
@@ -1516,15 +1397,6 @@ impl SecurityPolicy {
     // per-segment allowlist check. Each gate targets a specific bypass
     // technique. If any gate rejects, the whole command is blocked.
 
-    /// Check if a shell command is allowed.
-    ///
-    /// Validates the **entire** command string, not just the first word:
-    /// - Blocks subshell operators (`` ` ``, `$(`) that hide arbitrary execution
-    /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
-    ///   validates each sub-command against the allowlist
-    /// - Blocks single `&` background chaining (`&&` remains supported)
-    /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
-    /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
@@ -1539,11 +1411,6 @@ impl SecurityPolicy {
             return true;
         }
 
-        // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
-        // bypassing path checks through variable indirection. The helper below
-        // ignores escapes and literals inside single quotes, so `$(` or `${`
-        // literals are permitted there.
         if command.contains('`')
             || contains_unquoted_shell_variable_expansion(command)
             || command.contains("<(")
@@ -1630,16 +1497,6 @@ impl SecurityPolicy {
         })
     }
 
-    /// Check for dangerous arguments that allow sub-command execution or
-    /// fetch+execute untrusted external code.
-    ///
-    /// Local workspace operations (cargo build, npm test, python script.py)
-    /// are NOT blocked — the user trusts their own project.
-    ///
-    /// References:
-    /// - ZeptoClaw GHSA-5wp8-q9mx-8jx8 (CVSS 9.8): same vulnerability class
-    /// - OpenClaw strictInlineEval: blocks python -c, node -e, etc.
-    /// - OWASP OS Command Injection Defense Cheat Sheet
     fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
@@ -1648,12 +1505,6 @@ impl SecurityPolicy {
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
             }
             "git" => {
-                // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /").
-                // NOTE: `-c` (lowercase) is compared case-sensitively against
-                // `args_cased` because git's `-C` (uppercase, change directory)
-                // is a distinct, benign option that must not be conflated with
-                // `-c` (set config override).
                 !args_cased.iter().any(|arg| arg == "-c")
                     && !args.iter().any(|arg| {
                         arg == "config"
@@ -1662,19 +1513,9 @@ impl SecurityPolicy {
                             || arg.starts_with("alias.")
                     })
             }
-            "python" | "python3" => {
-                // -c executes arbitrary code from argument string
-                // -m runs any installed module as a script — broad block is intentional:
-                //   -m http.server opens a local exfil vector
-                //   -m pip install double-covers the pip arm
-                //   -m pytest, -m mypy, -m venv are blocked as collateral;
-                //   narrowing to a curated module list is a future option
-                // starts_with covers glued form: python3 -c'code' (one whitespace token)
-                // Ref: https://docs.python.org/3/using/cmdline.html
-                !args
-                    .iter()
-                    .any(|arg| arg.starts_with("-c") || arg.starts_with("-m"))
-            }
+            "python" | "python3" => !args
+                .iter()
+                .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
                 // -p/--print same as --eval but prints the result
@@ -1710,7 +1551,6 @@ impl SecurityPolicy {
     }
 
     /// Return the first path-like argument blocked by path policy.
-    ///
     /// This is best-effort token parsing for shell commands and is intended
     /// as a safety gate before command execution.
     pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
@@ -1832,12 +1672,6 @@ impl SecurityPolicy {
         None
     }
 
-    // ── Path Validation ────────────────────────────────────────────────
-    // Layered checks: null-byte injection → component-level traversal →
-    // URL-encoded traversal → tilde expansion → absolute-path block →
-    // forbidden-prefix match. Each layer addresses a distinct escape
-    // technique; together they enforce workspace confinement.
-
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Block null bytes (can truncate paths in C-backed syscalls)
@@ -1874,24 +1708,12 @@ impl SecurityPolicy {
             return true;
         }
 
-        // When workspace_only is set and the path is absolute, only allow it
-        // if it falls within the workspace directory or an explicit allowed
-        // root.  The workspace/allowed-root check runs BEFORE the forbidden
-        // prefix list so that workspace paths under broad defaults like
-        // "/home" are not rejected.  This mirrors the priority order in
-        // `is_resolved_path_allowed`.
         if expanded_path.is_absolute() {
             let in_workspace = expanded_path.starts_with(&self.workspace_dir);
             let in_allowed_root = self
                 .allowed_roots
                 .iter()
                 .any(|root| expanded_path.starts_with(root));
-            // String-level safety check is shared between read and
-            // write side tools, so accept paths under either grant
-            // tier here. The grant-direction enforcement happens at
-            // the resolved-path methods (`is_resolved_path_readable`
-            // / `is_resolved_path_allowed`), which split read-only
-            // and write-only entries into different code paths.
             let in_read_only_root = self
                 .allowed_roots_read_only
                 .iter()
@@ -1923,23 +1745,6 @@ impl SecurityPolicy {
         true
     }
 
-    /// Validate that a resolved path is readable by the current
-    /// security policy. Used by read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) that should honor
-    /// the read-write `allowed_roots` AND the read-only
-    /// `allowed_roots_read_only` lists, plus the universal POSIX
-    /// device files (`/dev/null`, `/dev/zero`, `/dev/random`,
-    /// `/dev/urandom`) that operators legitimately use for shell-
-    /// idiom CLI commands and standard input/output redirection.
-    ///
-    /// Importantly: this method does NOT consult
-    /// `allowed_roots_write_only`. `AccessMode::Write` grants write
-    /// access without read access; surfacing those paths through a
-    /// read-side tool would silently elevate the grant.
-    ///
-    /// Write-side tools (`file_write`, `file_edit`,
-    /// `git_operations`, `shell` write paths) call
-    /// [`Self::is_resolved_path_allowed`] instead.
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
         // Universal POSIX device files: any operator running on Linux,
         // macOS, or BSD expects these to be readable. Adding them to
@@ -1998,13 +1803,6 @@ impl SecurityPolicy {
         false
     }
 
-    /// Validate that a resolved path is inside the workspace or an
-    /// allowed root for write-side tools. Call this AFTER joining
-    /// `workspace_dir` + relative path and canonicalizing.
-    ///
-    /// Sees `allowed_roots` (read+write) AND
-    /// `allowed_roots_write_only` (write-only). Read-only allowlist
-    /// entries are NOT honored; that's the read-side tier.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         if is_null_device(resolved) {
             return true;
@@ -2058,13 +1856,6 @@ impl SecurityPolicy {
         false
     }
 
-    /// Directories whose `config.toml`-family files are protected from
-    /// agent self-modification. Includes the real config directory (the
-    /// parent of `config_path`, i.e. the install root) and, for
-    /// backward compatibility with the legacy flat layout, the parent of
-    /// `workspace_dir`. The two differ once per-agent workspaces nest
-    /// under `<install>/agents/<alias>/workspace/`: the config lives at
-    /// the install root, which is no longer `workspace_dir.parent()`.
     fn runtime_config_dirs(&self) -> Vec<PathBuf> {
         let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -2077,6 +1868,12 @@ impl SecurityPolicy {
                 dirs.push(dir);
             }
         }
+        if let Some(data_dir) = self.data_dir.as_deref() {
+            let dir = canon(data_dir);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
         dirs
     }
 
@@ -2084,10 +1881,13 @@ impl SecurityPolicy {
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
         };
-        let is_config_name = file_name == "config.toml"
+        let is_protected_name = file_name == "config.toml"
             || file_name == "config.toml.bak"
-            || file_name.starts_with(".config.toml.tmp-");
-        if !is_config_name {
+            || file_name.starts_with(".config.toml.tmp-")
+            || file_name == "estop-state.json"
+            || file_name == "otp-secret"
+            || file_name == "webauthn_credentials.json";
+        if !is_protected_name {
             return false;
         }
         let Some(parent) = resolved.parent() else {
@@ -2130,7 +1930,6 @@ impl SecurityPolicy {
     // (not read-only) and the sliding-window rate limiter.
 
     /// Enforce policy for a tool operation.
-    ///
     /// Read operations are always allowed by autonomy/rate gates.
     /// Act operations require non-readonly autonomy and available action budget.
     pub fn enforce_tool_operation(
@@ -2168,11 +1967,6 @@ impl SecurityPolicy {
             .is_limited_for_current(self.max_actions_per_hour)
     }
 
-    /// Resolve a user-provided path for tool use.
-    ///
-    /// Expands `~` prefixes and resolves relative paths against the workspace
-    /// directory. This should be called **after** `is_path_allowed` to obtain
-    /// the filesystem path that the tool actually operates on.
     pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
         let expanded = expand_user_path(path);
         if expanded.is_absolute() {
@@ -2200,17 +1994,6 @@ impl SecurityPolicy {
         }
     }
 
-    /// Check whether the given raw path (before canonicalization)
-    /// falls under an `allowed_roots` (read+write) OR
-    /// `allowed_roots_write_only` entry. Tilde expansion is applied to
-    /// the path before comparison. This is useful for tool-level
-    /// pre-checks that want to allow absolute paths the policy
-    /// explicitly permits to write.
-    ///
-    /// **Write-side semantics.** Use this from write-side tools
-    /// (`file_write`, `git_operations`, shell). Read-side tools
-    /// should use [`Self::is_under_any_allowed_root`] so a cross-agent
-    /// `AccessMode::Read` grant allows the read.
     pub fn is_under_allowed_root(&self, path: &str) -> bool {
         let expanded = expand_user_path(path);
         if !expanded.is_absolute() {
@@ -2220,13 +2003,6 @@ impl SecurityPolicy {
             || roots_contain(&self.allowed_roots_write_only, &expanded)
     }
 
-    /// Check whether the given raw path falls under a read-only allowed
-    /// root. Returns false for the read-write list; callers that want
-    /// the union should use [`Self::is_under_any_allowed_root`].
-    ///
-    /// Populated for multi-agent: an agent's `workspace.access`
-    /// entries with `AccessMode::Read` become read-only roots on the
-    /// policy.
     #[must_use]
     pub fn is_under_read_only_allowed_root(&self, path: &str) -> bool {
         let expanded = expand_user_path(path);
@@ -2236,45 +2012,13 @@ impl SecurityPolicy {
         roots_contain(&self.allowed_roots_read_only, &expanded)
     }
 
-    /// Check whether the given raw path falls under
-    /// `allowed_roots` (rw), `allowed_roots_read_only`, OR
-    /// `allowed_roots_write_only`. Read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) call
-    /// [`Self::is_resolved_path_readable`] for the resolved-path form,
-    /// which intentionally excludes the write-only tier. This raw-path
-    /// helper is the union of all three, used where read+write tools
-    /// share an entry point and the resolved-path check splits the
-    /// directionality afterward.
+    /// Union of all three root tiers; directionality is enforced later
+    /// by the resolved-path checks.
     #[must_use]
     pub fn is_under_any_allowed_root(&self, path: &str) -> bool {
         self.is_under_allowed_root(path) || self.is_under_read_only_allowed_root(path)
     }
 
-    /// Verify this policy does not escalate any permission beyond
-    /// `parent` (SubAgent inheritance subset check).
-    ///
-    /// Subset rules:
-    /// - Every `allowed_roots` entry on `self` must appear on
-    ///   `parent.allowed_roots`. (Read+write grants can never be
-    ///   wider than the parent's read+write list.)
-    /// - Every `allowed_roots_read_only` entry on `self` must appear
-    ///   on `parent.allowed_roots` OR on
-    ///   `parent.allowed_roots_read_only`. (A SubAgent can downgrade
-    ///   a parent's rw root to read-only, but it cannot grant read
-    ///   access to a path the parent could not even read.)
-    /// - Every `allowed_commands` entry on `self` must appear on
-    ///   `parent.allowed_commands`.
-    /// - `self.workspace_only` must be `true` whenever
-    ///   `parent.workspace_only` is `true`. A SubAgent cannot disable
-    ///   workspace_only when the parent enforces it.
-    /// - `self.max_actions_per_hour <= parent.max_actions_per_hour`
-    ///   and `self.max_cost_per_day_cents <=
-    ///   parent.max_cost_per_day_cents`. A SubAgent cannot raise the
-    ///   parent's rate or cost ceiling.
-    ///
-    /// Returns `Err(EscalationViolation)` describing the first
-    /// violation found. Callers should reject the spawn on `Err` so
-    /// a misconfigured override never lands as a constructed policy.
     pub fn ensure_no_escalation_beyond(
         &self,
         parent: &SecurityPolicy,
@@ -2288,11 +2032,6 @@ impl SecurityPolicy {
             });
         }
 
-        // Allowed roots: every child rw root must be CONTAINED in some
-        // parent rw root (so a child of `/srv/app` under a parent of
-        // `/srv` accepts; a child of `/srv` under a parent of
-        // `/srv/app` does not). Containment, not exact equality, lets
-        // the child legitimately narrow scope.
         for root in &self.allowed_roots {
             if !parent.allowed_roots.iter().any(|p| path_contains(p, root)) {
                 return Err(EscalationViolation::ReadWriteRootNotInParent { path: root.clone() });
@@ -2378,11 +2117,6 @@ impl SecurityPolicy {
         Ok(())
     }
 
-    /// Legacy entry point: build a `SecurityPolicy` from a risk profile
-    /// without a runtime profile. Budget caps default to zero (interpreted
-    /// as "no enforcement"). Tests and pre-multi-agent callsites use this;
-    /// production code should call `from_profiles` or `for_agent` so the
-    /// runtime profile's budget caps actually take effect.
     pub fn from_risk_profile(
         risk_profile: &crate::schema::RiskProfileConfig,
         workspace_dir: &Path,
@@ -2390,13 +2124,6 @@ impl SecurityPolicy {
         Self::from_profiles(risk_profile, None, workspace_dir)
     }
 
-    /// Build a `SecurityPolicy` from a resolved risk + runtime profile pair.
-    ///
-    /// Authorization fields (autonomy level, allowlists, sandbox) come from
-    /// the risk profile. Budget caps (`max_actions_per_hour`,
-    /// `max_cost_per_day_cents`, `shell_timeout_secs`) come from the
-    /// runtime profile but are enforced with parent-subset discipline on
-    /// SubAgent spawn (see `ensure_no_escalation_beyond`).
     pub fn from_profiles(
         risk_profile: &crate::schema::RiskProfileConfig,
         runtime_profile: Option<&crate::schema::RuntimeProfileConfig>,
@@ -2405,7 +2132,6 @@ impl SecurityPolicy {
         // When autonomy is Full, disable workspace_only so the agent can
         // access paths outside the workspace. Forbidden-path checks still
         // apply, preventing access to sensitive system directories.
-        // See issue #5463.
         let effective_workspace_only = if risk_profile.level == AutonomyLevel::Full {
             false
         } else {
@@ -2423,6 +2149,9 @@ impl SecurityPolicy {
             // Set by `for_agent` once the install root is known; the
             // profile-only constructor has no config path.
             config_path: None,
+            // Set by `for_agent` once the data dir is known; the
+            // profile-only constructor has no data dir.
+            data_dir: None,
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
@@ -2442,12 +2171,6 @@ impl SecurityPolicy {
                     }
                 })
                 .collect(),
-            // RiskProfileConfig has no read-only or write-only roots
-            // concept; the multi-agent runtime populates these lists
-            // when it builds a per-agent policy from the
-            // workspace.access map, turning `AccessMode::Read` and
-            // `AccessMode::Write` entries into the corresponding
-            // tiers.
             allowed_roots_read_only: Vec::new(),
             allowed_roots_write_only: Vec::new(),
             max_actions_per_hour: runtime.max_actions_per_hour,
@@ -2475,13 +2198,6 @@ impl SecurityPolicy {
         }
     }
 
-    /// Resolve the risk + runtime profiles owned by `agent_alias` and build
-    /// a `SecurityPolicy`. Bails when the agent isn't configured or when its
-    /// `risk_profile` field doesn't name a configured profile — there is no
-    /// global fallback, every security context is per-agent. Missing
-    /// `runtime_profile` falls back to zero budgets (treated as "inherit /
-    /// no enforcement"), matching the previous default when the budget
-    /// fields lived on the risk profile.
     pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
         let risk_profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -2514,29 +2230,17 @@ impl SecurityPolicy {
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
-        // Protect the active runtime config from agent self-modification.
-        // The per-agent workspace nests several levels under the install
-        // root, so `workspace_dir.parent()` alone no longer points at the
-        // directory holding `config.toml`. Record the real config path so
-        // `is_runtime_config_path` guards it directly.
         policy.config_path = Some(config.config_path.clone());
+        // Runtime data dir: same predicate extends there so state files
+        // that the gateway constructs with `&config.data_dir`
+        // (`webauthn_credentials.json` for WebAuthnManager) are protected
+        // from agent overwrites when `data_dir` overlaps an allowed root.
+        policy.data_dir = Some(config.data_dir.clone());
 
-        // Shared skills directory: every agent reads from
-        // `<install>/shared/skills/` so the `read_skills` tool resolves
-        // bundle directories no matter which bundle the agent is
-        // assigned. Read-only — bundle writes go through the SkillsService
-        // (gateway/CLI/TUI), not through the agent's filesystem tools.
-        // Archive root (`shared/skills/_deleted/`) is excluded to keep it
-        // out of agent context.
         policy
             .allowed_roots_read_only
             .push(config.shared_workspace_dir().join("skills"));
 
-        // Cross-agent filesystem access: the agent's
-        // [agents.<alias>.workspace.access] map declares which sibling
-        // workspaces this agent may read or write. Resolve each
-        // sibling's workspace dir and append to the appropriate
-        // allowlist tier.
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             for (sibling_alias, mode) in &agent_cfg.workspace.access {
                 let sibling_dir = config.agent_workspace_dir(sibling_alias.as_str());
@@ -2564,12 +2268,6 @@ impl SecurityPolicy {
         Ok(policy)
     }
 
-    /// Render a human-readable summary of the active security constraints
-    /// suitable for injection into the LLM system prompt.
-    ///
-    /// Giving the LLM visibility into these constraints prevents it from
-    /// wasting tokens on commands / paths that will be rejected at runtime.
-    /// See issue #2404.
     pub fn prompt_summary(&self) -> String {
         use std::fmt::Write;
 
@@ -2754,13 +2452,6 @@ mod tests {
         PathBuf::from("C:\\ro-shared")
     }
 
-    // ── is_tool_allowed truth table ──────────────────────────
-    //
-    // None         → unrestricted: every name allowed
-    // Some(vec![]) → deny-all: every name rejected
-    // Some(list)   → allowlist: only listed names allowed
-    // excluded_tools: subtracts from the allowed set even when allowlist matches
-
     #[test]
     fn is_tool_allowed_none_is_unrestricted() {
         let p = SecurityPolicy {
@@ -2820,13 +2511,29 @@ mod tests {
         assert!(!p.is_tool_allowed("spawn_subagent"));
     }
 
-    // ── from_profiles propagation coverage ────────────────────
-    //
-    // Every authorization-shaped field on RiskProfileConfig must reach
-    // SecurityPolicy. The test constructs a config with non-default
-    // values across the full field set and asserts each one landed.
-    // New risk_profile fields without an assertion here are silently
-    // dead config; that's the failure mode this test exists to prevent.
+    #[test]
+    fn is_tool_excluded_reflects_denylist_independent_of_allowlist() {
+        // No denylist → nothing excluded, regardless of allowlist.
+        let none = SecurityPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            excluded_tools: None,
+            ..SecurityPolicy::default()
+        };
+        assert!(!none.is_tool_excluded("shell"));
+        assert!(
+            !none.is_tool_excluded("deploy__run"),
+            "a tool omitted from the allowlist is not 'excluded' — the denylist is separate"
+        );
+
+        // Denylist subtracts by name, independent of the allowlist.
+        let denied = SecurityPolicy {
+            allowed_tools: None,
+            excluded_tools: Some(vec!["deploy__status".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(denied.is_tool_excluded("deploy__status"));
+        assert!(!denied.is_tool_excluded("deploy__run"));
+    }
 
     #[test]
     fn from_profiles_propagates_every_risk_profile_field() {
@@ -2902,10 +2609,6 @@ mod tests {
         );
     }
 
-    /// The Full-autonomy override on `workspace_only` is intentional
-    /// (issue #5463). The propagation test above sets ReadOnly so the
-    /// override is dormant; this companion test pins the override path
-    /// so a future refactor of from_profiles can't quietly remove it.
     #[test]
     fn from_profiles_full_autonomy_drops_workspace_only() {
         use crate::schema::RiskProfileConfig;
@@ -3939,7 +3642,7 @@ mod tests {
 
     #[test]
     fn git_dash_c_uppercase_is_allowed() {
-        // Regression test for #5809: git -C (change directory) must not be
+        // git -C (change directory) must not be
         // conflated with git -c (set config override) after arg lowercasing.
         let p = default_policy();
         assert!(
@@ -4146,11 +3849,6 @@ mod tests {
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
 
-        // `<<EOF` inside a double-quoted string is data, not a heredoc opener.
-        // The closing quote ends the string, and `/etc/shadow` after it is a
-        // real argv path argument that must still block. A non-quote-aware
-        // heredoc stripper would treat the quoted `<<EOF` as a real opener,
-        // swallow the following lines, and hide the forbidden path.
         assert_eq!(
             p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
@@ -4502,7 +4200,6 @@ mod tests {
             },
         );
 
-        // Sibling agents the test agent will reference.
         cfg.agents.insert(
             "writable_sibling".into(),
             AliasedAgentConfig {
@@ -4518,7 +4215,6 @@ mod tests {
             },
         );
 
-        // Test agent: write access to one sibling, read-only to another.
         let mut test_agent = AliasedAgentConfig {
             risk_profile: "default".into(),
             ..AliasedAgentConfig::default()
@@ -4696,12 +4392,6 @@ mod tests {
         let policy = SecurityPolicy::from_profiles(&risk, Some(&runtime), &workspace);
         assert!(!policy.is_rate_limited());
     }
-
-    // ══════════════════════════════════════════════════════════
-    // SECURITY CHECKLIST TESTS
-    // Checklist: gateway not public, pairing required,
-    //            filesystem scoped (no /), access via tunnel
-    // ══════════════════════════════════════════════════════════
 
     // ── Checklist #3: Filesystem scoped (no /) ──────────────
 
@@ -5468,6 +5158,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_state_files_in_config_dir_are_protected() {
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let config_dir = workspace.parent().unwrap();
+
+        // The state files are protected when they live in a runtime config dir.
+        assert!(policy.is_runtime_config_path(&config_dir.join("estop-state.json")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("webauthn_credentials.json")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("otp-secret")));
+
+        // Same names inside the workspace itself are NOT protected — those
+        // are user-owned files; only the runtime-state files at config_dir
+        // are sensitive.
+        assert!(!policy.is_runtime_config_path(&workspace.join("estop-state.json")));
+        assert!(!policy.is_runtime_config_path(&workspace.join("webauthn_credentials.json")));
+        assert!(!policy.is_runtime_config_path(&workspace.join("otp-secret")));
+
+        // Unrelated filenames are unaffected.
+        assert!(!policy.is_runtime_config_path(&config_dir.join("notes.md")));
+        assert!(!policy.is_runtime_config_path(&config_dir.join("agent-state.json")));
+        assert!(!policy.is_runtime_config_path(&config_dir.join("otp-state.json")));
+    }
+
+    #[test]
+    fn runtime_state_files_in_data_dir_are_protected() {
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let data_dir = PathBuf::from("/tmp/zeroclaw-profile/data");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            data_dir: Some(data_dir.clone()),
+            ..SecurityPolicy::default()
+        };
+
+        // The WebAuthn credentials file under data_dir is protected.
+        assert!(policy.is_runtime_config_path(&data_dir.join("webauthn_credentials.json")));
+
+        // The same file under the workspace is not — that's a user-owned
+        // file, not a WebAuthn store.
+        assert!(!policy.is_runtime_config_path(&workspace.join("webauthn_credentials.json")));
+
+        // Unrelated files under data_dir are unaffected.
+        assert!(!policy.is_runtime_config_path(&data_dir.join("logs.txt")));
+        assert!(!policy.is_runtime_config_path(&data_dir.join("cache.bin")));
+
+        // Without `data_dir` set, the predicate falls back to the
+        // config-dir-only behavior (matches the legacy flat layout where
+        // everything lives under one tree).
+        let legacy_policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert!(!legacy_policy.is_runtime_config_path(&PathBuf::from(
+            "/tmp/zeroclaw-profile/data/webauthn_credentials.json"
+        )));
+    }
+
+    #[test]
     fn workspace_files_are_not_runtime_config_paths() {
         let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
         let policy = SecurityPolicy {
@@ -5482,11 +5232,6 @@ mod tests {
 
     #[test]
     fn is_runtime_config_path_protects_install_root_for_nested_agent_layout() {
-        // Real per-agent layout: `<install>/agents/<alias>/workspace`, with
-        // the active config.toml at the install root, two levels above
-        // `workspace_dir.parent()`. Regression guard: the old check only
-        // looked at `workspace_dir.parent()`, leaving the install-root
-        // config.toml unprotected for nested agent workspaces.
         let install_root = PathBuf::from("/tmp/zeroclaw-install-nested");
         let workspace = install_root
             .join("agents")

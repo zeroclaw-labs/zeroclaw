@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronAddTool {
@@ -62,7 +62,7 @@ impl CronAddTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
@@ -72,7 +72,7 @@ impl CronAddTool {
         if self.security.is_rate_limited() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
             });
         }
@@ -80,7 +80,7 @@ impl CronAddTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
             });
         }
@@ -149,7 +149,7 @@ impl CronAddScheduleArg {
 fn schedule_error_result(error: String) -> ToolResult {
     ToolResult {
         success: false,
-        output: String::new(),
+        output: ToolOutput::default(),
         error: Some(error),
     }
 }
@@ -286,6 +286,11 @@ impl Tool for CronAddTool {
                     "type": "boolean",
                     "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for one-shot 'at' and 'after' schedules."
                 },
+                "uses_memory": {
+                    "type": "boolean",
+                    "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs that should not accumulate or consume memory entries.",
+                    "default": true
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
@@ -300,7 +305,7 @@ impl Tool for CronAddTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
@@ -310,7 +315,7 @@ impl Tool for CronAddTool {
                 if let Some(error) = Self::plain_string_schedule_error(raw) {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -320,7 +325,7 @@ impl Tool for CronAddTool {
                     Err(error) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(error),
                         });
                     }
@@ -331,7 +336,7 @@ impl Tool for CronAddTool {
                 Err(error) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -339,7 +344,7 @@ impl Tool for CronAddTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'schedule' parameter".to_string()),
                 });
             }
@@ -356,7 +361,7 @@ impl Tool for CronAddTool {
             Some(other) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Invalid job_type: {other}")),
                 });
             }
@@ -384,7 +389,7 @@ impl Tool for CronAddTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Invalid delivery config: {e}")),
                     });
                 }
@@ -399,7 +404,7 @@ impl Tool for CronAddTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("Missing 'command' for shell job".to_string()),
                         });
                     }
@@ -408,7 +413,7 @@ impl Tool for CronAddTool {
                 if let Err(reason) = self.security.validate_command_execution(command, approved) {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(reason),
                     });
                 }
@@ -438,7 +443,7 @@ impl Tool for CronAddTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("Missing 'prompt' for agent job".to_string()),
                         });
                     }
@@ -450,7 +455,7 @@ impl Tool for CronAddTool {
                         Err(e) => {
                             return Ok(ToolResult {
                                 success: false,
-                                output: String::new(),
+                                output: ToolOutput::default(),
                                 error: Some(format!("Invalid session_target: {e}")),
                             });
                         }
@@ -474,13 +479,17 @@ impl Tool for CronAddTool {
                         Err(e) => {
                             return Ok(ToolResult {
                                 success: false,
-                                output: String::new(),
+                                output: ToolOutput::default(),
                                 error: Some(format!("Invalid allowed_tools: {e}")),
                             });
                         }
                     },
                     None => None,
                 };
+                let uses_memory = args
+                    .get("uses_memory")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
 
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
@@ -502,6 +511,7 @@ impl Tool for CronAddTool {
                     delivery,
                     delete_after_run,
                     allowed_tools,
+                    uses_memory,
                 )
             }
         };
@@ -509,12 +519,12 @@ impl Tool for CronAddTool {
         match result {
             Ok(job) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&cron_add_output(&job))?,
+                output: serde_json::to_string_pretty(&cron_add_output(&job))?.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -1160,6 +1170,9 @@ mod tests {
 
         assert_eq!(values.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
         assert!(values.contains(&"dingtalk"));
+        assert!(values.contains(&"wechat"));
+        assert!(values.contains(&"signal"));
+        assert!(values.contains(&"email"));
     }
 
     #[tokio::test]

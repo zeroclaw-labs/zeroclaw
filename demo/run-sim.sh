@@ -8,7 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Pass env from .env if present (so MINIMAX_API_KEY etc. reach the container).
+# Load .env if present so Docker Compose can interpolate demo credentials.
 if [[ -f .env ]]; then
   set -a
   # shellcheck disable=SC1091

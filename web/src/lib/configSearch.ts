@@ -17,6 +17,7 @@
 // empty list so the palette keeps showing its nav destinations.
 
 import { getMapKeys, getSectionPicker, getSections, type SectionInfo } from "./api";
+import { badgeIsGood } from "../components/sections/SectionPicker";
 
 /** A flat, jump-to-able config search target. */
 export interface ConfigSearchItem {
@@ -72,7 +73,7 @@ async function loadEntities(section: SectionInfo): Promise<ConfigSearchItem[]> {
     try {
       const picker = await getSectionPicker(section.key);
       configuredTypes = picker.items
-        .filter((i) => i.badge === "configured" || i.badge === "active")
+        .filter((i) => badgeIsGood(i.badge))
         .map((i) => i.key);
     } catch {
       return [];

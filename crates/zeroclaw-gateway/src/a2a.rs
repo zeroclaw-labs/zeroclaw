@@ -1,25 +1,5 @@
 //! A2A discovery surface: the well-known catalog card and per-alias agent
 //! cards.
-//!
-//! A2A (Agent2Agent, Linux Foundation) assumes one agent per origin: a single
-//! spec-conforming `AgentCard` at `/.well-known/agent-card.json`. ZeroClaw
-//! hosts N agents per install, so the origin root serves a ZeroClaw discovery
-//! catalog card aggregating every published agent's exposed skills (each
-//! tagged with its owning alias) and enumerating each one's per-alias endpoint
-//! and card URL. The catalog card is NOT a runnable A2A agent; each published
-//! alias is, at its own endpoint.
-//!
-//! Cards are built on demand from the canonical `[agents.<alias>]` config (no
-//! stored second agent list). Skills resolve through the same `SkillsService`
-//! the dashboard uses, then narrow through the alias's `exposed_skills`
-//! filter; the skill bundles stay the single source of truth.
-//!
-//! The card types here are serde-native and serialize to the A2A v1.0
-//! protobuf-JSON wire shape. We roll them ourselves rather than depend on
-//! `a2a-rs`, whose `AgentCard` is a one-agent-per-origin protobuf type and
-//! pulls a ConnectRPC/prost/protoc build footprint that fights the
-//! single-static-binary directive. The vendored proto at
-//! `tests/fixtures/a2a-v1.proto` is the conformance reference.
 
 use axum::{
     Extension, Json, Router,
@@ -42,12 +22,6 @@ use crate::{AppState, api::require_auth, run_gateway_chat_with_tools};
 const A2A_PROTOCOL_VERSION: &str = "1.0";
 /// JSON-RPC is the spec-mandated baseline transport binding.
 const A2A_PROTOCOL_BINDING: &str = "JSONRPC";
-/// ZeroClaw catalog discovery path. Deliberately NOT the spec's singular
-/// `agent-card.json`: the spec assumes one agent per origin and a catalog is
-/// not a conforming agent card, so squatting the spec path with a catalog body
-/// would mislead a standard client into parsing it as an agent. The plural
-/// path makes the non-conformance explicit. Per-alias cards (which ARE
-/// conforming) use the singular spec path under their own base.
 const CATALOG_CARD_PATH: &str = "/.well-known/agents-card.json";
 /// Prefixed alias of the catalog under the `/a2a/` namespace, serving the same
 /// card so the whole A2A surface lives under one prefix while the root path
@@ -126,12 +100,6 @@ impl AdvertisedGatewayEndpoint {
     }
 }
 
-/// Resolve the externally advertised base URL for endpoint fields. Precedence:
-/// the operator-set `public_base_url`; then an explicit A2A `bind`/`port`
-/// advertise-only override; then the gateway listener host/port supplied by
-/// the runtime; then the configured gateway host and port. A partial A2A
-/// override fills the missing half from the runtime listener when available,
-/// falling back to the gateway config.
 fn advertised_base(config: &Config, endpoint: Option<&AdvertisedGatewayEndpoint>) -> String {
     let server = &config.a2a.server;
     let configured = server.public_base_url.trim();
@@ -271,11 +239,6 @@ fn published_aliases(config: &Config) -> Vec<String> {
     out
 }
 
-/// One-line agent description for the card. Prefers the alias identity
-/// document (AIEOS `identity.bio`, falling back to a name line) so an
-/// operator-authored identity supersedes the neutral default. Falls back to
-/// `ZeroClaw agent '<alias>'.` when no identity is configured or it fails to
-/// load. The result is collapsed to a single line.
 fn agent_description(config: &Config, alias: &str) -> String {
     if let Some(desc) = identity_description(config, alias) {
         return desc;
@@ -477,12 +440,6 @@ fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json:
     })
 }
 
-/// `POST /a2a/{alias}` — A2A JSON-RPC task endpoint. Runs one agent turn for a
-/// `message/send` call and returns a completed `Task` with the reply as an
-/// artifact. Requires a paired bearer token (a turn is tool-enabled, so it is
-/// never served unauthenticated), then gated on `[a2a.server] enabled` and the
-/// alias being published. The discovery cards are intentionally unauthenticated
-/// so peers can read the published surface before pairing; invocation is not.
 async fn handle_alias_task(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
@@ -623,13 +580,6 @@ async fn handle_alias_task(
     }
 }
 
-/// A2A discovery routes. The server-enabled gate is enforced per request (so a
-/// runtime config reload toggles it without a router rebuild); the routes are
-/// always mounted but answer 404 while disabled.
-///
-/// These are fast, read-only card lookups and belong under the standard
-/// gateway timeout. The synchronous task endpoint lives in
-/// [`a2a_task_route`] so it can opt into the long-running timeout.
 pub fn a2a_routes() -> Router<AppState> {
     a2a_routes_with_endpoint(None)
 }
@@ -649,11 +599,6 @@ pub(crate) fn a2a_routes_with_endpoint(
         .layer(Extension(endpoint))
 }
 
-/// The A2A `message/send` task endpoint. `handle_alias_task` runs a full agent
-/// turn inline through `run_gateway_chat_with_tools`, so this route must sit on
-/// the long-running timeout router (like manual cron triggers), not the 30s
-/// gateway-wide limit, or any non-trivial turn is cut off at
-/// `request_timeout_secs`.
 pub fn a2a_task_route() -> Router<AppState> {
     Router::new().route("/a2a/{alias}", post(handle_alias_task))
 }

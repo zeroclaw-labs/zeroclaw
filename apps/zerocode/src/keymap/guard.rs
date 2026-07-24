@@ -24,13 +24,6 @@ mod tests {
             || l == "match key.code {"
     }
 
-    /// Tokens that mean "this line reaches for a raw key or builds/tests
-    /// a chord to decide behavior". `KeyCode::` is forbidden wholesale so
-    /// new key variants are covered without enumeration; the sanctioned
-    /// text-entry idiom and waived lines are excused below. Chord
-    /// *constructors* and `.matches` are forbidden, but chord *readers*
-    /// (`Chord::display` and friends, which render registry labels for
-    /// hints) are fine and not listed here.
     const FORBIDDEN: &[&str] = &[
         "key.code ==",
         "match key.code",
@@ -90,9 +83,6 @@ mod tests {
         }
     }
 
-    /// Behavior is decided through `Action::from_chord` and the typed
-    /// action enums. A handler that reads a raw key or builds a `Chord`
-    /// inline is hardcoding a binding and bypasses the override layer.
     #[test]
     fn no_hardcoded_chords_in_handlers() {
         let root = Path::new(SRC);

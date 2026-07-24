@@ -4,11 +4,6 @@ pub mod registry;
 use anyhow::Result;
 use zeroclaw_config::schema::Config;
 
-/// Integration status
-///
-/// Two states only: an integration is either configured (`Active`) or it
-/// exists in the schema but isn't configured (`Available`). There is no
-/// "coming soon" state — if it is not real, it does not get listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationStatus {
     /// Fully implemented and ready to use
@@ -46,11 +41,6 @@ impl IntegrationCategory {
     }
 }
 
-/// A registered integration. The `status` is computed against a
-/// specific `&Config` at construction time (see
-/// `registry::all_integrations`). `name` and `description` are owned
-/// strings so the schema-derived path can build them at runtime from
-/// the `ChannelsConfig` field set.
 pub struct IntegrationEntry {
     pub name: String,
     pub description: String,
@@ -94,7 +84,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw config set channels.telegram.default.bot-token <token>");
+            println!("    3. Run: zeroclaw config set channels.telegram.default.bot_token <token>");
             println!("    4. Start: zeroclaw channel start");
         }
         "Discord" => {
@@ -127,10 +117,20 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    2. Pull a model: ollama pull llama3");
             println!("    3. Set model_provider to 'ollama' in config.toml");
         }
-        "GitHub" => {
+        "Git" => {
             println!("  Setup:");
-            println!("    1. Create a personal access token at https://github.com/settings/tokens");
-            println!("    2. Add to config: [integrations.github] token = \"ghp_...\"");
+            println!("    1. Create a GitHub App (Settings → Developer settings → GitHub Apps)");
+            println!(
+                "       Permissions: Issues R/W, Pull requests R/W, Metadata R. Webhook: off."
+            );
+            println!("    2. Generate a private key (.pem) and install the app on your repos");
+            println!("    3. Run: zeroclaw config set channels.git.default.provider github");
+            println!("       Run: zeroclaw config set channels.git.default.app-id <id>");
+            println!(
+                "       Run: zeroclaw config set channels.git.default.private-key-path <path>"
+            );
+            println!("       Run: zeroclaw config set channels.git.default.enabled true");
+            println!("    4. Start: zeroclaw channel start");
         }
         "Browser" => {
             println!("  Built-in:");

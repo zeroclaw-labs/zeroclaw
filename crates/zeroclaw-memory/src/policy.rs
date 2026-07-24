@@ -1,8 +1,4 @@
 //! Policy engine for memory operations.
-//!
-//! Validates operations against configurable rules before they reach the
-//! backend. Enforces namespace quotas, category limits, read-only namespaces,
-//! and per-category retention rules.
 
 use super::traits::MemoryCategory;
 use zeroclaw_config::schema::MemoryPolicyConfig;

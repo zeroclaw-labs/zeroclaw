@@ -1,22 +1,4 @@
 //! Plugin manifest loader — scans `~/.zeroclaw/tools/` at startup.
-//!
-//! Layout expected on disk:
-//! ```text
-//! ~/.zeroclaw/tools/
-//! ├── i2c_scan/
-//! │   ├── tool.toml
-//! │   └── i2c_scan.py
-//! └── pwm_set/
-//!     ├── tool.toml
-//!     └── pwm_set
-//! ```
-//!
-//! Rules:
-//! - The directory is **created** if it does not exist.
-//! - Each subdirectory is scanned for a `tool.toml`.
-//! - Manifests that fail to parse or validate are **skipped with a warning**;
-//!   they must not crash startup.
-//! - Non-directory entries at the top level are silently ignored.
 
 use super::manifest::ToolManifest;
 use super::subprocess::SubprocessTool;
@@ -35,11 +17,6 @@ pub struct LoadedPlugin {
     pub tool: Box<dyn Tool>,
 }
 
-/// Scan `~/.zeroclaw/tools/` and return all valid plugins.
-///
-/// - Creates the directory if absent.
-/// - Skips broken manifests with a `tracing::warn!` — does not propagate errors.
-/// - Returns an empty `Vec` when no plugins are installed.
 pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
     let tools_dir = match plugin_tools_dir() {
         Ok(p) => p,
@@ -167,7 +144,6 @@ pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
 }
 
 /// Parse and validate a single plugin directory.
-///
 /// Returns `Err` on any validation failure so the caller can log and continue.
 fn load_one_plugin(plugin_dir: &Path, manifest_path: &Path) -> Result<LoadedPlugin> {
     let raw = fs::read_to_string(manifest_path).map_err(|e| {

@@ -2,8 +2,6 @@
 //! parent's identity, security policy, and memory allowlist, runs a
 //! focused prompt, and returns the response. Cron's `JobType::Agent`
 //! dispatch is the other SubAgent spawn site; both funnel through
-//! [`crate::subagent::SubAgentSpawn`] so permission inheritance,
-//! tracing-span shape, and audit attribution stay uniform.
 
 use crate::agent::loop_::AgentRunOverrides;
 use crate::security::SecurityPolicy;
@@ -13,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 use zeroclaw_log::scope;
 
@@ -22,18 +20,6 @@ use zeroclaw_log::scope;
 pub struct SpawnSubagentTool {
     config: Arc<Config>,
     parent_alias: String,
-    /// The caller's live policy (the same `Arc` the agent loop and the
-    /// other acting tools share). Each launch attempt consumes one slot
-    /// from its action budget via `enforce_tool_operation(Act, ..)`,
-    /// mirroring `DelegateTool`, so the dedup exemption for re-entrant
-    /// agent tools cannot turn one model turn into unbounded child
-    /// agent starts.
-    ///
-    /// Also carries session-scoped policy fields — most importantly
-    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd —
-    /// into the SubAgent context via `SubAgentSpawn::for_agent_with_policy`,
-    /// so child file/shell tools jail to the same boundary as the
-    /// parent rather than the per-agent install dir (issue #7263).
     security: Arc<SecurityPolicy>,
     /// `true` when this tool is registered inside a run that is itself
     /// a SubAgent. Triggers a depth-1 cap refusal in `execute` before
@@ -107,7 +93,7 @@ impl Tool for SpawnSubagentTool {
         if self.is_subagent_caller {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"
                         .into(),
@@ -115,14 +101,6 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
-        // Risk-profile tool gate: a non-empty allowed_tools list that omits
-        // `spawn_subagent`, or an excluded_tools list that names it, must
-        // refuse pre-spawn. The agent-loop
-        // dispatch filter (apply_policy_tool_filter) already drops the
-        // tool from the registry when the policy excludes it, but this
-        // tool also runs from cron and other registry construction
-        // sites that don't currently apply the filter; refuse here so
-        // the gate is honored everywhere the tool is reachable.
         let risk_profile = self.config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
@@ -131,7 +109,7 @@ impl Tool for SpawnSubagentTool {
             if excluded || !allowed_when_listed {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "spawn_subagent: refused — agent '{}' risk_profile does not list spawn_subagent in allowed_tools",
                         self.parent_alias
@@ -154,28 +132,19 @@ impl Tool for SpawnSubagentTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing or empty 'prompt' parameter".into()),
                 });
             }
         };
 
-        // Launch-side budget gate: every spawn attempt past validation
-        // consumes one slot from the caller's shared action budget,
-        // mirroring DelegateTool (which validates target + depth, then
-        // calls enforce_tool_operation before spawning). The re-entrant
-        // dedup exemption means identical calls are not collapsed
-        // per-turn, so without this gate a single model turn could
-        // request unbounded child launches; with it, fan-out is bounded
-        // by `max_actions_per_hour` at launch time, not merely by work
-        // performed downstream.
         if let Err(error) = self
             .security
             .enforce_tool_operation(ToolOperation::Act, Self::NAME)
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -191,7 +160,7 @@ impl Tool for SpawnSubagentTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("subagent spawn failed: {e:#}")),
                 });
             }
@@ -205,23 +174,24 @@ impl Tool for SpawnSubagentTool {
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
-        // Pass the validated SubAgent context as run-time overrides so
-        // the subset-confirmed policy reaches the agent loop instead
-        // of being silently re-derived from config. `is_subagent: true`
-        // marks the child run so its own SpawnSubagentTool is
-        // registered with the depth-cap refusal armed.
         let run_overrides = AgentRunOverrides {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
             is_subagent: true,
+            // Sub-turn origin already skips memory injection; explicit for
+            // the same future-proofing reason as `is_subagent` above.
+            suppress_memory_inject: true,
+            // Subagents keep a live memory backend and the memory tools; only
+            // the injected context preamble is suppressed above.
+            memory_free: false,
+            // Subagent runs are short-lived; no cross-turn reuse contract,
+            // so the per-call `connect_all` path inside `agent::run` is
+            // the correct choice. The daemon heartbeat worker is the
+            // only `mcp_registry` supplier.
+            mcp_registry: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
-        // EPIC-A supervision: register the subagent run for registry completeness + a
-        // crash-audit trail (a subagent left Running when the daemon dies surfaces as Lost
-        // on reboot). spawn_subagent is SYNCHRONOUS (the parent awaits the run below), so
-        // this is NOT for orphan recovery; the reaper's no-heartbeat same-boot skip
-        // prevents any false timeout of a legitimately long subagent. No-op when absent.
         let cp_task_id = run_id.clone();
         if let Some(cp) = crate::control_plane::control_plane() {
             let _ = cp
@@ -261,6 +231,7 @@ impl Tool for SpawnSubagentTool {
                 false,
                 Some(session_path),
                 None,
+                zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
         ))
@@ -290,15 +261,15 @@ impl Tool for SpawnSubagentTool {
             Ok(response) => Ok(ToolResult {
                 success: true,
                 output: if response.trim().is_empty() {
-                    "subagent completed without output".to_string()
+                    "subagent completed without output".to_string().into()
                 } else {
-                    response
+                    response.into()
                 },
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("subagent run failed: {e}")),
             }),
         }
@@ -493,11 +464,6 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_spawns_blocked_once_action_budget_is_exhausted() {
-        // The dedup exemption lets identical spawn_subagent calls all
-        // reach execute(); the launch-side budget gate must be what
-        // bounds them. With a budget of 2, the 3rd validated launch
-        // attempt is refused before any spawn work, regardless of
-        // whether the spawns themselves succeed.
         let security = Arc::new(SecurityPolicy {
             max_actions_per_hour: 2,
             ..SecurityPolicy::default()
@@ -578,15 +544,6 @@ mod tests {
         );
     }
 
-    // ── Cron path stays depth-0: AgentRunOverrides::default() ──
-    //
-    // The cron `JobType::Agent` site constructs `AgentRunOverrides`
-    // without explicit `is_subagent`, so a `false` Default is the
-    // load-bearing invariant. A future refactor flipping the default
-    // would silently turn every cron-launched agent into a depth-1
-    // subagent and break recursive-spawn guarantees from the other
-    // direction. Pin the default explicitly.
-
     #[test]
     fn agent_run_overrides_default_is_top_level() {
         use crate::agent::loop_::AgentRunOverrides;
@@ -596,16 +553,6 @@ mod tests {
             "AgentRunOverrides::default().is_subagent must be false so cron paths inherit a top-level shape"
         );
     }
-
-    // ── Tool : Attributable contract ──────────────────────────
-    //
-    // Every Tool impl carries a structured role + alias the same way
-    // channels do, so log emissions, audit traces, and ops banners can
-    // tag tool activity with the same `<kind>.<alias>` composite shape
-    // they use for the rest of the runtime. The trait supertrait is
-    // the load-bearing piece: a `&dyn Tool` must coerce to a
-    // `&dyn Attributable` automatically. Without `Tool: Attributable`
-    // the line below does not compile.
 
     #[test]
     fn spawn_subagent_dyn_tool_implements_attributable() {

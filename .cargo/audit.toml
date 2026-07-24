@@ -11,6 +11,7 @@ ignore = [
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types
     "RUSTSEC-2026-0097",  # rand re-entrancy unsoundness; 0.8.6 copy is patched; 0.7.x copy predates rand::rng() and is not affected
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic; 0.102.x copy via rumqttc v0.25.1 has no fix in 0.102.x series; 0.103.x copy patched at v0.103.13; awaiting rumqttc upgrade
+    "RUSTSEC-2024-0429",  # glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series
     "RUSTSEC-2026-0049",  # rustls-webpki CRL matching bug; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade
     "RUSTSEC-2026-0098",  # rustls-webpki URI name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade
@@ -23,6 +24,17 @@ ignore = [
     # (graph-aware) tolerates. Reconcile and remediate per #8519.
     # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
     # bump in crates/zeroclaw-plugins. Resolved by #8542.
+    # GTK3 stack unmaintained via zeroclaw-desktop (tauri -> webkit2gtk); tracking #8519
+    "RUSTSEC-2024-0411",  # gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0412",  # gdk unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0413",  # atk unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0414",  # gdkx11-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0415",  # gtk unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0416",  # atk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0417",  # gdkx11 unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0418",  # gdk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0419",  # gtk3-macros unmaintained gtk-rs GTK3 bindings; tracking #8519
+    "RUSTSEC-2024-0420",  # gtk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519
     # unic-* unmaintained unicode tables (transitive); tracking #8519
     "RUSTSEC-2025-0075",  # unic-char-range unmaintained; tracking #8519
     "RUSTSEC-2025-0080",  # unic-common unmaintained; tracking #8519
@@ -34,5 +46,4 @@ ignore = [
     # (Tauri) was removed in PR #8544.
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; transitive macro helper; tracking #8519
     "RUSTSEC-2024-0388",  # derivative unmaintained; transitive derive helper; tracking #8519
-    "RUSTSEC-2026-0192",  # ttf-parser unmaintained; via pdf-extract -> lopdf; tracking #8519
 ]

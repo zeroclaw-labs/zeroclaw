@@ -1,17 +1,6 @@
 //! Observer bridge — projects [`crate::LogEvent`]s onto the typed
 //! [`zeroclaw_api::observability_traits::ObserverEvent`] variants when a
 //! bound observer is installed.
-//!
-//! Lets metrics backends (Prometheus, OTel) consume the same single
-//! emission stream as the JSONL log and the SSE broadcast. The
-//! projection is bounded: only the actions that map to a known variant
-//! get forwarded, and only the metric-relevant subset of fields
-//! crosses the boundary (the high-cardinality content like message body
-//! and attributes does not).
-//!
-//! Install via [`set_observer_bridge`]; bridge is invoked once per event
-//! by `writer::record_event`. Missing observer = no-op; unmapped action
-//! = no-op.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -97,6 +86,13 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
     } else {
         Some(agent_alias)
     };
+    // Parent correlation for nested cross-agent executions (live SOP steps):
+    // recovered from the record's attributes when the emitting loop stamped it.
+    let parent_agent_alias_opt = event
+        .attributes
+        .get("parent_agent_alias")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let turn_id_opt = if turn_id.is_empty() {
         None
     } else {
@@ -150,6 +146,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
                 .unwrap_or_default() as usize,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "llm_response" => Some(ObserverEvent::LlmResponse {
@@ -173,6 +170,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             messages: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
@@ -181,6 +179,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             arguments: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
         }),
         "tool_call" | "tool_call_result" => Some(ObserverEvent::ToolCall {
@@ -192,7 +191,24 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             result: None,
             channel: channel_opt,
             agent_alias: agent_alias_opt,
+            parent_agent_alias: parent_agent_alias_opt.clone(),
             turn_id: turn_id_opt,
+        }),
+        "memory_audit" => Some(ObserverEvent::MemoryAudit {
+            action: event
+                .attributes
+                .get("memory_action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            backend: event
+                .attributes
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            duration,
+            success,
         }),
         "channel_message_inbound" => Some(ObserverEvent::ChannelMessage {
             channel,
@@ -312,6 +328,43 @@ mod tests {
     }
 
     #[test]
+    fn projects_memory_audit() {
+        let _guard = BRIDGE_LOCK.lock();
+        clear_observer_bridge();
+        let observer = Arc::new(CapturingObserver::default());
+        set_observer_bridge(observer.clone());
+
+        let mut event = LogEvent::new(Severity::Info, "memory_audit", EventCategory::Memory);
+        event.zeroclaw.duration_ms = Some(42);
+        event.set_outcome(EventOutcome::Success);
+        event.attributes = serde_json::json!({
+            "memory_action": "store",
+            "backend": "sqlite"
+        });
+
+        forward(&event);
+
+        let projected = observer.events.lock().unwrap();
+        assert_eq!(projected.len(), 1);
+        match &projected[0] {
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                assert_eq!(action, "store");
+                assert_eq!(backend, "sqlite");
+                assert_eq!(*duration, Duration::from_millis(42));
+                assert!(*success);
+            }
+            other => panic!("expected MemoryAudit, got {other:?}"),
+        }
+
+        clear_observer_bridge();
+    }
+
+    #[test]
     fn unknown_action_is_noop() {
         let _guard = BRIDGE_LOCK.lock();
         clear_observer_bridge();
@@ -355,6 +408,7 @@ mod tests {
                 messages_count,
                 channel,
                 agent_alias,
+                parent_agent_alias: _,
                 turn_id,
             } => {
                 assert_eq!(model_provider, "anthropic");

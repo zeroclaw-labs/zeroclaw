@@ -1,4 +1,4 @@
-use crate::cmd::mdbook::refs::{build_api, build_refs};
+use crate::cmd::mdbook::refs::build_api;
 use crate::util::*;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -31,10 +31,6 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
         );
     }
 
-    let ref_dir = ref_dir(&root);
-    if !ref_dir.join("cli.md").exists() || !ref_dir.join("config.md").exists() {
-        build_refs(&root)?;
-    }
     if !root.join("target/doc").exists() {
         build_api(&root)?;
     }
@@ -42,14 +38,6 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     let book = book_dir(&root);
     let tag_dir = tag.unwrap_or("master");
     let out_dir = book.join("book").join(tag_dir);
-
-    // Lang switcher always advertises every locale from locales.toml — switching
-    // to an unbuilt locale will 404 in single-locale mode, which is fine for
-    // local iteration.
-    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &entries)?;
-    crate::cmd::mdbook::themes::run(&root)?;
-    crate::cmd::mdbook::keymap::run(&root)?;
-    crate::cmd::mdbook::hardware::run(&root)?;
 
     // Watched locale: the one passed in, or the first entry in locales.toml.
     let watch_locale = locale
@@ -59,6 +47,8 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
 
     match locale {
         Some(code) => {
+            // Lang switcher advertises every locale even when serve builds one.
+            crate::cmd::mdbook::build::prepare_generated_book_inputs(&root, &entries)?;
             println!("==> Building locale '{code}' for serve...");
             build_one_locale(&book, tag_dir, code)?;
         }

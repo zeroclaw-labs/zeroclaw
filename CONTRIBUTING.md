@@ -33,6 +33,18 @@ All PRs target **`master`**. PRs targeting `main` will be rejected.
 
 For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**. For non-trivial architecture, workflow, config, security, or agent-assisted changes, use the **[Architecture and contribution map](docs/book/src/contributing/architecture-map.md)** to find the right foundation and architecture context before implementing.
 
+## Keep contributions moving
+
+Contributors are not expected to respond instantly, but should remain in contact throughout the review process to avoid their contributions becoming inactive. The policies below explain contributor expectations and how inactive work is handled.
+
+**Pull requests:** Respond to actionable review feedback. Resolve conflicts or update your branch when a maintainer asks, or leave a comment explaining what is blocking you. A PR that remains unresponsive after a documented author-action request and follow-up period may be closed for backlog hygiene. Closing the PR does not reject the underlying bug or idea. If the work remains valuable, maintainers may carry it forward through a takeover or superseding PR while preserving contributor attribution. See [PR backlog pruning](docs/book/src/maintainers/reviewer-playbook.md#pr-backlog-pruning) and [Superseding PRs](docs/book/src/maintainers/superseding.md).
+
+Before requesting or re-requesting review, inspect the current PR state yourself. Relevant checks should pass, obvious failures and conflicts should be resolved, prior review findings should be addressed, and the PR description and validation evidence should match the current head. Perform a focused self-review of the production and user-visible paths changed by the PR.
+
+Do not rely on maintainers to check the test status or determine whether you have addressed every review finding. When the PR is ready, post one concise comment summarizing what changed and requesting re-review, and also use GitHub's re-request review control so the appropriate reviewers are formally requested again.
+
+**Issues:** If you open an issue, follow the discussion when you can and add new details as they become available. Other participants may also provide evidence that the issue remains relevant. A substantive update, such as a current reproduction, logs, or a concrete affected use case, can keep it active; a generic `+1` cannot. Issues without current evidence may close for backlog hygiene, but updated evidence can support reopening the issue or filing a new one. See the [issue stale policy](docs/book/src/maintainers/labels.md#issue-stale-policy) for the canonical rules.
+
 ## Development setup
 
 ```bash

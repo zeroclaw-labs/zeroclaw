@@ -1,23 +1,11 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Edit a file by replacing an exact string match with new content.
-///
-/// Uses `old_string` → `new_string` precise replacement within the workspace.
-/// The `old_string` must appear exactly once in the file (zero matches = not
-/// found, multiple matches = ambiguous). `new_string` may be empty to delete
-/// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
-    /// Whether edits to the workspace persist on the host filesystem. `false`
-    /// on an ephemeral runtime (Docker tmpfs / no volume mount), where the
-    /// rewritten file succeeds inside the container but is invisible on the
-    /// host and discarded at session end. When `false`, successful edits carry
-    /// a loud ephemeral-workspace warning. Mirrors
-    /// [`super::file_write::FileWriteTool`]. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -74,9 +62,9 @@ impl Tool for FileEditTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let mut result = self.edit_file(args).await?;
         // A successful edit on an ephemeral runtime rewrites a file that never
-        // reaches the host and is lost at session end; warn loudly (issue #4627).
+        // reaches the host and is lost at session end; warn loudly
         if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
         Ok(result)
     }
@@ -129,7 +117,7 @@ impl FileEditTool {
         if old_string.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("old_string must not be empty".into()),
             });
         }
@@ -138,7 +126,7 @@ impl FileEditTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -153,7 +141,7 @@ impl FileEditTool {
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Invalid path: missing parent directory".into()),
             });
         };
@@ -163,7 +151,7 @@ impl FileEditTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
                 });
             }
@@ -173,7 +161,7 @@ impl FileEditTool {
         if !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&resolved_parent),
@@ -184,7 +172,7 @@ impl FileEditTool {
         let Some(file_name) = full_path.file_name() else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Invalid path: missing file name".into()),
             });
         };
@@ -194,7 +182,7 @@ impl FileEditTool {
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .runtime_config_violation_message(&resolved_target),
@@ -208,7 +196,7 @@ impl FileEditTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Refusing to edit through symlink: {}",
                     resolved_target.display()
@@ -222,7 +210,7 @@ impl FileEditTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file: {e}")),
                 });
             }
@@ -233,7 +221,7 @@ impl FileEditTool {
         if match_count == 0 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(no_match_diagnostic(&content, old_string)),
             });
         }
@@ -241,7 +229,7 @@ impl FileEditTool {
         if match_count > 1 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "old_string matches {match_count} times; must match exactly once"
                 )),
@@ -256,25 +244,19 @@ impl FileEditTool {
                 output: format!(
                     "Edited {path}: replaced 1 occurrence ({} bytes)",
                     new_content.len()
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to write file: {e}")),
             }),
         }
     }
 }
 
-/// Build an actionable error when `old_string` has zero exact matches.
-///
-/// The common failure is a leading-whitespace mismatch (indentation width or
-/// tabs-vs-spaces) where the text is otherwise identical. A bare "not found"
-/// gives the caller nothing to act on and invites blind retries. When the only
-/// difference is leading whitespace, say so explicitly so the caller can fix
-/// indentation in one shot instead of guessing.
 fn no_match_diagnostic(content: &str, old_string: &str) -> String {
     fn strip_leading_ws(s: &str) -> String {
         s.lines()
@@ -373,10 +355,8 @@ mod tests {
         assert_eq!(tool.name(), "file_edit");
     }
 
-    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+    // ── Ephemeral-workspace warning────────────────
 
-    /// A successful edit on an ephemeral runtime rewrites a file that won't
-    /// persist; the output carries a loud warning while preserving the status.
     #[tokio::test]
     async fn file_edit_warns_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_ephemeral");
@@ -407,7 +387,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// A failed edit performs no write — not data loss — so no banner is added.
     #[tokio::test]
     async fn file_edit_failure_not_warned_on_ephemeral_workspace() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_ephemeral_fail");
@@ -435,7 +414,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// On a persistent runtime (the default) no warning is attached.
     #[tokio::test]
     async fn file_edit_no_warning_when_persistent() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_persistent");

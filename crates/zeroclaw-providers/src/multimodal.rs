@@ -1,18 +1,12 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-// MIME types we will inline for vision providers. Deliberately excludes
-// `image/bmp`: no major vision provider (Anthropic, OpenAI) accepts BMP, so
-// inlining it would make the *entire* provider request fail rather than just
-// dropping the one image. Rejecting it here instead surfaces a clean
-// "could not be loaded" note while the request (and any accompanying text or
-// metadata) still goes through. BMP is still detected by `detect_mime` so the
-// skip is logged as an explicit unsupported-MIME event rather than "unknown".
 const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
@@ -117,11 +111,6 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
-/// Returns true for payloads that are plausibly loadable image references:
-/// absolute filesystem paths, `http(s)://` URLs, or base64 `data:` URIs.
-/// Placeholder-style payloads like `...`, `<path>`, or `example.png` fail
-/// this check and are left as literal text by [`parse_image_markers`], so
-/// illustrative markdown in a conversation does not trigger loader errors.
 fn is_loadable_image_reference(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("http://")
@@ -149,16 +138,6 @@ fn is_windows_path(candidate: &str) -> bool {
     matches!(chars.next(), Some('\\') | Some('/'))
 }
 
-/// Returns true for Windows UNC share paths like `\\server\share\…`.
-///
-/// `image_info` emits these after unwrapping the verbatim-UNC prefix
-/// (`\\?\UNC\…`) that `canonicalize` produces on Windows. Without recognizing
-/// the unwrapped form here, [`is_loadable_image_reference`] would reject the
-/// marker (it is neither a `/`-rooted POSIX path nor a `C:\` drive path), so
-/// [`parse_image_markers`] would leave it as literal text and the image would
-/// never be inlined for vision models. Requires a non-empty server component
-/// and at least one further path segment; the verbatim/device prefixes
-/// (`\\?\…`, `\\.\…`) are rejected because they are not plain shares.
 fn is_windows_unc_path(candidate: &str) -> bool {
     let Some(rest) = candidate.strip_prefix(r"\\") else {
         return false;
@@ -172,12 +151,6 @@ fn is_windows_unc_path(candidate: &str) -> bool {
     !server.is_empty() && !share.is_empty()
 }
 
-/// Normalize a marker payload that may have been line-wrapped when pasted
-/// from a terminal (e.g. a log line where a long path was broken across
-/// rows with leading indentation). Interior newlines — and any whitespace
-/// immediately following them — are dropped; leading/trailing whitespace
-/// is trimmed. Legitimate paths may contain spaces but never newlines, so
-/// this only recovers corrupted markers and does not mangle real paths.
 fn collapse_wrapped_marker(raw: &str) -> String {
     if !raw.contains('\n') && !raw.contains('\r') {
         return raw.trim().to_string();
@@ -261,15 +234,6 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
-/// Count image markers that originate from genuine **user** messages (i.e.
-/// inbound attachments), excluding tool-result carriers (`role == "tool"` and
-/// `[Tool results]` user messages).
-///
-/// Callers use this to distinguish "the user sent an image we cannot see"
-/// (which should surface a user-facing capability error so the attachment is
-/// not silently ignored) from "an image marker arrived only via a tool result"
-/// (e.g. `image_info`/`screenshot`/`image_gen`), which can degrade to text-only
-/// on a non-vision provider without misleading the user.
 pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -278,18 +242,6 @@ pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
-/// Count image markers in the **most recent** genuine user message (the newest
-/// inbound user turn), ignoring tool-result carriers and any earlier user
-/// messages still present in history.
-///
-/// This is the turn-scoped counterpart to [`count_user_image_markers`]. It lets
-/// the vision router distinguish "the user *just* sent an image we cannot see"
-/// (surface a capability error so the attachment is not silently ignored) from
-/// "an earlier user image is merely carried over in history" (degrade to
-/// text-only). Erroring on a carried-over marker would poison every later turn,
-/// since the marker lives in the long-lived session history permanently. That
-/// was the reported bug: a single image to a non-vision provider made every
-/// subsequent text turn fail.
 pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -299,28 +251,128 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .unwrap_or(0)
 }
 
-/// Replace media markers (`[IMAGE:...]`, `[PHOTO:...]`, `[DOCUMENT:...]`,
-/// `[FILE:...]`, `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with
-/// `[media attachment]`. Match is case-insensitive to align with the channel
-/// attachment parsers, which all uppercase the kind before comparing
-/// (`crates/zeroclaw-channels/src/util.rs::ATTACHMENT_KINDS`,
-/// `telegram.rs`, `discord.rs`, `qq.rs`, `whatsapp_web.rs`).
-///
-/// Use before passing user-facing text to auxiliary `chat_with_system` calls
-/// (intent classification, summarization, delegation) so that local file
-/// paths from inbound channels do not leak to the upstream provider — the
-/// upstream API would otherwise receive a filesystem path as `image_url.url`
-/// and reject the request.
-///
-/// Auxiliary calls do not need to *see* the media content; they only route
-/// or summarize, so the placeholder is sufficient. The main agent loop
-/// continues to call `prepare_messages_for_provider` for full normalization.
+/// Media-marker kinds this module recognizes. `IMAGE` is the only kind
+/// resolved into provider content parts; [`AUDIO_MARKER_KINDS`] is the strict
+/// subset degraded when a loadable payload would otherwise reach the model as
+/// literal text. Both marker regexes below derive their kind alternation from
+/// these consts so the strip-all and strip-audio paths cannot drift apart on
+/// which kinds exist. The channel grammar (`ATTACHMENT_KINDS` in
+/// `crates/zeroclaw-channels/src/util.rs`) recognizes these same kinds plus
+/// `LOCATION`, which carries coordinates rather than a file reference and has
+/// no provider-side handling; the two lists live in different crates
+/// deliberately (providers cannot depend on channels).
+const MEDIA_MARKER_KINDS: &[&str] = &[
+    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "VOICE", "AUDIO",
+];
+
+/// Marker kinds whose loadable payload must not stay model-visible. No
+/// provider resolves audio into content parts, and an audio path is not
+/// otherwise actionable by the model: asked what it hears, a model handed a
+/// bare path tends to fabricate having played the file. Every other kind in
+/// [`MEDIA_MARKER_KINDS`] keeps its payload — `IMAGE` is resolved for vision
+/// downstream, and `PHOTO`/`DOCUMENT`/`FILE`/`VIDEO` paths stay actionable
+/// (file tools read them, and the channel delivery contract has the model
+/// copy them into outbound reply markers), so stripping those would break
+/// document and file delivery.
+const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
-            .unwrap()
+        regex::Regex::new(&format!(
+            r"(?i)\[(?:{}):[^\]]*\]",
+            MEDIA_MARKER_KINDS.join("|")
+        ))
+        .unwrap()
     });
     RE.replace_all(text, "[media attachment]").into_owned()
+}
+
+/// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
+/// payload for the loadable-reference check.
+static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"(?i)\[(?:{}):([^\]]*)\]",
+        AUDIO_MARKER_KINDS.join("|")
+    ))
+    .unwrap()
+});
+
+/// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
+/// *loadable* reference (absolute path, `http(s)://` URL, or `data:` URI) with
+/// the same `[media attachment]` placeholder the degrade path uses, returning
+/// the rewritten text and the number of markers replaced.
+///
+/// Non-loadable payloads are left as literal text — placeholders (`[AUDIO:...]`),
+/// prose (`[AUDIO:<clip>]`), and the no-transcription note (`[Audio: attached]`)
+/// are harmless and must survive — mirroring how [`parse_image_markers`]
+/// preserves non-loadable `[IMAGE:...]` markers. Runs over the raw string so it
+/// also cleans a marker embedded in a native tool-result JSON blob
+/// (`{"content":"…[AUDIO:/clip.wav]…"}`): `[media attachment]` contains no
+/// JSON-special characters, so the surrounding object stays valid.
+fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
+    let mut stripped = 0usize;
+    let out = AUDIO_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        let payload = collapse_wrapped_marker(&caps[1]);
+        if !payload.is_empty() && is_loadable_image_reference(&payload) {
+            stripped += 1;
+            "[media attachment]".to_string()
+        } else {
+            // Preserve placeholder/prose markers verbatim.
+            caps[0].to_string()
+        }
+    });
+    (out.into_owned(), stripped)
+}
+
+/// Strip loadable audio markers (see `strip_unplayable_audio_markers`)
+/// across every message in `messages`, logging one degradation warning when
+/// any are removed. Returns the input borrowed when no candidate marker is
+/// present (the common, allocation-free path) or an owned rebuilt vector
+/// otherwise.
+///
+/// This is the shared seam keeping a raw audio path out of provider payloads,
+/// whichever route the history takes:
+/// - the main iteration prep ([`prepare_messages_for_provider`], via
+///   `prepare_messages_inner`), and
+/// - one-shot queries that dispatch history directly without full prep (the
+///   max-iteration graceful summary and the other `run_model_query` callers).
+///
+/// Non-audio media markers pass through untouched; see `AUDIO_MARKER_KINDS`
+/// for why the split falls where it does.
+pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|m| AUDIO_MARKER_RE.is_match(&m.content))
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut stripped = 0usize;
+    let rebuilt: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| {
+            let (content, n) = strip_unplayable_audio_markers(&m.content);
+            stripped += n;
+            ChatMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    if stripped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "markers_stripped": stripped,
+                })),
+            "multimodal: stripped unplayable audio marker(s) (AUDIO/VOICE); no provider resolves audio into content parts, so a raw path/URL was replaced with a placeholder instead of being sent to the model as text"
+        );
+    }
+
+    Cow::Owned(rebuilt)
 }
 
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
@@ -434,17 +486,6 @@ fn replay_message_without_stale_tool_images(
     }
 }
 
-/// Attempt to normalize image markers inside a native tool-result JSON
-/// payload produced by `NativeToolDispatcher::to_provider_messages`. On
-/// success, returns the reserialized JSON string with the inner `content`
-/// field rewritten to inline `[IMAGE:data:…]` markers (data URIs). Returns
-/// `Ok(None)` when the payload is not a JSON object with a string `content`
-/// field, when the inner content has no normalizable markers, or when no
-/// rewriting is needed — letting the caller fall through to the existing
-/// plain-text path. The returned JSON preserves `tool_call_id` and any
-/// other top-level fields so downstream native adapters
-/// (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`) can keep
-/// recovering the tool-call linkage via `serde_json::from_str`.
 async fn normalize_native_tool_result_json(
     content: &str,
     config: &MultimodalConfig,
@@ -506,6 +547,16 @@ async fn prepare_messages_inner(
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
 ) -> anyhow::Result<PreparedMessages> {
+    // Strip loadable audio markers before any provider sees the history. Left
+    // in place, an audio path reaches the model as literal text and fails
+    // silently — the model typically hallucinates having played the file,
+    // which is worse than an explicit degradation. `[IMAGE:...]` markers are
+    // handled by the normalization below; other media kinds keep their
+    // payloads for delivery. The shared seam borrows the input untouched when
+    // no audio marker is present, so the common hot path stays allocation-free.
+    let sanitized = sanitize_audio_markers(messages);
+    let messages: &[ChatMessage] = &sanitized;
+
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
@@ -548,16 +599,6 @@ async fn prepare_messages_inner(
             continue;
         }
 
-        // Native tool dispatchers wrap tool results as a JSON object
-        // (`{"tool_call_id":"…","content":"…"}`) so that provider adapters
-        // can recover `tool_call_id` via `serde_json::from_str` on
-        // `message.content`. Treating that JSON blob as plain text would
-        // strip markers out of the `content` field and append the data URI
-        // outside the JSON object, breaking the native tool-result contract
-        // and dropping `tool_call_id`. When we recognise that shape,
-        // normalize only the inner `content` string and reserialize the
-        // JSON so adapters keep seeing the structure they expect. Falls
-        // through to the plain-text path for non-JSON tool messages.
         if message.role == "tool"
             && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
                 &message.content,
@@ -660,11 +701,6 @@ async fn prepare_messages_inner(
         messages: capped_messages,
     })
 }
-/// Strip images from user messages that are more than `max_turns` turns back
-/// from the end of `messages`.  A "turn" here is counted as a user-role
-/// message, so `max_turns = 2` keeps images in the two most recent user
-/// messages and strips them from all earlier ones.  Tool-result images are
-/// handled by the stale-tool-result mechanism and are left untouched.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
     // Count user messages from the end to find the cutoff index.
     let mut user_turn_count = 0usize;
@@ -833,17 +869,6 @@ async fn normalize_image_references(
                     "reason": error_reason.as_deref().unwrap_or(""),
                     "marker_preview": marker_preview,
                 });
-                // Severity rules:
-                //   - For inbound user attachments, any failure is a real
-                //     loss the operator cares about → WARN.
-                //   - For tool-result content, marker-looking strings often
-                //     come from tool output that just happened to contain
-                //     `[IMAGE:...]` patterns (e.g. an agent reading a test
-                //     fixture, a code search hitting an assertion, log
-                //     snippets). Treat best-effort recoverable failures as
-                //     DEBUG so they stop drowning real signal. Keep WARN
-                //     only for configuration/limit problems that the
-                //     operator can actually act on.
                 let is_tool_role = ctx.role == "tool";
                 let is_recoverable_load_failure = matches!(
                     error_kind,
@@ -1328,6 +1353,162 @@ mod tests {
         );
     }
 
+    // ── loadable audio markers degrade; other media kinds keep their paths ──
+
+    #[test]
+    fn strip_unplayable_audio_markers_replaces_loadable_audio_path() {
+        let (out, n) = strip_unplayable_audio_markers("hear this [AUDIO:/tmp/clip.wav] now");
+        assert_eq!(out, "hear this [media attachment] now");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_degrades_audio_kinds_only() {
+        // The delivery contract: DOCUMENT/FILE/VIDEO/PHOTO paths stay
+        // model-visible so the agent can hand them to file tools or copy them
+        // into outbound reply markers; only the audio kinds degrade.
+        let input = "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.wav]";
+        let (out, n) = strip_unplayable_audio_markers(input);
+        assert_eq!(
+            out,
+            "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [media attachment] [media attachment]"
+        );
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn audio_marker_kinds_is_subset_of_media_marker_kinds() {
+        for kind in AUDIO_MARKER_KINDS {
+            assert!(
+                MEDIA_MARKER_KINDS.contains(kind),
+                "audio kind {kind} missing from the full marker vocabulary"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_leaves_image_marker_untouched() {
+        // `[IMAGE:...]` is handled by `parse_image_markers`; the audio
+        // stripper must never touch it (that would drop a resolvable image).
+        let (out, n) = strip_unplayable_audio_markers("[IMAGE:/a.png] and [AUDIO:/b.wav]");
+        assert_eq!(out, "[IMAGE:/a.png] and [media attachment]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_preserves_non_loadable_payloads() {
+        // Placeholders, prose, a bare filename, and the no-transcription
+        // `[Audio: attached]` note are harmless literal text — keep them.
+        for input in [
+            "[AUDIO:...]",
+            "[VOICE:<clip>]",
+            "[Audio: attached]",
+            "[AUDIO:example.wav]",
+        ] {
+            let (out, n) = strip_unplayable_audio_markers(input);
+            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
+            assert_eq!(
+                n, 0,
+                "non-loadable marker must not count as stripped: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_is_case_insensitive() {
+        let (out, n) = strip_unplayable_audio_markers("[Audio:/tmp/clip.wav]");
+        assert_eq!(out, "[media attachment]");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn strip_unplayable_audio_markers_handles_data_uri_and_url() {
+        let (out, n) = strip_unplayable_audio_markers(
+            "[VOICE:data:audio/ogg;base64,AAAA] and [AUDIO:https://x/y.mp3]",
+        );
+        assert_eq!(out, "[media attachment] and [media attachment]");
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_tool_result_audio_marker() {
+        // The reported failure: a tool result surfaces an audio path. With no
+        // images in history, prep must still strip the marker so the raw
+        // filesystem path never reaches the provider as literal text.
+        let history = vec![
+            ChatMessage::user("call the tool and tell me what you hear"),
+            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let tool_msg = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message survives prep");
+        assert!(
+            !tool_msg.content.contains("/tmp/clip.wav"),
+            "raw audio path must not reach the provider: {}",
+            tool_msg.content
+        );
+        assert!(tool_msg.content.contains("[media attachment]"));
+        assert!(!prepared.contains_images);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_document_marker_for_delivery() {
+        // A tool result that surfaces a document path must reach the provider
+        // intact: the agent copies that path into an outbound reply marker to
+        // deliver the file, and file tools read it on request. Only the audio
+        // kinds degrade.
+        let history = vec![
+            ChatMessage::user("send me the report"),
+            ChatMessage::tool(
+                "[DOCUMENT:/workspace/report.pdf] generated, and [AUDIO:/tmp/note.wav]",
+            ),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let tool_msg = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message survives prep");
+        assert!(
+            tool_msg
+                .content
+                .contains("[DOCUMENT:/workspace/report.pdf]"),
+            "document path must stay model-visible for delivery: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("/tmp/note.wav"),
+            "audio path alongside it must still degrade: {}",
+            tool_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_audio_but_keeps_image_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:{}] and hear [AUDIO:/tmp/clip.wav]",
+            path.display()
+        ))];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
+        let content = &prepared.messages[0].content;
+        assert!(
+            !content.contains("/tmp/clip.wav"),
+            "audio path must be stripped: {content}"
+        );
+        assert!(content.contains("[media attachment]"));
+        // The image marker is still normalized to a data URI alongside it.
+        assert!(prepared.contains_images, "image still inlined: {content}");
+    }
+
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
         let input = "Check this [IMAGE:/tmp/a.png] and this [IMAGE:https://example.com/b.jpg]";
@@ -1357,7 +1538,7 @@ mod tests {
 
     #[test]
     fn parse_image_markers_extracts_unc_path() {
-        // Regression for the #7446 Windows follow-up: `image_info` unwraps the
+        // Regression for theWindows follow-up: `image_info` unwraps the
         // verbatim-UNC prefix (`\\?\UNC\…`) to a plain `\\server\share\…`
         // path, which must be treated as a loadable image reference (not left
         // as literal text) so the image reaches vision models.
@@ -1461,11 +1642,6 @@ mod tests {
     }
 
     #[tokio::test]
-    // Covers the plain-text fallback path for `role == "tool"` messages
-    // whose `content` is not a native-dispatcher JSON payload (e.g.
-    // synthetic XML-shaped input or future non-JSON tool transports). The
-    // JSON-shaped native contract is exercised by
-    // `prepare_messages_preserves_native_tool_result_json_shape` below.
     async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("tool-sample.png");
@@ -1496,17 +1672,6 @@ mod tests {
         assert!(refs[0].starts_with("data:image/png;base64,"));
     }
 
-    // Regression for the JSON-clobber bug surfaced on PR #6183: native tool
-    // dispatchers serialize tool results as `{"tool_call_id":"…","content":"…"}`
-    // and downstream adapters (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`)
-    // recover `tool_call_id` via `serde_json::from_str` on the message
-    // content. The multimodal preprocessor must keep that JSON intact while
-    // still inlining any `[IMAGE:/path]` markers inside the inner `content`
-    // field. Asserts:
-    //   1. Prepared content is still valid JSON.
-    //   2. `tool_call_id` survives unchanged.
-    //   3. The inner `content` field carries `data:image/png;base64,…`
-    //      (marker rewritten) and keeps surrounding text.
     #[tokio::test]
     async fn prepare_messages_preserves_native_tool_result_json_shape() {
         let temp = tempfile::tempdir().unwrap();
@@ -1855,10 +2020,10 @@ mod tests {
             ChatMessage::user("[IMAGE:/tmp/new.png]\nNew caption".to_string()),
         ];
 
-        // Should not error — instead trims oldest.
-        // (Will error on normalize_image_reference for the surviving images
-        //  since /tmp/mid.png and /tmp/new.png don't exist, but the trimming
-        //  itself should succeed.)
+        // Should not error — instead trims oldest. (Will error on
+        // normalize_image_reference for the surviving images since
+        // /tmp/mid.png and /tmp/new.png don't exist, but the trimming
+        // itself should succeed.)
         let trimmed = trim_old_images(&messages, 2);
         assert_eq!(trimmed.len(), 3);
 
@@ -2088,11 +2253,6 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_messages_caps_to_newest_successful_images() {
-        // Regression for the dead pre-normalization trim: with more valid images
-        // than the cap, normalization must run on all of them and the cap must
-        // keep the *newest* `max_images`, dropping the oldest. Exactly one
-        // "post-normalization image cap exceeded" path should fire — there is no
-        // longer a separate, misleading pre-normalization "trimmed_to" warning.
         let temp = tempfile::tempdir().unwrap();
         // Minimal valid PNG (1x1 RGB pixel).
         let png_data = [
@@ -2306,8 +2466,6 @@ mod tests {
         assert_eq!(payload, "abcd==");
     }
 
-    /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision model_providers.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
@@ -2317,8 +2475,6 @@ mod tests {
         assert_eq!(refs[0], "/tmp/photo.jpg");
     }
 
-    /// An image-only message (no caption) should produce an empty string after
-    /// marker stripping, so callers can drop it from history.
     #[test]
     fn parse_image_markers_image_only_message_becomes_empty() {
         let input = "[IMAGE:/tmp/photo.jpg]";

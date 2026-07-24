@@ -1,8 +1,4 @@
 //! Incident response playbook definitions and execution engine.
-//!
-//! Playbooks define structured response procedures for security incidents.
-//! Each playbook has named steps, some of which require human approval before
-//! execution. Playbooks are loaded from JSON files in the configured directory.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -165,7 +161,6 @@ pub fn can_auto_approve(
 }
 
 /// Evaluate a playbook step. Returns the result with approval gating.
-///
 /// Steps that require approval and cannot be auto-approved will return
 /// `StepStatus::PendingApproval` without executing.
 pub fn evaluate_step(

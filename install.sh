@@ -28,8 +28,8 @@ TUI_BIN_NAME="zerocode"
 
 # Apps installed by default (the rest are discovered and listed but off
 # until selected via --apps or the interactive picker). Intentionally a
-# fixed list: Tauri-based apps need the Tauri toolchain + webview deps,
-# so they ship off-by-default.
+# fixed list: zeroclaw-desktop needs the Tauri toolchain + webview deps,
+# so it ships off-by-default.
 DEFAULT_APPS="zerocode"
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
@@ -92,9 +92,9 @@ expand_default_features() {
 # `cargo install --path apps/<dir>` — they are NOT cargo features of the
 # main binary. The installable set is discovered from `apps/*/Cargo.toml`
 # so adding an app surfaces here without editing this script. `zerocode`
-# (the TUI) is the default app. Tauri-based apps need the Tauri toolchain
-# + system webview deps and are excluded from the simple `cargo install`
-# path.
+# (the TUI) is the default app. Tauri-based apps (e.g. zeroclaw-desktop)
+# need the Tauri toolchain + system webview deps and are excluded from the
+# simple `cargo install` path.
 discover_apps() {
   APPS=""
   for dir in apps/*/; do
@@ -171,7 +171,7 @@ list_features() {
     default | ci-all | fantoccini | landlock | metrics) continue ;;
     channel-*) channels="${channels:+$channels, }$feat" ;;
     observability-*) observability="${observability:+$observability, }$feat" ;;
-    hardware | peripheral-* | sandbox-* | browser-* | probe | rag-pdf | webauthn)
+    hardware | peripheral-* | sandbox-* | browser-* | probe | webauthn)
       platform="${platform:+$platform, }$feat"
       ;;
     *) other="${other:+$other, }$feat" ;;
@@ -302,8 +302,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries ship the full distribution channel set (all channels, no heavyweight extras)."
-  info "For heavyweight extras excluded from the distribution set (e.g. whatsapp-web), build from source with --preset full."
+  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -665,6 +665,16 @@ install_web_dist() {
   fi
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
+  # Prune files the fresh build no longer ships. Copy-then-prune keeps
+  # index.html present throughout, so a running gateway never 503s
+  # mid-install, while stale hashed chunks still get removed.
+  (
+    cd "$web_data_dir" || exit 0
+    find . -type f | while IFS= read -r f; do
+      [ -f "$src_dist/$f" ] || rm -f "$f"
+    done
+    find . -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+  )
   info "Web dashboard installed to $web_data_dir"
 }
 
@@ -1189,8 +1199,19 @@ See all available features:
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
   if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
-    # --full installs every discovered app (an explicit --apps still wins).
-    WANT_APPS="$APPS"
+    # --full installs every discovered app (an explicit --apps still wins) —
+    # except Tauri-based apps (tauri.conf.json present): they need the Tauri
+    # toolchain + system webview deps (webkit2gtk/GTK on Linux), which most
+    # machines don't have. Request them explicitly via --apps to opt in.
+    WANT_APPS=""
+    for app in $APPS; do
+      app_path=$(app_dir_for "$app") || continue
+      if [ -f "$app_path/tauri.conf.json" ]; then
+        info "Skipping $app: Tauri app needs system webview deps — install explicitly with --apps $app"
+        continue
+      fi
+      WANT_APPS="${WANT_APPS:+$WANT_APPS }$app"
+    done
   elif [ "$USER_APPS" = "none" ]; then
     WANT_APPS=""
   elif [ -n "$USER_APPS" ]; then

@@ -16,12 +16,6 @@ pub fn ref_dir(root: &Path) -> PathBuf {
     root.join("docs/book/src/reference")
 }
 
-/// Resolve the Cargo target directory, honoring `CARGO_TARGET_DIR`, a
-/// `.cargo/config.toml` `build.target-dir`, and any other override Cargo
-/// applies. `cargo doc` writes its output under `<target-dir>/doc`; hardcoding
-/// `<root>/target/doc` breaks whenever the target dir is relocated (CI runners,
-/// shared caches, `CARGO_TARGET_DIR`). Falls back to `<root>/target` only when
-/// `cargo metadata` is unavailable.
 pub fn target_dir(root: &Path) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -51,19 +45,6 @@ pub fn pot_file(root: &Path) -> PathBuf {
     root.join("docs/book/po/messages.pot")
 }
 
-/// Ensure the `docs/book/po` translations submodule is initialized and checked
-/// out before the sync writes `.po`/`.pot` files into it. A bare clone leaves
-/// the gitlink path as an empty directory with no `.git`; writing catalogs there
-/// lands them in the parent worktree instead of the translations repo, so the
-/// translations silently never reach the submodule. `git submodule update
-/// --init` is idempotent: a no-op when the submodule is already populated.
-///
-/// A prior broken sync may have already scattered generated catalogs
-/// (`.po`/`.pot`/`.failures.log`) into the empty gitlink directory, which makes
-/// `git submodule update --init` abort with "destination path already exists and
-/// is not an empty directory". When the directory holds only those generated
-/// artifacts and no `.git`, clear them first so the clone can proceed; refuse to
-/// touch anything else.
 pub fn ensure_po_submodule(root: &Path) -> anyhow::Result<()> {
     let po = po_dir(root);
     if po.join(".git").exists() {
@@ -170,11 +151,6 @@ fn tool_on_path(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the real `mdbook` binary on PATH, skipping the xtask's own build dir.
-/// The xtask itself is named `mdbook`; Cargo prepends `target/debug` and
-/// `target/debug/deps` to PATH for `cargo run`, and on Windows `Command::new`
-/// also searches the parent process's directory first — so without this guard
-/// the xtask would recursively spawn itself.
 pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     let exclude = std::env::current_exe()
         .ok()
@@ -200,15 +176,6 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     )
 }
 
-/// Point mdBook's `peer-groups` preprocessor at the xtask binary Cargo actually
-/// built, rather than the repo-relative `target/release/mdbook` hardcoded in
-/// `book.toml`. With a non-default `CARGO_TARGET_DIR` the helper lands under the
-/// external target dir while mdBook still tries the repo-relative path and fails
-/// with "preprocessor not found". The running xtask binary *is* the preprocessor
-/// (its `preprocess` subcommand), so the override resolves wherever Cargo placed
-/// it. mdBook maps `MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND` to the
-/// `preprocessor.peer-groups.command` key (`__` -> `.`, `_` -> `-`) and splits
-/// the value with shlex, so the path is quoted.
 pub fn peer_groups_preprocessor_env() -> Option<(String, String)> {
     let exe = std::env::current_exe().ok()?;
     let exe_str = exe.to_string_lossy();
@@ -235,13 +202,6 @@ pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Catalogue roots that `cargo fluent` walks. Each root holds `<locale>/`
-/// subdirectories of `.ftl` files. The runtime catalogue is the primary
-/// source; zerocode ships an independent catalogue under the same layout.
-/// Named Fluent catalogue roots. Each root holds `<locale>/` subdirectories of
-/// `.ftl` files. The runtime catalogue is the primary source; zerocode ships an
-/// independent catalogue under the same layout. The name is the `--catalog`
-/// selector value.
 pub fn fluent_catalog_roots_named(root: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
         ("runtime", root.join("crates/zeroclaw-runtime/locales")),
@@ -312,11 +272,6 @@ pub fn ftl_files_in(locale_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Build a ready-to-use `ModelProvider` for a configured alias, loading the
-/// typed `Config` from `config_dir` (mirrors `zeroclaw --config-dir`; defaults
-/// to ~/.zeroclaw then ~/.config/zeroclaw). The provider stack resolves the
-/// family endpoint, auth header, wire protocol, and decrypts secrets — this
-/// tool hand-rolls none of it. Returns the provider plus the resolved model id.
 pub fn build_model_provider(
     provider_name: &str,
     config_dir: Option<&str>,

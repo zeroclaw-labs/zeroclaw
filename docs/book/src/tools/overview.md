@@ -1,13 +1,16 @@
 # Tools: Overview
 
-**Tools** are the agent's hands. A tool is a capability the model can invoke mid-conversation, run a shell command, fetch an HTTP URL, extract a PDF, open a browser, write a file, read a sensor. Every tool call is subject to [security policy](../security/overview.md) and produces a [tool receipt](../security/tool-receipts.md).
+**Tools** are the agent's hands. A tool is a capability the model can invoke mid-conversation, run a shell command, fetch an HTTP URL, open a browser, write a file, read a sensor. Every tool call is subject to [security policy](../security/overview.md). Successful executions can include a [tool receipt](../security/tool-receipts.md) when receipts are enabled.
 
 Tools are not to be confused with `zeroclaw` CLI subcommands. CLI commands are for operators; tools are for the agent.
 
 An agent gets its tools through the skill, knowledge, and MCP bundles it references; see [Agents](../agents/overview.md) for how bundles attach to an agent.
+For the turn-level path from provider tool call to approval, dispatch, receipt,
+observer event, and history entry, see
+[Tool execution lifecycle](../architecture/tool-execution-lifecycle.md).
 
 Before adding a built-in tool or replacing one with an external integration,
-use the [first-party extension boundary](../developing/first-party-extensions.md#choose-built-in-or-external)
+use the [Built-In Tool Inventory](../developing/tool-inventory.md)
 to choose the smallest durable home.
 
 ## Built-in tools
@@ -17,13 +20,13 @@ A minimal build ships with:
 | Tool | What it does |
 |---|---|
 | `shell` | Execute a shell command in the workspace directory. Subject to command allow/deny lists |
-| `file_read` | Read a file with line numbers; supports partial reads and PDF text extraction (path must be inside the workspace unless autonomy permits otherwise) |
+| `file_read` | Read a file with line numbers; supports partial reads and base64 encoding for binary files (path must be inside the workspace unless autonomy permits otherwise) |
 | `file_write` | Write a file (same path constraint) |
 | `file_edit` | Replace an exact string match in a file with new content |
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, or Jina |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
@@ -46,7 +49,6 @@ Conditionally registered:
 |---|---|
 | `knowledge` | `[knowledge].enabled = true`. Stores structured relationship memory; see [Relationship memory](./relationship-memory.md) |
 | Hardware probes | `--features hardware`: GPIO, I2C, SPI reads/writes |
-| `pdf_read` | `--features rag-pdf` |
 | `sop_*` tools | Registered when `sop.sops_dir` is configured: run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
 
@@ -90,7 +92,7 @@ Every tool invocation is classified by risk:
 
 The [autonomy level](../security/autonomy.md) determines what each risk tier can do without operator approval. Default (`Supervised`): low runs, medium asks, high blocks.
 
-Every tool invocation, approved or blocked, produces a [tool receipt](../security/tool-receipts.md) in the audit log.
+When receipts are enabled, successful executions receive a [tool receipt](../security/tool-receipts.md). Denied, blocked, replaced, failed, or interrupted calls do not receive receipts.
 
 ## Disabling tools on non-CLI channels
 
@@ -108,6 +110,7 @@ See [Autonomy levels](../security/autonomy.md) for the full set of per-profile f
 ## See also
 
 - [MCP](./mcp.md)
+- [Tool execution lifecycle](../architecture/tool-execution-lifecycle.md)
 - [ACP](../channels/acp.md)
 - [Browser automation](./browser.md)
 - [Security → Overview](../security/overview.md)

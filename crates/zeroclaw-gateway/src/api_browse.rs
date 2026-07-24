@@ -1,8 +1,4 @@
 //! HTTP adapter over `zeroclaw_runtime::browse::list_directory`.
-//!
-//! `GET /api/browse?path=<relative-to-shared>` returns one level of
-//! children. All walking, containment, and sorting lives in the runtime
-//! browse module; this is request shape → service call → response shape.
 
 use axum::{
     Json,

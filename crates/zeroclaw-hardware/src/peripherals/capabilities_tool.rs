@@ -108,7 +108,7 @@ impl Tool for HardwareCapabilitiesTool {
 
         Ok(ToolResult {
             success: !outputs.is_empty(),
-            output,
+            output: output.into(),
             error: None,
         })
     }

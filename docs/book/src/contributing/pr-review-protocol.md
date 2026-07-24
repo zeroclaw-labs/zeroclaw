@@ -110,6 +110,8 @@ Labels are maintainer metadata, not a contributor blocker. If the right label is
 
 Ask the author about labels only when the right label choice is ambiguous or nobody with label permissions is available. Do not request changes or hold merge solely because an author cannot edit labels.
 
+If your request-changes review leaves the next step on the author, include `needs-author-action` in the review posting packet. Skip it when the requested cleanup is maintainer-owned, another maintainer is taking over the branch, or the PR is waiting on a maintainer decision rather than author work.
+
 ## Template and public artifact checks
 
 Before approving, compare the live PR body against the current
@@ -133,26 +135,37 @@ verdict:
 - Linked issue verbs are accurate: use `Closes` / `Fixes` / `Resolves` only
   when the PR fully resolves the issue; otherwise use `Related`, `Depends on`,
   or `Supersedes`.
-- Validation evidence names commands that actually ran, includes relevant
-  output or an honest skip reason, and does not treat pending CI as local
-  validation.
+- Behavior claims are checked against the controlling contract: the relevant architecture doc, source-of-truth module, trait boundary, existing test, public API shape, source comment, or explicit maintainer decision. Issue-fit alone is not enough.
+- Provenance claims are real. If the PR body, commits, docs, or review thread cite an RFC, audit, issue, PR, path, generated artifact, or follow-up finding, verify that the artifact exists and supports the claim.
+- Validation evidence names the checks being relied on: required CI, focused local tests, manual smoke, docs/link gates, or full workspace checks when broad coverage proves something narrower evidence would miss. Commands that ran include relevant output or an honest skip reason. Fresh required CI is valid evidence when it covers the changed surface; do not require duplicate local Cargo for the same head, target, and feature set. Pending CI is not evidence yet.
 - Security/privacy, compatibility, rollback, and scope-boundary claims match
   the diff and current behavior.
 - Public text does not include bot/AI attribution footers, local workflow
   mechanics, private paths, unredacted sensitive logs, excessive raw logs,
   irrelevant dumps, or stale lifecycle wording. Concise, relevant command
-  output tails in Validation Evidence are expected when the template asks for
+  output tails in `How I tested` are expected when the template asks for
   them.
 
 ## Verdict decision tree
 
 | Situation | Verdict flag |
 |---|---|
-| Your review is approving, the template/truthfulness checks are satisfied, and no other reviewer holds an active block | `--approve` |
+| Your review is approving, the template/truthfulness checks are satisfied, and prior substantive concerns are resolved, dismissed, stale, or explicitly reconciled in your review | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
-| You have nothing new to block on but other reviewers hold active blocks | `--comment` |
+| You have nothing new to block on but other reviewers hold unresolved substantive concerns | `--comment` |
 | You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions | `--comment` |
-| You're a maintainer override-approving over another reviewer's `CHANGES_REQUESTED` | **Don't.** Get the other reviewer to dismiss or convert their review first. |
+
+Do not ignore another reviewer's visible `CHANGES_REQUESTED`. Before approving, check whether the underlying concern is resolved in the current diff, stale, dismissed, or still valid. A review state left on an older head is not automatically an unresolved concern. If you approve while that state is still visible, explain why the concern has been resolved; your approval does not clear the other review state for merge.
+
+## Validation evidence gaps
+
+When validation is the concern, identify the exact evidence gap instead of asking for "full Cargo" by reflex. Check the current required CI jobs and the changed surface, then ask for extra validation only where required CI does not prove the thing under review: tests for a platform that only received compile checks, Clippy for a platform or path outside the required lint job, desktop coverage when the desktop workflow did not trigger, release targets outside the PR matrix, stale CI, or unavailable CI.
+
+## Shape and generated artifacts
+
+For `size:XL`, over-1k-line, or new channel/provider/tool-family PRs, review the diff shape before relying on CI or prior approval. The public review should say whether the size is justified, whether the slice is merge-justified now, whether it could reasonably be split, and whether the handwritten work is mostly new value rather than duplicated machinery.
+
+Do not dismiss generated artifacts as harmless because they are generated. If a checked-in generated file affects policy, schema, routes, migrations, lockfiles, release artifacts, capabilities, packages, runtime behavior, or reviewer evidence, review it like source and ask the PR to explain the provenance when that provenance matters.
 
 ## Feedback taxonomy
 
@@ -222,7 +235,7 @@ If a session-level handoff file exists (`tmp/handoff.md`), update it with the ve
 
 ## Never
 
-- **Never approve over another reviewer's active `CHANGES_REQUESTED`.** Resolve the prior block first.
+- **Never approve without resolving or explaining why another reviewer's active `CHANGES_REQUESTED` concern has been resolved.**
 - **Never post a review that re-raises a settled point** without explicitly noting it's already resolved.
 - **Never merge.** That's a separate decision and a separate skill.
 - **Never push to contributor branches** without explicit instruction. `maintainerCanModify: true` allows it; even then, ask before pushing anything other than trivial fixups.

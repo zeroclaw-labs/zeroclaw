@@ -27,7 +27,6 @@ infer = { version = "0.19", default-features = false }
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 nanohtml2text = "0.2"
 parking_lot = "0.12"
-pdf-extract = { version = "0.12", optional = true }
 probe-rs = { version = "0.31", optional = true }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
@@ -56,8 +55,14 @@ webpki-roots = "1.0.6"
 [features]
 default = []
 browser-native = ["dep:fantoccini"]
-rag-pdf = ["dep:pdf-extract"]
 probe = ["dep:probe-rs"]
+# Exposes cross-crate test-only constructors (e.g.
+# `McpRegistry::for_test_with_server_count`) so downstream test
+# suites can build registry fixtures without spawning real stdio
+# children. Intentionally not part of the default surface — the
+# constructors panic on real use and exist purely to keep
+# daemon-side tests self-contained.
+test-helpers = []
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true

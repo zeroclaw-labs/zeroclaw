@@ -55,7 +55,7 @@ pub(crate) async fn record_executed_outcomes(
         if let Some(hooks) = ctx.hooks {
             let tool_result_obj = crate::tools::ToolResult {
                 success: outcome.success,
-                output: outcome.output.clone(),
+                output: outcome.output.clone().into(),
                 error: None,
             };
             hooks
@@ -80,6 +80,19 @@ pub(crate) async fn record_executed_outcomes(
                 "Sending progress complete to draft"
             );
             let _ = tx.send(StreamDelta::Status(progress_msg)).await;
+        }
+
+        // Capture into the innermost live SOP step scope (no-op otherwise).
+        if crate::sop::executor::step_capture_active() {
+            crate::sop::executor::record_step_tool_call(
+                &call.name,
+                &call.arguments,
+                outcome.success,
+                outcome.output.clone(),
+                outcome.output_data.clone(),
+                outcome.error_reason.as_deref(),
+                u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            );
         }
 
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -111,9 +124,6 @@ fn render_completion_progress(
 mod tests {
     use super::render_completion_progress;
 
-    /// The CLI progress line is a rendering surface, so credential-shaped
-    /// failure text must be scrubbed even though `error_reason` is raw on the
-    /// data path.
     #[test]
     fn completion_progress_scrubs_credential_error_reason() {
         let line = render_completion_progress(

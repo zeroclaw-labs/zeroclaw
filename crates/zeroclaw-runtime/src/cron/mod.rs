@@ -39,6 +39,9 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "lark",
     "feishu",
     "dingtalk",
+    "wechat",
+    "signal",
+    "email",
 ];
 
 /// Validate a shell command against an agent's security policy
@@ -56,7 +59,6 @@ pub fn validate_shell_command(
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
-///
 /// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
 pub fn validate_shell_command_with_security(
     security: &SecurityPolicy,
@@ -90,12 +92,6 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("unsupported delivery mode: {}", delivery.mode);
     }
 
-    // Shape-only validation. Whether the named channel resolves to a
-    // configured `[channels.<type>.<alias>]` entry at the moment of add
-    // is checked separately and surfaced as a non-fatal warning, not a
-    // hard error — a cron job may be authored before its channel is
-    // provisioned, and the scheduler logs loudly on fire if the channel
-    // never materialises (see `process_due_jobs`).
     let channel = delivery.channel.as_deref().map(str::trim);
     if channel.filter(|value| !value.is_empty()).is_none() {
         bail!("delivery.channel is required for announce mode");
@@ -113,12 +109,6 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
     Ok(())
 }
 
-/// Create a validated shell job, enforcing security policy before persistence.
-///
-/// `agent_alias` names the agent under whose risk profile the command
-/// will be validated and executed. All entrypoints that create shell
-/// cron jobs should route through this function to guarantee consistent
-/// policy enforcement.
 pub fn add_shell_job_with_approval(
     config: &Config,
     agent_alias: &str,
@@ -134,7 +124,6 @@ pub fn add_shell_job_with_approval(
 }
 
 /// Update a shell job's command with security validation.
-///
 /// Validates the new command (if changed) against the named agent's
 /// risk profile before persisting.
 pub fn update_shell_job_with_approval(
@@ -804,6 +793,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 
@@ -815,6 +805,7 @@ mod tests {
                 command: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
+                uses_memory: None,
             },
             &config,
         )

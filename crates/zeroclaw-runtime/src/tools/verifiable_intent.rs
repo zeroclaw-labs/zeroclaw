@@ -13,7 +13,7 @@ use crate::verifiable_intent::verification::{
     ConstraintCheckResult, StrictnessMode, check_constraints, verify_sd_hash_binding,
     verify_timestamps,
 };
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Tool for verifying Verifiable Intent credential chains and evaluating
 /// constraints against fulfillment data.
@@ -88,7 +88,7 @@ impl Tool for VerifiableIntentTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -101,7 +101,7 @@ impl Tool for VerifiableIntentTool {
             "verify_timestamps" => execute_verify_timestamps(&args),
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("unknown operation: {operation}")),
             }),
         }
@@ -188,7 +188,8 @@ fn execute_evaluate_constraints(
         output: serde_json::to_string_pretty(&json!({
             "all_satisfied": all_satisfied,
             "results": summary,
-        }))?,
+        }))?
+        .into(),
         error: if all_satisfied {
             None
         } else {
@@ -234,7 +235,7 @@ fn execute_verify_timestamps(args: &serde_json::Value) -> anyhow::Result<ToolRes
 fn vi_error_result(e: &ViError) -> ToolResult {
     ToolResult {
         success: false,
-        output: String::new(),
+        output: ToolOutput::default(),
         error: Some(format!("{}", e)),
     }
 }

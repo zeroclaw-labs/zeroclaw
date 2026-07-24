@@ -5,6 +5,58 @@ use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
 
+/// Reserved `ChannelMessage.subject` prefix the git/forge channel uses to
+/// label SOP-ingress events. Routing is NOT keyed on this (see
+/// `ChannelMessage::internal_sop_event`); it exists so channels that fill
+/// `subject` from user-controlled data (email) can keep this reserved
+/// namespace out of inbound subjects.
+pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
+
+/// The single authority for the channel-SOP event topic grammar
+/// `channel.alias:event_type`. The producer that lifts a forge/platform event
+/// into SOP ingress builds the topic here; the SOP engine parses it here. The
+/// grammar lives in one place so the two sides cannot drift.
+///
+/// `alias` separates from `channel` with `.`; `event_type` separates from the
+/// `channel.alias` head with `:`. A bare `channel` (no alias, no event type)
+/// and the `channel/alias` message form are both accepted by `parse` so the
+/// same matcher serves agent-loop message triggers and forge event triggers.
+pub struct ChannelSopTopic;
+
+impl ChannelSopTopic {
+    const ALIAS_SEP: char = '.';
+    const EVENT_SEP: char = ':';
+    const MESSAGE_ALIAS_SEP: char = '/';
+
+    /// Build a forge/platform event topic `channel.alias:event_type`.
+    #[must_use]
+    pub fn build(channel: &str, alias: &str, event_type: &str) -> String {
+        format!(
+            "{channel}{}{alias}{}{event_type}",
+            Self::ALIAS_SEP,
+            Self::EVENT_SEP
+        )
+    }
+
+    /// Parse a channel-SOP topic into `(channel, alias, event_type)`. The head
+    /// before the event separator yields the channel kind and optional alias;
+    /// the tail after it is the optional event type. Accepts both the forge
+    /// form (`channel.alias:event_type`) and the message form (`channel` or
+    /// `channel/alias`).
+    #[must_use]
+    pub fn parse(topic: &str) -> (&str, Option<&str>, Option<&str>) {
+        let (head, event_type) = match topic.split_once(Self::EVENT_SEP) {
+            Some((before, after)) => (before, Some(after)),
+            None => (topic, None),
+        };
+        let (channel, alias) = head
+            .split_once(Self::ALIAS_SEP)
+            .or_else(|| head.split_once(Self::MESSAGE_ALIAS_SEP))
+            .map_or((head, None), |(c, a)| (c, Some(a)));
+        (channel, alias, event_type)
+    }
+}
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Compact description of a tool call presented to the user for approval.
@@ -34,6 +86,133 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// An approval response together with the back-channel that produced it.
+///
+/// When a channel fans one approval request out to several back-channels,
+/// `decided_by` names the back-channel that actually answered, so the audit
+/// trail attributes the decision to the deciding surface. The attribution
+/// travels with the returned decision, so concurrent approvals on the same
+/// channel instance cannot cross-wire it. Single channels leave it `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedApprovalResponse {
+    pub response: ChannelApprovalResponse,
+    pub decided_by: Option<String>,
+}
+
+/// A long-lived, channel-agnostic gate prompt (e.g. a parked SOP approval):
+/// rendered natively per channel (Discord embed + buttons, Telegram inline
+/// keyboard, ...), answered through the channel's normal inbound path — a
+/// component click or a `<choice> <reference>` text reply — NOT a blocking wait.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGatePrompt {
+    /// Short heading, e.g. "SOP approval needed: gitea-triage-pipeline".
+    pub title: String,
+    /// Body: what is waiting and how to answer (includes the text-reply form
+    /// for humans on channels that render it as plain text).
+    pub description: String,
+    /// Correlation key the answer must carry (e.g. the SOP run id). Encoded in
+    /// component custom_ids and expected in text replies.
+    pub reference: String,
+    /// The presented choices, in order.
+    pub choices: Vec<GateChoice>,
+    /// Body a RESOLVED prompt should keep showing (the context, without the
+    /// how-to-answer instructions): on finalize the channel appends the outcome
+    /// line under it, so the record of WHAT was approved survives in place.
+    /// `None` = the outcome replaces the body entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_description: Option<String>,
+}
+
+/// The fixed vocabulary of gate-answer tokens, and the single source of truth
+/// for their wire spelling. A gate answer crosses two stringly-typed transports
+/// — a Discord `custom_id` and a `<choice> <reference>` text reply — so the
+/// token must be a string on the wire; this enum keeps producer (the route
+/// adapter that mints [`GateChoice::id`]) and consumer (the orchestrator that
+/// maps an answer to an approval decision) matching on ONE definition instead of
+/// re-typing the literal at each site, so adding a choice is a compile error at
+/// every place that must handle it rather than a silent drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateChoiceKind {
+    /// Approve the gate as presented.
+    Approve,
+    /// Deny the gate (cancels / fails the run per the step's policy).
+    Deny,
+    /// Approve with an operator amendment to the declared editable field.
+    Edit,
+    /// Ask for a re-draft with guidance (checkpoint with an llm predecessor).
+    Revise,
+}
+
+impl GateChoiceKind {
+    /// The wire token — the string carried in a `custom_id` and a text reply.
+    pub fn id(self) -> &'static str {
+        match self {
+            GateChoiceKind::Approve => "approve",
+            GateChoiceKind::Deny => "deny",
+            GateChoiceKind::Edit => "edit",
+            GateChoiceKind::Revise => "revise",
+        }
+    }
+
+    /// Parse a wire token back to its kind (case-insensitive). `None` for any
+    /// unknown token, so an unrecognized answer is dropped, never coerced.
+    pub fn from_id(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "approve" => Some(GateChoiceKind::Approve),
+            "deny" => Some(GateChoiceKind::Deny),
+            "edit" => Some(GateChoiceKind::Edit),
+            "revise" => Some(GateChoiceKind::Revise),
+            _ => None,
+        }
+    }
+
+    /// True when answering this choice collects free text (the amended draft or
+    /// the re-draft guidance) — the channels that can, render a form for it.
+    pub fn collects_text(self) -> bool {
+        matches!(self, GateChoiceKind::Edit | GateChoiceKind::Revise)
+    }
+}
+
+/// One selectable choice on a [`ChannelGatePrompt`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateChoice {
+    /// Stable machine id carried back in the answer (e.g. "approve"). Mint it
+    /// from [`GateChoiceKind::id`] so it stays in lockstep with the parser.
+    pub id: String,
+    /// Human label for the button / keyboard entry.
+    pub label: String,
+    /// Visual emphasis hint for channels that support it.
+    pub emphasis: GateChoiceEmphasis,
+    /// When set, this choice collects free text from the operator before it is
+    /// answered (e.g. "Edit" amends a draft, "Revise" sends guidance). Channels
+    /// with a native form (Discord modal) render one; channels without simply
+    /// omit the choice — plain approve/deny stays universally answerable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<GateChoiceInput>,
+}
+
+/// The text-collection spec of an input-bearing [`GateChoice`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateChoiceInput {
+    /// Field label shown on the form (e.g. "Edited draft").
+    pub label: String,
+    /// Pre-filled text (e.g. the current draft an Edit starts from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+}
+
+/// Rendering hint for a [`GateChoice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateChoiceEmphasis {
+    /// The affirmative action (e.g. a green/primary button).
+    Positive,
+    /// The destructive/refusing action (e.g. a red button).
+    Negative,
+    /// No particular emphasis.
+    Neutral,
+}
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -53,10 +232,10 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`)
-    /// when the platform supports multiple bot instances. Used by
-    /// session_key construction so two bots on the same platform compute
+    /// when the platform supports multiple bot instances. Session-key
+    /// construction uses this so two bots on the same platform compute
     /// distinct session IDs and don't share conversation history. `None`
-    /// for channels that don't have an alias concept yet (webhook, cli).
+    /// for channels without an alias concept (webhook, cli).
     pub channel_alias: Option<String>,
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
@@ -73,6 +252,12 @@ pub struct ChannelMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
     pub subject: Option<String>,
+    /// Internal SOP-ingress marker carrying the event topic, set ONLY by the
+    /// git/forge channel producer. The orchestrator routes a message into the
+    /// SOP engine when (and only when) this is `Some`, so the decision can
+    /// never be driven by user-controlled fields like `subject` or `content`.
+    /// Never round-trips through serde.
+    pub internal_sop_event: Option<String>,
     /// When true, the orchestrator records this as context only and must not
     /// start an agent turn or emit visible channel side effects.
     pub passive_context: bool,
@@ -262,12 +447,6 @@ impl ChannelMessage {
 }
 
 impl SendMessage {
-    /// Build a reply `SendMessage` from an inbound `ChannelMessage`.
-    ///
-    /// Sets `recipient` from `msg.reply_target`, threads via `in_reply_to` and
-    /// `thread_ts`, and prepends `Re:` to the subject when the inbound message
-    /// carried one. Safe to call from any channel handler; the `in_reply_to`
-    /// field is silently ignored by channels that don't support it.
     pub fn reply_to(msg: &ChannelMessage, content: impl Into<String>) -> Self {
         let mut sm = Self::new(content, &msg.reply_target)
             .in_thread(msg.thread_ts.clone())
@@ -284,11 +463,33 @@ impl SendMessage {
     }
 }
 
+/// A low-level, provider-relative forge API request routed through a
+/// forge-backed channel. Channel-neutral so the `Channel` trait carries no
+/// forge-specific types; the git channel maps this onto its provider's
+/// `forge_request`. `method` is an uppercase HTTP verb (`GET`/`POST`/`PATCH`/
+/// `PUT`/`DELETE`); `path` is relative to the provider's API base (e.g.
+/// `repos/owner/repo/issues/12/labels`); `body` is an optional JSON payload.
+#[derive(Debug, Clone)]
+pub struct ForgeApiRequest {
+    pub method: String,
+    pub path: String,
+    pub body: Option<serde_json::Value>,
+}
+
+/// The outcome of a forge API request: the HTTP status and decoded JSON body
+/// (`Null` when the response had no body). Non-2xx statuses are carried here
+/// rather than raised, so the caller inspects the forge's own error envelope.
+#[derive(Debug, Clone)]
+pub struct ForgeApiResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
-/// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
-/// inherit `channel = <type>.<alias>` from the trait object's role + alias.
+/// `attribution_span!(&*ch)` so log emissions from within `listen()` /
+/// `send()` inherit `channel = <type>.<alias>`.
 #[async_trait]
 pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
@@ -303,6 +504,65 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Send a discrete-choice prompt with options.
+    ///
+    /// Each `(callback_id, label)` pair represents one choice. Whether
+    /// the `callback_id` round-trips on inbound is **channel-specific**:
+    ///
+    /// - **WhatsApp Cloud** preserves the `callback_id` exactly — it
+    ///   appears as `interactive.button_reply.id` /
+    ///   `interactive.list_reply.id`, surfaced as
+    ///   `[choice]<callback_id>` in the inbound `ChannelMessage.content`.
+    /// - **Signal** uses native polls. Real signal-cli `pollVote`
+    ///   payloads round-trip selected option indexes, surfaced as
+    ///   `[choice-index]N` with a 1-based index. Some alternate
+    ///   `pollAnswer` payloads may include selected titles and surface
+    ///   as `[choice]<label>`, but callers needing stable callback ids
+    ///   should maintain a side map keyed by poll option index.
+    /// - **Default text fallback** (Matrix, SMS, IRC, mock) renders a
+    ///   numbered list with a "reply with name or number" hint and
+    ///   relies on the consumer's own matcher to resolve the user's
+    ///   text reply against the option list.
+    ///
+    /// `options.is_empty()` is treated as "send the prompt as plain
+    /// text with no choices" rather than rendering an empty selection
+    /// hint; if `prompt` is also empty the call is a no-op (returns
+    /// `Ok(())`).
+    ///
+    /// `prompt` is the question / title; rendered ABOVE the options.
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let trimmed_prompt = prompt.trim();
+        if options.is_empty() {
+            // No options to render. Send the prompt as plain text; if
+            // there's nothing to say either, this is a no-op so we
+            // don't ship an empty message that confuses the client.
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
+
+        let mut text = String::new();
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        // Trim trailing newline so the message looks tidy across clients.
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
     }
 
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
@@ -320,58 +580,45 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Self-loop guard for multi-agent runs.
+    /// Whether `send` actually delivers a message OUTBOUND on this channel. Default
+    /// `true`. An INBOUND-ONLY transport (e.g. an AMQP trigger source whose `send` is a
+    /// deliberate no-op that returns `Ok`) overrides this to `false`, so a surface that
+    /// must genuinely deliver - such as the SOP approval route adapter - can refuse to
+    /// route to it (and report the misconfiguration) instead of silently succeeding
+    /// without sending anything.
+    fn supports_outbound_send(&self) -> bool {
+        true
+    }
+
+    /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
+    /// this channel, so the orchestrator can drop inbound events whose
+    /// `sender` matches. A bot must never respond to its own messages, even
+    /// if a misconfigured peer group lists the bot's handle as an external
+    /// peer.
     ///
-    /// Returns the bot's own handle/identity on this channel
-    /// (e.g. `@my_bot` for Telegram, the bot's user ID for Discord)
-    /// when known, so the orchestrator can drop inbound events whose
-    /// `sender` matches: a bot must never respond to its own
-    /// messages, even if a misconfigured peer group lists the bot's
-    /// handle as an external peer.
-    ///
-    /// **Channels that handle inbound traffic must override this.**
-    /// The default `None` makes both layers of the orchestrator's
-    /// self-loop guard (the SDK-side `drop_self_messages` here, and
-    /// the agent-loop fallback `peers::should_drop_self_loop`) into
-    /// no-ops — both layers consult the same `self_handle`, so a
-    /// channel that returns `None` has no protection from looping on
-    /// its own outbound. Outbound-only channels (webhook, gmail-push,
-    /// voice-call) never see inbound and can keep the default. The
-    /// in-tree overrides currently cover Telegram (`bot_username`
-    /// cache), IRC (configured nickname), Discord (decoded from token),
-    /// Slack (cached `auth.test` user_id); other inbound channels
-    /// remain on the default and rely on per-impl filtering instead
-    /// of the shared guard.
+    /// **Channels that handle inbound traffic must override this.** The
+    /// default `None` disables both layers of the self-loop guard
+    /// (`drop_self_messages` here and the agent-loop fallback), leaving the
+    /// channel unprotected from looping on its own outbound. Outbound-only
+    /// channels can keep the default.
     fn self_handle(&self) -> Option<String> {
         None
     }
 
-    /// The exact form the bot expects to see when addressed by users on
-    /// this channel. Discord wraps the snowflake as `<@1088...>`,
-    /// Telegram presents `@bot_username`, Matrix presents
-    /// `@bot:server`, Slack wraps the user ID as `<@U02...>`. Returned
-    /// verbatim into the per-channel system prompt so the agent
-    /// recognizes its own mention without guessing, and uses the same
-    /// form to tag itself or peers in outbound replies.
-    ///
-    /// Default `None` for channels that have no inbound mention
-    /// concept (CLI, webhook, hardware, ACP elicitation). Channels
-    /// that override `self_handle` should usually override this too,
-    /// applying their platform-native mention wrapper to the handle.
+    /// The exact form the bot expects when addressed by users on this channel
+    /// (e.g. Discord `<@snowflake>`, Telegram `@bot_username`). Returned
+    /// verbatim into the per-channel system prompt. Default `None` for
+    /// channels with no inbound mention concept. Channels that override
+    /// `self_handle` should usually override this too.
     fn self_addressed_mention(&self) -> Option<String> {
         None
     }
 
     /// Whether the orchestrator should drop an inbound message as
-    /// self-authored (multi-agent self-loop guard).
-    ///
-    /// Default implementation compares `msg.sender` against
-    /// [`Self::self_handle`] case-insensitively, after stripping a
-    /// leading `@` from each side so Telegram-style handles match
-    /// regardless of which form the SDK delivers. Override only for
-    /// platforms whose identity comparison is non-string (e.g. a
-    /// numeric Discord user ID is `as_str` already; this default
-    /// works there too).
+    /// self-authored (multi-agent self-loop guard). Default compares
+    /// `msg.sender` against [`Self::self_handle`] case-insensitively after
+    /// stripping a leading `@` from each side. Override only for platforms
+    /// whose identity comparison is non-string.
     fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
         let Some(handle) = self.self_handle() else {
             return false;
@@ -381,15 +628,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
-    /// Whether an inbound message is a direct, one-to-one conversation
-    /// with the bot (a DM/IM), as opposed to a group or broadcast
-    /// channel. A direct message is definitionally addressed to the
-    /// bot, so the orchestrator skips the reply-intent classifier and
-    /// goes straight to the tool-capable agent turn.
-    ///
-    /// Default `false`: channels that cannot prove a one-to-one context
-    /// keep the classifier precheck. Channels that distinguish DMs from
-    /// group traffic override this.
+    async fn forge_request(&self, _request: ForgeApiRequest) -> anyhow::Result<ForgeApiResponse> {
+        anyhow::bail!(
+            "channel '{}' does not support forge API requests",
+            self.name()
+        )
+    }
+
+    /// Whether an inbound message is a direct one-to-one conversation with
+    /// the bot. A DM is definitionally addressed to the bot, so the
+    /// orchestrator skips the reply-intent classifier and goes straight to
+    /// the tool-capable agent turn. Default `false`: channels that cannot
+    /// prove a one-to-one context keep the classifier precheck.
     fn is_direct_message(&self, _msg: &ChannelMessage) -> bool {
         false
     }
@@ -499,18 +749,10 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Request interactive tool-call approval from the channel operator.
     ///
     /// Returns `Ok(Some(response))` when the operator answers within the
-    /// channel's configured `approval_timeout_secs`; timeouts are surfaced
-    /// as `Deny`. Returns `Ok(None)` only for channels that do not implement
-    /// the prompt at all — the caller should fall back to its default policy
+    /// channel's configured `approval_timeout_secs`; timeouts surface as
+    /// `Deny`. Returns `Ok(None)` only for channels that do not implement
+    /// the prompt at all — the caller falls back to its default policy
     /// (typically auto-deny).
-    ///
-    /// Surface varies by channel:
-    /// - **Telegram** uses inline keyboard buttons.
-    /// - **Slack** Socket Mode uses Block Kit buttons; webhook fallback and
-    ///   non–Socket Mode deployments use a token text reply.
-    /// - **Discord, Signal, Matrix, WhatsApp** embed a 6-character
-    ///   alphanumeric token in the prompt and wait for a
-    ///   `<token> approve|deny|always` reply on the same conversation.
     async fn request_approval(
         &self,
         _recipient: &str,
@@ -519,16 +761,55 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
-    /// The name of the back-channel that produced the most recent
-    /// [`Channel::request_approval`] decision, when this channel fans a single
-    /// request out to several registered back-channels (the agent's approval
-    /// bridge does this so an ACP editor and a WebSocket dashboard can both
-    /// answer). Ordinary single channels return `None` — their own
-    /// [`Channel::name`] already identifies the deciding surface — so the
-    /// approval audit trail can record the channel that actually decided
-    /// instead of the turn loop's static channel name.
-    fn last_decision_channel(&self) -> Option<String> {
-        None
+    /// Like [`Channel::request_approval`], but also reports which
+    /// back-channel produced the decision when this channel fans the request
+    /// out. Default delegates to [`Channel::request_approval`] with
+    /// `decided_by: None`; only a fan-out bridge needs to override.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        Ok(self
+            .request_approval(recipient, request)
+            .await?
+            .map(|response| AttributedApprovalResponse {
+                response,
+                decided_by: None,
+            }))
+    }
+
+    /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
+    /// approval) on this channel, rendered natively — an embed with one button
+    /// per choice on Discord, an inline keyboard on Telegram, and so on.
+    ///
+    /// UNLIKE [`Channel::request_approval`] this does NOT wait for the answer:
+    /// the prompt outlives the call (and daemon restarts). The choice comes
+    /// back through the channel's normal INBOUND path — a component click
+    /// (stamped with an internal `sop.gate:` marker by the channel's own
+    /// interaction producer, never derivable from message text) or a plain
+    /// `<choice> <reference>` text reply — which the orchestrator resolves
+    /// against the parked gate.
+    ///
+    /// Default `Ok(false)` = "no native prompt on this channel"; the caller
+    /// then falls back to a plain text notice carrying the reply instructions.
+    async fn send_gate_prompt(
+        &self,
+        _recipient: &str,
+        _prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Mark a previously sent gate prompt as resolved: strip its interactive
+    /// controls and replace the body with `outcome` (e.g. "Approved by @user —
+    /// run resumed"), so a decided gate cannot be clicked again and the
+    /// decision is visible in place. `reference` is the same correlation key
+    /// the prompt was sent with. Best-effort: `Ok(false)` when this channel
+    /// has nothing to finalize (no native prompt, or the mapping was lost to a
+    /// restart) — the gate state itself is never affected.
+    async fn finalize_gate_prompt(&self, _reference: &str, _outcome: &str) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Ask the user a multiple-choice question and return the chosen option's text.
@@ -553,16 +834,6 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
-    /// Ask the user a multi-select multiple-choice question and return the
-    /// chosen options' text.
-    ///
-    /// Returns `Ok(Some(answers))` if the channel handled it natively (e.g.
-    /// ACP `elicitation/create` with a `type: array` schema). Returns
-    /// `Ok(None)` to signal the caller should fall back to a non-native
-    /// path (formatted text + reactions, etc.). Default impl returns `None`.
-    ///
-    /// `min_items` and `max_items` map to JSON Schema's `minItems` /
-    /// `maxItems` — clients enforce the bound before submitting.
     async fn request_multi_choice(
         &self,
         _question: &str,
@@ -575,14 +846,9 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Whether this channel can answer free-form (no-choices) `ask_user`
-    /// questions via the standard `send` + `listen` flow.
-    ///
-    /// Channels that can only handle structured choices (e.g. ACP in Phase 1
-    /// of the elicitation rollout — see
-    /// the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>)
-    /// should return `false` so callers can fail fast with a useful error
-    /// instead of timing out on `listen`. Free-form text support flips this
-    /// to `true` in Phase 2.
+    /// questions via the standard `send` + `listen` flow. Channels that only
+    /// handle structured choices return `false` so callers fail fast with a
+    /// useful error instead of timing out on `listen`.
     fn supports_free_form_ask(&self) -> bool {
         true
     }
@@ -591,6 +857,53 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_choice_kind_ids_round_trip_and_reject_unknown() {
+        for kind in [
+            GateChoiceKind::Approve,
+            GateChoiceKind::Deny,
+            GateChoiceKind::Edit,
+            GateChoiceKind::Revise,
+        ] {
+            assert_eq!(GateChoiceKind::from_id(kind.id()), Some(kind));
+        }
+        // Case-insensitive parse; unknown tokens are None (dropped, never coerced).
+        assert_eq!(
+            GateChoiceKind::from_id("APPROVE"),
+            Some(GateChoiceKind::Approve)
+        );
+        assert_eq!(GateChoiceKind::from_id("escalate"), None);
+        assert_eq!(GateChoiceKind::from_id(""), None);
+        // Only the text-collecting choices report collects_text.
+        assert!(GateChoiceKind::Edit.collects_text());
+        assert!(GateChoiceKind::Revise.collects_text());
+        assert!(!GateChoiceKind::Approve.collects_text());
+        assert!(!GateChoiceKind::Deny.collects_text());
+    }
+
+    #[test]
+    fn channel_sop_topic_build_parse_roundtrip() {
+        let topic = ChannelSopTopic::build("git", "main", "pull_request.opened");
+        assert_eq!(topic, "git.main:pull_request.opened");
+        let (channel, alias, event_type) = ChannelSopTopic::parse(&topic);
+        assert_eq!(channel, "git");
+        assert_eq!(alias, Some("main"));
+        assert_eq!(event_type, Some("pull_request.opened"));
+    }
+
+    #[test]
+    fn channel_sop_topic_parses_message_forms() {
+        let (channel, alias, event_type) = ChannelSopTopic::parse("telegram");
+        assert_eq!(channel, "telegram");
+        assert_eq!(alias, None);
+        assert_eq!(event_type, None);
+
+        let (channel, alias, event_type) = ChannelSopTopic::parse("telegram/prod");
+        assert_eq!(channel, "telegram");
+        assert_eq!(alias, Some("prod"));
+        assert_eq!(event_type, None);
+    }
 
     /// Stub channel that overrides `self_handle` so the default
     /// `drop_self_messages` implementation can be exercised.

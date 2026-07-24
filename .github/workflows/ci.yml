@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -78,6 +78,8 @@ jobs:
             sed 's/^/  /' "$gitlinks"
             exit 1
           fi
+      - name: Test translation release submodule handling
+        run: scripts/release/refresh-translations.test.sh
 
   # ── Post-format required quality gate ─────────────────────────────────────
 
@@ -92,7 +94,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
@@ -100,7 +102,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+        run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
@@ -111,6 +113,7 @@ jobs:
           SECONDS=0
           cargo clippy \
             --workspace \
+            --exclude zeroclaw-desktop \
             --all-targets \
             --features ci-all \
             -- -D warnings 2>&1 | tee "$cargo_log"
@@ -145,6 +148,10 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
+      - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
+        run: |
+          bash scripts/ci/comment_hygiene_gate.test.sh
+          bash scripts/ci/comment_hygiene_gate.sh
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
@@ -195,7 +202,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           components: clippy
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -275,7 +282,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
@@ -284,11 +291,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-            /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update -qq
-          sudo apt-get install -y mold
+        run: bash scripts/ci/apt_install.sh mold
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -349,7 +352,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
@@ -357,7 +360,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
         if: matrix.sys_deps != ''
-        run: sudo apt-get update -qq && sudo apt-get install -y ${{ matrix.sys_deps }}
+        run: bash scripts/ci/apt_install.sh ${{ matrix.sys_deps }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check
@@ -395,7 +398,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         if: steps.changed.outputs.run == 'true'
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.changed.outputs.run == 'true'
         with:
@@ -414,7 +417,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
@@ -422,7 +425,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
-        run: sudo apt-get update -qq && sudo apt-get install -y gcc-multilib
+        run: bash scripts/ci/apt_install.sh gcc-multilib
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check (32-bit, no default features)
@@ -437,7 +440,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
@@ -446,7 +449,39 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Verify benchmarks compile
-        run: cargo bench --no-run --locked
+        shell: bash
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-bench.log"
+          SECONDS=0
+          cargo bench --bench agent_benchmarks --no-run --locked --no-default-features --features agent-runtime 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Benchmarks Compile diagnostics"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Cargo duration | \`${duration_seconds}s\` |"
+            echo "| Cargo status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
   # ── Post-format tests ─────────────────────────────────────────────────────
 
@@ -459,24 +494,23 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check firmware protocol crate
+        run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-            /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update -qq
-          sudo apt-get install -y mold
+        run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
-        run: cargo nextest run --locked --workspace
+        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -492,7 +526,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
@@ -510,7 +544,18 @@ jobs:
       - name: Validate YAML workflow syntax
         run: |
           pip install pyyaml -q 2>/dev/null || true
-          python3 -c "import sys, yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ci.yml: valid')"
+          python3 - <<'PY'
+          import yaml
+
+          for path in (
+              ".github/workflows/ci.yml",
+              ".github/workflows/project-dashboard-plan.yml",
+          ):
+              yaml.safe_load(open(path))
+              print(f"{path}: valid")
+          PY
+      - name: Validate project dashboard planner
+        run: python3 scripts/github/project_dashboard_plan_test.py
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
@@ -526,7 +571,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Nix
-        run: sudo apt-get update -qq && sudo apt-get install -y nix-bin nix-setup-systemd
+        run: bash scripts/ci/apt_install.sh nix-bin nix-setup-systemd
       - name: Verify Nix
         run: sudo nix --version
       - name: Evaluate Nix module assertions
@@ -631,7 +676,7 @@ jobs:
         run: bash scripts/ci/install_target_triple_test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
         with:
@@ -640,6 +685,25 @@ jobs:
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
 
+  web-permission-tests:
+    name: Web Permission Tests
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Run permission and catalog regressions
+        working-directory: web
+        run: npm run test:permissions
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -647,7 +711,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

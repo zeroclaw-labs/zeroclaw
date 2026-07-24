@@ -10,6 +10,7 @@ use super::step_contract::{StepFailure, StepRouting};
 
 /// SOP priority level, used for execution mode resolution and scheduling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SopPriority {
     Low,
@@ -67,9 +68,21 @@ impl fmt::Display for SopExecutionMode {
 // ── Filesystem event kind ───────────────────────────────────────
 
 /// A normalized filesystem change kind reported by the watcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumIter,
+    strum_macros::IntoStaticStr,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum FilesystemEventKind {
     Created,
     Modified,
@@ -99,11 +112,36 @@ impl std::str::FromStr for FilesystemEventKind {
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumDiscriminants,
+    zeroclaw_macros::TriggerFields,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[strum_discriminants(
+    name(SopTriggerSource),
+    derive(
+        Hash,
+        Serialize,
+        Deserialize,
+        strum_macros::EnumIter,
+        strum_macros::IntoStaticStr,
+        strum_macros::Display
+    ),
+    serde(rename_all = "lowercase"),
+    strum(serialize_all = "lowercase"),
+    doc = "The source type of an incoming event that may trigger an SOP. \
+           Derived from `SopTrigger`; one discriminant per trigger variant."
+)]
 pub enum SopTrigger {
     /// MQTT message arrival. Live: delivered by the MQTT listener.
+    #[trigger(display = "topic")]
     Mqtt {
         /// Topic filter. `+` matches one level, `#` matches the remaining levels.
         topic: String,
@@ -113,16 +151,19 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     /// Inbound HTTP request. Defined and matched, but no live route feeds it.
+    #[trigger(display = "path")]
     Webhook {
         /// Request path matched exactly against the event path.
         path: String,
     },
-    /// Time-based firing. Defined and matched, but no scheduler feeds it.
+    /// Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).
+    #[trigger(display = "expression")]
     Cron {
         /// Cron expression evaluated over the run window.
         expression: String,
     },
     /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
+    #[trigger(display = "board/signal")]
     Peripheral {
         /// Board identifier the signal originates from.
         board: String,
@@ -133,6 +174,7 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     /// Filesystem change. Live: delivered by the filesystem watcher.
+    #[trigger(display = "path")]
     Filesystem {
         /// Path glob (`*`, `**`, `?`); a bare directory matches anything under it.
         path: String,
@@ -144,16 +186,38 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     /// Calendar event state. Defined and matched, but no poller feeds it live.
+    #[trigger(display = "calendar_source")]
     Calendar {
         /// Calendar source identifier the event originates from.
         calendar_source: String,
         /// Calendar IDs to scope to; empty matches all of the source's calendars.
         #[serde(default)]
         calendar_ids: Vec<String>,
+        /// Optional expression evaluated against the calendar event payload.
+        #[serde(default)]
+        condition: Option<String>,
+    },
+    /// Inbound message or forge/platform event on a configured channel
+    /// (telegram, discord, slack, git, ...). Live: delivered by the channel
+    /// orchestrator when the channel's SOP dispatch is enabled. The Git forge
+    /// producer sets an event topic of the form `<channel>.<alias>:<event_type>`
+    /// and puts `event_type` in the payload, so an authored `condition` filters
+    /// forge events by type without a second trigger shape.
+    #[trigger(config_derived, display = "channel", opt = "alias")]
+    Channel {
+        /// `ChannelKind` snake_case value naming the channel type.
+        channel: String,
+        /// Optional configured-instance alias; unset matches every instance.
+        #[serde(default)]
+        alias: Option<String>,
+        /// Optional expression evaluated against the message payload.
+        #[serde(default)]
+        condition: Option<String>,
     },
     /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
     /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
+    #[trigger(display = "routing_key")]
     Amqp {
         /// Routing-key filter (topic-exchange semantics): `.`-delimited words,
         /// `*` matches one word, `#` matches zero or more words.
@@ -164,20 +228,9 @@ pub enum SopTrigger {
     },
 }
 
-impl fmt::Display for SopTrigger {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mqtt { topic, .. } => write!(f, "mqtt:{topic}"),
-            Self::Webhook { path } => write!(f, "webhook:{path}"),
-            Self::Cron { expression } => write!(f, "cron:{expression}"),
-            Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
-            Self::Filesystem { path, .. } => write!(f, "filesystem:{path}"),
-            Self::Calendar {
-                calendar_source, ..
-            } => write!(f, "calendar:{calendar_source}"),
-            Self::Manual => write!(f, "manual"),
-            Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
-        }
+impl SopTrigger {
+    pub fn source(&self) -> SopTriggerSource {
+        SopTriggerSource::from(self)
     }
 }
 
@@ -185,6 +238,7 @@ impl fmt::Display for SopTrigger {
 
 /// The kind of a workflow step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopStepKind {
     /// Normal step — executed by the agent (or deterministic handler).
@@ -192,6 +246,8 @@ pub enum SopStepKind {
     Execute,
     /// Checkpoint step — pauses execution and waits for human approval.
     Checkpoint,
+    /// Deterministic capability step - executed by the SOP capability registry.
+    Capability,
 }
 
 impl fmt::Display for SopStepKind {
@@ -199,6 +255,7 @@ impl fmt::Display for SopStepKind {
         match self {
             Self::Execute => write!(f, "execute"),
             Self::Checkpoint => write!(f, "checkpoint"),
+            Self::Capability => write!(f, "capability"),
         }
     }
 }
@@ -206,10 +263,10 @@ impl fmt::Display for SopStepKind {
 // ── Typed step parameters ────────────────────────────────────────
 
 /// JSON Schema fragment for validating step input/output data.
-///
 /// Stored as a raw `serde_json::Value` so callers can validate without
 /// pulling in a full JSON Schema library.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StepSchema {
     /// JSON Schema object describing expected input shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,14 +278,58 @@ pub struct StepSchema {
 
 // ── Step ────────────────────────────────────────────────────────
 
-/// A single step in an SOP procedure, parsed from SOP.md.
+/// An authored tool invocation planned for a step. Args may embed
+/// `{{steps.N.path}}` / `{{calls.K.path}}` bindings (see `sop::binding`)
+/// that resolve against captured run data before dispatch. `pinned`
+/// carries a sample output (typically lifted from a real run's
+/// `StepToolCall.output_data`) so downstream bindings can be authored
+/// and previewed without re-executing the tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct PlannedToolCall {
+    pub tool: String,
+    /// Argument template; string leaves may contain bindings.
+    #[serde(default)]
+    pub args: serde_json::Value,
+    /// Pinned sample output for authoring/preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<serde_json::Value>,
+}
+
+/// Persisted canvas coordinate for a step node. Written by the Blueprint
+/// editor when a node is dragged; never edited in the step-definition form.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StepPos {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A single step in an SOP procedure, parsed from SOP.md.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopStep {
+    /// Ordinal position of this step within the procedure. Steps run in
+    /// number order unless routing overrides the sequence; the daemon
+    /// renumbers on save so gaps and reorders normalize to 1..N.
+    #[serde(default)]
     pub number: u32,
+    /// Short human label for the step, shown on the canvas node and in the
+    /// step list. Leave blank and the surface falls back to "untitled".
+    #[serde(default)]
     pub title: String,
+    /// The step's instruction body in Markdown. This is the prompt the
+    /// running agent executes for the step; bindings like `{{steps.N}}`
+    /// resolve against prior step outputs at run time.
+    #[serde(default)]
     pub body: String,
+    /// Advisory tool names surfaced to the agent for this step. Legacy alias
+    /// for `scope.allow`; when `step_scope_enforce` is off these are hints,
+    /// not a hard restriction.
     #[serde(default)]
     pub suggested_tools: Vec<String>,
+    /// Pause for human confirmation before this step runs. Independent of
+    /// `checkpoint` kind and the SOP-level approval gate; both still apply.
     #[serde(default)]
     pub requires_confirmation: bool,
     /// Step kind: `execute` (default) or `checkpoint`.
@@ -249,6 +350,45 @@ pub struct SopStep {
     /// Optional per-step execution mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SopExecutionMode>,
+    /// Ordered tool calls planned for this step. Args may carry
+    /// `{{steps.N}}` / `{{calls.K}}` bindings validated at save time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<PlannedToolCall>,
+    /// Persisted canvas coordinate, set by dragging the node in the Blueprint
+    /// editor. Absent until the node is moved; not surfaced in the step form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<StepPos>,
+    /// Agent alias that runs this step. Overrides the SOP's parent agent when
+    /// set; unset inherits the parent. Authored, persisted, and resolved into
+    /// the executing action via `effective_agent` (step override then parent).
+    /// Spawning a distinct per-step agent's own session at execution time is
+    /// staged follow-on work; today the resolved alias is stamped on the action
+    /// and the active agent loop executes the step body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Capability identifier used when `kind = "capability"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Capability arguments, serialized as `with` in TOML/JSON definitions.
+    #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
+    pub capability_input: Option<serde_json::Value>,
+    /// Approval policy name (a key in `[sop.approval].policies`) the approval broker
+    /// enforces for this step's gate: required approver group + quorum. `None` keeps
+    /// today's behavior (`approval_mode` alone governs, no membership/quorum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Authored gate-notice template for a HITL step (`- prompt:` bullet).
+    /// `{{path.to.field}}` placeholders resolve against the step's piped input
+    /// (the trigger payload at step 1, the previous step's output later) — pure
+    /// lookups, no logic. Rendered into the out-of-band approval notice so the
+    /// approver sees WHAT they are approving; absent = an automatic summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_prompt: Option<String>,
+    /// Editable-field opt-in for a checkpoint step (`- edit: body` bullet): the
+    /// named field of the piped value an approver may amend before the run
+    /// resumes (the gate prompt gains an "Edit" choice). Absent = no editing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<String>,
 }
 
 impl Default for SopStep {
@@ -265,11 +405,33 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::default(),
             mode: None,
+            calls: Vec::new(),
+            pos: None,
+            agent: None,
+            capability: None,
+            capability_input: None,
+            policy: None,
+            gate_prompt: None,
+            edit: None,
         }
     }
 }
 
 impl SopStep {
+    pub fn capability_id(&self) -> Option<&str> {
+        self.capability.as_deref()
+    }
+
+    pub fn capability_call_input(&self, piped_input: serde_json::Value) -> serde_json::Value {
+        let Some(mut configured) = self.capability_input.clone() else {
+            return piped_input;
+        };
+        if let Some(object) = configured.as_object_mut() {
+            object.entry("input").or_insert(piped_input);
+        }
+        configured
+    }
+
     pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
         let mut scope = self.scope.clone();
         if !self.suggested_tools.is_empty() {
@@ -280,30 +442,72 @@ impl SopStep {
         }
         scope
     }
+
+    /// The agent alias that runs this step: the step's own override when set,
+    /// otherwise the SOP's parent agent.
+    pub fn effective_agent<'a>(&'a self, parent: Option<&'a str>) -> Option<&'a str> {
+        self.agent.as_deref().or(parent)
+    }
 }
 
 // ── SOP ─────────────────────────────────────────────────────────
 
 /// A complete Standard Operating Procedure definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Sop {
+    /// Unique procedure name. Doubles as the on-disk directory key, so a
+    /// rename in the editor moves the SOP's folder. Must be non-empty.
     pub name: String,
+    /// Free-text summary of what the procedure does and when it fires. Shown
+    /// in the SOP list and header; purely descriptive, never executed.
     pub description: String,
+    /// Semantic version string for the procedure definition (e.g. `1.0.0`).
+    /// Bump it when you change step behavior so runs are traceable.
     pub version: String,
+    /// Scheduling priority when concurrency limits force a choice between
+    /// runnable procedures: `critical`, `high`, `normal` (default), `low`.
     pub priority: SopPriority,
+    /// How steps are driven: `auto`, `supervised` (default), `step_by_step`,
+    /// `priority_based`, or `deterministic`. `deterministic = true` forces
+    /// the last regardless of this field.
     pub execution_mode: SopExecutionMode,
+    /// Signals that start a run. A procedure may bind several triggers; any
+    /// one firing (subject to its own condition) launches the SOP.
     pub triggers: Vec<SopTrigger>,
+    /// Ordered step definitions. This is the body of the procedure; the
+    /// daemon renumbers and remaps routing refs on save.
     pub steps: Vec<SopStep>,
+    /// Minimum seconds between successive runs of this procedure. `0`
+    /// (default) disables the cooldown and back-to-back runs are allowed.
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
+    /// Maximum simultaneous runs of this one procedure. Excess trigger
+    /// firings queue or drop per the engine's concurrency policy. Default 1.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
     #[serde(skip)]
+    #[cfg_attr(feature = "schema-export", schemars(skip))]
     pub location: Option<PathBuf>,
     /// When true, sets execution_mode to Deterministic.
     /// Steps execute sequentially without LLM round-trips.
     #[serde(default)]
     pub deterministic: bool,
+    /// How to handle a trigger that cannot be admitted immediately because this
+    /// SOP's execution slots are full (A2). Default `parallel`.
+    #[serde(default)]
+    pub admission_policy: SopAdmissionPolicy,
+    /// Upper bound on runs of this SOP parked at a HITL approval at once
+    /// (`0` = unlimited). Once reached, further triggers are deferred (surfaced for
+    /// backpressure/redelivery) rather than silently dropped. Default `0`.
+    #[serde(default = "default_max_pending_approvals")]
+    pub max_pending_approvals: u32,
+    /// Parent agent alias that owns this procedure. Every `execute` step runs
+    /// as this agent unless the step names its own `agent` override. Required
+    /// for headless triggers (mqtt, webhook, cron, amqp), which have no
+    /// ambient agent loop to borrow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -314,18 +518,92 @@ fn default_max_concurrent() -> u32 {
     1
 }
 
+fn default_max_pending_approvals() -> u32 {
+    0
+}
+
+/// How concurrent triggers are handled when a SOP's execution slots are full. A
+/// run parked at a HITL approval releases its slot (A1), so this governs the
+/// remaining case: too many runs actively *executing* at once. No variant ever
+/// silently drops a trigger except `Drop`, which is explicit opt-in.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SopAdmissionPolicy {
+    /// Admit up to `max_concurrent` concurrent runs; a trigger that cannot admit
+    /// now is DEFERRED (surfaced for backpressure/redelivery), never silently
+    /// dropped. Best fit for independent work like PR-request approvals.
+    #[default]
+    Parallel,
+    /// Serialize: admit only when no run of this SOP is active or parked; other
+    /// triggers are deferred. For pipelines whose pre-approval steps must not overlap.
+    Hold,
+    /// Collapse concurrent triggers: when a run is already in flight for this SOP a
+    /// new trigger is coalesced (dropped as redundant - the in-flight run already
+    /// covers the latest state). For "only current state matters" SOPs.
+    Coalesce,
+    /// Legacy fire-and-forget: a trigger that cannot admit now is dropped. Explicit
+    /// opt-in only; never the default.
+    Drop,
+}
+
+impl fmt::Display for SopAdmissionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parallel => write!(f, "parallel"),
+            Self::Hold => write!(f, "hold"),
+            Self::Coalesce => write!(f, "coalesce"),
+            Self::Drop => write!(f, "drop"),
+        }
+    }
+}
+
+/// A2: the outcome of evaluating a matched trigger against a SOP's
+/// `SopAdmissionPolicy`. Advisory - `Admit` still passes through the authoritative
+/// CAS `start_run`; the non-admit variants are surfaced by the dispatch layer
+/// (logged + carried on `DispatchResult`) so a trigger is never silently lost.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SopAdmission {
+    /// A slot is available - proceed to start the run.
+    Admit,
+    /// Cannot admit now (execution slots or the pending-approval pool are full).
+    /// Apply backpressure / redelivery rather than dropping.
+    Defer { reason: String },
+    /// A run is already in flight for this SOP; collapse this trigger into it.
+    Coalesce { existing_run_id: String },
+    /// Drop this trigger: either the `drop` policy with no free slot, or a cooldown
+    /// / unknown SOP (which drop regardless of policy).
+    Drop { reason: String },
+}
+
 // ── TOML manifest (internal parse target) ───────────────────────
 
 /// Top-level SOP.toml structure.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopManifest {
     pub sop: SopMeta,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<SopTrigger>,
+    /// Persisted canvas coordinates per step. Written by the Blueprint editor,
+    /// kept out of SOP.md so step prose stays position-free. Merged back onto
+    /// `SopStep::pos` at load time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub positions: Vec<StepPosition>,
+    #[serde(default)]
+    pub steps: Vec<SopStep>,
+}
+
+/// One step's persisted canvas coordinate in SOP.toml.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StepPosition {
+    pub step: u32,
+    pub x: f64,
+    pub y: f64,
 }
 
 /// The `[sop]` table in SOP.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopMeta {
     pub name: String,
     pub description: String,
@@ -333,7 +611,7 @@ pub struct SopMeta {
     pub version: String,
     #[serde(default)]
     pub priority: SopPriority,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<SopExecutionMode>,
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
@@ -342,6 +620,49 @@ pub struct SopMeta {
     /// Opt-in deterministic execution (no LLM round-trips between steps).
     #[serde(default)]
     pub deterministic: bool,
+    /// Concurrent-trigger admission policy (`parallel` | `hold` | `coalesce` | `drop`).
+    #[serde(default)]
+    pub admission_policy: SopAdmissionPolicy,
+    /// Max runs parked at a HITL approval at once (`0` = unlimited).
+    #[serde(default = "default_max_pending_approvals")]
+    pub max_pending_approvals: u32,
+    /// Parent agent alias that owns the procedure. Steps run as this agent
+    /// unless a step overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+impl SopManifest {
+    pub fn from_sop(sop: &Sop) -> Self {
+        Self {
+            sop: SopMeta {
+                name: sop.name.clone(),
+                description: sop.description.clone(),
+                version: sop.version.clone(),
+                priority: sop.priority,
+                execution_mode: Some(sop.execution_mode),
+                cooldown_secs: sop.cooldown_secs,
+                max_concurrent: sop.max_concurrent,
+                deterministic: sop.deterministic,
+                admission_policy: sop.admission_policy,
+                max_pending_approvals: sop.max_pending_approvals,
+                agent: sop.agent.clone(),
+            },
+            triggers: sop.triggers.clone(),
+            positions: sop
+                .steps
+                .iter()
+                .filter_map(|s| {
+                    s.pos.map(|p| StepPosition {
+                        step: s.number,
+                        x: p.x,
+                        y: p.y,
+                    })
+                })
+                .collect(),
+            steps: sop.steps.clone(),
+        }
+    }
 }
 
 fn default_sop_version() -> String {
@@ -349,35 +670,6 @@ fn default_sop_version() -> String {
 }
 
 // ── Event ────────────────────────────────────────────────────────
-
-/// The source type of an incoming event that may trigger an SOP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SopTriggerSource {
-    Mqtt,
-    Webhook,
-    Cron,
-    Peripheral,
-    Filesystem,
-    Calendar,
-    Manual,
-    Amqp,
-}
-
-impl fmt::Display for SopTriggerSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mqtt => write!(f, "mqtt"),
-            Self::Webhook => write!(f, "webhook"),
-            Self::Cron => write!(f, "cron"),
-            Self::Peripheral => write!(f, "peripheral"),
-            Self::Filesystem => write!(f, "filesystem"),
-            Self::Calendar => write!(f, "calendar"),
-            Self::Manual => write!(f, "manual"),
-            Self::Amqp => write!(f, "amqp"),
-        }
-    }
-}
 
 /// An incoming event that may trigger one or more SOPs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +689,7 @@ pub struct SopEvent {
 
 /// Status of an SOP execution run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopRunStatus {
     Pending,
@@ -442,6 +735,31 @@ impl fmt::Display for SopStepStatus {
     }
 }
 
+/// One tool invocation captured during a step's execution. A step may
+/// make any number of calls (including the same tool repeatedly);
+/// `index` preserves invocation order so authoring surfaces can replay
+/// the sequence and map data between calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StepToolCall {
+    /// Zero-based invocation order within the step.
+    pub index: u32,
+    pub tool: String,
+    /// Arguments the tool actually received.
+    pub args: serde_json::Value,
+    pub success: bool,
+    /// Display text of the tool output.
+    pub output: String,
+    /// Structured output when the tool declared one (`ToolOutput::data`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Wall-clock duration in milliseconds.
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
 /// Result of executing a single SOP step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopStepResult {
@@ -450,6 +768,17 @@ pub struct SopStepResult {
     pub output: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// The agent whose policy/tools/provider actually executed this step —
+    /// the acting authority the audit record must name. For a step that
+    /// delegated to a different agent this is the step agent, not the turn's
+    /// outer agent; `None` for deterministic/checkpoint steps, drivers with
+    /// no resolved alias, and legacy records persisted before capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent: Option<String>,
+    /// Ordered tool invocations made while executing this step. Empty
+    /// for checkpoint steps and legacy records persisted before capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<StepToolCall>,
 }
 
 /// A full SOP execution run (from trigger to completion).
@@ -473,6 +802,19 @@ pub struct SopRun {
     /// Number of LLM calls saved by deterministic execution in this run.
     #[serde(default)]
     pub llm_calls_saved: u64,
+    /// Gate-presentation counter: bumped on each `Revise` re-presentation AND on
+    /// each new checkpoint park after the first, so EVERY prompt this run ever
+    /// sends has a unique revision-qualified reference (`<run_id>#<rev>`; bare =
+    /// 0, the run's very first gate). An answer on a superseded prompt — an older
+    /// draft, or an earlier GATE's leftover buttons — can never resolve the
+    /// current one.
+    #[serde(default)]
+    pub revision: u32,
+    /// `revision` as of the CURRENT gate's first presentation. `revision -
+    /// revision_base` = re-drafts spent at this gate (the per-gate revise cap);
+    /// reset when a new checkpoint parks, untouched by revise re-parks.
+    #[serde(default)]
+    pub revision_base: u32,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -481,6 +823,41 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
     }
     fn alias(&self) -> &str {
         &self.sop_name
+    }
+}
+
+/// Lightweight projection of a run for list surfaces (Runs page). Carries
+/// just enough to render a row and open the per-run overlay, without the
+/// full step-result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunSummary {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatus,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    /// Where the run's trigger came from (manual, a channel, cron, ...).
+    pub trigger_source: String,
+    /// True while the run is live (in the engine's active set) rather than
+    /// a retained terminal record.
+    pub active: bool,
+}
+
+impl SopRunSummary {
+    pub fn from_run(run: &SopRun, active: bool) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            status: run.status,
+            current_step: run.current_step,
+            total_steps: run.total_steps,
+            started_at: run.started_at.clone(),
+            completed_at: run.completed_at.clone(),
+            trigger_source: run.trigger_event.source.to_string(),
+            active,
+        }
     }
 }
 
@@ -522,7 +899,30 @@ pub struct DeterministicSavings {
 /// What the engine instructs the caller to do next after a state transition.
 #[derive(Debug, Clone)]
 pub enum SopRunAction {
-    /// Inject this step into the agent for execution.
+    /// Inject this step into the agent for execution. `step.agent` is the
+    /// resolved effective agent (step override then parent), not the raw
+    /// persisted override; consumers must not re-resolve it. Consumers MUST run
+    /// the step AS that effective agent: when it names a different agent than
+    /// the one running the turn, the step's COMPLETE per-agent execution
+    /// contract must be re-assembled for that agent, never inherited from the
+    /// parent turn — its gated tool registry, security policy, MCP scope,
+    /// provider binding (incl. the agent's own temperature), resolved runtime
+    /// controls (iteration/result/context limits, parsing/parallelism, dedup
+    /// exemptions, tool filter groups), and an approval manager built from the
+    /// step agent's risk profile under the parent surface's interactivity mode
+    /// (a live operator approval route survives delegation). The step runs on
+    /// an EXPLICIT child transcript (the step agent's own system prompt plus
+    /// the step context); the parent turn's conversation is never sent to the
+    /// step agent's provider, and only the step's final output flows back.
+    /// Records emitted while the step runs stamp the step agent as the acting
+    /// identity, with the delegating agent preserved as parent correlation.
+    /// A driver path that carries the re-assembly handle (the live runtime and
+    /// channel-orchestrator turn paths) re-assembles the step agent; a path
+    /// that does NOT carry it (e.g. a bounded delegate sub-loop) MUST fail the
+    /// cross-agent step CLOSED rather than run it with the parent's context.
+    /// Either way the invariant holds: a cross-agent step never executes with
+    /// a broader scope than its own agent — it is re-assembled or it is
+    /// refused.
     ExecuteStep {
         run_id: String,
         step: SopStep,
@@ -565,9 +965,54 @@ pub enum SopRunAction {
     },
 }
 
+/// Exhaustive sample builder: one representative `SopTrigger` per source.
+/// The match has no wildcard, so adding a source fails to compile here until a
+/// sample is supplied, keeping every drift walk that consumes it exhaustive.
+#[cfg(test)]
+pub(crate) fn sample_trigger(source: SopTriggerSource) -> SopTrigger {
+    match source {
+        SopTriggerSource::Mqtt => SopTrigger::Mqtt {
+            topic: "t".into(),
+            condition: None,
+        },
+        SopTriggerSource::Webhook => SopTrigger::Webhook {
+            path: "/hook".into(),
+        },
+        SopTriggerSource::Cron => SopTrigger::Cron {
+            expression: "* * * * *".into(),
+        },
+        SopTriggerSource::Peripheral => SopTrigger::Peripheral {
+            board: "b".into(),
+            signal: "s".into(),
+            condition: None,
+        },
+        SopTriggerSource::Filesystem => SopTrigger::Filesystem {
+            path: "/p".into(),
+            events: vec![],
+            condition: None,
+        },
+        SopTriggerSource::Calendar => SopTrigger::Calendar {
+            calendar_source: "src".into(),
+            calendar_ids: vec![],
+            condition: None,
+        },
+        SopTriggerSource::Channel => SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: None,
+            condition: None,
+        },
+        SopTriggerSource::Manual => SopTrigger::Manual,
+        SopTriggerSource::Amqp => SopTrigger::Amqp {
+            routing_key: "k".into(),
+            condition: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use strum::IntoEnumIterator;
 
     #[test]
     fn priority_display() {
@@ -595,11 +1040,74 @@ mod tests {
         let calendar = SopTrigger::Calendar {
             calendar_source: "microsoft365".into(),
             calendar_ids: vec!["primary".into()],
+            condition: None,
         };
         assert_eq!(calendar.to_string(), "calendar:microsoft365");
 
         let manual = SopTrigger::Manual;
         assert_eq!(manual.to_string(), "manual");
+    }
+
+    #[test]
+    fn trigger_display_covers_every_variant() {
+        // Walks every source through the exhaustive sample builder and checks
+        // structural Display invariants that hold for all sources, with no
+        // per-source string table to drift. A variant missing its
+        // `#[trigger(display=...)]` attribute renders as the bare source and
+        // fails the payload-suffix check; a new source is forced through
+        // `sample_trigger` by the compiler.
+        for source in SopTriggerSource::iter() {
+            let trigger = sample_trigger(source);
+            let rendered = trigger.to_string();
+            let source_str = source.to_string();
+
+            assert!(
+                rendered == source_str || rendered.starts_with(&format!("{source_str}:")),
+                "source {source} Display '{rendered}' must be the bare source or \
+                 '{source_str}:<value>'"
+            );
+
+            // Whether the variant carries authoring fields is derived from its
+            // serde form (keys beyond the `type` tag), not a hardcoded list.
+            let json = serde_json::to_value(&trigger).unwrap();
+            let payload_fields = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| k.as_str() != "type")
+                .count();
+
+            if payload_fields == 0 {
+                assert_eq!(
+                    rendered, source_str,
+                    "fieldless source {source} must render as the bare source"
+                );
+            } else {
+                assert_ne!(
+                    rendered, source_str,
+                    "source {source} has {payload_fields} field(s) but renders as the \
+                     bare source; its `#[trigger(display=...)]` attribute is missing"
+                );
+                let suffix = &rendered[source_str.len() + 1..];
+                assert!(
+                    !suffix.is_empty(),
+                    "source {source} renders an empty value suffix"
+                );
+            }
+        }
+        // The Channel alias branch is a within-variant option, not a source, so
+        // it is exercised explicitly: alias present must append `/{alias}`.
+        let bare = SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: None,
+            condition: None,
+        };
+        let aliased = SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: Some("prod".into()),
+            condition: None,
+        };
+        assert_eq!(aliased.to_string(), format!("{}/prod", bare));
     }
 
     #[test]
@@ -623,6 +1131,7 @@ mod tests {
         let trigger = SopTrigger::Calendar {
             calendar_source: "microsoft365".into(),
             calendar_ids: vec!["primary".into()],
+            condition: None,
         };
 
         let json = serde_json::to_string(&trigger).unwrap();
@@ -646,7 +1155,7 @@ calendar_ids = ["primary", "team"]
         let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
 
         assert!(
-            matches!(trigger, SopTrigger::Calendar { ref calendar_source, ref calendar_ids }
+            matches!(trigger, SopTrigger::Calendar { ref calendar_source, ref calendar_ids, .. }
                 if calendar_source == "microsoft365"
                     && calendar_ids.as_slice() == ["primary", "team"])
         );
@@ -711,6 +1220,22 @@ path = "/var/inbox"
     }
 
     #[test]
+    fn trigger_channel_toml() {
+        let toml_str = r#"
+type = "channel"
+channel = "git"
+alias = "main"
+condition = "$.event_type == \"pull_request.opened\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(matches!(
+            trigger,
+            SopTrigger::Channel { ref channel, ref alias, .. }
+                if channel == "git" && alias.as_deref() == Some("main")
+        ));
+    }
+
+    #[test]
     fn filesystem_event_kind_display_and_serde() {
         assert_eq!(FilesystemEventKind::Created.to_string(), "created");
         assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
@@ -747,6 +1272,7 @@ path = "/var/inbox"
     fn step_kind_display() {
         assert_eq!(SopStepKind::Execute.to_string(), "execute");
         assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+        assert_eq!(SopStepKind::Capability.to_string(), "capability");
     }
 
     #[test]
@@ -806,6 +1332,8 @@ path = "/var/inbox"
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+        assert!(step.capability.is_none());
+        assert!(step.capability_input.is_none());
     }
 
     #[test]
@@ -822,6 +1350,8 @@ path = "/var/inbox"
         assert!(value.get("routing").is_none());
         assert!(value.get("on_failure").is_none());
         assert!(value.get("mode").is_none());
+        assert!(value.get("capability").is_none());
+        assert!(value.get("with").is_none());
     }
 
     #[test]
@@ -848,6 +1378,7 @@ path = "/sop/test"
     #[test]
     fn trigger_source_display() {
         assert_eq!(SopTriggerSource::Mqtt.to_string(), "mqtt");
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
         assert_eq!(SopTriggerSource::Manual.to_string(), "manual");
     }
 
@@ -890,14 +1421,18 @@ path = "/sop/test"
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "Step 1 done".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:00:05Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

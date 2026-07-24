@@ -1,20 +1,4 @@
 //! Matrix channel using matrix-rust-sdk 0.16.
-//!
-//! Organisation (single file, internal `mod` blocks):
-//! - `markers`: parse `[image:...] [voice:...]` etc. from outbound text
-//! - `mention`: detect `m.mentions.user_ids` + body fallback
-//! - `allowlist`: filter inbound by sender + room
-//! - `approval`: 8-char token gen + reply parser
-//! - `context`: thread-root preamble fetcher + delivered-set
-//! - `streaming`: Partial + MultiMessage state machines
-//! - `session`: `session.json` blob persistence next to the SQLite store
-//! - `client`: SDK build, login/restore, recovery, cross-signing bootstrap, alias resolve
-//! - `inbound`: event handlers + sync loop
-//! - `outbound`: Channel::send + reactions + redact + media upload
-//!
-//! All protocol details (E2EE, sync token, encrypted upload, edits, threads, recovery)
-//! are delegated to the SDK. We only own user-facing config logic and small bits of
-//! cross-cutting state.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -192,12 +176,6 @@ mod mention {
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
 mod allowlist {
-    /// Matrix user IDs are spec-lowercase for the localpart, but some
-    /// homeservers accept capitalised forms in the auth layer. An operator
-    /// who configured `allowed_users = ["@Bot:Example.org"]` would silently
-    /// see no messages on a strict byte match — the channel filters to
-    /// `@bot:example.org`. ASCII case-insensitive match is the conservative
-    /// reading.
     pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
         crate::allowlist::is_user_allowed(
             allowed_users,
@@ -421,11 +399,6 @@ mod streaming {
         EmptyError,
     }
 
-    /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
-    /// with the accumulated agent output; we send each `\n\n`-bounded paragraph
-    /// as its own room message, threaded under `thread_anchor` when present.
-    /// `sent_so_far` is a byte counter into the accumulated text — everything
-    /// before that index has already been emitted.
     #[derive(Debug, Clone)]
     pub(super) struct MultiDraft {
         pub thread_anchor: Option<OwnedEventId>,
@@ -546,16 +519,6 @@ mod session {
         state_dir.join(SESSION_FILE)
     }
 
-    /// Load the saved login blob. Returns `Ok(None)` when:
-    /// - the file doesn't exist (fresh install, expected first-run state), or
-    /// - the file exists but is corrupt JSON (manual edit gone wrong, partial
-    ///   write from a prior interrupted save). The corrupt case used to
-    ///   propagate an error and stall startup; treating it as a missing
-    ///   session lets the build flow's auto-recovery path fall through to
-    ///   fresh login when credentials are available.
-    ///
-    /// Read errors (permission denied, I/O failure on the underlying file)
-    /// still propagate — those are real problems the operator should see.
     pub(super) fn load(state_dir: &Path) -> anyhow::Result<Option<SessionBlob>> {
         let p = path(state_dir);
         if !p.exists() {
@@ -672,12 +635,6 @@ mod client {
 
     const WHOAMI_ENDPOINT: &str = "_matrix/client/v3/account/whoami";
 
-    /// Per-request HTTP timeout for the Matrix client. Must stay strictly
-    /// greater than [`super::inbound::SYNC_LONGPOLL_TIMEOUT`] so an idle
-    /// `/sync` long-poll always completes server-side before the HTTP layer's
-    /// own deadline fires. Without this, `Client::builder()` falls back to the
-    /// SDK's 30s default request timeout, which races the (unbounded-by-default)
-    /// long-poll and makes every idle sync error out at exactly 30 seconds.
     pub(super) const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
     const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
     const WHOAMI_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
@@ -708,26 +665,6 @@ mod client {
         state_dir.join("store")
     }
 
-    /// Build the SDK client, handling all three of:
-    /// - normal restore from a consistent session.json + store/
-    /// - first-run fresh login
-    /// - corruption recovery (with password)
-    ///
-    /// Corruption signals (per matrix-sdk encryption.md and SDK source —
-    /// `IdentityManager::update_or_create_device` rejects updates with
-    /// `SigningKeyChanged`, and `Encryption::send_outgoing_request` records
-    /// the durable `OneTimeKeyAlreadyUploaded` state-store flag): the SDK
-    /// rejects a device key update when the store and server disagree, and
-    /// offers no public API to selectively forget a device record. The
-    /// official remediation is "Clear storage to create a new device". We
-    /// do that automatically when password + user_id are configured;
-    /// otherwise we surface a clear error so the operator can either
-    /// provide a password or wipe state manually.
-    ///
-    /// Wrong-recovery-key failures are *not* a corruption signal — they're
-    /// an operator-config issue. We log them clearly and continue with
-    /// `bootstrap_cross_signing_if_needed`, which sets up fresh cross-signing
-    /// when no identity could be imported.
     pub(super) async fn build(config: &MatrixConfig, state_dir: &Path) -> Result<Client> {
         build_attempt(config, state_dir, 0).await
     }
@@ -798,12 +735,6 @@ mod client {
         has_password && has_user_id
     }
 
-    /// Decide whether a saved session belongs to a different Matrix account
-    /// than the one this channel block is configured for. Restoring a foreign
-    /// session would run the block as the wrong bot identity. Only a fully
-    /// qualified configured `user_id` (`@local:server`) is compared against the
-    /// saved canonical MXID; a bare localpart or unset `user_id` cannot be
-    /// compared without false positives, so those never flag.
     pub(super) fn saved_session_is_foreign(
         config: &MatrixConfig,
         blob: &session::SessionBlob,
@@ -851,11 +782,6 @@ mod client {
             .await;
         }
 
-        // The saved device_id is canonical — it's what the server actually
-        // assigned at login. config.device_id is only a hint for first-ever
-        // login. If they drift (e.g. after auto-recovery generates a fresh
-        // device, or the operator edits config), warn but honor the saved
-        // value. Wiping on drift would create a recovery loop.
         if let (Some(blob), Some(want)) = (
             saved.as_ref(),
             config.device_id.as_deref().filter(|s| !s.is_empty()),
@@ -876,11 +802,6 @@ mod client {
             );
         }
 
-        // Detect orphan crypto state — store data without a session blob.
-        // This typically happens after a manual `rm session.json` or when a
-        // prior install crashed mid-write. Restoring is impossible; logging
-        // in fresh on top of the orphan store reproduces the same
-        // SigningKeyChanged / Duplicate-OTK loop the user just hit.
         if saved.is_none() && store_has_orphan_data(state_dir) {
             return recover_or_bail(
                 config,
@@ -947,15 +868,6 @@ mod client {
                 }
             }
 
-            // Durable corruption signal: when the matrix-sdk encounters a
-            // duplicate-OTK upload (the server says it already has the
-            // one-time-keys we're trying to upload),
-            // `Encryption::send_outgoing_request` records the
-            // `StateStoreDataKey::OneTimeKeyAlreadyUploaded` flag in the
-            // state store. Per the SDK's own comment, this means "we
-            // forgot about some of our one-time keys. This will lead to
-            // UTDs." The flag survives restarts. The only remediation is
-            // to wipe and re-login.
             let otk_corruption_flagged = client
                 .state_store()
                 .get_kv_data(matrix_sdk::store::StateStoreDataKey::OneTimeKeyAlreadyUploaded)
@@ -988,28 +900,11 @@ mod client {
             }
         }
 
-        // Step 2: import existing cross-signing + room keys from the
-        // homeserver's encrypted backup. Failure here (wrong recovery_key,
-        // missing backup, secret-storage rotated) is non-fatal — bootstrap
-        // below fills in fresh cross-signing instead. The operator should
-        // see the warning and either fix the recovery key or accept fresh
-        // bootstrap as the new baseline.
         if let Some(key) = config.recovery_key.as_deref()
             && !key.is_empty()
         {
             run_recovery(&client, key).await;
         }
-
-        // Cross-signing is handled by Step 2's `recover()` — when
-        // `recovery_key` matches what the homeserver has sealed in secret
-        // storage, the SDK imports the existing master / self-signing /
-        // user-signing keys and the new device is signed by them
-        // automatically. No bootstrap, no UIA, no key rotation.
-        //
-        // If `recover()` fails (wrong recovery_key, missing default key,
-        // passphrase / base58 mismatch) the diagnostics emitted there name
-        // exactly what's wrong; the operator fixes the recovery key in
-        // Element + config and the next start succeeds.
 
         Ok(client)
     }
@@ -1322,13 +1217,6 @@ mod client {
         })
     }
 
-    /// Try to import cross-signing keys + room keys from the homeserver's
-    /// encrypted backup using the operator's recovery key. Logs detailed
-    /// diagnostics on failure so a MAC mismatch can be debugged without
-    /// guessing — server-side default-key id, whether the key event has
-    /// passphrase info (changes which SDK decode path runs first), input
-    /// length (whitespace-stripped, not the value), and the full error
-    /// debug chain (the SDK's `Display` masks fallback errors).
     async fn run_recovery(client: &Client, key: &str) {
         use matrix_sdk::encryption::recovery::RecoveryState;
 
@@ -1345,13 +1233,6 @@ mod client {
         let stripped_len = key.chars().filter(|c| !c.is_whitespace()).count();
         diagnose_secret_storage(client, stripped_len).await;
 
-        // Use the operator's configured recovery_key to open secret storage and
-        // import secrets. recover_and_fix_backup additionally repairs the key
-        // backup if the server-side backup is inconsistent with this key
-        // (missing/mismatched backup decryption key) WITHOUT rotating the
-        // recovery key, so the configured channels.matrix.recovery-key stays
-        // valid. This clears the "no backup key was found" loop that occurs
-        // when a backup version exists but the local backup link is broken.
         match recovery.recover_and_fix_backup(key).await {
             Ok(()) => ::zeroclaw_log::record!(
                 INFO,
@@ -1466,11 +1347,6 @@ mod client {
         }
     }
 
-    /// Be lenient with `<anything>||<room-id-or-alias>` recipients (some
-    /// operators write cron `delivery.to` that way). Extracts the last
-    /// segment that looks like a Matrix room id (`!…`) or alias (`#…`).
-    /// Returns `(chosen, was_normalized)` so the caller can log a warning
-    /// when normalization actually triggered.
     pub(super) fn normalize_recipient(id_or_alias: &str) -> (&str, bool) {
         if !id_or_alias.contains("||") {
             return (id_or_alias, false);
@@ -1565,14 +1441,6 @@ mod inbound {
     };
     use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
-    /// Server-side long-poll window for `/sync`. Sent as the `?timeout=`
-    /// parameter so the homeserver holds an idle sync open for this long
-    /// (returning early the moment new events arrive) instead of replying
-    /// immediately and busy-looping. Must stay strictly below
-    /// [`super::client::CLIENT_REQUEST_TIMEOUT`] so the HTTP request deadline
-    /// never fires before the long-poll completes. `SyncSettings::default()`
-    /// leaves this unset, which — combined with the SDK's 30s default request
-    /// timeout — makes every idle sync error out at exactly 30 seconds.
     pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Clone)]
@@ -1600,17 +1468,6 @@ mod inbound {
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
-        // Bind handler lifetime to this function's scope. matrix-sdk 0.16's
-        // `add_event_handler` registers handlers on the cached `Client` and
-        // never deduplicates — so without explicit removal, every supervisor
-        // restart of `run_sync_loop` (after sleep/wake, WLAN drop, transient
-        // sync errors) would stack a fresh handler on top of the existing
-        // one, multiplying every inbound event by the restart count.
-        //
-        // Wrapping the returned `EventHandlerHandle` in
-        // `EventHandlerDropGuard` makes the SDK call `remove_event_handler`
-        // when this function returns, keeping exactly one active handler
-        // per event type at all times.
         let handler_ctx = ctx.clone();
         let message_handler = client.add_event_handler(
             move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
@@ -1652,11 +1509,6 @@ mod inbound {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "matrix: starting sync loop"
         );
-        // Run an initial sync once so the sync token + state are populated,
-        // then flip the health flag and enter the long-running sync loop.
-        // Both calls pin an explicit long-poll timeout (see
-        // `SYNC_LONGPOLL_TIMEOUT`) so an idle server doesn't leave the request
-        // hanging until the HTTP client's own deadline trips.
         let sync_settings = SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT);
         if let Err(e) = client.sync_once(sync_settings.clone()).await {
             ::zeroclaw_log::record!(
@@ -1824,12 +1676,6 @@ mod inbound {
             }
         }
 
-        // Process inbound media: download, persist to {workspace}/matrix_files/,
-        // and emit a content marker the runtime's vision/document pipeline reads.
-        // The runtime ignores `ChannelMessage.attachments` for vision — markers
-        // in `content` are how Telegram and the multimodal pipeline communicate
-        // (see telegram.rs `format_attachment_content`). We always leave
-        // `attachments` empty.
         let media_kind = match &ev.content.msgtype {
             MessageType::Image(m) => Some(MediaInfo::new(
                 m.source.clone(),
@@ -1876,13 +1722,6 @@ mod inbound {
             )
             .await;
         } else if let Some(reply_target) = extract_in_reply_to(&raw) {
-            // The current event has no media of its own but is a reply (often
-            // mention-only text replying to a previously-ignored media event).
-            // Fetch the parent event and pull in any media it carries so the
-            // agent can answer questions like "can you see the image?". The
-            // parent's MediaCategory (set by parent_media_info) is the
-            // authoritative kind here — `raw` is the text reply, not the
-            // parent voice/image, so we never look at `raw` for kind data.
             match room.event(&reply_target, None).await {
                 Ok(timeline_event) => {
                     if let Some(info) = parent_media_info(timeline_event.into_raw()) {
@@ -1914,11 +1753,6 @@ mod inbound {
             ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
         }
 
-        // Self-anchored roots carry their own event_id as the outbound
-        // anchor. This is a delivery/threading detail — not a conversation
-        // boundary. Strip it from interruption_scope_id so in-flight
-        // cancellation keys match the sender+room scope used by
-        // conversation_history_key.
         let interruption_scope =
             interruption_scope_from_anchor(outbound_anchor.as_deref(), &ev.event_id);
 
@@ -1968,13 +1802,6 @@ mod inbound {
         )
     }
 
-    /// Decide where the bot should anchor its reply. Carries the existing
-    /// thread root when the inbound is already inside an `m.thread`
-    /// relation. When the inbound is a root timeline event and
-    /// `reply_in_thread` is enabled, anchors a brand-new thread on the
-    /// inbound event itself so the bot's reply opens a thread the user
-    /// can continue the conversation in (matches the schema doc for
-    /// `[channels.matrix.<alias>].reply_in_thread`).
     pub(super) fn resolve_outbound_anchor(
         thread_id: Option<&OwnedEventId>,
         event_id: &OwnedEventId,
@@ -1989,12 +1816,6 @@ mod inbound {
         })
     }
 
-    /// When the resolved outbound anchor points at the inbound event
-    /// itself (a self-anchored root), the anchor is a delivery/threading
-    /// detail — not a conversation boundary. Return `None` so the
-    /// interruption scope falls back to sender+room, matching the key
-    /// used by `conversation_history_key`. For real thread replies the
-    /// anchor is kept as the cancellation scope.
     pub(super) fn interruption_scope_from_anchor(
         outbound_anchor: Option<&str>,
         event_id: &OwnedEventId,
@@ -2016,13 +1837,6 @@ mod inbound {
         root.parse().ok()
     }
 
-    /// Pull the `m.in_reply_to.event_id` from a raw event. This is Matrix's
-    /// inline-reply mechanism (separate from threads): when a user replies to
-    /// a previous message — for instance a media-only event the bot ignored
-    /// because of mention-only filtering — the reply event embeds a pointer
-    /// to that previous event under `content.m.relates_to.m.in_reply_to`.
-    /// The pointer can also live inside an `m.thread` relation when the
-    /// client is using the modern threaded-reply spec, so we accept both.
     pub(super) fn extract_in_reply_to(raw: &RawEvent) -> Option<OwnedEventId> {
         let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
         let relates = v.get("content")?.get("m.relates_to")?;
@@ -2061,14 +1875,6 @@ mod inbound {
         File,
     }
 
-    /// Decide whether transcription should run on a media attachment given
-    /// its category and the channel's transcription config. The previous
-    /// gate also required `is_voice_message(raw)` to be true, but `raw`
-    /// is the *current* event — for parent media pulled via `m.in_reply_to`,
-    /// the current event is the user's text reply (no MSC3245 flag), so
-    /// the gate would short-circuit and skip transcription on reply-to-voice
-    /// flows. `parent_media_info` already classifies by reading the parent
-    /// event's flag, so trust `info.kind` directly.
     pub(super) fn should_transcribe(
         kind: &MediaCategory,
         transcription: Option<&TranscriptionConfig>,
@@ -2076,14 +1882,6 @@ mod inbound {
         matches!(kind, MediaCategory::Voice) && matches!(transcription, Some(t) if t.enabled)
     }
 
-    /// Common path for both "this event carries media" and "this event is a
-    /// reply to one that did" — downloads, persists to workspace, appends a
-    /// `[IMAGE:path]` / `[Document:...] path` marker to `content`, and runs
-    /// voice transcription when the media is an MSC3245 voice note.
-    ///
-    /// `body_hint` is the originating event's body (used to decide whether
-    /// to overwrite the placeholder body with the marker or append to it);
-    /// pass `""` when the media came from a parent reply target.
     async fn attach_media(
         room: &Room,
         info: &MediaInfo,
@@ -2426,11 +2224,6 @@ mod outbound {
         pub threads_seen: &'a Arc<TokioRwLock<std::collections::HashSet<OwnedEventId>>>,
         pub reaction_log: &'a Arc<TokioMutex<HashMap<ReactionKey, OwnedEventId>>>,
         pub reply_in_thread: bool,
-        /// Workspace root that bounds local marker targets. Outbound marker
-        /// `[file:...]`/`[image:...]` paths must live inside this directory
-        /// after canonicalisation; any path that escapes is refused. None
-        /// means the channel was constructed without `with_workspace_dir`,
-        /// in which case all local markers are refused.
         pub workspace_dir: Option<&'a Path>,
     }
 
@@ -2522,12 +2315,6 @@ mod outbound {
         Http(reqwest::Url),
     }
 
-    /// Why `validate_marker_target` rejected a target. The distinction drives
-    /// the user-facing emoji reaction: `Refused` (the bot declined a target
-    /// it could have fetched) becomes 🚫, `NotFound` (the file simply isn't
-    /// there) becomes ⚠️ alongside other delivery failures. Without this
-    /// split, an agent emitting `[file:/missing.pdf]` would surface as a
-    /// safety refusal even though no policy fired.
     #[derive(Debug)]
     pub(super) enum ValidateError {
         /// Trust-boundary refusal: disallowed scheme, no workspace
@@ -2557,20 +2344,6 @@ mod outbound {
         }
     }
 
-    /// Validate an outbound marker target against the trust boundary policy:
-    ///
-    /// * `http`/`https` URLs are accepted (their fetch is then bounded by
-    ///   `MAX_MARKER_BYTES` and `MARKER_HTTP_TIMEOUT` in `fetch_http`).
-    /// * Schemes other than `http`/`https` (`file:`, `data:`, anything with
-    ///   `://`) are refused outright.
-    /// * Local paths are canonicalised and must live inside `workspace_dir`.
-    ///   `..` traversal that escapes the workspace, or absolute paths outside
-    ///   it, are refused.
-    /// * Local paths require `workspace_dir` to be configured. Without it,
-    ///   the channel cannot make a safe path decision.
-    ///
-    /// Pure(ish) helper: does FS canonicalisation but no network I/O.
-    /// Unit-tested directly without a live SDK or HTTP server.
     pub(super) fn validate_marker_target(
         target: &str,
         workspace_dir: Option<&Path>,
@@ -2579,6 +2352,24 @@ mod outbound {
             let url = reqwest::Url::parse(target)
                 .with_context(|| format!("parse marker URL {target}"))
                 .map_err(ValidateError::Refused)?;
+            let host_str = url.host_str().unwrap_or("");
+            if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(host_str) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "host": host_str,
+                            "reason": "ssrf_private_host",
+                        })),
+                    "matrix: marker target points to a private/local host"
+                );
+                return Err(ValidateError::Refused(anyhow::Error::msg(format!(
+                    "matrix: marker target {target} resolves to a private or local host ({host_str}); refusing for SSRF safety. \
+                     Use a public URL or attach the file from workspace_dir directly."
+                ))));
+            }
             return Ok(MarkerTarget::Http(url));
         }
         if target.contains("://") {
@@ -2683,19 +2474,59 @@ mod outbound {
         Ok(MarkerTarget::Local(target_canon))
     }
 
+    /// Maximum number of redirects to follow on a marker HTTP fetch. The
+    /// `Policy::custom` closure below rejects any redirect target whose host
+    /// is private/local, so the cap mainly bounds the worst-case public-→-public
+    /// chain an attacker can construct.
+    const MAX_MARKER_REDIRECTS: usize = 10;
+
     fn marker_http_client() -> &'static reqwest::Client {
         static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
         CLIENT.get_or_init(|| {
+            let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_MARKER_REDIRECTS {
+                    return attempt.error(std::io::Error::other(format!(
+                        "Too many marker redirects (max {MAX_MARKER_REDIRECTS})"
+                    )));
+                }
+                // `attempt.url()` borrows the attempt, so we copy out the
+                // bits we need into owned Strings before `attempt.error(...)`,
+                // which moves the attempt, can run.
+                let target_str = attempt.url().as_str().to_string();
+                let host = attempt.url().host_str().unwrap_or("").to_string();
+                if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&host) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "target": target_str,
+                                "host": host,
+                                "reason": "ssrf_redirect_to_private_host",
+                            })),
+                        "matrix: marker redirect targets a private/local host"
+                    );
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Blocked marker redirect to private or local host ({host}); \
+                             refusing for SSRF safety. Use a public URL or attach the file \
+                             from workspace_dir directly."
+                        ),
+                    ));
+                }
+                attempt.follow()
+            });
             reqwest::Client::builder()
                 .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::limited(5))
+                .redirect(redirect_policy)
                 .user_agent("zeroclaw-matrix/1.0")
                 .build()
                 .expect("default reqwest client config never fails to build")
         })
     }
 
-    async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
+    pub(super) async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
         let client = marker_http_client();
         let resp = client
             .get(url.clone())
@@ -2741,17 +2572,6 @@ mod outbound {
         attachments: &[MediaAttachment],
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<AttachmentDelivery> {
-        // Outbound attachments. SendMessage.attachments comes from the runtime's
-        // structured attachment list; missing/empty data is fatal there because
-        // the bytes were already in memory. Marker-driven uploads are best-
-        // effort: if a marker target can't be read or uploaded, log it and fall
-        // back to a textual note so the operator sees what the agent intended
-        // rather than a silently-dropped reply.
-        //
-        // Track the last successful attachment event_id so a marker-only send
-        // (text empty after stripping markers) can return Ok with that id
-        // instead of an Err — otherwise the runtime would see a failure even
-        // though the attachment actually landed in the room.
         let mut last_attachment_id: Option<OwnedEventId> = None;
         for att in attachments {
             let id = upload_attachment(room, att, AttachmentKind::Auto, thread_anchor).await?;
@@ -3367,11 +3187,6 @@ impl MatrixChannel {
         if !has_token && !has_password {
             bail!("matrix: configure either `access_token` or `password`");
         }
-        // Initial resolved value: when the per-channel override is set
-        // we honor it directly; when it's `None`, default to `true`
-        // (the channels-wide default). Orchestrator callers should chain
-        // `.with_ack_reactions(...)` after construction to thread the
-        // actual `[channels].ack_reactions` global through.
         let ack_reactions = config.ack_reactions.unwrap_or(true);
         Ok(Self {
             config: Arc::new(config),
@@ -3399,11 +3214,6 @@ impl MatrixChannel {
         &self.alias
     }
 
-    /// Override the resolved `ack_reactions` value for this Matrix
-    /// channel. Used by the orchestrator to push the channels-wide
-    /// default down after constructing from per-channel config; the
-    /// orchestrator computes `mx.ack_reactions.unwrap_or(config.channels.ack_reactions)`
-    /// and passes the resolved bool here.
     #[must_use]
     pub fn with_ack_reactions(mut self, ack_reactions: bool) -> Self {
         self.ack_reactions = ack_reactions;
@@ -3931,12 +3741,6 @@ impl Channel for MatrixChannel {
             request.tool_name, request.arguments_summary
         );
 
-        // Register the waiter BEFORE sending the prompt so a fast operator
-        // reply landing on the inbound event handler between send and
-        // register isn't silently dropped (the inbound parser would find
-        // no matching token in `pending_approvals` and treat the reply as
-        // a normal message). If the send itself fails, clean up the
-        // registration before propagating the error.
         let (tx, rx) = oneshot::channel();
         self.pending_approvals
             .lock()
@@ -4769,43 +4573,6 @@ mod tests {
             }
         }
 
-        /// Reviewer-requested smoke: keep a configured Matrix channel idle for
-        /// longer than 30 seconds and confirm `/sync` no longer errors at the
-        /// 30-second cadence that motivated this PR.
-        ///
-        /// The pre-fix failure mode was two-pronged:
-        ///   1. `SyncSettings::default()` sends no `?timeout=` parameter, so an
-        ///      idle homeserver replies immediately and the SDK busy-polls.
-        ///   2. `Client::builder()` falls back to the SDK's 30s default request
-        ///      timeout, so every 30s window races the HTTP deadline and any
-        ///      idle long-poll that did manage to start errors out at ~30s.
-        ///
-        /// This test exercises both fixes against a real homeserver:
-        ///   * `ensure_client()` builds the client with `CLIENT_REQUEST_TIMEOUT`
-        ///     applied to the underlying `RequestConfig`.
-        ///   * Each `sync_once` call passes `SYNC_LONGPOLL_TIMEOUT` so the
-        ///     homeserver holds the request open.
-        ///
-        /// We then assert three things over a >30s soak window:
-        ///   * No `sync_once` call returns an error (rules out the 30s HTTP
-        ///     deadline tripping mid-long-poll).
-        ///   * Each individual `sync_once` call takes long enough to indicate
-        ///     the server actually long-polled (rules out the busy-poll path
-        ///     where every iteration returns instantly because no `?timeout=`
-        ///     was sent).
-        ///   * The number of round-trips over the soak window stays modest
-        ///     (defense-in-depth against a regression that reintroduces busy
-        ///     polling).
-        ///
-        /// Tunables via env (sensible defaults so the test stays "short" per
-        /// reviewer guidance — ~35s wall-time by default):
-        ///   * `ZEROCLAW_MATRIX_SMOKE_IDLE_SECS` — total soak duration in
-        ///     seconds (default `35`, must be > 30).
-        ///   * `ZEROCLAW_MATRIX_SMOKE_MIN_LONGPOLL_MS` — minimum wall-time a
-        ///     single `sync_once` call must take before we consider it a real
-        ///     long-poll (default `1000`). The homeserver is free to return
-        ///     early when events arrive; this only guards against the pre-fix
-        ///     "every call returns in <100ms" pattern.
         #[tokio::test]
         #[ignore = "requires Matrix smoke credentials and a disposable idle test room"]
         async fn idle_sync_does_not_error_at_30s_cadence() {
@@ -4958,11 +4725,6 @@ mod tests {
 
         #[test]
         fn corrupt_returns_none() {
-            // Contract change: a corrupt session.json (manually edited,
-            // truncated by a crash, partial write) must NOT propagate as
-            // an error that stalls startup. Returning None lets the build
-            // flow auto-recover via fresh login when credentials are
-            // available.
             let dir = TempDir::new().unwrap();
             let p = dir.path().join("session.json");
             std::fs::write(p, "{not valid json").unwrap();
@@ -5067,11 +4829,6 @@ mod tests {
 
         #[test]
         fn foreign_session_detected_when_user_ids_differ() {
-            // The collision bug: two matrix blocks shared one state dir, so the
-            // second to start restored the first account's saved session and
-            // ran as the wrong bot. With the configured user_id known, a saved
-            // session for a different account must be flagged so the build flow
-            // wipes and re-logins instead of impersonating.
             let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
             let foreign = blob_for("@bender-bending-rodriguez-zeroclaw:matrix.org");
             assert!(saved_session_is_foreign(&cfg, &foreign));
@@ -5365,7 +5122,7 @@ mod tests {
 
         #[test]
         fn self_anchored_root_strips_interruption_scope() {
-            // #7349: when reply_in_thread anchors on the inbound event
+            // when reply_in_thread anchors on the inbound event
             // itself the anchor is a delivery detail, not a conversation
             // boundary — interruption_scope_id should be None so
             // cancellation keys match sender+room.
@@ -5751,8 +5508,6 @@ mod tests {
         #[test]
         fn rejects_dotdot_traversal() {
             let workspace = TempDir::new().unwrap();
-            // Build a file outside the workspace, then try to reach it via
-            // `<workspace>/../<sibling-name>/file`.
             let parent = workspace.path().parent().unwrap();
             let outside_dir = parent.join("zeroclaw-test-outside");
             let _ = std::fs::create_dir(&outside_dir);
@@ -5848,16 +5603,181 @@ mod tests {
             let result = validate_marker_target("https://example.com/x.jpg", None);
             assert!(matches!(result, Ok(MarkerTarget::Http(_))));
         }
+
+        fn assert_ssr_refused(target: &str) {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target(target, Some(workspace.path()));
+            let msg = result
+                .expect_err(&format!("expected SSRF refusal for {target}"))
+                .to_string();
+            assert!(
+                msg.contains("private or local host"),
+                "expected SSRF refusal message for {target}, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v4() {
+            assert_ssr_refused("http://127.0.0.1/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v6() {
+            assert_ssr_refused("http://[::1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_rfc1918_v4() {
+            for h in ["10.0.0.5", "172.16.0.1", "192.168.1.1"] {
+                assert_ssr_refused(&format!("http://{h}/internal"));
+            }
+        }
+
+        #[test]
+        fn ssrf_refuses_link_local_v4() {
+            // AWS / GCP / Azure cloud-metadata endpoint.
+            assert_ssr_refused("http://169.254.169.254/latest/meta-data/");
+        }
+
+        #[test]
+        fn ssrf_refuses_cgnat_v4() {
+            // RFC 6598 shared address space (100.64.0.0/10).
+            assert_ssr_refused("http://100.64.0.1/api");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv4_mapped_loopback() {
+            // ::ffff:127.0.0.1 — IPv4-mapped loopback, often missed by
+            // naive IP-literal checks.
+            assert_ssr_refused("http://[::ffff:127.0.0.1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_localhost_name() {
+            assert_ssr_refused("http://localhost/admin");
+            assert_ssr_refused("http://foo.localhost/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_local_suffix_name() {
+            assert_ssr_refused("http://printer.local/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_unique_local() {
+            // fc00::/7 — RFC 4193 unique local addresses.
+            assert_ssr_refused("http://[fd00::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_link_local() {
+            // fe80::/10 — link-local.
+            assert_ssr_refused("http://[fe80::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_https_same_as_http() {
+            // The guard is scheme-agnostic; the same private host is
+            // refused over https:// too.
+            assert_ssr_refused("https://10.0.0.5/secret");
+            assert_ssr_refused("https://[::1]/secret");
+        }
+
+        #[test]
+        fn ssrf_refuses_with_userinfo_attempt() {
+            // An attacker who controls the host string might smuggle a
+            // private host through userinfo syntax; the SSRF guard fires
+            // on the host portion regardless.
+            assert_ssr_refused("http://attacker@127.0.0.1/");
+        }
+
+        #[test]
+        fn accepts_public_host() {
+            // Sanity: a normal public-looking host must still pass through.
+            for h in ["example.com", "cdn.example.com", "1.1.1.1", "8.8.8.8"] {
+                let workspace = TempDir::new().unwrap();
+                let result = validate_marker_target(
+                    &format!("https://{h}/photo.jpg"),
+                    Some(workspace.path()),
+                );
+                assert!(
+                    matches!(result, Ok(MarkerTarget::Http(_))),
+                    "public host {h} must be accepted, got: {result:?}"
+                );
+            }
+        }
+    }
+
+    mod outbound_redirect_ssrf {
+
+        use super::super::outbound::fetch_http;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn private_redirect_body(location: &str) -> ResponseTemplate {
+            ResponseTemplate::new(302).insert_header("Location", location)
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_cloud_metadata_ip() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body(
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to cloud-metadata IP must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_loopback() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://127.0.0.1:9200/_cat/indices"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to loopback must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn follows_public_redirect_target() {
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("example.com"),
+                "public hostnames must not be classified as private by the per-hop guard"
+            );
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("cdn.example.com"),
+                "public subdomains must not be classified as private"
+            );
+        }
     }
 
     mod transcription_gate {
-        //! `should_transcribe` decides whether to run STT on a downloaded
-        //! media attachment. The previous gate also required
-        //! `is_voice_message(raw)` to be true on the *current* event, which
-        //! short-circuited reply-to-voice flows because the current event
-        //! is the user's text reply, not the parent voice note. The new
-        //! gate trusts `info.kind` (set by `parent_media_info` for parent
-        //! media or the inbound match for direct media).
 
         use super::super::inbound::{MediaCategory, should_transcribe};
         use zeroclaw_config::schema::TranscriptionConfig;
@@ -5916,11 +5836,6 @@ mod tests {
 
         #[test]
         fn voice_kind_alone_is_sufficient() {
-            // The bug fix: parent-voice replies set info.kind = Voice via
-            // parent_media_info, but the previous gate also looked at the
-            // *current* event's voice flag (which is the text reply event,
-            // never carrying the flag) and skipped transcription.
-            // info.kind alone is sufficient now.
             assert!(should_transcribe(
                 &MediaCategory::Voice,
                 Some(&enabled_cfg())

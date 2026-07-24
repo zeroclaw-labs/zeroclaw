@@ -62,11 +62,6 @@ struct CollectorState {
 
 // ── DoraCollector ────────────────────────────────────────────
 
-/// Thread-safe DORA metrics collector.
-///
-/// Tracks deployment frequency, lead time for changes, change failure rate,
-/// and mean time to recovery (MTTR). Supports time-windowed views at
-/// 7-day, 30-day, and 90-day intervals.
 pub struct DoraCollector {
     inner: RwLock<CollectorState>,
 }
@@ -80,7 +75,6 @@ impl DoraCollector {
     }
 
     /// Record a completed deployment (success or failure).
-    ///
     /// `lead_time` is the duration from commit to deploy completion.
     pub fn record_deployment(&self, success: bool, lead_time: Option<Duration>) {
         let mut state = self.inner.write().expect("DORA lock poisoned");

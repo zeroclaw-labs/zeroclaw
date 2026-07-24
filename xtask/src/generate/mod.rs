@@ -2,7 +2,6 @@
 //! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
 //! install.sh@HEAD is the behavioral reference. The spec is the single source
 //! of truth; surfaces are derived and drift-checked. Surfaces are registered in
-//! one table so adding one is data, not control flow.
 
 pub mod container;
 pub mod container_base;
@@ -80,16 +79,16 @@ fn registry() -> Vec<Surface> {
     ]
 }
 
-/// Dockerfile-family ARG default: ships Dist by default (all channels, no
-/// heavyweight), build-time overridable via --build-arg.
+/// Dockerfile-family ARG default: ships the lean standard Dist selection,
+/// build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
     let spliced = container::splice(current, "docker-features-arg", &body)?;
     container_base::splice_zones(root, &spliced)
 }
 
-/// Containerfile surface: standard image ships Dist (all channels, no
-/// heavyweight); fat image ships All (kitchen sink). Selections, not literals.
+/// Containerfile surface: standard image ships lean Dist; fat image ships All
+/// (kitchen sink). Selections, not literals.
 fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",
@@ -107,18 +106,25 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn features(selection_id: &str) -> anyhow::Result<()> {
-    let menu = Sel::menu();
-    let selection = menu
-        .iter()
-        .find(|s| s.id() == selection_id)
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "unknown selection `{selection_id}` (known: {})",
-                menu.iter().map(|s| s.id()).collect::<Vec<_>>().join(", ")
-            ))
-        })?;
-    let list = spec::resolve_feature_list(&workspace_root(), selection)?;
+pub fn features(
+    selection_id: &str,
+    target: Option<&str>,
+    excluded: &[String],
+) -> anyhow::Result<()> {
+    let selection = Sel::from_id(selection_id).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "unknown selection `{selection_id}` (known: {})",
+            Sel::named()
+                .iter()
+                .map(Sel::id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let list = spec::exclude_features(
+        spec::resolve_feature_list_for_target(&workspace_root(), &selection, target)?,
+        excluded,
+    )?;
     println!("{}", list.join(","));
     Ok(())
 }

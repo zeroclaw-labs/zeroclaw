@@ -2,11 +2,6 @@
 //! component's `custom_id` (≤100 chars) back verbatim on every click/submit, so
 //! it is the only channel for routing state. We encode a `(kind, arg)` pair
 //! behind a scheme marker (`zc1`) so the inbound dispatch can tell *our*
-//! components from foreign ones (a bot may share a channel with other apps'
-//! buttons) and parse them back; anything that isn't a well-formed `zc1` token
-//! parses to `None` and is ignored — the same ownership-marker discipline the
-//! slash reaper uses. No bearer secrets ever go in a `custom_id`: it flows
-//! through logs and client round-trips, so it carries only a routing key.
 
 /// Scheme marker prefixing every custom_id this channel emits. Versioned so a
 /// future wire change can coexist with `zc1` tokens still in flight on
@@ -33,11 +28,6 @@ impl CustomId {
         }
     }
 
-    /// Encode to the wire form `zc1|<kind>|<arg>`, escaping the `|` and `\`
-    /// separators in each field so they round-trip. Returns `None` when the
-    /// result would exceed Discord's 100-char `custom_id` limit (the caller must
-    /// shorten the payload rather than emit a token Discord will 400) or when
-    /// `kind` is empty (a token with no handler is unroutable).
     pub(crate) fn encode(&self) -> Option<String> {
         if self.kind.is_empty() {
             return None;

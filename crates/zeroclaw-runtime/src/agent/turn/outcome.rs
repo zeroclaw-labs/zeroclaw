@@ -21,13 +21,6 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
-/// A provider stream failed *after* caller-visible output (text chunks,
-/// thinking, pre-executed tool events) was already forwarded on `event_tx`.
-///
-/// Carries the text accumulated before the failure so the loop can persist
-/// the visible partial. Unlike a pre-output stream failure, this must NOT
-/// trigger the non-streaming fallback: a retry would duplicate already
-/// delivered output on append-only consumers (WS/RPC/ACP).
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
@@ -42,16 +35,6 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 
 impl std::error::Error for StreamInterruptedAfterOutput {}
 
-/// The user cancelled mid-stream *after* caller-visible text was already
-/// forwarded on `event_tx`.
-///
-/// Carries the forwarded text so the loop can persist the visible partial
-/// with the `[interrupted by user]` marker — the pre-consolidation streaming
-/// engine committed the watched partial on cancel, and losing it makes the
-/// transcript disagree with what the user saw stream. Chains to
-/// [`ToolLoopCancelled`] via `source()`, so [`is_tool_loop_cancelled`] (and
-/// every caller built on it: the no-fallback rule, the fixed observer
-/// message, the wrappers' cancel arms) recognizes it unchanged.
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
     pub(crate) partial_text: String,

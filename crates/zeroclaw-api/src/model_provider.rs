@@ -79,12 +79,6 @@ impl ChatMessage {
         self.role == "user" && self.content.trim() == PRUNED_CONTEXT_SEPARATOR
     }
 
-    /// Returns true when a provider payload should omit an internal history-pruning marker.
-    ///
-    /// Summaries always drop because they would otherwise reach the model as its
-    /// own prior reply. Separators only drop when they directly follow a summary
-    /// in the input, so a stray separator-shaped user turn is preserved instead
-    /// of silently discarding possible user content.
     pub fn should_skip_internal_pruning_marker(messages: &[Self], index: usize) -> bool {
         let Some(msg) = messages.get(index) else {
             return false;
@@ -97,6 +91,28 @@ impl ChatMessage {
                 .checked_sub(1)
                 .and_then(|previous| messages.get(previous))
                 .is_some_and(Self::is_pruned_tool_exchange_summary)
+    }
+
+    pub fn is_system(&self) -> bool {
+        self.role == "system"
+    }
+
+    pub fn is_user(&self) -> bool {
+        self.role == "user"
+    }
+
+    pub fn sanitize_leading_turn_order(messages: &mut Vec<Self>) {
+        let first_non_system = messages
+            .iter()
+            .position(|m| !m.is_system())
+            .unwrap_or(messages.len());
+        let mut drop_to = first_non_system;
+        while drop_to < messages.len() && !messages[drop_to].is_user() {
+            drop_to += 1;
+        }
+        if drop_to > first_non_system {
+            messages.drain(first_non_system..drop_to);
+        }
     }
 }
 
@@ -113,24 +129,6 @@ pub struct ToolCall {
     pub extra_content: Option<serde_json::Value>,
 }
 
-/// Raw token counts from a single LLM API response.
-///
-/// Contract: `input_tokens` is the **total prompt size** sent to the model
-/// (every token the model saw, regardless of cache state).
-/// `cached_input_tokens` is the **subset** of `input_tokens` that was served
-/// from the prompt cache. So `cached_input_tokens <= input_tokens`, and the
-/// billable uncached portion is `input_tokens - cached_input_tokens`.
-///
-/// Providers normalize to this shape:
-/// - OpenAI/Compatible: `prompt_tokens` is already total, `cached_tokens` is
-///   already a subset — used directly.
-/// - Anthropic: the API reports three DISJOINT buckets per
-///   <https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>:
-///   `total_input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens`,
-///   where Anthropic's `input_tokens` is *only* the tokens after the last
-///   cache breakpoint. The adapter sums all three to produce the total here.
-///   `cached_input_tokens` is set to `cache_read_input_tokens` (the
-///   discount-billed subset).
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     /// Total prompt size: uncached + cached input tokens.
@@ -186,14 +184,6 @@ pub struct ChatRequest<'a> {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub content: String,
-    /// Name of the tool that produced this result, retained so downstream
-    /// media-marker canonicalization stays provenance-aware: path-listing
-    /// tools (`content_search`, `glob_search`) must not have incidental image
-    /// paths promoted to routable `[IMAGE:...]` markers (PR #7345). Empty when
-    /// the producing tool is unknown (e.g. results reconstructed from a
-    /// provider-wire `tool` message that never carried the name), in which case
-    /// the blind canonicalizer runs exactly as before (PR #6183).
-    /// `#[serde(default)]` keeps older serialized session records readable.
     #[serde(default)]
     pub tool_name: String,
 }
@@ -278,7 +268,6 @@ impl StreamChunk {
 }
 
 /// Structured events emitted by model_provider streaming APIs.
-///
 /// This extends plain text chunk streaming with explicit tool-call signals so
 /// agent loops can preserve native tool semantics without parsing payload text.
 #[derive(Debug, Clone)]
@@ -368,7 +357,6 @@ pub struct ProviderCapabilityError {
 }
 
 /// ModelProvider capabilities declaration.
-///
 /// Describes what features a model_provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
 #[allow(clippy::struct_excessive_bools)]
@@ -419,11 +407,6 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 /// classic chat completions shape.
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
-/// Per-token pricing for a model. All values are per-token rates as strings
-/// expressed in USD per token — e.g. `"0.000005"` = $5.00 per 1M tokens.
-///
-/// Deserialized from the `pricing` object in OpenAI-compatible `/models`
-/// responses (Kilo Gateway, OpenRouter, etc.).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelPricing {
     /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
@@ -457,13 +440,19 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         ProviderCapabilities::default()
     }
 
-    // ── ModelProvider-family defaults ────────────────────────────────────────────
-    // `temperature` is `Option<f64>` end-to-end on the wire. `None` from the
-    // caller means "do not send a `temperature` field"; serialization handles
-    // that via `#[serde(skip_serializing_if)]`. The `default_temperature()`
-    // method below documents the family's preferred default for non-wire uses
-    // (introspection, tests). It is NOT consulted to substitute a value for
-    // `None` in chat methods.
+    /// Query the effective capabilities for the model that will be dispatched.
+    ///
+    /// Most providers have one capability set for every model and inherit this
+    /// default. Composite providers override it when the model selects a route
+    /// or when failover can reach children with different capabilities.
+    fn capabilities_for_model(&self, _model: &str) -> ProviderCapabilities {
+        let mut capabilities = self.capabilities();
+        // Preserve compatibility with providers that historically overrode the
+        // convenience accessor instead of capabilities(). Composite overrides
+        // should still make the model-aware value authoritative.
+        capabilities.vision = self.supports_vision();
+        capabilities
+    }
 
     /// Family-preferred temperature default. Override per family. Documented
     /// for introspection only; never use to convert `None` into a wire value.
@@ -504,7 +493,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Simple one-shot chat (single user message, no explicit system prompt).
-    ///
     /// `temperature == None` means the field is omitted on the wire.
     async fn simple_chat(
         &self,
@@ -526,12 +514,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         temperature: Option<f64>,
     ) -> anyhow::Result<String>;
 
-    /// Fetch the list of available model IDs for this model_provider.
-    ///
-    /// Used by onboard to present a live model picker. Default bails with
-    /// "not supported"; concrete model_providers override to hit their own public
-    /// endpoint (OpenRouter, Ollama) or delegate to the shared models.dev
-    /// catalog (no auth required) in `zeroclaw_providers::models_dev`.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("live model listing is not supported for this model_provider")
     }
@@ -717,13 +699,16 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 }
 
 /// Blanket implementation: `Arc<T>` delegates all `ModelProvider` methods to `T`.
-///
 /// This eliminates the need for manual `impl ModelProvider for Arc<MyModelProvider>`
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         self.as_ref().capabilities()
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+        self.as_ref().capabilities_for_model(model)
     }
 
     fn default_max_tokens(&self) -> u32 {
@@ -876,4 +861,65 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     }
 
     instructions
+}
+
+#[cfg(test)]
+mod turn_order_tests {
+    use super::ChatMessage;
+
+    #[test]
+    fn drops_leading_assistant_tool_call_before_first_user() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+            ChatMessage::user("actual user"),
+        ];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "actual user");
+    }
+
+    #[test]
+    fn drops_leading_orphan_tool_turn() {
+        let mut msgs = vec![ChatMessage::tool("orphan result"), ChatMessage::user("hi")];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn preserves_already_valid_history() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q"),
+            ChatMessage::assistant("[tool_call] x"),
+            ChatMessage::tool("r"),
+            ChatMessage::assistant("done"),
+        ];
+        let before = msgs.clone();
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs.len(), before.len());
+        assert_eq!(msgs[1].role, "user");
+    }
+
+    #[test]
+    fn no_user_turn_drops_all_non_system() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] x"),
+            ChatMessage::tool("r"),
+        ];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+    }
+
+    #[test]
+    fn empty_history_is_noop() {
+        let mut msgs: Vec<ChatMessage> = vec![];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert!(msgs.is_empty());
+    }
 }

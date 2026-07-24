@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_memory::Memory;
@@ -68,7 +68,7 @@ impl Tool for MemoryPurgeTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -85,7 +85,7 @@ impl Tool for MemoryPurgeTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to purge namespace: {e}")),
                     });
                 }
@@ -101,7 +101,7 @@ impl Tool for MemoryPurgeTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to purge session: {e}")),
                     });
                 }
@@ -111,9 +111,9 @@ impl Tool for MemoryPurgeTool {
         Ok(ToolResult {
             success: true,
             output: if output_parts.is_empty() {
-                format!("Purged {total_purged} memories")
+                format!("Purged {total_purged} memories").into()
             } else {
-                output_parts.join("; ")
+                output_parts.join("; ").into()
             },
             error: None,
         })

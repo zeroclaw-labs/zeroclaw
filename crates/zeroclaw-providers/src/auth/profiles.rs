@@ -168,6 +168,12 @@ impl AuthProfilesStore {
         self.load_locked().await
     }
 
+    pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
+        let _lock = self.acquire_lock().await?;
+        let persisted = self.read_persisted_locked().await?;
+        Ok(persisted.profiles.into_keys().collect())
+    }
+
     pub async fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
@@ -591,6 +597,7 @@ impl Default for PersistedAuthProfiles {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedAuthProfile {
+    #[serde(alias = "provider")]
     model_provider: String,
     profile_name: String,
     kind: String,
@@ -675,6 +682,31 @@ mod tests {
     }
 
     #[test]
+    fn persisted_profile_accepts_legacy_provider_key() {
+        let raw = r#"{
+            "schema_version": 2,
+            "updated_at": "2026-07-11T00:00:00Z",
+            "active_profiles": {
+                "openai-codex": "openai-codex:default"
+            },
+            "profiles": {
+                "openai-codex:default": {
+                    "provider": "openai-codex",
+                    "profile_name": "default",
+                    "kind": "oauth",
+                    "access_token": "access-token"
+                }
+            }
+        }"#;
+
+        let parsed: PersistedAuthProfiles = serde_json::from_str(raw).unwrap();
+        let profile = parsed.profiles.get("openai-codex:default").unwrap();
+
+        assert_eq!(profile.model_provider, "openai-codex");
+        assert_eq!(profile.profile_name, "default");
+    }
+
+    #[test]
     fn token_expiry_math() {
         let token_set = TokenSet {
             access_token: "token".into(),
@@ -743,5 +775,37 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[tokio::test]
+    async fn list_profile_ids_lists_without_decrypting_or_rewriting() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+
+        let codex = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "access-xyz".into(),
+                refresh_token: Some("refresh-xyz".into()),
+                id_token: None,
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+        );
+        let anthropic = AuthProfile::new_token("anthropic", "default", "token-abc".into());
+        store.upsert_profile(codex.clone(), true).await.unwrap();
+        store.upsert_profile(anthropic, false).await.unwrap();
+
+        let before = tokio::fs::read(store.path()).await.unwrap();
+
+        let ids = store.list_profile_ids().await.unwrap();
+        assert!(ids.iter().any(|id| id == "openai-codex:default"));
+        assert!(ids.iter().any(|id| id == "anthropic:default"));
+
+        // No decrypt-and-migrate side effect: the store bytes are untouched.
+        let after = tokio::fs::read(store.path()).await.unwrap();
+        assert_eq!(before, after, "list_profile_ids must not rewrite the store");
     }
 }

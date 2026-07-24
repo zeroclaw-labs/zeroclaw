@@ -31,8 +31,10 @@ sequenceDiagram
     participant TL as Tool
 
     CH->>RT: process_message(envelope)
-    RT->>MEM: load_context(session + recalled memory)
-    MEM-->>RT: prior messages + retrieved facts
+    Note over RT: resolve memory-inject policy from the turn's TurnOrigin
+    RT->>MEM: recall(query, session scopes)
+    MEM-->>RT: entries
+    Note over RT: render [Memory context] preamble (engine-side)
     RT->>PR: chat(system, history, tools)
     loop Streaming
         PR-->>RT: StreamEvent::TextDelta
@@ -63,6 +65,7 @@ Key properties:
 - **Streaming is end-to-end.** The provider streams tokens. If the channel adapter reports `supports_draft_updates()`, the runtime edits a sent message in place as text arrives. Discord, Slack, and Telegram support this.
 - **Tool calls are mid-stream.** The model can emit a tool call while still generating text. The runtime pauses the stream, validates, invokes, feeds the result back, and resumes.
 - **Security gates every tool call.** `evaluate_tool_access` consults the [autonomy level](../security/autonomy.md), allow/deny lists, and path boundaries. Medium-risk calls under `Supervised` autonomy go to the operator-approval path.
+- **Memory context is engine-injected.** Before the first provider call, the turn engine resolves an injection policy from the turn's `TurnOrigin` (who initiated the turn): nested sub-turns never inject, scheduled origins (cron, daemon) inject with conversation-category entries excluded, and user-facing origins inject (excluding conversation entries when the turn has no session scope). A spawn site can suppress injection for any origin (for example a cron job with `uses_memory = false`), and turns that carry no memory backend skip it entirely. A single renderer applies time decay, relevance filtering, a prompt-poisoning skip set, and budget caps uniformly on every path; memory backends only answer `recall`, they do not format context.
 - **History and memory are separate.** Session history preserves conversation, tool-call, and tool-result continuity. Explicit memory writes persist selected entries in the memory backend. Receipts ride in-band in the conversation text rather than as a separate persisted artifact. For payload ownership details, see [Memory and payload lifecycle](./memory-payload-lifecycle.md).
 
 ## Tool receipts
@@ -76,6 +79,7 @@ Outbound messages go back through the same channel adapter. Adapters with multi-
 ## Where it lives in code
 
 - Agent loop: `crates/zeroclaw-runtime/src/agent/turn/` (`run_tool_call_loop`), with entry points in `crates/zeroclaw-runtime/src/agent/loop_.rs` (`process_message`, `run`)
+- Memory-context injection: `crates/zeroclaw-runtime/src/agent/memory_inject.rs` (`resolve_inject_policy`, `render_memory_context`), keyed on `TurnOrigin` from `zeroclaw-api`'s ingress types and invoked by the turn engine
 - Tool-call access checks: `crates/zeroclaw-runtime/src/security/` (`iam_policy.rs` `evaluate_tool_access`)
 - Channel orchestration: `crates/zeroclaw-channels/src/orchestrator/`
 - Provider streaming: `crates/zeroclaw-api/src/model_provider.rs` (`StreamEvent` enum, re-exported from `zeroclaw-providers`), `compatible.rs` (SSE parser)

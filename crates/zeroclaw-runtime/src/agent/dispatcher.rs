@@ -130,11 +130,6 @@ impl ToolDispatcher for XmlToolDispatcher {
         let mut content = String::new();
         for result in results {
             let status = if result.success { "ok" } else { "error" };
-            // Provenance-gated: search/listing tools (content_search,
-            // glob_search) must not have incidental image paths promoted to
-            // routable [IMAGE:...] markers (PR #7345). The producing tool name is
-            // known here, so canonicalize through the same shared helper the
-            // turn loop uses.
             let output = canonicalize_tool_result_media_markers_for(&result.name, &result.output);
             let _ = writeln!(
                 content,
@@ -172,12 +167,6 @@ impl ToolDispatcher for XmlToolDispatcher {
                 ConversationMessage::ToolResults(results) => {
                     let mut content = String::new();
                     for result in results {
-                        // Provenance-aware (PR #7345). XML format_results stores
-                        // a Chat message rather than ToolResults, so this branch
-                        // only fires for ToolResults reconstructed elsewhere
-                        // (ACP/RPC resume) and rendered through an XML agent;
-                        // gate it for the same reason as the native path. Empty
-                        // `tool_name` falls back to blind canon (PR #6183).
                         let output = canonicalize_tool_result_media_markers_for(
                             &result.tool_name,
                             &result.content,
@@ -230,9 +219,9 @@ impl ToolDispatcher for NativeToolDispatcher {
                 // Retain the producing tool name so the read path
                 // (`to_provider_messages`) can re-canonicalize provenance-aware
                 // instead of blindly re-promoting a search/listing path back
-                // into an `[IMAGE:...]` marker (PR #7345).
+                // into an `[IMAGE:...]` marker
                 tool_name: result.name.clone(),
-                // Provenance-gated (PR #7345): see the XML dispatcher above.
+                // Provenance-gated see the XML dispatcher above.
                 content: canonicalize_tool_result_media_markers_for(&result.name, &result.output),
             })
             .collect();
@@ -268,12 +257,6 @@ impl ToolDispatcher for NativeToolDispatcher {
                         ChatMessage::tool(
                             serde_json::json!({
                                 "tool_call_id": result.tool_call_id,
-                                // Provenance-aware (PR #7345): a stored
-                                // search/listing result keeps its literal path
-                                // instead of being re-promoted to `[IMAGE:...]`.
-                                // Empty `tool_name` (results with no recorded
-                                // provenance) falls back to the blind
-                                // canonicalizer, preserving PR #6183.
                                 "content": canonicalize_tool_result_media_markers_for(
                                     &result.tool_name,
                                     &result.content,
@@ -416,18 +399,6 @@ mod tests {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // provenance-gated media-marker canonicalization (PR #7345)
-    // ═══════════════════════════════════════════════════════════════════════
-    // The dispatcher result-formatting path is reachable from `Agent::turn`
-    // / `Agent::turn_streamed` (ACP, gateway WebSocket + RPC). A search/listing
-    // tool that merely *lists* a local image path must NOT have that path
-    // rewritten into a routable `[IMAGE:...]` marker - otherwise it falsely
-    // triggers vision routing and a provider-capability error on a text-only
-    // provider. A genuine image-producing tool (e.g. `image_gen`) MUST still be
-    // canonicalized. Both dispatchers gate via the shared
-    // `canonicalize_tool_result_media_markers_for(tool_name, ...)` helper.
-
     /// Write a throwaway PNG and return its absolute path string. An existing
     /// local image path is required for canonicalization to fire at all.
     fn write_temp_image(dir: &std::path::Path, name: &str) -> String {
@@ -547,13 +518,6 @@ mod tests {
         );
     }
 
-    /// Round-trip the native tool-result history shape: `format_results`
-    /// (write) -> `to_provider_messages` (read). This is the path the agent
-    /// loop actually exercises (`Agent::turn` serializes `self.history` via
-    /// `to_provider_messages` before handing it to `run_tool_call_loop`).
-    /// Without provenance carried on `ToolResultMessage`, the provenance-blind
-    /// read-side serializer re-promoted a stored search path back into a
-    /// routable `[IMAGE:...]` marker. (PR #7345 blocker.)
     fn native_round_trip_tool_content(
         dispatcher: &NativeToolDispatcher,
         result: ToolExecutionResult,
@@ -618,7 +582,7 @@ mod tests {
 
     #[test]
     fn native_unknown_provenance_still_promotes_on_read() {
-        // PR #6183 contract preserved: a tool result stored WITHOUT provenance
+        // contract preserved: a tool result stored WITHOUT provenance
         // (empty `tool_name`, e.g. reconstructed from a provider-wire message)
         // still has a genuine image path canonicalized on the read side.
         let dir = tempfile::tempdir().unwrap();

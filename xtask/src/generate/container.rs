@@ -2,8 +2,6 @@
 //! Dockerfile.debian) that inject a cargo `--features` line per build stage.
 //! Each injection point is a sentinel-delimited zone naming the `Selection` it
 //! renders; the feature list is resolved from the canonical spec, never typed.
-//!
-//! Hash-comment syntax (`#`) for Dockerfile/Containerfile.
 
 use super::spec::{self, Selection};
 use std::path::Path;
@@ -15,12 +13,6 @@ fn end(zone: &str) -> String {
     format!("# >>> end generated:{zone} <<<")
 }
 
-/// Render the feature-arg body for a zone: a `ZEROCLAW_FEATURES="X,Y"`
-/// assignment the surrounding `cargo build` references as
-/// `--features "${ZEROCLAW_FEATURES}"`. Using a variable (rather than injecting
-/// a `--features` line mid backslash-continuation) keeps the generated zone a
-/// standalone statement, so sentinel comments never sit inside a continued
-/// command - which would break the shell parse and the StageX `--frozen` build.
 pub fn render_features(
     manifest_dir: &Path,
     selection: &Selection,
@@ -30,11 +22,6 @@ pub fn render_features(
     Ok(format!("{indent}ZEROCLAW_FEATURES=\"{}\"", list.join(",")))
 }
 
-/// Render an `ARG ZEROCLAW_CARGO_FLAGS="..."` default line from a selection.
-/// The flag string (`--no-default-features [--features ...]` or empty for the
-/// Cargo default) is the only form that distinguishes `minimal` from the
-/// default-features build. Build-time overridable; only its default is
-/// canonical. Resolved, never typed.
 pub fn render_features_arg(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<String> {
     let flags = spec::resolve_flags(manifest_dir, selection)?;
     Ok(format!("ARG ZEROCLAW_CARGO_FLAGS=\"{flags}\""))
@@ -102,9 +89,12 @@ mod tests {
     }
 
     #[test]
-    fn dist_renders_all_channels() {
+    fn dist_renders_lean_release_channels() {
         let b = render_features(&root(), &Selection::Dist, "        ").unwrap();
-        assert!(b.contains("channel-discord") && !b.contains("hardware"));
+        assert!(b.contains("channel-matrix"));
+        assert!(b.contains("channel-lark"));
+        assert!(b.contains("whatsapp-web"));
+        assert!(!b.contains("channel-slack"));
     }
 
     #[test]

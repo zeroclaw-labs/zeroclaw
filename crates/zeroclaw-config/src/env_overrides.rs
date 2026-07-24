@@ -1,28 +1,4 @@
 //! V0.8.0 env-var override mechanism.
-//!
-//! Grammar: `ZEROCLAW_<dotted_path_with_double_underscores>=<value>`.
-//! Each `__` (double underscore) is a path separator (`.` in the TOML); each
-//! single `_` is either a snake-case joiner inside a field name (which the
-//! walker converts to kebab `-` for `set_prop`) or a literal char inside an
-//! alias key.
-//!
-//! Schema-derived: [`map_key_sections`] gives HashMap positions (one alias
-//! token consumed; alias chars are `[a-z0-9_]`); [`prop_fields`] gives every
-//! other leaf path. No string-literal pattern matching, no hardcoded family
-//! names.
-//!
-//! Bootstrap exception: `ZEROCLAW_WORKSPACE` and `ZEROCLAW_CONFIG_DIR` keep
-//! their UPPERCASE form. The case rule (lowercase tail = config-tree,
-//! uppercase tail = bootstrap) does the disambiguation work without an
-//! exemption list.
-//!
-//! Persistence boundary: each overridden path's pre-override raw value is
-//! snapshotted (post-`decrypt_secrets`, so secrets are plaintext) and used
-//! by [`mask_env_overrides_for_save`] to restore disk-or-default values
-//! before `encrypt_secrets()` runs. Env-injected values never reach disk.
-//!
-//! [`map_key_sections`]: crate::schema::Config::map_key_sections
-//! [`prop_fields`]: crate::schema::Config::prop_fields
 
 use crate::schema::Config;
 use anyhow::{Context, Result};
@@ -32,20 +8,9 @@ use std::sync::LazyLock;
 const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
 
-/// Paths that the schema exposes via `prop_fields()` but that operators must
-/// not override at runtime. Currently just `schema_version` (snake form, as
-/// emitted by `prop_fields()`) — the migration engine sets it from the
-/// on-disk file's value, and an env override would either skip needed
-/// migrations or trigger a no-op rerun. O(1) HashSet lookup so adding more
-/// reserved paths stays cheap.
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| HashSet::from(["schema_version"]));
 
-/// Outcome of [`apply_env_overrides`]: the set of overridden paths plus the
-/// per-path snapshot of pre-override raw values. The snapshot drives
-/// [`mask_env_overrides_for_save`] so secret fields recover their original
-/// plaintext (which `encrypt_secrets()` then re-encrypts), and non-secret
-/// fields recover their disk-or-default value.
 #[derive(Debug, Default, Clone)]
 pub struct AppliedOverrides {
     pub paths: HashSet<String>,
@@ -198,17 +163,6 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
         })
 }
 
-/// Read the raw string value at a dotted (kebab-cased) prop path from a
-/// serializable Config struct, bypassing the `is_secret` masking that
-/// `Config::get_prop` applies. Returns `None` when the path doesn't resolve
-/// (e.g. the alias entry hasn't been created yet on disk).
-///
-/// Walks the TOML serialization. Each segment is resolved value-aware:
-/// tried verbatim first so hyphenated map keys (aliases, model names like
-/// `claude-opus-4-8`) survive, then snake-cased only as a fallback for a
-/// kebab field segment. Used by [`apply_env_overrides`] so the pre-override
-/// snapshot of a secret field captures the real plaintext rather than the
-/// display mask.
 pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
     let table = toml::Value::try_from(source).ok()?;
     let mut current: &toml::Value = &table;
@@ -225,15 +179,6 @@ pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> 
     })
 }
 
-/// Restore env-overridden paths in a save-bound clone to their pre-override
-/// snapshots, so env-injected values never reach `encrypt_secrets()` or the
-/// on-disk TOML.
-///
-/// Snapshots come from [`apply_env_overrides`] which captures the
-/// post-`decrypt_secrets` plaintext for secret fields. After this restore,
-/// `encrypt_secrets()` re-encrypts the recovered plaintext to fresh
-/// ciphertext that decrypts to the same value — preserving the operator's
-/// real on-disk credential across env-override + save cycles.
 pub fn mask_env_overrides_for_save(
     config_to_save: &mut Config,
     snapshots: &HashMap<String, String>,
@@ -252,11 +197,6 @@ pub fn mask_env_overrides_for_save(
     Ok(())
 }
 
-/// Process-wide lock for env-mutating tests. Both `env_overrides::tests`
-/// and `schema::tests` race on `ZEROCLAW_*` env vars and must serialize on
-/// the same mutex; defining it once here and re-exporting `pub(crate)`
-/// keeps a single coordinator. `#[cfg(test)]` so it never lands in
-/// production builds.
 #[cfg(test)]
 pub(crate) async fn env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -268,8 +208,6 @@ mod tests {
     use super::*;
     use crate::schema::Config;
 
-    /// RAII-ish helper: removes the named ZEROCLAW_* var on drop so failed
-    /// asserts don't leak state into sibling tests.
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {
         fn set(name: &'static str, value: &str) -> Self {
@@ -458,7 +396,7 @@ mod tests {
 
         // Save-bound clone restores the pre-override plaintext, NOT the
         // display mask. This is the regression bar for the data-loss bug
-        // identified in PR #6523 review.
+        // identified inreview.
         let mut to_save = config.clone();
         mask_env_overrides_for_save(&mut to_save, &applied.snapshots).expect("mask succeeds");
         assert_eq!(

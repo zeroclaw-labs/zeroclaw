@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZeroClaw</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0e1116;
+        --panel: #161b22;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --border: #30363d;
+        --accent: #2f81f7;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f8fa;
+          --panel: #ffffff;
+          --text: #1f2328;
+          --muted: #59636e;
+          --border: #d1d9e0;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        -webkit-font-smoothing: antialiased;
+        user-select: none;
+        cursor: default;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        gap: 22px;
+        padding: 32px;
+        text-align: center;
+      }
+      .mark {
+        font-size: 52px;
+        line-height: 1;
+      }
+      h1 {
+        font-size: 22px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+      .spinner {
+        width: 26px;
+        height: 26px;
+        border: 3px solid var(--border);
+        border-top-color: var(--accent);
+        border-radius: 999px;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .status {
+        font-size: 13px;
+        color: var(--muted);
+        line-height: 1.5;
+        max-width: 360px;
+        min-height: 38px;
+      }
+      .hint {
+        font-size: 12px;
+        color: var(--muted);
+        opacity: 0;
+        transition: opacity 0.4s ease;
+        max-width: 360px;
+        line-height: 1.5;
+      }
+      .hint.show { opacity: 0.85; }
+      .error { color: #f85149; }
+    </style>
+  </head>
+  <body>
+    <div class="mark">🦀</div>
+    <h1>ZeroClaw</h1>
+    <div class="spinner" id="spinner"></div>
+    <p class="status" id="status">Starting ZeroClaw…</p>
+    <p class="hint" id="hint">
+      Connecting to your ZeroClaw daemon. This usually takes a moment.
+    </p>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const hintEl = document.getElementById("hint");
+      const spinnerEl = document.getElementById("spinner");
+
+      function invoke(cmd, args) {
+        const fn = window.__TAURI__?.core?.invoke;
+        if (!fn) return Promise.reject(new Error("Tauri IPC bridge unavailable"));
+        return fn(cmd, args);
+      }
+
+      // The backend tells us when it's starting its own daemon, or when it
+      // can't (e.g. the `zeroclaw` binary is missing). Once a status arrives it
+      // owns the message, so the polling loop stops overwriting it.
+      let statusLocked = false;
+      window.__TAURI__?.event
+        ?.listen("zeroclaw://splash-status", (event) => {
+          const { kind, message } = event.payload ?? {};
+          if (!message) return;
+          statusLocked = true;
+          statusEl.textContent = message;
+          if (kind === "error" || kind === "missing") {
+            spinnerEl.style.display = "none";
+            statusEl.classList.add("error");
+            hintEl.classList.remove("show");
+          }
+        })
+        .catch(() => {});
+
+      let launching = false;
+      let attempts = 0;
+
+      async function tick() {
+        if (launching) return;
+        attempts += 1;
+
+        let healthy = false;
+        try {
+          healthy = await invoke("get_health");
+        } catch (err) {
+          // IPC not ready yet — keep polling.
+          healthy = false;
+        }
+
+        if (healthy) {
+          launching = true;
+          statusLocked = true;
+          statusEl.classList.remove("error");
+          statusEl.textContent = "Opening your dashboard…";
+          hintEl.classList.remove("show");
+          spinnerEl.style.display = "";
+          try {
+            await invoke("open_dashboard");
+            // On success the backend closes this splash window.
+          } catch (err) {
+            launching = false;
+            spinnerEl.style.display = "none";
+            statusEl.classList.add("error");
+            statusEl.textContent =
+              "Couldn't open the dashboard: " + String(err?.message ?? err);
+          }
+          return;
+        }
+
+        if (!statusLocked) statusEl.textContent = "Starting ZeroClaw…";
+        // After several seconds with no daemon, surface a fallback hint (in
+        // case the status event was missed).
+        if (attempts >= 6 && !statusLocked) hintEl.classList.add("show");
+      }
+
+      tick();
+      setInterval(tick, 1200);
+    </script>
+  </body>
+</html>

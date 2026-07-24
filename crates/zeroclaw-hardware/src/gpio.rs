@@ -1,20 +1,4 @@
 //! GPIO tools — `gpio_read` and `gpio_write` for LLM-driven hardware control.
-//!
-//! These are the first built-in hardware tools. They implement the standard
-//! [`Tool`] trait so the LLM can call them via function
-//! calling, and dispatch commands to physical devices via the
-//! `Transport` layer.
-//!
-//! Wire protocol (ZeroClaw serial JSON):
-//! ```text
-//! gpio_write:
-//!   Host → Device:  {"cmd":"gpio_write","params":{"pin":25,"value":1}}\n
-//!   Device → Host:  {"ok":true,"data":{"pin":25,"value":1,"state":"HIGH"}}\n
-//!
-//! gpio_read:
-//!   Host → Device:  {"cmd":"gpio_read","params":{"pin":25}}\n
-//!   Device → Host:  {"ok":true,"data":{"pin":25,"value":1,"state":"HIGH"}}\n
-//! ```
 
 use super::device::DeviceRegistry;
 use super::protocol::ZcCommand;
@@ -23,7 +7,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use zeroclaw_api::attribution::ToolKind;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 tool_attribution!(GpioWriteTool, ToolKind::Plugin);
@@ -31,11 +15,6 @@ tool_attribution!(GpioReadTool, ToolKind::Plugin);
 
 // ── GpioWriteTool ─────────────────────────────────────────────────────────────
 
-/// Tool: set a GPIO pin HIGH or LOW on a connected hardware device.
-///
-/// The LLM provides `device` (alias), `pin`, and `value` (0 or 1).
-/// The tool builds a `ZcCommand`, sends it via the device's transport,
-/// and returns a human-readable result.
 pub struct GpioWriteTool {
     registry: Arc<RwLock<DeviceRegistry>>,
 }
@@ -84,7 +63,7 @@ impl Tool for GpioWriteTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing required parameter: pin".to_string()),
                 });
             }
@@ -94,7 +73,7 @@ impl Tool for GpioWriteTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing required parameter: value".to_string()),
                 });
             }
@@ -103,7 +82,7 @@ impl Tool for GpioWriteTool {
         if value > 1 {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("value must be 0 or 1".to_string()),
             });
         }
@@ -117,7 +96,7 @@ impl Tool for GpioWriteTool {
                 Err(msg) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(msg),
                     });
                 }
@@ -136,13 +115,13 @@ impl Tool for GpioWriteTool {
                     .unwrap_or(if value == 1 { "HIGH" } else { "LOW" });
                 Ok(ToolResult {
                     success: true,
-                    output: format!("GPIO {} set {} on {}", pin, state, device_alias),
+                    output: format!("GPIO {} set {} on {}", pin, state, device_alias).into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "device returned ok:false".to_string()),
@@ -150,7 +129,7 @@ impl Tool for GpioWriteTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("transport error: {}", e)),
             }),
         }
@@ -160,7 +139,6 @@ impl Tool for GpioWriteTool {
 // ── GpioReadTool ──────────────────────────────────────────────────────────────
 
 /// Tool: read the current HIGH/LOW state of a GPIO pin on a connected device.
-///
 /// The LLM provides `device` (alias) and `pin`. The tool builds a `ZcCommand`,
 /// sends it via the device's transport, and returns the pin state.
 pub struct GpioReadTool {
@@ -206,7 +184,7 @@ impl Tool for GpioReadTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("missing required parameter: pin".to_string()),
                 });
             }
@@ -221,7 +199,7 @@ impl Tool for GpioReadTool {
                 Err(msg) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(msg),
                     });
                 }
@@ -241,13 +219,14 @@ impl Tool for GpioReadTool {
                     .unwrap_or(if value == 1 { "HIGH" } else { "LOW" });
                 Ok(ToolResult {
                     success: true,
-                    output: format!("GPIO {} is {} ({}) on {}", pin, state, value, device_alias),
+                    output: format!("GPIO {} is {} ({}) on {}", pin, state, value, device_alias)
+                        .into(),
                     error: None,
                 })
             }
             Ok(resp) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     resp.error
                         .unwrap_or_else(|| "device returned ok:false".to_string()),
@@ -255,7 +234,7 @@ impl Tool for GpioReadTool {
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("transport error: {}", e)),
             }),
         }
@@ -265,7 +244,6 @@ impl Tool for GpioReadTool {
 // ── Factory ───────────────────────────────────────────────────────────────────
 
 /// Create the built-in GPIO tools for a given device registry.
-///
 /// Returns `[GpioWriteTool, GpioReadTool]` ready for registration in the
 /// agent's tool list or a future `ToolRegistry`.
 pub fn gpio_tools(registry: Arc<RwLock<DeviceRegistry>>) -> Vec<Box<dyn Tool>> {

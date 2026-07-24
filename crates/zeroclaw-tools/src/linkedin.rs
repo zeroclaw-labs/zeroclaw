@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{LinkedInContentConfig, LinkedInImageConfig};
 
@@ -174,7 +174,7 @@ impl Tool for LinkedInTool {
         if Self::is_write_action(action) && !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -183,7 +183,7 @@ impl Tool for LinkedInTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -195,7 +195,7 @@ impl Tool for LinkedInTool {
                 let strategy = self.build_content_strategy_summary();
                 return Ok(ToolResult {
                     success: true,
-                    output: strategy,
+                    output: strategy.into(),
                     error: None,
                 });
             }
@@ -205,7 +205,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("Missing required 'text' parameter for create_post".into()),
                         });
                     }
@@ -228,7 +228,7 @@ impl Tool for LinkedInTool {
                 if article_title.is_some() && article_url.is_none() {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'article_title' requires 'article_url' to be provided".into()),
                     });
                 }
@@ -277,7 +277,7 @@ impl Tool for LinkedInTool {
                                 success: true,
                                 output: format!(
                                     "Post {action_word} with image. Post ID: {post_id}, Image: {image_urn}"
-                                ),
+                                ).into(),
                                 error: None,
                             });
                         }
@@ -308,7 +308,7 @@ impl Tool for LinkedInTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Post {action_word} successfully. Post ID: {post_id}"),
+                    output: format!("Post {action_word} successfully. Post ID: {post_id}").into(),
                     error: None,
                 })
             }
@@ -324,7 +324,7 @@ impl Tool for LinkedInTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string(&posts)?,
+                    output: serde_json::to_string(&posts)?.into(),
                     error: None,
                 })
             }
@@ -335,7 +335,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("Missing required 'post_id' parameter for comment".into()),
                         });
                     }
@@ -346,7 +346,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("Missing required 'text' parameter for comment".into()),
                         });
                     }
@@ -356,7 +356,7 @@ impl Tool for LinkedInTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Comment posted successfully. Comment ID: {comment_id}"),
+                    output: format!("Comment posted successfully. Comment ID: {comment_id}").into(),
                     error: None,
                 })
             }
@@ -367,7 +367,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some("Missing required 'post_id' parameter for react".into()),
                         });
                     }
@@ -378,7 +378,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required 'reaction_type' parameter for react".into(),
                             ),
@@ -390,7 +390,7 @@ impl Tool for LinkedInTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Reaction '{reaction_type}' added to post {post_id}"),
+                    output: format!("Reaction '{reaction_type}' added to post {post_id}").into(),
                     error: None,
                 })
             }
@@ -401,7 +401,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required 'post_id' parameter for delete_post".into(),
                             ),
@@ -413,7 +413,7 @@ impl Tool for LinkedInTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Post {post_id} deleted successfully"),
+                    output: format!("Post {post_id} deleted successfully").into(),
                     error: None,
                 })
             }
@@ -424,7 +424,7 @@ impl Tool for LinkedInTool {
                     _ => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required 'post_id' parameter for get_engagement".into(),
                             ),
@@ -436,7 +436,7 @@ impl Tool for LinkedInTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string(&engagement)?,
+                    output: serde_json::to_string(&engagement)?.into(),
                     error: None,
                 })
             }
@@ -446,14 +446,14 @@ impl Tool for LinkedInTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string(&profile)?,
+                    output: serde_json::to_string(&profile)?.into(),
                     error: None,
                 })
             }
 
             unknown => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown action: '{unknown}'")),
             }),
         }

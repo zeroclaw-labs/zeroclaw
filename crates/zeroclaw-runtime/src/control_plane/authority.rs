@@ -1,21 +1,7 @@
 //! Runtime-authority guard — decides whether THIS process may reclaim a task.
-//!
-//! Mirrors OpenClaw's `isRuntimeAuthoritative` (`task-registry.maintenance.ts`): a
-//! daemon must never move another *live* daemon's task to a terminal-loss state.
-//! Reclamation is safe only when the record is a prior-boot orphan, or its owning
-//! process is dead.
 
 use super::task_registry::TaskRecord;
 
-/// True iff this process may reconcile `rec` to a terminal-loss state.
-///
-/// Authoritative when:
-///   * the record is from a PRIOR boot (`owner_boot_id != current_boot_id`) — the
-///     daemon that owned it is gone, so its in-flight tasks are orphans; or
-///   * the record is same-boot but its `owner_pid` is no longer alive (crashed
-///     mid-run without writing a terminal state).
-///
-/// Never reclaims a task a live same-boot daemon is actively heart-beating.
 pub fn is_authoritative(rec: &TaskRecord, current_boot_id: &str) -> bool {
     is_authoritative_with_pid_liveness(rec, current_boot_id, pid_is_alive)
 }

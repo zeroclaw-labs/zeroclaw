@@ -1,22 +1,4 @@
 //! Bindings for the Total Phase Aardvark I2C/SPI/GPIO USB adapter.
-//!
-//! Uses [`libloading`] to load `aardvark.so` at runtime — the same pattern
-//! the official Total Phase C stub (`aardvark.c`) uses internally.
-//!
-//! # Library search order
-//!
-//! 1. `ZEROCLAW_AARDVARK_LIB` environment variable (full path to `aardvark.so`)
-//! 2. `<workspace>/crates/aardvark-sys/vendor/aardvark.so` (development default)
-//! 3. `./aardvark.so` (next to the binary, for deployment)
-//!
-//! If none resolve, every method returns
-//! [`Err(AardvarkError::LibraryNotFound)`](AardvarkError::LibraryNotFound).
-//!
-//! # Safety
-//!
-//! This crate is the **only** place in ZeroClaw where `unsafe` is permitted.
-//! All `unsafe` is confined to `extern "C"` call sites inside this file.
-//! The public API is fully safe Rust.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -153,12 +135,6 @@ pub type Result<T> = std::result::Result<T, AardvarkError>;
 
 // ── Handle ────────────────────────────────────────────────────────────────
 
-/// Safe RAII handle over the Aardvark C library handle.
-///
-/// Automatically closes the adapter on `Drop`.
-///
-/// **Usage pattern:** open a fresh handle per command and let it drop at the
-/// end of each operation (lazy-open / eager-close).
 pub struct AardvarkHandle {
     handle: i32,
 }
@@ -190,7 +166,6 @@ impl AardvarkHandle {
     }
 
     /// Return the port numbers of all **free** connected adapters.
-    ///
     /// Ports in-use by another process are filtered out.
     /// Returns an empty `Vec` when `aardvark.so` cannot be loaded.
     pub fn find_devices() -> Vec<u16> {
@@ -300,7 +275,6 @@ impl AardvarkHandle {
     }
 
     /// Scan the I2C bus, returning addresses of all responding devices.
-    ///
     /// Probes `0x08–0x77` with a 1-byte read; returns addresses that ACK.
     pub fn i2c_scan(&self) -> Vec<u8> {
         let Some(lib) = lib() else {
@@ -350,7 +324,6 @@ impl AardvarkHandle {
     }
 
     /// Full-duplex SPI transfer.
-    ///
     /// Sends `send` bytes; returns the simultaneously received bytes (same length).
     pub fn spi_transfer(&self, send: &[u8]) -> Result<Vec<u8>> {
         let lib = lib().ok_or(AardvarkError::LibraryNotFound)?;
@@ -378,7 +351,6 @@ impl AardvarkHandle {
     // ── GPIO ──────────────────────────────────────────────────────────────
 
     /// Set GPIO pin directions and output values.
-    ///
     /// `direction`: bitmask — `1` = output, `0` = input.
     /// `value`: output state bitmask.
     pub fn gpio_set(&self, direction: u8, value: u8) -> Result<()> {

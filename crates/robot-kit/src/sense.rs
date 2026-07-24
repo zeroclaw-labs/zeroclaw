@@ -1,5 +1,4 @@
 //! Sense Tool - LIDAR, motion sensors, ultrasonic distance
-//!
 //! Provides environmental awareness through various sensors.
 //! Supports multiple backends: direct GPIO, ROS2 topics, or mock.
 

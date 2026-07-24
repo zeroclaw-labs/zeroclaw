@@ -1,5 +1,4 @@
 //! Landlock sandbox (Linux kernel 5.13+ LSM)
-//!
 //! Landlock provides unprivileged sandboxing through the Linux kernel.
 //! This module uses the pure-Rust `landlock` crate for filesystem access control.
 

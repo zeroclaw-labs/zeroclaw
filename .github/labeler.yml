@@ -332,6 +332,7 @@
       - any-glob-to-any-file:
           - "crates/zeroclaw-runtime/src/security/pairing.rs"
           - "crates/zeroclaw-gateway/src/api_pairing.rs"
+          - "apps/tauri/src/commands/pairing.rs"
           - "web/src/pages/Pairing.tsx"
 
 "security:policy":

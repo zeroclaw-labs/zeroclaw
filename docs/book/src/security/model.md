@@ -68,8 +68,27 @@ Beyond the six layers:
 - **OTP gating**: `[security.otp] gated_actions = ["shell", "browser", "file_write"]` requires a one-time code before each listed action. Useful for remote-access scenarios.
 - **Emergency stop**: `zeroclaw estop` halts all in-flight tool calls. With `[security.estop] enabled = true`, resuming requires an OTP.
 - **Prompt injection guard**: scans model output for known injection patterns before tool calls are validated.
-- **Leak detector**: scans outbound messages for secrets (API key patterns, private keys) and blocks sends that match.
+- **Leak detector**: scans outbound channel responses for credentials and redacts matches before delivery. It covers deterministic credential patterns and can also run a standalone high-entropy-token heuristic.
 - **Pairing guard**: device pairing for channel auth; prevents stolen credentials from working on a new device.
+
+## Leak detector configuration
+
+Configure outbound leak detection in its own TOML section:
+
+```toml
+[security.leak_detection]
+enabled = true
+sensitivity = 0.7
+high_entropy_tokens = true
+```
+
+`enabled = false` disables the entire outbound leak detector.
+`high_entropy_tokens = false` disables only the standalone entropy heuristic;
+deterministic credential patterns still run. `sensitivity` accepts `0.0`
+through `1.0`; higher values are more aggressive.
+
+The complete field table and defaults are in the
+[Config reference](../reference/config.md#securityleak_detection).
 
 ## When things go wrong
 

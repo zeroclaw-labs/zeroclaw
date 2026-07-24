@@ -1,11 +1,4 @@
 //! Multi-provider Text-to-Speech (TTS) subsystem.
-//!
-//! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
-//! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
-//!
-//! per-instance configs live under `[tts_providers.<type>.<alias>]`; agents
-//! pick which instance to use via the `tts_provider` dotted alias reference.
-//! Global runtime knobs (default_voice, max_text_length, etc.) live on `[tts]`.
 
 use std::collections::HashMap;
 
@@ -18,6 +11,9 @@ const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
 
 /// Default HTTP request timeout for TTS API calls.
 const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Maximum time allowed for a local ffmpeg transcode.
+const FFMPEG_TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ── TtsProvider trait ────────────────────────────────────────────
 
@@ -415,11 +411,6 @@ impl EdgeTtsProvider {
     /// Allowed basenames for the Edge TTS binary.
     const ALLOWED_BINARIES: &[&str] = &["edge-tts", "edge-playback"];
 
-    /// Create a new Edge TTS model_provider from config.
-    ///
-    /// `binary_path` must be a bare command name (no path separators) matching
-    /// one of `ALLOWED_BINARIES`. This prevents arbitrary executable
-    /// paths like `/tmp/malicious/edge-tts` from passing the basename check.
     pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
         let raw_path = config
             .binary_path
@@ -602,16 +593,37 @@ impl TtsProvider for PiperTtsProvider {
 
 // ── TtsManager ───────────────────────────────────────────────────
 
-/// Transcode raw audio bytes to OGG/Opus via an `ffmpeg` subprocess.
-///
-/// Pipes `audio` into ffmpeg's stdin and reads OGG/Opus from stdout.
-/// stdin and stdout are driven concurrently to avoid buffer-deadlocks on
-/// large inputs. Requires `ffmpeg` with `libopus` support installed.
-async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
-    use std::process::Stdio;
+async fn write_audio_and_wait_with_output(
+    mut child: tokio::process::Child,
+    audio: Vec<u8>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = tokio::process::Command::new("ffmpeg")
+    let mut stdin = child.stdin.take().context("ffmpeg stdin was not piped")?;
+
+    tokio::time::timeout(timeout, async move {
+        // Drive stdin and wait concurrently: if the child fills its stdout pipe
+        // before stdin is complete, sequential operation would deadlock.
+        let (write_result, output) = tokio::join!(
+            async move {
+                stdin.write_all(&audio).await?;
+                stdin.shutdown().await
+            },
+            child.wait_with_output()
+        );
+
+        write_result.context("failed to write audio to ffmpeg stdin")?;
+        output.context("ffmpeg process error")
+    })
+    .await
+    .with_context(|| format!("ffmpeg transcode timed out after {timeout:?}"))?
+}
+
+async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
+    use std::process::Stdio;
+
+    let child = tokio::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
@@ -631,26 +643,14 @@ async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context(
             "failed to spawn ffmpeg — ensure ffmpeg with libopus support is installed \
              (e.g. `sudo dnf install ffmpeg` / `sudo apt install ffmpeg`)",
         )?;
 
-    let mut stdin = child.stdin.take().expect("stdin configured above");
-
-    // Drive stdin and wait concurrently: if ffmpeg fills its stdout pipe
-    // before we finish writing stdin, sequential operation would deadlock.
-    let (write_result, output) = tokio::join!(
-        async move {
-            stdin.write_all(&audio).await?;
-            stdin.shutdown().await
-        },
-        child.wait_with_output()
-    );
-
-    write_result.context("failed to write audio to ffmpeg stdin")?;
-    let output = output.context("ffmpeg process error")?;
+    let output = write_audio_and_wait_with_output(child, audio, FFMPEG_TRANSCODE_TIMEOUT).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -665,14 +665,6 @@ async fn transcode_to_opus(audio: Vec<u8>) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Central manager for per-agent TTS synthesis.
-///
-/// `tts_providers` are keyed by their dotted alias (`<type>.<alias>`).
-/// Per-instance voice overrides come from the `voice` field on each
-/// `TtsProviderConfig`. The `agent_tts_provider` field carries the
-/// resolved alias for the agent that owns this manager instance — empty
-/// means the agent doesn't want TTS, and `synthesize_for_agent` fails
-/// loud rather than silently pick a default.
 pub struct TtsManager {
     tts_providers: HashMap<String, Box<dyn TtsProvider>>,
     voice_by_alias: HashMap<String, String>,
@@ -684,28 +676,10 @@ pub struct TtsManager {
 }
 
 impl TtsManager {
-    /// Build a `TtsManager` from `[tts_providers.<type>.<alias>]` instances
-    /// in `Config`. Each instance is registered under its dotted alias key
-    /// (`<type>.<alias>`). Failures to construct a particular instance are
-    /// logged at warn but do not abort the manager.
-    /// Build a `TtsManager` from `[tts_providers.<type>.<alias>]` instances.
-    /// The manager's resolved alias comes from the runtime-active agent's
-    /// `tts_provider` field — there is no global default-provider concept,
-    /// so when no agent-bound resolution is available the manager refuses
-    /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_for_agent(config, None)
     }
 
-    /// Build a `TtsManager` bound to a specific agent's `tts_provider`.
-    ///
-    /// `agent_alias` is the channel-owning agent (resolve via
-    /// [`Config::agent_for_channel`]). When `None`, falls back to the
-    /// runtime-active agent ([`Config::resolved_runtime_agent_alias`]) for
-    /// callers that cannot determine the owning agent. Binding to the
-    /// owning agent is what lets a channel owned by e.g. `primary` use
-    /// `primary`'s `tts_provider` instead of whichever enabled agent
-    /// happens to sort first.
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
@@ -776,11 +750,6 @@ impl TtsManager {
         })
     }
 
-    /// Synthesize `text` and return OGG/Opus audio suitable for Telegram
-    /// `sendVoice` and WhatsApp PTT voice notes. If the active provider
-    /// already outputs Opus (e.g. OpenAI with `response_format = "opus"`),
-    /// the bytes pass through unchanged; otherwise they are transcoded via an
-    /// `ffmpeg` subprocess. Requires `ffmpeg` with `libopus` support installed.
     pub async fn synthesize_opus(&self, text: &str) -> Result<Vec<u8>> {
         let audio = self.synthesize(text).await?;
         let provider_alias = self.agent_tts_provider.as_str();
@@ -795,12 +764,6 @@ impl TtsManager {
         transcode_to_opus(audio).await
     }
 
-    /// Synthesize text using the runtime-active agent's resolved
-    /// `tts_provider` reference and the per-instance voice override (or
-    /// `default_voice` as the per-instance fallback). Fails loud when the
-    /// agent has no `tts_provider` configured — there is no global
-    /// default-provider concept and this manager refuses to silently pick
-    /// one.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
         let provider_alias = self.agent_tts_provider.as_str();
         if provider_alias.is_empty() {
@@ -884,11 +847,6 @@ impl TtsManager {
         names
     }
 
-    /// Audio output format of the runtime-active agent's resolved TTS provider
-    /// (e.g. `"wav"`, `"opus"`, `"mp3"`). `None` when the agent has no
-    /// `tts_provider` configured or the alias is not registered. Channels use
-    /// this to label the upload with the correct MIME type and pick the right
-    /// Telegram send method.
     pub fn agent_output_format(&self) -> Option<&str> {
         let alias = self.agent_tts_provider.as_str();
         if alias.is_empty() {
@@ -959,6 +917,80 @@ impl ::zeroclaw_api::attribution::Attributable for PiperTtsProvider {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn piped_shell_child(script: &str) -> tokio::process::Child {
+        use std::process::Stdio;
+
+        tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn test child")
+    }
+
+    #[cfg(unix)]
+    async fn process_exists(pid: u32) -> bool {
+        use std::process::Stdio;
+
+        tokio::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcode_process_times_out_stalled_child() {
+        let child = piped_shell_child("exec sleep 60");
+        let pid = child.id().expect("spawned child has a process ID");
+        let started = std::time::Instant::now();
+        let error = write_audio_and_wait_with_output(
+            child,
+            b"audio".to_vec(),
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("stalled child must time out");
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "expected timeout error, got: {error:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stalled child must return promptly"
+        );
+
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_exists(pid).await && std::time::Instant::now() < cleanup_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!process_exists(pid).await, "timed-out child must be killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transcode_process_preserves_healthy_pipe_io() {
+        let input = vec![b'a'; 1024 * 1024];
+        let output = write_audio_and_wait_with_output(
+            piped_shell_child("exec cat"),
+            input.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("healthy child completes");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, input);
+    }
+
     fn config_with_edge_alias() -> Config {
         let mut cfg = Config::default();
         cfg.agents.insert(
@@ -1015,10 +1047,6 @@ mod tests {
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
     }
 
-    /// Regression for #7001: a channel-owning agent's `tts_provider` must win
-    /// over a lexicographically-earlier enabled agent that has none. Binding
-    /// the manager to the owner (`from_config_for_agent(cfg, Some("primary"))`)
-    /// resolves `primary`'s provider, not the first-sorting agent's empty one.
     #[test]
     fn tts_manager_binds_owning_agent_provider() {
         // Reuse the edge.default provider registration, but install two agents:

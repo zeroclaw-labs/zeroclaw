@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
 use zeroclaw_log::Instrument;
-use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
@@ -36,36 +35,6 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
 
-/// True when an LLM-produced output is a *quiet* `NO_REPLY` sentinel — one that
-/// means "nothing to report" — rather than content meant to be delivered.
-///
-/// Cron jobs and heartbeat tasks routinely instruct the model to answer with
-/// `NO_REPLY` when a health/status check finds nothing worth surfacing. The
-/// delivery path must recognise this sentinel and skip sending, otherwise the
-/// literal string "NO_REPLY" is announced to the channel (the bug reported in
-/// zeroclaw-labs/zeroclaw#2128).
-///
-/// # Why only the *quiet* forms are suppressed
-///
-/// The channel reply-intent classifier (see `zeroclaw-channels`
-/// `parse_reply_intent`) emits kinded forms with distinct operational meaning:
-///
-/// - `NO_REPLY` / `NO_REPLY: <reason>` / `NO_REPLY[INFO]: <reason>` — quiet,
-///   "nothing to report". **Suppressed here.**
-/// - `NO_REPLY[REFUSE]: <reason>` — refused for safety/policy/prompt-injection.
-/// - `NO_REPLY[FAIL]: <reason>` — tried but couldn't fulfil (timeout, bad URL,
-///   missing resource).
-///
-/// In the channel path a refusal or failure still surfaces out-of-band via a
-/// chat reaction (🚫 / ⚠️). Cron and heartbeat *announce* delivery have no such
-/// side channel: if we suppressed `NO_REPLY[FAIL]: database check timed out`,
-/// that operator-visible failure would silently vanish into a DEBUG log. So
-/// only the informational/legacy/bare forms are treated as suppressible here;
-/// refusal and failure kinds fall through and are delivered as visible text.
-///
-/// Matching is case-insensitive and trim-tolerant. The kinded `[...]` form is
-/// only treated as a sentinel when the kind is explicitly `INFO`; any other
-/// bracketed kind (including unknown future kinds) is conservatively delivered.
 #[must_use]
 pub fn is_no_reply_sentinel(output: &str) -> bool {
     let trimmed = output.trim();
@@ -91,14 +60,6 @@ pub fn is_no_reply_sentinel(output: &str) -> bool {
     false
 }
 
-/// The delivery decision for an announce-mode cron job or heartbeat task.
-///
-/// Separated from the I/O so the suppression behaviour can be unit-tested
-/// without a registered `DELIVERY_FN`, a live channel, or the full heartbeat
-/// worker. Both the cron announce site (`deliver_if_configured`) and the
-/// heartbeat worker route their suppression decision through
-/// [`announce_delivery_decision`], so a regression that drops the guard at
-/// either site is caught by the decision tests (zeroclaw-labs/zeroclaw#2128).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnounceDecision {
     /// Send the output to the configured channel.
@@ -116,7 +77,6 @@ impl AnnounceDecision {
 }
 
 /// Decide whether an announce-mode output should be delivered or suppressed.
-///
 /// Suppresses only the *quiet* `NO_REPLY` forms (see [`is_no_reply_sentinel`]);
 /// failure/refusal kinds and all real content are delivered.
 #[must_use]
@@ -366,12 +326,6 @@ pub async fn run(
         ),
     }
 
-    // ── Startup catch-up: run ALL overdue jobs before entering the
-    //    normal polling loop. The regular loop is capped by `max_tasks`,
-    //    which could leave some overdue jobs waiting across many cycles
-    //    if the machine was off for a while. The catch-up phase fetches
-    //    without the `max_tasks` limit so every missed job fires once.
-    //    Controlled by `[scheduler] catch_up_on_startup` (default: true).
     if config.scheduler.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &event_tx).await;
     } else {
@@ -384,11 +338,6 @@ pub async fn run(
     }
 
     loop {
-        // `select!` between the interval tick and the cancellation
-        // token so the daemon's shutdown path (`channels_cancel.cancel()`
-        // at daemon/mod.rs:584) reaches the scheduler without waiting
-        // for the next tick — and so the loop returns `Ok(())` cleanly
-        // before the supervisor's `.abort()` fallback would fire.
         tokio::select! {
             _ = interval.tick() => {
                 // Keep scheduler liveness fresh even when there are no due jobs.
@@ -425,16 +374,6 @@ pub async fn run(
     }
 }
 
-/// Resolve which agent owns a given cron job. Lookup order:
-///
-/// 1. The row's persisted `agent_alias` field, when it names a
-///    configured agent.
-/// 2. Reverse-resolve via `[agents.<x>].cron_jobs` (declarative path:
-///    every alias that lists the cron alias claims ownership).
-///
-/// Returns `None` when neither resolves. Callers (process_due_jobs,
-/// execute_job_now) log and skip the job rather than crashing the
-/// scheduler loop.
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
     if !job.agent_alias.is_empty()
         && let Some((alias, _)) = config
@@ -448,7 +387,6 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str
 }
 
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
-///
 /// Called once at scheduler startup so that jobs missed during downtime
 /// (e.g. late boot, daemon restart) are caught up immediately.
 async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
@@ -493,14 +431,6 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 }
 
-/// Advance `next_run` for all overdue jobs without executing them.
-///
-/// Called at scheduler startup when `catch_up_on_startup` is disabled so
-/// that the normal polling loop (which selects `next_run <= now`) doesn't
-/// pick up jobs that became overdue during daemon downtime.
-///
-/// - Recurring jobs: `next_run` is advanced to the next future occurrence.
-/// - One-shot `At` jobs: disabled with a `skipped` last status.
 async fn skip_missed_jobs_on_startup(config: &Config) {
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
@@ -647,15 +577,6 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-/// Atomically claim each due job, returning only the jobs this scheduler won.
-///
-/// Claiming is part of selection: a job already in flight (claimed by an earlier
-/// poll, the startup catch-up, or a concurrent trigger) is dropped here so it is
-/// never launched again while a prior run is still running (issue #6037). Each
-/// claimed job's lock is released in `execute_and_persist_job` once its run
-/// completes. Callers pass jobs sourced from `due_jobs` / `all_overdue_jobs`,
-/// which are always DB-backed, so a failed claim means the row is locked (or the
-/// claim query errored) rather than absent.
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
     jobs.into_iter()
         .filter(|job| match claim_job(config, &job.id, Utc::now()) {
@@ -696,11 +617,6 @@ async fn process_due_jobs(
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        // Resolve owning agent per-job. Skip orphans with a warning so a
-        // mis-configured job can't take down the scheduler loop. The job was
-        // claimed in `claim_due_jobs`, so release the lock on every skip path
-        // here — otherwise a skipped job would stay filtered out of `due_jobs`
-        // until restart instead of being retried next poll (issue #6037).
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
             let _ = release_job(config, &job.id);
@@ -782,7 +698,7 @@ async fn execute_and_persist_job(
     // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
     // that the run (and its reschedule/disable/delete in `persist_job_result`) is
     // done. A deleted one-shot row simply releases nothing. If this fails the lock
-    // is recovered by `clear_stale_locks` at the next startup (issue #6037).
+    // is recovered by `clear_stale_locks` at the next startup
     if let Err(e) = release_job(config, &job.id) {
         ::zeroclaw_log::record!(
             WARN,
@@ -802,11 +718,6 @@ async fn run_agent_job(
     agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
-    // Cron is one of two SubAgent spawn sites; the other is the
-    // agent-loop `spawn_subagent` tool. Both funnel through
-    // `SubAgentSpawn::for_agent` so permission inheritance, tracing
-    // span shape, and audit attribution stay uniform across spawn
-    // sites.
     let subagent_ctx = match crate::subagent::SubAgentSpawn::for_agent(config, agent_alias)
         .and_then(|spawn| spawn.build(crate::subagent::SubAgentOverrides::default()))
     {
@@ -837,50 +748,7 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
 
-    // Recall relevant memories so cron jobs have context awareness.
-    // Skipped when `job.uses_memory` is false (e.g. stateless digest jobs).
-    // Exclude `Conversation` memories to prevent chat context from
-    // leaking into scheduled executions. Routes through
-    // the cron-owning agent's per-agent memory wrapper so the
-    // recall is scoped to that agent's bound + allowlisted rows.
-    let memory_context = if !job.uses_memory {
-        String::new()
-    } else {
-        match zeroclaw_memory::create_memory_for_agent(
-            config,
-            agent_alias,
-            config
-                .model_provider_for_agent(agent_alias)
-                .and_then(|e| e.api_key.as_deref()),
-        )
-        .await
-        {
-            Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-                Ok(entries) if !entries.is_empty() => {
-                    let ctx: String = entries
-                        .iter()
-                        .filter(|e| {
-                            !matches!(
-                                e.category,
-                                zeroclaw_memory::traits::MemoryCategory::Conversation
-                            )
-                        })
-                        .map(|e| format!("- {}: {}", e.key, e.content))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if ctx.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n")
-                    }
-                }
-                _ => String::new(),
-            },
-            Err(_) => String::new(),
-        }
-    };
-
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let mut cron_config = config.clone();
@@ -902,21 +770,24 @@ async fn run_agent_job(
         spawn_site = "cron",
     );
 
-    // Pass the validated SubAgent context as run-time overrides so the
-    // policy that came back from `SubAgentSpawn::build` reaches the
-    // agent loop. Without this the loop reconstructs from config and
-    // any future caller-supplied narrowing override would silently
-    // collapse back to the parent's verbatim policy.
-    //
-    // `is_subagent: false` is explicit (not `..Default::default()`) so
-    // a future refactor that flips the default can't quietly promote
-    // every cron-launched agent to a depth-1 subagent — they're
-    // top-level runs by design, despite riding through SubAgentSpawn.
     let run_security = cron_agent_run_security_policy(subagent_ctx.policy.as_ref(), job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
         memory: None,
         is_subagent: false,
+        // `uses_memory = false` fully opts the job out of the engine's
+        // memory-context injection (stateless digest jobs)...
+        suppress_memory_inject: !job.uses_memory,
+        // ...and makes the run memory-free end to end: the loop binds a
+        // `NoneMemory` backend and drops the persistent memory tools, so a
+        // `uses_memory = false` job can neither recall/store through a real
+        // backend nor reach one via advertised memory tools
+        memory_free: !job.uses_memory,
+        // Cron runs are short-lived and one-shot — no cross-turn reuse
+        // contract, so the per-call `connect_all` path inside
+        // `agent::run` is the correct choice. The daemon heartbeat
+        // worker is the only `mcp_registry` supplier.
+        mcp_registry: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -934,6 +805,7 @@ async fn run_agent_job(
                     false,
                     Some(session_path.clone()),
                     job.allowed_tools.clone(),
+                    zeroclaw_api::ingress::TurnOrigin::Cron,
                     run_overrides,
                 )
                 .instrument(subagent_span),
@@ -953,12 +825,6 @@ async fn run_agent_job(
         ),
         Err(e) => {
             if matches!(job.session_target, SessionTarget::Isolated) {
-                // Purge memories written during this failed run so they don't
-                // pollute future recall and cause context snowball. Routes
-                // through the cron-owning agent's per-agent memory wrapper
-                // so the purge stays scoped to the agent that wrote them.
-                // Sanitize the session key so it matches what the runtime
-                // writes via the orchestrator session-key sanitizer.
                 let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
                     "cli:{}",
                     session_path.display()
@@ -1113,11 +979,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
-    // Skip delivery when the job's agent signalled "nothing to report" via the
-    // quiet NO_REPLY sentinel. Without this guard the literal sentinel string is
-    // announced to the channel (zeroclaw-labs/zeroclaw#2128). Failure/refusal
-    // kinds (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are *not* suppressed — they
-    // carry operator-visible meaning and are delivered as visible text.
     if !announce_delivery_decision(output).should_deliver() {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1200,18 +1061,6 @@ pub async fn deliver_announcement(
         )
         .await
     } else {
-        // No handler registered: this is a runtime-level state (the binary
-        // hasn't called `register_delivery_fn`), not a per-job failure.
-        // Returning `Err` here would force every announce-mode job to set
-        // `best_effort=true` just to survive a system that legitimately has
-        // no delivery wired (e.g. headless test runs, gateway-only deployments
-        // where channel orchestration lives elsewhere).
-        //
-        // We log loudly via `tracing::warn` so operators see the dropped
-        // delivery in their logs, then return `Ok(())` so `persist_job_result`
-        // records the job execution itself as successful. Operators that
-        // actively rely on delivery wire a handler at startup; absence is a
-        // configuration signal, not a delivery error.
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1311,19 +1160,6 @@ async fn run_job_command_with_timeout(
     }
 }
 
-/// Build a shell `Command` for cron job execution.
-///
-/// Uses `sh -c <command>` (non-login shell). On Windows, ZeroClaw users
-/// typically have Git Bash installed which provides `sh` in PATH, and
-/// cron commands are written with Unix shell syntax. The previous `-lc`
-/// (login shell) flag was dropped: login shells load the full user
-/// profile on every invocation which is slow and may cause side effects.
-///
-/// The command is configured with:
-/// - `current_dir` set to the workspace
-/// - `stdin` piped to `/dev/null` (no interactive input)
-/// - `stdout` and `stderr` piped for capture
-/// - `kill_on_drop(true)` for safe timeout handling
 fn build_cron_shell_command(
     command: &str,
     workspace_dir: &std::path::Path,
@@ -1378,7 +1214,7 @@ mod tests {
         // REFUSE / FAIL carry operator-visible meaning. In the cron/heartbeat
         // announce context there is no reaction side-channel, so suppressing
         // them would silently drop a failure/refusal the operator must see
-        // (zeroclaw-labs/zeroclaw#2128 review feedback).
+        // review feedback).
         assert!(!is_no_reply_sentinel(
             "NO_REPLY[FAIL]: database check timed out"
         ));
@@ -2125,6 +1961,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2152,6 +1989,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2180,6 +2018,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2337,6 +2176,7 @@ mod tests {
             }),
             false,
             None,
+            true,
         )
         .unwrap();
         let started = Utc::now();
@@ -2433,6 +2273,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         assert!(!job.delete_after_run);
@@ -2462,14 +2303,6 @@ mod tests {
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
     }
 
-    /// Process-global recorder for the injected delivery fn. `deliver_announcement`
-    /// reads a single `OnceLock`-backed handler, so the whole test binary shares
-    /// one handler regardless of registration order. This recorder is a superset
-    /// of the failure-contract handler the delivery-classification tests rely on:
-    /// it fails for `channel == "fail-delivery"`, counts deliveries on the
-    /// dedicated `count-delivery` channel, and otherwise just succeeds. Counting
-    /// only the dedicated channel keeps the suppression test's count deltas
-    /// immune to deliveries from other tests running in parallel.
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Channel name the recorder counts. Used only by the suppression test.
@@ -2505,11 +2338,6 @@ mod tests {
         job
     }
 
-    /// Regression for zeroclaw-labs/zeroclaw#2128: the cron announce delivery
-    /// path must NOT call the channel delivery fn for a quiet `NO_REPLY`
-    /// sentinel, but MUST call it for real content and for failure/refusal
-    /// kinds. This exercises `deliver_if_configured` end-to-end, so it fails if
-    /// the suppression guard is removed from that call site.
     #[tokio::test]
     async fn deliver_if_configured_suppresses_no_reply_but_delivers_real_and_failure() {
         register_recording_delivery_fn();
@@ -2559,11 +2387,6 @@ mod tests {
         }
     }
 
-    /// Mirrors the heartbeat worker's suppression decision (daemon/mod.rs).
-    /// The worker computes `suppress_delivery` from `announce_delivery_decision`,
-    /// so this locks the two user-visible heartbeat behaviors from #2128:
-    /// a `NO_REPLY` heartbeat sends nothing, while real output (and the
-    /// empty-output `💓 heartbeat task completed` fallback) still deliver.
     #[test]
     fn heartbeat_announce_decision_matches_worker_behavior() {
         // NO_REPLY heartbeat: suppressed.
@@ -2705,7 +2528,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_due_jobs_skips_in_flight_job() {
-        // Regression for #6037: once a due job is claimed for execution, a
+        // once a due job is claimed for execution, a
         // subsequent selection pass must not pick it up again until the prior
         // run releases it — otherwise a job that runs longer than the poll
         // interval is launched repeatedly.
@@ -2736,7 +2559,7 @@ mod tests {
         // A job claimed for execution but then skipped by process_due_jobs (here
         // an orphan with no owning agent) must have its in-flight lock released,
         // so it is retried on the next poll instead of being wedged out of
-        // due_jobs until restart (issue #6037).
+        // due_jobs until restart
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         // Insert a real, claimable DB row under a configured agent, then drive

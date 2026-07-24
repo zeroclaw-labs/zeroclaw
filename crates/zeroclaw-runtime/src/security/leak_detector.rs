@@ -1,17 +1,24 @@
 //! Credential leak detection for outbound content.
-//!
-//! Scans outbound messages for potential credential leaks before they are sent,
-//! preventing accidental exfiltration of API keys, tokens, passwords, and other
-//! sensitive values.
-//!
-//! Contributed from RustyClaw (MIT licensed).
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::OnceLock;
+use zeroclaw_config::schema::LeakDetectionConfig;
 
 /// Minimum token length considered for high-entropy detection.
 const ENTROPY_TOKEN_MIN_LEN: usize = 24;
+
+#[derive(Debug, Clone)]
+struct CandidateToken<'a> {
+    value: &'a str,
+    span: Range<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct Redaction {
+    span: Range<usize>,
+    replacement: &'static str,
+}
 
 /// Result of leak detection.
 #[derive(Debug, Clone)]
@@ -30,8 +37,12 @@ pub enum LeakResult {
 /// Credential leak detector for outbound content.
 #[derive(Debug, Clone)]
 pub struct LeakDetector {
+    /// Enable all outbound credential detection.
+    enabled: bool,
     /// Sensitivity threshold (0.0-1.0, higher = more aggressive detection).
     sensitivity: f64,
+    /// Enable heuristic redaction of standalone high-entropy token candidates.
+    high_entropy_tokens: bool,
 }
 
 impl Default for LeakDetector {
@@ -43,40 +54,106 @@ impl Default for LeakDetector {
 impl LeakDetector {
     /// Create a new leak detector with default sensitivity.
     pub fn new() -> Self {
-        Self { sensitivity: 0.7 }
+        Self::with_config(&LeakDetectionConfig::default())
     }
 
     /// Create a detector with custom sensitivity.
     pub fn with_sensitivity(sensitivity: f64) -> Self {
         Self {
             sensitivity: sensitivity.clamp(0.0, 1.0),
+            ..Self::new()
+        }
+    }
+
+    /// Create a detector from the user-facing config source of truth.
+    pub fn with_config(config: &LeakDetectionConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            sensitivity: config.sensitivity.clamp(0.0, 1.0),
+            high_entropy_tokens: config.high_entropy_tokens,
         }
     }
 
     /// Scan content for potential credential leaks.
     pub fn scan(&self, content: &str) -> LeakResult {
-        let mut patterns = Vec::new();
-        let mut redacted = content.to_string();
+        self.scan_with_protected_spans(content, &[])
+    }
 
-        // Check each pattern type
-        self.check_api_keys(content, &mut patterns, &mut redacted);
-        self.check_aws_credentials(content, &mut patterns, &mut redacted);
-        self.check_generic_secrets(content, &mut patterns, &mut redacted);
-        self.check_private_keys(content, &mut patterns, &mut redacted);
-        self.check_jwt_tokens(content, &mut patterns, &mut redacted);
-        self.check_database_urls(content, &mut patterns, &mut redacted);
-        self.check_bot_token(content, &mut patterns, &mut redacted);
-        self.check_high_entropy_tokens(content, &mut patterns, &mut redacted);
+    /// Scan content while applying caller-supplied byte ranges to heuristics.
+    ///
+    /// Protected spans mark ranges that the high-entropy heuristic must not
+    /// rewrite. Deterministic credential detectors still scan the full content
+    /// and may redact precise credential patterns inside protected ranges. This
+    /// keeps format-specific paths, URLs, and references from tripping entropy
+    /// detection without letting real secrets hide in functional destinations.
+    pub fn scan_with_protected_spans(
+        &self,
+        content: &str,
+        protected_spans: &[Range<usize>],
+    ) -> LeakResult {
+        if !self.enabled {
+            return LeakResult::Clean;
+        }
+
+        let mut patterns = Vec::new();
+        let protected_spans = merge_spans(
+            protected_spans
+                .iter()
+                .filter(|span| {
+                    span.start < span.end
+                        && span.end <= content.len()
+                        && content.is_char_boundary(span.start)
+                        && content.is_char_boundary(span.end)
+                })
+                .cloned()
+                .collect(),
+        );
+        let mut redactions = Vec::new();
+
+        // Deterministic credential patterns always scan the full, unprotected
+        // content. They match precise, low-false-positive shapes (AWS key
+        // format, PEM markers, JWT triple-base64, DB URL schemes, bot-token
+        // syntax) that ordinary generated file paths do not produce, so the
+        // shape-based false-positive problem does not apply to them. A real
+        // credential can be placed inside a link destination or file reference
+        // exactly as easily as in visible text, and visible text must still
+        // be scanned for real secrets -- the same must hold for non-visible
+        // functional parts. Only the high-entropy heuristic, which misfires on
+        // the *shape* of a path rather than on an actual secret token, honors
+        // caller-supplied protected spans.
+        let no_protected_spans: &[Range<usize>] = &[];
+        self.check_api_keys(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_aws_credentials(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_generic_secrets(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_private_keys(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_jwt_tokens(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_database_urls(content, no_protected_spans, &mut patterns, &mut redactions);
+        self.check_bot_token(content, no_protected_spans, &mut patterns, &mut redactions);
+        if self.high_entropy_tokens {
+            self.check_high_entropy_tokens(
+                content,
+                &protected_spans,
+                &mut patterns,
+                &mut redactions,
+            );
+        }
 
         if patterns.is_empty() {
             LeakResult::Clean
         } else {
+            let redacted = apply_redactions(content, &redactions);
             LeakResult::Detected { patterns, redacted }
         }
     }
 
     /// Check for common API key patterns.
-    fn check_api_keys(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_api_keys(
+        &self,
+        content: &str,
+        protected_spans: &[Range<usize>],
+        patterns: &mut Vec<String>,
+        redactions: &mut Vec<Redaction>,
+    ) {
         static API_KEY_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = API_KEY_PATTERNS.get_or_init(|| {
             vec![
@@ -128,12 +205,15 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) {
-                patterns.push(String::from(*name));
-                *redacted = regex
-                    .replace_all(redacted, "[REDACTED_API_KEY]")
-                    .to_string();
-            }
+            collect_regex_redactions(
+                content,
+                regex,
+                protected_spans,
+                name,
+                "[REDACTED_API_KEY]",
+                patterns,
+                redactions,
+            );
         }
     }
 
@@ -141,8 +221,9 @@ impl LeakDetector {
     fn check_aws_credentials(
         &self,
         content: &str,
+        protected_spans: &[Range<usize>],
         patterns: &mut Vec<String>,
-        redacted: &mut String,
+        redactions: &mut Vec<Redaction>,
     ) {
         static AWS_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = AWS_PATTERNS.get_or_init(|| {
@@ -162,12 +243,15 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) {
-                patterns.push(String::from(*name));
-                *redacted = regex
-                    .replace_all(redacted, "[REDACTED_AWS_CREDENTIAL]")
-                    .to_string();
-            }
+            collect_regex_redactions(
+                content,
+                regex,
+                protected_spans,
+                name,
+                "[REDACTED_AWS_CREDENTIAL]",
+                patterns,
+                redactions,
+            );
         }
     }
 
@@ -175,8 +259,9 @@ impl LeakDetector {
     fn check_generic_secrets(
         &self,
         content: &str,
+        protected_spans: &[Range<usize>],
         patterns: &mut Vec<String>,
-        redacted: &mut String,
+        redactions: &mut Vec<Redaction>,
     ) {
         static SECRET_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = SECRET_PATTERNS.get_or_init(|| {
@@ -197,15 +282,28 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) && self.sensitivity > 0.5 {
-                patterns.push(String::from(*name));
-                *redacted = regex.replace_all(redacted, "[REDACTED_SECRET]").to_string();
+            if self.sensitivity > 0.5 {
+                collect_regex_redactions(
+                    content,
+                    regex,
+                    protected_spans,
+                    name,
+                    "[REDACTED_SECRET]",
+                    patterns,
+                    redactions,
+                );
             }
         }
     }
 
     /// Check for private keys.
-    fn check_private_keys(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_private_keys(
+        &self,
+        content: &str,
+        protected_spans: &[Range<usize>],
+        patterns: &mut Vec<String>,
+        redactions: &mut Vec<Redaction>,
+    ) {
         // PEM-encoded private keys
         let key_patterns = [
             (
@@ -231,39 +329,81 @@ impl LeakDetector {
         ];
 
         for (begin, end, name) in key_patterns {
-            if content.contains(begin) && content.contains(end) {
-                patterns.push(name.to_string());
-                // Redact the entire key block
-                if let Some(start_idx) = content.find(begin)
-                    && let Some(end_idx) = content.find(end)
-                {
-                    let key_block = &content[start_idx..end_idx + end.len()];
-                    *redacted = redacted.replace(key_block, "[REDACTED_PRIVATE_KEY]");
+            let mut search_from = 0;
+            let mut matched = false;
+
+            while let Some(start_offset) = content[search_from..].find(begin) {
+                let start_idx = search_from + start_offset;
+                search_from = start_idx + begin.len();
+                if is_span_protected(&(start_idx..search_from), protected_spans) {
+                    continue;
                 }
+
+                let end_search_from = start_idx + begin.len();
+                let mut end_scan_from = end_search_from;
+                let end_idx = loop {
+                    let Some(end_offset) = content[end_scan_from..].find(end) else {
+                        break None;
+                    };
+                    let candidate_end = end_scan_from + end_offset;
+                    end_scan_from = candidate_end + end.len();
+                    if !is_span_protected(&(candidate_end..end_scan_from), protected_spans) {
+                        break Some(candidate_end);
+                    }
+                };
+                let Some(end_idx) = end_idx else {
+                    continue;
+                };
+                let span = start_idx..end_idx + end.len();
+                search_from = span.end;
+
+                for unprotected in unprotected_subspans(span, protected_spans) {
+                    matched = true;
+                    redactions.push(Redaction {
+                        span: unprotected,
+                        replacement: "[REDACTED_PRIVATE_KEY]",
+                    });
+                }
+            }
+
+            if matched {
+                patterns.push(name.to_string());
             }
         }
     }
 
     /// Check for JWT tokens.
-    fn check_jwt_tokens(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_jwt_tokens(
+        &self,
+        content: &str,
+        protected_spans: &[Range<usize>],
+        patterns: &mut Vec<String>,
+        redactions: &mut Vec<Redaction>,
+    ) {
         static JWT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let regex = JWT_PATTERN.get_or_init(|| {
             // JWT: three base64url-encoded parts separated by dots
             Regex::new(r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*").unwrap()
         });
 
-        if regex.is_match(content) {
-            patterns.push("JWT token".to_string());
-            *redacted = regex.replace_all(redacted, "[REDACTED_JWT]").to_string();
-        }
+        collect_regex_redactions(
+            content,
+            regex,
+            protected_spans,
+            "JWT token",
+            "[REDACTED_JWT]",
+            patterns,
+            redactions,
+        );
     }
 
     /// Check for database connection URLs.
     fn check_database_urls(
         &self,
         content: &str,
+        protected_spans: &[Range<usize>],
         patterns: &mut Vec<String>,
-        redacted: &mut String,
+        redactions: &mut Vec<Redaction>,
     ) {
         static DB_PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
         let regexes = DB_PATTERNS.get_or_init(|| {
@@ -288,53 +428,50 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) {
-                patterns.push(String::from(*name));
-                *redacted = regex
-                    .replace_all(redacted, "[REDACTED_DATABASE_URL]")
-                    .to_string();
-            }
+            collect_regex_redactions(
+                content,
+                regex,
+                protected_spans,
+                name,
+                "[REDACTED_DATABASE_URL]",
+                patterns,
+                redactions,
+            );
         }
     }
 
-    /// Check for messaging bot tokens embedded in API URLs.
-    ///
-    /// Telegram bot tokens appear in request URLs as `/bot<id>:<token>` and
-    /// would otherwise reach error logs verbatim. The token half is not
-    /// guaranteed high-entropy, so it needs an explicit pattern rather than
-    /// relying on the entropy scan.
-    fn check_bot_token(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+    fn check_bot_token(
+        &self,
+        content: &str,
+        protected_spans: &[Range<usize>],
+        patterns: &mut Vec<String>,
+        redactions: &mut Vec<Redaction>,
+    ) {
         static BOT_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
         let regex =
             BOT_TOKEN_PATTERN.get_or_init(|| Regex::new(r"/bot[0-9]+:[A-Za-z0-9_-]+").unwrap());
 
-        if regex.is_match(content) {
-            patterns.push("Bot token".to_string());
-            *redacted = regex
-                .replace_all(redacted, "/bot[REDACTED_BOT_TOKEN]")
-                .to_string();
-        }
+        collect_regex_redactions(
+            content,
+            regex,
+            protected_spans,
+            "Bot token",
+            "/bot[REDACTED_BOT_TOKEN]",
+            patterns,
+            redactions,
+        );
     }
 
-    /// Check for high-entropy tokens that may be leaked credentials.
-    ///
-    /// Extracts candidate tokens from content (after stripping URLs to avoid
-    /// false-positives on path segments) and flags any that exceed the Shannon
-    /// entropy threshold derived from the detector's sensitivity.
     fn check_high_entropy_tokens(
         &self,
         content: &str,
+        protected_spans: &[Range<usize>],
         patterns: &mut Vec<String>,
-        redacted: &mut String,
+        redactions: &mut Vec<Redaction>,
     ) {
         // Entropy threshold scales with sensitivity: at 0.7 this is ~4.37.
         let entropy_threshold = 3.5 + self.sensitivity * 1.25;
 
-        // Strip URLs and media markers before extracting tokens so that path
-        // segments are not mistaken for high-entropy credentials.
-        // Media markers like [IMAGE:/path/to/file.png] contain filesystem paths
-        // that look like high-entropy tokens when `/` is included in the token
-        // character set.
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
         let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
         static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -347,19 +484,29 @@ impl LeakDetector {
         static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let receipt_re =
             RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
-        let content_stripped = url_re.replace_all(content, "");
-        let content_without_urls = media_re.replace_all(&content_stripped, "");
-        let content_without_receipts = receipt_re.replace_all(&content_without_urls, "");
+        let mut entropy_protected = protected_spans.to_vec();
+        collect_regex_spans(content, url_re, &mut entropy_protected);
+        collect_regex_spans(content, media_re, &mut entropy_protected);
+        collect_regex_spans(content, receipt_re, &mut entropy_protected);
+        let entropy_protected = merge_spans(entropy_protected);
 
-        let tokens = extract_candidate_tokens(&content_without_receipts);
+        let tokens = extract_candidate_tokens(content);
 
         for token in tokens {
-            if token.len() >= ENTROPY_TOKEN_MIN_LEN {
-                let entropy = shannon_entropy(token);
-                if entropy >= entropy_threshold && has_mixed_alpha_digit(token) {
+            if is_span_protected(&token.span, &entropy_protected) {
+                continue;
+            }
+
+            if is_path_like_token(token.value) {
+                if collect_path_segment_entropy_redactions(&token, entropy_threshold, redactions) {
                     patterns.push("High-entropy token".to_string());
-                    *redacted = redacted.replace(token, "[REDACTED_HIGH_ENTROPY_TOKEN]");
                 }
+            } else if is_high_entropy_candidate(token.value, entropy_threshold) {
+                patterns.push("High-entropy token".to_string());
+                redactions.push(Redaction {
+                    span: token.span,
+                    replacement: "[REDACTED_HIGH_ENTROPY_TOKEN]",
+                });
             }
         }
     }
@@ -367,11 +514,30 @@ impl LeakDetector {
 
 /// Extract candidate tokens by splitting on characters outside the
 /// alphanumeric + common credential character set.
-fn extract_candidate_tokens(content: &str) -> Vec<&str> {
-    content
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '+' && c != '/')
-        .filter(|s| !s.is_empty())
-        .collect()
+fn extract_candidate_tokens(content: &str) -> Vec<CandidateToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+
+    for (idx, ch) in content.char_indices() {
+        let is_token_char = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '/');
+        if is_token_char {
+            start.get_or_insert(idx);
+        } else if let Some(token_start) = start.take() {
+            tokens.push(CandidateToken {
+                value: &content[token_start..idx],
+                span: token_start..idx,
+            });
+        }
+    }
+
+    if let Some(token_start) = start {
+        tokens.push(CandidateToken {
+            value: &content[token_start..],
+            span: token_start..content.len(),
+        });
+    }
+
+    tokens
 }
 
 /// Compute Shannon entropy (bits per character) for the given string.
@@ -380,14 +546,17 @@ fn shannon_entropy(s: &str) -> f64 {
     if len == 0.0 {
         return 0.0;
     }
-    let mut freq: HashMap<u8, usize> = HashMap::new();
+    let mut freq = [0usize; 256];
     for &b in s.as_bytes() {
-        *freq.entry(b).or_insert(0) += 1;
+        freq[b as usize] += 1;
     }
-    freq.values().fold(0.0, |acc, &count| {
-        let p = count as f64 / len;
-        acc - p * p.log2()
-    })
+
+    freq.into_iter()
+        .filter(|&count| count > 0)
+        .fold(0.0, |acc, count| {
+            let p = count as f64 / len;
+            acc - p * p.log2()
+        })
 }
 
 /// Check whether a token contains both alphabetic and digit characters.
@@ -397,9 +566,245 @@ fn has_mixed_alpha_digit(s: &str) -> bool {
     has_alpha && has_digit
 }
 
+fn is_high_entropy_candidate(s: &str, entropy_threshold: f64) -> bool {
+    s.len() >= ENTROPY_TOKEN_MIN_LEN
+        && shannon_entropy(s) >= entropy_threshold
+        && has_mixed_alpha_digit(s)
+}
+
+fn collect_path_segment_entropy_redactions(
+    token: &CandidateToken<'_>,
+    entropy_threshold: f64,
+    redactions: &mut Vec<Redaction>,
+) -> bool {
+    let mut found = false;
+    let mut offset = 0;
+    for segment in token.value.split('/') {
+        let end = offset + segment.len();
+        if is_high_entropy_candidate(segment, entropy_threshold) {
+            found = true;
+            redactions.push(Redaction {
+                span: token.span.start + offset..token.span.start + end,
+                replacement: "[REDACTED_HIGH_ENTROPY_TOKEN]",
+            });
+        }
+        offset = end + 1;
+    }
+    found
+}
+
+fn is_path_like_token(s: &str) -> bool {
+    if !s.contains('/') {
+        return false;
+    }
+    let mut segments = s.split('/').filter(|segment| !segment.is_empty());
+    let Some(first_segment) = segments.next() else {
+        return false;
+    };
+
+    let mut count = 1;
+    let mut has_dated_slug = is_dated_slug_segment(first_segment);
+    let mut all_segments_path_like = is_path_segment_like(first_segment);
+    for segment in segments {
+        count += 1;
+        has_dated_slug |= is_dated_slug_segment(segment);
+        all_segments_path_like &= is_path_segment_like(segment);
+    }
+
+    count >= 3 && has_dated_slug && all_segments_path_like
+}
+
+fn is_path_segment_like(segment: &str) -> bool {
+    is_dated_slug_segment(segment)
+        || is_env_root_segment(segment)
+        || is_lower_path_segment(segment)
+        || is_upper_path_segment(segment)
+        || is_acronym_slug_segment(segment)
+}
+
+fn is_dated_slug_segment(segment: &str) -> bool {
+    starts_with_iso_date(segment) && segment[10..].bytes().any(|b| b.is_ascii_lowercase())
+}
+
+fn is_env_root_segment(segment: &str) -> bool {
+    segment.contains('_')
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'_'))
+}
+
+fn is_lower_path_segment(segment: &str) -> bool {
+    segment
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+}
+
+fn is_upper_path_segment(segment: &str) -> bool {
+    segment
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+}
+
+fn is_acronym_slug_segment(segment: &str) -> bool {
+    segment.contains('-')
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        && segment.split('-').all(|part| {
+            part.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                || part
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+}
+
+fn starts_with_iso_date(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 10
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn collect_regex_redactions(
+    content: &str,
+    regex: &Regex,
+    protected_spans: &[Range<usize>],
+    pattern_name: &str,
+    replacement: &'static str,
+    patterns: &mut Vec<String>,
+    redactions: &mut Vec<Redaction>,
+) {
+    let mut matched = false;
+    for mat in regex.find_iter(content) {
+        let span = mat.start()..mat.end();
+        for unprotected in unprotected_subspans(span, protected_spans) {
+            if !content[unprotected.clone()]
+                .bytes()
+                .any(|b| b.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            matched = true;
+            redactions.push(Redaction {
+                span: unprotected,
+                replacement,
+            });
+        }
+    }
+
+    if matched {
+        patterns.push(pattern_name.to_string());
+    }
+}
+
+fn collect_regex_spans(content: &str, regex: &Regex, spans: &mut Vec<Range<usize>>) {
+    spans.extend(regex.find_iter(content).map(|mat| mat.start()..mat.end()));
+}
+
+fn apply_redactions(content: &str, redactions: &[Redaction]) -> String {
+    if redactions.is_empty() {
+        return content.to_string();
+    }
+
+    let mut sorted = redactions.to_vec();
+    sorted.sort_by(|a, b| {
+        a.span
+            .start
+            .cmp(&b.span.start)
+            .then_with(|| b.span.end.cmp(&a.span.end))
+    });
+
+    let mut non_overlapping = Vec::new();
+    let mut last_end = 0;
+    for redaction in sorted {
+        if redaction.span.start >= last_end {
+            last_end = redaction.span.end;
+            non_overlapping.push(redaction);
+        }
+    }
+
+    let mut redacted = content.to_string();
+    for redaction in non_overlapping.iter().rev() {
+        redacted.replace_range(
+            redaction.span.start..redaction.span.end,
+            redaction.replacement,
+        );
+    }
+    redacted
+}
+
+fn is_span_protected(span: &Range<usize>, protected_spans: &[Range<usize>]) -> bool {
+    protected_spans
+        .iter()
+        .any(|protected| span.start < protected.end && span.end > protected.start)
+}
+
+fn unprotected_subspans(span: Range<usize>, protected_spans: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut subspans = Vec::new();
+    let mut cursor = span.start;
+
+    for protected in protected_spans {
+        if protected.end <= cursor {
+            continue;
+        }
+        if protected.start >= span.end {
+            break;
+        }
+        if cursor < protected.start {
+            subspans.push(cursor..protected.start.min(span.end));
+        }
+        cursor = cursor.max(protected.end);
+        if cursor >= span.end {
+            break;
+        }
+    }
+
+    if cursor < span.end {
+        subspans.push(cursor..span.end);
+    }
+
+    subspans
+}
+
+fn merge_spans(mut spans: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    if spans.is_empty() {
+        return spans;
+    }
+
+    spans.sort_by_key(|span| (span.start, span.end));
+    let mut merged = Vec::new();
+    let mut iter = spans.into_iter();
+    let Some(mut current) = iter.next() else {
+        return Vec::new();
+    };
+    for span in iter {
+        if span.start <= current.end {
+            current.end = current.end.max(span.end);
+        } else {
+            merged.push(current);
+            current = span;
+        }
+    }
+    merged.push(current);
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn has_high_entropy_candidate_without_path_exemption(content: &str) -> bool {
+        let entropy_threshold = 3.5 + 0.7 * 1.25;
+        extract_candidate_tokens(content).into_iter().any(|token| {
+            token.value.len() >= ENTROPY_TOKEN_MIN_LEN
+                && shannon_entropy(token.value) >= entropy_threshold
+                && has_mixed_alpha_digit(token.value)
+        })
+    }
 
     #[test]
     fn clean_content_passes() {
@@ -530,6 +935,31 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
+    fn generated_workspace_paths_not_redacted_as_high_entropy() {
+        let detector = LeakDetector::new();
+        let cases = [
+            "missions/2026-07-02-plan-b-for-something-useful/briefs/ARCH-1-plan-b-useful-direction.md",
+            "/home/zeroclaw/.zeroclaw/agents/scribe/workspace/tasks/inbox/2026-07-02-13-20-plan-b-draft-materialization.md",
+            "/home/zeroclaw/.zeroclaw/agents/scribe/workspace/drafts/2026-07-02-plan-b-for-something-useful/",
+            "$ZC_DIR/agents/scribe/workspace/drafts/2026-07-02-plan-b-for-something-useful/",
+            "agents/scribe/workspace/drafts/2026-07-02-plan-b-for-something-useful/",
+            "drafts/2026-07-03-v3-delegation-practices-reviewed-source/proposed/shared/skills/core/useful-routing-and-planning-governance/SKILL.md",
+        ];
+
+        for path in cases {
+            let content = format!("Recorded path: {path}");
+            assert!(
+                has_high_entropy_candidate_without_path_exemption(&content),
+                "fixture should reproduce the old entropy false positive: {path}"
+            );
+            assert!(
+                matches!(detector.scan(&content), LeakResult::Clean),
+                "workspace path should not be redacted: {path}"
+            );
+        }
+    }
+
+    #[test]
     fn tool_receipts_not_redacted_as_high_entropy() {
         let detector = LeakDetector::new();
         let content = "The date is Fri Mar 27.\n\n[receipt: zc-receipt-1774608496-gzpEBuUIRYX1vd4fQl4oYkqhq4-GnoJDStmlYzvQiWA]";
@@ -581,14 +1011,161 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
 
     #[test]
     fn extract_candidate_tokens_splits_correctly() {
-        let tokens = extract_candidate_tokens("foo.bar:baz qux-quux key=val");
-        assert!(tokens.contains(&"foo"));
-        assert!(tokens.contains(&"bar"));
-        assert!(tokens.contains(&"baz"));
-        assert!(tokens.contains(&"qux-quux"));
+        let tokens = extract_candidate_tokens("foo.bar:baz qux-quux key=val path/segment");
+        let values: Vec<_> = tokens.iter().map(|token| token.value).collect();
+        assert!(values.contains(&"foo"));
+        assert!(values.contains(&"bar"));
+        assert!(values.contains(&"baz"));
+        assert!(values.contains(&"qux-quux"));
+        assert!(values.contains(&"path/segment"));
         // '=' is a delimiter, not part of tokens
-        assert!(tokens.contains(&"key"));
-        assert!(tokens.contains(&"val"));
+        assert!(values.contains(&"key"));
+        assert!(values.contains(&"val"));
+    }
+
+    // Protected spans are honored only by the high-entropy heuristic, which
+    // misfires on the *shape* of ordinary generated paths. Deterministic
+    // credential patterns (API keys, AWS creds, private keys, JWTs, DB URLs,
+    // bot tokens, generic secrets) are precise, low-false-positive signals that
+    // a real credential can trigger just as easily inside a link destination or
+    // file reference as in visible text, so they always scan full content and
+    // are never suppressed by a caller-supplied protected span.
+
+    #[test]
+    fn protected_spans_are_opaque_only_to_the_entropy_heuristic() {
+        let detector = LeakDetector::new();
+        let content = "link-target aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let protected = "link-target ".len()..content.len();
+
+        assert!(matches!(
+            detector.scan_with_protected_spans(content, std::slice::from_ref(&protected)),
+            LeakResult::Clean
+        ));
+    }
+
+    #[test]
+    fn deterministic_secret_syntax_is_still_detected_inside_a_protected_uri() {
+        let detector = LeakDetector::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let content = format!("Recorded {target}.");
+        let start = "Recorded ".len();
+        let protected = start..start + target.len();
+
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(
+                    patterns.iter().any(|p| p == "Token value"),
+                    "patterns: {patterns:?}"
+                );
+                assert!(
+                    redacted.contains("[REDACTED_SECRET]"),
+                    "redacted: {redacted}"
+                );
+            }
+            LeakResult::Clean => {
+                panic!(
+                    "a deterministic secret pattern inside a protected span must still be caught"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn private_key_markers_are_still_detected_inside_a_protected_span() {
+        let detector = LeakDetector::new();
+        let target = "file:///tmp/-----BEGIN PRIVATE KEY-----abc-----END PRIVATE KEY-----.pem";
+        let content = format!("Recorded {target}.");
+        let start = "Recorded ".len();
+        let protected = start..start + target.len();
+
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    redacted.contains("[REDACTED_PRIVATE_KEY]"),
+                    "redacted: {redacted}"
+                );
+            }
+            LeakResult::Clean => {
+                panic!("private key markers should still be detected regardless of protected spans")
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_protected_span_boundaries_are_ignored() {
+        let detector = LeakDetector::new();
+        let content = "é leaked token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let invalid_utf8_boundary = 0..1;
+
+        match detector.scan_with_protected_spans(content, &[invalid_utf8_boundary]) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(redacted.contains("[REDACTED"));
+            }
+            LeakResult::Clean => panic!("invalid protected span should be ignored"),
+        }
+    }
+
+    #[test]
+    fn private_key_detection_ignores_protected_spans() {
+        let detector = LeakDetector::new();
+        let leaked_key = "-----BEGIN PRIVATE KEY-----\nrealkeybody\n-----END PRIVATE KEY-----";
+        let content = format!("Recorded a reference.\nLeaked:\n{leaked_key}");
+        // Marking the whole message as "protected" must not suppress a real
+        // leaked key.
+        let protected = 0..content.len();
+
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(!redacted.contains("realkeybody"), "redacted: {redacted}");
+                assert!(
+                    redacted.contains("[REDACTED_PRIVATE_KEY]"),
+                    "redacted: {redacted}"
+                );
+            }
+            LeakResult::Clean => {
+                panic!("private key should still be detected even under a protected span")
+            }
+        }
+    }
+
+    #[test]
+    fn protected_spans_do_not_hide_unprotected_high_entropy_tokens() {
+        let detector = LeakDetector::new();
+        let protected_token = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let leaked_token = "zC9vN4mK8pQ2rL7xT5yU1hD6jF0gB3wE";
+        let content = format!("safe-target {protected_token}\nactual {leaked_token}");
+        let protected = 0.."safe-target ".len() + protected_token.len();
+
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(redacted.contains(protected_token));
+                assert!(!redacted.contains(leaked_token));
+            }
+            LeakResult::Clean => panic!("unprotected token should still be detected"),
+        }
+    }
+
+    #[test]
+    fn protected_spans_do_not_hide_a_secret_pattern_that_overlaps_them() {
+        let detector = LeakDetector::new();
+        let target = "file:///tmp/report.md";
+        let content = format!("[password=longsecretvalue]({target})");
+        let start = "[password=longsecretvalue](".len();
+        let protected = start..start + target.len();
+
+        match detector.scan_with_protected_spans(&content, std::slice::from_ref(&protected)) {
+            LeakResult::Detected { redacted, .. } => {
+                assert!(
+                    !redacted.contains("longsecretvalue"),
+                    "redacted: {redacted}"
+                );
+                assert!(
+                    redacted.contains("[REDACTED_SECRET]"),
+                    "redacted: {redacted}"
+                );
+            }
+            LeakResult::Clean => panic!("unprotected link text secret should still be detected"),
+        }
     }
 
     #[test]
@@ -627,6 +1204,57 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 panic!("Should still detect high-entropy tokens outside media markers")
             }
         }
+    }
+
+    #[test]
+    fn slash_containing_high_entropy_token_still_detected() {
+        let detector = LeakDetector::new();
+        let cases = [
+            "/aB3xK9mW2pQ7vL4n/R8sT1yU6hD0jF5cG/zP4qX7vN2mK8rL5s",
+            "/2026-07-04/aB3xK9mW2pQ7vL4n/R8sT1yU6hD0jF5cG/zP4qX7vN2mK8rL5s",
+            "/2026-07-04-plan/aB3xK9mW2pQ7vL4n/R8sT1yU6hD0jF5cG/zP4qX7vN2mK8rL5s",
+        ];
+
+        for token in cases {
+            match detector.scan(&format!("Leaked credential: token={token}")) {
+                LeakResult::Detected { redacted, .. } => {
+                    assert!(redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"));
+                }
+                LeakResult::Clean => {
+                    panic!("slash-containing high-entropy token should be detected: {token}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_detector_returns_clean_without_redaction() {
+        let detector = LeakDetector::with_config(&LeakDetectionConfig {
+            enabled: false,
+            ..LeakDetectionConfig::default()
+        });
+        let content = "Leaked credential: aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = detector.scan(content);
+
+        assert!(matches!(result, LeakResult::Clean));
+    }
+
+    #[test]
+    fn high_entropy_detection_can_be_disabled_without_disabling_specific_patterns() {
+        let detector = LeakDetector::with_config(&LeakDetectionConfig {
+            high_entropy_tokens: false,
+            ..LeakDetectionConfig::default()
+        });
+
+        assert!(matches!(
+            detector.scan("Leaked credential: aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG"),
+            LeakResult::Clean
+        ));
+        assert!(matches!(
+            detector.scan("AWS key: AKIAIOSFODNN7EXAMPLE"),
+            LeakResult::Detected { .. }
+        ));
     }
 
     #[test]

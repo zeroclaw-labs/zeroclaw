@@ -1,37 +1,24 @@
 //! Self-process resource sampling — RSS (resident memory) and CPU%.
-//!
-//! Linux-only via `/proc/self/{status,stat}` so no extra deps. macOS /
-//! Windows return `ProcessStats::unsupported()` (rss=0, cpu=None); the
-//! dashboard renders the rss tile blank-with-note on those platforms.
-//!
-//! CPU% is computed across calls by stashing the previous (wall_instant,
-//! process_ticks) sample in a process-global `OnceLock<Mutex<...>>` and
-//! taking the delta. First call returns `cpu_percent = None` since
-//! there's no baseline yet; the first refresh after gateway boot fills
-//! it in.
 
-#[cfg(target_os = "linux")]
 use parking_lot::Mutex;
 use serde::Serialize;
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-#[cfg(target_os = "linux")]
 use std::time::Instant;
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessStats {
     /// Resident set size in bytes. `0` when unsupported.
     pub rss_bytes: u64,
-    /// Total system RAM in bytes, from `/proc/meminfo`'s `MemTotal`.
-    /// `0` when unsupported. The dashboard renders `rss / system_ram_total`
-    /// as a percentage so the RAM tile is meaningful at a glance regardless
-    /// of host size.
+    /// Total system RAM in bytes. `0` when unsupported. The dashboard
+    /// renders `rss / system_ram_total` as a percentage so the RAM tile is
+    /// meaningful at a glance regardless of host size.
     pub system_ram_total_bytes: u64,
-    /// CPU usage as a percentage averaged across logical cores (0..100*ncpu).
+    /// CPU usage as a percentage summed across logical cores (0..100*ncpu).
     /// `None` on the first sample (no baseline) or unsupported platforms.
     pub cpu_percent: Option<f32>,
-    /// Number of logical CPUs the OS reports. Useful for clamping the
-    /// CPU% bar on the dashboard. `0` when unknown.
+    /// Number of logical CPUs the OS reports. Useful for clamping the CPU%
+    /// bar on the dashboard. `0` when unknown.
     pub num_cpus: u32,
 }
 
@@ -46,129 +33,113 @@ impl ProcessStats {
     }
 }
 
-#[cfg(target_os = "linux")]
-struct LastSample {
-    wall: Instant,
-    process_ticks: u64,
+struct State {
+    system: System,
+    /// True once we've refreshed at least once — only then does
+    /// `Process::cpu_usage()` have a delta to report. We return `None` on
+    /// the first sample to preserve the pre-sysinfo contract (dashboard
+    /// already handles this).
+    have_baseline: bool,
+    last_cpu_refresh: Option<Instant>,
+    /// Last CPU% we returned; served on rapid re-samples so callers still
+    /// see a plausible value instead of a sysinfo-internal artifact.
+    last_cpu_percent: Option<f32>,
+    pid: Pid,
 }
 
-#[cfg(target_os = "linux")]
-static LAST: OnceLock<Mutex<Option<LastSample>>> = OnceLock::new();
+static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
 
-#[cfg(target_os = "linux")]
-fn last() -> &'static Mutex<Option<LastSample>> {
-    LAST.get_or_init(|| Mutex::new(None))
+fn state() -> &'static Mutex<Option<State>> {
+    STATE.get_or_init(|| Mutex::new(None))
 }
 
-/// Sample current RSS + CPU%. Cheap to call (single /proc read on Linux).
-/// Safe to call from any thread.
+/// Sample current RSS + CPU%. Cheap to call — refreshes only this process
+/// and only the CPU/memory fields. Safe to call from any thread.
 pub fn sample() -> ProcessStats {
-    #[cfg(target_os = "linux")]
-    {
-        sample_linux().unwrap_or_else(ProcessStats::unsupported)
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return ProcessStats::unsupported();
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        ProcessStats::unsupported()
-    }
-}
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        return ProcessStats::unsupported();
+    };
 
-#[cfg(target_os = "linux")]
-fn sample_linux() -> Option<ProcessStats> {
-    let rss_bytes = read_rss_bytes()?;
-    let ticks = read_process_ticks()?;
+    let mut guard = state().lock();
+    let st = guard.get_or_insert_with(|| {
+        // Populate `cpus()` and initial memory once. `RefreshKind::nothing()`
+        // keeps the constructor cheap; per-sample refreshes fill in the
+        // fields we actually read below.
+        let system = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(sysinfo::CpuRefreshKind::nothing())
+                .with_memory(MemoryRefreshKind::nothing().with_ram()),
+        );
+        State {
+            system,
+            have_baseline: false,
+            last_cpu_refresh: None,
+            last_cpu_percent: None,
+            pid,
+        }
+    });
+
+    // Skip the CPU-refresh half when the caller is hammering us faster than
+    // sysinfo's internal tick window; otherwise `cpu_usage()` returns a
+    // meaningless floor/ceiling value. Memory refresh is always cheap and
+    // has no minimum-interval constraint, so we always update RSS.
     let now = Instant::now();
-    let num_cpus = read_num_cpus();
-    let clock_ticks = clock_ticks_per_sec();
-    let system_ram_total_bytes = read_system_ram_total().unwrap_or(0);
+    let cpu_stale = st
+        .last_cpu_refresh
+        .is_none_or(|prev| now.duration_since(prev) >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    let refresh_kind = if cpu_stale {
+        ProcessRefreshKind::nothing().with_cpu().with_memory()
+    } else {
+        ProcessRefreshKind::nothing().with_memory()
+    };
+    st.system
+        .refresh_processes_specifics(ProcessesToUpdate::Some(&[st.pid]), true, refresh_kind);
+    // Total system RAM can change at runtime (memory hot-add on enterprise
+    // servers, hypervisor ballooning on VMs), so refresh it every sample.
+    // Cost is a single sysctl / /proc/meminfo read / GlobalMemoryStatusEx —
+    // cheap enough that we don't rate-limit it.
+    st.system
+        .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    // Refresh the CPU list too — logical CPU count can shift (Linux CPU
+    // hot-plug via /sys/devices/system/cpu/cpuN/online, cloud VM vCPU
+    // resize). Only piggy-backs when we're already doing a CPU refresh, so
+    // rapid re-samples remain cheap.
+    if cpu_stale {
+        st.system
+            .refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing());
+    }
 
-    let mut guard = last().lock();
-    let cpu_percent = if let Some(prev) = guard.as_ref() {
-        let elapsed = now.duration_since(prev.wall).as_secs_f64();
-        if elapsed > 0.0 && clock_ticks > 0 {
-            let dticks = ticks.saturating_sub(prev.process_ticks) as f64;
-            let cpu_seconds = dticks / clock_ticks as f64;
-            Some(((cpu_seconds / elapsed) * 100.0) as f32)
+    let Some(proc) = st.system.process(st.pid) else {
+        return ProcessStats::unsupported();
+    };
+    let rss_bytes = proc.memory();
+    let cpu_percent = if cpu_stale {
+        st.last_cpu_refresh = Some(now);
+        if st.have_baseline {
+            let v = proc.cpu_usage();
+            st.last_cpu_percent = Some(v);
+            Some(v)
         } else {
+            st.have_baseline = true;
             None
         }
     } else {
-        None
+        // Sub-interval refresh: reuse the previous reading rather than
+        // returning a sysinfo artifact.
+        st.last_cpu_percent
     };
-    *guard = Some(LastSample {
-        wall: now,
-        process_ticks: ticks,
-    });
+    let system_ram_total_bytes = st.system.total_memory();
+    let num_cpus = st.system.cpus().len() as u32;
 
-    Some(ProcessStats {
+    ProcessStats {
         rss_bytes,
         system_ram_total_bytes,
         cpu_percent,
         num_cpus,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn read_system_ram_total() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok())?;
-            return Some(kb.saturating_mul(1024));
-        }
     }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_rss_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            // Format: `VmRSS:    12345 kB`
-            let kb: u64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse().ok())?;
-            return Some(kb.saturating_mul(1024));
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_process_ticks() -> Option<u64> {
-    // /proc/self/stat fields are space-delimited but `comm` (field 2) is
-    // parenthesized and may contain spaces, so anchor on the closing `)`
-    // and count from there. Fields after comm: state(3) ppid(4) ...
-    // utime(14) stime(15).
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let close = stat.rfind(')')?;
-    let after: &str = stat[close + 1..].trim_start();
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    // After `comm)`, field indices are 0-based here but correspond to
-    // /proc indices 3..; utime is /proc field 14 → here index 11,
-    // stime is /proc field 15 → here index 12.
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(utime + stime)
-}
-
-#[cfg(target_os = "linux")]
-fn clock_ticks_per_sec() -> u64 {
-    // SAFETY: sysconf(_SC_CLK_TCK) is a const POSIX query, no side effects.
-    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if v > 0 { v as u64 } else { 100 }
-}
-
-#[cfg(target_os = "linux")]
-fn read_num_cpus() -> u32 {
-    // SAFETY: sysconf(_SC_NPROCESSORS_ONLN) is a const POSIX query.
-    let v = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if v > 0 { v as u32 } else { 0 }
 }
 
 #[cfg(test)]
@@ -176,19 +147,23 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn sample_returns_rss_on_linux() {
+    fn sample_returns_rss_on_supported_hosts() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
         let s = sample();
-        assert!(s.rss_bytes > 0, "rss should be non-zero on Linux");
+        assert!(s.rss_bytes > 0, "rss should be non-zero on supported hosts");
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn sample_returns_system_ram_total_and_rss_is_a_subset() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
         let s = sample();
         assert!(
             s.system_ram_total_bytes > 0,
-            "MemTotal should be non-zero on Linux"
+            "total memory should be non-zero on supported hosts"
         );
         assert!(
             s.rss_bytes <= s.system_ram_total_bytes,
@@ -199,10 +174,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn cpu_percent_filled_on_second_sample() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
         let _ = sample();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // sysinfo requires at least MINIMUM_CPU_UPDATE_INTERVAL between
+        // refreshes for the CPU% delta to be meaningful. Sleep just past it.
+        std::thread::sleep(
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(10),
+        );
         for _ in 0..10_000 {
             std::hint::black_box(0u64);
         }
@@ -214,10 +195,45 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn sample_is_unsupported_off_linux() {
+    fn sample_reports_num_cpus_on_supported_hosts() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
         let s = sample();
-        assert_eq!(s.rss_bytes, 0);
-        assert!(s.cpu_percent.is_none());
+        assert!(
+            s.num_cpus > 0,
+            "num_cpus should be non-zero on supported hosts"
+        );
+    }
+
+    #[test]
+    fn rapid_resample_reuses_last_cpu_percent_instead_of_sysinfo_artifact() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
+        // Prime a real reading so `last_cpu_percent` is populated.
+        let _ = sample();
+        std::thread::sleep(
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(10),
+        );
+        let primed = sample();
+        assert!(primed.cpu_percent.is_some(), "primed sample has cpu%");
+
+        // Two back-to-back calls well under MINIMUM_CPU_UPDATE_INTERVAL —
+        // without rate limiting sysinfo would return 0 (or 100*ncpu on
+        // Linux). We should instead see the cached value from `primed`.
+        let a = sample();
+        let b = sample();
+        assert_eq!(
+            a.cpu_percent, primed.cpu_percent,
+            "rapid resample must reuse the last real reading, not a sysinfo artifact"
+        );
+        assert_eq!(
+            b.cpu_percent, primed.cpu_percent,
+            "second rapid resample also reuses cached value"
+        );
+        // RSS is fine to update at any cadence — just check it stays plausible.
+        assert!(a.rss_bytes > 0);
+        assert!(b.rss_bytes > 0);
     }
 }

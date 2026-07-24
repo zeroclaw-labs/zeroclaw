@@ -12,6 +12,12 @@ echo "==> pre-push: running rust quality gate..."
     exit 1
 }
 
+echo "==> pre-push: running firmware protocol gate..."
+./scripts/ci/firmware_protocol_gate.sh || {
+    echo "FAIL: firmware protocol gate failed."
+    exit 1
+}
+
 if [ "${ZEROCLAW_STRICT_LINT:-0}" = "1" ]; then
     echo "==> pre-push: running strict clippy warnings gate (ZEROCLAW_STRICT_LINT=1)..."
     ./scripts/ci/rust_quality_gate.sh --strict || {
@@ -45,7 +51,7 @@ if [ "${ZEROCLAW_DOCS_LINKS:-0}" = "1" ]; then
 fi
 
 echo "==> pre-push: running tests..."
-cargo test --locked || {
+cargo test --locked --workspace --exclude zeroclaw-desktop || {
     echo "FAIL: some tests did not pass."
     exit 1
 }

@@ -17,24 +17,6 @@
 use crate::api_error::{ConfigApiCode, ConfigApiError};
 use crate::traits::PropKind;
 
-/// Coerce a JSON value to the string representation `Config::set_prop`
-/// expects, validating against the target field's declared `PropKind`.
-///
-/// Type rules:
-/// - `StringArray`: JSON array of strings; rejects non-array, rejects
-///   non-string elements (with offending index in the message). Empty
-///   array `[]` is valid and distinct from `null`.
-/// - `Bool`: JSON boolean (or string `"true"` / `"false"` for legacy
-///   callers).
-/// - `Integer`: JSON number with integer value (or numeric string).
-/// - `Float`: JSON number (or numeric string).
-/// - `String` / `Enum`: any scalar coerces to its display form.
-/// - `null`: always valid; means "reset to default".
-///
-/// `kind` may be `None` for paths whose declared kind isn't known to the
-/// caller (e.g. enum-shaped fields the introspection layer surfaces as
-/// `Enum`); in that case we fall through to the existing best-effort
-/// coercion that mirrors `set_prop`'s own string parser.
 pub fn coerce_for_set_prop(
     value: &serde_json::Value,
     kind: Option<PropKind>,

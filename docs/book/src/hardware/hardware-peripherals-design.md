@@ -114,7 +114,7 @@ ZeroClaw on Pi; GPIO via rppal or sysfs. No separate firmware.
 
 ### RAG Pipeline (Datasheet Retrieval)
 
-- **Index:** Datasheets, reference manuals, register maps (PDF → chunks, embeddings).
+- **Index:** Datasheets, reference manuals, register maps (pre-converted `.md` / `.txt` → chunks, embeddings).
 - **Retrieve:** On user query ("turn on LED"), fetch relevant snippets (e.g. GPIO section for target board).
 - **Inject:** Add to LLM system prompt or context.
 - **Result:** LLM generates accurate, board-specific code.
@@ -265,7 +265,7 @@ tracking phase status here (which drifts as work lands), the layers are:
 - [STM32 Nucleo-F401RE](https://www.st.com/en/evaluation-tools/nucleo-f401re.html)
 - [tonic](https://github.com/hyperium/tonic): gRPC for Rust
 - [probe-rs](https://probe.rs/): ARM debug probe, flash, memory access
-- [nusb](https://github.com/nic-hartley/nusb): USB device enumeration (VID/PID)
+- [nusb](https://github.com/kevinmehall/nusb): USB device enumeration (VID/PID)
 
 ## 14. Raw Prompt Summary
 

@@ -63,7 +63,9 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) parameters: Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request
+    pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
 
@@ -227,19 +229,6 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// Single source of truth for "does the per-turn tool list contain at least
-/// one entry?" — used by both `send_responses_request` and `stream_chat`
-/// to gate `tool_choice` and `parallel_tool_calls` on the request body.
-///
-/// Returns `true` only when `tools` is `Some(non_empty)`. Returns `false`
-/// for `Some(vec![])` and for `None`. This is the wire-format contract that
-/// vLLM 0.19+ and other spec-compliant validators enforce: when
-/// `tool_choice` is present, `tools` must also be present and non-empty
-/// (issue #7862, surface left out of #7864).
-///
-/// Factored out so the gate is tested in one place rather than mirrored
-/// inside the regression test. Both production call sites now call this
-/// helper, so the test that exercises it covers both paths.
 pub(crate) fn has_turn_tools(tools: Option<&Vec<ResponsesToolSpec>>) -> bool {
     tools.as_ref().is_some_and(|t| !t.is_empty())
 }
@@ -257,7 +246,7 @@ pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesT
                 kind: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: std::sync::Arc::clone(&tool.parameters),
                 strict: false,
             })
             .collect(),
@@ -336,6 +325,22 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
         .collect::<Vec<_>>();
 
     (!items.is_empty()).then_some(items)
+}
+
+/// Build a single Responses-API `function_call` input item from a parsed
+/// `ProviderToolCall`. The `arguments` field is routed through the shared
+/// `sanitize_tool_arguments` helper so the openai_codex call site inherits
+/// the same malformed-JSON → `"{}"` contract as the other four typed
+/// providers. Factored out so the call-site behavior is testable without
+/// running the full input builder.
+pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
+    let name = call.name;
+    serde_json::json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": name,
+        "arguments": crate::compatible::sanitize_tool_arguments(&name, &call.arguments),
+    })
 }
 
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
@@ -422,12 +427,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                     }
 
                     for call in parsed_calls {
-                        input.push(serde_json::json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments,
-                        }));
+                        input.push(build_function_call_item(call));
                     }
                 } else if !msg.content.trim().is_empty() {
                     input.push(response_message_item(
@@ -1089,12 +1089,6 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
-/// Read the response body incrementally via `bytes_stream()` to avoid
-/// buffering the entire SSE payload in memory.  The previous implementation
-/// used `response.text().await?` which holds the HTTP connection open until
-/// every byte has arrived — on high-latency links the long-lived connection
-/// often drops mid-read, producing the "error decoding response body" failure
-/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
@@ -1227,7 +1221,7 @@ impl OpenAiCodexModelProvider {
                         "openai_codex: auth profile present but no usable access token"
                     );
                     anyhow::Error::msg(
-                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --provider openai-codex` to sign in again.",
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --model-provider openai-codex` to sign in again.",
                     )
                 } else {
                     ::zeroclaw_log::record!(
@@ -1241,7 +1235,7 @@ impl OpenAiCodexModelProvider {
                         "openai_codex: no auth profile found"
                     );
                     anyhow::Error::msg(
-                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --provider openai-codex` to sign in.",
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --model-provider openai-codex` to sign in.",
                     )
                 }
             })?)
@@ -1259,7 +1253,7 @@ impl OpenAiCodexModelProvider {
                     "openai_codex: account_id not found in profile/token"
                 );
                 anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --model-provider openai-codex` again.",
                 )
             })?)
         };
@@ -1770,21 +1764,13 @@ mod tests {
             kind: "function".to_string(),
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
             strict: false,
         }
     }
 
     #[tokio::test]
     async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
-        // End-to-end regression for #7862 (vLLM HTTP 400). The test
-        // drives the production `chat()` path against the mock Codex
-        // transport, then asserts the **captured** request body
-        // (the actual JSON the provider sent over the wire) does not
-        // contain `tool_choice` or `parallel_tool_calls` when the
-        // converted tool list is empty. This proves the gate is wired
-        // into the production request builder, not just a struct field
-        // shape that happens to omit the keys.
         let (provider, captured, server_handle, _temp_dir) =
             mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
                 "output_text": "ok",
@@ -2424,10 +2410,10 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
@@ -2435,7 +2421,7 @@ data: [DONE]
                 },
                 "required": ["action"]
             }),
-        }];
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
@@ -2536,5 +2522,38 @@ data: [DONE]
 
         assert!(provider.supports_streaming());
         assert!(provider.supports_streaming_tool_events());
+    }
+
+    #[test]
+    fn build_function_call_item_sanitizes_invalid_arguments_to_empty_object() {
+        // Pins that the openai_codex call site of `sanitize_tool_arguments`
+        // is wired in. The helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
+        let call = ProviderToolCall {
+            id: "call_bad".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"rm -rf"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["call_id"], "call_bad");
+        assert_eq!(item["name"], "shell");
+        assert_eq!(item["arguments"], "{}");
+    }
+
+    #[test]
+    fn build_function_call_item_passes_through_valid_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        let call = ProviderToolCall {
+            id: "call_ok".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["arguments"], r#"{"command":"pwd"}"#);
     }
 }

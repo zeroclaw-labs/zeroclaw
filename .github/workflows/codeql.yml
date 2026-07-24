@@ -1,0 +1,54 @@
+name: CodeQL
+
+# Static analysis for JavaScript/TypeScript source under web/.
+# Uses the existing .github/codeql/codeql-config.yml (paths-ignore tests/).
+# Rust CodeQL lives in the sibling ci-code-analysis.yml workflow (master push
+# + daily, alongside Semgrep); language coverage is split across the two.
+#
+# Triggers:
+#   push to master     — immediate feedback on merged code
+#   schedule           — weekly catch for new queries (query packs update
+#                        independently of the codebase)
+#   workflow_dispatch  — manual re-run after a config change
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '34 10 * * 2'   # Tuesdays at 10:34 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        with:
+          languages: ${{ matrix.language }}
+          config-file: .github/codeql/codeql-config.yml
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        with:
+          category: '/language:${{ matrix.language }}'

@@ -1,42 +1,41 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
-rust-version = "1.87"
+rust-version = "1.96.1"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.2" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.2" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.2", default-features = false }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.2" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.2" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.2" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.2" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.2", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.2" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.2", default-features = false }
-zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.2" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.2" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.2" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.2" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.2" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.2" }
-zerocode = { path = "apps/zerocode", version = "0.8.2" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.3" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.3" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.3", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.3" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.3" }
+zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.3" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.3" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.3" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.3", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.3" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.3", default-features = false }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.3", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.3" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.3" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.3" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.3" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.3" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.3" }
+zerocode = { path = "apps/zerocode", version = "0.8.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 sys-locale = "0.3"
 
 [package]
 name = "zeroclawlabs"
-# Publishing blocked during microkernel workspace transition — see #5811.
-# All 14 workspace sub-crates are publish = false and therefore unresolvable
-# on crates.io. Flip or remove this once the multi-crate publish topology is
-# designed per RFC #5579.
+# Workspace crates are publish = false during microkernel transition.
 publish = false
 default-run = "zeroclaw"
 version.workspace = true
@@ -139,7 +138,7 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
-# Zip extraction for ClawHub / OpenClaw registry installers
+# Zip extraction (plugin registry, self-update archives)
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
@@ -254,17 +253,13 @@ non_row_features = [
     "metrics",
     "embedded-web",
 ]
-# Heavyweight non-channel features excluded from the default binary
-# distribution (`Selection::Dist`): they pull large native/ML deps and would
-# bloat the single artifact for users who never use them. Still opt-in via
-# source `--features`, the docker `:all-features` tag, or a nix override. This
-# "too big for the default download" bit is not derivable from the feature
-# graph, so it lives here in the canonical registry; never shadowed.
-heavyweight_features = [
-    "hardware",
-    "browser-native",
-    "rag-pdf",
-    "voice-wake",
+# Features intentionally added to the lean Cargo defaults for standard
+# distribution artifacts. This list is the complete positive policy beyond
+# `default`; target-specific exclusions are resolved from the table below.
+dist_extra_features = [
+    "channel-matrix",
+    "channel-lark",
+    "whatsapp-web",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -275,6 +270,13 @@ heavyweight_features = [
 container_excluded_features = [
     "voice-wake",
 ]
+
+# Compatibility exclusions for standard distribution artifacts. Release
+# workflows pass only their target triple; feature policy stays here.
+[package.metadata.zeroclaw.dist_target_exclusions]
+aarch64-linux-android = ["whatsapp-web"]
+arm-unknown-linux-gnueabihf = ["observability-prometheus"]
+armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
 
 [features]
 default = [
@@ -307,13 +309,13 @@ default-channels = [
     "channel-filesystem",
 ]
 
-# Historical broad channel bundle. Use this for builds that should preserve the
-# pre-#6895 default channel surface.
+# Historical broad channel bundle. Preserves the older default channel surface.
 channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
+    "channel-line",
     "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
-    "channel-dingtalk", "channel-qq", "channel-bluesky",
+    "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
@@ -345,6 +347,9 @@ channel-imessage = ["zeroclaw-channels/channel-imessage"]
 channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
 channel-qq = ["zeroclaw-channels/channel-qq"]
 channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
+channel-git = ["zeroclaw-channels/channel-git"]
+provider-github = ["zeroclaw-channels/provider-github"]
+provider-gitea = ["zeroclaw-channels/provider-gitea"]
 channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
@@ -355,7 +360,7 @@ channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-lin
 channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
 channel-mochat = ["zeroclaw-channels/channel-mochat"]
-channel-wechat = ["zeroclaw-channels/channel-wechat"]
+channel-wechat = ["zeroclaw-channels/channel-wechat", "zeroclaw-gateway?/channel-wechat"]
 channel-wecom = ["zeroclaw-channels/channel-wecom"]
 channel-wecom-ws = ["zeroclaw-channels/channel-wecom-ws"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
@@ -367,7 +372,7 @@ channel-line = ["zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`
 # selects Feishu endpoints at runtime.
 channel-feishu = ["channel-lark"]
-whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+whatsapp-web = ["zeroclaw-channels/whatsapp-web", "zeroclaw-gateway?/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
@@ -388,7 +393,6 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
-rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
 
@@ -412,7 +416,7 @@ metrics = ["observability-prometheus"]
 # - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary size,
 #   but requires plugin authors to compile a specific version for each target
 #   architecture (`.cwasm` files instead of `.wasm`) unless one of the two JIT
-#   compilation feature flags is also used. 
+#   compilation feature flags is also used.
 # - `plugins-wasm-cranelift`: Add the Cranelift JIT compilation engine on top of
 #   the runtime which enables compiling WASM plugins on the host machine, but
 #   results in larger binary size due to the Cranelift dependency. NOTE: Not
@@ -432,7 +436,7 @@ ci-all = [
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
-    "browser-native", "probe", "rag-pdf",
+    "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
 ]

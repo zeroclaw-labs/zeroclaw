@@ -47,8 +47,10 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and only for
-  a plugin whose manifest grants `http_client`.
+  more. Outbound HTTP is the one network surface that can be opened, and only
+  when the manifest grants `http_client` and that capability adapter explicitly
+  enables its tested HTTP boundary. Tool and channel adapters do; memory does
+  not yet.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -57,19 +59,22 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, config injection, `http_client`, and host-fed inbound are wired.**
-  Of the permissions a manifest can declare, `config_read` injects the plugin's
-  own config section, and `http_client` attaches an outbound `wasi:http` surface
-  so the plugin can make HTTP requests. Filesystem and memory-access permissions
-  are still accepted by the manifest schema but inert: their host functions are
-  not yet registered in the linker. See Permissions and Host imports below.
+- **`logging`, config injection, and host-fed inbound are wired; tool and channel
+  adapters also implement `http_client`.** Of the permissions a manifest can
+  declare, `config_read` injects the plugin's own config section. An
+  `http_client` grant is necessary for outbound `wasi:http`, but the adapter must
+  also opt into the host surface. Memory intentionally remains HTTP-free until
+  its network boundary has component-level coverage. Filesystem and
+  memory-access permissions are still accepted by the manifest schema but
+  inert: their host functions are not yet registered in the linker. See
+  Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
-  through ambient WASI. A `http_client` plugin gets outbound `wasi:http` and
-  nothing else; it cannot listen. Channel plugins that must receive inbound
-  traffic do not open a listener themselves: the host runs the listener and
-  feeds messages through the `inbound` import, which the plugin drains from its
-  `poll-message` export.
+  through ambient WASI. A tool or channel plugin with an `http_client` grant
+  gets outbound `wasi:http` because those adapters opt in; it cannot listen.
+  Channel plugins that must receive inbound traffic do not open a listener
+  themselves: the host runs the listener and feeds messages through the
+  `inbound` import, which the plugin drains from its `poll-message` export.
 - **A 32-bit boundary.** The target is `wasm32-wasip2`. Guest memory is a 32-bit
   address space and the component ABI lowers offsets as 32-bit regardless of
   host word size. Large values (for example a channel attachment's raw bytes)
@@ -118,7 +123,11 @@ jail, and host-fed `inbound` queue) is complete and unit-covered, and
 to register. Wiring those into the live orchestrator (the discovery-to-channel
 loop in the runtime, plus a per-vendor host listener that drains its transport
 into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice.
+runtime channel-registration change, not this host slice. The memory bridge
+(`WasmMemory`) is in the same position one step earlier: the adapter implements
+the full `Memory` trait against the `memory-plugin` world, but the host does not
+yet expose a memory counterpart to `channel_plugin_details()` and the runtime
+does not yet construct a `WasmMemory` as a configurable backend.
 
 ## Plugin structure
 
@@ -181,7 +190,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.2.0",
+      "version": "0.8.3",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -235,6 +244,8 @@ skills and between bundles.
 
 ## Manifest format
 
+{{#include ../_snippets/plugin-manifest-fields.md}}
+
 ### Capabilities
 
 `capabilities` is a non-empty list of `PluginCapability` values, defined in
@@ -259,14 +270,15 @@ Be aware of the gap between declared and enforced: in the component host today
 tool plugin's resolved config section into `execute` only when the manifest
 grants `config_read`, and strips any caller-supplied `__config` so the section
 cannot be spoofed; a channel plugin receives the same section through its
-`configure` export under the same rule. `http_client` attaches an outbound
-`wasi:http` context to the plugin's store and links the `wasi:http` interface,
-so a granted plugin can make HTTP requests and one without the permission has no
-network surface at all. The remaining variants (`file_read`, `file_write`,
-`memory_read`, `memory_write`) are accepted by the manifest schema but are not
-yet wired to a host import: declaring them grants nothing on its own. They
-reserve the names for the host functions that will gate them (see Host imports
-below).
+`configure` export under the same rule. `http_client` is a necessary grant, not
+a complete authority decision: the capability adapter must also construct the
+HTTP context and link `wasi:http`. Tool and channel adapters opt in after grant
+validation. The memory adapter deliberately does not, so granting
+`http_client` to a memory scope alone adds no network surface. The remaining
+variants (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted
+by the manifest schema but are not yet wired to a host import: declaring them
+grants nothing on its own. They reserve the names for the host functions that
+will gate them (see Host imports below).
 
 ## WIT interfaces
 
@@ -334,13 +346,13 @@ Host functions are imported by the plugin and provided by the runtime. Every
 world's linker wires `logging` (via the host impl in `component_logging.rs`,
 linked alongside `add_wasi` in `component.rs`). The `channel-plugin` world also
 imports `inbound`, the host-fed message queue a channel drains from
-`poll-message`. Outbound `wasi:http` is linked on top for any plugin whose
-manifest grants `http_client` (`add_wasi_http` in `component.rs`), gated so the
-context and the linked interface always agree. The filesystem and memory-access
-permissions remain inert: the host functions that would gate them are not yet
-wired into the linker. A plugin's ambient authority is the WASI context (no
-preopens, no ambient network) plus exactly the host imports its world and
-permissions wire in.
+`poll-message`. Tool and channel adapters link outbound `wasi:http` only after
+the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
+and `add_wasi_http` in `component.rs`). Memory withholds both the context and
+linker surface. The filesystem and memory-access permissions remain inert: the
+host functions that would gate them are not yet wired into the linker. A
+plugin's ambient authority is the WASI context (no preopens, no ambient network)
+plus exactly the host imports its grants and adapter opt-ins jointly enable.
 
 ### `inbound`
 
@@ -394,10 +406,14 @@ reserved `__config` key, but only when the manifest grants `config_read`:
 `runtime.rs` strips any caller-supplied `__config` before injecting the resolved
 section, so the section cannot be spoofed, and withholds it entirely when the
 permission is absent. Operators populate this section through the configuration
-surfaces above (zerocode, the CLI, the gateway), never by hand-editing a file;
-the section's keys are whatever the plugin's schema declares. The field is
-marked secret, so values encrypt at rest under the adjacent `.secret_key`. A
-plugin only ever sees its own section.
+surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a
+file, with one current exception: a freshly installed plugin has no
+`plugins.entries` entry yet, and `config set` cannot materialize a missing
+natural-key entry, so the first entry must be added to the file by hand
+(tracked in issue #8636). The section's keys are whatever the plugin's schema
+declares. The field is marked secret, so CLI-written values encrypt at rest
+under the adjacent `.secret_key`; hand-written plaintext values are also
+accepted at load. A plugin only ever sees its own section.
 
 ## WASI Component Host
 
@@ -486,7 +502,10 @@ fails its policy rather than aborting the whole host; install returns the error.
 
 A plugin is a `cdylib` crate that targets the component model. Generate the
 guest bindings from the same `wit/v0` package the host uses, implement the
-exported world, and compile to `wasm32-wasip2`.
+exported world, and compile to `wasm32-wasip2`. For the full worked
+walkthroughs from empty crate to installed plugin, see the
+[plugin guides](../plugins/index.md); the notes below cover the
+build and install mechanics.
 
 ### Building
 
@@ -534,9 +553,11 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 ## Configuration
 
-You never hand-edit TOML to configure a plugin. ZeroClaw exposes the plugin
+You rarely hand-edit TOML to configure a plugin. ZeroClaw exposes the plugin
 config schema through every surface, and each surface writes the same underlying
-state through the schema mirror. Pick whichever fits the moment:
+state through the schema mirror (the one current exception: seeding a fresh
+plugin's `plugins.entries` entry, per the note under Per-plugin config). Pick
+whichever fits the moment:
 
 - **zerocode** the interactive config editor. Walk to the plugins section and
   set fields with validation and inline help.
@@ -567,7 +588,11 @@ workspace `Cargo.toml` select whether plugins are built in at all and which
 execution backend ships:
 
 - `plugins-wasm` is the umbrella that pulls the plugin host and its runtime
-  integration into the binary.
+  integration into the binary. It is **required**: the backend features below
+  select an execution engine but do not imply the umbrella, so building with
+  only a backend feature succeeds and silently yields a binary with no
+  `plugin` subcommand. Always pass `plugins-wasm` plus your chosen backend,
+  e.g. `--features plugins-wasm,plugins-wasm-cranelift`.
 - `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
   components are deserialized from a precompiled `.cwasm`.
 - `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is

@@ -40,7 +40,21 @@ X-Webhook-Signature: sha256=<hex-encoded HMAC-SHA256 of the raw body>
 
 The channel computes `HMAC-SHA256(secret, raw_body)`, hex-encodes it, and compares against the header value (the `sha256=` prefix is stripped before decode). Mismatch or missing header returns `401`.
 
-When `secret` is unset, **no verification runs**: every request is accepted. Don't expose an unsecured webhook channel to the public internet; either set `secret`, restrict access at a reverse proxy, or run the listener bound to a private network only.
+When `secret` is unset, the channel **refuses to start** (the listener
+bails at startup with an error directing the operator to configure one).
+An enabled webhook channel always requires a configured `secret`. This
+is a deliberate fail-fast: an unauthenticated webhook listener with
+agent access is an open ingress that should not exist in any deployment.
+
+> **Breaking change.** Deployments that previously ran the listener
+> secretless behind a reverse proxy or bound to a private network must
+> now configure a `secret` in `[channels.webhook.<alias>].secret`.
+> The secretless fallback path is removed: an enabled webhook listener
+> is treated as an unconditional risk that no deployment topology should
+> be exposed to. Operators in this situation should set a `secret` and
+> either keep the listener behind their existing reverse proxy or
+> continue binding to a private network; either is fine, the secret is
+> what is now load-bearing.
 
 ## Outbound
 

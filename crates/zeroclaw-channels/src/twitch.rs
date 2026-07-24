@@ -1,26 +1,4 @@
 //! Twitch chat channel — thin adapter over the IRC channel.
-//!
-//! Twitch chat speaks IRC: `irc.chat.twitch.tv:6697` over TLS, with the
-//! OAuth token sent as `PASS oauth:{token}`. The adapter constructs an
-//! `IrcChannel` with Twitch-specific defaults so operators don't have to
-//! know IRC is the wire protocol.
-//!
-//! # Auth
-//! Twitch OAuth user-access token. Operator mints via either
-//! <https://twitchapps.com/tmi/> (one-click implicit flow, returns
-//! `oauth:...` directly) or the Twitch CLI Device Code Flow (returns a
-//! raw access token; the channel auto-prefixes `oauth:` if missing).
-//!
-//! # Inbound
-//! Forwards to the wrapped `IrcChannel::listen`. Each `ChannelMessage`
-//! emerging from the inner channel is rewritten so `channel = "twitch"`
-//! before being forwarded to the agent runtime — this keeps routing,
-//! auditing, and metrics distinct from the plain-IRC channel.
-//!
-//! # Outbound
-//! Forwards to `IrcChannel::send`. Twitch's chat protocol is plain
-//! `PRIVMSG #channel :body`, which the IRC channel already handles
-//! (including length splitting).
 
 use crate::irc::{IrcChannel, IrcChannelConfig};
 use anyhow::Result;
@@ -147,11 +125,6 @@ pub fn normalize_oauth_token(raw: &str) -> String {
     }
 }
 
-/// Normalize a Twitch channel name. Twitch channel names are
-/// case-insensitive Twitch logins; the IRC `JOIN` command requires them
-/// prefixed with `#`. Whitespace is trimmed; an empty entry yields `None`
-/// so the operator can include trailing commas without crashing the
-/// listen loop.
 pub fn normalize_twitch_channel(raw: &str) -> Option<String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let bare = trimmed.trim_start_matches('#');

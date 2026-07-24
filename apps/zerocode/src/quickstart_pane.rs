@@ -11,16 +11,9 @@ use ratatui::{
 };
 use std::sync::Arc;
 
-/// Display placeholder the daemon emits for an unset `Option` field,
-/// mirroring `zeroclaw_config::traits::UNSET_DISPLAY`. zerocode talks to
-/// the daemon over RPC and mirrors config types on the wire rather than
-/// depending on `zeroclaw-config`, so the sentinel is duplicated here.
-/// It is a *display* value, never a real default — seeding a field
-/// buffer with it or submitting it makes the daemon validate `<unset>`
-/// against the field's true type (e.g. a bool), which fails with
-/// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
 const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
+const MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT: usize = 5;
 
 /// Upper bound on rendered secret-mask bullets. A pasted API key can be
 /// 100+ chars; one bullet per character wraps the masked value across
@@ -69,9 +62,10 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 7] = [
+    const ALL: [Selector; 8] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
+        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -109,6 +103,18 @@ impl Selector {
         }
     }
 
+    fn from_step(step: QuickstartStep) -> Option<Self> {
+        match step {
+            QuickstartStep::ModelProvider => Some(Selector::ModelProvider),
+            QuickstartStep::RiskProfile => Some(Selector::RiskProfile),
+            QuickstartStep::RuntimeProfile => Some(Selector::RuntimeProfile),
+            QuickstartStep::Memory => Some(Selector::Memory),
+            QuickstartStep::Channels => Some(Selector::Channels),
+            QuickstartStep::PeerGroups => Some(Selector::PeerGroups),
+            QuickstartStep::Agent => Some(Selector::Agent),
+        }
+    }
+
     /// Localised title for the selector that owns a validation step, so
     /// a field error can name where the problem lives (e.g.
     /// `Model provider / alias: …`) instead of only a count.
@@ -126,18 +132,6 @@ impl Selector {
     }
 }
 
-/// Drop validation errors for selectors the user hasn't filled yet.
-///
-/// `revalidate` runs after every selector commit, and the runtime
-/// validates the *whole* submission, short-circuiting at the first
-/// failing step. Mid-build that first failure is almost always a
-/// selector the user simply hasn't reached — e.g. the empty risk
-/// profile, surfacing the instant the model provider is committed. Shown
-/// as a red "1 error(s) — fix selectors and resubmit", it reads as if the
-/// step they just finished broke. Keep only errors for selectors the user
-/// has actually filled; unfilled ones are already tracked as `[ ]` in the
-/// checklist, and submit re-validates the full set with nothing empty to
-/// short-circuit on.
 fn retain_filled_selector_errors(
     form: &FormState,
     errors: Vec<QuickstartError>,
@@ -152,11 +146,60 @@ fn retain_filled_selector_errors(
         .collect()
 }
 
-fn next_selector_index_after(sel: Selector) -> Option<usize> {
+fn first_incomplete_required_selector(form: &FormState) -> Option<Selector> {
+    Selector::ALL.iter().copied().find(|sel| {
+        !matches!(
+            sel,
+            Selector::Submit | Selector::Channels | Selector::PeerGroups
+        ) && !form.is_satisfied(*sel)
+    })
+}
+
+fn incomplete_submit_error(form: &FormState) -> Option<QuickstartError> {
+    let sel = first_incomplete_required_selector(form)?;
+    let message_key = match sel {
+        Selector::ModelProvider => "zc-quickstart-missing-model-provider",
+        Selector::RiskProfile => "zc-quickstart-missing-risk-profile",
+        Selector::RuntimeProfile => "zc-quickstart-missing-runtime-profile",
+        Selector::Memory => "zc-quickstart-missing-memory",
+        Selector::Agent => "zc-quickstart-missing-agent",
+        Selector::Channels | Selector::PeerGroups | Selector::Submit => return None,
+    };
+    Some(QuickstartError {
+        step: sel.step(),
+        field: String::new(),
+        message: crate::i18n::t(message_key),
+    })
+}
+
+fn errors_include_selector(errors: &[QuickstartError], sel: Selector) -> bool {
+    let step = sel.step();
+    errors.iter().any(|e| e.step == step)
+}
+
+fn next_selector_index_after(sel: Selector, form: &FormState) -> Option<usize> {
+    let current = Selector::ALL.iter().position(|s| *s == sel)?;
+    let next = (current + 1).min(Selector::ALL.len().saturating_sub(1));
+
     Selector::ALL
         .iter()
-        .position(|s| *s == sel)
-        .map(|idx| (idx + 1).min(Selector::ALL.len().saturating_sub(1)))
+        .enumerate()
+        .skip(next)
+        .find_map(|(idx, candidate)| {
+            if selector_needs_attention(*candidate, form) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .or(Some(next))
+}
+
+fn selector_needs_attention(sel: Selector, form: &FormState) -> bool {
+    match sel {
+        Selector::Submit => form.all_selectors_satisfied(),
+        _ => !form.is_satisfied(sel),
+    }
 }
 
 fn apply_model_catalog_result(form: &mut FieldFormModal, models: Option<Vec<String>>) {
@@ -180,7 +223,9 @@ fn opt(value: &str, label: impl Into<String>, help: impl Into<String>) -> Picker
         value: value.to_string(),
         label: label.into(),
         help: help.into(),
-        use_existing: false,
+        kind: PickerOptionKind::Choice {
+            use_existing: false,
+        },
     }
 }
 
@@ -189,7 +234,49 @@ fn existing_opt(alias: String) -> PickerOption {
         label: format!("Use existing: {alias}"),
         value: alias,
         help: crate::i18n::t("zc-quickstart-reuse-alias-help"),
-        use_existing: true,
+        kind: PickerOptionKind::Choice { use_existing: true },
+    }
+}
+
+fn existing_provider_opt(alias: String) -> PickerOption {
+    PickerOption {
+        label: alias.clone(),
+        value: alias,
+        help: crate::i18n::t("zc-quickstart-reuse-alias-help"),
+        kind: PickerOptionKind::Choice { use_existing: true },
+    }
+}
+
+fn header_opt(label: impl Into<String>) -> PickerOption {
+    PickerOption {
+        value: String::new(),
+        label: label.into(),
+        help: String::new(),
+        kind: PickerOptionKind::Header,
+    }
+}
+
+fn existing_provider_toggle_opt(hidden_count: usize, expanded: bool) -> PickerOption {
+    let label = if expanded {
+        format!(
+            "  {}",
+            crate::i18n::t("zc-quickstart-existing-providers-show-fewer")
+        )
+    } else {
+        let count = hidden_count.to_string();
+        format!(
+            "  {}",
+            crate::i18n::t_args(
+                "zc-quickstart-existing-providers-show-more",
+                &[("count", count.as_str())],
+            )
+        )
+    };
+    PickerOption {
+        value: String::new(),
+        label,
+        help: String::new(),
+        kind: PickerOptionKind::ExistingProviderToggle { expanded },
     }
 }
 
@@ -220,13 +307,6 @@ fn queue_apply_handoff(
     }
 }
 
-/// The character a key press contributes to a free-text buffer (the
-/// agent-name field), or `None` for control chords and non-character
-/// keys. Letters that double as modal hotkeys on file rows — `e` (edit
-/// in $EDITOR), `t` (from template), `c` (clear), `d` (delete) — are
-/// still plain text on a text row, so this deliberately ignores the
-/// chord mapping: the hotkey arms are gated on `on_file` and never fire
-/// while the cursor is on the name field.
 fn typed_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
@@ -267,37 +347,44 @@ fn risk_options() -> [PickerOption; 3] {
     ]
 }
 
-fn runtime_options() -> [PickerOption; 3] {
-    [
-        opt(
-            "tight",
-            crate::i18n::t("zc-quickstart-runtime-tight"),
-            crate::i18n::t("zc-quickstart-runtime-tight-desc"),
-        ),
-        opt(
-            "balanced",
-            crate::i18n::t("zc-quickstart-runtime-balanced"),
-            crate::i18n::t("zc-quickstart-runtime-balanced-desc"),
-        ),
-        opt(
-            "unbounded",
-            crate::i18n::t("zc-quickstart-runtime-unbounded"),
-            crate::i18n::t("zc-quickstart-runtime-unbounded-desc"),
-        ),
-    ]
+fn runtime_picker_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
+    snapshot
+        .into_iter()
+        .flat_map(|snapshot| &snapshot.runtime_presets)
+        .map(|preset| {
+            let localized = match preset.preset_name.as_str() {
+                "tight" => Some((
+                    "zc-quickstart-runtime-tight",
+                    "zc-quickstart-runtime-tight-desc",
+                )),
+                "local_small" => Some((
+                    "zc-quickstart-runtime-local-small",
+                    "zc-quickstart-runtime-local-small-desc",
+                )),
+                "balanced" => Some((
+                    "zc-quickstart-runtime-balanced",
+                    "zc-quickstart-runtime-balanced-desc",
+                )),
+                "unbounded" => Some((
+                    "zc-quickstart-runtime-unbounded",
+                    "zc-quickstart-runtime-unbounded-desc",
+                )),
+                _ => None,
+            };
+            let (label, help) = localized
+                .map(|(label_key, help_key)| {
+                    (
+                        crate::i18n::try_t(label_key).unwrap_or_else(|| preset.label.clone()),
+                        crate::i18n::try_t(help_key).unwrap_or_else(|| preset.help.clone()),
+                    )
+                })
+                .unwrap_or_else(|| (preset.label.clone(), preset.help.clone()));
+            opt(&preset.preset_name, label, help)
+        })
+        .collect()
 }
 
 fn memory_options() -> Vec<PickerOption> {
-    // Walk every variant of the schema's canonical `MemoryBackendKind`.
-    // `serde_json::to_value` returns the `#[serde(rename_all =
-    // "snake_case")]` string for each variant — that string IS the
-    // wire key written into `memory.backend`, so the picker carries
-    // no parallel mapping. Variants come out in declaration order
-    // because `enum-iterator`-style iteration is unnecessary for a
-    // closed set: we list them once here against the schema and any
-    // schema additions are caught at compile time because
-    // `MemoryKind` is a public re-export and a `match` exhaustiveness
-    // check below would fail to compile if a variant were dropped.
     let variants: [MemoryKind; 6] = [
         MemoryKind::Sqlite,
         MemoryKind::Markdown,
@@ -325,23 +412,12 @@ fn memory_options() -> Vec<PickerOption> {
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{kind:?}").to_lowercase());
-            PickerOption {
-                value: wire.clone(),
-                label: wire,
-                help: String::new(),
-                use_existing: false,
-            }
+            opt(&wire, wire.clone(), String::new())
         })
         .collect()
 }
 
 fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
-    // Source of truth is the daemon-side
-    // `zeroclaw_runtime::quickstart::snapshot_state`, which maps the
-    // canonical `zeroclaw_providers::list_model_providers()` registry
-    // into wire rows. Adding a model provider in
-    // `zeroclaw-providers` lights up here automatically — Quickstart
-    // never maintains its own list.
     let Some(snap) = snapshot else {
         return Vec::new();
     };
@@ -355,9 +431,65 @@ fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<Picker
             } else {
                 crate::i18n::t("zc-quickstart-provider-cloud")
             },
-            use_existing: false,
+            kind: PickerOptionKind::Choice {
+                use_existing: false,
+            },
         })
         .collect()
+}
+
+fn ordered_existing_provider_refs(existing: &[String]) -> Vec<String> {
+    let mut refs: Vec<String> = existing.to_vec();
+    refs.sort_by(|a, b| {
+        let rank = |value: &str| {
+            if value == "openrouter.default" {
+                0
+            } else if value.ends_with(".default") {
+                1
+            } else {
+                2
+            }
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
+    refs
+}
+
+fn model_provider_picker_options(
+    snapshot: Option<&QuickstartStateResult>,
+    existing_expanded: bool,
+) -> Vec<PickerOption> {
+    let Some(snap) = snapshot else {
+        return Vec::new();
+    };
+
+    let mut options = Vec::new();
+    let existing = ordered_existing_provider_refs(&snap.model_providers);
+    if !existing.is_empty() {
+        options.push(header_opt(crate::i18n::t(
+            "zc-quickstart-existing-providers-heading",
+        )));
+        let visible_count = if existing_expanded {
+            existing.len()
+        } else {
+            existing.len().min(MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT)
+        };
+        for alias in existing.iter().take(visible_count) {
+            options.push(existing_provider_opt(alias.clone()));
+        }
+        if existing.len() > MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT {
+            options.push(existing_provider_toggle_opt(
+                existing.len() - MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT,
+                existing_expanded,
+            ));
+        }
+    }
+
+    options.push(header_opt(crate::i18n::t(
+        "zc-quickstart-new-provider-heading",
+    )));
+    options.extend(provider_type_options(snapshot));
+    options
 }
 
 fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerOption> {
@@ -373,7 +505,9 @@ fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerO
             value: t.kind.clone(),
             label: t.display_name.clone(),
             help: format!("Configure a new {} channel.", t.display_name),
-            use_existing: false,
+            kind: PickerOptionKind::Choice {
+                use_existing: false,
+            },
         })
         .collect()
 }
@@ -382,7 +516,7 @@ fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerO
 struct ChannelDraft {
     channel_type: String,
     alias: String,
-    token: Option<String>,
+    fields: std::collections::HashMap<String, String>,
     mode: SelectorMode,
 }
 
@@ -411,6 +545,7 @@ struct FormState {
     risk_mode: SelectorMode,
     runtime: String,
     runtime_mode: SelectorMode,
+    runtime_auto_defaulted: bool,
     memory: MemoryKind,
     memory_mode: SelectorMode,
     /// `true` once the user has explicitly committed a Memory
@@ -440,6 +575,7 @@ impl FormState {
             risk_mode: SelectorMode::Fresh,
             runtime: String::new(),
             runtime_mode: SelectorMode::Fresh,
+            runtime_auto_defaulted: false,
             memory: MemoryKind::Sqlite,
             memory_mode: SelectorMode::Fresh,
             memory_chosen: false,
@@ -493,6 +629,10 @@ impl FormState {
                 )
             })
             .all(|s| self.is_satisfied(*s))
+    }
+
+    fn selector_is_complete(&self, sel: Selector, errors: &[QuickstartError]) -> bool {
+        self.is_satisfied(sel) && !errors_include_selector(errors, sel)
     }
 
     fn summary(&self, sel: Selector) -> String {
@@ -554,9 +694,7 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        // Runtime profile picker removed from all surfaces; apply silently
-        // forces the `unbounded` preset. Submit it so the field is well-formed.
-        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
+        let runtime_profile = self.runtime_profile_choice();
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -573,7 +711,7 @@ impl FormState {
                     SelectorMode::Fresh => SelectorChoice::Fresh(ChannelQuickStart {
                         channel_type: c.channel_type.clone(),
                         alias: c.alias.clone(),
-                        token: c.token.clone(),
+                        fields: c.fields.clone(),
                     }),
                     SelectorMode::Existing => {
                         SelectorChoice::Existing(format!("{}.{}", c.channel_type, c.alias))
@@ -589,6 +727,51 @@ impl FormState {
             },
         }
     }
+
+    fn runtime_profile_choice(&self) -> SelectorChoice<String> {
+        match self.runtime_mode {
+            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
+            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
+        }
+    }
+
+    fn apply_provider_runtime_default(&mut self, default: Option<&str>) {
+        let Some(next) = default else { return };
+        if self.runtime.is_empty() || self.runtime_auto_defaulted {
+            self.runtime = next.to_string();
+            self.runtime_mode = SelectorMode::Fresh;
+            self.runtime_auto_defaulted = true;
+        }
+    }
+}
+
+fn provider_runtime_default<'a>(
+    snapshot: Option<&'a QuickstartStateResult>,
+    type_key: &str,
+) -> Option<&'a str> {
+    let snapshot = snapshot?;
+    snapshot
+        .model_provider_types
+        .iter()
+        .find(|provider| provider.kind == type_key)
+        .and_then(|provider| provider.default_runtime_profile.as_deref())
+        .or(snapshot.default_runtime_profile.as_deref())
+}
+
+fn apply_existing_provider_choice(
+    form: &mut FormState,
+    snapshot: Option<&QuickstartStateResult>,
+    dotted_ref: &str,
+) {
+    let Some((provider_type, alias)) = dotted_ref.split_once('.') else {
+        return;
+    };
+    form.provider_type = provider_type.to_string();
+    form.provider_alias = alias.to_string();
+    form.provider_mode = SelectorMode::Existing;
+    form.model.clear();
+    form.provider_fields.clear();
+    form.apply_provider_runtime_default(provider_runtime_default(snapshot, provider_type));
 }
 
 /// Modal kinds the pane can put up over the main checklist. Each
@@ -647,11 +830,6 @@ struct TextInputModal {
     peer_group_channel: Option<String>,
 }
 
-/// Lifecycle of the live model catalog for a ModelProvider FieldForm.
-/// The form opens immediately in `Pending` so the modal paints a
-/// loading row instead of the picker blocking on the catalog RPC; a
-/// later `tick` resolves it to `Loaded` (model row upgraded to an
-/// enum picker) or `Empty` (catalog unavailable → free-text fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelCatalogState {
     /// Section has no model row (channels) — nothing to load.
@@ -689,6 +867,16 @@ struct FieldFormRow {
     buf: String,
 }
 
+fn channel_fields_from_rows(rows: &[FieldFormRow]) -> std::collections::HashMap<String, String> {
+    rows.iter()
+        .filter_map(|row| {
+            let value = row.buf.trim();
+            (!value.is_empty() && value != UNSET_DISPLAY)
+                .then(|| (row.descriptor.key.clone(), value.to_string()))
+        })
+        .collect()
+}
+
 struct ChannelListModal {
     /// `cursor < channels.len()`  → highlight that draft (Enter = delete).
     /// `cursor == channels.len()` → "+ Add channel" row.
@@ -721,6 +909,21 @@ struct FileEditorState {
     lines: Vec<String>,
     cursor_row: usize,
     cursor_col: usize,
+}
+
+fn personality_file_needs_template(agent: &AgentModal, filename: &str) -> bool {
+    agent
+        .files
+        .get(filename)
+        .map(|content| content.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn advance_agent_modal_after_file(agent: &mut AgentModal) {
+    let row_count = agent.filenames.len() + 2;
+    if agent.cursor + 1 < row_count {
+        agent.cursor += 1;
+    }
 }
 
 impl FileEditorState {
@@ -849,6 +1052,13 @@ fn byte_index_at_char(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerOptionKind {
+    Choice { use_existing: bool },
+    Header,
+    ExistingProviderToggle { expanded: bool },
+}
+
 #[derive(Clone)]
 struct PickerOption {
     /// Wire-side value written back into [`FormState`].
@@ -857,10 +1067,24 @@ struct PickerOption {
     label: String,
     /// One-line help / blurb.
     help: String,
-    /// `true` when this option points at an already-configured alias
-    /// (`SelectorChoice::Existing`). `false` for fresh presets / type
-    /// rows that build a `SelectorChoice::Fresh`.
-    use_existing: bool,
+    kind: PickerOptionKind,
+}
+
+impl PickerOption {
+    fn is_selectable(&self) -> bool {
+        !matches!(self.kind, PickerOptionKind::Header)
+    }
+
+    fn use_existing(&self) -> bool {
+        matches!(self.kind, PickerOptionKind::Choice { use_existing: true })
+    }
+
+    fn existing_provider_toggle_expanded(&self) -> Option<bool> {
+        match self.kind {
+            PickerOptionKind::ExistingProviderToggle { expanded } => Some(expanded),
+            _ => None,
+        }
+    }
 }
 
 pub struct QuickstartPane {
@@ -949,10 +1173,9 @@ impl QuickstartPane {
     pub fn wants_text_input(&self) -> bool {
         match self.active_modal.as_ref() {
             Some(Modal::TextInput(_)) => true,
-            Some(Modal::FieldForm(f)) => f
-                .fields
-                .get(f.cursor)
-                .is_some_and(|row| field_row_variants(row).is_none()),
+            Some(Modal::FieldForm(f)) => f.fields.get(f.cursor).is_some_and(|row| {
+                field_form_row_visible(f, f.cursor) && field_row_variants(row).is_none()
+            }),
             Some(Modal::Agent(a)) => a.editor.is_some() || a.cursor == 0,
             _ => false,
         }
@@ -993,11 +1216,6 @@ impl QuickstartPane {
             self.handle_modal_key(key).await;
             return false;
         }
-        // After Apply, `applied_alias` is set and the daemon is in the
-        // middle of reloading. Suppress all main-list key handling
-        // until the connection drops and the next `app::run`
-        // iteration consumes the armed Stage-2 intent. Pressing Enter
-        // here does nothing — there's no reachable RPC to act on.
         if self.applied_alias.is_some() {
             return false;
         }
@@ -1019,6 +1237,8 @@ impl QuickstartPane {
                     if matches!(sel, Selector::Submit) {
                         if self.can_create() {
                             self.submit().await;
+                        } else {
+                            self.report_incomplete_submit();
                         }
                     } else {
                         self.open_modal_for(sel);
@@ -1029,6 +1249,8 @@ impl QuickstartPane {
             Some(QuickstartTabAction::Create) => {
                 if self.can_create() {
                     self.submit().await;
+                } else {
+                    self.report_incomplete_submit();
                 }
                 false
             }
@@ -1040,14 +1262,6 @@ impl QuickstartPane {
         }
     }
 
-    /// Route a bracketed-paste payload into the active modal's text
-    /// field. Mirrors the per-modal char-insertion rules in
-    /// `handle_modal_key` so paste lands in exactly the same buffer a
-    /// keystroke would: the TextInput buffer, the focused non-enum
-    /// FieldForm row (e.g. an `api_key`), or the Agent name row. Panes
-    /// without an active text target ignore the paste. Without this,
-    /// `app`'s `Event::Paste` had no Quickstart arm, so paste was
-    /// silently dropped on every Quickstart widget.
     pub fn handle_paste(&mut self, text: &str) {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
@@ -1055,7 +1269,8 @@ impl QuickstartPane {
         match modal {
             Modal::TextInput(t) => t.buf.push_str(text),
             Modal::FieldForm(f) => {
-                if let Some(row) = f.fields.get_mut(f.cursor)
+                if field_form_row_visible(f, f.cursor)
+                    && let Some(row) = f.fields.get_mut(f.cursor)
                     && row.descriptor.enum_variants.is_none()
                 {
                     row.buf.push_str(text);
@@ -1082,14 +1297,6 @@ impl QuickstartPane {
             .await;
     }
 
-    /// Mouse handler. Recognises:
-    ///   - left-click on a modal row → moves modal cursor + synthesises
-    ///     Enter (committing that row);
-    ///   - left-click outside an active modal → closes the modal;
-    ///   - left-click on a selector row → moves the selector cursor +
-    ///     opens that selector's modal;
-    ///   - scroll up/down → moves the cursor on whichever surface is
-    ///     active (modal if open, otherwise selector list).
     pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent, _content: Rect) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let col = mouse.column;
@@ -1106,6 +1313,9 @@ impl QuickstartPane {
                         .enumerate()
                         .find(|(_, r)| in_rect(col, row, **r))
                     {
+                        if !self.modal_row_is_selectable(idx) {
+                            return;
+                        }
                         self.set_modal_cursor(idx);
                         // Synthesise the same Enter behaviour the
                         // keyboard takes.
@@ -1143,6 +1353,8 @@ impl QuickstartPane {
                         if matches!(sel, Selector::Submit) {
                             if self.can_create() {
                                 self.submit().await;
+                            } else {
+                                self.report_incomplete_submit();
                             }
                         } else {
                             self.open_modal_for(sel);
@@ -1168,13 +1380,23 @@ impl QuickstartPane {
             editor.scroll_lines(delta);
             return;
         }
+        if let Modal::Picker(p) = modal {
+            p.cursor = wrapped_selectable_option_index(&p.options, p.cursor, delta);
+            return;
+        }
+        if let Modal::FieldForm(f) = modal {
+            if delta >= 0 {
+                move_field_form_cursor(f, 1);
+            } else {
+                move_field_form_cursor(f, -1);
+            }
+            return;
+        }
         let (cur, len) = match modal {
-            Modal::Picker(p) => (&mut p.cursor, p.options.len()),
-            Modal::FieldForm(f) => (&mut f.cursor, f.fields.len()),
             Modal::ChannelList(cl) => (&mut cl.cursor, self.modal_row_rects.len()),
             Modal::PeerGroupList(pl) => (&mut pl.cursor, self.modal_row_rects.len()),
             Modal::Agent(a) => (&mut a.cursor, self.modal_row_rects.len()),
-            Modal::TextInput(_) => return,
+            Modal::Picker(_) | Modal::FieldForm(_) | Modal::TextInput(_) => return,
         };
         if len == 0 {
             return;
@@ -1191,13 +1413,14 @@ impl QuickstartPane {
         };
         match modal {
             Modal::Picker(p) => {
-                if idx < p.options.len() {
+                if p.options.get(idx).is_some_and(PickerOption::is_selectable) {
                     p.cursor = idx;
                 }
             }
             Modal::FieldForm(f) => {
                 if idx < f.fields.len() {
                     f.cursor = idx;
+                    normalize_field_form_cursor(f);
                 }
             }
             Modal::ChannelList(cl) => {
@@ -1220,6 +1443,14 @@ impl QuickstartPane {
         }
     }
 
+    fn modal_row_is_selectable(&self, idx: usize) -> bool {
+        match self.active_modal.as_ref() {
+            Some(Modal::Picker(p)) => p.options.get(idx).is_some_and(PickerOption::is_selectable),
+            Some(Modal::TextInput(_)) | None => false,
+            _ => true,
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         let len = Selector::ALL.len() as i32;
         let current = self.list_state.selected().unwrap_or(0) as i32;
@@ -1228,8 +1459,31 @@ impl QuickstartPane {
     }
 
     fn advance_after_completed(&mut self, sel: Selector) {
-        if let Some(next) = next_selector_index_after(sel) {
+        if let Some(next) = next_selector_index_after(sel, &self.form) {
             self.list_state.select(Some(next));
+        }
+    }
+
+    fn keep_selector_selected(&mut self, sel: Selector) {
+        if let Some(idx) = Selector::ALL.iter().position(|candidate| *candidate == sel) {
+            self.list_state.select(Some(idx));
+        }
+    }
+
+    fn advance_after_validated(&mut self, sel: Selector) {
+        if errors_include_selector(&self.last_errors, sel) {
+            self.keep_selector_selected(sel);
+        } else {
+            self.advance_after_completed(sel);
+        }
+    }
+
+    fn report_incomplete_submit(&mut self) {
+        if let Some(error) = incomplete_submit_error(&self.form) {
+            if let Some(sel) = Selector::from_step(error.step) {
+                self.keep_selector_selected(sel);
+            }
+            self.last_errors = vec![error];
         }
     }
 
@@ -1261,18 +1515,13 @@ impl QuickstartPane {
                 }));
             }
             Selector::ModelProvider => {
-                let mut options: Vec<PickerOption> =
-                    provider_type_options(self.state_snapshot.as_ref());
-                if let Some(snap) = &self.state_snapshot {
-                    for alias in &snap.model_providers {
-                        options.push(existing_opt(alias.clone()));
-                    }
-                }
+                let options = model_provider_picker_options(self.state_snapshot.as_ref(), false);
+                let cursor = current_provider_picker_cursor(&options, &self.form);
                 self.active_modal = Some(Modal::Picker(PickerModal {
                     selector: sel,
                     purpose: PickerPurpose::ProviderType,
                     options,
-                    cursor: 0,
+                    cursor,
                 }));
             }
             Selector::Channels => {
@@ -1290,7 +1539,7 @@ impl QuickstartPane {
     fn open_picker_modal(&mut self, sel: Selector) {
         let mut options: Vec<PickerOption> = match sel {
             Selector::RiskProfile => risk_options().to_vec(),
-            Selector::RuntimeProfile => runtime_options().to_vec(),
+            Selector::RuntimeProfile => runtime_picker_options(self.state_snapshot.as_ref()),
             Selector::Memory => memory_options(),
             _ => return,
         };
@@ -1314,6 +1563,9 @@ impl QuickstartPane {
                 }
                 options.push(existing_opt(alias.clone()));
             }
+        }
+        if options.is_empty() {
+            return;
         }
         let cursor = match sel {
             Selector::RiskProfile => options
@@ -1347,20 +1599,50 @@ impl QuickstartPane {
         };
         use crate::keymap::QuickstartModalAction;
         let action = QuickstartModalAction::from_chord(&key);
+        if let Modal::FieldForm(form) = modal {
+            normalize_field_form_cursor(form);
+        }
         match modal {
             Modal::Picker(p) => match action {
                 Some(QuickstartModalAction::Cancel) => {
                     self.active_modal = None;
                 }
-                Some(QuickstartModalAction::Up) if p.cursor > 0 => {
-                    p.cursor -= 1;
+                Some(QuickstartModalAction::Up) => {
+                    if let Some(next) = adjacent_selectable_option_index(&p.options, p.cursor, -1) {
+                        p.cursor = next;
+                    }
                 }
-                Some(QuickstartModalAction::Down) if p.cursor + 1 < p.options.len() => {
-                    p.cursor += 1;
+                Some(QuickstartModalAction::Down) => {
+                    if let Some(next) = adjacent_selectable_option_index(&p.options, p.cursor, 1) {
+                        p.cursor = next;
+                    }
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    let chosen = p.options[p.cursor].value.clone();
-                    let use_existing = p.options[p.cursor].use_existing;
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if let Some(expanded) = option.existing_provider_toggle_expanded() {
+                        p.options =
+                            model_provider_picker_options(self.state_snapshot.as_ref(), !expanded);
+                        p.cursor = p
+                            .options
+                            .iter()
+                            .position(|option| {
+                                option.existing_provider_toggle_expanded() == Some(!expanded)
+                            })
+                            .unwrap_or_else(|| {
+                                nearest_selectable_option_index(&p.options, p.cursor)
+                            });
+                        return;
+                    }
+                    let Some(option) = p.options.get(p.cursor) else {
+                        return;
+                    };
+                    if !option.is_selectable() {
+                        return;
+                    }
+                    let chosen = option.value.clone();
+                    let use_existing = option.use_existing();
                     let selector = p.selector;
                     let purpose = p.purpose;
                     match (purpose, use_existing) {
@@ -1368,13 +1650,13 @@ impl QuickstartPane {
                             self.apply_picker_choice(selector, chosen, use_existing);
                             self.active_modal = None;
                             self.revalidate().await;
-                            self.advance_after_completed(selector);
+                            self.advance_after_validated(selector);
                         }
                         (PickerPurpose::ProviderType, true) => {
                             self.adopt_existing_provider(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
-                            self.advance_after_completed(selector);
+                            self.advance_after_validated(selector);
                         }
                         (PickerPurpose::ProviderType, false) => {
                             self.active_modal = None;
@@ -1389,7 +1671,7 @@ impl QuickstartPane {
                             self.adopt_existing_channel(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
-                            self.advance_after_completed(selector);
+                            self.advance_after_validated(selector);
                         }
                         (PickerPurpose::ChannelType, false) => {
                             self.active_modal = None;
@@ -1460,22 +1742,36 @@ impl QuickstartPane {
                     self.active_modal = None;
                 }
                 Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down) => {
-                    if f.cursor + 1 < f.fields.len() {
-                        f.cursor += 1;
-                    } else {
-                        f.cursor = 0;
+                    if let Some(error) =
+                        current_field_form_duplicate_error(self.state_snapshot.as_ref(), f)
+                    {
+                        self.last_errors = vec![error];
+                        return;
                     }
+                    if current_field_form_row_is_model_provider_alias(f) {
+                        self.last_errors.retain(|e| {
+                            e.step != QuickstartStep::ModelProvider || e.field != "alias"
+                        });
+                    }
+                    move_field_form_cursor(f, 1);
                 }
                 Some(QuickstartModalAction::PrevField) | Some(QuickstartModalAction::Up) => {
-                    if f.cursor == 0 {
-                        f.cursor = f.fields.len().saturating_sub(1);
-                    } else {
-                        f.cursor -= 1;
-                    }
+                    move_field_form_cursor(f, -1);
                 }
                 Some(QuickstartModalAction::Confirm) => {
-                    if f.cursor + 1 < f.fields.len() {
-                        f.cursor += 1;
+                    if !field_form_cursor_is_last_visible(f) {
+                        if let Some(error) =
+                            current_field_form_duplicate_error(self.state_snapshot.as_ref(), f)
+                        {
+                            self.last_errors = vec![error];
+                            return;
+                        }
+                        if current_field_form_row_is_model_provider_alias(f) {
+                            self.last_errors.retain(|e| {
+                                e.step != QuickstartStep::ModelProvider || e.field != "alias"
+                            });
+                        }
+                        move_field_form_cursor(f, 1);
                         return;
                     }
                     let selector = f.selector;
@@ -1491,9 +1787,11 @@ impl QuickstartPane {
                             Some(Modal::ChannelList(ChannelListModal { cursor: 0 }));
                     } else {
                         self.active_modal = None;
-                        self.advance_after_completed(selector);
                     }
                     self.revalidate().await;
+                    if !from_channel {
+                        self.advance_after_validated(selector);
+                    }
                 }
                 Some(QuickstartModalAction::Left) => {
                     let variants = f
@@ -1590,7 +1888,8 @@ impl QuickstartPane {
                             }));
                         } else if cl.cursor == drafts + 1 {
                             self.active_modal = None;
-                            self.advance_after_completed(Selector::Channels);
+                            self.revalidate().await;
+                            self.advance_after_validated(Selector::Channels);
                         }
                     }
                     _ => {}
@@ -1629,7 +1928,8 @@ impl QuickstartPane {
                             }
                         } else if pl.cursor == drafts + 1 {
                             self.active_modal = None;
-                            self.advance_after_completed(Selector::PeerGroups);
+                            self.revalidate().await;
+                            self.advance_after_validated(Selector::PeerGroups);
                         }
                     }
                     _ => {}
@@ -1676,7 +1976,30 @@ impl QuickstartPane {
                         self.commit_agent_modal();
                         self.active_modal = None;
                         self.revalidate().await;
-                        self.advance_after_completed(Selector::Agent);
+                        self.advance_after_validated(Selector::Agent);
+                    }
+                    Some(QuickstartModalAction::Confirm) if on_file => {
+                        let filename = a.filenames[a.cursor - 1].clone();
+                        if !personality_file_needs_template(a, &filename) {
+                            advance_agent_modal_after_file(a);
+                            return;
+                        }
+                        let agent_name = a.name.trim().to_string();
+                        let templated = self
+                            .fetch_personality_template(&filename, Some(agent_name.as_str()))
+                            .await;
+                        match templated {
+                            Some(content) => {
+                                if let Some(Modal::Agent(a)) = self.active_modal.as_mut() {
+                                    a.files.insert(filename, content);
+                                    advance_agent_modal_after_file(a);
+                                }
+                                self.last_errors.clear();
+                            }
+                            None => {
+                                self.last_errors = vec![missing_template_error(&filename)];
+                            }
+                        }
                     }
                     Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down)
                         if a.cursor + 1 < row_count =>
@@ -1768,17 +2091,7 @@ impl QuickstartPane {
     }
 
     fn adopt_existing_provider(&mut self, dotted_ref: String) {
-        if let Some((ty, alias)) = dotted_ref.split_once('.') {
-            self.form.provider_type = ty.to_string();
-            self.form.provider_alias = alias.to_string();
-            self.form.provider_mode = SelectorMode::Existing;
-            // Default model / field values aren't carried in the
-            // "existing" path — the runtime resolves the alias against
-            // the live config at apply time. Leave them empty so they
-            // don't overwrite the existing alias's values.
-            self.form.model.clear();
-            self.form.provider_fields.clear();
-        }
+        apply_existing_provider_choice(&mut self.form, self.state_snapshot.as_ref(), &dotted_ref);
     }
 
     fn adopt_existing_channel(&mut self, dotted_ref: String) {
@@ -1786,7 +2099,7 @@ impl QuickstartPane {
             self.form.channels.push(ChannelDraft {
                 channel_type: ty.to_string(),
                 alias: alias.to_string(),
-                token: None,
+                fields: std::collections::HashMap::new(),
                 mode: SelectorMode::Existing,
             });
         }
@@ -1822,20 +2135,10 @@ impl QuickstartPane {
         refs.sort();
         refs.dedup();
         refs.into_iter()
-            .map(|r| PickerOption {
-                label: r.clone(),
-                value: r,
-                help: String::new(),
-                use_existing: false,
-            })
+            .map(|r| opt(&r, r.clone(), String::new()))
             .collect()
     }
 
-    /// Debounced-ish validation: after a selector commit, ask the
-    /// runtime whether the assembled submission would pass. Errors
-    /// land in `last_errors` and surface in the status strip. The
-    /// `quickstart/validate` path is read-only and cheap; we run it
-    /// once per commit rather than per keystroke.
     async fn revalidate(&mut self) {
         let submission = self.form.to_submission();
         match self.rpc.quickstart_validate(&submission).await {
@@ -1871,13 +2174,8 @@ impl QuickstartPane {
             }
         };
         let is_model_provider = matches!(section, QuickstartFieldSection::ModelProvider);
-        // Open the form before loading the live model catalog. The next
-        // idle tick upgrades the model row to a picker or paints the
-        // free-text fallback, so users see progress instead of a
-        // frozen modal while the catalog RPC runs. The row builder also
-        // handles bool toggles, enum defaults, and the synthetic model
-        // provider alias row.
-        let rows = build_field_form_rows(section, fields, None);
+        let mut rows = build_field_form_rows(section, fields, None);
+        restore_field_form_rows_from_form(section, &type_key, &mut rows, &self.form);
         let model_catalog_state = if is_model_provider {
             ModelCatalogState::Pending
         } else {
@@ -1968,8 +2266,13 @@ impl QuickstartPane {
         let missing: Vec<&str> = f
             .fields
             .iter()
-            .filter(|r| r.descriptor.required && r.buf.trim().is_empty())
-            .map(|r| r.descriptor.key.as_str())
+            .enumerate()
+            .filter(|(index, r)| {
+                field_form_row_visible(f, *index)
+                    && r.descriptor.required
+                    && r.buf.trim().is_empty()
+            })
+            .map(|(_, r)| r.descriptor.key.as_str())
             .collect();
         if !missing.is_empty() {
             self.last_errors = missing
@@ -1982,8 +2285,23 @@ impl QuickstartPane {
                 .collect();
             return false;
         }
+        if let Some(error) = model_provider_alias_duplicate_error(self.state_snapshot.as_ref(), f) {
+            let alias_idx = f
+                .fields
+                .iter()
+                .position(|row| row.descriptor.key == "alias")
+                .unwrap_or(0);
+            self.last_errors = vec![error];
+            if let Some(Modal::FieldForm(form)) = self.active_modal.as_mut() {
+                form.cursor = alias_idx;
+            }
+            return false;
+        }
         match f.selector {
             Selector::ModelProvider => {
+                let runtime_default =
+                    provider_runtime_default(self.state_snapshot.as_ref(), &f.type_key)
+                        .map(str::to_string);
                 let pick = |key: &str| {
                     f.fields
                         .iter()
@@ -1993,7 +2311,10 @@ impl QuickstartPane {
                 };
                 let mut provider_fields: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
-                for row in &f.fields {
+                for (index, row) in f.fields.iter().enumerate() {
+                    if !field_form_row_visible(f, index) {
+                        continue;
+                    }
                     // `model` and `alias` are hoisted to FormState
                     // fields; every other descriptor flows through
                     // `provider_fields` keyed by its schema identifier
@@ -2019,31 +2340,14 @@ impl QuickstartPane {
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
+                self.form
+                    .apply_provider_runtime_default(runtime_default.as_deref());
             }
             Selector::Channels => {
-                let pick = |key: &str| {
-                    f.fields
-                        .iter()
-                        .find(|r| r.descriptor.key == key)
-                        .map(|r| r.buf.trim().to_string())
-                        .unwrap_or_default()
-                };
-                // `bot-token` covers Telegram / Discord; `token` is the
-                // generic fallback for any channel kind that just needs
-                // one secret.
-                let token = {
-                    let v = pick("bot-token");
-                    if v.is_empty() {
-                        let alt = pick("token");
-                        if alt.is_empty() { None } else { Some(alt) }
-                    } else {
-                        Some(v)
-                    }
-                };
                 self.form.channels.push(ChannelDraft {
                     channel_type: f.type_key.clone(),
                     alias: f.alias.clone(),
-                    token,
+                    fields: channel_fields_from_rows(&f.fields),
                     mode: SelectorMode::Fresh,
                 });
             }
@@ -2066,6 +2370,7 @@ impl QuickstartPane {
             Selector::RuntimeProfile => {
                 self.form.runtime = value;
                 self.form.runtime_mode = mode;
+                self.form.runtime_auto_defaulted = false;
             }
             Selector::Memory => {
                 if use_existing {
@@ -2090,7 +2395,7 @@ impl QuickstartPane {
     }
 
     fn can_create(&self) -> bool {
-        self.form.all_selectors_satisfied() && !self.busy
+        self.form.all_selectors_satisfied() && self.last_errors.is_empty() && !self.busy
     }
 
     async fn submit(&mut self) {
@@ -2119,16 +2424,9 @@ impl QuickstartPane {
     }
 
     fn handle_apply_success(&mut self, agent: AppliedAgent, daemon_restarted: bool) {
-        // Arm the Stage-2 hand-off **before** any daemon reload can kick
-        // in. When reload is signalled the socket dies shortly after
-        // this returns, the TUI waits during the disconnect, and the
-        // next `app::run` pane rebuild consumes the pending reconnect
-        // chat handoff.
-        //
-        // Test/standalone daemons can report `daemon_restarted = false`.
-        // In that case no disconnect is coming, so freezing Quickstart
-        // behind `applied_alias` strands the user. Queue an immediate
-        // connected-client handoff instead.
+        // A real daemon reload must survive the old connection closing:
+        // use the immediate handoff only when the daemon reports that no
+        // reconnect is needed.
         self.applied_alias =
             queue_apply_handoff(&self.reconnect_state, agent.alias, daemon_restarted);
         self.last_errors.clear();
@@ -2146,7 +2444,7 @@ impl QuickstartPane {
         let items: Vec<ListItem> = Selector::ALL
             .iter()
             .map(|sel| {
-                let satisfied = self.form.is_satisfied(*sel);
+                let satisfied = self.form.selector_is_complete(*sel, &self.last_errors);
                 let glyph_style = if satisfied {
                     Style::default()
                         .fg(Color::Green)
@@ -2226,14 +2524,12 @@ impl QuickstartPane {
         } else {
             crate::i18n::t_args("zc-quickstart-status-hint", &[("chord", "c")])
         };
-        let style = if self.applied_alias.is_some() {
+        let style = if self.applied_alias.is_some() || can_create {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else if !self.last_errors.is_empty() {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        } else if can_create {
-            theme::accent_style()
         } else {
             theme::dim_style()
         };
@@ -2255,15 +2551,6 @@ fn generate_run_id() -> String {
     format!("{now:x}-{pid:x}")
 }
 
-/// Wrapped visual-row height of each logical line at `width`, using the
-/// same word-wrap (`Wrap { trim: false }`) the modal body renders with.
-/// Every line occupies at least one row — a blank line still takes a row.
-///
-/// Sizing the modal by logical line count alone left it too short
-/// whenever content soft-wrapped: long risk-profile blurbs pushed the
-/// `yolo` option off-screen, and a long pasted `api_key` pushed the
-/// `model` picker out of view. These heights drive both the box size and
-/// the cursor-tracking scroll so the geometry survives wrapping.
 fn wrapped_row_heights(lines: &[Line], width: u16) -> Vec<u16> {
     lines
         .iter()
@@ -2299,6 +2586,180 @@ fn apply_model_catalog_to_rows(rows: &mut [FieldFormRow], model_catalog: Option<
     }
 }
 
+fn first_selectable_option_index(options: &[PickerOption]) -> usize {
+    options
+        .iter()
+        .position(PickerOption::is_selectable)
+        .unwrap_or(0)
+}
+
+fn nearest_selectable_option_index(options: &[PickerOption], preferred: usize) -> usize {
+    if options
+        .get(preferred)
+        .is_some_and(PickerOption::is_selectable)
+    {
+        return preferred;
+    }
+    options
+        .iter()
+        .enumerate()
+        .skip(preferred.saturating_add(1))
+        .find(|(_, option)| option.is_selectable())
+        .map(|(idx, _)| idx)
+        .or_else(|| {
+            options
+                .iter()
+                .enumerate()
+                .take(preferred)
+                .rev()
+                .find(|(_, option)| option.is_selectable())
+                .map(|(idx, _)| idx)
+        })
+        .unwrap_or(0)
+}
+
+fn adjacent_selectable_option_index(
+    options: &[PickerOption],
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
+    if delta < 0 {
+        options
+            .iter()
+            .enumerate()
+            .take(current)
+            .rev()
+            .find(|(_, option)| option.is_selectable())
+            .map(|(idx, _)| idx)
+    } else {
+        options
+            .iter()
+            .enumerate()
+            .skip(current.saturating_add(1))
+            .find(|(_, option)| option.is_selectable())
+            .map(|(idx, _)| idx)
+    }
+}
+
+fn wrapped_selectable_option_index(options: &[PickerOption], current: usize, delta: i32) -> usize {
+    if options.is_empty() {
+        return 0;
+    }
+    let mut next = current.min(options.len().saturating_sub(1));
+    for _ in 0..options.len() {
+        next = (next as i32 + delta).rem_euclid(options.len() as i32) as usize;
+        if options[next].is_selectable() {
+            return next;
+        }
+    }
+    current.min(options.len().saturating_sub(1))
+}
+
+fn current_provider_picker_cursor(options: &[PickerOption], form: &FormState) -> usize {
+    if form.provider_type.is_empty() {
+        return first_selectable_option_index(options);
+    }
+
+    let target = if form.provider_mode == SelectorMode::Existing && !form.provider_alias.is_empty()
+    {
+        format!("{}.{}", form.provider_type, form.provider_alias)
+    } else {
+        form.provider_type.clone()
+    };
+
+    options
+        .iter()
+        .position(|o| o.value == target && o.is_selectable())
+        .unwrap_or_else(|| first_selectable_option_index(options))
+}
+
+fn model_provider_alias_value(form: &FieldFormModal) -> String {
+    form.fields
+        .iter()
+        .find(|row| row.descriptor.key == "alias")
+        .map(|row| row.buf.trim().to_string())
+        .filter(|alias| !alias.is_empty())
+        .unwrap_or_else(|| form.alias.clone())
+}
+
+fn model_provider_alias_duplicate_error(
+    snapshot: Option<&QuickstartStateResult>,
+    form: &FieldFormModal,
+) -> Option<QuickstartError> {
+    if form.selector != Selector::ModelProvider {
+        return None;
+    }
+    let alias = model_provider_alias_value(form);
+    if alias.trim().is_empty() {
+        return None;
+    }
+    let dotted = format!("{}.{}", form.type_key, alias.trim());
+    let exists = snapshot?
+        .model_providers
+        .iter()
+        .any(|existing| existing == &dotted);
+    if !exists {
+        return None;
+    }
+    Some(QuickstartError {
+        step: QuickstartStep::ModelProvider,
+        field: "alias".into(),
+        message: crate::i18n::t_args(
+            "zc-quickstart-provider-alias-exists",
+            &[("alias", dotted.as_str())],
+        ),
+    })
+}
+
+fn current_field_form_duplicate_error(
+    snapshot: Option<&QuickstartStateResult>,
+    form: &FieldFormModal,
+) -> Option<QuickstartError> {
+    let row = form.fields.get(form.cursor)?;
+    if row.descriptor.key != "alias" {
+        return None;
+    }
+    model_provider_alias_duplicate_error(snapshot, form)
+}
+
+fn current_field_form_row_is_model_provider_alias(form: &FieldFormModal) -> bool {
+    form.selector == Selector::ModelProvider
+        && form
+            .fields
+            .get(form.cursor)
+            .is_some_and(|row| row.descriptor.key == "alias")
+}
+
+fn restore_field_form_rows_from_form(
+    section: QuickstartFieldSection,
+    type_key: &str,
+    rows: &mut [FieldFormRow],
+    form: &FormState,
+) {
+    if !matches!(section, QuickstartFieldSection::ModelProvider)
+        || form.provider_type != type_key
+        || form.provider_mode != SelectorMode::Fresh
+    {
+        return;
+    }
+
+    for row in rows {
+        match row.descriptor.key.as_str() {
+            "alias" if !form.provider_alias.is_empty() => {
+                row.buf = form.provider_alias.clone();
+            }
+            "model" if !form.model.is_empty() => {
+                row.buf = form.model.clone();
+            }
+            key => {
+                if let Some(value) = form.provider_fields.get(key) {
+                    row.buf = value.clone();
+                }
+            }
+        }
+    }
+}
+
 fn is_model_field(field: &QuickstartFieldDescriptor) -> bool {
     field.key.eq_ignore_ascii_case("model") || field.label.eq_ignore_ascii_case("model")
 }
@@ -2314,11 +2775,6 @@ fn build_field_form_rows(
             if matches!(d.kind, crate::client::QuickstartFieldKind::Bool) {
                 d.enum_variants = Some(vec!["false".to_string(), "true".to_string()]);
             }
-            // For enum fields, default the buffer to the first variant
-            // so the user lands on a valid value. ←/→ cycles through the
-            // list. The daemon's `<unset>` placeholder for optional
-            // fields is treated as no value — seeding or submitting it
-            // would fail validation against the field's real type.
             let default = d
                 .default
                 .clone()
@@ -2374,6 +2830,56 @@ fn field_row_variants(row: &FieldFormRow) -> Option<&[String]> {
     None
 }
 
+fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
+    matches!(form.selector, Selector::ModelProvider)
+        && form.type_key.trim().eq_ignore_ascii_case("openai")
+        && form.fields.iter().any(|row| {
+            row.descriptor.key == "auth_mode" && row.buf.trim().eq_ignore_ascii_case("codex")
+        })
+}
+
+fn field_form_row_visible(form: &FieldFormModal, index: usize) -> bool {
+    let Some(row) = form.fields.get(index) else {
+        return false;
+    };
+    !(field_form_uses_openai_codex_auth(form) && row.descriptor.key == "api_key")
+}
+
+fn visible_field_form_indices(
+    form: &FieldFormModal,
+) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    (0..form.fields.len()).filter(|index| field_form_row_visible(form, *index))
+}
+
+fn normalize_field_form_cursor(form: &mut FieldFormModal) {
+    if field_form_row_visible(form, form.cursor) {
+        return;
+    }
+    let first_visible = visible_field_form_indices(form).next();
+    if let Some(index) = first_visible {
+        form.cursor = index;
+    }
+}
+
+fn move_field_form_cursor(form: &mut FieldFormModal, delta: i32) {
+    let visible: Vec<usize> = visible_field_form_indices(form).collect();
+    if visible.is_empty() {
+        return;
+    }
+    let current_pos = visible
+        .iter()
+        .position(|index| *index == form.cursor)
+        .unwrap_or(0);
+    let next_pos = (current_pos as i32 + delta).rem_euclid(visible.len() as i32);
+    form.cursor = visible[next_pos as usize];
+}
+
+fn field_form_cursor_is_last_visible(form: &FieldFormModal) -> bool {
+    visible_field_form_indices(form)
+        .next_back()
+        .is_none_or(|index| index == form.cursor)
+}
+
 fn missing_template_error(filename: &str) -> QuickstartError {
     QuickstartError {
         step: QuickstartStep::Agent,
@@ -2382,11 +2888,6 @@ fn missing_template_error(filename: &str) -> QuickstartError {
     }
 }
 
-/// Paint the modal and return `(inner_rect, row_to_cursor)` so the
-/// pane's mouse handler can resolve a click to a cursor index. The
-/// `row_to_cursor` vec maps each body row (top → bottom) to either
-/// `Some(cursor_index)` for clickable rows or `None` for help /
-/// blank lines.
 fn draw_modal(
     frame: &mut Frame,
     area: Rect,
@@ -2476,6 +2977,10 @@ fn draw_modal(
             ]));
             lines.push(Line::from(""));
             for (i, row) in f.fields.iter().enumerate() {
+                if !field_form_row_visible(f, i) {
+                    cursor_lines.push(usize::MAX);
+                    continue;
+                }
                 cursor_lines.push(lines.len());
                 let is_cursor = i == f.cursor;
                 let glyph = if is_cursor { " › " } else { "   " };
@@ -2495,13 +3000,6 @@ fn draw_modal(
                     row.buf.clone()
                 };
                 let is_empty_buf = raw_display.is_empty();
-                // Ghost text (the field default) is a placeholder for an
-                // empty buffer, but only when the row is NOT focused.
-                // Showing it on the focused row makes the default look
-                // like real, editable text the user cannot Backspace
-                // away — the alias `default` ghost-state defect. The
-                // focused empty row renders empty so the cursor sits
-                // where typing lands.
                 let show_ghost = is_empty_buf && !is_cursor && !is_enum;
                 let (display, value_style) = if is_model_row
                     && matches!(
@@ -2609,10 +3107,10 @@ fn draw_modal(
                         Span::styled(glyph, theme::accent_style()),
                         Span::styled(format!("{}.{}", c.channel_type, c.alias), style),
                         Span::styled(
-                            if c.token.is_some() {
-                                "  (token set)"
-                            } else {
+                            if c.fields.is_empty() {
                                 ""
+                            } else {
+                                "  (configured)"
                             },
                             theme::dim_style(),
                         ),
@@ -2843,11 +3341,6 @@ fn draw_modal(
         .inner(Rect::new(area.x, area.y, box_w, area.height))
         .width;
 
-    // Size the box from the *wrapped* row counts, not the logical line
-    // counts. Long picker blurbs and long pasted field values (e.g. an
-    // `api_key`) soft-wrap across several rows; sizing by line count alone
-    // left the box too short, so later rows — the `yolo` risk option, the
-    // `model` picker — fell outside the viewport entirely.
     let body_heights = wrapped_row_heights(&body_lines, inner_width);
     let header_rows = wrapped_total(&header_lines, inner_width);
     // Prefix sums: where each logical body line begins in wrapped-row
@@ -2892,7 +3385,10 @@ fn draw_modal(
     // maps it into wrapped-row space so the scroll math survives wrapping.
     let selected_line = match modal {
         Modal::Picker(p) => cursor_lines.get(p.cursor).copied(),
-        Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
+        Modal::FieldForm(f) => cursor_lines
+            .get(f.cursor)
+            .copied()
+            .filter(|line| *line != usize::MAX),
         Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
         Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
         Modal::Agent(a) => {
@@ -2958,6 +3454,9 @@ fn draw_modal(
     let row_rects: Vec<Rect> = cursor_lines
         .into_iter()
         .map(|line_idx| {
+            if line_idx == usize::MAX {
+                return Rect::new(0, 0, 0, 0);
+            }
             let start = row_starts.get(line_idx).copied().unwrap_or(0);
             let height = body_heights.get(line_idx).copied().unwrap_or(1).max(1);
             match start.checked_sub(scroll_offset) {
@@ -2984,6 +3483,22 @@ fn draw_modal(
 mod tests {
     use super::*;
 
+    fn field_row(key: &str, value: &str) -> FieldFormRow {
+        FieldFormRow {
+            descriptor: QuickstartFieldDescriptor {
+                key: key.to_string(),
+                label: key.to_string(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: key == "bot_token",
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            buf: value.to_string(),
+        }
+    }
+
     /// A FormState with every real selector satisfied.
     fn complete_form() -> FormState {
         let mut f = FormState::default_form();
@@ -2995,6 +3510,223 @@ mod tests {
         f.memory_chosen = true;
         f.agent_name = "bob".into();
         f
+    }
+
+    fn model_provider_snapshot(existing: Vec<&str>) -> QuickstartStateResult {
+        QuickstartStateResult {
+            quickstart_completed: false,
+            agents: Vec::new(),
+            risk_profiles: Vec::new(),
+            runtime_profiles: Vec::new(),
+            default_runtime_profile: Some("unbounded".into()),
+            model_providers: existing.into_iter().map(str::to_string).collect(),
+            channels: Vec::new(),
+            unassigned_channels: Vec::new(),
+            storage: Vec::new(),
+            model_provider_types: vec![
+                crate::client::QuickstartTypeOption {
+                    kind: "openrouter".into(),
+                    display_name: "OpenRouter".into(),
+                    local: false,
+                    default_runtime_profile: Some("unbounded".into()),
+                },
+                crate::client::QuickstartTypeOption {
+                    kind: "anthropic".into(),
+                    display_name: "Anthropic".into(),
+                    local: false,
+                    default_runtime_profile: Some("unbounded".into()),
+                },
+                crate::client::QuickstartTypeOption {
+                    kind: "lmstudio".into(),
+                    display_name: "LM Studio".into(),
+                    local: true,
+                    default_runtime_profile: Some("local_small".into()),
+                },
+            ],
+            channel_types: Vec::new(),
+            risk_presets: Vec::new(),
+            runtime_presets: Vec::new(),
+            memory_kinds: Vec::new(),
+            personality_files: Vec::new(),
+        }
+    }
+
+    fn selectable_labels(options: &[PickerOption]) -> Vec<&str> {
+        options
+            .iter()
+            .filter(|option| option.is_selectable())
+            .map(|option| option.label.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn model_provider_picker_groups_existing_first_without_hiding_new_provider() {
+        let snap = model_provider_snapshot(vec!["openrouter.default", "openai.gpt5"]);
+
+        let options = model_provider_picker_options(Some(&snap), false);
+        let labels = selectable_labels(&options);
+
+        assert_eq!(labels[0], "openrouter.default");
+        assert_eq!(labels[1], "openai.gpt5");
+        assert!(
+            labels.contains(&"OpenRouter"),
+            "create-new provider rows must remain visible"
+        );
+    }
+
+    #[test]
+    fn model_provider_picker_collapses_existing_provider_overflow() {
+        let snap = model_provider_snapshot(vec![
+            "openrouter.default",
+            "openai.gpt5",
+            "anthropic.sonnet",
+            "anthropic.haiku",
+            "ollama.local",
+            "groq.default",
+            "xai.grok",
+        ]);
+
+        let collapsed = model_provider_picker_options(Some(&snap), false);
+        let collapsed_labels = selectable_labels(&collapsed);
+        assert!(collapsed_labels.contains(&"  [+ Show 2 more existing providers]"));
+        assert!(!collapsed_labels.contains(&"xai.grok"));
+
+        let expanded = model_provider_picker_options(Some(&snap), true);
+        let expanded_labels = selectable_labels(&expanded);
+        assert!(expanded_labels.contains(&"xai.grok"));
+        assert!(expanded_labels.contains(&"  [- Show fewer existing providers]"));
+        assert!(expanded_labels.contains(&"OpenRouter"));
+    }
+
+    #[test]
+    fn existing_local_provider_adoption_uses_daemon_runtime_default() {
+        let snapshot = model_provider_snapshot(vec!["lmstudio.default"]);
+        let mut form = FormState::default_form();
+
+        apply_existing_provider_choice(&mut form, Some(&snapshot), "lmstudio.default");
+
+        assert_eq!(form.provider_type, "lmstudio");
+        assert_eq!(form.provider_alias, "default");
+        assert_eq!(form.provider_mode, SelectorMode::Existing);
+        assert_eq!(form.runtime, "local_small");
+        assert!(form.runtime_auto_defaulted);
+    }
+
+    #[test]
+    fn runtime_picker_includes_daemon_advertised_local_small_preset() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![crate::client::QuickstartPresetMirror {
+            preset_name: "local_small".into(),
+            label: "Local small".into(),
+            help: "Safe defaults for local models.".into(),
+        }];
+
+        let options = runtime_picker_options(Some(&snapshot));
+        let local_small = options
+            .iter()
+            .find(|option| option.value == "local_small")
+            .expect("daemon-advertised runtime preset should be selectable");
+
+        assert!(!local_small.use_existing());
+    }
+
+    #[test]
+    fn runtime_picker_localizes_known_presets_and_preserves_unknown_daemon_text() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.runtime_presets = vec![
+            crate::client::QuickstartPresetMirror {
+                preset_name: "tight".into(),
+                label: "Daemon Tight".into(),
+                help: "Daemon tight help.".into(),
+            },
+            crate::client::QuickstartPresetMirror {
+                preset_name: "future_runtime".into(),
+                label: "Future Runtime".into(),
+                help: "Future runtime help.".into(),
+            },
+        ];
+
+        let options = runtime_picker_options(Some(&snapshot));
+
+        assert_eq!(
+            options[0].label,
+            crate::i18n::t("zc-quickstart-runtime-tight")
+        );
+        assert_eq!(
+            options[0].help,
+            crate::i18n::t("zc-quickstart-runtime-tight-desc")
+        );
+        assert_eq!(options[1].label, "Future Runtime");
+        assert_eq!(options[1].help, "Future runtime help.");
+    }
+
+    #[tokio::test]
+    async fn runtime_picker_does_not_open_without_advertised_presets() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = std::sync::Arc::new(crate::client::RpcClient::with_rpc(std::sync::Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let reconnect_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, reconnect_state);
+
+        pane.open_picker_modal(Selector::RuntimeProfile);
+
+        assert!(pane.active_modal.is_none());
+    }
+
+    #[test]
+    fn model_provider_alias_duplicate_is_caught_from_snapshot() {
+        let snap = model_provider_snapshot(vec!["openrouter.default"]);
+        let mut form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openrouter".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::NotApplicable,
+            model_catalog_attempts: 0,
+            fields: vec![model_provider_alias_row()],
+            cursor: 0,
+        };
+        form.fields[0].buf = "default".into();
+
+        let error = model_provider_alias_duplicate_error(Some(&snap), &form).expect("duplicate");
+
+        assert_eq!(error.step, QuickstartStep::ModelProvider);
+        assert_eq!(error.field, "alias");
+        assert!(error.message.contains("openrouter.default"));
+    }
+
+    #[test]
+    fn model_provider_alias_duplicate_check_allows_new_aliases() {
+        let snap = model_provider_snapshot(vec!["openrouter.default"]);
+        let mut form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openrouter".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::NotApplicable,
+            model_catalog_attempts: 0,
+            fields: vec![model_provider_alias_row()],
+            cursor: 0,
+        };
+        form.fields[0].buf = "work".into();
+
+        assert!(model_provider_alias_duplicate_error(Some(&snap), &form).is_none());
+    }
+
+    #[test]
+    fn channel_form_preserves_all_schema_field_keys() {
+        let rows = vec![
+            field_row("bot_token", " 123:ABC "),
+            field_row("allowed_users", "[\"42\"]"),
+            field_row("unused", UNSET_DISPLAY),
+        ];
+
+        let fields = channel_fields_from_rows(&rows);
+
+        assert_eq!(fields["bot_token"], "123:ABC");
+        assert_eq!(fields["allowed_users"], "[\"42\"]");
+        assert!(!fields.contains_key("unused"));
     }
 
     #[test]
@@ -3021,12 +3753,21 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_submit_reports_first_missing_required_selector() {
+        let mut f = complete_form();
+        f.channels.clear();
+        f.peer_groups.clear();
+        f.agent_name.clear();
+
+        let error = incomplete_submit_error(&f).expect("missing required selector");
+
+        assert_eq!(error.step, QuickstartStep::Agent);
+        assert_eq!(error.field, String::new());
+        assert!(error.message.contains("Name the agent"));
+    }
+
+    #[test]
     fn optional_channel_and_peer_group_rows_do_not_block_submit() {
-        // Regression: Channels and Peer groups are labelled optional,
-        // but the checklist stayed incomplete until the user opened
-        // each row and explicitly confirmed "none". They still render
-        // as incomplete when empty so optional "skipped" is not
-        // confused with "completed".
         let f = complete_form();
         assert!(f.channels.is_empty());
         assert!(f.peer_groups.is_empty());
@@ -3045,7 +3786,7 @@ mod tests {
         f.channels.push(ChannelDraft {
             channel_type: "telegram".into(),
             alias: "chat".into(),
-            token: None,
+            fields: std::collections::HashMap::new(),
             mode: SelectorMode::Fresh,
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {
@@ -3061,7 +3802,145 @@ mod tests {
     }
 
     #[test]
-    fn apply_handoff_starts_chat_and_preserves_reconnect_when_reload_was_signalled() {
+    fn submission_preserves_selected_fresh_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn submission_preserves_selected_existing_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "small-laptop".into();
+        f.runtime_mode = SelectorMode::Existing;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Existing("small-laptop".into())
+        );
+    }
+
+    #[test]
+    fn local_provider_defaults_to_local_small_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn cloud_provider_defaults_to_unbounded_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("unbounded"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn missing_provider_override_uses_daemon_state_fallback() {
+        let mut snapshot = model_provider_snapshot(Vec::new());
+        snapshot.model_provider_types[0].default_runtime_profile = None;
+
+        assert_eq!(
+            provider_runtime_default(Some(&snapshot), "openrouter"),
+            Some("unbounded"),
+        );
+    }
+
+    #[test]
+    fn missing_provider_and_state_defaults_leave_runtime_incomplete() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(None);
+
+        assert!(f.runtime.is_empty());
+        assert!(!f.selector_is_complete(Selector::RuntimeProfile, &[]));
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_runtime_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "tight".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "tight");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("tight".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_unbounded_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_local_small_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(Some("unbounded"));
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_choice_stops_provider_default_rewrites() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(Some("local_small"));
+        assert_eq!(f.runtime, "local_small");
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+        f.runtime_auto_defaulted = false;
+        f.apply_provider_runtime_default(Some("local_small"));
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn apply_handoff_waits_for_reconnect_when_reload_was_signalled() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(
             crate::app::CrossReconnectState::default(),
         ));
@@ -3189,6 +4068,142 @@ mod tests {
     }
 
     #[test]
+    fn model_provider_picker_reopens_on_current_provider() {
+        let options = vec![
+            opt("anthropic", "Anthropic", ""),
+            opt("openai", "OpenAI", ""),
+            existing_opt("openai.default".into()),
+        ];
+        let mut form = FormState::default_form();
+
+        form.provider_type = "openai".into();
+        form.provider_mode = SelectorMode::Fresh;
+        assert_eq!(current_provider_picker_cursor(&options, &form), 1);
+
+        form.provider_alias = "default".into();
+        form.provider_mode = SelectorMode::Existing;
+        assert_eq!(current_provider_picker_cursor(&options, &form), 2);
+    }
+
+    #[test]
+    fn model_provider_form_reopens_with_staged_values() {
+        let fields = vec![
+            QuickstartFieldDescriptor {
+                key: "model".into(),
+                label: "model".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: false,
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            QuickstartFieldDescriptor {
+                key: "api_key".into(),
+                label: "api_key".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: true,
+                enum_variants: None,
+                required: false,
+                default: None,
+            },
+        ];
+        let mut form = FormState::default_form();
+        form.provider_type = "openai".into();
+        form.provider_alias = "work".into();
+        form.provider_mode = SelectorMode::Fresh;
+        form.model = "gpt-5".into();
+        form.provider_fields.insert(
+            "api_key".into(),
+            "sk-test-value-that-is-long-enough-to-wrap".into(),
+        );
+
+        let mut rows = build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None);
+        restore_field_form_rows_from_form(
+            QuickstartFieldSection::ModelProvider,
+            "openai",
+            &mut rows,
+            &form,
+        );
+
+        assert_eq!(rows[0].descriptor.key, "alias");
+        assert_eq!(rows[0].buf, "work");
+        assert_eq!(rows[1].descriptor.key, "model");
+        assert_eq!(rows[1].buf, "gpt-5");
+        assert_eq!(rows[2].descriptor.key, "api_key");
+        assert_eq!(rows[2].buf, "sk-test-value-that-is-long-enough-to-wrap");
+        assert!(masked_secret(&rows[2].buf).contains("(+"));
+    }
+
+    #[test]
+    fn openai_codex_auth_hides_api_key_row_in_tui_form() {
+        let fields = vec![
+            QuickstartFieldDescriptor {
+                key: "model".into(),
+                label: "model".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: false,
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            QuickstartFieldDescriptor {
+                key: "auth_mode".into(),
+                label: "Authentication".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::Enum,
+                is_secret: false,
+                enum_variants: Some(vec!["api_key".into(), "codex".into()]),
+                required: true,
+                default: Some("codex".into()),
+            },
+            QuickstartFieldDescriptor {
+                key: "api_key".into(),
+                label: "api_key".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: true,
+                enum_variants: None,
+                required: false,
+                default: None,
+            },
+        ];
+        let mut form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openai".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::Empty,
+            model_catalog_attempts: 0,
+            fields: build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None),
+            cursor: 2,
+        };
+
+        let keys: Vec<&str> = visible_field_form_indices(&form)
+            .map(|index| form.fields[index].descriptor.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["alias", "model", "auth_mode"]);
+
+        move_field_form_cursor(&mut form, 1);
+        assert_eq!(
+            form.fields[form.cursor].descriptor.key, "alias",
+            "next from auth_mode must skip the hidden api_key row"
+        );
+
+        let auth_mode = form
+            .fields
+            .iter_mut()
+            .find(|row| row.descriptor.key == "auth_mode")
+            .expect("auth_mode row");
+        auth_mode.buf = "api_key".into();
+        let keys: Vec<&str> = visible_field_form_indices(&form)
+            .map(|index| form.fields[index].descriptor.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["alias", "model", "auth_mode", "api_key"]);
+    }
+
+    #[test]
     fn transient_model_catalog_miss_retries_before_manual_fallback() {
         let mut form = FieldFormModal {
             selector: Selector::ModelProvider,
@@ -3263,17 +4278,65 @@ mod tests {
 
     #[test]
     fn completed_selector_advances_to_next_row() {
-        assert_eq!(next_selector_index_after(Selector::ModelProvider), Some(1));
+        let form = FormState::default_form();
+        assert_eq!(
+            Selector::ALL,
+            [
+                Selector::ModelProvider,
+                Selector::RiskProfile,
+                Selector::RuntimeProfile,
+                Selector::Memory,
+                Selector::Channels,
+                Selector::PeerGroups,
+                Selector::Agent,
+                Selector::Submit,
+            ],
+        );
+        assert_eq!(
+            next_selector_index_after(Selector::ModelProvider, &form),
+            Some(1)
+        );
         assert_eq!(Selector::ALL[1], Selector::RiskProfile);
         let submit_index = Selector::ALL.len() - 1;
         assert_eq!(
-            next_selector_index_after(Selector::Agent),
+            next_selector_index_after(Selector::Agent, &complete_form()),
             Some(submit_index)
         );
         assert_eq!(Selector::ALL[submit_index], Selector::Submit);
         assert_eq!(
-            next_selector_index_after(Selector::Submit),
+            next_selector_index_after(Selector::Submit, &complete_form()),
             Some(submit_index)
+        );
+    }
+
+    #[test]
+    fn completed_selector_visits_optional_rows() {
+        let mut form = complete_form();
+        form.channels.clear();
+        form.peer_groups.clear();
+
+        assert_eq!(
+            next_selector_index_after(Selector::ModelProvider, &form).map(|idx| Selector::ALL[idx]),
+            Some(Selector::Channels)
+        );
+        assert_eq!(
+            next_selector_index_after(Selector::Channels, &form).map(|idx| Selector::ALL[idx]),
+            Some(Selector::PeerGroups)
+        );
+        assert_eq!(
+            next_selector_index_after(Selector::PeerGroups, &form).map(|idx| Selector::ALL[idx]),
+            Some(Selector::Submit)
+        );
+    }
+
+    #[test]
+    fn completed_selector_keeps_first_unfilled_required_row() {
+        let mut form = complete_form();
+        form.risk.clear();
+
+        assert_eq!(
+            next_selector_index_after(Selector::ModelProvider, &form).map(|idx| Selector::ALL[idx]),
+            Some(Selector::RiskProfile)
         );
     }
 
@@ -3331,6 +4394,43 @@ mod tests {
         assert!(err.message.contains("MEMORY.md"));
     }
 
+    fn test_agent_modal() -> AgentModal {
+        AgentModal {
+            cursor: 1,
+            name: "scout".into(),
+            files: std::collections::BTreeMap::new(),
+            filenames: vec!["MEMORY.md".into(), "SKILL.md".into()],
+            editor: None,
+        }
+    }
+
+    #[test]
+    fn agent_file_enter_loads_template_when_unset() {
+        let agent = test_agent_modal();
+
+        assert!(personality_file_needs_template(&agent, "MEMORY.md"));
+    }
+
+    #[test]
+    fn agent_file_enter_advances_when_content_already_set() {
+        let mut agent = test_agent_modal();
+        agent.files.insert("MEMORY.md".into(), "custom".into());
+
+        assert!(!personality_file_needs_template(&agent, "MEMORY.md"));
+        advance_agent_modal_after_file(&mut agent);
+        assert_eq!(agent.cursor, 2);
+    }
+
+    #[test]
+    fn last_agent_file_enter_advances_to_save_row() {
+        let mut agent = test_agent_modal();
+        agent.cursor = 2;
+        agent.files.insert("SKILL.md".into(), "custom".into());
+
+        advance_agent_modal_after_file(&mut agent);
+        assert_eq!(agent.cursor, 3);
+    }
+
     fn err(step: QuickstartStep) -> QuickstartError {
         QuickstartError {
             step,
@@ -3341,11 +4441,6 @@ mod tests {
 
     #[test]
     fn revalidate_hides_errors_for_unfilled_selectors() {
-        // Regression: committing the model provider triggered a full
-        // re-validate. The runtime short-circuits at the first failing
-        // step, so the still-empty risk profile came back as a single
-        // error and the status strip flashed "1 error(s) — fix selectors
-        // and resubmit", as if the provider step had failed.
         let mut f = FormState::default_form();
         f.provider_type = "anthropic".into();
         f.provider_alias = "default".into();
@@ -3374,14 +4469,21 @@ mod tests {
     }
 
     #[test]
+    fn selector_with_validation_error_does_not_render_complete() {
+        let mut f = FormState::default_form();
+        f.provider_type = "anthropic".into();
+        f.provider_alias = "default".into();
+        f.model = "claude-3-5-haiku-20241022".into();
+        assert!(f.is_satisfied(Selector::ModelProvider));
+
+        let errors = vec![err(QuickstartStep::ModelProvider)];
+
+        assert!(!f.selector_is_complete(Selector::ModelProvider, &errors));
+        assert!(errors_include_selector(&errors, Selector::ModelProvider));
+    }
+
+    #[test]
     fn name_field_accepts_hotkey_letters() {
-        // Regression: e/t/c/d double as Agent-modal hotkeys (edit in
-        // $EDITOR, from template, clear, delete) on file rows. On the
-        // name row they are plain text, but the old handler routed every
-        // keypress through the chord mapping and dropped any char that
-        // resolved to an action — so agent names could not contain those
-        // letters. `typed_char` is the text-buffer path; assert it keeps
-        // them, and that they really are bound actions (bug was reachable).
         use crate::keymap::QuickstartModalAction;
         for ch in ['e', 'c', 't', 'd', 'E', 'C', 'T', 'D'] {
             let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
@@ -3403,11 +4505,6 @@ mod tests {
 
     #[test]
     fn unset_placeholder_is_not_a_real_default() {
-        // The daemon emits `<unset>` as a display placeholder for
-        // optional fields. Seeding a buffer with it (or submitting it)
-        // made the daemon validate `<unset>` against the field's real
-        // type, failing e.g. a bool with "length 7". Confirm the
-        // sentinel matches the daemon's UNSET_DISPLAY wire value.
         assert_eq!(UNSET_DISPLAY, "<unset>");
         let seeded = Some(UNSET_DISPLAY.to_string())
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
@@ -3493,11 +4590,6 @@ mod tests {
 
     #[test]
     fn wrapped_total_counts_soft_wrapped_rows() {
-        // Regression: the modal box was sized from logical line count, so
-        // a picker blurb (or pasted value) wider than the box still
-        // counted as one row — leaving later options like `yolo` outside
-        // the viewport. `wrapped_total` must report the real wrapped
-        // height the body Paragraph renders.
         let long = Line::from("a".repeat(40));
         assert_eq!(wrapped_total(std::slice::from_ref(&long), 10), 4);
         // A blank line still occupies one row.
@@ -3519,11 +4611,6 @@ mod tests {
         assert_eq!(wrapped_total(&lines, 10), 5);
     }
 
-    /// Render a modal through a headless `TestBackend` and return the
-    /// `(box_rect, per-cursor hit-rects)` `draw_modal` produced — the same
-    /// geometry the live render path uses, so a test can assert on the
-    /// post-scroll, wrapped-row layout instead of just the measurement
-    /// primitives.
     fn render_modal_rects(area: Rect, modal: &Modal) -> (Rect, Vec<Rect>) {
         use ratatui::{Terminal, backend::TestBackend};
         let backend = TestBackend::new(area.width, area.height);
@@ -3552,12 +4639,6 @@ mod tests {
 
     #[test]
     fn picker_keeps_every_option_visible_when_blurbs_wrap() {
-        // #7359 headline: each risk-profile option carries an inline help
-        // blurb that wraps to two rows. The old box was sized from the
-        // logical line count (3), so the last option (`yolo`) fell off the
-        // bottom. With wrapped sizing the box grows to fit all three, and
-        // the hit-rects are spaced by *wrapped* height (>=2 rows apart),
-        // not logical lines (which would be 1 apart — the pre-fix bug).
         let help = "Applies specific filesystem and approval defaults for day-to-day operation.";
         let modal = risk_picker(2, help);
         let area = Rect::new(0, 0, 60, 24);
@@ -3578,12 +4659,6 @@ mod tests {
 
     #[test]
     fn picker_scrolls_to_keep_selected_option_visible() {
-        // When even the grown box can't fit every wrapped row, the selected
-        // row must scroll into view: its hit-rect is non-zero while an
-        // earlier row that scrolled off the top collapses to a zero rect.
-        // This exercises the row_starts -> scroll_offset -> row_rects chain
-        // that the measurement-helper tests don't reach. On the pre-fix code
-        // (logical-line scroll) the first option's rect stayed non-zero.
         let help = "Applies specific filesystem and approval defaults, with extra \
                     explanation to force several wrapped rows inside a narrow modal box.";
         let modal = risk_picker(2, help);

@@ -1,7 +1,6 @@
 //! MQTT → SOP event fan-in listener.
-//!
 //! This is NOT a `Channel` trait implementor — it routes MQTT messages
-//! to the SOP engine via `dispatch_sop_event`, not to the chat loop.
+//! to the SOP engine via `dispatch_untrusted_fan_in`, not to the chat loop.
 
 use std::sync::{Arc, Mutex};
 
@@ -9,14 +8,12 @@ use anyhow::Result;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 
 use zeroclaw_config::schema::MqttConfig;
-use zeroclaw_runtime::security::cap_untrusted;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
-use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
-use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
+use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::engine::SopEngine;
+use zeroclaw_runtime::sop::types::SopTriggerSource;
 
 /// Run the MQTT SOP listener loop.
-///
 /// Subscribes to configured topics and dispatches incoming publishes
 /// to the SOP engine. Blocks until disconnected or cancelled.
 pub async fn run_mqtt_sop_listener(
@@ -71,52 +68,16 @@ pub async fn run_mqtt_sop_listener(
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(msg))) => {
-                let max_bytes = match engine.lock() {
-                    Ok(eng) => eng.config().untrusted_payload_max_bytes,
-                    Err(e) => {
-                        zeroclaw_runtime::health::mark_component_error(
-                            "mqtt",
-                            format!("SOP engine lock poisoned: {e}"),
-                        );
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "MQTT SOP listener: engine lock poisoned while reading SOP safety config"
-                        );
-                        continue;
-                    }
-                };
-                let (topic, topic_truncated) = cap_mqtt_text(&msg.topic, max_bytes);
                 let payload_raw = String::from_utf8_lossy(&msg.payload);
-                let (payload, payload_truncated) = cap_mqtt_text(&payload_raw, max_bytes);
-                if topic_truncated || payload_truncated {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "topic_truncated": topic_truncated,
-                                "payload_truncated": payload_truncated,
-                                "max_bytes": max_bytes,
-                            })),
-                        "MQTT SOP listener: capped oversized untrusted publish"
-                    );
-                }
-
-                let event = SopEvent {
-                    source: SopTriggerSource::Mqtt,
-                    topic: Some(topic),
-                    payload: Some(payload),
-                    timestamp: now_iso8601(),
-                };
-
-                let results = dispatch_sop_event(&engine, &audit, event).await;
-                process_headless_results(&results);
+                dispatch_untrusted_fan_in(
+                    &engine,
+                    &audit,
+                    SopTriggerSource::Mqtt,
+                    Some(&msg.topic),
+                    Some(&payload_raw),
+                    None,
+                )
+                .await;
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 zeroclaw_runtime::health::mark_component_ok("mqtt");
@@ -170,10 +131,6 @@ fn broker_port(url: &str) -> u16 {
         .next()
         .and_then(|p| p.parse().ok())
         .unwrap_or(default_port)
-}
-
-fn cap_mqtt_text(content: &str, max_bytes: usize) -> (String, bool) {
-    cap_untrusted(content, max_bytes)
 }
 
 #[cfg(test)]
@@ -345,13 +302,5 @@ mod tests {
     #[test]
     fn broker_port_defaults_8883_for_mqtts() {
         assert_eq!(broker_port("mqtts://secure.example.com"), 8883);
-    }
-
-    #[test]
-    fn cap_mqtt_text_truncates_on_char_boundary() {
-        let (capped, truncated) = cap_mqtt_text("abc😀def", 5);
-
-        assert!(truncated);
-        assert_eq!(capped, "abc...[truncated 7 bytes]");
     }
 }

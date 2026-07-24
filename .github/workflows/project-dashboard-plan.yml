@@ -1,0 +1,40 @@
+name: Project Dashboard Planner
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to plan"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: project-dashboard-plan-${{ inputs.issue_number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan issue dashboard status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Read issue for manual run
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" > "$RUNNER_TEMP/issue.json"
+
+      - name: Plan from manual issue
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python3 scripts/github/project_dashboard_plan.py \
+            --issue-json "$RUNNER_TEMP/issue.json" \
+            --format markdown \
+            --output "$GITHUB_STEP_SUMMARY"

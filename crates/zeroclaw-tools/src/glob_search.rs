@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 const MAX_RESULTS: usize = 1000;
@@ -67,7 +67,7 @@ impl Tool for GlobSearchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Absolute paths are not allowed. Use a relative glob pattern.".into()),
             });
         }
@@ -76,7 +76,7 @@ impl Tool for GlobSearchTool {
         if pattern.contains("../") || pattern.contains("..\\") || pattern == ".." {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
             });
         }
@@ -94,7 +94,7 @@ impl Tool for GlobSearchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Invalid glob pattern: {e}")),
                 });
             }
@@ -106,7 +106,7 @@ impl Tool for GlobSearchTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Cannot resolve workspace directory: {e}")),
                 });
             }
@@ -166,7 +166,7 @@ impl Tool for GlobSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

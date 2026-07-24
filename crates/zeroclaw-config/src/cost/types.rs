@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-/// Token usage information from a single API call.
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Model identifier (e.g., "anthropic/claude-sonnet-4-20250514")
@@ -18,12 +18,22 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     /// Calculated cost in USD
     pub cost_usd: f64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
+    pub pricing_available: bool,
     /// Timestamp of the request
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true_bool(v: &bool) -> bool {
+    *v
 }
 
 impl TokenUsage {
@@ -39,12 +49,6 @@ impl TokenUsage {
         self.input_tokens.saturating_sub(self.cached_input_tokens)
     }
 
-    /// Create a new token usage record. Cached input tokens are billed at
-    /// `cached_input_price_per_million`; the rest of `input_tokens` at the
-    /// standard `input_price_per_million`. When `cached_input_price` is 0
-    /// the cached subset bills at the standard rate (no discount), so
-    /// providers that don't surface a cached rate still produce a sane
-    /// total.
     pub fn new(
         model: impl Into<String>,
         input_tokens: u64,
@@ -104,6 +108,7 @@ impl TokenUsage {
             cached_input_tokens,
             total_tokens,
             cost_usd,
+            pricing_available: true,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -114,15 +119,16 @@ impl TokenUsage {
     }
 }
 
-/// Time period for cost aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsagePeriod {
+    /// Current tracker session for this daemon lifetime.
     Session,
+    /// Current UTC/local-day aggregate used by daily budget checks.
     Day,
+    /// Current calendar-month aggregate used by monthly budget checks.
     Month,
 }
 
-/// A single cost record for persistent storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
     /// Unique identifier
@@ -136,6 +142,13 @@ pub struct CostRecord {
     /// attribution, or when `[cost].track_per_agent = false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
+    #[serde(
+        default,
+        rename = "goal_task_id",
+        alias = "task_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task_id: Option<String>,
 }
 
 impl CostRecord {
@@ -146,6 +159,7 @@ impl CostRecord {
             usage,
             session_id: session_id.into(),
             agent_alias: None,
+            task_id: None,
         }
     }
 
@@ -160,25 +174,49 @@ impl CostRecord {
             usage,
             session_id: session_id.into(),
             agent_alias,
+            task_id: None,
+        }
+    }
+
+    /// Create a new cost record attributed to an agent and/or durable task.
+    pub fn with_attribution(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        task_id: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            agent_alias,
+            task_id,
         }
     }
 }
 
-/// Budget enforcement result.
 #[derive(Debug, Clone)]
 pub enum BudgetCheck {
-    /// Within budget, request can proceed
+    /// Within budget; request can proceed.
     Allowed,
-    /// Warning threshold exceeded but request can proceed
+    /// Warning threshold exceeded, but request can proceed.
     Warning {
+        /// Current spend in the affected aggregation period before the
+        /// estimated request cost is committed.
         current_usd: f64,
+        /// Configured limit for the affected aggregation period.
         limit_usd: f64,
+        /// Aggregation period that crossed the warning threshold.
         period: UsagePeriod,
     },
-    /// Budget exceeded, request blocked
+    /// Budget exceeded; request should be blocked before provider dispatch.
     Exceeded {
+        /// Current spend in the affected aggregation period before the
+        /// estimated request cost is committed.
         current_usd: f64,
+        /// Configured limit for the affected aggregation period.
         limit_usd: f64,
+        /// Aggregation period whose limit would be exceeded.
         period: UsagePeriod,
     },
 }
@@ -333,7 +371,50 @@ mod tests {
         let record = CostRecord::new("session-123", usage);
 
         assert_eq!(record.session_id, "session-123");
+        assert!(record.task_id.is_none());
         assert!(!record.id.is_empty());
         assert_eq!(record.usage.model, "test/model");
+    }
+
+    #[test]
+    fn cost_record_task_attribution_roundtrips_existing_field() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
+        let record = CostRecord::with_attribution(
+            "session-123",
+            Some("agent-a".into()),
+            Some("goal-123".into()),
+            usage,
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains("goal_task_id"),
+            "serialized key stays compatible with existing JSONL"
+        );
+        let parsed: CostRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.agent_alias.as_deref(), Some("agent-a"));
+        assert_eq!(parsed.task_id.as_deref(), Some("goal-123"));
+    }
+
+    #[test]
+    fn cost_record_task_attribution_accepts_generic_alias() {
+        let json = r#"{
+            "id": "rec-1",
+            "usage": {
+                "model": "test/model",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "cost_usd": 0.001,
+                "timestamp": "2026-06-30T00:00:00Z"
+            },
+            "session_id": "session-123",
+            "agent_alias": "agent-a",
+            "task_id": "task-123"
+        }"#;
+        let parsed: CostRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
+        assert!(parsed.usage.pricing_available);
     }
 }

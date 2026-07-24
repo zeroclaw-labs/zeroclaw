@@ -4,7 +4,6 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
 /// ngrok Tunnel — wraps the `ngrok` binary.
-///
 /// Requires `ngrok` installed. Optionally set a custom domain
 /// (requires ngrok paid plan).
 pub struct NgrokTunnel {

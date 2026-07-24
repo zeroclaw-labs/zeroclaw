@@ -1,33 +1,11 @@
 //! Per-turn output routing tool (`send_via`).
-//!
-//! Two modes, determined by whether `body` is present:
-//!
-//! **Routing instruction** (no `body`): sets where and how the agent's current
-//! reply is delivered this turn. Does not send a message itself. The orchestrator
-//! reads [`TurnRoutingHandle`] after the tool-call loop and applies the entries.
-//!   - `send_via(modality: "text")` — same channel, force text even on voice-only peer
-//!   - `send_via(target: "discord.main")` — redirect reply to a different channel
-//!   - `send_via(target: "discord.main", modality: "voice")` — redirect + force modality
-//!
-//! **Immediate send** (with `body`): delivers a separate message independently of
-//! the agent's main reply. The main reply still goes to the originating channel.
-//! `target` is required when `body` is present.
-//!   - `send_via(target: "email.default", body: "...details...")` — fanout with own content
-//!
-//! **Authorization**: targets are constrained to channels covered by peer groups
-//! that include the active agent.
-//!
-//! **Modality resolution priority** (highest to lowest):
-//!   1. Explicit `modality` parameter
-//!   2. Peer group `output_modality`
-//!   3. Text (channel default)
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::multi_agent::OutputModality;
 use zeroclaw_config::multi_agent::PeerGroupConfig;
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
@@ -41,11 +19,6 @@ pub type PerToolChannelHandle = Arc<parking_lot::RwLock<HashMap<String, Arc<dyn 
 pub type AgentPeerGroupResolver = Arc<dyn Fn() -> HashMap<String, PeerGroupConfig> + Send + Sync>;
 
 tokio::task_local! {
-    /// The current turn's routing handle, scoped by the orchestrator around its
-    /// `run_tool_call_loop` call. `send_via` writes its routing entry here so each
-    /// turn sees only its own routes — even when several turns for the same agent
-    /// run concurrently and share one `SendViaTool`. `None` outside a scoped turn
-    /// (one-shot / non-channel entry paths), where routing instructions are ignored.
     pub static TURN_ROUTING: Option<TurnRoutingHandle>;
 }
 
@@ -105,7 +78,6 @@ impl SendViaTool {
     }
 
     /// Resolve `target` to `(channel_key, channel, peer_group_output_modality)`.
-    ///
     /// `target` may be a peer group name, a composite channel key, or a bare type.
     /// Returns `Err(reason)` when the target is rejected or not found.
     fn resolve_target(&self, target: &str) -> ResolvedTarget {
@@ -117,14 +89,6 @@ impl SendViaTool {
         if let Some(pg) = agent_peer_groups.get(target) {
             let pg_channel = &pg.channel;
 
-            // Resolve the group's channel deterministically. An exact composite
-            // key (`telegram.main`) is used as-is; a bare type (`telegram`)
-            // resolves to `<type>.default`, matching the bare channel-target
-            // path below. Scanning for the first covering alias in the channel
-            // map would pick an arbitrary `telegram.*` account when several are
-            // registered, delivering through the wrong sender while still
-            // reporting success. Fail closed when no exact/`.default` match
-            // exists so the config must name the alias it means.
             let resolved = if pg_channel.contains('.') {
                 channel_map
                     .get(pg_channel.as_str())
@@ -170,12 +134,6 @@ impl SendViaTool {
             ));
         };
 
-        // --- 3. Authorize: must be within an agent peer group ---
-        // The matched group decides the recipient (first external peer) and
-        // inherited modality, so the match must be unambiguous: if more than
-        // one peer group covers this channel, picking one out of a HashMap
-        // would send to an arbitrary recipient. Fail closed and require the
-        // caller to name the peer group instead.
         let mut matching: Vec<(&String, &PeerGroupConfig)> = agent_peer_groups
             .iter()
             .filter(|(_, pg)| Self::peer_group_covers_channel(&pg.channel, &channel_key))
@@ -264,7 +222,7 @@ impl Tool for SendViaTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -298,11 +256,10 @@ impl Tool for SendViaTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: json!({
+                        output: ToolOutput::json(json!({
                             "status": "rejected",
                             "reason": "`target` is required when `body` is present"
-                        })
-                        .to_string(),
+                        })),
                         error: None,
                     });
                 }
@@ -314,12 +271,11 @@ impl Tool for SendViaTool {
                     Err(reason) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: json!({
+                            output: ToolOutput::json(json!({
                                 "target": target_key,
                                 "status": "rejected",
                                 "reason": reason
-                            })
-                            .to_string(),
+                            })),
                             error: None,
                         });
                     }
@@ -332,13 +288,12 @@ impl Tool for SendViaTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: json!({
+                        output: ToolOutput::json(json!({
                             "target": target_key,
                             "status": "rejected",
                             "reason": "target peer group has no external_peers configured; \
                                        cannot determine send recipient"
-                        })
-                        .to_string(),
+                        })),
                         error: None,
                     });
                 }
@@ -354,23 +309,21 @@ impl Tool for SendViaTool {
             return match channel.send(&message).await {
                 Ok(()) => Ok(ToolResult {
                     success: true,
-                    output: json!({
+                    output: ToolOutput::json(json!({
                         "target": channel_key,
                         "mode": "immediate",
                         "resolved_modality": modality_str(modality),
                         "status": "ok"
-                    })
-                    .to_string(),
+                    })),
                     error: None,
                 }),
                 Err(e) => Ok(ToolResult {
                     success: false,
-                    output: json!({
+                    output: ToolOutput::json(json!({
                         "target": channel_key,
                         "status": "failed",
                         "reason": e.to_string()
-                    })
-                    .to_string(),
+                    })),
                     error: None,
                 }),
             };
@@ -380,11 +333,10 @@ impl Tool for SendViaTool {
         if target.is_none() && explicit_modality.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: json!({
+                output: ToolOutput::json(json!({
                     "status": "rejected",
                     "reason": "at least one of `target` or `modality` is required when `body` is absent"
-                })
-                .to_string(),
+                })),
                 error: None,
             });
         }
@@ -400,13 +352,12 @@ impl Tool for SendViaTool {
                     if recipient.is_none() {
                         return Ok(ToolResult {
                             success: false,
-                            output: json!({
+                            output: ToolOutput::json(json!({
                                 "target": t,
                                 "status": "rejected",
                                 "reason": "target peer group has no external_peers configured; \
                                            cannot determine routing recipient"
-                            })
-                            .to_string(),
+                            })),
                             error: None,
                         });
                     }
@@ -419,12 +370,11 @@ impl Tool for SendViaTool {
                 Err(reason) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: json!({
+                        output: ToolOutput::json(json!({
                             "target": t,
                             "status": "rejected",
                             "reason": reason
-                        })
-                        .to_string(),
+                        })),
                         error: None,
                     });
                 }
@@ -458,25 +408,23 @@ impl Tool for SendViaTool {
         if !queued {
             return Ok(ToolResult {
                 success: false,
-                output: json!({
+                output: ToolOutput::json(json!({
                     "target": resolved_channel.as_deref().unwrap_or("<originating>"),
                     "status": "ignored",
                     "reason": "routing is only available while handling a channel turn"
-                })
-                .to_string(),
+                })),
                 error: None,
             });
         }
 
         Ok(ToolResult {
             success: true,
-            output: json!({
+            output: ToolOutput::json(json!({
                 "target": resolved_channel.as_deref().unwrap_or("<originating>"),
                 "mode": "routing",
                 "resolved_modality": modality_str(resolved_modality),
                 "status": "queued"
-            })
-            .to_string(),
+            })),
             error: None,
         })
     }
@@ -994,11 +942,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_turns_do_not_share_routing_state() {
-        // Two turns for the same agent share one SendViaTool but each scopes its
-        // own TURN_ROUTING handle. A route queued by one turn must never appear
-        // in the other turn's handle — the privacy/correctness boundary from the
-        // review. We share the tool across both tasks via Arc, exactly as the
-        // per-agent registry does.
         let mut groups = HashMap::new();
         groups.insert(
             "tg".to_string(),

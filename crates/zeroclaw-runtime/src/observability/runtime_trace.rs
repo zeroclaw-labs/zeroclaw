@@ -1,10 +1,4 @@
 //! Compatibility shim for the doctor command's log-reading utilities.
-//!
-//! The legacy positional-arg `record_event` shim was retired in favor of
-//! direct `zeroclaw_log::record!` invocations carrying typed attribution
-//! via `attribution_span!`. This module survives only as the doctor
-//! command's path-resolution + load surface; new emission code goes
-//! directly to `zeroclaw_log::record!`.
 
 use std::path::Path;
 
@@ -12,17 +6,6 @@ use zeroclaw_log::LogEvent;
 
 pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
-/// Snapshot the observability config into the decoupled
-/// [`zeroclaw_log::LogConfig`] (the boundary that breaks the `zeroclaw-config`
-/// dependency cycle; see `docs/book/src/architecture/logging.md`).
-///
-/// This copies values once, at startup / explicit re-init. The `zeroclaw-log`
-/// writer then holds that snapshot for the life of the process, so a live config
-/// reload does not propagate to it: changes to any `log_persistence*` field,
-/// including the `rotating`-mode knobs (`log_persistence_max_bytes`,
-/// `log_persistence_rotate_daily`, `log_persistence_retention_max_files`,
-/// `log_persistence_retention_max_age_days`), take effect only after a daemon
-/// restart. Hot-reload is tracked as a follow-up in issue #8314.
 fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
     zeroclaw_log::LogConfig {
         log_persistence: config.log_persistence.as_wire().to_string(),

@@ -7,7 +7,7 @@ Use with:
 - [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
 - [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
-Last updated: **June 2026** (merge queue disabled on `master`; maintainers
+Last updated: **July 2026** (merge queue disabled on `master`; maintainers
 merge directly. The `merge_group` CI plumbing is retained, so the queue can be
 re-enabled from branch protection with no code change).
 
@@ -18,7 +18,7 @@ re-enabled from branch protection with no code change).
 ZeroClaw uses a single default branch: `master`. All contributor PRs target
 `master` directly. There is no `dev` or promotion branch.
 
-Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `WareWolf-MoonWall`, `Nillth`, and `tidux`.
+Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWall`, `Nillth`, and `tidux`.
 
 ---
 
@@ -28,9 +28,12 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 |---|---|---|
 | `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` (dormant) | Lint + test + build on PRs and trusted post-merge cache-warming runs. The `merge_group` trigger stays wired but never fires while the merge queue is disabled. |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
+| `docker-publish.yml` | `workflow_call`, `workflow_dispatch`, tag push `v*` | Build, sign, and scan the generated Docker variant matrix |
+| `trivy-scheduled.yml` | `workflow_dispatch`; weekly schedule | Re-scan published `dist` and `default-features` images for new CVEs |
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `cross-platform-clippy.yml` | `workflow_dispatch`; weekly schedule | Advisory macOS/Windows Clippy coverage, outside the required PR gate |
 | `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
+| `project-dashboard-plan.yml` | `workflow_dispatch` | Manual report-only issue Project Status planning; does not mutate ProjectV2, issues, or labels |
 
 ---
 
@@ -41,8 +44,8 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 | PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
 | PR added to the merge queue (`merge_group`) | **Inactive**: the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
-| Manual dispatch | `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, or `release-stable-manual.yml` |
-| Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
+| Manual dispatch | `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docker-publish.yml`, `trivy-scheduled.yml`, `project-dashboard-plan.yml`, or `release-stable-manual.yml` |
+| Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) and `docker-publish.yml` (generated variant matrix) |
 
 There is no automatic release on merge. `ci.yml` does run after trusted
 `master` pushes so post-merge Quality Gate runs can seed Rust caches for later
@@ -58,14 +61,14 @@ tag push.
 1. Contributor opens or updates a PR targeting `master`.
 2. `ci.yml` runs:
    - `lint`: `cargo fmt --all -- --check`, `cargo clippy --workspace
-     --all-targets --features ci-all -- -D warnings`
+     --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
      (PRs only).
    - `build`: matrix across `x86_64-unknown-linux-gnu`,
      `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
    - `check`: matrix: all features + no default features.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
-   - `test`: `cargo nextest run --locked --workspace` on `ubuntu-latest`.
+   - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. Maintainer reviews. Once the gate is green and review policy is satisfied,
@@ -87,10 +90,12 @@ for the full procedure. In summary:
 2. Version bump PR is merged.
 3. Maintainer triggers `release-stable-manual.yml` via `workflow_dispatch`
    with the version number, or pushes an annotated tag `vX.Y.Z`.
-4. Workflow builds all targets, creates the GitHub Release, publishes to
-   crates.io, pushes Docker images, and notifies distribution channels.
-5. Maintainer approves the three environment gates
-   (`github-releases`, `crates-io`, `docker`) when prompted.
+4. Workflow builds all targets, creates the GitHub Release, pushes the prebuilt
+   Docker images, calls the generated Docker variant matrix, updates Scoop and
+   AUR, and sends announcements. Homebrew Core discovers the release through
+   its own autobump service.
+5. Maintainer approves the two environment gates (`github-releases`, `docker`)
+   when prompted.
 
 ### 3) Full Platform Build (manual)
 
@@ -141,9 +146,10 @@ flowchart TD
   A["workflow_dispatch: version=X.Y.Z\nor tag push vX.Y.Z"] --> V["validate\nsemver · Cargo.toml match · tag uniqueness"]
   V --> BLD["build all targets"]
   BLD --> PUB["publish\nGitHub Release · SHA256SUMS"]
-  PUB --> CR["crates-io"]
-  PUB --> DOC["docker\nGHCR :vX.Y.Z + :latest"]
-  PUB --> DIST["scoop · aur · homebrew"]
+  BLD --> DOC["docker\nprebuilt :vX.Y.Z · :latest · :debian"]
+  PUB & DOC --> MATRIX["docker-publish.yml\nminimal · default-features · dist · all-features"]
+  PUB --> DIST["scoop · aur"]
+  PUB -. release detected .-> HB["homebrew core\nofficial autobump"]
   PUB --> ANN["discord · tweet"]
 ```
 

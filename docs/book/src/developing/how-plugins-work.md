@@ -12,7 +12,8 @@ A plugin is a sandboxed WebAssembly module plus a manifest. The host loads it,
 reads the capabilities and permissions it declares, and exposes its tools to
 the agent only when the operator has turned the plugin system on. Nothing about
 a plugin is implicit: a plugin gets exactly the capabilities its manifest
-declares and the operator's policy allows, and nothing else.
+declares and the operator's policy allows, and nothing else. To build one
+yourself, start with the [plugin guides](../plugins/index.md).
 
 Three properties hold at every layer:
 
@@ -43,8 +44,10 @@ one.
 4. **Enforce signature policy.** Each plugin is checked against the configured
    `[plugins.security] signature_mode` and `trusted_publisher_keys`. A plugin
    that fails the policy is dropped from the loaded set, not surfaced as a tool.
-5. **Register tools.** Surviving tool plugins are wrapped as agent tools. A
-   plugin tool can never shadow a built-in tool; collisions are namespaced.
+5. **Register tools.** Surviving tool plugins are wrapped as agent tools and
+   appended after the built-ins. Tool dispatch resolves names first-match, so a
+   plugin tool that collides with a built-in name is never selected; give plugin
+   tools unique names.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
@@ -58,7 +61,7 @@ signature is enforced through `[plugins.security] signature_mode`:
 | Mode | What loads | Use when |
 |------|------------|----------|
 | `disabled` | Every well-formed plugin, signed or not | Local development against plugins you built yourself |
-| `permissive` | Unsigned plugins load; a present-but-invalid signature is rejected | Migrating toward signing without breaking existing installs |
+| `permissive` | Every well-formed plugin; unsigned, untrusted, and invalid signatures load with a warning | Migrating toward signing without breaking existing installs |
 | `strict` | Only plugins with a valid signature from a trusted publisher load | Any shared or production host |
 
 In `strict` mode the manifest's `publisher_key` must appear in
@@ -96,22 +99,21 @@ page covers the signature-policy boundary.
 
 ## Configuration reference
 
-```toml
-[plugins]
-# Master switch. Nothing loads while this is false.
-enabled = true
-# Where plugins are discovered (default: ~/.zeroclaw/plugins/).
-plugins_dir = "~/.zeroclaw/plugins"
-# Cap on how many plugins may load.
-max_plugins = 32
+All settings live under the `plugins.*` config paths and are set through any
+config surface (zerocode, the gateway, or the CLI):
 
-[plugins.security]
+```bash
+# Master switch. Nothing loads while this is false.
+zeroclaw config set plugins.enabled true
+
+# Where plugins are discovered (default: ~/.zeroclaw/plugins).
+zeroclaw config set plugins.plugins_dir ~/.zeroclaw/plugins
+
 # disabled | permissive | strict
-signature_mode = "strict"
+zeroclaw config set plugins.security.signature_mode strict
+
 # Hex-encoded Ed25519 public keys allowed to publish plugins under strict mode.
-trusted_publisher_keys = [
-  "a1b2c3d4e5f6...",
-]
+zeroclaw config set plugins.security.trusted_publisher_keys '["a1b2c3d4e5f6..."]'
 ```
 
 A host meant to load third-party plugins should set `enabled = true`,
@@ -130,8 +132,9 @@ Even with every permission granted, the sandbox bounds a plugin:
 - Secret-value isolation at the egress boundary (the host injecting credentials
   so the plugin learns only that a secret exists, never its value) is part of
   that same companion work; this PR does not add it.
-- It cannot shadow or impersonate a built-in tool; the built-ins claim their
-  names first and a colliding plugin tool is namespaced.
+- It cannot displace a built-in tool: the built-ins register first and tool
+  dispatch resolves names first-match, so a colliding plugin tool is simply
+  never selected.
 
 These bounds hold regardless of what the plugin's own code attempts, which is
 what makes it safe to load a plugin you did not write, provided your signature

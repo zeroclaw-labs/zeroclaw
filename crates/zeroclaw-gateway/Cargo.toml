@@ -45,7 +45,7 @@ include_dir = { version = "0.7", optional = true }
 schemars = { version = "1.2", optional = true }
 
 # Async runtime
-tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal", "process"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["sync"] }
 tokio-util = { version = "0.7", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -75,11 +75,17 @@ toml_edit = "0.25"
 rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
+# Unix-only: self-signal SIGTERM to trigger the daemon's graceful shutdown for
+# supervised post-upgrade restart (version.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
 
 [features]
 default = ["schema-export", "a2a"]
@@ -97,11 +103,13 @@ channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
+channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
+whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 gateway-voice-duplex = []
 # Enables OPTIONS /api/config* responses with the schemars-generated
 # JSON Schema body and the serde-side schemars derives transitively. Defaults
 # on; turning it off omits OPTIONS schema bodies (returns a small placeholder)
 # and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
-schema-export = ["zeroclaw-config/schema-export", "dep:schemars"]
+schema-export = ["zeroclaw-config/schema-export", "zeroclaw-runtime/schema-export", "dep:schemars"]
 embedded-web = ["dep:include_dir"]

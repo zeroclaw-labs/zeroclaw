@@ -1,15 +1,3 @@
-//! Discord embed value object (contract tier): the structured rich-content an
-//! agent can attach to an outgoing message. Pure data plus trivial JSON
-//! serialization that drops absent fields — no IO and no trust decisions. URL
-//! vetting and the `[EMBED:…]` author surface live in `markers` (the egress
-//! trust boundary), which builds these from author specs; `DiscordOutgoing`
-//! (in `types`) carries a `Vec<DiscordEmbed>` and serializes each via
-//! [`DiscordEmbed::to_api`].
-//!
-//! This module is contract tier: it imports only std/serde and is imported by
-//! `types` (the envelope) and the impl modules — it imports no sibling impl
-//! module, so the contract layer stays acyclic.
-
 use serde_json::{Map, Value};
 
 /// A Discord rich embed. Every field is optional per the Discord API;

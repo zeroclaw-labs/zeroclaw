@@ -18,6 +18,10 @@ run_in_ci() {
   "${compose_cmd[@]}" run --rm local-ci bash -c "$cmd"
 }
 
+run_firmware_protocol_gate() {
+  run_in_ci "./scripts/ci/firmware_protocol_gate.sh"
+}
+
 build_smoke_image() {
   if docker buildx version >/dev/null 2>&1; then
     mkdir -p "$SMOKE_CACHE_DIR"
@@ -48,6 +52,7 @@ Commands:
   shell         Open an interactive shell inside the CI container
   lint          Run rustfmt + clippy correctness gate (container only)
   lint-strict   Run rustfmt + full clippy warnings gate (container only)
+  firmware-protocol Run standalone firmware protocol host gate (container only)
   test          Run cargo test (container only)
   test-component  Run component tests only
   test-integration Run integration tests only
@@ -59,7 +64,7 @@ Commands:
   deny          Run cargo deny check (container only)
   security      Run cargo audit + cargo deny (container only)
   docker-smoke  Build and verify runtime image (host docker daemon)
-  all           Run lint, test, build, security, docker-smoke
+  all           Run lint, firmware-protocol, test, build, security, docker-smoke
   clean         Remove local CI containers and volumes
 EOF
 }
@@ -86,8 +91,19 @@ case "$1" in
     run_in_ci "./scripts/ci/rust_quality_gate.sh --strict"
     ;;
 
+  firmware-protocol)
+    run_firmware_protocol_gate
+    ;;
+
   test)
-    run_in_ci "cargo test --locked --verbose"
+    # Local Docker test path uses the stable `cargo test` runner. Required
+    # CI uses `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`
+    # (see `.github/workflows/ci.yml`). Both select the same workspace
+    # package boundary, but they differ in runner, scheduling, isolation,
+    # and reporting behavior (nextest runs each test binary in its own
+    # process and emits per-binary JUnit reports; cargo test uses the test
+    # harness's default process model).
+    run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
     ;;
 
   test-component)
@@ -133,8 +149,13 @@ case "$1" in
     ;;
 
   all)
+    # The `test` arm above and the `cargo test` invocation below both use
+    # `cargo test` (not `nextest`) — see the comment on the `test` case
+    # for why this differs from required CI. If you change the runner here,
+    # update that comment in lockstep.
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
-    run_in_ci "cargo test --locked --verbose"
+    run_firmware_protocol_gate
+    run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"

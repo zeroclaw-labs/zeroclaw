@@ -10,7 +10,7 @@ publish = false
 anyhow = "1.0"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
-serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std", "rc"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 strum = "0.28"
 strum_macros = "0.28"

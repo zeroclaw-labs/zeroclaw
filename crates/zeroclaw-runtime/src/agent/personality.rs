@@ -1,9 +1,5 @@
 //! Personality system — loads workspace identity files (SOUL.md, IDENTITY.md,
 //! USER.md) and injects them into the system prompt pipeline.
-//!
-//! Ported from RustyClaw `src/agent/personality.rs`.  The loader reads markdown
-//! files from the workspace root, validates size limits, and produces a
-//! [`PersonalityProfile`] that the prompt builder can render.
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -23,11 +19,6 @@ pub const PERSONALITY_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
-/// Subset of [`PERSONALITY_FILES`] that the dashboard exposes for
-/// authoring. `BOOTSTRAP.md` is deliberately excluded: it's a
-/// first-run scaffold the agent reads once and deletes, not a file
-/// the user is meant to hand-edit. The runtime still injects it when
-/// it exists on disk.
 pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
@@ -94,34 +85,12 @@ impl PersonalityProfile {
 }
 
 /// Loads personality files from a workspace directory.
-///
 /// Each well-known file is read and validated.  Missing files are recorded
 /// in `PersonalityProfile::missing` rather than treated as errors.
 pub fn load_personality(workspace_dir: &Path) -> PersonalityProfile {
     load_personality_files(workspace_dir, PERSONALITY_FILES)
 }
 
-/// Seed a freshly created agent's workspace with the default personality
-/// preset so it boots with real base templates instead of empty files.
-///
-/// Builds the [`TemplateContext`] — agent name from `alias`, `include_memory`
-/// from the **target agent's** resolved memory backend — then delegates to
-/// [`ensure_personality_preset`]. Only missing or blank files are written;
-/// existing user content is preserved.
-///
-/// `include_memory` is derived from `agents.<alias>.memory.backend`, the same
-/// per-agent source of truth [`zeroclaw_memory::create_memory_for_agent`]
-/// branches on (a `None` backend yields `NoneMemory`) — **not** the
-/// install-wide `config.memory.backend`. These files are the prompt contract
-/// for local/prompt-guided models, so a memoryless agent must get the
-/// no-memory `AGENTS.md` variant and no `MEMORY.md`; otherwise it would be
-/// coached to use memory the runtime never provides. An alias absent from the
-/// agents table (defensive edge; real call sites always have it) defaults to
-/// memory-enabled, matching [`MemoryBackendKind`]'s `Sqlite` default.
-///
-/// [`TemplateContext`]: crate::agent::personality_templates::TemplateContext
-/// [`ensure_personality_preset`]: crate::agent::personality_templates::ensure_personality_preset
-/// [`MemoryBackendKind`]: zeroclaw_config::multi_agent::MemoryBackendKind
 pub async fn seed_default_personality(
     config: &zeroclaw_config::schema::Config,
     alias: &str,

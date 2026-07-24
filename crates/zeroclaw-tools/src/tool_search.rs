@@ -1,9 +1,4 @@
 //! Built-in `tool_search` tool for on-demand MCP tool schema loading.
-//!
-//! When `mcp.deferred_loading` is enabled, this tool lets the LLM discover and
-//! activate deferred MCP tools. Supports two query modes:
-//! - `select:name1,name2` — fetch exact tools by prefixed name.
-//! - Free-text keyword search — returns the best-matching stubs.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
@@ -11,37 +6,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
 type ActivationHook = Arc<dyn Fn(Arc<dyn Tool>) + Send + Sync>;
 
-/// Tool-level access policy applied at discovery time.
-///
-/// When set on `ToolSearchTool`, deferred tools that fail this check are
-/// never surfaced to the LLM and never activated — keeping them out of
-/// the context window entirely.
-///
-/// The policy carries two independent allow-list gates that are AND-ed
-/// together, plus a single deny-list:
-///
-/// - `allowed`: the agent's risk-profile allow-list. The MCP
-///   `<server>__<tool>` auto-admit exception (any name containing `__`
-///   passes when the list is non-empty) applies **only** to this gate.
-///   This is the high-risk default-accept-unless-denied shift introduced
-///   in PR #7547 so that the post-#7464 `mcp.enabled = true` default
-///   actually surfaces discovered MCP tools to agents.
-/// - `caller_allowed`: a caller-supplied per-run allow-list (cron job
-///   `allowed_tools`, narrowed delegate invocations, etc.). This is a
-///   strict explicit-list intersection — there is **no** MCP auto-admit
-///   on this gate. PR #7547 review (Audacity88, singlerider) called out
-///   that collapsing this list into `allowed` made per-run narrowing
-///   stop working as a capability boundary the moment an MCP server was
-///   configured.
-/// - `denied`: subtracts from the final set. Applies to both gates and
-///   to auto-admitted MCP names.
 #[derive(Clone, Default)]
 pub struct ToolAccessPolicy {
     pub allowed: Option<Vec<String>>,
@@ -50,16 +21,6 @@ pub struct ToolAccessPolicy {
 }
 
 impl ToolAccessPolicy {
-    /// Construct from a `SecurityPolicy`'s tool fields and an optional
-    /// caller-supplied allowlist. Used by both `run()` and
-    /// `process_message()` to keep policy construction in sync.
-    ///
-    /// The risk-profile `allowed_tools` and the caller-supplied
-    /// `caller_allowed` are kept as two separate gates inside the
-    /// returned policy. Per PR #7547 review, this is required so the
-    /// MCP `<server>__<tool>` auto-admit exception that applies to the
-    /// risk-profile gate does **not** silently widen narrower per-run
-    /// allow-lists.
     pub fn from_security(
         allowed_tools: Option<&[String]>,
         excluded_tools: Option<&[String]>,
@@ -104,11 +65,6 @@ impl ToolAccessPolicy {
             return false;
         }
 
-        // Caller-supplied per-run gate: strict explicit-list intersection.
-        // No MCP auto-admit here — per PR #7547 review, that exception is
-        // scoped to the risk-profile gate so per-run narrowing (cron jobs,
-        // narrowed delegate invocations) remains a reliable capability
-        // boundary even when an MCP server is configured.
         match self.caller_allowed.as_ref() {
             None => true,
             Some(list) => list.iter().any(|t| t == name),
@@ -204,7 +160,7 @@ impl Tool for ToolSearchTool {
         if query.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("query parameter is required".into()),
             });
         }
@@ -305,7 +261,7 @@ impl Tool for ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -391,7 +347,7 @@ impl ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -523,8 +479,6 @@ mod tests {
         assert_poisoned_activated_contains(&activated, "fs__read");
     }
 
-    /// Verify tool_search works with stubs from multiple MCP servers,
-    /// simulating a daemon-mode setup where several servers are deferred.
     #[tokio::test]
     async fn multiple_servers_stubs_all_searchable() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -554,8 +508,6 @@ mod tests {
         assert!(result.output.contains("server_b__query_db"));
     }
 
-    /// Verify select mode activates tools and they stay activated across calls,
-    /// matching the daemon-mode pattern where a single ActivatedToolSet persists.
     #[tokio::test]
     async fn select_activates_and_persists_across_calls() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -614,7 +566,6 @@ mod tests {
         assert_poisoned_activated_contains(&activated, "srv__tool_a");
     }
 
-    /// Verify re-activating an already-activated tool does not duplicate it.
     #[tokio::test]
     async fn reactivation_is_idempotent() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -756,7 +707,7 @@ mod tests {
         // Runtime-discovered MCP tools (names containing "__") are auto-admitted
         // when an allow-list is present, so the operator-visible way to block a
         // specific MCP tool is the deny-list (the `excluded_tools` equivalent).
-        // See `ToolAccessPolicy::is_tool_allowed` and PR #7547.
+        // See `ToolAccessPolicy::is_tool_allowed` and
         let policy = ToolAccessPolicy {
             allowed: Some(vec!["srv__ok".into()]),
             denied: Some(vec!["srv__nope".into()]),
@@ -776,17 +727,6 @@ mod tests {
         assert!(!activated.lock().unwrap().is_activated("srv__nope"));
     }
 
-    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
-    /// the MCP `<server>__<tool>` auto-admit exception must apply ONLY to
-    /// the risk-profile allow-list, not to the caller-supplied per-run
-    /// `allowed_tools`. Otherwise a cron job that narrows
-    /// `allowed_tools = ["cron_add"]` would still surface every
-    /// runtime-discovered MCP wrapper, breaking per-job capability
-    /// narrowing the moment an MCP server is configured.
-    ///
-    /// This test fixes `from_security` semantics so an MCP name the
-    /// caller did not explicitly include is rejected even when the
-    /// risk-profile allow-list would auto-admit it.
     #[test]
     fn caller_allowed_per_run_gate_does_not_auto_admit_mcp_names() {
         // The risk-profile gate is wide (unrestricted), so the MCP
@@ -812,11 +752,6 @@ mod tests {
         );
     }
 
-    /// Companion to the test above: even when the risk profile DOES have
-    /// a non-empty allow-list (so the auto-admit branch is live on that
-    /// gate), the caller-supplied per-run list still narrows the final
-    /// set strictly. The risk-profile auto-admit must not leak past the
-    /// per-run gate.
     #[test]
     fn caller_allowed_per_run_gate_narrows_after_risk_profile_auto_admit() {
         let policy = ToolAccessPolicy::from_security(
@@ -843,8 +778,6 @@ mod tests {
         assert!(!policy.is_tool_allowed("memory_recall"));
     }
 
-    /// `excluded_tools` must subtract regardless of which gate admitted
-    /// the name. Pins the deny-list contract across the refactor.
     #[test]
     fn caller_allowed_per_run_gate_still_honors_denylist() {
         let policy = ToolAccessPolicy::from_security(

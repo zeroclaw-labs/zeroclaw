@@ -40,7 +40,7 @@ pub use schema::{
 };
 
 pub use schema::ModelProviderConfig;
-// Per-family model model_provider configs (typed split — #6273). Re-exported here
+// Per-family model model_provider configs (typed split — Re-exported here
 // so tests + downstream binary callers can construct typed family entries
 // without reaching into `zeroclaw_config::schema` directly.
 pub use schema::{
@@ -105,6 +105,7 @@ mod tests {
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
+            debounce_ms: None,
         };
 
         let discord = DiscordConfig {

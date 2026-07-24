@@ -1,9 +1,4 @@
 //! Emoji reaction tool for cross-channel message reactions.
-//!
-//! Exposes `add_reaction` and `remove_reaction` from the [`Channel`] trait as an
-//! agent-callable tool. The tool holds a late-binding channel map handle that is
-//! populated once channels are initialized (after tool construction). This mirrors
-//! the pattern used by `DelegateTool` for its parent-tools handle.
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -11,7 +6,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -81,7 +76,7 @@ impl Tool for ReactionTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -144,7 +139,7 @@ impl Tool for ReactionTool {
         if action != "add" && action != "remove" {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid action '{action}': must be 'add' or 'remove'"
                 )),
@@ -157,7 +152,7 @@ impl Tool for ReactionTool {
             if map.is_empty() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("No channels available yet (channels not initialized)".to_string()),
                 });
             }
@@ -167,7 +162,7 @@ impl Tool for ReactionTool {
                     let available: Vec<String> = map.keys().cloned().collect();
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Channel '{channel_name}' not found. Available channels: {}",
                             available.join(", ")
@@ -194,12 +189,13 @@ impl Tool for ReactionTool {
                 success: true,
                 output: format!(
                     "Reaction {past_tense}: {emoji} on message {message_id} in {channel_name}"
-                ),
+                )
+                .into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to {action} reaction: {e}")),
             }),
         }

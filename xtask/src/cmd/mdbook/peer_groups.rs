@@ -1,16 +1,4 @@
 //! mdBook preprocessor: expand `{{#peer-group <channel>}}` directives.
-//!
-//! Implements the mdBook preprocessor protocol directly over JSON (no `mdbook`
-//! crate dependency). mdBook invokes this as:
-//!
-//!   * `mdbook preprocess supports <renderer>` — exit 0 if supported.
-//!   * `mdbook preprocess` — stdin is `[context, book]` JSON; stdout is the
-//!     modified `book` JSON.
-//!
-//! A page writes `{{#peer-group matrix}}`; the preprocessor renders the single
-//! canonical peer-group block from `docs/book/peer-groups.toml` inline, so the
-//! page passes the parameter and exactly one template exists. Channel keys are
-//! validated against the canonical channel inventory in `zeroclaw-config`.
 
 use crate::util::{book_dir, repo_root};
 use serde::Deserialize;
@@ -127,6 +115,7 @@ fn expand_directives(
         "{{#channel-streaming-matrix",
         "{{#thread-context ",
         "{{#config-fields ",
+        "{{#config-set ",
         "{{#sop-trigger-index",
         "{{#sop-trigger ",
         "{{#streaming ",
@@ -154,6 +143,7 @@ fn expand_directives(
         let rendered = match marker {
             "{{#config-where " => render_config_where(arg, depth)?,
             "{{#config-fields " => render_config_fields(arg)?,
+            "{{#config-set " => render_config_set(arg),
             "{{#sop-trigger-index" => render_sop_trigger_index()?,
             "{{#sop-trigger " => render_sop_trigger(arg)?,
             "{{#secret-config " => render_secret_config(arg),
@@ -186,11 +176,6 @@ fn lookup<'a>(params: &'a [PeerParams], key: &str) -> anyhow::Result<&'a PeerPar
         .ok_or_else(|| anyhow::Error::msg(format!("unknown peer-group channel '{key}'")))
 }
 
-/// Render a "where to configure this" widget for a config section path. Tabs by
-/// surface: the gateway dashboard and the zerocode Config pane. The section is
-/// validated against the canonical section registry; the zerocode label comes
-/// from `Section::label()`, so a non-existent section fails the build and the
-/// label can never drift from the real UI.
 fn render_config_where(path: &str, depth: usize) -> anyhow::Result<String> {
     let _ = depth;
     // Arg is `<section>` or `<section> <type>`. With a type, build the
@@ -222,12 +207,6 @@ In the **Config** pane, under **{label}**.
     ))
 }
 
-/// Render a config section's full field-reference table directly from the
-/// `Config` JSON Schema, so the table can never drift from the schema. The arg
-/// is the dotted config path to the section (`channels.matrix`,
-/// `providers.models`, `acp`, …). Map sections insert an `<alias>` level
-/// automatically. The schema is the single source of truth for fields, types,
-/// defaults, and descriptions.
 fn render_config_fields(arg: &str) -> anyhow::Result<String> {
     let path = arg.trim();
     let schema = schemars::schema_for!(zeroclaw_config::schema::Config);
@@ -235,16 +214,6 @@ fn render_config_fields(arg: &str) -> anyhow::Result<String> {
         .map_err(anyhow::Error::msg)
 }
 
-/// Render a SOP trigger type's field reference plus a load-and-verify widget,
-/// directly from the `SopTrigger` JSON Schema, so the trigger field list can
-/// never drift from the enum. The arg is the lowercase variant tag (`amqp`,
-/// `mqtt`, `filesystem`, …). The variant's own doc-comment is the summary; its
-/// struct fields drive the table via the same `field_table` emitter the config
-/// pages use. The widget defers authoring to the Syntax page and references the
-/// real `zeroclaw sop` verbs. Intended for pages under `sop/fan-in/`.
-/// The ordered `SopTrigger` variants from the live schema: `(tag, variant
-/// object, $defs)`. Single source for every SOP trigger directive so the doc
-/// surface can never list a trigger the enum does not define.
 fn sop_trigger_variants() -> anyhow::Result<(serde_json::Value, Vec<(String, serde_json::Value)>)> {
     let schema = schemars::schema_for!(zeroclaw_runtime::sop::types::SopTrigger);
     let root = schema.to_value();
@@ -322,13 +291,6 @@ fn render_sop_trigger_index() -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// Render a SOP trigger type's field reference plus a load-and-verify widget,
-/// directly from the `SopTrigger` JSON Schema, so the trigger field list can
-/// never drift from the enum. The arg is the lowercase variant tag (`amqp`,
-/// `mqtt`, `filesystem`, …). The variant's own doc-comment is the summary; its
-/// struct fields drive the table via the same `field_table` emitter the config
-/// pages use. The widget defers authoring to the Syntax page and references the
-/// real `zeroclaw sop` verbs. Intended for pages under `sop/fan-in/`.
 fn render_sop_trigger(arg: &str) -> anyhow::Result<String> {
     let ty = arg.trim();
     let (defs, variants) = sop_trigger_variants()?;
@@ -396,11 +358,6 @@ zeroclaw sop show <name>
     ))
 }
 
-/// Resolve the display label for a config section path. Prefers the curated
-/// `Section` registry label; falls back to the schema-humanized key for real
-/// schema sections that aren't curated quickstart sections (e.g. `browser`).
-/// Errors only when the path matches neither — so a fabricated section fails
-/// the build.
 fn config_section_label(path: &str) -> anyhow::Result<String> {
     use zeroclaw_config::schema::Config;
     if let Some(section) = zeroclaw_config::sections::Section::from_key(path) {
@@ -452,7 +409,35 @@ zeroclaw config set {path}    # prompts for masked input, stores encrypted
     )
 }
 
-/// Dashboard deep-link section path from a dotted config field path. Drops the
+/// Render a set-it-any-surface widget for a single non-secret config field.
+/// Same three-surface tabs as `secret-config` (gateway dashboard, zerocode,
+/// `zeroclaw config set`) minus the masked-secret framing. The arg is the full
+/// dotted path to the field, e.g. `channels.git.<alias>.app_id`. Used by setup
+/// guides that walk each required field individually.
+fn render_config_set(path: &str) -> String {
+    let path = path.trim();
+    let section = dashboard_section(path);
+    let display_path = display_config_path(path);
+    format!(
+        r#"<div class="os-tabs-src">
+
+#### Gateway dashboard
+
+Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
+
+#### zerocode
+
+In the **Config** pane, set the `{display_path}` field.
+
+#### zeroclaw config
+
+```sh
+zeroclaw config set {path} <value>
+```
+
+</div>"#,
+    )
+}
 /// `<alias>` placeholder and the trailing field name, slash-joining the rest:
 /// `channels.matrix.<alias>.password` -> `channels/matrix`. A bare section like
 /// `acp.foo` -> `acp`. The gateway resolves these `/config/<section>` routes.
@@ -483,15 +468,6 @@ fn dashboard_section(field_path: &str) -> String {
     }
 }
 
-/// live in threads. Args are `key="value"` pairs:
-///   - `channel` (required): display name, e.g. `Slack`, `Matrix`.
-///   - `prop` (optional): the channel's thread-reply config property, e.g.
-///     `thread_replies`. When present, the channel exposes a toggle and the
-///     copy names it; when absent (threads are native, no toggle, e.g.
-///     Discord), the toggle sentence is dropped.
-///   - `path` (optional): the full dotted config path to `prop`, e.g.
-///     `channels.matrix.<alias>.reply_in_thread`. When present, renders the
-///     set-it-three-ways surface tabs so the section is actionable.
 fn render_thread_context(arg: &str) -> anyhow::Result<String> {
     let kv = parse_kv_args(arg);
     let channel = kv.get("channel").filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -566,14 +542,6 @@ earlier turns.{toggle}
     ))
 }
 
-/// Shared "how this channel streams replies" explainer. Args are `key="value"`
-/// pairs:
-///   - `channel` (required): display name, e.g. `Discord`, `Slack`.
-///   - `mode` (required): `stream_mode` (the off/partial/multi_message enum,
-///     e.g. Discord, Matrix, Telegram), `stream_drafts` (a partial-only
-///     boolean, e.g. Slack), or `none` (no streaming, single message only).
-///   - `path` (optional): dotted config path to the streaming field, for the
-///     actionable config tabs.
 fn render_streaming(arg: &str) -> anyhow::Result<String> {
     let kv = parse_kv_args(arg);
     let channel = kv.get("channel").filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -699,7 +667,7 @@ fn parse_kv_args(arg: &str) -> std::collections::HashMap<String, String> {
 }
 
 fn display_config_path(path: &str) -> String {
-    path.replace('<', "&lt;").replace('>', "&gt;")
+    path.to_string()
 }
 
 fn render_example(p: &PeerParams) -> String {
@@ -819,11 +787,6 @@ fn render_env_var_name(path: &str) -> anyhow::Result<String> {
     Ok(format!("`{}`", env_form(path)))
 }
 
-/// Render the complete model-provider catalog as a table grouped by registry
-/// category: one row per canonical slot with its default endpoint and a local
-/// marker, all from `zeroclaw_providers::list_model_providers()` +
-/// `default_model_provider_url()`. Replaces the hand-typed catalog table so it
-/// can never drift from the constructible slot set.
 fn render_model_provider_catalog_table() -> String {
     use zeroclaw_providers::ModelProviderCategory as C;
     let category_title = |c: C| match c {
@@ -857,13 +820,6 @@ fn render_model_provider_catalog_table() -> String {
     out
 }
 
-/// Walk the canonical model-provider registry and emit one expandable entry per
-/// provider, grouped by category. Each entry's summary shows the slot, default
-/// endpoint, and local flag (all derived from `list_model_providers()` and
-/// `default_model_provider_url()`); expanding it reveals that provider's full
-/// config field accordion, rendered from the `providers.models.<slot>` schema.
-/// Nothing here is hand-listed, so it can never drift from the registry or the
-/// config schema.
 fn render_model_provider_fields() -> String {
     use std::fmt::Write as _;
     use zeroclaw_providers::ModelProviderCategory as C;
@@ -881,11 +837,6 @@ fn render_model_provider_fields() -> String {
     let provider_defaults =
         serde_json::to_value(zeroclaw_config::schema::ModelProviderConfig::default()).ok();
 
-    // Every provider slot flattens the same `ModelProviderConfig` base and adds
-    // a handful of slot-specific extras. Render the base once and per-provider
-    // only the extras, so the page does not repeat ~18 identical fields 70+
-    // times (which bloats both the page and the search index). The base set is
-    // the intersection of every slot's field names, derived, not hand-listed.
     let base: std::collections::BTreeSet<String> = providers
         .iter()
         .map(|p| {
@@ -989,11 +940,6 @@ fn render_model_provider_fields() -> String {
     out
 }
 
-/// `ZEROCLAW_`-prefixed env-var name for a dotted schema path. This is the exact
-/// inverse of the runtime resolver in `zeroclaw_config::env_overrides`, which
-/// matches an env tail by `field.name.replace('.', "__")`. Keeping the same
-/// rule here means a rendered example and the value the runtime accepts can
-/// never disagree.
 fn env_form(path: &str) -> String {
     format!("ZEROCLAW_{}", path.replace('.', "__"))
 }
@@ -1057,11 +1003,6 @@ fn load_env_var_params() -> anyhow::Result<Vec<EnvVarParams>> {
     Ok(parsed.var)
 }
 
-/// Validate every example `path` against the canonical schema, the same way the
-/// runtime resolver does: alias-bearing paths must sit under a real
-/// `map_key_sections()` entry; every other path must be a real `prop_fields()`
-/// leaf. A renamed or removed field fails the doc build loudly instead of
-/// silently rotting into a stale literal.
 fn validate_env_var_paths(vars: &[EnvVarParams]) -> anyhow::Result<()> {
     for v in vars {
         validate_env_var_path(&v.path)?;
@@ -1069,11 +1010,6 @@ fn validate_env_var_paths(vars: &[EnvVarParams]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate one dotted `path` against the canonical schema, the same way the
-/// runtime resolver does: alias-bearing paths must sit under a real
-/// `map_key_sections()` entry; every other path must be a real `prop_fields()`
-/// leaf. A renamed or removed field fails the doc build loudly instead of
-/// silently rotting into a stale literal.
 fn validate_env_var_path(path: &str) -> anyhow::Result<()> {
     use zeroclaw_config::schema::Config;
     let config = Config::default();
@@ -1101,11 +1037,6 @@ under no map section; it cannot be derived from the schema"
 
 #[cfg(test)]
 mod generated_prose_gate {
-    //! Mirror of the `scripts/ci/docs_quality_gate.sh` em-dash rule, applied to
-    //! the preprocessor's *generated* output. The bash gate only lints the
-    //! checked-in source pages, so without this the generators could emit
-    //! prose em-dashes that bypass the rule. Any directive that emits prose is
-    //! exercised here.
 
     /// True if `s` contains a U+2014 em-dash outside inline `code` spans,
     /// `<code>` HTML elements, and fenced code blocks, matching the gate's
@@ -1149,16 +1080,26 @@ mod generated_prose_gate {
     }
 
     #[test]
-    fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
-        let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
+    fn sop_trigger_channel_renders_live_and_appears_in_index() {
+        let single = super::render_sop_trigger("channel").expect("channel trigger renders");
+        assert!(single.contains("Live: delivered by the channel orchestrator"));
+        assert!(single.contains("channel"));
 
-        assert!(rendered.contains("`channels.discord.&lt;alias&gt;.bot_token`"));
-        assert!(rendered.contains("zeroclaw config set channels.discord.<alias>.bot_token"));
-        assert!(!rendered.contains("`channels.discord.<alias>.bot_token`"));
+        let index = super::render_sop_trigger_index().expect("trigger index renders");
+        assert!(index.contains("| `channel` |"));
+        assert!(index.contains("| `amqp` |"));
     }
 
     #[test]
-    fn config_explainers_escape_alias_placeholder_in_rendered_markdown() {
+    fn secret_config_escapes_alias_placeholder_in_rendered_markdown() {
+        let rendered = super::render_secret_config("channels.discord.<alias>.bot_token");
+
+        assert!(rendered.contains("`channels.discord.<alias>.bot_token`"));
+        assert!(rendered.contains("zeroclaw config set channels.discord.<alias>.bot_token"));
+    }
+
+    #[test]
+    fn config_explainers_keep_alias_placeholder_raw_in_markdown() {
         let thread = super::render_thread_context(
             r#"channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread""#,
         )
@@ -1168,25 +1109,18 @@ mod generated_prose_gate {
         )
         .expect("streaming context should render");
 
-        assert!(thread.contains("`channels.matrix.&lt;alias&gt;.reply_in_thread`"));
+        assert!(thread.contains("`channels.matrix.<alias>.reply_in_thread`"));
         assert!(
             thread.contains("zeroclaw config set channels.matrix.<alias>.reply_in_thread true")
         );
-        assert!(!thread.contains("`channels.matrix.<alias>.reply_in_thread`"));
-        assert!(streaming.contains("`channels.slack.&lt;alias&gt;.stream_drafts`"));
+        assert!(streaming.contains("`channels.slack.<alias>.stream_drafts`"));
         assert!(
             streaming.contains("zeroclaw config set channels.slack.<alias>.stream_drafts <value>")
         );
-        assert!(!streaming.contains("`channels.slack.<alias>.stream_drafts`"));
     }
 
     #[test]
     fn directives_emit_no_prose_em_dashes() {
-        // Walk every book source page, expand its directives through the exact
-        // production dispatch (`expand_directives`), and lint the generated
-        // output. No path is hardcoded here: the book source is the source of
-        // truth for which directives exist, so adding or removing a directive
-        // on any page is covered automatically and this guard cannot drift.
         let root = crate::util::repo_root();
         let src = crate::util::book_dir(&root).join("src");
         let params = super::load_params().expect("load peer-group params");

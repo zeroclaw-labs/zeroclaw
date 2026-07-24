@@ -1,9 +1,3 @@
-/// Generic OAuth2 device-code flow and token refresh for IMAP email channels.
-///
-/// Endpoint URLs and client IDs are supplied by the caller (via
-/// `[channels.email.<alias>.oauth2]` config) — this module contains no
-/// provider-specific constants.  Microsoft Outlook and Google Workspace
-/// are both supported by pointing at their respective endpoints.
 use crate::auth::profiles::TokenSet;
 use anyhow::{Context, Result};
 use chrono::Utc;

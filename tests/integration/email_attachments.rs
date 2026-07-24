@@ -2,7 +2,6 @@ use mail_parser::{MessageParser, MimeHeaders};
 use zeroclaw::channels::SendMessage;
 use zeroclaw::channels::media_pipeline::MediaAttachment;
 
-/// Test that extract_attachments correctly parses binary attachments from multipart MIME
 #[test]
 fn extract_attachments_from_multipart_email() {
     // Construct a raw multipart MIME email with a PDF and an image attachment
@@ -53,7 +52,6 @@ fn extract_attachments_from_multipart_email() {
     assert_eq!(png.data, b"PNG_BINARY_DATA");
 }
 
-/// Test that text parts are skipped by extract_attachments
 #[test]
 fn extract_attachments_skips_text_parts() {
     let raw_email = concat!(
@@ -83,7 +81,6 @@ fn extract_attachments_skips_text_parts() {
     assert_eq!(attachments.len(), 0);
 }
 
-/// Test that extract_attachments respects max_attachment_bytes size limit
 #[test]
 fn extract_attachments_respects_size_limit() {
     let raw_email = concat!(
@@ -121,14 +118,12 @@ fn extract_attachments_respects_size_limit() {
     assert_eq!(attachments.len(), 1);
 }
 
-/// Test SendMessage::new() initializes attachments to empty vec
 #[test]
 fn send_message_attachments_default_empty() {
     let msg = SendMessage::new("content", "recipient@example.com");
     assert!(msg.attachments.is_empty());
 }
 
-/// Test SendMessage::with_attachments() builder method
 #[test]
 fn send_message_with_attachments_builder() {
     let attachments = vec![MediaAttachment {
@@ -163,11 +158,11 @@ fn extract_attachments_with_limit(
         let mime_str =
             ct.map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
 
-        // Skip text parts — already handled by extract_text()
-        if let Some(ref m) = mime_str {
-            if m.starts_with("text/") {
-                continue;
-            }
+        // Skip text parts — already handled by extract_text
+        if let Some(ref m) = mime_str
+            && m.starts_with("text/")
+        {
+            continue;
         }
 
         let data = part.contents().to_vec();

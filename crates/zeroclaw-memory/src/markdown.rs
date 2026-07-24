@@ -4,12 +4,6 @@ use chrono::{DateTime, FixedOffset, Local, NaiveDate};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-/// Decide whether a markdown entry's `timestamp` stem falls inside the
-/// recall `[since, until]` window. Markdown timestamps are file stems, not
-/// RFC 3339 strings: daily logs use a bare `YYYY-MM-DD` date and the core
-/// file uses `MEMORY.md`. We therefore (1) try RFC 3339, (2) fall back to a
-/// `NaiveDate` compared at day granularity, and (3) leave non-date stems
-/// (e.g. `MEMORY.md`) unfiltered so evergreen core memories still surface.
 fn entry_in_window(
     timestamp: &str,
     since: Option<&DateTime<FixedOffset>>,
@@ -45,11 +39,6 @@ fn entry_in_window(
     true
 }
 
-/// Markdown-based memory — plain files as source of truth
-///
-/// Layout:
-///   workspace/MEMORY.md          — curated long-term memory (core)
-///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
 pub struct MarkdownMemory {
     alias: String,
     workspace_dir: PathBuf,
@@ -346,13 +335,6 @@ impl Memory for MarkdownMemory {
         _importance: Option<f64>,
         _agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Markdown's per-agent attribution is the on-disk path: the
-        // backend writes into `<workspace_dir>/MEMORY.md` and the
-        // workspace_dir is owned by the agent that constructed this
-        // backend. The agent_id parameter is redundant and ignored at
-        // the trait boundary; cross-agent reads merge multiple
-        // MarkdownMemory instances at the `AgentScopedMarkdownMemory`
-        // wrapper layer.
         self.store(key, content, category, session_id).await
     }
 
@@ -365,12 +347,6 @@ impl Memory for MarkdownMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        // Same per-agent-path attribution model as `store_with_agent`:
-        // a single MarkdownMemory instance reads only its own
-        // workspace_dir. Cross-agent recall is composed by
-        // `AgentScopedMarkdownMemory`, which holds an own
-        // MarkdownMemory plus a Vec<(alias, MarkdownMemory)> peer set
-        // and unions their results with attribution.
         self.recall(query, limit, session_id, since, until).await
     }
 }
@@ -541,11 +517,6 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 0);
     }
 
-    // Markdown has no agents table and no UUID indirection. Rows return
-    // `agent_alias = agent_id = None`; the dashboard renders these as
-    // "unattributed". This locks that contract so a future change can't
-    // silently leak a synthesized UUID into `agent_alias` (the bug that
-    // bit the SQL backends before the JOIN landed).
     #[tokio::test]
     async fn markdown_entries_carry_no_agent_attribution() {
         let (_tmp, mem) = temp_workspace();
@@ -575,11 +546,6 @@ mod tests {
         }
     }
 
-    // Markdown entry timestamps are file stems (a bare `YYYY-MM-DD` for daily
-    // logs), not RFC 3339. `recall` must still honour the `since`/`until`
-    // window: a daily entry is dropped when the window ends before its date
-    // and surfaces when the window opens in the past. Evergreen `MEMORY.md`
-    // entries (non-date stems) must NOT be filtered out by the window.
     #[tokio::test]
     async fn markdown_recall_since_until_filters_daily() {
         let (_tmp, mem) = temp_workspace();

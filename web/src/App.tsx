@@ -228,7 +228,7 @@ function PairingDialog({
       <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
         <div className="text-center mb-8">
           <img
-            src={`${basePath}/_app/zeroclaw-trans.png`}
+            src={`${basePath}/_app/logo.png`}
             alt="ZeroClaw"
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
             onError={(e) => {

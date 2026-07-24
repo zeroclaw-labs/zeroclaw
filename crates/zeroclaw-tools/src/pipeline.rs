@@ -1,15 +1,9 @@
-// Pipeline tool: collapses multi-step tool chains into a single inference call.
-//
-// The agent invokes `execute_pipeline` with a JSON payload describing steps,
-// and this tool executes them sequentially (or in parallel) with result
-// interpolation between steps.
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
 /// Errors specific to pipeline execution.
@@ -140,7 +134,7 @@ impl PipelineTool {
                     tool: step.tool.clone(),
                     message: tool_result
                         .error
-                        .unwrap_or_else(|| tool_result.output.clone()),
+                        .unwrap_or_else(|| tool_result.output.clone().into_string()),
                 });
             }
 
@@ -148,7 +142,7 @@ impl PipelineTool {
                 index: i,
                 tool: step.tool.clone(),
                 success: true,
-                output: tool_result.output,
+                output: tool_result.output.into_string(),
             });
         }
 
@@ -206,7 +200,7 @@ impl PipelineTool {
                     tool: tool_name,
                     message: tool_result
                         .error
-                        .unwrap_or_else(|| tool_result.output.clone()),
+                        .unwrap_or_else(|| tool_result.output.clone().into_string()),
                 });
             }
 
@@ -214,7 +208,7 @@ impl PipelineTool {
                 index,
                 tool: tool_name,
                 success: true,
-                output: tool_result.output,
+                output: tool_result.output.into_string(),
             });
         }
 
@@ -292,7 +286,7 @@ impl Tool for PipelineTool {
         if let Err(e) = self.validate(&request) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             });
         }
@@ -315,13 +309,13 @@ impl Tool for PipelineTool {
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -329,7 +323,6 @@ impl Tool for PipelineTool {
 }
 
 /// Interpolate `{{step[N].result}}` references in tool arguments.
-///
 /// Single-pass replacement: values containing `{{` after substitution are stripped
 /// to prevent injection.
 pub fn interpolate_args(
@@ -680,7 +673,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: self.output.clone(),
+                output: self.output.clone().into(),
                 error: None,
             })
         }

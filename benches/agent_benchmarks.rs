@@ -1,13 +1,4 @@
 //! Performance benchmarks for ZeroClaw hot paths.
-//!
-//! Benchmarks cover:
-//!   - Tool dispatch (XML parsing, native parsing)
-//!   - Memory store/recall cycles (SQLite backend)
-//!   - Agent turn cycle (full orchestration loop)
-//!
-//! Run: `cargo bench`
-//!
-//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -20,7 +11,7 @@ use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
-use zeroclaw::tools::{Tool, ToolResult};
+use zeroclaw::tools::{Tool, ToolOutput, ToolResult};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -132,7 +123,7 @@ impl Tool for NoopTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: true,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: None,
         })
     }

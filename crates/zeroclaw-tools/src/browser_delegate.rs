@@ -1,20 +1,10 @@
 //! Browser delegation tool.
-//!
-//! Delegates browser-based tasks to a browser-capable CLI subprocess (e.g.
-//! Claude Code with `claude-in-chrome` MCP tools) for interacting with
-//! corporate web applications (Teams, Outlook, Jira, Confluence) that lack
-//! direct API access.
-//!
-//! The tool spawns the configured CLI binary in non-interactive mode, passing
-//! a structured prompt that instructs it to use browser automation. A
-//! persistent Chrome profile can be configured so SSO sessions survive across
-//! invocations.
 
 use async_trait::async_trait;
 use regex::Regex;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 pub use zeroclaw_config::scattered_types::BrowserDelegateConfig;
@@ -32,7 +22,6 @@ impl BrowserDelegateTool {
     }
 
     /// Build the CLI command for a browser task.
-    ///
     /// Constructs a `tokio::process::Command` with the configured CLI binary,
     /// `--print` flag for non-interactive mode, and optional Chrome profile env.
     fn build_command(&self, task: &str, url: Option<&str>) -> tokio::process::Command {
@@ -67,7 +56,6 @@ impl BrowserDelegateTool {
     }
 
     /// Extract URLs from free-form text and validate each against domain policy.
-    ///
     /// Prevents policy bypass by embedding blocked URLs in the `task` text,
     /// which is forwarded verbatim to the browser CLI subprocess.
     fn validate_task_urls(&self, task: &str) -> anyhow::Result<()> {
@@ -79,7 +67,6 @@ impl BrowserDelegateTool {
     }
 
     /// Validate URL against allowed/blocked domain lists and scheme restrictions.
-    ///
     /// Only `http` and `https` schemes are permitted. Blocked domains take
     /// precedence over allowed domains when both lists contain the same entry.
     fn validate_url(&self, url: &str) -> anyhow::Result<()> {
@@ -185,14 +172,14 @@ impl Tool for BrowserDelegateTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("browser_delegate tool is denied by security policy".into()),
             });
         }
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("browser_delegate action rate-limited".into()),
             });
         }
@@ -206,7 +193,7 @@ impl Tool for BrowserDelegateTool {
         if task.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'task' parameter is required and cannot be empty".into()),
             });
         }
@@ -223,7 +210,7 @@ impl Tool for BrowserDelegateTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("URL validation failed: {e}")),
             });
         }
@@ -234,7 +221,7 @@ impl Tool for BrowserDelegateTool {
         if let Err(e) = self.validate_task_urls(task) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("task text contains a disallowed URL: {e}")),
             });
         }
@@ -248,7 +235,7 @@ impl Tool for BrowserDelegateTool {
         if !VALID_EXTRACT_FORMATS.contains(&extract_format) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "unsupported extract_format '{}': allowed values are 'text', 'json', 'summary'",
                     extract_format
@@ -279,7 +266,7 @@ impl Tool for BrowserDelegateTool {
                 if output.status.success() {
                     Ok(ToolResult {
                         success: true,
-                        output: stdout,
+                        output: stdout.into(),
                         error: if stderr_truncated.is_empty() {
                             None
                         } else {
@@ -289,7 +276,7 @@ impl Tool for BrowserDelegateTool {
                 } else {
                     Ok(ToolResult {
                         success: false,
-                        output: stdout,
+                        output: stdout.into(),
                         error: Some(format!(
                             "CLI exited with status {}: {}",
                             output.status, stderr_truncated
@@ -299,12 +286,12 @@ impl Tool for BrowserDelegateTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("failed to spawn browser CLI: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "browser task timed out after {}s",
                     self.config.task_timeout_secs

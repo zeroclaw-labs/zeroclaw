@@ -1,14 +1,5 @@
 //! Single-use, TTL-swept registry binding a component `custom_id` to the
 //! server-side intent it resolves.
-//!
-//! A component click echoes back only the `custom_id` we put on it — a
-//! client-controlled string. So the *meaning* of a component must never be
-//! trusted from the wire: the sender registers the intent here when it emits the
-//! component, and the inbound dispatch `take`s it (removing it) on the click. A
-//! `custom_id` that isn't in the registry — forged, replayed, or expired —
-//! resolves to nothing and is refused, so a crafted id can't drive an arbitrary
-//! action. This is the replay/forgery half of the component security model; the
-//! per-click `interaction_gate` (fail-closed authz) is the other half.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -23,28 +14,13 @@ const COMPONENT_TTL: Duration = Duration::from_secs(15 * 60);
 /// tool-approval `oneshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComponentIntent {
-    /// Enqueue this prompt as an agent turn — the click drives the agent, whose
-    /// reply is delivered through the interaction followup. Bound to action
-    /// buttons and select options by the `[COMPONENTS:…]` marker builder, and
-    /// to a modal's `custom_id` so its type-5 submit resolves into a turn (the
-    /// submitted field values are appended to the prompt at dispatch).
-    ResolveIntoTurn { prompt: String },
-    /// Open a text-input modal (Discord response type 9) in answer to the
-    /// click. The modal-open IS the interaction response (no defer, no enqueue
-    /// here). When the click is dispatched, the modal's own `custom_id` is
-    /// registered as `ResolveIntoTurn { prompt }`, so the eventual type-5 submit
-    /// resolves into a turn (with the submitted field values appended). Binding
-    /// the submit at click time (not emit time) starts its single-use TTL when
-    /// the modal actually opens.
+    ResolveIntoTurn {
+        prompt: String,
+    },
     OpenModal {
         modal: Box<super::components::DiscordModal>,
         prompt: String,
     },
-    /// Resolve a parked tool-approval `oneshot` keyed by `token` in
-    /// `pending_approvals` with the server-bound `decision`. The decision is a
-    /// fixed enum captured when the button was emitted — NEVER derived from the
-    /// clicked `custom_id` — so a crafted id cannot turn a deny button into an
-    /// allow. The click resolves the approval; it does not enqueue a turn.
     Approval {
         token: String,
         decision: super::approval::ApprovalDecision,

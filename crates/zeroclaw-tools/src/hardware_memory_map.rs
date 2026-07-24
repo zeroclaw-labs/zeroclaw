@@ -1,12 +1,8 @@
 //! Hardware memory map tool — returns flash/RAM address ranges for connected boards.
-//!
-//! Phase B: When user asks "what are the upper and lower memory addresses?", this tool
-//! returns the memory map. Uses probe-rs for Nucleo/STM32 when available; otherwise
-//! returns static maps from datasheets.
 
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Known memory maps (from datasheets). Used when probe-rs is unavailable.
 const MEMORY_MAPS: &[(&str, &str)] = &[
@@ -84,7 +80,7 @@ impl Tool for HardwareMemoryMapTool {
         if self.boards.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "No peripherals configured. Add boards to config.toml [peripherals.boards]."
                         .into(),
@@ -137,7 +133,7 @@ impl Tool for HardwareMemoryMapTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

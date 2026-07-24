@@ -1,7 +1,7 @@
 //! Reusable mouse interaction helpers for the TUI.
-//!
 //! Pure geometry + timing utilities. No pane-specific logic lives here.
 
+#[cfg(not(test))]
 use std::io::Write;
 use std::time::Instant;
 
@@ -37,11 +37,6 @@ pub(crate) fn help_hint_click(col: u16, row: u16, content_area: Rect) -> bool {
 
 // ── List helpers ─────────────────────────────────────────────────
 
-/// Map a mouse click row to the item index in a bordered `List` widget.
-///
-/// Returns `None` if the click lands on a border or outside the item
-/// range. `scroll_offset` is `ListState::offset()` (the index of the
-/// first visible item).
 pub(crate) fn list_click_index(
     mouse_row: u16,
     list_area: Rect,
@@ -79,13 +74,6 @@ pub(crate) fn list_scroll(
 
 // ── Tab bar helpers ──────────────────────────────────────────────
 
-/// Map a click column to the tab index in a tab bar.
-///
-/// Each tab is rendered as a span occupying the label's *display width*
-/// (terminal columns), separated by `sep_width` columns (typically
-/// `" │ "` = 3). Display width — not byte length — is what the terminal
-/// lays out, so CJK (double-width) and combining glyphs hit-test correctly
-/// regardless of the locale's label lengths.
 pub(crate) fn tab_click_index(
     mouse_col: u16,
     mouse_row: u16,
@@ -111,25 +99,20 @@ pub(crate) fn tab_click_index(
     None
 }
 
-/// Map a click column to a mode (F-key number 1–5) in the app mode bar.
-///
-/// The mode bar renders each tab as: `key` + `label` + `" "`.
-/// E.g. `"F1"` + `" Dashboard "` + `" "`. Widths are measured in display
-/// columns so non-Latin labels (e.g. localized mode names) hit-test where
-/// they actually render, not where their byte length would put them.
 pub(crate) fn mode_bar_click(
     mouse_col: u16,
     mouse_row: u16,
     bar_area: Rect,
     labels: &[(&str, &str)],
 ) -> Option<u8> {
-    use unicode_width::UnicodeWidthStr;
     if !in_rect(mouse_col, mouse_row, bar_area) {
         return None;
     }
     let mut x = bar_area.x as usize;
     for (i, (key, label)) in labels.iter().enumerate() {
-        let w = UnicodeWidthStr::width(*key) + UnicodeWidthStr::width(*label) + 1; // +1 for trailing " "
+        let w = crate::display_width::display_width(key)
+            + crate::display_width::display_width(label)
+            + 1; // +1 for trailing " "
         if (mouse_col as usize) >= x && (mouse_col as usize) < x + w {
             return Some((i + 1) as u8);
         }
@@ -184,6 +167,7 @@ impl DoubleClickTracker {
 /// Works in most modern terminals (iTerm2, kitty, alacritty, WezTerm,
 /// foot, tmux with `set-clipboard on`). Terminals that don't support
 /// OSC 52 silently ignore the sequence.
+#[cfg(not(test))]
 pub(crate) fn copy_osc52(text: &str) {
     let encoded = base64_encode(text.as_bytes());
     // OSC 52 ; c ; <base64> ST
@@ -191,6 +175,9 @@ pub(crate) fn copy_osc52(text: &str) {
     let _ = std::io::stdout().write_all(seq.as_bytes());
     let _ = std::io::stdout().flush();
 }
+
+#[cfg(test)]
+pub(crate) fn copy_osc52(_text: &str) {}
 
 /// Minimal base64 encoder. Standard alphabet, with padding.
 pub(crate) fn base64_encode(input: &[u8]) -> String {

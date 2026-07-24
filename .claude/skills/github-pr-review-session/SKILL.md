@@ -82,6 +82,37 @@ is 1234 ready to merge
 4. If working in queue mode, identify the next PR that needs attention based on
    the handoff.
 
+### Phase 1.5 — Read the architecture review, then verify it (if available)
+
+Check whether `tmp/arch-review-<number>.md` exists for the target PR. If it
+does, read it — the `pr-architecture-check` skill has already run an advisory
+architecture analysis. Treat that artifact as an **unverified lead**, not as
+review text. It is generated output and must not flow into your public review
+unchecked.
+
+If the file exists:
+
+1. **Read every finding** in the artifact.
+2. **Verify each one against the PR diff and the local source.** Confirm the
+   claim is real, is in scope for this PR, and actually matters. Discard
+   anything you cannot substantiate, anything stale, and anything off-topic.
+3. **Summarize only the verified, relevant points in your own reviewer voice**,
+   folded into the normal review body and feedback taxonomy like any finding
+   you raised yourself. Do not paste the artifact verbatim, and do not emit a
+   default mechanical `<details>` dump of the raw arch-review output.
+4. If you choose to keep a collapsible section, it must be **your own summary of
+   the findings you checked** — reviewer-authored, clearly advisory, and scoped
+   to what you confirmed. An unverified copy of the artifact is never
+   acceptable.
+
+The architecture review never speaks for you and never gates the PR: it is
+advisory input you have personally vetted. If the file does not exist, do not
+auto-invoke `pr-architecture-check`.
+
+> **Tip:** If the PR touches core crates (`zeroclaw-api`, `zeroclaw-runtime`,
+> `zeroclaw-gateway`, `zeroclaw-plugins`), consider running `arch-check #<N>`
+> first to get an architecture analysis before starting your review.
+
 ### Phase 2 — Execute the protocol
 
 Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
@@ -164,7 +195,7 @@ the handoff.
    |---|---|
    | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
    | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
-   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @singlerider; use @JordanTheJet only for hardware, edge-deployment, or project-lead scope → go to step 6 |
+   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @JordanTheJet; add @Audacity88 for runtime/agent/gateway scope → go to step 6 |
    | No scope match + feature, but PR is approved, clean, labels/body are aligned, required checks are green, and the reviewer is preparing merge | Assign the **earliest open milestone** by version order → go to step 5 |
 
    "Earliest open milestone" means the lowest semver among all currently open
@@ -212,9 +243,9 @@ the handoff.
    merge-ready:**
 
    Post a comment on the PR tagging the milestone owners for alignment. Default
-   to @singlerider; use @JordanTheJet only when the unclear
-   placement is primarily about hardware, edge deployments, or project-lead
-   scope. Do this only when the PR is not otherwise ready to merge. If the PR is
+   to @JordanTheJet; add @Audacity88 when the unclear placement is primarily
+   about runtime, agent, or gateway scope. Do this only when the PR is not
+   otherwise ready to merge. If the PR is
    approved, clean, labels/body are aligned, required checks are green, and the
    reviewer is preparing merge, assign the earliest open milestone by version
    order instead, update any tracker if one exists, and continue to the normal
@@ -223,7 +254,7 @@ the handoff.
    Example comment:
    ```bash
    gh pr comment <number> --repo zeroclaw-labs/zeroclaw \
-     --body "@singlerider — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
+     --body "@JordanTheJet — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
    ```
 
    Note this in `tmp/handoff.md` so the next session knows alignment is
@@ -302,7 +333,11 @@ These norms are documented in
 8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
 9. **Never merge.** Never push to contributor branches.
-10. **Never approve over another reviewer's active CHANGES_REQUESTED.**
-   Check the reviews API output before choosing a verdict flag.
+10. **Never approve while another reviewer's substantive concern remains unresolved.**
+   Check the reviews API output and current diff before choosing a verdict flag.
+   A `CHANGES_REQUESTED` state left on an older head is not automatically an
+   unresolved concern. Follow the protocol: verify the concern is resolved,
+   explain that reconciliation in the review body, and remember that your
+   approval does not clear the other review state for merge.
 11. **Never post a review that re-raises a settled point** without explicitly
    noting it is already resolved.

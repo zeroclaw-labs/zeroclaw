@@ -2,7 +2,6 @@
 //! store, and the REST callbacks that ack (defer), refuse (reject), and answer
 //! (edit @original) an interaction. The listen-loop dispatch arm and the
 //! authorization gate (`interaction_gate`, coupled to the channel filters) stay
-//! in `mod.rs` and call down into these.
 
 use serde_json::json;
 
@@ -84,16 +83,6 @@ pub(crate) async fn discord_open_modal(
     Ok(())
 }
 
-/// Answer an APPLICATION_COMMAND_AUTOCOMPLETE (type 4) interaction with a
-/// callback type 8 (APPLICATION_COMMAND_AUTOCOMPLETE_RESULT) carrying inline
-/// choices. Discord shows up to 25 choices; over that it 400s, so the caller's
-/// list is truncated here. An empty list is a valid answer (clears the
-/// suggestion box) — used when authz fails or no choices are available, so a
-/// per-keystroke event never hangs or leaks a policy decision.
-///
-/// Unlike `discord_reject_interaction`/`discord_defer_interaction`, this is the
-/// ONLY response an autocomplete keystroke may produce: it neither defers nor
-/// posts an ephemeral, so authorization stays side-effect-free.
 pub(crate) async fn discord_answer_autocomplete(
     client: &reqwest::Client,
     interaction_id: &str,
@@ -176,19 +165,6 @@ pub(crate) async fn discord_reject_interaction(
     Ok(())
 }
 
-/// Edit the deferred interaction's @original message
-/// (`PATCH {api_base}/webhooks/{app_id}/{token}/messages/@original`). The token
-/// is valid for 15 minutes; no bot auth header is required for the followup
-/// webhook. Renders any `[EMBED:…]` the agent emitted by attaching `embeds`
-/// alongside the content via the same `DiscordOutgoing` envelope the normal send
-/// path uses. `content` must be within Discord's 2000-char limit — callers whose
-/// reply may exceed it chunk first and post the remainder via
-/// [`discord_post_interaction_followup`]. `api_base` is injectable for tests.
-///
-/// `components` are the interactive action rows that ride on this edit (the
-/// `[COMPONENTS:{…}]` marker's buttons/selects, already registered server-side
-/// by the caller). An empty slice omits the `components` key entirely, so plain
-/// text replies serialise byte-identically to before — no behaviour change.
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,

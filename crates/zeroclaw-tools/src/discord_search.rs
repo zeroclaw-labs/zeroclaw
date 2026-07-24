@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::Memory;
 
 /// Search Discord message history stored in discord.db.
@@ -63,7 +63,7 @@ impl Tool for DiscordSearchTool {
         if query.trim().is_empty() && since.is_none() && until.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Provide at least 'query' (keywords) or time range ('since'/'until')".into(),
                 ),
@@ -75,7 +75,7 @@ impl Tool for DiscordSearchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid 'since' date: {s}. Expected RFC 3339, e.g. 2025-03-01T00:00:00Z"
                 )),
@@ -86,7 +86,7 @@ impl Tool for DiscordSearchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid 'until' date: {u}. Expected RFC 3339, e.g. 2025-03-01T00:00:00Z"
                 )),
@@ -101,7 +101,7 @@ impl Tool for DiscordSearchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'since' must be before 'until'".into()),
             });
         }
@@ -132,13 +132,13 @@ impl Tool for DiscordSearchTool {
                 }
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Discord search failed: {e}")),
             }),
         }

@@ -1,19 +1,10 @@
 //! Unauthenticated cross-provider model catalog via models.dev.
-//!
-//! `https://models.dev/api.json` is a community-maintained public aggregator
-//! that lists model IDs for 100+ model_providers (Anthropic, OpenAI, Google,
-//! Bedrock, Azure, Moonshot, Qwen, …). No API key required, same shape for
-//! every model_provider. We fetch the catalog once per process and cache in
-//! memory.
-//!
-//! Providers that have a native public `/models` endpoint (OpenRouter,
-//! Ollama's `/api/tags`) override `ModelProvider::list_models` directly and
-//! skip this path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::pricing::{ModelRates, sane_mtok};
 use anyhow::Result;
 use serde::Deserialize;
 use tokio::sync::OnceCell;
@@ -30,13 +21,30 @@ pub(crate) struct ProviderEntry {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    #[serde(default)]
+    cost: Option<ModelCost>,
+}
+
+/// models.dev `cost` block: USD per 1M tokens (the same unit ZeroClaw's rate
+/// sheet uses, so no conversion is needed).
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+struct ModelCost {
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
 }
 
 pub(crate) type Catalog = HashMap<String, ProviderEntry>;
 
 static CACHED_CATALOG: OnceCell<Arc<Catalog>> = OnceCell::const_new();
 
-async fn fetch_catalog() -> Result<Arc<Catalog>> {
+/// Fetch and parse the models.dev catalog fresh (no process cache). Used by the
+/// live-pricing refresher so its fallback tracks upstream changes per cycle;
+/// the cached [`list_models_for`] path stays on the process-lifetime cache.
+pub(crate) async fn fetch_catalog() -> Result<Arc<Catalog>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
@@ -73,17 +81,6 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
     Ok(ids)
 }
 
-/// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
-///
-/// First call fetches the catalog; subsequent calls hit the cache. The
-/// returned list is sorted for stable menu rendering.
-///
-/// Attribution: the models.dev catalog is a global, pre-authentication
-/// metadata source with no concrete `Attributable` thing of its own.
-/// We wrap the body with `scope!(model_provider_type: "models_dev",
-/// model_provider_alias: "catalog", …)` so the `filter_models` warning
-/// (and any future record! inside `fetch_catalog`) lands with the
-/// model_provider_type and model_provider_alias slots populated.
 pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
     ::zeroclaw_log::scope!(
         model_provider_type: "models_dev",
@@ -94,6 +91,31 @@ pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
         }
     )
     .await
+}
+
+pub(crate) fn pricing_from_catalog(
+    catalog: &Catalog,
+    provider_key: &str,
+) -> HashMap<String, ModelRates> {
+    let mut out = HashMap::new();
+    let Some(entry) = catalog.get(provider_key) else {
+        return out;
+    };
+    for model in entry.models.values() {
+        let Some(cost) = model.cost else { continue };
+        // models.dev `cost` is already USD per 1M tokens, no scaling. Each
+        // dimension is sanity-bounded so a malformed catalog entry can't bill
+        // an absurd cost (same ceiling as the gateway path).
+        let rates = ModelRates {
+            input_per_mtok: cost.input.and_then(sane_mtok),
+            output_per_mtok: cost.output.and_then(sane_mtok),
+            cached_input_per_mtok: cost.cache_read.and_then(sane_mtok),
+        };
+        if !rates.is_empty() {
+            out.insert(model.id.clone(), rates);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -158,5 +180,27 @@ mod tests {
     #[test]
     fn parse_errors_on_malformed_json() {
         assert!(parse_catalog(b"not json").is_err());
+    }
+
+    #[test]
+    fn pricing_from_catalog_reads_cost_and_skips_unpriced() {
+        // `cost` is USD per 1M tokens; models without it are omitted.
+        let raw = r#"{
+            "kilo": {
+                "models": {
+                    "a": {"id": "minimax-m2.7", "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.06}},
+                    "b": {"id": "no-cost-model"}
+                }
+            }
+        }"#;
+        let catalog = parse_catalog(raw.as_bytes()).unwrap();
+        let map = pricing_from_catalog(&catalog, "kilo");
+        let m = map.get("minimax-m2.7").expect("priced");
+        assert_eq!(m.input_per_mtok, Some(0.3));
+        assert_eq!(m.output_per_mtok, Some(1.2));
+        assert_eq!(m.cached_input_per_mtok, Some(0.06));
+        assert!(!map.contains_key("no-cost-model"));
+        // Unknown provider key yields an empty map, not an error.
+        assert!(pricing_from_catalog(&catalog, "absent").is_empty());
     }
 }

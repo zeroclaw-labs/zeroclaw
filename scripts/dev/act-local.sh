@@ -74,7 +74,8 @@ cross-platform-build-manual:build
 release-stable-manual:validate
 release-stable-manual:web
 release-stable-manual:release-notes
-release-stable-manual:build"
+release-stable-manual:build
+release-stable-manual:build-desktop"
 
 log()  { printf '==> %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }

@@ -1,17 +1,4 @@
 //! WebSocket endpoint for dynamic node discovery and capability advertisement.
-//!
-//! External processes/devices connect to `/ws/nodes` and advertise their
-//! capabilities at runtime. The gateway exposes these as dynamically available
-//! tools to the agent.
-//!
-//! ## Protocol
-//!
-//! ```text
-//! Node -> Gateway: {"type":"register","node_id":"phone-1","capabilities":[{"name":"camera.snap","description":"Take a photo","parameters":{...}}]}
-//! Gateway -> Node: {"type":"registered","node_id":"phone-1","capabilities_count":1}
-//! Gateway -> Node: {"type":"invoke","call_id":"uuid","capability":"camera.snap","args":{...}}
-//! Node -> Gateway: {"type":"result","call_id":"uuid","success":true,"output":"..."}
-//! ```
 
 use super::AppState;
 use axum::{
@@ -28,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use zeroclaw_runtime::security::pairing::PairingGuard;
+use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -226,13 +213,6 @@ fn extract_node_ws_token<'a>(
     None
 }
 
-/// GET /ws/nodes — WebSocket upgrade for node connections
-/// Check the /ws/nodes access-control policy.
-///
-/// Returns `Some(status, body)` if the request should be rejected before
-/// the WebSocket upgrade, or `None` if it passes and the upgrade may proceed.
-/// Extracted so the auth decision matrix can be unit-tested without a WS
-/// handshake (which axum performs before calling the handler).
 pub(crate) fn check_node_auth(
     nodes_config: &zeroclaw_config::schema::NodesConfig,
     pairing: &PairingGuard,
@@ -246,8 +226,22 @@ pub(crate) fn check_node_auth(
         ));
     }
     if let Some(ref expected_token) = nodes_config.auth_token {
+        // Fail-closed: a whitespace-only / empty configured token must not
+        // authenticate missing or arbitrary tokens (trimming both sides
+        // would produce `constant_time_eq("", "")` = true and bypass auth).
+        if expected_token.trim().is_empty() {
+            return Some((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable — nodes.auth_token must not be empty or whitespace-only",
+            ));
+        }
         let token = extract_node_ws_token(headers, query_token).unwrap_or("");
-        if token != expected_token {
+        // SECURITY: route through `constant_time_eq` (not `==`) to prevent
+        // a remote timing attack that could leak `nodes.auth_token` one
+        // byte at a time. Both sides are `.trim()`-normalized to match
+        // the canonical pattern at
+        // `crates/zeroclaw-config/src/pairing.rs:139`.
+        if !constant_time_eq(token.trim(), expected_token.trim()) {
             return Some((
                 axum::http::StatusCode::UNAUTHORIZED,
                 "Unauthorized — provide a valid node auth token",
@@ -387,13 +381,6 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                         "Node registered: with capabilities"
                     );
                     registered_node_id = Some(node_id.clone());
-
-                    // Send ack — we can't use `sender` here since it's moved
-                    // into the send task. Instead, send ack via the invoke channel
-                    // pattern isn't ideal. We'll use a workaround: send the ack
-                    // through a special invocation that the send task converts to
-                    // a registered message. For simplicity, we just log and the
-                    // ack is implicit in the protocol.
                 } else {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -458,7 +445,6 @@ mod tests {
         PairingGuard::new(require, &[])
     }
 
-    /// nodes.enabled=false → 404 before any WS upgrade attempt.
     #[test]
     fn nodes_disabled_returns_404() {
         let cfg = NodesConfig {
@@ -469,8 +455,6 @@ mod tests {
         assert_eq!(result.map(|(s, _)| s), Some(StatusCode::NOT_FOUND));
     }
 
-    /// nodes.enabled=true, no auth_token, pairing disabled → 503.
-    /// Previously this combination allowed unauthenticated registration.
     #[test]
     fn nodes_enabled_no_auth_no_pairing_returns_503() {
         let cfg = NodesConfig {
@@ -479,6 +463,56 @@ mod tests {
             ..NodesConfig::default()
         };
         let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, no token provided → 503
+    /// (fail-closed: empty-trimmed config must not match missing token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_missing_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents a token → 503
+    /// (fail-closed: empty-trimmed config must not authenticate any token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_any_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("anything");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents matching
+    /// whitespace token → 503 (same fail-closed path).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_matching_whitespace_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("   ");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
         assert_eq!(
             result.map(|(s, _)| s),
             Some(StatusCode::SERVICE_UNAVAILABLE)
@@ -497,7 +531,6 @@ mod tests {
         assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
     }
 
-    /// nodes.auth_token set, correct token → auth passes (None = proceed to upgrade).
     #[test]
     fn nodes_auth_token_correct_token_passes() {
         let cfg = NodesConfig {
@@ -510,7 +543,6 @@ mod tests {
         assert!(result.is_none(), "correct token must pass auth gate");
     }
 
-    /// Pairing required, wrong/missing bearer token → 401.
     #[test]
     fn nodes_pairing_required_wrong_token_returns_401() {
         let cfg = NodesConfig {
@@ -747,5 +779,74 @@ mod tests {
     fn extract_node_ws_token_none_when_empty() {
         let headers = HeaderMap::new();
         assert_eq!(extract_node_ws_token(&headers, None), None);
+    }
+
+    /// Regression for non-constant-time `nodes.auth_token` comparison.
+    ///
+    /// The old code used `if token != expected_token`, which short-circuits
+    /// on the first differing byte and leaks the configured `nodes.auth_token`
+    /// one byte at a time via response timing. The fix routes through
+    /// `constant_time_eq` (from `zeroclaw_config::pairing`) and trims both
+    /// sides — matching the canonical pairing pattern at
+    /// `crates/zeroclaw-config/src/pairing.rs:139`.
+    ///
+    /// We can't measure wall-clock timing in a unit test, but we can lock
+    /// in the behavior contract: trim-normalized inputs match, wrong
+    /// tokens still reject. A future refactor that drops the
+    /// `constant_time_eq` call (e.g., back to `==`) would still pass the
+    /// "wrong token rejected" half — the trim half is what proves the new
+    /// shape is in place.
+    #[test]
+    fn nodes_auth_token_compare_uses_constant_time_eq_and_trims() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("node-secret-token".into()),
+            ..NodesConfig::default()
+        };
+
+        // Whitespace-padded Authorization header still passes
+        // (trim-normalized on both sides, per the canonical pairing pattern).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer   node-secret-token   ".parse().unwrap(),
+        );
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None),
+            None,
+            "auth_token comparison must trim both sides (canonical pairing pattern)"
+        );
+
+        // Wrong token via Authorization header is rejected.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None).map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Wrong token via `?token=` query parameter is also rejected.
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("wrong-token"),
+            )
+            .map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Correct token via `?token=` (with no trim ambiguity) passes.
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("node-secret-token"),
+            ),
+            None
+        );
     }
 }

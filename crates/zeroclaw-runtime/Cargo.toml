@@ -15,6 +15,7 @@ zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
+zeroclaw-sop-graph.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 fluent = "0.16"
@@ -28,7 +29,6 @@ console = "0.16"
 cron = "0.15"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
-flate2 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 glob = "0.3"
 hex = "0.4"
@@ -52,9 +52,16 @@ rustls-pki-types = "1.14.0"
 schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+strum = "0.28"
+strum_macros = "0.28"
 sha2 = "0.10"
 shellexpand = "3.1"
 sys-locale.workspace = true
+# Pinned to 0.36 because 0.37+ requires rustc 1.88; workspace MSRV is 1.87.
+# Used only by `process_stats.rs` to sample this process's RSS/CPU% across
+# Linux, macOS, Windows, and FreeBSD. `default-features = false` drops the
+# multi-threaded refresh path (we sample a single pid).
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.26"
 thiserror = "2.0"
@@ -70,7 +77,6 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 zeroclaw-macros.workspace = true
 
 # Optional deps
@@ -79,7 +85,6 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 # Optional deps for specific features
-pdf-extract = { version = "0.12", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
@@ -96,11 +101,10 @@ default = ["observability-prometheus", "schema-export"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 sandbox-landlock = ["dep:landlock"]
-schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
+schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-graph/schema-export"]
 
 
 browser-native = []
-rag-pdf = ["dep:pdf-extract"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = []
 sandbox-bubblewrap = []
@@ -114,6 +118,10 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
 filetime = "0.2"
 wiremock = "0.6"
+# Test-only registry constructor used by the daemon heartbeat MCP
+# retry-regression tests. Not in default deps so
+# the helper is unreachable from production builds.
+zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
 
 # Channel features (forwarded to zeroclaw-channels)
 

@@ -2,11 +2,6 @@
 //! web dashboard's theme registry (`web/src/contexts/themes.json`). That JSON
 //! is the single source of truth shared with the React dashboard; the docs
 //! mirror it so both surfaces expose the same named themes without a second
-//! hardcoded list.
-//!
-//! Outputs (gitignored, derived):
-//!   docs/book/theme/pc-themes.css       — one `html.<id>` block per theme
-//!   docs/book/theme/pc-theme-list.html  — `<li>` switcher buttons (reference)
 
 use crate::util::book_dir;
 use anyhow::{Context, Result};
@@ -57,11 +52,6 @@ pub fn run(root: &Path) -> Result<()> {
     let css = render_css(arr)?;
     let list = render_list(arr)?;
     std::fs::write(book.join("theme/pc-themes.css"), css)?;
-    // Inject the switcher buttons into index.hbs between markers. They must be
-    // present at parse time because mdBook's bundled book.js reads the theme
-    // list synchronously on load; injecting later would abort its handler.
-    // index.hbs is tracked but the marker region is regenerated from
-    // themes.json, so themes.json stays the single source of truth.
     inject_theme_list(&book.join("theme/index.hbs"), &list)?;
     // Write the zerocode TUI theme-name list to a derived fragment that
     // themes.md `{{#include}}`s at build time. Gitignored, like cli.md/config.md
@@ -140,10 +130,6 @@ fn render_css(themes: &[Value]) -> Result<String> {
             .get("vars")
             .and_then(Value::as_object)
             .context("theme missing vars object")?;
-        // Sanitize the registry-supplied id and values before they enter the
-        // CSS file. The id forms a selector (`html.<id>`); values land in
-        // declarations. Stripping CSS-structural characters prevents a hostile
-        // theme from breaking out of the rule (defense in depth).
         let id = css_ident(id);
         out.push_str(&format!("html.{id} {{\n"));
         // Re-emit the raw --pc-* tokens so component rules resolve per theme.
@@ -203,10 +189,6 @@ fn render_list(themes: &[Value]) -> Result<String> {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        // Escape all theme-registry values before they enter HTML/CSS. The
-        // registry is maintainer-controlled, but escaping keeps a malformed or
-        // hostile theme name/colour from breaking out of the attribute, text,
-        // or style context (defense in depth).
         let id = html_attr_escape(id);
         let name = html_text_escape(name);
         let s0 = css_color(preview.first().copied().unwrap_or("#000"));
