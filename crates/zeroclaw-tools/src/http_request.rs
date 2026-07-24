@@ -389,6 +389,42 @@ impl HttpRequestTool {
             text.to_string()
         }
     }
+
+    /// Read the response body while bounding memory to the display cap. The
+    /// crate enables reqwest's gzip/brotli/deflate decoders, so a small
+    /// compressed response can decode into a much larger body; stopping the
+    /// stream once we pass the cap keeps that expansion bounded instead of
+    /// buffering the whole decoded body before `truncate_response`.
+    async fn read_capped_response_text(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<String, reqwest::Error> {
+        use futures_util::StreamExt;
+
+        let hard_cap = if self.max_response_size == 0 {
+            usize::MAX
+        } else {
+            // One extra byte so `truncate_response` can still detect and mark an
+            // over-limit body.
+            self.max_response_size.saturating_add(1)
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() >= hard_cap {
+                break;
+            }
+            let remaining = hard_cap - bytes.len();
+            if chunk.len() > remaining {
+                bytes.extend_from_slice(&chunk[..remaining]);
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
 }
 
 fn resolve_env_backed_auth_secret(
@@ -590,8 +626,9 @@ impl Tool for HttpRequestTool {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                // Get response body with size limit
-                let response_text = match response.text().await {
+                // Get response body with a streamed size limit so transparent
+                // decompression cannot expand past the cap in memory.
+                let response_text = match self.read_capped_response_text(response).await {
                     Ok(text) => self.truncate_response(&text),
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
@@ -1290,6 +1327,70 @@ api_token = "Bearer from-secret"
         let truncated = tool.truncate_response(text);
         assert!(truncated.starts_with("hello"));
         assert!(truncated.contains("[Response truncated"));
+    }
+
+    #[tokio::test]
+    async fn read_capped_response_text_bounds_decompressed_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A tiny gzip body that decodes to 10 KiB. Enabling reqwest's gzip
+        // decoder crate-wide means this must not buffer the whole decoded body
+        // before the cap applies.
+        let payload = "a".repeat(10_000);
+        let gz = {
+            use flate2::{Compression, write::GzEncoder};
+            use std::io::Write;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload.as_bytes()).unwrap();
+            enc.finish().unwrap()
+        };
+        assert!(gz.len() < 200, "compressed fixture should be small");
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(gz, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            128,
+            30,
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Fetch with a plain decoding client and read through the cap directly.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let response = client.get(&url).send().await.expect("request succeeds");
+        let text = tool
+            .read_capped_response_text(response)
+            .await
+            .expect("body reads");
+
+        // Read stops just past the 128-byte cap, nowhere near the 10 KiB decoded
+        // body, so `truncate_response` can still mark it over-limit.
+        assert!(
+            text.starts_with(&"a".repeat(128)),
+            "decoded prefix preserved up to the cap"
+        );
+        assert!(
+            text.len() <= 129,
+            "streamed read must stop at the cap (+1), got {} bytes",
+            text.len()
+        );
     }
 
     #[test]

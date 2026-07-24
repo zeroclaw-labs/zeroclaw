@@ -29,7 +29,7 @@ nanohtml2text = "0.2"
 parking_lot = "0.12"
 probe-rs = { version = "0.31", optional = true }
 regex = "1.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream", "gzip", "brotli", "deflate"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
@@ -71,3 +71,8 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 tokio-test = "0.4"
+# Produce deterministic gzip/deflate/brotli fixtures for the web_fetch and
+# http_request decompression tests. Pinned to the versions reqwest already
+# resolves for its own decoders.
+flate2 = "1.1"
+brotli = "8.0"

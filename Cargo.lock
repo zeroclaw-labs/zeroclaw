@@ -1653,6 +1653,7 @@ version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
+ "brotli",
  "compression-core",
  "flate2",
  "memchr",
@@ -13565,9 +13566,11 @@ dependencies = [
  "async-imap",
  "async-trait",
  "base64 0.22.1",
+ "brotli",
  "chrono",
  "directories",
  "fantoccini",
+ "flate2",
  "fluent",
  "futures-util",
  "glob",
