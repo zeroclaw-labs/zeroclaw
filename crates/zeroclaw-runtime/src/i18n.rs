@@ -544,6 +544,70 @@ mod tests {
         }
     }
 
+    /// Locale-key coverage for the daemon foreground startup echo:
+    /// every banner key must exist and format in all five catalogues, and
+    /// the machine-facing arguments (gateway URL, socket path, timeout
+    /// seconds) must survive translation.
+    #[test]
+    fn daemon_startup_echo_keys_format_in_all_locales() {
+        let url = "http://127.0.0.1:42617";
+        let path = "/tmp/zeroclaw-test/daemon.sock";
+        // Expected parts are locale-independent machine tokens only
+        // ("ZeroClaw", component names, the arguments) — the prose itself
+        // is translated per locale. The slice bindings keep temporaries
+        // alive for the whole `cases` array (let-extension).
+        let no_args: &[(&str, &str)] = &[];
+        let gateway_args: &[(&str, &str)] = &[("url", url)];
+        let socket_args: &[(&str, &str)] = &[("path", path)];
+        let seconds_args: &[(&str, &str)] = &[("seconds", "15")];
+        let expected_gateway: &[&str] = &[url];
+        let expected_socket: &[&str] = &[path];
+        let cases = [
+            ("cli-daemon-started-title", no_args, ["ZeroClaw"].as_slice()),
+            ("cli-daemon-started-gateway", gateway_args, expected_gateway),
+            ("cli-daemon-started-socket", socket_args, expected_socket),
+            (
+                "cli-daemon-started-components",
+                no_args,
+                ["gateway"].as_slice(),
+            ),
+            (
+                "cli-daemon-started-pairing",
+                no_args,
+                ["enabled"].as_slice(),
+            ),
+            ("cli-daemon-started-stop", no_args, ["Ctrl+C"].as_slice()),
+            (
+                "cli-daemon-starting-title",
+                no_args,
+                ["ZeroClaw"].as_slice(),
+            ),
+            (
+                "cli-daemon-starting-detail",
+                seconds_args,
+                ["15"].as_slice(),
+            ),
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args, expected_parts) in &cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in *expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [

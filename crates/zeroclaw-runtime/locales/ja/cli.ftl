@@ -918,6 +918,17 @@ cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動し
 
 cli-daemon-gateway-already-running = ZeroClaw ゲートウェイは既に {$host}:{$port} で実行中です。デーモンは自身のゲートウェイを監視しており、同じアドレスで2つ目を開始しません。そのゲートウェイを停止するか、`zeroclaw config set gateway.port <port>` でデーモンを空きポートに向けてから、もう一度デーモンを実行してください。
 cli-daemon-gateway-port-occupied = ゲートウェイアドレス {$host}:{$port} は別のプロセスで既に使用されています。ポートを解放するか、デーモンを空きポートに向けて (`zeroclaw config set gateway.port <port>`)、もう一度デーモンを実行してください。
+
+cli-daemon-started-title = 🧠 ZeroClaw デーモンが起動しました
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-components = Components: gateway, channels, heartbeat, scheduler
+cli-daemon-started-pairing = Pairing:    enabled（コードは上の gateway 出力に表示されます）
+cli-daemon-started-stop = Ctrl+C または SIGTERM で停止
+cli-daemon-starting-title = 🧠 ZeroClaw デーモンを起動しています…
+cli-daemon-starting-detail = {$seconds} 秒経過しても endpoint が確認できません — gateway/socket がまだ bind 中か supervisor の再試行中です。ログで readiness を確認してください。
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 不明 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています

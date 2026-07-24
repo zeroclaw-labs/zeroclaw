@@ -918,6 +918,17 @@ cli-gateway-restart-hint-process = reinicie el proceso `zeroclaw daemon`
 
 cli-daemon-gateway-already-running = Ya hay un gateway de ZeroClaw ejecutándose en {$host}:{$port}. El daemon supervisa su propio gateway y no iniciará un segundo en la misma dirección. Detén ese gateway (o apunta el daemon a un puerto libre con `zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
 cli-daemon-gateway-port-occupied = La dirección del gateway {$host}:{$port} ya está en uso por otro proceso. Libera el puerto o apunta el daemon a un puerto libre (`zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
+
+cli-daemon-started-title = 🧠 Daemon de ZeroClaw iniciado
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-components = Components: gateway, channels, heartbeat, scheduler
+cli-daemon-started-pairing = Pairing:    enabled (el código aparece en la salida del gateway, arriba)
+cli-daemon-started-stop = Ctrl+C o SIGTERM para detener
+cli-daemon-starting-title = 🧠 Daemon de ZeroClaw iniciándose…
+cli-daemon-starting-detail = Endpoints no confirmados después de {$seconds}s — el gateway/socket aún se está vinculando o en reintento del supervisor. Revisa el log para ver la disponibilidad.
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: desconocido / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}

@@ -921,6 +921,17 @@ cli-gateway-restart-hint-process = redémarrez le processus `zeroclaw daemon`
 
 cli-daemon-gateway-already-running = Une passerelle ZeroClaw est déjà en cours d'exécution sur {$host}:{$port}. Le démon supervise sa propre passerelle et ne démarrera pas une seconde passerelle sur la même adresse. Arrêtez cette passerelle (ou pointez le démon vers un port libre avec `zeroclaw config set gateway.port <port>`), puis relancez le démon.
 cli-daemon-gateway-port-occupied = L'adresse de passerelle {$host}:{$port} est déjà utilisée par un autre processus. Libérez le port ou pointez le démon vers un port libre (`zeroclaw config set gateway.port <port>`), puis relancez le démon.
+
+cli-daemon-started-title = 🧠 Démon ZeroClaw démarré
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-components = Components: gateway, channels, heartbeat, scheduler
+cli-daemon-started-pairing = Pairing:    enabled (le code apparaît dans la sortie de la passerelle ci-dessus)
+cli-daemon-started-stop = Ctrl+C ou SIGTERM pour arrêter
+cli-daemon-starting-title = 🧠 Démon ZeroClaw en cours de démarrage…
+cli-daemon-starting-detail = Endpoints non confirmés après {$seconds}s — la passerelle/le socket sont encore en cours de liaison ou en retry du superviseur. Consultez le log pour la disponibilité.
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: inconnu / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}

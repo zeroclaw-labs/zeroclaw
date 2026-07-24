@@ -249,6 +249,40 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
+/// Foreground-echo gate for `daemon::run`: true only when
+/// stderr is an interactive terminal AND this process owns that terminal's
+/// foreground process group. A shell background job (`zeroclaw daemon ... &`)
+/// inherits the TTY descriptor, so `is_terminal()` alone would wrongly print
+/// the startup banner for background callers; the process-group comparison
+/// is what separates an interactive foreground caller from a background job.
+#[cfg(unix)]
+fn stderr_is_interactive_foreground() -> bool {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return false;
+    }
+    // SAFETY: `tcgetpgrp` and `getpgrp` take no pointers and are safe to
+    // call on any fd / from any process state. `tcgetpgrp` returns -1 on
+    // error (e.g. no controlling terminal); `getpgrp` cannot fail.
+    let foreground_pgrp = unsafe { libc::tcgetpgrp(libc::STDERR_FILENO) };
+    let own_pgrp = unsafe { libc::getpgrp() };
+    stderr_foreground_decision(foreground_pgrp, own_pgrp)
+}
+
+/// Non-unix platforms have no POSIX foreground process group; the TTY
+/// descriptor check is the best available signal there.
+#[cfg(not(unix))]
+fn stderr_is_interactive_foreground() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Pure decision behind [`stderr_is_interactive_foreground`], split out so
+/// the interactive-background and detached-service cases are unit-testable
+/// without a PTY. `foreground_pgrp <= 0` is the `tcgetpgrp` error return.
+#[cfg(unix)]
+fn stderr_foreground_decision(foreground_pgrp: i32, own_pgrp: i32) -> bool {
+    foreground_pgrp > 0 && foreground_pgrp == own_pgrp
+}
+
 fn print_no_command_help(cmd: clap::Command) -> Result<()> {
     #[cfg(feature = "agent-runtime")]
     {
@@ -4117,7 +4151,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4132,6 +4166,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4191,14 +4226,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
-                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                registry.register_wss(Box::new(|ctx, cancel, client_count, _ready_tx| {
                     Box::pin(async move {
                         let wss_cfg = ctx.config.read().wss.clone();
                         if !wss_cfg.enabled {
@@ -4233,6 +4273,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    // Foreground echo: only true when this
+                    // daemon is the user's interactive foreground process
+                    // (no `--verbose`, stderr is a real tty, and on unix
+                    // this process owns the tty's foreground process
+                    // group — a shell background job inherits the tty
+                    // descriptor but is not the foreground owner).
+                    // Background / systemd-supervised callers stay silent
+                    // so we don't pollute the journal with the seven
+                    // informational lines.
+                    !cli.verbose && stderr_is_interactive_foreground(),
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -7863,10 +7913,11 @@ async fn run_gateway_if_enabled(
     zeroclaw_runtime::restart::record_launch();
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
-    // manually" message, None for tui_registry (no TUI socket), and None
-    // for canvas_store so the gateway falls back to its own default.
+    // manually" message, None for tui_registry (no TUI socket), None
+    // for canvas_store so the gateway falls back to its own default, and
+    // None for ready_tx (no daemon startup echo consumes readiness here).
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -8248,6 +8299,22 @@ mod tests {
         let mut line = String::from("abcdefgh");
         cap_line_utf8_safe(&mut line, 4);
         assert_eq!(line, "abcd");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stderr_foreground_decision_true_only_for_foreground_owner() {
+        // Interactive foreground: the shell gave this process group the
+        // terminal — echo is appropriate.
+        assert!(stderr_foreground_decision(123, 123));
+        // Interactive background job (`zeroclaw daemon ... &`): inherits
+        // the tty descriptor but the foreground group belongs to the shell
+        // or another job — must stay silent.
+        assert!(!stderr_foreground_decision(123, 456));
+        // No controlling terminal / tcgetpgrp error: -1 must never pass.
+        assert!(!stderr_foreground_decision(-1, 123));
+        // Defensive: 0 is not a valid process group id.
+        assert!(!stderr_foreground_decision(0, 0));
     }
 
     #[test]

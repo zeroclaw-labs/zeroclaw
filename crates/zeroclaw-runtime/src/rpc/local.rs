@@ -121,10 +121,16 @@ impl RpcTransport for LocalTransport {
 /// Run the local IPC RPC listener as a daemon subsystem.
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
+///
+/// `ready_tx` is the daemon foreground startup echo's readiness signal
+/// `true` is sent once, immediately after the IPC endpoint is
+/// bound and secured, so the echo cannot announce readiness before the
+/// socket accepts connections. Callers without an echo pass `None`.
 pub async fn run_local_listener(
     ctx: Arc<RpcContext>,
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
+    ready_tx: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Result<()> {
     let path = {
         let config = ctx.config.read();
@@ -137,6 +143,14 @@ pub async fn run_local_listener(
     let mut listener = platform::bind(&path).context("binding local IPC endpoint")?;
 
     platform::secure_endpoint(&path).await;
+
+    // Announce endpoint availability the moment the socket is bound and
+    // secured: the daemon's foreground startup echo gates its "started"
+    // banner on this signal. A send failure only means no receiver
+    // is listening — not an error worth failing startup over.
+    if let Some(tx) = &ready_tx {
+        let _ = tx.send(true);
+    }
 
     ::zeroclaw_log::record!(
         INFO,
@@ -462,7 +476,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
         });
 
         wait_for_socket(&sock_path).await;
@@ -515,7 +529,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -553,7 +567,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -584,7 +598,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
 
         for _ in 0..50 {
@@ -614,7 +628,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
         });
         wait_for_socket(&sock_path).await;
 
@@ -660,7 +674,7 @@ mod tests {
         let server_ctx = ctx.clone();
         let server_count = count.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, server_count).await;
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -697,7 +711,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
         });
 
         // Poll-connect until the server creates its pending instance.

@@ -917,6 +917,17 @@ cli-gateway-restart-hint-process = 重启 `zeroclaw daemon` 进程
 
 cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
 cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
+
+cli-daemon-started-title = 🧠 ZeroClaw daemon 已启动
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-components = Components: gateway, channels, heartbeat, scheduler
+cli-daemon-started-pairing = Pairing:    enabled（配对码显示在上方 gateway 输出中）
+cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
+cli-daemon-starting-title = 🧠 ZeroClaw daemon 正在启动…
+cli-daemon-starting-detail = {$seconds} 秒后 endpoint 仍未确认——gateway/socket 仍在绑定或处于 supervisor 重试中。请查看日志了解就绪状态。
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 未知 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}

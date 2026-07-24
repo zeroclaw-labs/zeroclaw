@@ -19,6 +19,13 @@ pub struct GatewayReloadControls {
     pub reload_tx: watch::Sender<bool>,
 }
 
+/// Starts the gateway HTTP server for one daemon run/reload iteration.
+///
+/// The optional broadcast sender carries daemon events, the optional reload
+/// controls let gateway/RPC surfaces coordinate in-process reloads, the
+/// optional TUI registry powers the gateway's TUI identity endpoints, and
+/// the optional readiness sender reports the actual bound address to the
+/// daemon's foreground startup echo the moment the listener binds.
 pub type GatewayStarter = Box<
     dyn Fn(
             String,
@@ -27,6 +34,7 @@ pub type GatewayStarter = Box<
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
+            Option<watch::Sender<Option<std::net::SocketAddr>>>,
         ) -> StarterFuture
         + Send
         + Sync,
@@ -36,8 +44,19 @@ pub type GatewayStarter = Box<
 pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
 
 /// Starts an RPC transport using the shared daemon RPC context.
+///
+/// The optional readiness sender reports endpoint readiness to the daemon's
+/// foreground startup echo the moment the transport's listener binds
+/// Transports without an echo consumer receive `None`.
 pub type RpcStarter = Box<
-    dyn Fn(Arc<RpcContext>, CancellationToken, Arc<AtomicUsize>) -> StarterFuture + Send + Sync,
+    dyn Fn(
+            Arc<RpcContext>,
+            CancellationToken,
+            Arc<AtomicUsize>,
+            Option<watch::Sender<bool>>,
+        ) -> StarterFuture
+        + Send
+        + Sync,
 >;
 
 /// Starts the MQTT SOP listener for one configured MQTT channel alias.
@@ -157,7 +176,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
@@ -165,7 +184,7 @@ mod tests {
     }
 
     fn rpc_starter() -> RpcStarter {
-        Box::new(|_, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn mqtt_starter() -> MqttStarter {

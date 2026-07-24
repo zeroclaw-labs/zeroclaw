@@ -568,6 +568,11 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // Readiness signal owned by the daemon's foreground startup echo
+    // The actual bound address is sent once, immediately after the
+    // listener binds, so the echo cannot announce readiness before the
+    // endpoint is available. Standalone gateway passes `None`.
+    ready_tx: Option<tokio::sync::watch::Sender<Option<std::net::SocketAddr>>>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -619,6 +624,15 @@ pub async fn run_gateway(
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
+
+    // Announce endpoint availability before anything else: the daemon's
+    // foreground startup echo gates its "started" banner on this signal, so
+    // it must fire the moment the listener is bound. A send failure
+    // only means no receiver is listening (standalone gateway) — not an
+    // error worth failing startup over.
+    if let Some(tx) = &ready_tx {
+        let _ = tx.send(Some(actual_addr));
+    }
 
     let (boot_family, boot_alias, boot_entry) = config
         .providers
@@ -4815,7 +4829,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4871,7 +4897,19 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4912,7 +4950,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4967,6 +5017,7 @@ mod tests {
                 config,
                 None,
                 Some(reload_controls),
+                None,
                 None,
                 None,
                 None,

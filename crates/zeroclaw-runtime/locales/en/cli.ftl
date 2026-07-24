@@ -1055,6 +1055,22 @@ cli-gateway-restart-hint-process = restart the `zeroclaw daemon` process
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
 
+# ── daemon foreground startup echo — zeroclaw daemon (#9000) ──
+# Rendered by `echo_daemon_started_to_terminal` in
+# crates/zeroclaw-runtime/src/daemon/mod.rs. The cli-daemon-started-* lines
+# print only after every announced endpoint has reported its bind through
+# the readiness signal; the cli-daemon-starting-* lines print when the
+# bounded readiness wait elapses, and must never announce endpoint
+# addresses. The three-space banner indent lives at the call site.
+cli-daemon-started-title = 🧠 ZeroClaw daemon started
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-components = Components: gateway, channels, heartbeat, scheduler
+cli-daemon-started-pairing = Pairing:    enabled (code appears in gateway output above)
+cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
+cli-daemon-starting-title = 🧠 ZeroClaw daemon starting…
+cli-daemon-starting-detail = Endpoints not confirmed after {$seconds}s — the gateway/socket are still binding or in supervisor retry. Watch the log for readiness.
+
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
