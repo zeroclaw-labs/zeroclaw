@@ -452,6 +452,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             parallel_tools: false,
             max_tool_result_chars: 30_000,
             context_token_budget: 100_000,
+            model_context_window: 0,
             receipt_generator: None,
             knobs: &crate::agent::loop_::LoopKnobs::default(),
         },
@@ -837,6 +838,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
                     context_token_budget: 100_000,
+                    model_context_window: 0,
                     receipt_generator: None,
                     knobs: &crate::agent::loop_::LoopKnobs::default(),
                 },
@@ -1993,5 +1995,165 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
     assert_eq!(
         args["approved"], false,
         "model-supplied approved=true must be stripped even with no approval gate"
+    );
+}
+
+// ── seam 9: per-call provider identity on Usage + drain-unblock regressions
+//
+// note.md blocker: TurnEvent::Usage must carry the serving provider
+// reference, and the drain loop must continue processing events after the
+// Usage callback returns. These tests drive the production
+// `turn_streamed_with_steering_state` path and assert both the
+// `provider_ref` content and the cross-event ordering the wire/gateway
+// layers depend on.
+
+async fn run_turn_collect_events(
+    agent_factory: impl FnOnce() -> Agent,
+    prompt: impl Into<String> + Send + 'static,
+) -> Vec<TurnEvent> {
+    let mut agent = agent_factory();
+    let (tx, mut rx) = mpsc::channel(256);
+    let prompt = prompt.into();
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state(&prompt, tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+    events
+}
+
+fn agent_with_provider_name(
+    provider: Box<dyn ModelProvider>,
+    tools_vec: Vec<Box<dyn Tool>>,
+    provider_name: &str,
+) -> Agent {
+    Agent::builder()
+        .model_provider(provider)
+        .tools(tools_vec)
+        .memory(mem_none())
+        .observer(Arc::from(observability::NoopObserver {}))
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name(provider_name.to_string())
+        .model_name("mock-model".into())
+        .build()
+        .expect("agent builder should succeed")
+}
+
+/// Regression: Usage event carries the serving provider's name as
+/// `provider_ref`, and a subsequent Chunk event arrives after the Usage
+/// callback returns (the drain must not stall when the callback resolves
+/// the window from the embedded provider_ref).
+#[tokio::test]
+async fn usage_event_carries_provider_ref_and_drain_continues() {
+    let mut first = text_response("hello");
+    first.usage = Some(token_usage(10, 5));
+    let provider = ScriptedProvider::new(vec![first]);
+    let events = run_turn_collect_events(
+        || agent_with_provider_name(Box::new(provider), vec![], "mock-provider"),
+        "hi",
+    )
+    .await;
+
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Usage { provider_ref, .. } => Some(provider_ref.clone()),
+            _ => None,
+        })
+        .expect("a Usage event must be emitted");
+    assert_eq!(
+        usage, "mock-provider",
+        "Usage.provider_ref must carry the serving provider name (note.md blocker)"
+    );
+
+    let pos_usage = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::Usage { .. }))
+        .expect("Usage event position");
+    let pos_chunk = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("hello")))
+        .expect("a final Chunk carrying the response must be emitted");
+    assert!(
+        pos_usage < pos_chunk,
+        "Usage must precede the final Chunk — drain continued after the Usage callback"
+    );
+}
+
+/// Regression: a tool turn emits Usage (call 1) → ToolCall → ToolResult →
+/// Usage (call 2) → final Chunk, proving the drain processes every event
+/// type after a Usage event without relocking the agent. This is the
+/// "real execute_turn callback through usage followed by another event"
+/// case from note.md.
+#[tokio::test]
+async fn usage_then_tool_events_then_usage_again_proves_drain_unblocked() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut first = tool_response(vec![tool_call("tc-1", "echo")]);
+    first.usage = Some(token_usage(10, 5));
+    let mut second = text_response("all done");
+    second.usage = Some(token_usage(20, 8));
+    let provider = ScriptedProvider::new(vec![first, second]);
+    let echo_calls = Arc::clone(&calls);
+    let events = run_turn_collect_events(
+        || {
+            agent_with_provider_name(
+                Box::new(provider),
+                vec![Box::new(CountingTool {
+                    name: "echo",
+                    calls: echo_calls,
+                })],
+                "mock-provider",
+            )
+        },
+        "seq",
+    )
+    .await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "echo tool runs once");
+
+    let positions = |pred: &dyn Fn(&TurnEvent) -> bool| {
+        events
+            .iter()
+            .position(|e| pred(e))
+            .expect("expected event not found")
+    };
+
+    let pos_usage_1 = positions(
+        &|e| matches!(e, TurnEvent::Usage { provider_ref, .. } if provider_ref == "mock-provider"),
+    );
+    let pos_tool_call = positions(&|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"));
+    let pos_tool_result =
+        positions(&|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"));
+    let usage_count = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Usage { .. }))
+        .count();
+    let pos_final_chunk =
+        positions(&|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("all done")));
+
+    assert_eq!(
+        usage_count, 2,
+        "two Usage events (one per LLM call) must be emitted"
+    );
+    assert!(
+        pos_usage_1 < pos_tool_call,
+        "Usage (call 1) must precede ToolCall"
+    );
+    assert!(
+        pos_tool_call < pos_tool_result,
+        "ToolCall must precede ToolResult"
+    );
+    assert!(
+        pos_tool_result < pos_final_chunk,
+        "ToolResult must precede the final Chunk — drain did not stall after Usage + Tool events"
     );
 }

@@ -4054,17 +4054,6 @@ impl Config {
     /// Provider's explicit `context_window`, or `None`. Use on wire
     /// boundaries: emitting the 32k stub from
     /// `effective_model_context_window()` would freeze the client
-    /// meter at 32k instead of the profile budget. Use
-    /// `effective_model_context_window()` elsewhere (display, recovery).
-    #[must_use]
-    pub fn effective_model_context_window_opt(&self, agent_alias: &str) -> Option<usize> {
-        self.resolved_model_provider_for_agent(agent_alias)
-            .and_then(|(_, _, provider_config)| provider_config.context_window)
-    }
-
-    /// Provider's explicit `context_window`, or `None`. Use on wire
-    /// boundaries: emitting the 32k stub from
-    /// `effective_model_context_window()` would freeze the client
     /// meter at 32k instead of the profile budget. Use this instead
     /// of the agent-alias variant when the live provider identity is
     /// known (e.g., from `Agent.attribution_fields().1` or

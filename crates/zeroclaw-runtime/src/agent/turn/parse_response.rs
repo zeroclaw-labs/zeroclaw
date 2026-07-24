@@ -134,8 +134,15 @@ pub(crate) async fn interpret_chat_response(
         .map(|u| (u.input_tokens, u.output_tokens))
         .unwrap_or((None, None));
 
+    // Per-iteration provider identity: vision routing or a mid-turn
+    // override may have changed which provider served this call.
+    let effective_provider_name = ctx
+        .serving_provider_name
+        .as_deref()
+        .unwrap_or(ctx.provider_name);
+
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: ctx.provider_name.to_string(),
+        model_provider: effective_provider_name.to_string(),
         model: ctx.model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
@@ -154,7 +161,7 @@ pub(crate) async fn interpret_chat_response(
     let call_cost_usd = resp
         .usage
         .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(effective_provider_name, ctx.model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
@@ -168,7 +175,7 @@ pub(crate) async fn interpret_chat_response(
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_usd: call_cost_usd,
-                provider_ref: ctx.provider_name.to_string(),
+                provider_ref: effective_provider_name.to_string(),
             })
             .await;
     }
@@ -477,6 +484,7 @@ mod cost_usd_regression_tests {
             channel: None,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            serving_provider_name: None,
         };
 
         let specs = IterationToolSpecs {

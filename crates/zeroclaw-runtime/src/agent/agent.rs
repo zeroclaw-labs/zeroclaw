@@ -2298,6 +2298,7 @@ impl Agent {
                                     .config
                                     .resolved
                                     .effective_context_budget(),
+                                model_context_window: self.config.resolved.model_context_window,
                                 knobs: &knobs,
                             },
                         ),
@@ -2483,7 +2484,7 @@ impl Agent {
             Some(turn_id.clone()),
         );
 
-let active_dispatcher = {
+        let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
@@ -2670,6 +2671,7 @@ let active_dispatcher = {
                                         .config
                                         .resolved
                                         .effective_context_budget(),
+                                    model_context_window: self.config.resolved.model_context_window,
                                     knobs: &knobs,
                                 },
                             ),

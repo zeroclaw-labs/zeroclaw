@@ -6807,12 +6807,11 @@ mod tests {
         };
 
         let max_ctx = Some(context_usage_max_tokens(&cfg, "coder"));
-        let model_ctx_window = cfg
-            .effective_model_context_window_opt("coder")
-            .map(|v| v as u64);
+        let model_ctx_window =
+            crate::agent::resolve_live_model_context_window(&cfg, "openrouter.default");
         assert!(
             model_ctx_window.is_none(),
-            "effective_model_context_window_opt must return None when no \
+            "resolve_live_model_context_window must return None when no \
              provider context_window is set"
         );
 

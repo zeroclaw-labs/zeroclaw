@@ -176,6 +176,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
                 context_token_budget: 100_000,
+                model_context_window: 0,
                 knobs: &LoopKnobs::default(),
             },
         ),

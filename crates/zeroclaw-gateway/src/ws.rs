@@ -1407,11 +1407,14 @@ async fn process_chat_message(
             // for accurate context_window resolution (accounts for vision routing
             // and mid-turn provider switches). Fall back to re-reading attribution
             // fields when no usage events were emitted.
-            let (model_context_window, provider_ref_label) = if let Some(ref provider_ref) = last_provider_ref {
+            let (model_context_window, provider_ref_label) = if let Some(ref provider_ref) =
+                last_provider_ref
+            {
                 let cfg = state.config.read();
-                let window = zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_ref);
+                let window =
+                    zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_ref);
                 // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
-                let label = provider_ref.split('.').last().unwrap_or(provider_ref);
+                let label = provider_ref.split('.').next_back().unwrap_or(provider_ref);
                 (window, label.to_string())
             } else {
                 let (_, live_provider, _) = agent.attribution_fields();
@@ -1419,8 +1422,14 @@ async fn process_chat_message(
                     (None, provider_label.clone())
                 } else {
                     let cfg = state.config.read();
-                    let window = zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, &live_provider);
-                    let label = live_provider.split('.').last().unwrap_or(&live_provider);
+                    let window = zeroclaw_runtime::agent::resolve_live_model_context_window(
+                        &cfg,
+                        &live_provider,
+                    );
+                    let label = live_provider
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(&live_provider);
                     (window, label.to_string())
                 }
             };
@@ -2199,12 +2208,11 @@ mod tests {
         };
 
         let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-        let model_ctx_window: Option<u64> = cfg
-            .effective_model_context_window_opt("coder")
-            .map(|v| v as u64);
+        let model_ctx_window =
+            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, "openrouter.default");
         assert!(
             model_ctx_window.is_none(),
-            "effective_model_context_window_opt must return None when no \
+            "resolve_live_model_context_window must return None when no \
              provider context_window is set, preserving absence at the \
              producer boundary"
         );
@@ -2276,13 +2284,12 @@ mod tests {
         };
 
         let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-        let model_ctx_window: Option<u64> = cfg
-            .effective_model_context_window_opt("coder")
-            .map(|v| v as u64);
+        let model_ctx_window =
+            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, "openrouter.glm-5.2");
         assert_eq!(
             model_ctx_window,
             Some(1_000_000),
-            "effective_model_context_window_opt must return the provider's \
+            "resolve_live_model_context_window must return the provider's \
              explicit context_window when set"
         );
 
