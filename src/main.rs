@@ -4852,6 +4852,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
+                // Propagate Ctrl+C into the supervisor's lifecycle token so
+                // listeners that perform their own graceful shutdown on Ctrl+C
+                // (e.g. WhatsApp Web) can return Ok(()) without the supervisor
+                // treating it as an unexpected exit and restarting them.
+                let ctrlc_cancel = cancel.clone();
+                let _ctrlc_guard = ::zeroclaw_spawn::spawn!(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    ctrlc_cancel.cancel();
+                });
                 let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
