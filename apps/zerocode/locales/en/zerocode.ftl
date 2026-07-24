@@ -440,7 +440,9 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
+zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
 zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
