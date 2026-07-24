@@ -4,7 +4,6 @@ use tokio::process::Command;
 
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
 /// `tailscale funnel` (public internet).
-///
 /// Requires Tailscale installed and authenticated (`tailscale up`).
 pub struct TailscaleTunnel {
     funnel: bool,

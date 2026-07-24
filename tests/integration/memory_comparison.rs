@@ -1,5 +1,4 @@
 //! Head-to-head comparison: SQLite vs Markdown memory backends
-//!
 //! Run with: cargo test --test memory_comparison -- --nocapture
 
 use std::time::Instant;

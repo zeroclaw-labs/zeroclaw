@@ -1,20 +1,4 @@
 //! Paginated stream reader for the JSONL log file.
-//!
-//! RAM contract: at any moment, in-memory state is bounded by `limit`
-//! (the number of events the caller asked for) plus a single-line read
-//! buffer. We do NOT slurp the whole file into a `String`.
-//!
-//! The pagination model is cursor-by-timestamp + cursor-by-id. Callers
-//! pass `until_ts` to ask for "events strictly older than this timestamp
-//! (or older with the same timestamp by id ordering)". Returning page
-//! includes `next_cursor` which is the oldest event's `(timestamp, id)`
-//! pair — callers use that to ask for the next page.
-//!
-//! Filters apply lazily: the reader scans backwards from EOF, decoding
-//! each line, applying the filter predicate, and stopping when it has
-//! collected `limit` matches or exhausted the file. Worst case for tight
-//! filters: the whole file is scanned. Best case (no filter): only
-//! `limit` lines decoded.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
@@ -26,14 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::LogEvent;
 
-/// Filter parameters for [`load_page`]. Each field is independent; an
-/// event must match ALL provided constraints to be included.
-///
-/// Per-attribution-field equality filters live in [`Self::field_eq`]:
-/// keys are any `zeroclaw.*` attribution name (e.g. `"agent_alias"`,
-/// `"channel"`, `"channel_type"`, `"risk_profile"`, `"model_provider"`).
-/// Adding a new attribution field anywhere in the schema requires no
-/// changes here — the filter looks it up dynamically.
 #[derive(Debug, Clone, Default)]
 pub struct LogFilter {
     /// RFC 3339 lower bound (inclusive).
@@ -42,14 +18,6 @@ pub struct LogFilter {
     pub until_ts: Option<String>,
     /// Match against the cursor's id when `until_ts` ties.
     pub until_id: Option<String>,
-    /// Upper bound on file position. When `Some`, the reader drops any
-    /// line whose `line_byte_end` exceeds this value, so a follow-up
-    /// page request only sees lines strictly older than the previous
-    /// page. The caller sets this from the previous page's
-    /// [`LogPage::next_cursor_line_offset`]. Independent of id
-    /// ordering, so it makes same-timestamp pagination deterministic
-    /// even when event ids are written in an order that diverges from
-    /// lexicographic order.
     pub until_line_offset: Option<u64>,
     /// Match exact event.action (case-insensitive).
     pub action: Option<String>,
@@ -74,17 +42,6 @@ pub struct LogFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogPage {
     pub events: Vec<LogEvent>,
-    /// `Some((timestamp, id))` when more older events may exist. This is
-    /// the **legacy** cursor: it tie-breaks same-timestamp events by
-    /// lexicographic id, which can drop earlier-written events when id
-    /// ordering diverges from file insertion order. Prefer
-    /// [`Self::next_cursor_line_offset`] when available — it is
-    /// independent of id ordering.
-    ///
-    /// Deprecated since 0.8.0; tracked for removal in
-    /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>. New code
-    /// should read [`Self::next_cursor_line_offset`] and pass it back
-    /// as [`LogFilter::until_line_offset`].
     #[deprecated(
         since = "0.8.0",
         note = "tie-breaks by lexicographic id and can silently drop events; \
@@ -102,23 +59,6 @@ pub struct LogPage {
     pub at_end: bool,
 }
 
-/// Load one page of events. Newest first.
-///
-/// Implementation: we open the file, read it line by line into a fixed
-/// in-memory buffer (capped at `limit` matched events). To preserve the
-/// "newest first" order without reading from the tail, we accumulate
-/// matched events into a `VecDeque`, keeping the cap = `limit`, popping
-/// the front when overflowed. Final result is reversed in place. That
-/// gives us a one-pass, single-allocation-bounded reader without needing
-/// `mmap` or reverse-byte-stream gymnastics.
-///
-/// When the caller supplies [`LogFilter::until_line_offset`] (from a
-/// previous page's [`LogPage::next_cursor_line_offset`]), the reader
-/// stops scanning as soon as it sees a line whose `line_byte_end` is at
-/// or past that offset. This both avoids re-scanning already-read bytes
-/// **and** makes same-timestamp pagination deterministic regardless of
-/// id ordering — the byte offset is the source of truth for "where I
-/// left off", independent of how ids sort lexicographically.
 #[allow(deprecated)] // we still populate `next_cursor` for backwards compat
 pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPage> {
     let limit = limit.clamp(1, 10_000);
@@ -199,11 +139,6 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
             continue;
         }
 
-        // Track each matched event's line_byte_end so we can produce a
-        // cursor that points at the oldest event currently in `window`
-        // — the one a follow-up page would resume from in file order.
-        // Pairing the offset with the event lets us update the cursor
-        // correctly when an overflow evicts the front of the deque.
         window.push_back((event, line_byte_end));
         if window.len() > limit {
             window.pop_front();
@@ -227,39 +162,6 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
     // they haven't upgraded to byte-offset cursors yet.
     let next_cursor = events.last().map(|e| (e.timestamp.clone(), e.id.clone()));
 
-    // We've reached the tail of the matched set when no older matching
-    // events were ever discarded during the scan AND we did not stop
-    // early because of the caller's cursor cap.
-    //
-    // The empty-page guard matters: when `until_line_offset` already
-    // sits at or past every line in the file but no events matched the
-    // caller's filter, the page is empty and `next_cursor_line_offset`
-    // is `None`. Without the empty-page override a caller would see
-    // `at_end = false` with no way to advance — they'd loop or 500.
-    // An empty page means "nothing more to paginate here", regardless
-    // of how we got there.
-    //
-    // Two specific scenarios this resolves (raised during review):
-    //
-    // 1. Log file rotated/truncated under us, with the caller's cursor
-    //    pointing past the new EOF. `stopped_early = true` (the cursor
-    //    cap fires on the first byte we read), `events.is_empty() = true`
-    //    (we never matched anything). Formula resolves to
-    //    `at_end = true` — a caller paging-until-at-end stops cleanly
-    //    instead of looping on the same empty page forever. The empty
-    //    page also returns `next_cursor_line_offset = None`, so a
-    //    caller that doesn't trust `at_end` still has nothing to page
-    //    on.
-    //
-    // 2. `stopped_early = true` AND the cursor cap falls in the
-    //    middle of the file (caller is mid-pagination) AND no events
-    //    in the scanned window matched the filter. The formula still
-    //    resolves to `at_end = true` via `events.is_empty()`. Is this
-    //    safe? Yes — the next page would re-scan the prefix up to the
-    //    same `until_line_offset` cap with the same filter and again
-    //    match nothing. Returning `at_end = true` short-circuits that
-    //    infinite re-scan. Callers that want to break out of a
-    //    no-match window can do so by clearing the filter.
     let at_end = !dropped_older && !stopped_early || events.is_empty();
 
     Ok(LogPage {
@@ -549,16 +451,6 @@ mod tests {
         assert!(older_page.at_end);
     }
 
-    /// Regression test for issue #7694: when many events share the same
-    /// timestamp, pagination must walk through every event exactly once
-    /// — no duplicates across pages and no losses. The reader breaks
-    /// ties by `(timestamp, id)`: events with `id >= cursor_id` at the
-    /// same timestamp are excluded so the boundary event is never
-    /// repeated.
-    ///
-    /// Note: ids in this fixture are written in lexicographic order
-    /// matching file order. Out-of-scope: reader behavior when id
-    /// ordering diverges from file order — flagged for follow-up.
     #[test]
     #[allow(deprecated)] // legacy cursor is the subject under test
     fn same_timestamp_pagination_walks_all_events_exactly_once() {
@@ -623,11 +515,6 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #7694: when the page boundary lands on
-    /// a timestamp that matches multiple events, the cursor's `until_id`
-    /// must exclude events with id >= cursor_id, not silently drop them.
-    /// Without the id tie-break, the same event would appear in two
-    /// consecutive pages.
     #[test]
     #[allow(deprecated)] // legacy cursor is the subject under test
     fn same_timestamp_cursor_does_not_duplicate_boundary_event() {
@@ -666,14 +553,6 @@ mod tests {
         assert_ne!(page2.events[0].id, page1.events[0].id);
     }
 
-    /// Regression test for follow-up #7694: when event ids are written in
-    /// an order that diverges from lexicographic order (deliberately
-    /// scrambled here), pagination driven by `next_cursor_line_offset`
-    /// must still walk every event exactly once. The legacy
-    /// `next_cursor` (lexicographic `until_id` tie-break) silently drops
-    /// events like `evt-c` and `evt-e` in this fixture because their ids
-    /// sort greater than the boundary id, so the byte-offset cursor is
-    /// the recommended path.
     #[test]
     fn line_offset_pagination_walks_scrambled_ids_exactly_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -730,10 +609,6 @@ mod tests {
         );
     }
 
-    /// Regression test: `next_cursor_line_offset` must point at the byte
-    /// offset immediately after the last event on the page, so passing
-    /// it back as `until_line_offset` resumes exactly where the previous
-    /// page left off with no overlap and no gap.
     #[test]
     fn line_offset_cursor_resumes_with_no_overlap_or_gap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -780,9 +655,6 @@ mod tests {
         );
     }
 
-    /// Regression test: `next_cursor_line_offset` must point at a byte
-    /// offset that strictly advances each page, so a caller can detect a
-    /// misbehaving cursor by comparing offsets.
     #[test]
     fn line_offset_cursor_advances_monotonically() {
         let tmp = tempfile::tempdir().unwrap();
@@ -822,10 +694,6 @@ mod tests {
         }
     }
 
-    /// Regression test: an `until_line_offset` of 0 must yield an empty
-    /// page without erroring. A stale cursor from a truncated or rotated
-    /// log that points at or before the file start should degrade
-    /// silently to "no events at or past this offset" rather than a 500.
     #[test]
     fn line_offset_cursor_at_file_start_returns_empty_page() {
         let tmp = tempfile::tempdir().unwrap();
@@ -856,12 +724,6 @@ mod tests {
         );
     }
 
-    /// Regression test: when `until_line_offset` sits at or past every
-    /// line in the file but the filter excludes all events, the page is
-    /// empty **and** the caller's cursor has nothing further to point
-    /// at. Reporting `at_end = false` here would deadlock callers that
-    /// page until `at_end` is true — they would loop forever on a page
-    /// that never produces events and never advances the cursor.
     #[test]
     fn empty_page_with_filter_excludes_everything_reports_at_end() {
         let tmp = tempfile::tempdir().unwrap();

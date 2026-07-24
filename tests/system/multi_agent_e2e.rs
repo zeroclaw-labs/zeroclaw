@@ -1,19 +1,7 @@
 //! End-to-end tests for the multi-agent runtime.
-//!
-//! Covers install-level upgrade and per-agent lifecycle paths that
-//! cross multiple subsystems (config schema, filesystem migration,
-//! per-agent memory, agents-table machinery). Tests run against a
-//! TempDir-rooted install so they're hermetic and can be run in
-//! parallel.
 
 use tempfile::TempDir;
 
-/// Filesystem migration: a legacy `<install>/workspace/` is split on
-/// first boot — shared databases (`memory/`, `sessions/`, `state/`)
-/// move to `<install>/data/`, per-agent plaintext (MEMORY.md,
-/// IDENTITY.md, SOUL.md, anything else) moves to
-/// `<install>/agents/default/workspace/`. Timestamped backup retains
-/// the legacy tree; re-run on a fresh-cleaned install is a no-op.
 #[test]
 fn legacy_install_upgrades_cleanly_with_backup() {
     let tmp = TempDir::new().unwrap();
@@ -104,11 +92,6 @@ fn legacy_install_upgrades_cleanly_with_backup() {
     );
 }
 
-/// Multi-agent install: two agents on different memory backends
-/// don't interfere. The schema validator rejects cross-backend
-/// `read_memory_from` entries at config load; the runtime only ever
-/// sees same-backend allowlists by the time the per-agent memory
-/// factory builds its wrappers.
 #[tokio::test]
 async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
@@ -138,9 +121,6 @@ async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
         );
     }
 
-    // Build per-agent wrappers and store an attributable row from
-    // each. Without an allowlist between them, neither sibling sees
-    // the other's row.
     let alpha_mem = zeroclaw_memory::create_memory_for_agent(&cfg, "alpha", None)
         .await
         .expect("per-agent memory for alpha");
@@ -199,21 +179,6 @@ async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
     );
 }
 
-/// Peer-group routing: a peer group can bind to an exact channel alias
-/// (`telegram.prod`) or to a bare channel type (`telegram`) for legacy
-/// type-wide compatibility. Asserts:
-///   1. Resolver: alpha (in the group) recognizes beta + the external
-///      operator on type `"telegram"` and refuses gamma (on the channel
-///      but not on the group).
-///   2. Resolver: gamma's resolved set is empty (no peer-group
-///      membership).
-///   3. Tool: alpha cannot dispatch to gamma — the rejection names the
-///      peer-set check, not a delivery failure, so the operator can
-///      tell why it bounced.
-///   4. Tool: alpha → beta routes in-process (the channel's bot
-///      identity is shared, so an outbound through the channel would
-///      loop back to inbound; agent-to-agent is process-internal by
-///      design) and the success output names that path.
 #[tokio::test]
 async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     use serde_json::json;

@@ -1,6 +1,6 @@
 # Mattermost
 
-REST v4 polling client. Self-hosted, on-prem, or sovereign-cloud Mattermost servers all work the same way: the bot polls the channels it can read every 3 seconds for new posts, and reply posts go out via `POST /api/v4/posts`.
+REST v4 polling and WebSocket client. By default the bot polls channels every 3 seconds for new posts; set `listen_mode = "websocket"` for near-real-time event delivery over a persistent WebSocket connection. Reply posts always go out via `POST /api/v4/posts` regardless of listen mode.
 
 ## Who can talk to the agent
 
@@ -40,6 +40,25 @@ There are two scoping modes.
 
 In both modes each channel has its own `since` cursor: the bot tracks the highest `create_at` it has processed per channel and passes that as `since=<ms>` on the next `GET /api/v4/channels/{id}/posts` call. Cursors do not leak across channels, so a slow-moving channel doesn't suppress posts on a busy one.
 
+## WebSocket mode
+
+Set `listen_mode = "websocket"` to switch from REST polling to a persistent WebSocket connection (`wss://<server>/api/v4/websocket`). The WebSocket mode:
+
+- Delivers new posts in near-real-time (no 3-second poll delay).
+- Reduces HTTP load on the Mattermost server (one connection vs. N polls/3s).
+- Returns failed sessions to the shared channel supervisor, which reconnects with bounded exponential backoff using the configured `reliability.channel_initial_backoff_secs` and `reliability.channel_max_backoff_secs` values.
+- Requires Mattermost v4.0+ (the `/api/v4/websocket` endpoint).
+
+Channel discovery, `mention_only`, `thread_replies`, audio transcription, and peer-group authorization work identically in both modes.
+
+**Trade-offs:**
+
+- WebSocket mode must maintain a persistent TCP+TLS connection.
+- During a reconnect window, messages posted to a channel may be missed because this listener does not yet request Mattermost connection resume/replay. Polling catches up via `since=` cursors.
+- Polling mode is more resilient to transient network interruptions at the cost of constant HTTP traffic.
+
+To roll back, set `listen_mode = "polling"` (or remove the field; polling is the default).
+
 ## Direct messages
 
 Mattermost classifies channels by `type`:
@@ -76,7 +95,7 @@ Two paths:
 
 ## Voice messages
 
-When `[transcription]` is configured and an inbound post has an audio attachment (mime `audio/*` or extension `ogg`/`mp3`/`m4a`/`wav`/`opus`/`flac`) with no text body, the audio is downloaded via `GET /api/v4/files/{file_id}` and routed through the configured transcription provider. The transcript is prefixed `[Voice] ` and becomes the message content. Attachments larger than 25 MB or longer than `transcription.max_duration_secs` are dropped with a WARN.
+When `[transcription]` is configured and an inbound post has an audio attachment (mime `audio/*` or extension `ogg`/`mp3`/`m4a`/`wav`/`opus`/`flac`) with no text body, the audio is downloaded via `GET /api/v4/files/{file_id}` and routed through the configured transcription provider. The transcript is prefixed `[Voice]` and becomes the message content. Attachments larger than 25 MB or longer than `transcription.max_duration_secs` are dropped with a WARN.
 
 ## Setup
 

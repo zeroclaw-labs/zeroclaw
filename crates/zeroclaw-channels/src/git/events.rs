@@ -1,15 +1,5 @@
 //! Provider-agnostic git-forge events and their mapping to
 //! `ChannelMessage`s.
-//!
-//! [`GitEvent`] normalizes inbound forge activity independent of which
-//! provider (GitHub today, GitLab/Gitea later) and which transport
-//! surfaced it: every provider constructs the same variant carrying the
-//! same dedup identity, so cross-transport, cross-provider de-duplication
-//! is a plain seen-set lookup. Also home to the channel's inbound
-//! filtering rules (self/bot/mention). No IO and no forge specifics —
-//! every function here is fixture-testable. Provider-specific payload
-//! shapes and their `GitEvent` constructors live under
-//! `providers::<forge>::mapping`.
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -193,12 +183,6 @@ impl GitEvent {
         }
     }
 
-    /// Transport-stable identity for de-duplication, doubling as the
-    /// `ChannelMessage` id. Must be derivable identically from every
-    /// transport that can surface the event — object ids where the id
-    /// space is shared, `owner/repo#number` where it isn't (PRs). The
-    /// `gh*`-style prefixes are provider-neutral namespacing on the
-    /// event-variant, not a forge marker; a second provider reuses them.
     pub fn dedup_id(&self) -> String {
         match self {
             Self::IssueCommentCreated(p) => format!("ghc_{}", p.comment_id),
@@ -255,15 +239,6 @@ impl GitEvent {
     }
 }
 
-/// Map a routed event to the `ChannelMessage` delivered to the agent
-/// loop, or `None` when the event is filtered out. `gate_mentions` is
-/// the route's call (message-path routes gate, sop-routed deliveries
-/// don't); the gate itself only ever bites on conversational events
-/// under `mention_only`. Self/bot filtering applies to every event.
-///
-/// `channel_key` is the channel's config/routing key (`"git"`) stamped on
-/// the message; the originating forge surfaces through attribution and the
-/// channel's logs, not the message body.
 pub fn event_to_message(
     event: &GitEvent,
     filter: &EventFilter<'_>,
@@ -596,12 +571,6 @@ fn message(
     }
 }
 
-/// Case-insensitive `@handle` match on a word boundary, so `@myapp` does
-/// not match `@myapp-helper`.
-///
-/// ASCII-only folding throughout this module: forge app slugs and logins
-/// are ASCII, and `to_ascii_lowercase` preserves byte offsets, which
-/// `strip_mention` relies on to index the original body safely.
 pub fn contains_mention(body: &str, handle: &str) -> bool {
     if handle.is_empty() {
         return false;

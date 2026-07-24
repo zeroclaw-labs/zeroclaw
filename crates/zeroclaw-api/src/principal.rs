@@ -1,34 +1,5 @@
 //! The authenticated subject — the single `Principal` every gateway/RPC/ACP
 //! connection carries once an [`crate`] auth provider has verified a credential.
-//!
-//! This is the shared identity contract for RFC #7141 ("Authentication Provider
-//! support"): each accepted auth provider (`oidc`, `ssh-key`, `peercred`, `native`)
-//! verifies its own credential kind and emits ONE uniform [`Principal`] carrying
-//! identity plus its asserted grant *claims*. Everything downstream — dispatch
-//! authorization, audit, per-principal session/memory isolation — reads this type
-//! and is therefore provider-agnostic.
-//!
-//! It lives in `zeroclaw-api` (the leaf crate) so it is importable by
-//! `zeroclaw-runtime` (the auth engine + control plane), `zeroclaw-gateway` /
-//! `zeroclaw-channels` (auth resolution), and any peer/A2A surface, with no
-//! dependency cycle. The verification *engine* (the provider trait + registry +
-//! IdP-claims→`Principal` mapping) lives in `zeroclaw-runtime/src/security/`; only
-//! the data contract lives here.
-//!
-//! **This is a foundational seam, deliberately extensible — not frozen.**
-//! [`AuthMethod`] and [`Principal`] are `#[non_exhaustive]`: a new provider adds an
-//! `AuthMethod` arm + a provider impl, and the resolved-grant fields the RFC
-//! requires (allowed-agents, config-write, admin/all — see [`Principal`]) are added
-//! as additive `Principal` fields by the IamPolicy-wiring epic. Consumers match
-//! `AuthMethod` with a `_` arm and construct `Principal` via [`Principal::new`];
-//! both changes are non-breaking. Scoping the seam to the *accepted* #7141 set keeps
-//! this PR from silently widening the security design ahead of the RFC decisions.
-//!
-//! Single source of truth: the legacy `NevisIdentity` (in
-//! `zeroclaw-runtime/src/security/nevis.rs`) carries an overlapping identity+grants
-//! shape today. Per RFC #7141 the `oidc` provider absorbs and **removes** it
-//! (`NevisConfig` collapses into `oidc`), so this is the one forward identity type —
-//! not a competing source of truth. The two coexist only until that provider lands.
 
 use serde::{Deserialize, Serialize};
 
@@ -75,14 +46,6 @@ impl AgentAlias {
     }
 }
 
-/// How a principal proved identity. The provider that authenticated it sets this.
-///
-/// Scoped to the **accepted RFC #7141 provider set** (OIDC, ssh-key, peercred,
-/// native) plus the unbound/trusted sentinels. The enum is `#[non_exhaustive]`:
-/// arms for not-yet-accepted providers are added additively by their own scoped
-/// change (e.g. a local `Password` provider once its #7141 scope is accepted; a
-/// `Peer` arm by the A2A effort), so landing them is never a silent widening of
-/// this foundational security seam. Consumers match exhaustively with a `_` arm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -94,7 +57,7 @@ pub enum AuthMethod {
     /// shared pairing bearer / trusted-local stdio. Carries the
     /// [`PrincipalId::SHARED_OPERATOR`] sentinel.
     SharedOperator,
-    /// External OpenID Connect IdP (RFC #7141 headline provider).
+    /// External OpenID Connect IdP (RFCheadline provider).
     Oidc,
     /// Challenge-response against a registered SSH public key.
     SshKey,
@@ -104,29 +67,9 @@ pub enum AuthMethod {
     Native,
 }
 
-/// The single authenticated subject, produced by an auth provider and consumed by
-/// every dispatch/authz/audit/isolation surface.
-///
-/// **Extensible, not frozen.** This struct is `#[non_exhaustive]` so later epics
-/// can ADD fields without a breaking change. Construct it via [`Principal::new`]
-/// plus the builder setters (or [`Principal::shared_operator`]), never a struct
-/// literal from another crate.
-///
-/// Field semantics:
-/// - [`Principal::id`] is the canonical join/attribution key (NOT `user_id`).
-/// - `roles` / `scopes` are the **claims the identity source asserted** — they are
-///   *inputs* to grant resolution, NOT ZeroClaw's resolved grants. The RFC #7141
-///   resolved-grant shape (allowed agents, config-write paths, admin/all), computed
-///   by `IamPolicy` from these claims, is added as additive fields in the
-///   IamPolicy-wiring epic (#7142); `#[non_exhaustive]` keeps that non-breaking.
-/// - `allowed_aliases` is today's coarse per-agent grant (the only resolved grant
-///   carried so far).
-/// - Constructed via a provider's `verify`, or [`Principal::shared_operator`] for
-///   the trusted-local path. Never half-built.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Principal {
-    /// Stable opaque id — the audit/approval/provenance origin and A2A join key.
     pub id: PrincipalId,
     /// Human/account identifier from the identity source (e.g. OIDC `sub`).
     /// Equals `id.0` for a real user; sentinel for [`AuthMethod::SharedOperator`].
@@ -154,11 +97,6 @@ pub struct Principal {
 }
 
 impl Principal {
-    /// The sentinel principal for the shared-bearer / trusted-local path. No
-    /// roles/scopes ⇒ authorization falls back to today's behaviour when no policy
-    /// is configured. Lets callers carry a `Principal` everywhere instead of an
-    /// `Option`, while [`Principal::is_authenticated`] still distinguishes it from
-    /// a real IdP principal.
     #[must_use]
     pub fn shared_operator() -> Self {
         Self {
@@ -346,5 +284,52 @@ mod tests {
     fn auth_method_serializes_snake_case() {
         let j = serde_json::to_string(&AuthMethod::SshKey).expect("serialize");
         assert_eq!(j, "\"ssh_key\"");
+    }
+
+    #[test]
+    fn authenticated_outcome_is_allowed_and_exposes_principal() {
+        // Existing tests cover Trusted and Denied but not the Authenticated arm.
+        let outcome = AuthOutcome::Authenticated(Principal::shared_operator());
+        assert!(outcome.is_allowed());
+        assert!(outcome.principal().is_some());
+    }
+
+    #[test]
+    fn none_auth_method_is_not_authenticated() {
+        let mut p = Principal::shared_operator();
+        p.auth_method = AuthMethod::None;
+        assert!(!p.is_authenticated());
+    }
+
+    #[test]
+    fn builder_methods_set_fields() {
+        let p = Principal::shared_operator()
+            .with_roles(vec!["admin".to_owned()])
+            .with_scopes(vec!["read".to_owned(), "write".to_owned()])
+            .with_mfa_verified(true)
+            .with_expires_at(42)
+            .with_allowed_aliases(vec![AgentAlias("bot".to_owned())]);
+        assert_eq!(p.roles, vec!["admin".to_owned()]);
+        assert_eq!(p.scopes.len(), 2);
+        assert!(p.mfa_verified);
+        assert_eq!(p.expires_at, 42);
+        assert_eq!(p.allowed_aliases.len(), 1);
+        assert_eq!(p.allowed_aliases[0].as_str(), "bot");
+    }
+
+    #[test]
+    fn every_deny_reason_is_not_allowed() {
+        for reason in [
+            DenyReason::NoCredential,
+            DenyReason::BadCredential,
+            DenyReason::TokenExpired,
+            DenyReason::MfaRequired,
+            DenyReason::AliasNotEntitled,
+            DenyReason::Misconfigured,
+        ] {
+            let outcome = AuthOutcome::Denied { reason };
+            assert!(!outcome.is_allowed());
+            assert!(outcome.principal().is_none());
+        }
     }
 }

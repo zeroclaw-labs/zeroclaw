@@ -1,12 +1,4 @@
 //! Tool input/output capture: leak-scan + truncation + denylist.
-//!
-//! The actual `LeakDetector` lives in `zeroclaw-runtime::security` (it
-//! depends on regex tables that themselves depend on other runtime types).
-//! This crate is upstream of runtime, so we can't reach the detector
-//! directly. Instead, callers in runtime invoke
-//! [`capture_tool_input`] / [`capture_tool_output`] with the post-scan
-//! string (the runtime side runs `LeakDetector::scan` first and passes
-//! the redacted output here for truncation + size-flagging).
 
 use crate::config::{LlmRequestPayloadPolicy, ResolvedPolicy, ToolIoPolicy};
 
@@ -70,15 +62,6 @@ fn capture_with_policy(
     }
 }
 
-/// Capture the (already leak-scanned) LLM request payload per the
-/// request-payload policy. Unlike tool I/O there is no per-tool denylist:
-/// the whole payload is gated by the policy alone, and `truncate_bytes`
-/// reuses the shared tool-io truncate cap. Returns `None` when the policy is
-/// `off` (the default) so the prompt is never persisted unless opted in.
-///
-/// Takes the policy + cap directly (not a [`ResolvedPolicy`]) so the call
-/// site can use [`crate::llm_request_payload_policy`] without holding the
-/// full resolved bundle.
 #[must_use]
 pub fn capture_llm_request(
     policy: LlmRequestPayloadPolicy,

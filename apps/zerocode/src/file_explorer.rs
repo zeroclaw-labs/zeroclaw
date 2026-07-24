@@ -1,5 +1,4 @@
 //! Reusable file explorer modal widget with multi-file selection.
-//!
 //! Browses the local filesystem where the TUI is running. Designed to
 //! be invoked from any pane (Chat, ACP, etc.).
 
@@ -103,11 +102,6 @@ impl FileExplorerState {
         state
     }
 
-    /// Create a directory picker that fetches entries from the remote daemon (WSS).
-    ///
-    /// Builds the struct with `remote_rpc` set **before** the first
-    /// `load_entries()` call so the listing comes from the remote daemon
-    /// rather than the local filesystem.
     pub fn new_dir_picker_remote(start_dir: PathBuf, rpc: Arc<crate::client::RpcClient>) -> Self {
         let mut state = Self {
             cwd: start_dir,
@@ -709,9 +703,6 @@ mod tests {
         );
     }
 
-    /// Verify that `new_dir_picker_remote` sends the initial listing request
-    /// over the RPC channel (not the local filesystem) and populates entries
-    /// from the remote response.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn new_dir_picker_remote_lists_via_rpc() {
         use crate::client::RpcClient;

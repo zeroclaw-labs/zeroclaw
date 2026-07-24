@@ -1,5 +1,4 @@
 //! Cloud pattern library for recommending cloud-native architectural patterns.
-//!
 //! Provides a built-in set of cloud migration and modernization patterns,
 //! with pattern matching against workload descriptions.
 

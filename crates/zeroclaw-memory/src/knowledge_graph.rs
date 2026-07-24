@@ -1,10 +1,4 @@
 //! Knowledge graph for capturing, organizing, and reusing expertise.
-//!
-//! SQLite-backed storage for knowledge nodes (patterns, decisions, lessons,
-//! experts, technologies, clients, contacts, and interactions) and directed
-//! edges (uses, replaces, extends, authored_by, applies_to, manages_client,
-//! contact_of, interacted_with). Supports full-text search, tag filtering, and
-//! relation traversal.
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -544,7 +538,6 @@ impl KnowledgeGraph {
     const MAX_SUBGRAPH_DEPTH: usize = 100;
 
     /// Extract a subgraph starting from `root_id` up to `depth` hops.
-    ///
     /// `depth` must be between 1 and `MAX_SUBGRAPH_DEPTH` (100).
     /// Uses a recursive CTE for efficient single-query bidirectional traversal.
     pub fn get_subgraph(

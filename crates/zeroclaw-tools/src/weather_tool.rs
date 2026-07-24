@@ -1,9 +1,4 @@
 //! Weather tool — fetches current conditions and forecast via wttr.in.
-//!
-//! Uses the free, no-API-key wttr.in service (`?format=j1` JSON endpoint).
-//! Supports any location wttr.in accepts: city names (in any language/script),
-//! airport IATA codes, GPS coordinates, zip/postal codes, and domain-based
-//! geolocation. Units default to metric but can be overridden per-call.
 
 use async_trait::async_trait;
 use serde::Deserialize;

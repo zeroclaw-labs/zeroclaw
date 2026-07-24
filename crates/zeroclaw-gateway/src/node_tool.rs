@@ -1,6 +1,5 @@
 //! Wraps a node capability as a zeroclaw [`Tool`] so it can be dispatched
 //! through the existing tool registry and agent loop.
-//!
 //! Tool names are prefixed with the node ID: `node:<node_id>:<capability_name>`.
 
 use std::sync::Arc;
@@ -20,7 +19,6 @@ tool_attribution!(NodeTool, ToolKind::Plugin);
 const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
 
 /// A zeroclaw [`Tool`] backed by a node capability.
-///
 /// The `prefixed_name` (e.g. `node:phone-1:camera.snap`) is what the agent
 /// loop sees. Invocations are routed to the connected node via WebSocket.
 pub struct NodeTool {

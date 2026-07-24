@@ -1,14 +1,5 @@
 //! Aardvark hardware tools — I2C, SPI, and GPIO operations via the Total Phase
 //! Aardvark USB adapter.
-//!
-//! All tools follow the same pattern as the built-in GPIO tools:
-//! 1. Accept an optional `device` alias parameter.
-//! 2. Resolve the Aardvark device from the [`DeviceRegistry`].
-//! 3. Build a [`ZcCommand`] and send it through the registered transport.
-//! 4. Return a [`ToolResult`] with human-readable output.
-//!
-//! These tools are only registered when at least one Aardvark adapter is
-//! detected at startup (see [`DeviceRegistry::has_aardvark`]).
 
 use super::device::DeviceRegistry;
 use super::protocol::ZcCommand;
@@ -29,7 +20,6 @@ tool_attribution!(GpioAardvarkTool, ToolKind::Plugin);
 // ── Factory ───────────────────────────────────────────────────────────────────
 
 /// Build the five Aardvark hardware tools.
-///
 /// Called from [`ToolRegistry::load`] when an Aardvark adapter is present.
 pub fn aardvark_tools(devices: Arc<RwLock<DeviceRegistry>>) -> Vec<Box<dyn Tool>> {
     vec![
@@ -44,7 +34,6 @@ pub fn aardvark_tools(devices: Arc<RwLock<DeviceRegistry>>) -> Vec<Box<dyn Tool>
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Resolve the Aardvark device from args and return an owned `DeviceContext`.
-///
 /// Thin wrapper so individual tool `execute` methods don't duplicate the logic.
 async fn resolve(
     registry: &Arc<RwLock<DeviceRegistry>>,
@@ -457,7 +446,6 @@ impl Tool for SpiTransferTool {
 // ── GpioAardvarkTool ──────────────────────────────────────────────────────────
 
 /// Tool: set or read the Aardvark adapter's GPIO pins.
-///
 /// The Aardvark has 8 GPIO pins accessible via the 10-pin expansion header.
 /// Each pin can be configured as input or output via bitmasks.
 pub struct GpioAardvarkTool {

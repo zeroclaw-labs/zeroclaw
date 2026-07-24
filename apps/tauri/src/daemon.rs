@@ -1,13 +1,4 @@
 //! Locate and launch a `zeroclaw daemon` when none is already running.
-//!
-//! The desktop app reuses an existing gateway/daemon on its port when one
-//! answers; otherwise it spawns its own `zeroclaw daemon` (the supervisor
-//! mode — `gateway start` alone can't hot-reload after the Quickstart).
-//!
-//! The spawned daemon is detached into its own process group so it keeps
-//! running as a background service after the app quits; the next launch finds
-//! it healthy and reuses it. It inherits the app's environment, so an operator
-//! (or a test harness) can point it at a specific config via `ZEROCLAW_CONFIG_DIR`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,7 +18,6 @@ fn zeroclaw_exe_name() -> &'static str {
 pub fn find_zeroclaw_binary() -> Option<PathBuf> {
     let exe_name = zeroclaw_exe_name();
 
-    // 1. Sibling of the desktop executable.
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.with_file_name(exe_name);
         if sibling.is_file() {

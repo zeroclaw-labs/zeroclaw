@@ -1,18 +1,4 @@
 //! Persisted Discord slash-command reconcile state.
-//!
-//! The Discord channel reconciles its application's global slash commands with
-//! the desired (skill-derived) set on every gateway `READY`. Discord's daily
-//! command-create budget is finite, so re-running a full GET + per-command diff
-//! on every process start — and re-hammering after a rate-limit — risks the
-//! daily reconcile-429 burst.
-//!
-//! This module persists, per application id, the fingerprint of the last
-//! *successful* reconcile and any active `Retry-After` cooldown, so that a
-//! restart skips an unchanged set and honours a server-imposed back-off instead
-//! of immediately retrying. State lives at `<workspace_dir>/state/slash-commands.json`
-//! (the same `state/` convention the model cache uses); when no workspace dir is
-//! configured, persistence degrades to a no-op and the channel behaves as it did
-//! before — a full reconcile each start.
 
 use std::path::{Path, PathBuf};
 
@@ -147,12 +133,6 @@ pub fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Derive a `Retry-After` deadline (unix seconds) from a `429` response.
-///
-/// Discord returns the wait in the JSON body's `retry_after` (seconds, may be
-/// fractional); the `Retry-After` and `X-RateLimit-Reset-After` headers carry
-/// the same in seconds. We take the first present, in that order, round up, and
-/// floor at one second so a missing/zero value still yields a real cooldown.
 pub fn retry_after_deadline(
     headers: &reqwest::header::HeaderMap,
     body: Option<&serde_json::Value>,

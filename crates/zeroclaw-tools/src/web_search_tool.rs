@@ -1,4 +1,6 @@
-use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_search_provider};
+use super::web_search_provider_routing::{
+    SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
+};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -60,11 +62,6 @@ impl WebSearchTool {
         }
     }
 
-    /// Create a `WebSearchTool` with config-reload and decryption support.
-    ///
-    /// `config_path` is the path to `config.toml` so the tool can re-read API
-    /// keys at execution time. `secrets_encrypt` controls whether the keys are
-    /// decrypted via `SecretStore`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         model_provider: String,
@@ -206,7 +203,7 @@ impl WebSearchTool {
             if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
                 anyhow::bail!(message);
             }
-            anyhow::bail!("DuckDuckGo search failed with status: {}", status);
+            return Err(http_search_failure("duckduckgo", status));
         }
 
         let html = response.text().await?;
@@ -290,7 +287,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Brave search failed with status: {}", response.status());
+            return Err(http_search_failure("brave", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -382,13 +379,6 @@ impl WebSearchTool {
             .await
     }
 
-    /// Build the production HTTP client for Tavily, wired through the
-    /// process-global runtime proxy state. Extracted so the
-    /// `search_tavily_with_client` test path can substitute a fresh
-    /// client and stay isolated from concurrent tests that mutate
-    /// `RUNTIME_PROXY_CONFIG` (a request built off a stale "enabled"
-    /// proxy snapshot otherwise routes through a non-existent proxy
-    /// and the wiremock connection fails).
     fn build_tavily_client(&self) -> anyhow::Result<reqwest::Client> {
         let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
         let builder =
@@ -428,7 +418,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Tavily search failed with status: {}", response.status());
+            return Err(http_search_failure("tavily", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -582,7 +572,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Jina AI search failed with status: {}", response.status());
+            return Err(http_search_failure("jina", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -632,12 +622,6 @@ impl WebSearchTool {
         Ok(lines.join("\n"))
     }
 
-    /// Resolve the Bocha AI API key from canonical config at use time.
-    ///
-    /// Unlike the legacy Brave/Tavily/Jina paths, there is intentionally no
-    /// boot-time snapshot for this key: `[web_search] bocha_api_key` in
-    /// `config.toml` is the single source of truth, so key rotation or
-    /// removal after boot takes effect on the next call without a restart.
     fn resolve_bocha_api_key(&self) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -716,16 +700,6 @@ impl WebSearchTool {
             .await
     }
 
-    /// Inner Bocha AI request implementation, parameterized on the HTTP client
-    /// and endpoint URL so request-shape tests can target a local mock server
-    /// with a client that doesn't read process-global proxy state. Production
-    /// calls always go through [`Self::search_bocha`].
-    ///
-    /// API docs: <https://bocha-ai.feishu.cn/wiki/RXEOw02rFiwzGSkd9mUcqoeAnNK>.
-    /// We always pass `summary: true` so each result carries an AI-generated
-    /// excerpt — that's the main draw over the snippet-only Brave/SearXNG
-    /// responses. `freshness` stays at `noLimit` (Bocha's docs explicitly
-    /// recommend this; narrower windows can return empty result sets).
     async fn search_bocha_with_client(
         &self,
         client: &reqwest::Client,
@@ -752,23 +726,13 @@ impl WebSearchTool {
 
         let status = response.status();
         if !status.is_success() {
-            anyhow::bail!("Bocha AI search failed with status: {}", status);
+            return Err(http_search_failure("bocha", status));
         }
 
         let json: serde_json::Value = response.json().await?;
         self.parse_bocha_results(&json, query)
     }
 
-    /// Parse Bocha's response shape into the same plain-text format used by
-    /// the other providers.
-    ///
-    /// Response layout (HTTP 200 success):
-    /// `{"code": 200, "msg": null, "data": {"webPages": {"value": [{"name",
-    /// "url", "snippet", "summary", "siteName", "datePublished"}, ...]}}}`.
-    ///
-    /// Bocha also returns business-logic failures as HTTP 200 with a non-200
-    /// `code` in the body — surface those instead of silently returning
-    /// "No results".
     fn parse_bocha_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         if let Some(code) = json.get("code").and_then(|c| c.as_i64())
             && code != 200
@@ -979,7 +943,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("SearXNG search failed with status: {}", response.status());
+            return Err(http_search_failure("searxng", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -1054,6 +1018,50 @@ fn duckduckgo_block_message(
     } else {
         None
     }
+}
+
+/// Classify a non-2xx HTTP status into a coarse search status for the agent-
+/// visible error tag. Called only on the failure path (`!status.is_success()`);
+/// 2xx never reaches here.
+///
+/// These classes are coarse heuristics, not verified provider contracts — a
+/// status code alone does not prove why a provider refused the request, and
+/// providers differ. 451 stays `Blocked` because RFC 9110 ties it to a
+/// legal-refusal reason; 5xx, 429, and 408 are `Unavailable` (provider-side or
+/// transient); other non-2xx statuses fall through to `ClientError` (request/
+/// credential side). DuckDuckGo's confirmed CAPTCHA block is intercepted
+/// upstream by `duckduckgo_block_message`, so this helper only sees non-block
+/// failures. The agent should treat the tag as a hint to verify, not a diagnosis.
+fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
+    match status.as_u16() {
+        451 => SearchStatus::Blocked, // legal block (RFC-tied refusal reason)
+        408 | 429 | 500..=599 => SearchStatus::Unavailable, // provider-side / transient
+        _ => SearchStatus::ClientError, // other non-success → request/credential side (coarse)
+    }
+}
+
+/// Build a provider HTTP-failure error whose message carries a precise
+/// `search_status` tag (blocked / unavailable / client_error) and an actionable
+/// hint matching the class. The central tool executor owns the failure log
+/// record; this helper emits no log of its own.
+///
+/// The runtime (`tool_execution.rs`) forwards the `Err` returned by `execute`
+/// to the agent as readable text, so placing actionable hints in the message
+/// makes them visible to the agent.
+fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
+    let search_status = classify_http_status(status);
+    let hint = match search_status {
+        SearchStatus::Blocked | SearchStatus::Unavailable => {
+            "Provider may be transiently unavailable or blocking the request; retry, or try a different provider (SearXNG, Brave, or Tavily)."
+        }
+        SearchStatus::ClientError => {
+            "The provider refused the request; verify the query, credentials, billing or quota, and provider configuration."
+        }
+    };
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status={}, http={status}). {hint}",
+        search_status.as_str()
+    ))
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
@@ -1249,6 +1257,90 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn http_search_failure_classifies_legal_block_as_blocked() {
+        // 451 (legal block) is the one status RFC 9110 ties to a refusal reason,
+        // so it is the one status classified as `Blocked`. It must surface
+        // search_status=blocked and the "different provider" hint. (403 and other
+        // 4xx fall through to client_error — see that case.)
+        let err = http_search_failure("brave", reqwest::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search_status=blocked"),
+            "451 must tag search_status=blocked, got: {msg}"
+        );
+        assert!(msg.contains("http=451"));
+        assert!(
+            msg.contains("different provider"),
+            "blocked status must suggest switching providers, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_search_failure_classifies_provider_side_failures_as_unavailable() {
+        // 5xx outages, 429 rate limiting, and 408 timeout are provider-side or
+        // transient — retrying or switching provider is the actionable remedy;
+        // each must tag `search_status=unavailable` and surface the "different
+        // provider" hint.
+        for status in [
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+        ] {
+            let err = http_search_failure("searxng", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=unavailable"),
+                "{status} must classify as unavailable, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("different provider"),
+                "unavailable status must suggest switching providers, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_search_failure_classifies_client_errors_as_client_error() {
+        // 400/401/402/403/404/410 all fall through to client_error as a coarse
+        // request/credential-side bucket — a status code alone doesn't prove the
+        // cause, so the hint stays neutral and asks the agent to verify, not to
+        // switch provider. DuckDuckGo's confirmed-block 403 is intercepted
+        // upstream by duckduckgo_block_message.
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::GONE,
+        ] {
+            let err = http_search_failure("tavily", status);
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("search_status=client_error"),
+                "{status} must classify as client_error, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("http={}", status.as_u16())),
+                "message must include the HTTP status code, got: {msg}"
+            );
+            assert!(
+                msg.contains("provider refused the request"),
+                "client_error hint must stay neutral, got: {msg}"
+            );
+            assert!(
+                !msg.contains("different provider"),
+                "client_error must NOT suggest switching providers, got: {msg}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_duckduckgo_request_reports_forbidden_status() {
         use wiremock::matchers::{method, path, query_param};
@@ -1270,6 +1362,36 @@ mod tests {
 
         assert!(err.to_string().contains("DuckDuckGo blocked"));
         assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_non_block_failure_with_status_tag() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("500 should be reported as a non-block HTTP failure");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search_status=unavailable"),
+            "non-block DDG failure must carry the search_status tag, got: {msg}"
+        );
+        assert!(
+            msg.contains("http=500"),
+            "non-block DDG failure must carry the HTTP status code, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1330,7 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_anomaly_modal_block() {
-        // Regression for #6373: DuckDuckGo's anti-bot page now ships an
+        // DuckDuckGo's anti-bot page now ships an
         // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
         // no verification form), and the old detector slid past it,
         // returning a misleading "No results found" message to the agent.
@@ -1658,12 +1780,6 @@ mod tests {
         assert_eq!(key, "tvly-secret-key");
     }
 
-    /// Regression: Tavily auth must travel as `Authorization: Bearer <key>`
-    /// (the documented contract per
-    /// https://docs.tavily.com/documentation/api-reference/endpoint/search),
-    /// NOT as an `api_key` field in the JSON body. The previous shape worked
-    /// against the live service for legacy reasons, but the docs identify
-    /// bearer-header as the canonical method.
     #[tokio::test]
     async fn test_tavily_request_uses_bearer_auth_header_not_body_field() {
         use wiremock::matchers::{header, method, path};
@@ -1694,9 +1810,6 @@ mod tests {
             false,
         );
 
-        // Isolated client so the request shape under test isn't affected
-        // by `RUNTIME_PROXY_CONFIG` mutations from sibling proxy_config
-        // tests running concurrently in the same process.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
@@ -2063,9 +2176,6 @@ mod tests {
         assert_eq!(key, "bocha-secret-key");
     }
 
-    /// Rotation and removal must take effect on the next call without a
-    /// restart: the key is resolved from `config.toml` on every call, never
-    /// from a snapshot taken at construction time.
     #[test]
     fn test_resolve_bocha_api_key_tracks_rotation_and_removal() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2186,10 +2296,6 @@ mod tests {
         );
     }
 
-    /// Bocha auth must travel as `Authorization: Bearer <key>` with the
-    /// documented body fields (`summary: true` for AI excerpts, `freshness:
-    /// "noLimit"` per Bocha's own recommendation, `count` bound to
-    /// `max_results`). The key is read from config at request time.
     #[tokio::test]
     async fn test_bocha_request_uses_bearer_auth_and_documented_body() {
         use wiremock::matchers::{header, method, path};
@@ -2218,9 +2324,6 @@ mod tests {
         .unwrap();
         let tool = bocha_tool(config_path, false);
 
-        // Isolated client so the request shape under test isn't affected
-        // by `RUNTIME_PROXY_CONFIG` mutations from sibling proxy_config
-        // tests running concurrently in the same process.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()

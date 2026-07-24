@@ -1,5 +1,4 @@
 //! Utility functions for `ZeroClaw`.
-//!
 //! This module contains reusable helper functions used across the codebase.
 
 /// Allowed serial device path prefixes — reject arbitrary paths for security.
@@ -22,36 +21,6 @@ pub fn is_serial_path_allowed(path: &str) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
-///
-/// This function safely handles multi-byte UTF-8 characters (emoji, CJK, accented characters)
-/// by using character boundaries instead of byte indices.
-///
-/// # Arguments
-/// * `s` - The string to truncate
-/// * `max_chars` - Maximum number of characters to keep (excluding "...")
-///
-/// # Returns
-/// * Original string if length <= `max_chars`
-/// * Truncated string with "..." appended if length > `max_chars`
-///
-/// # Examples
-/// ```ignore
-/// use zeroclaw::util::truncate_with_ellipsis;
-///
-/// // ASCII string - no truncation needed
-/// assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
-///
-/// // ASCII string - truncation needed
-/// assert_eq!(truncate_with_ellipsis("hello world", 5), "hello...");
-///
-/// // Multi-byte UTF-8 (emoji) - safe truncation
-/// assert_eq!(truncate_with_ellipsis("Hello 🦀 World", 8), "Hello 🦀...");
-/// assert_eq!(truncate_with_ellipsis("😀😀😀😀", 2), "😀😀...");
-///
-/// // Empty string
-/// assert_eq!(truncate_with_ellipsis("", 10), "");
-/// ```
 pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => {
@@ -63,19 +32,6 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Truncate a string to at most `max_chars` characters of **content**, then
-/// append a friendly marker of the form `…[truncated {n} of {total} chars]`.
-/// Returns `None` if `max_chars == 0` (meaning: don't write this field).
-///
-/// The marker reports how many characters were cut (`n`) out of the original
-/// `total`, so `n = total - max_chars` when the original exceeds the budget.
-///
-/// The marker is metadata and does **not** count against `max_chars`: the kept
-/// content is always exactly `max_chars` characters (char-boundary safe), with
-/// the marker appended on top. Callers that need a hard ceiling on total output
-/// length (content + marker) should apply their own bound downstream.
-///
-/// Used for OTel attribute truncation where `None` signals "omit this attribute entirely".
 pub fn truncate_field(s: &str, max_chars: usize) -> Option<String> {
     if max_chars == 0 {
         return None;
@@ -105,12 +61,6 @@ fn take_first_chars(s: &str, n: usize) -> &str {
     }
 }
 
-/// Recursively truncate all string leaves in a JSON value to `max_chars`.
-/// Returns `None` if `max_chars == 0` (meaning: don't write this field).
-///
-/// Preserves JSON structure (object keys, array order, nesting) — only
-/// string values are truncated. Used for tool arguments JSON where we want
-/// to keep the structure while bounding individual string values.
 pub fn truncate_json_leaves(v: &serde_json::Value, max_chars: usize) -> Option<serde_json::Value> {
     if max_chars == 0 {
         return None;
@@ -142,18 +92,6 @@ pub enum MaybeSet<T> {
     Null,
 }
 
-/// Return free heap memory at the top of glibc's arenas to the kernel.
-///
-/// After the session reaper or an explicit `session/close` drops an `Agent`
-/// and its conversation history, glibc keeps the freed pages in its per-arena
-/// free lists instead of `munmap`-ing them, so resident set size stays flat
-/// despite a correct free. This releases the arena tops so the daemon's RSS
-/// actually falls. No-op on targets without glibc's `malloc_trim`.
-///
-/// Gated on Linux + glibc specifically: `libc` is a `cfg(unix)`-only
-/// dependency, and `malloc_trim` is a glibc extension. A bare
-/// `target_env = "gnu"` also matches the `windows-gnu` target, where `libc`
-/// is absent and the call fails to resolve.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn release_freed_heap() {
     // SAFETY: `malloc_trim` only inspects and releases the allocator's own

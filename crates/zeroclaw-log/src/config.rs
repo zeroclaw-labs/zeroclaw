@@ -1,9 +1,4 @@
 //! Policy types parsed from the runtime's observability config.
-//!
-//! `zeroclaw-log` defines its own minimal [`LogConfig`] shape so it does
-//! not depend on `zeroclaw-config`. Callers convert the full
-//! `zeroclaw_config::schema::ObservabilityConfig` into a [`LogConfig`]
-//! before calling [`crate::init_from_config`].
 
 use std::path::{Path, PathBuf};
 

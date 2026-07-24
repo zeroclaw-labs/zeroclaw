@@ -19,27 +19,6 @@ const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// LINE Messaging API caps `sender.name` at 20 characters.
 const LINE_SENDER_NAME_MAX_CHARS: usize = 20;
 
-/// LINE Messaging API channel.
-///
-/// Receives messages via an embedded axum webhook server. Each incoming event
-/// carries a one-time `replyToken` (expires ~30 s). `send()` tries the Reply
-/// API first; if the token is gone it falls back to the Push API.
-///
-/// Mention detection uses LINE's native `message.mention.mentionees` field,
-/// which carries the bot's own `userId` — no display-name config needed.
-/// The bot's `userId` is fetched once from `GET /v2/bot/info` at startup.
-///
-/// ## Access policies
-///
-/// DM (1:1) access is controlled by `dm_policy`:
-/// - `open`      — respond to everyone
-/// - `pairing`   — require a one-time `/bind <code>` handshake (default)
-/// - `allowlist` — respond only to user IDs in the channel's peer group
-///
-/// Group/room access is controlled by `group_policy`:
-/// - `open`     — respond to every message
-/// - `mention`  — respond only when @mentioned (default)
-/// - `disabled` — ignore all group messages
 pub struct LineChannel {
     /// Long-lived channel access token — used for both Reply and Push APIs.
     channel_access_token: String,
@@ -55,12 +34,6 @@ pub struct LineChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle. `None` in tests and one-shot
-    /// builds (pairing then doesn't survive — and without persistence
-    /// the resolver never sees the paired user, matching telegram's
-    /// no-persistence semantics). `Some` in the long-running daemon,
-    /// wired via `.with_persistence(config)`. RwLock so concurrent
-    /// peer reads from sibling channels don't serialize.
     persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard — `Some` when `dm_policy = Pairing`.
     pairing: Option<Arc<PairingGuard>>,
@@ -207,7 +180,6 @@ async fn send_bind_reply(
 }
 
 /// Download audio/voice message binary from the LINE Content API.
-///
 /// LINE stores message content at `https://api-data.line.me/v2/bot/message/{id}/content`.
 /// Audio messages are typically M4A (`audio/x-m4a`).
 async fn download_audio_content(
@@ -806,14 +778,6 @@ impl LineChannel {
         self
     }
 
-    /// Construct a `LineChannel` directly from a [`zeroclaw_config::schema::LineConfig`].
-    ///
-    /// Mirrors [`LarkChannel::from_config`] — keeps construction logic inside the
-    /// channel crate rather than duplicating it across orchestrator call sites.
-    ///
-    /// `sender_name_resolver` is called at send-time to read the canonical
-    /// display-name from the live config (SSOT). Callers should close over
-    /// `Arc<RwLock<Config>>` so hot-reloads are reflected without restart.
     pub fn from_config(
         config: &zeroclaw_config::schema::LineConfig,
         alias: impl Into<String>,
@@ -853,7 +817,6 @@ impl LineChannel {
     }
 
     /// Enable voice/audio transcription for incoming LINE audio messages.
-    ///
     /// When enabled, `type = "audio"` webhook events are downloaded from the
     /// LINE Content API and transcribed before being forwarded to the agent.
     pub fn with_transcription(
@@ -865,12 +828,6 @@ impl LineChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
-                // Channel doesn't carry an agent identity itself; the
-                // configured local_whisper / openai / groq / etc.
-                // provider auto-acts as the agent_transcription_provider
-                // here so inbound audio routes to whichever single
-                // provider the operator configured under
-                // [transcription.<provider>].
                 let m = if config.local_whisper.is_some() {
                     m.with_agent_transcription_provider("local_whisper")
                 } else if config.openai.is_some() {
@@ -899,7 +856,6 @@ impl LineChannel {
         self
     }
 
-    /// Override the LINE API base URL. Intended for tests.
     #[cfg(test)]
     pub(crate) fn with_api_base_url(mut self, url: &str) -> Self {
         let url = url.trim_end_matches('/').to_string();
@@ -909,7 +865,6 @@ impl LineChannel {
         self
     }
 
-    /// Returns `true` if a pairing code is currently active.
     #[cfg(test)]
     pub(crate) fn pairing_code_active(&self) -> bool {
         self.pairing
@@ -918,7 +873,6 @@ impl LineChannel {
             .is_some()
     }
 
-    /// Verify `X-Line-Signature: <base64(HMAC-SHA256(body, channel_secret))>`.
     #[cfg(test)]
     pub(crate) fn verify_signature(&self, body: &[u8], signature_header: Option<&str>) -> bool {
         let Some(sig_b64) = signature_header else {
@@ -953,11 +907,6 @@ impl LineChannel {
         resp.json::<BotInfo>().await.map_err(Into::into)
     }
 
-    /// Resolve the canonical recipient for a source object.
-    ///
-    /// - `user` source  → userId  (1:1 chat)
-    /// - `group` source → groupId (group chat)
-    /// - `room` source  → roomId  (multi-person chat)
     #[cfg(test)]
     pub(crate) fn resolve_recipient(source: &serde_json::Value) -> Option<String> {
         let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -986,11 +935,6 @@ impl LineChannel {
         if code.is_empty() { None } else { Some(code) }
     }
 
-    /// Check whether the bot (`bot_user_id`) is mentioned in the message.
-    ///
-    /// Uses LINE's native `message.mention.mentionees` field — no display-name
-    /// matching needed. Returns the `(char_index, char_length)` of the first
-    /// matching mention so the caller can strip it from the text.
     fn find_bot_mention(msg_obj: &serde_json::Value, bot_user_id: &str) -> Option<(usize, usize)> {
         let mentionees = msg_obj
             .get("mention")
@@ -1046,21 +990,10 @@ impl LineChannel {
         chunks
     }
 
-    /// Normalize a configured display name to LINE's `sender.name` contract.
-    ///
-    /// The Messaging API caps `sender.name` at 20 characters; an overlong value
-    /// makes the whole Reply/Push message object invalid and the send bails on
-    /// the non-2xx response. Truncate on character boundaries so multibyte
-    /// display names cannot split a codepoint.
     fn normalize_sender_name(name: &str) -> String {
         name.chars().take(LINE_SENDER_NAME_MAX_CHARS).collect()
     }
 
-    /// Build the LINE `sender` object for icon/nickname switch.
-    ///
-    /// Returns `None` when `sender_name` is empty (LINE rejects empty names).
-    /// The name is normalized to LINE's 20-character `sender.name` limit here so
-    /// every send path is protected at a single choke point.
     fn build_sender_obj(name: &str, icon: &Option<String>) -> Option<serde_json::Value> {
         let name = Self::normalize_sender_name(name);
         if name.is_empty() {
@@ -1154,11 +1087,6 @@ impl LineChannel {
         Ok(())
     }
 
-    /// Start serving the webhook on an already-bound `TcpListener`.
-    ///
-    /// `bot_user_id` is used for native mention detection. The public `listen()`
-    /// fetches it automatically from `GET /v2/bot/info`; tests can supply it
-    /// directly to avoid a real network call.
     pub(crate) async fn listen_with_listener(
         &self,
         listener: tokio::net::TcpListener,
@@ -1217,11 +1145,6 @@ impl Channel for LineChannel {
         "line"
     }
 
-    /// Send a reply.
-    ///
-    /// Strategy: try the cached `replyToken` for the recipient first (free).
-    /// If no token is available (already consumed or expired), fall back to
-    /// the Push API.
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let reply_token = self.pending_tokens.write().remove(&message.recipient);
 
@@ -1244,11 +1167,6 @@ impl Channel for LineChannel {
         self.send_push(&message.recipient, &message.content).await
     }
 
-    /// Start the embedded webhook server and forward incoming text events to `tx`.
-    ///
-    /// Fetches the bot's `userId` and `displayName` from `GET /v2/bot/info` once
-    /// before starting the server. The `userId` is used for native mention detection
-    /// via `message.mention.mentionees`.
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_info = self.fetch_bot_info().await?;
         *self.sender_icon.write() = bot_info.picture_url;

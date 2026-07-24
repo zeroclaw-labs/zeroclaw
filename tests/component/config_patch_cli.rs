@@ -93,6 +93,7 @@ fn test_state(config: Config) -> AppState {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         reload_tx: None,
         node_registry: Arc::new(gateway::nodes::NodeRegistry::new(16)),
+        mdns_peer_registry: gateway::nodes::mdns::MdnsPeerRegistry::default(),
         path_prefix: String::new(),
         web_dist_dir: None,
         session_backend: None,
@@ -281,14 +282,6 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
 // `ensure_map_key_for_path` guard in `handle_patch`, api_config.rs:2040-2051)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `add` on a leaf under a not-yet-existing map-keyed alias (a brand-new
-/// `channels.telegram.<alias>`) now materializes the alias first instead of
-/// failing `Unknown property`, and the materialized alias is actually
-/// persisted to disk. A second op sets `bot_token` too — `TelegramConfig`'s
-/// `bot_token` field has no `#[serde(default)]`, so a section missing it
-/// fails to deserialize on the next load and gets salvaged back to defaults
-/// by the migration layer, which would make the round-trip assertion below
-/// meaningless.
 #[test]
 fn config_patch_add_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -322,9 +315,6 @@ fn config_patch_add_materializes_new_map_alias_and_persists() {
     );
 }
 
-/// HTTP's guard covers both `add` and `replace` identically (same
-/// `matches!(op.op.as_str(), "add" | "replace")` in `handle_patch`) — prove
-/// the CLI's does too.
 #[test]
 fn config_patch_replace_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -354,10 +344,6 @@ fn config_patch_replace_materializes_new_map_alias_and_persists() {
     assert!(bot.enabled);
 }
 
-/// `replace` on an EXISTING alias's leaf must still succeed, and must not
-/// re-touch the map-keyed section's alias set — guards against the new
-/// materialization guard accidentally re-creating (or disturbing) an alias
-/// that already exists.
 #[test]
 fn config_patch_replace_on_existing_alias_does_not_recreate_it() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -399,10 +385,6 @@ fn config_patch_replace_on_existing_alias_does_not_recreate_it() {
     assert!(!after.channels.telegram["existingbot"].enabled);
 }
 
-/// `remove`/`test` intentionally do NOT materialize (the new guard is
-/// `matches!(op_name, "add" | "replace")` only) — a nonexistent alias path
-/// via either op must still fail with the same `path_not_found` error as
-/// before this change, and must not create the alias as a side effect.
 #[test]
 fn config_patch_remove_and_test_do_not_materialize_unknown_alias() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -438,10 +420,6 @@ fn config_patch_remove_and_test_do_not_materialize_unknown_alias() {
     );
 }
 
-/// `add` on `/agents/default/<field>` is refused with `ValidationFailed` and
-/// a message naming the reserved alias, mirroring the schema-level
-/// `ensure_map_key_for_path_refuses_reserved_default_agent`
-/// (`crates/zeroclaw-config/src/alias_refs.rs`) and HTTP's identical guard.
 #[test]
 fn config_patch_add_on_reserved_default_agent_is_refused() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -476,11 +454,6 @@ fn config_patch_add_on_reserved_default_agent_is_refused() {
     );
 }
 
-/// The genuinely new risk: a patch document where `add` targets a brand-new
-/// alias's leaf, the alias gets materialized in-memory, but the op itself
-/// (or a later op in the same document) then fails post-apply
-/// `Config::validate()`. `config.save_dirty()` only runs after the whole op
-/// loop succeeds, so the phantom alias must never reach disk.
 #[test]
 fn config_patch_add_failure_after_materialization_does_not_persist_phantom_alias() {
     let config_dir = tempfile::tempdir().expect("temp config dir");

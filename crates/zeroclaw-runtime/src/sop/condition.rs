@@ -1,18 +1,5 @@
 use serde_json::Value;
 
-/// Evaluate a trigger condition against an event payload.
-///
-/// Condition syntax:
-///   - JSON path comparison: `$.key.subkey > 85`
-///   - Direct numeric comparison: `> 0` (used by peripheral triggers)
-///
-/// Supported operators: `>=`, `<=`, `!=`, `>`, `<`, `==`
-///
-/// Returns `false` (fail-closed) when:
-///   - payload is missing or empty
-///   - condition cannot be parsed
-///   - JSON path does not resolve to a value
-///   - extracted value and comparand are not comparable
 pub fn evaluate_condition(condition: &str, payload: Option<&str>) -> bool {
     let condition = condition.trim();
     if condition.is_empty() {

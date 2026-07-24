@@ -1,11 +1,3 @@
-//! Canonical event schema. OTel logs data model + ECS attribute
-//! conventions, with a `zeroclaw.*` namespace for the alias-bound
-//! domain attribution fields.
-//!
-//! On-disk JSON shape is the canonical contract — third-party tail
-//! consumers parse `serde_json::Value` and walk the keys. This struct is
-//! `pub(crate)` to keep external consumers off the typed surface.
-
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -214,15 +206,6 @@ pub fn is_attribution_field(name: &str) -> bool {
     false
 }
 
-/// ZeroClaw-domain attribution. Every field is alias-bound where
-/// applicable: `channel` is the `<type>.<alias>` composite, `model_provider`
-/// is the `<type>.<alias>` composite, etc. Composites are stored as three
-/// keys (`<prefix>`, `<prefix>_type`, `<prefix>_alias`) so filters can
-/// match either coarse or precise.
-///
-/// The shape is a flat string map flattened into the parent on-disk JSON,
-/// driven by [`ATTRIBUTION_FIELDS`] + [`COMPOSITE_PREFIXES`]. Adding a new
-/// attribution key requires extending those constants — nothing else.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZeroclawAttribution {
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -305,11 +288,8 @@ pub struct LogEvent {
     #[serde(default)]
     pub service: ServiceDescriptor,
 
-    /// Per-turn trace identifier so multiple events from one agent
-    /// turn group together in the UI. Populated by the `LogCaptureLayer`,
-    /// which promotes it from `attributes.trace_id`, set at the call site
-    /// via `record!(.. with_attrs(json!({"trace_id": ..})))` or inherited
-    /// from a `scope!(trace_id: ..)`.
+    /// Per-turn trace identifier promoted from attributes without removing the
+    /// attributes copy used by downstream observers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
 
@@ -334,6 +314,15 @@ pub struct LogEvent {
     /// the event is an error, …).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub attributes: Value,
+
+    /// Broadcast-only structured payload for short-lived secrets (QR
+    /// pairing payloads, pair codes). Deep-merged into `attributes` on
+    /// the copy sent to the in-memory broadcast hook (SSE `/api/events`)
+    /// and NEVER serialized — the persisted JSONL trace and `/api/logs`
+    /// never see these fields. `serde(skip)` enforces the at-rest
+    /// exclusion at the type level.
+    #[serde(skip)]
+    pub ephemeral_attributes: Value,
 
     /// Schema version. `2` = this struct. Older files containing version-1
     /// rows get migrated in place at daemon startup.
@@ -368,6 +357,7 @@ impl LogEvent {
             zeroclaw: ZeroclawAttribution::default(),
             message: None,
             attributes: Value::Null,
+            ephemeral_attributes: Value::Null,
             schema_version: LogEvent::SCHEMA_VERSION,
         }
     }
@@ -443,6 +433,7 @@ pub enum Action {
     Save,
     Migrate,
     Validate,
+    MemoryAudit,
     Note,
 }
 
@@ -465,6 +456,7 @@ pub struct Event {
     pub outcome: EventOutcome,
     pub duration_ms: Option<u64>,
     pub attrs: Option<Value>,
+    pub ephemeral_attrs: Option<Value>,
 }
 
 impl Event {
@@ -477,6 +469,7 @@ impl Event {
             outcome: EventOutcome::Unknown,
             duration_ms: None,
             attrs: None,
+            ephemeral_attrs: None,
         }
     }
 
@@ -504,6 +497,16 @@ impl Event {
         self
     }
 
+    /// Attach broadcast-only attributes for short-lived secrets (QR
+    /// payloads, pair codes). These reach the in-memory broadcast hook
+    /// (SSE `/api/events`) deep-merged into `attributes`, but are never
+    /// written to the persisted JSONL trace or served by `/api/logs`.
+    #[must_use]
+    pub fn with_ephemeral_attrs(mut self, attrs: Value) -> Self {
+        self.ephemeral_attrs = Some(attrs);
+        self
+    }
+
     #[must_use]
     pub fn category_str(&self) -> &'static str {
         self.category.map_or("", EventCategory::as_str)
@@ -519,6 +522,16 @@ impl Event {
     #[must_use]
     pub fn attrs_str(&self) -> String {
         match &self.attrs {
+            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+
+    /// JSON-encode the ephemeral attrs payload for tracing::event!
+    /// transport. Same mechanics as [`Self::attrs_str`].
+    #[must_use]
+    pub fn ephemeral_attrs_str(&self) -> String {
+        match &self.ephemeral_attrs {
             Some(v) => serde_json::to_string(v).unwrap_or_default(),
             None => String::new(),
         }

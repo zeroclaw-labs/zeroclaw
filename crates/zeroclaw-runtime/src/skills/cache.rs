@@ -1,39 +1,4 @@
 //! Process-global cache for skill-directory loads.
-//!
-//! [`super::load_skills_from_directory`] and `super::load_open_skills_from_directory`
-//! are pure functions of `(dir, allow_scripts, filesystem state)`, but each call
-//! does a recursive read *and* a full security audit (content scan + parse) of
-//! every skill subdirectory. They run on every prompt build and every
-//! `read_skill` invocation, so the cost recurs constantly even when nothing on
-//! disk has changed.
-//!
-//! This module memoizes the result keyed by `(canonical dir, allow_scripts, tag)`
-//! and validates freshness with a **content digest** of the directory: it hashes
-//! the bytes of every file reachable under `dir` (plus each symlink's target),
-//! never following symlinks so it can't loop. Because the digest covers file
-//! *content*, any change the auditor would care about — an edited `SKILL.md`, a
-//! flipped script, a retargeted symlink, altered TOML — produces a different
-//! signature and forces a re-audit. This matters specifically because the cache
-//! sits in front of the security audit: serving a cached "clean" verdict for
-//! content that has since changed would defeat the audit, so the freshness key is
-//! deliberately tied to the audited bytes rather than to metadata (mtime/length),
-//! which an edit can preserve. (The only residual risk is a 64-bit hash
-//! collision, which is not a practical forgery vector.)
-//!
-//! The digest reads each file once, but a cache *hit* then skips the audit's
-//! content scan, its regex/script/symlink checks, and the Markdown/TOML parsing —
-//! work the loader otherwise repeats (re-reading files) on every prompt build and
-//! every `read_skill` call. So the cache stays a net win without weakening the
-//! audit boundary.
-//!
-//! [`invalidate`] gives the [`super::SkillsService`] an explicit hook to drop the
-//! cache immediately after a write, so an added/edited/removed skill is picked up
-//! on the very next load without waiting on anything.
-//!
-//! Kill-switch: the cache is on by default; setting `ZEROCLAW_SKILLS_CACHE_ENABLED`
-//! to a falsey value (`0` / `false` / `no` / `off`) forces every load to re-walk
-//! and re-audit, i.e. the exact pre-cache behavior. This is a runtime off-ramp if
-//! the cache is ever suspected of serving stale results.
 
 use super::{DroppedSkill, Skill};
 use std::collections::hash_map::DefaultHasher;
@@ -51,12 +16,6 @@ struct CacheKey {
     tag: &'static str,
 }
 
-/// The cached unit of a skill-directory load: the loaded skills *and* the
-/// audit-dropped candidates the loader skipped. Caching both keeps the
-/// skipped-audit record (#7963) alive across cache hits without re-auditing —
-/// the whole point of the cache (see module docs). A side-channel that
-/// recomputed drops would re-walk + re-audit on every hit and defeat both the
-/// cache and the audit-parity guarantee.
 #[derive(Clone)]
 pub(super) struct LoadOutput {
     pub skills: Vec<Skill>,
@@ -97,15 +56,6 @@ fn cache_enabled() -> bool {
     cache_enabled_from_env(std::env::var(CACHE_ENABLED_ENV).ok().as_deref())
 }
 
-/// Content fingerprint of everything reachable under `dir` (recursive). Hashes
-/// each entry's path plus a digest of its *bytes* (files) or link target
-/// (symlinks). Never follows symlinks, so it can't loop on a cycle and matches
-/// the auditor's no-follow stance. Tying the key to content — not metadata an edit
-/// can preserve — is what keeps a cached "clean" audit verdict from outliving the
-/// bytes it audited. Only *regular* files are opened: a non-regular entry (FIFO,
-/// socket, device) makes this return `None` so we never block opening it just to
-/// build a key. Returns `None` too when `dir` is absent or any entry can't be
-/// read; callers treat that as "do not cache" rather than trust a partial digest.
 fn dir_signature(dir: &Path) -> Option<u64> {
     if !dir.exists() {
         return None;
@@ -138,12 +88,6 @@ fn dir_signature(dir: &Path) -> Option<u64> {
                 let digest = hash_file_contents(&path)?;
                 entries.insert(path, (1, digest));
             } else {
-                // Non-regular entry (FIFO, socket, device, ...). Opening a FIFO
-                // for read blocks on a writer, so probing it just to build the
-                // cache key could hang skill loading / prompt building — a far
-                // wider open surface than the uncached loader, which only reads
-                // the manifest it parses. Never open it: decline to cache this
-                // directory and let the uncached path handle whatever it is.
                 return None;
             }
         }
@@ -177,11 +121,6 @@ fn hash_file_contents(path: &Path) -> Option<u64> {
     Some(hasher.finish())
 }
 
-/// Memoize `load` for `(dir, allow_scripts, tag)`, validated by the directory
-/// signature. On a hit with a matching signature, returns a clone of the cached
-/// skills without touching the auditor. On a miss (or when the directory can't be
-/// signed) runs `load` and stores the result. Concurrent misses simply run the
-/// idempotent loader more than once; lock poisoning is recovered, not panicked.
 pub(super) fn cached_load(
     dir: &Path,
     allow_scripts: bool,
@@ -191,10 +130,6 @@ pub(super) fn cached_load(
     cached_load_in(cache(), dir, allow_scripts, tag, load)
 }
 
-/// Core of [`cached_load`] parameterized over the backing cache store. Production
-/// always passes the process-global [`cache`]; tests can pass a fresh local store
-/// so a hit/miss assertion is isolated from sibling tests (and their
-/// [`invalidate`] calls) under a parallel run.
 fn cached_load_in(
     cache: &RwLock<HashMap<CacheKey, CacheEntry>>,
     dir: &Path,
@@ -349,11 +284,6 @@ mod tests {
         );
     }
 
-    // Audit-boundary regression (review of #7786): the cache sits in front of the
-    // security audit, so an edit that preserves BOTH length and mtime — exactly the
-    // case a metadata-only signature would miss — must still force a re-audit. This
-    // would fail on the original mtime+length signature and passes because the key
-    // is now a content digest.
     #[test]
     fn same_length_same_mtime_edit_still_busts_cache() {
         let local_cache = RwLock::new(HashMap::new());
@@ -397,11 +327,6 @@ mod tests {
         );
     }
 
-    // Audit-boundary regression (review of #7786, round 2): a FIFO (or other
-    // non-regular entry) inside a skills dir must never be opened while building
-    // the cache key — opening a FIFO for read blocks on a writer and would hang
-    // skill loading / prompt building. `dir_signature` must bail to `None` so the
-    // directory simply bypasses the cache. If this regresses, the test hangs.
     #[cfg(unix)]
     #[test]
     fn non_regular_entry_bypasses_cache_without_hanging() {
@@ -526,17 +451,6 @@ mod tests {
         }
     }
 
-    // #7963: the dropped-skill record must ride the cache, so a cache HIT returns
-    // the same drops as the miss without re-running (re-auditing) the loader.
-    //
-    // This drives `cached_load_in` against a FRESH LOCAL cache store rather than the
-    // process-global one. The hit/miss assertions (loader runs exactly once; drops
-    // survive the hit) hinge on no other actor touching the entry between the miss
-    // and the hit. The global `invalidate()` clears the whole shared map, and every
-    // sibling cache test calls it on entry, so against the global cache a concurrent
-    // sibling could wipe this entry between the two loads and turn the expected hit
-    // into a miss under the default parallel run. A private store removes that shared
-    // state entirely, so the test is deterministic in parallel.
     #[test]
     fn dropped_records_survive_cache_hit() {
         let local_cache = RwLock::new(HashMap::new());

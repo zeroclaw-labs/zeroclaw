@@ -1,19 +1,5 @@
-//! Typed slash-command option model (contract tier): the option shapes that
-//! flow from a skill's `[[skill.slash_options]]` manifest declaration into the
-//! Discord application-command registration body. Pure data plus the trivial
-//! serialization to Discord's option JSON — no IO, no runtime types. Imported
-//! by `types` (the command spec carries a `Vec<OptionSpec>`) and by `slash`
-//! (which maps skill declarations into these and builds the registration body);
-//! imports no sibling impl module, so the contract layer stays acyclic.
-
 use serde_json::{Map, Value, json};
 
-/// Discord caps a registered option's static `choices` array — and an
-/// autocomplete answer's `choices` — at 25. A scalar option whose predefined
-/// list exceeds this can't be registered as static choices (Discord 400s); it
-/// is instead flagged `autocomplete: true` and its choices are served (filtered
-/// by the user's partial input) through the type-4 dispatch arm. The same cap
-/// truncates the answered set.
 pub(crate) const DISCORD_MAX_STATIC_CHOICES: usize = 25;
 
 /// A Discord application-command option type this channel supports. The wire
@@ -113,24 +99,10 @@ pub struct OptionSpec {
 }
 
 impl OptionSpec {
-    /// Whether this option is served via autocomplete (type-4) rather than a
-    /// static `choices` array. Discord forbids both on one option and rejects a
-    /// static list over [`DISCORD_MAX_STATIC_CHOICES`]; so a scalar option whose
-    /// predefined list exceeds that cap is registered `autocomplete: true` and
-    /// its choices are filtered + answered through the type-4 dispatch arm. A
-    /// small list (≤ cap) stays static — Discord renders it natively without
-    /// firing autocomplete, so marking it would only lose that native rendering.
     pub(crate) fn serves_autocomplete(&self) -> bool {
         self.kind.is_scalar() && self.choices.len() > DISCORD_MAX_STATIC_CHOICES
     }
 
-    /// The predefined choices matching a user's partial input, as
-    /// `(name, value)` pairs, capped at [`DISCORD_MAX_STATIC_CHOICES`]. The
-    /// filter is a case-insensitive substring match on the choice name (and,
-    /// for a non-empty partial, the value too), so a few keystrokes narrow a
-    /// large list. An empty partial returns the first `cap` choices. A
-    /// non-autocomplete option (no choices, or a small static list) returns
-    /// empty — only options flagged autocomplete receive type-4 events.
     pub(crate) fn matching_choices(&self, partial: &str) -> Vec<(String, String)> {
         if !self.serves_autocomplete() {
             return Vec::new();
@@ -223,15 +195,6 @@ fn number_value(v: f64, kind: OptKind) -> Value {
     }
 }
 
-/// Extract the values a user submitted for a slash command's options out of an
-/// INTERACTION_CREATE payload's `data.options[]`, as `(name, display)` pairs in
-/// the order Discord sent them. The value is stringified by JSON kind (string
-/// as-is; number/bool to text) for folding into the synthesized agent prompt.
-/// This generalises the single-`input` extractor for typed commands.
-///
-/// Limitation: user/channel/role/mentionable options yield the raw snowflake id
-/// (Discord puts the resolved entity in `data.resolved`, which is not consulted
-/// here) — resolving ids to display names/mentions is a follow-on.
 pub fn extract_submitted_options(data: &Value) -> Vec<(String, String)> {
     data.get("data")
         .and_then(|d| d.get("options"))
@@ -248,12 +211,6 @@ pub fn extract_submitted_options(data: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The focused option of an APPLICATION_COMMAND_AUTOCOMPLETE (type-4) payload,
-/// as `(command_name, option_name, partial_input)`. Discord marks exactly one
-/// `data.options[]` entry `"focused": true` and carries the user's partial text
-/// in its `value`. Returns `None` when no option is focused or the command name
-/// is absent (a malformed payload we simply can't complete). The partial is
-/// stringified (a focused integer/number option carries a numeric `value`).
 pub(crate) fn extract_focused_option(data: &Value) -> Option<(String, String, String)> {
     let d = data.get("data")?;
     let command = d.get("name")?.as_str()?.to_string();
@@ -534,11 +491,6 @@ mod tests {
     #[test]
     fn from_kind_projects_every_canonical_variant_to_matching_wire_type() {
         use zeroclaw_runtime::skills::SlashOptionKind as K;
-        // Walk the canonical registry: each variant projects to a wire OptKind
-        // whose manifest name round-trips back to the same canonical token, and
-        // whose capability flags agree with the canonical enum. Exhaustive by
-        // construction (walks `K::ALL`), so a new canonical variant that lacks a
-        // wire projection fails to compile in `from_kind` before it reaches here.
         for kind in K::ALL {
             let projected = OptKind::from_kind(kind);
             assert_eq!(

@@ -25,11 +25,6 @@ pub enum RouteAction {
     Sop { sop: String },
 }
 
-/// Resolve one event type against the routing table. Event types absent
-/// from the table fall back to the conversational default —
-/// `issue_comment.created`, `issues.opened`, and `pull_request.opened`
-/// are messages (the channel's original behavior); everything else is
-/// ignored unless listed.
 pub fn resolve_route(event_type: &str, table: &HashMap<String, GitEventRoute>) -> RouteAction {
     match table.get(event_type) {
         Some(route) => {

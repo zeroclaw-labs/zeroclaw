@@ -22,6 +22,14 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
+/// Max wait for the next streaming body read before the connection is treated
+/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
+/// long-running responses mid-stream), so without a per-read bound a connection
+/// that goes silent after the headers park `bytes_stream().next().await` forever
+/// and the turn hangs on "working". `read_timeout` caps the gap between reads and
+/// converts a silent stall into a retryable stream error.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
@@ -116,7 +124,7 @@ struct NativeToolFunctionSpec {
     name: String,
     description: String,
     /// `Arc`-shared with the tool registry's stored schema — serialized
-    /// transparently, never deep-cloned per request (#8642).
+    /// transparently, never deep-cloned per request
     parameters: std::sync::Arc<serde_json::Value>,
 }
 
@@ -205,35 +213,75 @@ impl NativeResponseMessage {
     }
 }
 
-impl OpenAiModelProvider {
-    pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self::with_base_url(alias, None, credential)
+/// Typed builder for [`OpenAiModelProvider`].
+///
+/// Only `alias` is required. `base_url` defaults to the module-level
+/// `BASE_URL` constant, `credential` treats whitespace-only inputs as
+/// missing, and `timeout_secs` uses the 120 s workspace default.
+#[must_use]
+pub struct OpenAiBuilder {
+    alias: String,
+    credential: Option<String>,
+    base_url: Option<String>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
+}
+
+impl OpenAiBuilder {
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
     }
 
-    /// Create a model_provider with an optional custom base URL.
-    /// Falls back to `https://api.openai.com/v1` when `base_url` is `None`.
-    pub fn with_base_url(alias: &str, base_url: Option<&str>, credential: Option<&str>) -> Self {
-        Self {
-            alias: alias.to_string(),
-            base_url: base_url
-                .map(|u| u.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| BASE_URL.to_string()),
-            credential: credential.map(ToString::to_string),
-            max_tokens: None,
-            timeout_secs: 120,
-        }
-    }
-
-    /// Override the HTTP request timeout for LLM API calls.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
+    /// Override the API endpoint. Trailing slashes are stripped.
+    pub fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.trim_end_matches('/').to_string());
         self
     }
 
     /// Set the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default 120 s is kept) so a stray `Some(0)` from
+    /// config cannot silently disable the safety timeout.
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub fn build(self) -> OpenAiModelProvider {
+        OpenAiModelProvider {
+            alias: self.alias,
+            base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            credential: self.credential,
+            max_tokens: self.max_tokens,
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+        }
+    }
+}
+
+impl OpenAiModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenAiBuilder`].
+    pub fn builder(alias: &str) -> OpenAiBuilder {
+        OpenAiBuilder {
+            alias: alias.to_string(),
+            credential: None,
+            base_url: None,
+            max_tokens: None,
+            timeout_secs: None,
+        }
     }
 
     /// Adjust temperature for models that have specific requirements.
@@ -298,13 +346,19 @@ impl OpenAiModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content");
@@ -489,12 +543,6 @@ impl ModelProvider for OpenAiModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
-            // Omit tool_choice when the tool list is empty — vLLM 0.19+ and
-            // spec-compliant validators reject tool_choice without a non-empty
-            // tools field (HTTP 400). `Self::convert_tools` is a plain
-            // `tools.map(...)`, so an empty input slice yields `Some(vec![])`
-            // (not `None`) — guard on `tools` being `Some` *and* the resulting
-            // list being non-empty, not merely on `is_some()`.
             tool_choice: tools
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
@@ -673,12 +721,6 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiModelProvider {
     }
 }
 
-// ── OpenAI Responses API provider (wire_api = "responses") ────────────────
-//
-// Uses the OpenAI Responses API (`/v1/responses`) with a standard API key.
-// Supports full streaming tool calls, unlike the chat-completions `OpenAiModelProvider`.
-// Constructed by the factory when `wire_api = "responses"` without Codex OAuth.
-
 /// Request body for the standard OpenAI Responses API.
 #[derive(Debug, Serialize)]
 struct ResponsesApiRequest {
@@ -774,7 +816,6 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 }
 
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
-///
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
 /// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
 pub(crate) async fn run_responses_sse(
@@ -903,29 +944,82 @@ pub struct OpenAiResponsesModelProvider {
     /// connect timeout so long-running responses aren't killed mid-stream.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
-    /// Extra HTTP headers to include on every request issued through
-    /// `http_client` / `streaming_client`. Each entry is merged into the
-    /// reqwest `Client` builder's `default_headers`.
-    ///
-    /// **Authorization is reserved.** An entry whose key matches
-    /// `Authorization` (case-insensitive) is dropped at
-    /// `build_default_headers` time with a WARN log. The provider's
-    /// built-in bearer credential (configured via the `credential`
-    /// constructor argument and emitted per-request as
-    /// `Authorization: Bearer <key>`) is authoritative; operator auth
-    /// overrides via `extra_headers` are not supported on this code path
-    /// because reqwest 0.12 *appends* per-request headers on top of
-    /// `default_headers` rather than substituting them, which would
-    /// produce two `Authorization` values on the wire and cause most
-    /// servers to reject or pick non-deterministically. To rotate the
-    /// bearer credential, pass it through the `credential` constructor
-    /// argument instead.
     extra_headers: std::collections::HashMap<String, String>,
 }
 
-impl OpenAiResponsesModelProvider {
-    pub fn new(alias: &str, api_url: Option<&str>, credential: Option<&str>) -> Self {
-        let responses_url = api_url
+/// Typed builder for [`OpenAiResponsesModelProvider`].
+///
+/// Only `alias` is required. `api_url` defaults to the OpenAI Responses
+/// endpoint; if a custom URL is supplied, `/responses` is appended when
+/// not already present so callers can pass either shape. Every runtime
+/// override (`timeout_secs` / `max_tokens` / `reasoning_effort` /
+/// `extra_headers`) is set via a chain method on this builder before
+/// [`Self::build`] — the built provider itself has no post-construction
+/// mutators.
+#[must_use]
+pub struct OpenAiResponsesBuilder {
+    alias: String,
+    api_url: Option<String>,
+    credential: Option<String>,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
+    timeout_secs: Option<u64>,
+    extra_headers: std::collections::HashMap<String, String>,
+}
+
+impl OpenAiResponsesBuilder {
+    /// Override the API endpoint. The `/responses` suffix is appended
+    /// automatically if the input does not already end in it.
+    pub fn api_url(mut self, api_url: &str) -> Self {
+        self.api_url = Some(api_url.to_string());
+        self
+    }
+
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Override the non-streaming HTTP request timeout. Values of 0 are
+    /// ignored (the default 120 s is kept) so a stray `Some(0)` from
+    /// config cannot silently disable the safety timeout — same guard
+    /// applied by [`OpenAiBuilder::timeout_secs`],
+    /// [`crate::compatible::OpenAiCompatibleBuilder::timeout_secs`], and
+    /// [`crate::openrouter::OpenRouterBuilder::timeout_secs`].
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    /// Set extra HTTP headers to include on every request. Reserved
+    /// keys (e.g. `Authorization`) are dropped at request-build time —
+    /// see [`OpenAiResponsesModelProvider`] for details.
+    pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    pub fn build(self) -> OpenAiResponsesModelProvider {
+        let responses_url = self
+            .api_url
+            .as_deref()
             .map(|url| {
                 let trimmed = url.trim_end_matches('/');
                 if trimmed.ends_with("/responses") {
@@ -935,45 +1029,31 @@ impl OpenAiResponsesModelProvider {
                 }
             })
             .unwrap_or_else(|| RESPONSES_URL.to_string());
-        Self {
-            alias: alias.to_string(),
+        OpenAiResponsesModelProvider {
+            alias: self.alias,
             responses_url,
-            credential: credential.map(ToString::to_string),
-            max_tokens: None,
-            reasoning_effort: None,
-            timeout_secs: 120,
-            extra_headers: std::collections::HashMap::new(),
+            credential: self.credential,
+            max_tokens: self.max_tokens,
+            reasoning_effort: self.reasoning_effort,
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+            extra_headers: self.extra_headers,
         }
     }
+}
 
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
-    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
-        self.reasoning_effort = effort;
-        self
-    }
-
-    /// Override the non-streaming HTTP request timeout in seconds.
-    /// Streaming SSE calls are unaffected; they use the connect-timeout-only
-    /// `streaming_client` so long responses aren't killed by a total timeout.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
-        self
-    }
-
-    /// Set the extra HTTP headers to include on every request issued through
-    /// this provider. Invalid header names / values are logged at WARN and
-    /// skipped at client-construction time (see `http_client` /
-    /// `streaming_client`).
-    pub fn with_extra_headers(
-        mut self,
-        headers: std::collections::HashMap<String, String>,
-    ) -> Self {
-        self.extra_headers = headers;
-        self
+impl OpenAiResponsesModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenAiResponsesBuilder`].
+    pub fn builder(alias: &str) -> OpenAiResponsesBuilder {
+        OpenAiResponsesBuilder {
+            alias: alias.to_string(),
+            api_url: None,
+            credential: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
+        }
     }
 
     fn build_request(
@@ -1006,17 +1086,6 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    /// Build the default-header set from `extra_headers`. Returns an empty
-    /// `HeaderMap` when the provider has no extra headers configured.
-    ///
-    /// Reserved keys (case-insensitive `Authorization`) are dropped with
-    /// a WARN log: the provider's built-in bearer credential is
-    /// authoritative, and an operator-set `Authorization` would produce
-    /// two header values on the wire (reqwest 0.12 appends per-request
-    /// headers on top of `default_headers`, it does not substitute them).
-    ///
-    /// Invalid header names / values are also logged at WARN and skipped
-    /// (matching the `OpenAiCompatibleModelProvider::http_client` policy).
     fn build_default_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.extra_headers {
@@ -1054,14 +1123,6 @@ impl OpenAiResponsesModelProvider {
         headers
     }
 
-    /// HTTP client for non-streaming responses requests: total timeout from
-    /// `self.timeout_secs` plus a 10s connect timeout, plus any
-    /// `extra_headers` (with reserved keys dropped — see
-    /// `build_default_headers`) merged into reqwest `default_headers`.
-    /// The per-request `.header("Authorization", ...)` calls in
-    /// `chat` / `chat_with_system` / `stream_chat` are the sole source of
-    /// the `Authorization` value on the wire; the built-in provider
-    /// credential is therefore authoritative on this code path.
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1073,15 +1134,11 @@ impl OpenAiResponsesModelProvider {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
-    /// HTTP client for streaming SSE connections: connect timeout only,
-    /// no total timeout (a total timeout would kill long-running SSE
-    /// responses mid-stream). When `extra_headers` is non-empty they are
-    /// merged into `default_headers`; per-request `.header(...)` calls
-    /// (e.g. `Authorization`, `Accept: text/event-stream`) override any
-    /// matching `default_headers` entries.
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(STREAM_IDLE_TIMEOUT);
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
@@ -1325,47 +1382,40 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("openai-test-credential"))
+            .build();
         assert_eq!(p.credential.as_deref(), Some("openai-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn responses_url_appends_responses_to_custom_base() {
-        let p =
-            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
+        let p = OpenAiResponsesModelProvider::builder("opencode")
+            .api_url("https://opencode.ai/zen/v1")
+            .credential(None)
+            .build();
         assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
     }
 
     #[test]
     fn responses_url_defaults_to_openai_when_base_absent() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .credential(None)
+            .build();
         assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
-    // ----------------------------------------------------------
-    // Issue #7690 follow-up: timeout_secs + extra_headers wiring.
-    //
-    // The PR #8037 wire-body pin covers `max_tokens` / `reasoning_effort` /
-    // model / instructions / temperature / stream / tools / tool_choice /
-    // parallel_tool_calls (everything that flows through `build_request`).
-    // The two remaining runtime options the issue asked for —
-    // `provider_timeout_secs` and `extra_headers` — are client-level
-    // (they configure the `reqwest::Client` builder), so they need
-    // different tests: builder-propagation tests for the struct fields,
-    // and `build_default_headers` tests for the HeaderMap shape (reqwest
-    // `Client` does not expose its internal timeout or default_headers,
-    // so the HeaderMap is the only testable surface).
-    // ----------------------------------------------------------
-
     #[test]
     fn responses_provider_defaults_timeout_to_120() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        let p = OpenAiResponsesModelProvider::builder("test").build();
         assert_eq!(
             p.timeout_secs, 120,
             "fresh provider must default timeout_secs to 120 (matches OpenAiCompatibleModelProvider)"
@@ -1374,7 +1424,7 @@ mod tests {
 
     #[test]
     fn responses_provider_defaults_extra_headers_to_empty() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        let p = OpenAiResponsesModelProvider::builder("test").build();
         assert!(
             p.extra_headers.is_empty(),
             "fresh provider must default extra_headers to an empty HashMap"
@@ -1382,27 +1432,31 @@ mod tests {
     }
 
     #[test]
-    fn with_timeout_secs_overrides_default() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None).with_timeout_secs(45);
+    fn timeout_secs_overrides_default() {
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .timeout_secs(45)
+            .build();
         assert_eq!(
             p.timeout_secs, 45,
-            "with_timeout_secs must override the 120 default"
+            "builder .timeout_secs(...) must override the 120 default"
         );
     }
 
     #[test]
-    fn with_extra_headers_propagates() {
+    fn extra_headers_propagates() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
         headers.insert(
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .extra_headers(headers)
+            .build();
         assert_eq!(
             p.extra_headers.len(),
             2,
-            "with_extra_headers must store the configured headers"
+            "builder .extra_headers(...) must store the configured headers"
         );
         assert_eq!(
             p.extra_headers.get("X-Title").map(String::as_str),
@@ -1418,7 +1472,7 @@ mod tests {
 
     #[test]
     fn build_default_headers_is_empty_when_no_extra_headers() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        let p = OpenAiResponsesModelProvider::builder("test").build();
         let headers = p.build_default_headers();
         assert!(
             headers.is_empty(),
@@ -1434,7 +1488,9 @@ mod tests {
             "HTTP-Referer".to_string(),
             "https://example.com".to_string(),
         );
-        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1463,7 +1519,9 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X Valid".to_string(), "ok".to_string()); // space → invalid
         headers.insert("X-Also-Valid".to_string(), "ok".to_string());
-        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1484,7 +1542,9 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Bad-Value".to_string(), "has\0nul".to_string()); // NUL → invalid
         headers.insert("X-Good-Value".to_string(), "ok".to_string());
-        let p = OpenAiResponsesModelProvider::new("test", None, None).with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1497,38 +1557,17 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------
-    // Issue #7690 follow-up: Authorization header precedence (option A).
-    //
-    // Per the review on PR #8037 (singlerider, 2026-06-23): reqwest 0.12
-    // *appends* per-request headers on top of `default_headers`, it does
-    // not substitute them. An `Authorization` entry in `extra_headers`
-    // therefore produces two `Authorization` values on the wire and
-    // most servers reject or pick non-deterministically. The fix is to
-    // drop the reserved key (case-insensitive) from the merge and emit
-    // a WARN. The provider's built-in bearer credential (set via the
-    // `credential` constructor argument and emitted per-request as
-    // `Authorization: Bearer <key>`) stays authoritative.
-    //
-    // These tests pin the precedence at the `build_default_headers`
-    // surface (the only HeaderMap observable test seam — reqwest
-    // `Client` does not expose its internal `default_headers`).
-    // ----------------------------------------------------------
-
     #[test]
     fn build_default_headers_drops_authorization_in_favor_of_builtin() {
-        // Operator sets an `Authorization` in `extra_headers`. The
-        // builder must drop it (case-insensitive) and emit a WARN. The
-        // built-in provider credential (set via the `credential`
-        // constructor argument) is the sole `Authorization` source on
-        // the wire.
         let mut headers = std::collections::HashMap::new();
         headers.insert(
             "Authorization".to_string(),
             "Bearer operator-override".to_string(),
         );
-        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
-            .with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .api_url("sk-builtin")
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert!(
             default_headers.get("Authorization").is_none(),
@@ -1554,8 +1593,10 @@ mod tests {
         ] {
             let mut headers = std::collections::HashMap::new();
             headers.insert(variant.to_string(), "Bearer x".to_string());
-            let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
-                .with_extra_headers(headers);
+            let p = OpenAiResponsesModelProvider::builder("test")
+                .api_url("sk-builtin")
+                .extra_headers(headers)
+                .build();
             let default_headers = p.build_default_headers();
             assert!(
                 default_headers.get("Authorization").is_none(),
@@ -1571,11 +1612,6 @@ mod tests {
 
     #[test]
     fn build_default_headers_preserves_non_authorization_extra_headers() {
-        // Reserved-key drop is *narrow*: only `Authorization` (and its
-        // case variants) is reserved. Other custom headers flow through
-        // unchanged. This pins that the drop does not accidentally widen
-        // to a deny-list of common headers like `Cookie`, `X-Api-Key`,
-        // etc.
         let mut headers = std::collections::HashMap::new();
         headers.insert(
             "Authorization".to_string(),
@@ -1587,8 +1623,10 @@ mod tests {
             "https://example.com".to_string(),
         );
         headers.insert("X-Trace-Id".to_string(), "trace-123".to_string());
-        let p = OpenAiResponsesModelProvider::new("test", Some("sk-builtin"), None)
-            .with_extra_headers(headers);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .api_url("sk-builtin")
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1621,14 +1659,27 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_empty_key() {
-        let p = OpenAiModelProvider::new("test", Some(""));
-        assert_eq!(p.credential.as_deref(), Some(""));
+    fn empty_key_is_treated_as_missing() {
+        // Whitespace-only / empty credentials collapse to None so a stray
+        // "" from config cannot produce a bogus `Bearer ` header. Matches
+        // the trim-then-filter contract shared with anthropic/openrouter/
+        // azure/compat.
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some(""))
+            .build();
+        assert!(p.credential.is_none());
+
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("  \t  "))
+            .build();
+        assert!(p.credential.is_none());
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -1636,7 +1687,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -1728,7 +1781,9 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = OpenAiModelProvider::new("test", None);
+        let model_provider = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
@@ -1779,7 +1834,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1804,7 +1861,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_rejects_invalid_tool_shape() {
-        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("openai-test-credential"))
+            .build();
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1939,6 +1998,39 @@ mod tests {
         let native = OpenAiModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // Pins that the openai `convert_messages` call site of
+        // `sanitize_tool_arguments` is wired in. The helper contract itself is
+        // covered in `compatible::tests::sanitize_tool_arguments_*`.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#.to_string(),
+        )];
+
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#.to_string(),
+        )];
+
+        let native = OpenAiModelProvider::convert_messages(&messages);
+        let tool_calls = native[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
     }
 
     #[test]
@@ -2106,93 +2198,12 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------
-    // Responses-wire option propagation (#7690)
-    //
-    // Pinned regression: non-default options configured on
-    // `OpenAiResponsesModelProvider` (via the `with_*` builders) must
-    // survive into `ResponsesApiRequest` at the wire boundary. Without
-    // these tests, a future refactor could silently drop
-    // `max_tokens` / `reasoning_effort` / `responses_url` / tools /
-    // instructions / temperature while existing smoke tests still pass.
-    //
-    // Test seam: `build_request` is private but reachable via `super::*`
-    // from this `#[cfg(test)] mod tests`. We construct the provider with
-    // the non-default option, call `build_request` with minimal
-    // required arguments, serialize to JSON, and assert each option is
-    // present in the wire body (or, for URL, in the field
-    // `responses_url`).
-    //
-    // No live network dependency. No provider credentials required.
-    // ----------------------------------------------------------
-    //
-    // Supported options (asserted below with `propagates_*_when_set`
-    // tests, and pinned for `None` propagation with `omits_*_when_unset`
-    // tests):
-    //
-    // | Provider builder        | Wire field on `ResponsesApiRequest` | Notes                                  |
-    // |-------------------------|--------------------------------------|----------------------------------------|
-    // | `with_max_tokens`       | `max_output_tokens`                  | Omits when `None`                      |
-    // | `with_reasoning_effort` | `reasoning.effort`                   | Omits when `None`                      |
-    // | `with_timeout_secs`     | (client-level: reqwest total timeout) | Default 120; non-streaming only        |
-    // | `with_extra_headers`    | (client-level: reqwest default headers) | Invalid names/values WARN-skipped     |
-    // | (model arg)             | `model`                              | Always present                         |
-    // | (instructions arg)      | `instructions`                       | Omits when `None`                      |
-    // | (temperature arg)       | `temperature`                        | Force-1.0 for o1/o3/gpt-5-*; else pass |
-    // | (stream arg)            | `stream`                             | Always present (bool)                  |
-    // | (tools arg)             | `tools`                              | Omits when `None`                      |
-    // | (tool_choice arg)       | `tool_choice`                        | Omits when `None` AND tools absent     |
-    // | (parallel arg)          | `parallel_tool_calls`                | Omits when `None` AND tools absent     |
-    //
-    // Intentionally NOT propagated by the responses wire (these would
-    // be silently dropped — listed here as known-unsupported for this
-    // code path so future maintainers do not "fix" them by quietly
-    // adding fields the OpenAI Responses API does not accept):
-    //
-    // - `top_p` — Responses API has no `top_p`; callers who need it
-    //   must use the legacy `OpenAiModelProvider` (chat-completions
-    //   path).
-    // - `frequency_penalty` / `presence_penalty` — Responses API
-    //   rejects both. Same fallback path as `top_p`.
-    // - `stop` / `seed` — not exposed by
-    //   `OpenAiResponsesModelProvider`'s `with_*` builders; add to this
-    //   list if/when a `with_seed` builder is introduced.
-    // - `logprobs` — Responses API uses `top_logprobs` instead; not
-    //   propagated. Same fallback path as `top_p`.
-    //
-    // Runtime options routed through the responses provider
-    // (now supported by the factory + provider — tests below pin the
-    // struct-level defaults, the builder propagation, and the
-    // `build_default_headers` shape, and the factory's end-to-end
-    // timeout forwarding is exercised in
-    // `factory::tests::responses_factory_forwards_timeout_secs_to_responses_provider`):
-    //
-    // - `provider_timeout_secs` — `OpenAiResponsesModelProvider` carries
-    //   a `timeout_secs` field (default 120) with a `with_timeout_secs`
-    //   builder; the non-streaming `http_client` applies it as the
-    //   reqwest `Client::builder().timeout(...)` and the streaming
-    //   `streaming_client` uses connect-timeout only (no total timeout,
-    //   so long SSE responses aren't killed mid-stream).
-    // - `extra_headers` — `OpenAiResponsesModelProvider` carries an
-    //   `extra_headers` field (default empty `HashMap`) with a
-    //   `with_extra_headers` builder; the `build_default_headers`
-    //   helper merges them into the `reqwest::Client` default headers
-    //   for both `http_client` and `streaming_client`, with invalid
-    //   header names / values logged at WARN and skipped (matching
-    //   `OpenAiCompatibleModelProvider::http_client`).
-    // - `api_path` — already routed correctly via the `api_url` argument
-    //   to `OpenAiResponsesModelProvider::new`, which lands in the
-    //   `responses_url` field and composes the final URL with the
-    //   `/responses` suffix. The `opts.api_path` runtime option is
-    //   not separately needed on the responses path because the
-    //   factory maps `api_url` (from the provider config) into the
-    //   `OpenAiResponsesModelProvider::new` constructor.
-    // ----------------------------------------------------------
-
     #[test]
     fn responses_request_propagates_max_tokens_when_set() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(2048));
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .max_tokens(Some(2048))
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2212,7 +2223,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_max_tokens_when_unset() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         assert!(
             provider.max_tokens.is_none(),
             "fresh provider must default max_tokens to None"
@@ -2238,8 +2251,10 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_reasoning_effort_when_set() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None)
-            .with_reasoning_effort(Some("high".to_string()));
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2255,13 +2270,15 @@ mod tests {
         assert_eq!(
             reasoning.get("effort").and_then(serde_json::Value::as_str),
             Some("high"),
-            "with_reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+            ".reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
         );
     }
 
     #[test]
     fn responses_request_omits_reasoning_when_unset() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         assert!(
             provider.reasoning_effort.is_none(),
             "fresh provider must default reasoning_effort to None"
@@ -2287,8 +2304,10 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_instructions_and_temperature_and_model() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .api_url("https://api.example.test/v1")
+            .credential(None)
+            .build();
         let req = provider.build_request(
             Some("You are a careful assistant.".to_string()),
             vec![serde_json::json!({"role": "user", "content": "summarize"})],
@@ -2322,8 +2341,10 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(1024));
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .max_tokens(Some(1024))
+            .build();
         let tools = Some(vec![ResponsesToolSpec {
             kind: "function".to_string(),
             name: "lookup_weather".to_string(),
@@ -2369,7 +2390,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_tool_choice_and_parallel_when_tools_absent() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2399,7 +2422,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_tool_choice_and_parallel_when_tools_empty() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],

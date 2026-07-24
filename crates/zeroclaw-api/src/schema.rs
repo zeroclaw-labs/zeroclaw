@@ -24,17 +24,17 @@
 //!     "properties": {
 //!         "name": {
 //!             "type": "string",
-//!             "minLength": 1,  // Gemini rejects this
-//!             "pattern": "^[a-z]+$"  // Gemini rejects this
+//!             "minLength": 1, // Gemini rejects this
+//!             "pattern": "^[a-z]+$" // Gemini rejects this
 //!         },
 //!         "age": {
-//!             "$ref": "#/$defs/Age"  // Needs resolution
+//!             "$ref": "#/$defs/Age" // Needs resolution
 //!         }
 //!     },
 //!     "$defs": {
 //!         "Age": {
 //!             "type": "integer",
-//!             "minimum": 0  // Gemini rejects this
+//!             "minimum": 0 // Gemini rejects this
 //!         }
 //!     }
 //! });
@@ -43,11 +43,11 @@
 //!
 //! // Result:
 //! // {
-//! //   "type": "object",
-//! //   "properties": {
-//! //     "name": { "type": "string" },
-//! //     "age": { "type": "integer" }
-//! //   }
+//! // "type": "object",
+//! // "properties": {
+//! // "name": { "type": "string" },
+//! // "age": { "type": "integer" }
+//! // }
 //! // }
 //! ```
 //!
@@ -136,8 +136,8 @@ impl SchemaCleanr {
         Self::clean(schema, CleaningStrategy::OpenAI)
     }
 
-    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas
-    /// (#8642): returns the same `Arc` when the pre-scan proves cleaning is a
+    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas:
+    /// returns the same `Arc` when the pre-scan proves cleaning is a
     /// no-op, deep-copying the tree only when a rewrite is actually needed.
     pub fn clean_shared(schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
         if Self::needs_cleaning(schema, strategy) {
@@ -588,7 +588,7 @@ mod tests {
     use super::*;
 
     /// `!needs_cleaning(s)` must imply `clean(s) == s` — the safety contract
-    /// that lets `clean_shared` skip the deep copy (#8642).
+    /// that lets `clean_shared` skip the deep copy.
     #[test]
     fn test_needs_cleaning_false_implies_clean_is_identity() {
         let clean_schemas = [
@@ -725,6 +725,27 @@ mod tests {
 
         assert_eq!(cleaned["properties"]["age"]["type"], "integer");
         assert!(cleaned["properties"]["age"].get("minimum").is_none()); // Stripped by Gemini strategy
+        assert!(cleaned.get("$defs").is_none());
+    }
+
+    #[test]
+    fn test_resolve_ref_decodes_json_pointer_escapes() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "slash": { "$ref": "#/$defs/Foo~1Bar" },
+                "tilde": { "$ref": "#/$defs/Tilde~0Name" }
+            },
+            "$defs": {
+                "Foo/Bar": { "type": "string" },
+                "Tilde~Name": { "type": "integer" }
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_anthropic(schema);
+
+        assert_eq!(cleaned["properties"]["slash"]["type"], "string");
+        assert_eq!(cleaned["properties"]["tilde"]["type"], "integer");
         assert!(cleaned.get("$defs").is_none());
     }
 

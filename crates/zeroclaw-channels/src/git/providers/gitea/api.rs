@@ -97,13 +97,6 @@ impl GiteaApi {
         }
     }
 
-    /// GET every page of a Gitea list endpoint, following `page` until a short
-    /// page (fewer than `per_page` items) marks the end. Gitea caps `limit`, so
-    /// a single request only ever sees the first page; without this an account
-    /// or repo with more than one page silently drops repos/issues/comments/
-    /// releases. `base_url` must carry any endpoint query params (state/since/
-    /// ...) but NOT `limit`/`page`, which this adds. The `1..=1000` bound is a
-    /// backstop against an endpoint that never returns a short page.
     async fn get_paged<T: DeserializeOwned>(
         &self,
         endpoint: &str,

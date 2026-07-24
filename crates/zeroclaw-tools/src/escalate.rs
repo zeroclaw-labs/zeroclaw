@@ -1,9 +1,4 @@
 //! Human escalation tool with urgency-aware routing.
-//!
-//! Exposes `escalate_to_human` as an agent-callable tool that sends a structured
-//! escalation message to a messaging channel. High/critical urgency escalations
-//! additionally notify any channels listed in `[escalation] alert_channels`.
-//! Supports optional blocking mode to wait for a human response.
 
 use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;
@@ -237,13 +232,6 @@ impl Tool for EscalateToHumanTool {
             (name.clone(), ch.clone())
         };
 
-        // Channels without free-form `listen` support (e.g. ACP in Phase 1
-        // of the elicitation rollout) can't deliver the human's reply. Fail
-        // fast so the agent can route the escalation differently or proceed
-        // without blocking — the alternative is silently timing out for
-        // `timeout_secs` seconds. Phase 2 of the elicitation rollout will
-        // flip ACP's `supports_free_form_ask` to true.
-        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,

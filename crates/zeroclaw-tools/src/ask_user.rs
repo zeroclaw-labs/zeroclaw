@@ -1,10 +1,4 @@
 //! Interactive user prompting tool for cross-channel confirmations.
-//!
-//! Exposes `ask_user` as an agent-callable tool that sends a question to a
-//! messaging channel and waits for the user's response. The tool holds a
-//! late-binding channel map handle that is populated once channels are
-//! initialized (after tool construction). This mirrors the pattern used by
-//! [`ReactionTool`](super::reaction::ReactionTool).
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -216,13 +210,6 @@ impl Tool for AskUserTool {
                 }
             }
         } else if !channel.supports_free_form_ask() {
-            // Free-form ask_user has no first-class ACP method yet. Phase 1
-            // of the elicitation rollout shipped multiple-choice; free-form
-            // text is Phase 2 of that spec. Until Phase 2 lands, agents
-            // talking to ACP clients must supply `choices` so we can route
-            // through `request_choice` → `elicitation/create` (or the
-            // legacy `session/request_permission` fallback for older clients).
-            // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

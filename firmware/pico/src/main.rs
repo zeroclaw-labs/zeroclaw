@@ -1,9 +1,4 @@
 //! ZeroClaw Pico firmware — JSON-over-serial peripheral.
-//!
-//! Listens for newline-delimited JSON on UART0 (GP0=TX, GP1=RX).
-//! LED on GP25 (onboard LED on standard Pico).
-//!
-//! Protocol: same as Nucleo/Arduino/ESP32 — see docs/hardware-peripherals-design.md
 
 #![no_std]
 #![no_main]

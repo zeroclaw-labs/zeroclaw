@@ -17,7 +17,6 @@ const NC_MAX_MESSAGE_LENGTH: usize = 32_000;
 const DEFAULT_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
 /// Nextcloud Talk channel in webhook mode.
-///
 /// Incoming messages are received by the gateway endpoint `/nextcloud-talk`.
 /// Outbound replies are sent through Nextcloud Talk OCS API.
 pub struct NextcloudTalkChannel {
@@ -81,7 +80,6 @@ impl NextcloudTalkChannel {
     }
 
     /// Configure streaming draft-update behaviour.
-    ///
     /// `mode` — `Off` disables draft updates entirely; `Partial` enables live edits.
     /// `interval_ms` — minimum delay between consecutive OCS edit calls per room.
     pub fn with_streaming(mut self, mode: StreamMode, interval_ms: u64) -> Self {
@@ -96,7 +94,6 @@ impl NextcloudTalkChannel {
     }
 
     /// Returns true if the given name/id belongs to this bot itself.
-    ///
     /// Prevents feedback loops where ZeroClaw reacts to its own messages.
     fn is_bot_name(&self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
@@ -135,29 +132,6 @@ impl NextcloudTalkChannel {
         }
     }
 
-    /// Parse a Nextcloud Talk webhook payload into channel messages.
-    ///
-    /// Two payload formats are supported:
-    ///
-    /// **Format A — legacy/custom** (`type: "message"`):
-    /// ```json
-    /// {
-    ///   "type": "message",
-    ///   "object": { "token": "<room>" },
-    ///   "message": { "actorId": "...", "message": "...", ... }
-    /// }
-    /// ```
-    ///
-    /// **Format B — Activity Streams 2.0** (`type: "Create"`):
-    /// This is the format actually sent by Nextcloud Talk bot webhooks.
-    /// ```json
-    /// {
-    ///   "type": "Create",
-    ///   "actor": { "type": "Person", "id": "users/alice", "name": "Alice" },
-    ///   "object": { "type": "Note", "id": "177", "content": "{\"message\":\"hi\",\"parameters\":[]}", "mediaType": "text/markdown" },
-    ///   "target": { "type": "Collection", "id": "<room_token>", "name": "Room Name" }
-    /// }
-    /// ```
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let messages = Vec::new();
 
@@ -584,7 +558,6 @@ impl NextcloudTalkChannel {
     }
 
     /// Edit an existing message via the Nextcloud Talk OCS API.
-    ///
     /// `PUT /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
     async fn edit_message(
         &self,
@@ -608,7 +581,6 @@ impl NextcloudTalkChannel {
     }
 
     /// Delete a message via the Nextcloud Talk OCS API.
-    ///
     /// `DELETE /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
     async fn delete_message(&self, room_token: &str, message_id: &str) -> anyhow::Result<()> {
         let response = self
@@ -833,7 +805,6 @@ impl Channel for NextcloudTalkChannel {
 }
 
 /// Verify Nextcloud Talk webhook signature.
-///
 /// Signature calculation (official Talk bot docs):
 /// `hex(hmac_sha256(secret, X-Nextcloud-Talk-Random + raw_body))`
 pub fn verify_nextcloud_talk_signature(

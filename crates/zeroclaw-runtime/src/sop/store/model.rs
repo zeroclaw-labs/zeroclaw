@@ -1,13 +1,4 @@
 //! Durable run-state store — versioned wire shapes (EPIC B).
-//!
-//! [`SopRun`] is the runtime FSM state; for durability it is wrapped in a
-//! forward-compatible [`PersistedRun`] envelope (version + monotonic revision +
-//! stall timestamp + redaction marker). The CAS [`ClaimToken`], append-only
-//! [`SopEventRecord`], and procedural-memory [`ProposalRecord`] share the same
-//! store so concurrency-control, audit-trail, and procedural-memory ride one
-//! abstraction rather than three.
-//!
-//! Design: `epics/B-run-state-store/03-architecture.md` (SOP path-to-5).
 
 use serde::{Deserialize, Serialize};
 
@@ -17,11 +8,6 @@ use crate::sop::types::{SopRun, SopTriggerSource};
 /// skips + logs unknown major versions rather than panicking on boot.
 pub const SOP_STORE_VERSION: u32 = 1;
 
-/// Forward-compatible durable envelope around a [`SopRun`].
-///
-/// `SopRun` is not persisted directly: this envelope adds the durability
-/// metadata (`version`, monotonic `revision`, stall `last_progress_at`,
-/// `redacted` marker, `trigger_source`) the raw run lacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedRun {
     /// = [`SOP_STORE_VERSION`] at write time.
@@ -70,8 +56,6 @@ pub struct ClaimToken {
     pub holder: String,
 }
 
-/// One append-only audit/observability event. Never overwritten (the primitive
-/// the keyed `Memory` backend lacks).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopEventRecord {
     pub run_id: String,

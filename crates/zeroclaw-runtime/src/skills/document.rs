@@ -1,8 +1,4 @@
 //! Parse and serialize canonical `SKILL.md` files.
-//!
-//! A [`SkillDocument`] is the on-disk pair of frontmatter and body. The
-//! splitter [`split_frontmatter`] is shared with the legacy `parse_skill_markdown`
-//! path in `super` so both readers see the same delimiter rules.
 
 use std::fmt::Write as _;
 
@@ -117,7 +113,7 @@ fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> 
         }
         // YAML block list under `tags:` — consume `- item` continuation lines
         // until a non-list line. Mirrors the loader's parser so both readers
-        // agree on tag shape (zeroclaw-labs/zeroclaw#7490 reads the same tags).
+        // agree on tag shapereads the same tags).
         if collecting_tags {
             let trimmed = line.trim();
             if let Some(item) = trimmed.strip_prefix("- ") {
@@ -222,21 +218,10 @@ fn write_tags(out: &mut String, tags: &[String]) {
     let _ = writeln!(out, "tags: [{}]", tags.join(", "));
 }
 
-// ─── Nested `slash_options:` (the one non-flat field) ──────────────────────
-//
-// Parsed/serialized here and shared with the loader's `parse_simple_frontmatter`
-// so both readers agree on the shape. A scoped, dependency-free parser for the
-// exact YAML subset the serializer below emits — see `parse_slash_options`.
-
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Locate a top-level `slash_options:` block as a `[start, end)` line range
-/// (header line included). The block is the header plus every following indented
-/// (or blank) line, ending at the next top-level non-blank line or EOF. Only the
-/// block form (`slash_options:` with an empty inline value) is recognized; an
-/// inline `slash_options: [...]` is intentionally ignored.
 fn locate_slash_options_block(src: &str) -> Option<(usize, usize)> {
     let lines: Vec<&str> = src.lines().collect();
     let start = lines.iter().position(|line| {
@@ -260,27 +245,6 @@ fn locate_slash_options_block(src: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Parse the nested `slash_options:` block from a SKILL.md frontmatter source.
-/// Absent block → empty. Lenient by design (matching the flat parser): an option
-/// missing `name` or `type` is dropped rather than failing the whole parse.
-///
-/// Supported subset (exactly what `write_slash_options` emits — keeps the
-/// hand-rolled parser tractable, no YAML dependency):
-/// ```text
-/// slash_options:
-///   - name: format
-///     description: Output format.
-///     type: string
-///     required: true
-///     choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
-///   - name: words
-///     type: integer
-///     min: 10
-///     max: 2000
-/// ```
-/// `choices` accepts an inline flow list (above) or a block list of single-line
-/// flow maps (`    - {name: X, value: Y}`). Option descriptions are single-line
-/// (no block scalars inside an option).
 pub(crate) fn parse_slash_options(src: &str) -> Vec<SkillSlashOption> {
     let Some((start, end)) = locate_slash_options_block(src) else {
         return Vec::new();

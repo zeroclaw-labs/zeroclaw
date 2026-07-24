@@ -1,13 +1,5 @@
 use async_trait::async_trait;
 
-/// The identity of the embedder that produced a store's vectors: resolved
-/// provider, model, and dimensions. Two identities are compatible only when
-/// all three match — a change in any of them means existing vectors live in
-/// a different (or differently-sized) vector space and must be re-embedded.
-///
-/// `provider` is the *resolved* provider string (`openai`, `openrouter`, or
-/// `custom:<base_url>`), not a dotted `[[embedding_routes]]` reference, so the
-/// identity reflects the endpoint that actually served the embeddings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingIdentity {
     pub provider: String,

@@ -1,15 +1,4 @@
 //! Loop detection guardrail for the agent tool-call loop.
-//!
-//! Monitors a sliding window of recent tool calls and their results to detect
-//! three repetitive patterns that indicate the agent is stuck:
-//!
-//! 1. **Exact repeat** — same tool + args called 3+ times consecutively.
-//! 2. **Ping-pong** — two tools alternating (A->B->A->B) for 4+ cycles.
-//! 3. **No progress** — same tool called 5+ times with different args but
-//!    identical result hash each time, counted across the window rather than
-//!    only consecutively, so interleaving other calls does not evade it.
-//!
-//! Detection triggers escalating responses: `Warning` -> `Block` -> `Break`.
 
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
@@ -120,11 +109,6 @@ impl LoopDetector {
         }
     }
 
-    /// Record a completed tool call and check for loop patterns.
-    ///
-    /// * `name` — tool name (e.g. `"shell"`, `"file_read"`).
-    /// * `args` — the arguments JSON value sent to the tool.
-    /// * `result` — the tool's textual output.
     pub fn record(
         &mut self,
         name: &str,
@@ -161,12 +145,6 @@ impl LoopDetector {
         LoopDetectionResult::Ok
     }
 
-    /// Pattern 1: Same tool + same args called N+ times consecutively.
-    ///
-    /// Escalation:
-    /// - N == max_repeats     -> Warning
-    /// - N == max_repeats + 1 -> Block
-    /// - N >= max_repeats + 2 -> Break (circuit breaker)
     fn detect_exact_repeat(&self) -> Option<LoopDetectionResult> {
         let max = self.config.max_repeats;
         if self.window.len() < max {
@@ -277,7 +255,7 @@ impl LoopDetector {
         }
 
         let last = self.window.back()?;
-        // #7143: the stuck agent ran 43 near-duplicate shell calls returning
+        // the stuck agent ran 43 near-duplicate shell calls returning
         // byte-identical output, interleaved with other tools; filter (not a
         // consecutive take_while) is what lets that non-adjacent run be counted.
         let same_tool_same_result: Vec<&ToolCallRecord> = self
@@ -538,7 +516,7 @@ mod tests {
 
     #[test]
     fn no_progress_triggered_when_interleaved_with_other_calls() {
-        // #7143: same tool + same result repeated non-consecutively, with
+        // same tool + same result repeated non-consecutively, with
         // varied unrelated calls interleaved, must still be detected. The old
         // take_while logic reset the streak on any interleaved call.
         let mut det = LoopDetector::new(default_config());

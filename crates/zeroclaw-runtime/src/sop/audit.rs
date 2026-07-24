@@ -8,11 +8,6 @@ use zeroclaw_memory::traits::{Memory, MemoryCategory};
 
 const SOP_CATEGORY: &str = "sop";
 
-/// Persists SOP execution runs and step results to the Memory backend.
-///
-/// Storage keys:
-/// - `sop_run_{run_id}` — full `SopRun` JSON (created on start, updated on complete)
-/// - `sop_step_{run_id}_{step_number}` — `SopStepResult` JSON (one per step)
 pub struct SopAuditLogger {
     memory: Arc<dyn Memory>,
 }
@@ -130,17 +125,6 @@ impl SopAuditLogger {
         Ok(())
     }
 
-    // NOTE (EPIC C): the per-gate approval audit (`log_approval` /
-    // `log_timeout_auto_approve`) was removed. Those wrote last-write-wins Memory
-    // keys (`sop_approval_{run}_{step}` / `sop_timeout_approve_{run}_{step}`, no
-    // who/where, clobbered on re-approval). The audit of record for gate
-    // resolutions is now the append-only run-store event log
-    // (`SopRunStore::append_event`, written inside `engine.resolve_gate` with the
-    // transport-derived principal); read it via `engine.run_events`. The metrics
-    // restart-recovery path (`SopMetricsCollector::rebuild_from_persistence`)
-    // reconstructs the approval / timeout-auto-approval counters from that ledger,
-    // not these keys.
-
     /// Retrieve a stored run by ID (if it exists in memory).
     pub async fn get_run(&self, run_id: &str) -> Result<Option<SopRun>> {
         let key = run_key(run_id);
@@ -221,11 +205,14 @@ mod tests {
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         }
     }
 
     fn test_step_result(n: u32) -> SopStepResult {
         SopStepResult {
+            effective_agent: None,
             step_number: n,
             status: SopStepStatus::Completed,
             output: format!("Step {n} completed"),

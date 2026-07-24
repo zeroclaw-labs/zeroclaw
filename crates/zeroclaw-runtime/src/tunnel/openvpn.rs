@@ -3,13 +3,6 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// OpenVPN Tunnel — uses the `openvpn` CLI to establish a VPN connection.
-///
-/// Requires the `openvpn` binary installed and accessible. On most systems,
-/// OpenVPN requires root/administrator privileges to create tun/tap devices.
-///
-/// The tunnel exposes the gateway via the VPN network using a configured
-/// `advertise_address` (e.g., `"10.8.0.2:42617"`).
 pub struct OpenVpnTunnel {
     config_file: String,
     auth_file: Option<String>,
@@ -20,13 +13,6 @@ pub struct OpenVpnTunnel {
 }
 
 impl OpenVpnTunnel {
-    /// Create a new OpenVPN tunnel instance.
-    ///
-    /// * `config_file` — path to the `.ovpn` configuration file.
-    /// * `auth_file` — optional path to a credentials file for `--auth-user-pass`.
-    /// * `advertise_address` — optional public address to advertise once connected.
-    /// * `connect_timeout_secs` — seconds to wait for the initialization sequence.
-    /// * `extra_args` — additional CLI arguments forwarded to the `openvpn` binary.
     pub fn new(
         config_file: String,
         auth_file: Option<String>,

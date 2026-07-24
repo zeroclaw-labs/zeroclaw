@@ -1,10 +1,4 @@
 //! System-level tests — full agent orchestration with real components.
-//!
-//! These tests wire ALL internal components together:
-//! MockModelProvider → Agent → Tools → Memory → Agent response
-//!
-//! Unlike integration tests, system tests use real memory backends (SQLite)
-//! and verify end-to-end data flow across component boundaries.
 
 use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
 use crate::support::{CountingTool, EchoTool, MockModelProvider, RecordingTool};
@@ -14,7 +8,6 @@ use zeroclaw::providers::ToolCall;
 // Full-stack system tests
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Simplest system test: inject message → MockModelProvider returns text → verify response.
 #[tokio::test]
 async fn system_simple_text_response() {
     let model_provider = Box::new(MockModelProvider::new(vec![text_response(
@@ -29,8 +22,6 @@ async fn system_simple_text_response() {
     assert_eq!(response, "System test response");
 }
 
-/// Full tool execution flow: message → model_provider requests tool → tool executes →
-/// result fed back to model_provider → final response.
 #[tokio::test]
 async fn system_tool_execution_flow() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -54,7 +45,6 @@ async fn system_tool_execution_flow() {
     );
 }
 
-/// Multi-turn conversation with real SQLite memory — verify history accumulation.
 #[tokio::test]
 async fn system_multi_turn_conversation() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -82,7 +72,6 @@ async fn system_multi_turn_conversation() {
     assert_eq!(history.len(), 7, "History should contain 7 messages");
 }
 
-/// Tool execution is recorded and arguments are passed correctly.
 #[tokio::test]
 async fn system_tool_arguments_passed_correctly() {
     let (recording_tool, calls) = RecordingTool::new("recorder");
@@ -120,7 +109,6 @@ async fn system_tool_arguments_passed_correctly() {
     );
 }
 
-/// Multiple tools in a single response — both execute and results feed back.
 #[tokio::test]
 async fn system_parallel_tool_execution() {
     let (counting_tool, count) = CountingTool::new();

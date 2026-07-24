@@ -1,23 +1,4 @@
 //! Agent evaluation harness for ZeroClaw.
-//!
-//! **Phase 0 — deterministic replay.** This crate runs the *real* agent loop
-//! ([`zeroclaw_runtime`]) against scripted LLM responses (an [`LlmTrace`] fixture)
-//! and grades the outcome against declarative [`TraceExpects`]. Because the LLM
-//! responses are fixed, a replay eval is free, fast, and fully deterministic —
-//! it proves the agent *machinery* (tool parsing, dispatch, multi-turn looping)
-//! behaves correctly given a known model output. It does **not** measure model
-//! quality; that is the live mode added in later phases.
-//!
-//! ## Pieces
-//! - [`case`] — the [`LlmTrace`] fixture/case format and suite loading.
-//! - [`replay::TraceLlmProvider`] — a [`ModelProvider`](zeroclaw_api::model_provider::ModelProvider)
-//!   that replays trace steps per turn, FIFO within each turn's boundary.
-//! - [`tools`] — deterministic built-in tools the replay agent can dispatch.
-//! - [`observer::RecordingObserver`] — captures tool-call names/outcomes and token
-//!   usage from the agent run.
-//! - [`grader`] — non-panicking [`GradeResult`](grader::GradeResult) checks over a run.
-//! - [`runner`] — builds an isolated agent per case, drives it, and grades it.
-//! - [`report`] — pass/fail aggregation and table/JSON rendering.
 
 pub mod case;
 pub mod grader;

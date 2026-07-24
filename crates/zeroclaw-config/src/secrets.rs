@@ -161,13 +161,13 @@ impl SecretStore {
 
         let plaintext_bytes = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| {
-                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string()})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
+            .map_err(|e| {
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string(), "error": format!("{e}")})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
                      Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
                      Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw quickstart`.");
-                anyhow::Error::msg(
-                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)"
-                )
+                anyhow::Error::msg(format!(
+                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext): {e}"
+                ))
             })?;
 
         String::from_utf8(plaintext_bytes)
@@ -244,7 +244,7 @@ impl SecretStore {
 
                 // First, ensure the current user owns the file. Without this,
                 // Windows may assign an invalid SID as owner, making the file
-                // unreadable for subsequent commands. (See issue #4532.)
+                // unreadable for subsequent commands.
                 match std::process::Command::new("takeown")
                     .arg("/F")
                     .arg(&self.key_path)
@@ -383,6 +383,12 @@ fn build_windows_icacls_grant_arg(username: &str) -> Option<String> {
 fn hex_decode(hex: &str) -> Result<Vec<u8>> {
     if (hex.len() & 1) != 0 {
         anyhow::bail!("Hex string has odd length");
+    }
+    // Reject non-ASCII up front: valid hex is always ASCII, and this guarantees
+    // every byte is a char boundary so the byte-index slicing below cannot panic
+    // on a corrupt/tampered ciphertext (it returns the Err the signature promises).
+    if !hex.is_ascii() {
+        anyhow::bail!("Hex string contains non-ASCII characters");
     }
     (0..hex.len())
         .step_by(2)
@@ -1113,6 +1119,17 @@ exit 65
     #[test]
     fn hex_decode_invalid_chars_fails() {
         assert!(hex_decode("zzzz").is_err());
+    }
+
+    #[test]
+    fn hex_decode_non_ascii_returns_error() {
+        // A corrupt/tampered ciphertext with even *byte* length made of
+        // non-ASCII chars previously slipped past the odd-length check and
+        // panicked on mid-UTF-8-char byte slicing. It must now return Err
+        // gracefully (the signature's promise). "€€" is 6 bytes.
+        assert!(hex_decode("€€").is_err());
+        // Non-ASCII that is a whole 2-byte char also errors, not panics.
+        assert!(hex_decode("ÿÿ").is_err());
     }
 
     #[test]

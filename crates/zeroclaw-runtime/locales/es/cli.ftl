@@ -442,6 +442,8 @@ cli-sop-execution-mode = {"  "}Modo de ejecución: {$value}
 cli-sop-deterministic = {"  "}Determinista:  {$value}
 cli-sop-cooldown = {"  "}Tiempo de espera: {$value}s
 cli-sop-max-concurrent = {"  "}Máx. concurrentes: {$value}
+cli-sop-admission-policy = {"  "}Admisión:        {$value}
+cli-sop-max-pending-approvals = {"  "}Máx. pendientes: {$value}
 cli-sop-location = {"  "}Ubicación:       {$value}
 cli-sop-triggers = {"  "}Disparadores:
 cli-sop-steps = {"  "}Pasos:
@@ -592,6 +594,8 @@ cli-quickstart-error-unknown-risk-preset = preset de riesgo desconocido `{$prese
 cli-quickstart-error-unknown-runtime-preset = preset de runtime desconocido `{$preset}`
 cli-quickstart-error-channel-bound = el canal `{$reference}` ya está vinculado al agente `{$owner}`
 cli-quickstart-error-channel-required = se requieren tipo de canal y alias
+cli-quickstart-error-channel-field-not-advertised = el campo de canal `{$field}` no está disponible en Quickstart
+cli-quickstart-error-channel-token-required = se requiere el token del bot de Telegram
 cli-quickstart-error-peer-group-name-required = se requiere el nombre del grupo de pares
 cli-quickstart-error-peer-group-channel-required = se requiere la referencia de canal del grupo de pares
 cli-quickstart-error-peer-group-unknown-channel = el grupo de pares `{$name}` referencia un canal desconocido `{$channel}`
@@ -794,8 +798,10 @@ cli-models-status-none = No hay ningún modelo predeterminado configurado.
 turn-interrupted-by-user = [interrumpido por el usuario]
 turn-cancelled-client-rpc = [turno cancelado mediante el cliente]
 turn-stream-interrupted = [transmisión interrumpida]
+turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) no estaba disponible; esta respuesta fue generada por { $actual_model } ({ $actual_provider }).
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = límite de mensajes del historial superado
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = Esta solicitud no se procesó: { $reason }
 turn-tool-interrupted-before-result = [interrumpido por el usuario antes de que esta herramienta produjera un resultado]
@@ -901,6 +907,15 @@ cli-bundle-warn-archive = advertencia: falló el archivado del directorio del bu
 cli-bundle-deleted = eliminado skill_bundles.{$alias} (eliminado de {$count} agente(s))
 cli-bundle-warn-move = advertencia: falló el movimiento del directorio del bundle: {$error}
 cli-bundle-renamed = renombrado skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Sugerencias de reinicio del panel web — RestartInfo.hint mostrado tras una actualización en la app (PR #8173) ──
+# Las primeras cuatro son plantillas de comando de shell que se muestran tal cual; no se traducen.
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = reinicie el proceso `zeroclaw daemon`
+
 cli-daemon-gateway-already-running = Ya hay un gateway de ZeroClaw ejecutándose en {$host}:{$port}. El daemon supervisa su propio gateway y no iniciará un segundo en la misma dirección. Detén ese gateway (o apunta el daemon a un puerto libre con `zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
 cli-daemon-gateway-port-occupied = La dirección del gateway {$host}:{$port} ya está en uso por otro proceso. Libera el puerto o apunta el daemon a un puerto libre (`zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
@@ -915,3 +930,13 @@ cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
 cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
 cli-doctor-ctxwin-none = No se necesitan actualizaciones.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
+cli-doctor-degraded-section = La sección de configuración `{$path}` está mal formada y se restableció a sus valores predeterminados; los valores de esa sección NO están en efecto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
+sop-approval-deferred-at-capacity = No se pudo reanudar la ejecución {$run_id}: los cupos de ejecución están llenos. La aprobación sigue en espera; inténtalo de nuevo cuando se libere un cupo.
+sop-approval-policy-unavailable = La aprobación falló porque el paso de SOP en espera no está disponible: {$reason}. La ejecución sigue en espera.
+sop-rpc-decision-invalid-state = La ejecución {$run_id} no se puede resolver en su estado actual.
+sop-rpc-decision-unauthorized = La identidad RPC no está autorizada para resolver este paso de SOP.
+sop-rpc-policy-missing = La política de aprobación de SOP '{$name}' no está configurada.
+sop-rpc-policy-unavailable = La política del SOP en espera no está disponible: {$reason}.

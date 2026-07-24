@@ -28,6 +28,13 @@ import {
 } from "@/lib/api";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import {
+  requiredQuickstartSelectionsComplete,
+  runtimeAfterProviderChange,
+  runtimeDefaultForProvider,
+  runtimeValueForSubmit,
+  type RuntimeSelection,
+} from "./runtime-selection";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -51,7 +58,7 @@ interface StagedChannel {
   mode: "fresh" | "existing";
   channel_type: string;
   alias: string;
-  extras: Record<string, string>;
+  fields: Record<string, string>;
 }
 
 interface StagedPeerGroup {
@@ -67,10 +74,6 @@ interface StagedPersonalityFile {
   content: string;
 }
 
-/** A preset selection — typed wrapper around a `preset_name` so the
- *  shape can't carry a raw user-typed string. The only way to construct
- *  one is via the `PresetSection` picker, which sources values from
- *  `state.risk_presets` / `state.runtime_presets` / `state.memory_kinds`. */
 interface StagedPreset {
   preset_name: string;
 }
@@ -78,7 +81,7 @@ interface StagedPreset {
 interface FormState {
   provider: StagedProvider | null;
   risk: StagedPreset | null;
-  runtime: StagedPreset | null;
+  runtime: RuntimeSelection | null;
   memory: StagedPreset | null;
   channels: StagedChannel[];
   peerGroups: StagedPeerGroup[];
@@ -112,6 +115,7 @@ export default function Quickstart() {
   );
   const lastStepRef = useRef<QuickstartStep | null>(null);
   const submittedRef = useRef(false);
+  const runtimeAutoDefaultedRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,18 +124,12 @@ export default function Quickstart() {
         const s = await getQuickstartState();
         if (!cancelled) {
           setState(s);
-          // Default the runtime profile to the previously-hardcoded value
-          // ("unbounded") so behaviour is unchanged unless the user picks
-          // another preset. Fall back to the first preset if the daemon ever
-          // drops "unbounded" from the list. Don't clobber a user choice.
-          const defaultRuntime =
-            s.runtime_presets.find((p) => p.preset_name === "unbounded") ??
-            s.runtime_presets[0];
+          const defaultRuntime = runtimeDefaultForProvider(s);
           if (defaultRuntime) {
             setForm((f) =>
               f.runtime
                 ? f
-                : { ...f, runtime: { preset_name: defaultRuntime.preset_name } },
+                : { ...f, runtime: { preset_name: defaultRuntime } },
             );
           }
         }
@@ -165,6 +163,8 @@ export default function Quickstart() {
   };
 
   const submit = async () => {
+    const runtimeProfile = runtimeValueForSubmit(form.runtime);
+    if (!runtimeProfile) return;
     setBusy(true);
     setErrors([]);
     const res = await quickstartApply({
@@ -172,7 +172,7 @@ export default function Quickstart() {
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
       runtime_profile: {
         mode: "fresh",
-        value: form.runtime?.preset_name ?? "unbounded",
+        value: runtimeProfile,
       },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
@@ -183,11 +183,7 @@ export default function Quickstart() {
               value: {
                 channel_type: c.channel_type,
                 alias: c.alias,
-                token:
-                  c.extras["bot_token"] ??
-                  c.extras["token"] ??
-                  c.extras["access_token"] ??
-                  null,
+                fields: c.fields,
               },
             },
       ),
@@ -210,15 +206,17 @@ export default function Quickstart() {
 
   const providerDone = form.provider !== null;
   const riskDone = form.risk !== null;
+  const runtimeDone = form.runtime !== null;
   const memoryDone = form.memory !== null;
   const agentDone = form.agentName.trim() !== "";
-  const allDone = providerDone && riskDone && memoryDone && agentDone;
+  const allDone = requiredQuickstartSelectionsComplete(form);
 
   // Required-step progress for the wizard stepper. Channels / peer groups /
   // personality files are optional and intentionally excluded from the gate.
   const steps = [
     { label: t("quickstart.step_provider"), done: providerDone },
     { label: t("quickstart.step_risk"), done: riskDone },
+    { label: t("quickstart.runtime_profile_title"), done: runtimeDone },
     { label: t("quickstart.step_memory"), done: memoryDone },
     { label: t("quickstart.step_agent"), done: agentDone },
   ];
@@ -280,7 +278,19 @@ export default function Quickstart() {
           <ProviderForm
             state={state}
             onStage={(p) => {
-              setForm((f) => ({ ...f, provider: p }));
+              setForm((f) => {
+                const runtime = runtimeAfterProviderChange(
+                  state,
+                  p.provider_type,
+                  f.runtime,
+                  runtimeAutoDefaultedRef.current,
+                );
+                return {
+                  ...f,
+                  provider: p,
+                  runtime,
+                };
+              });
               recordStep("model_provider");
             }}
           />
@@ -312,6 +322,7 @@ export default function Quickstart() {
         }))}
         value={form.runtime?.preset_name ?? ""}
         onChange={(v) => {
+          runtimeAutoDefaultedRef.current = false;
           setForm((f) => ({ ...f, runtime: { preset_name: v } }));
           recordStep("runtime_profile");
         }}
@@ -1033,7 +1044,7 @@ function ChannelAddForm({
   const [descriptors, setDescriptors] = useState<QuickstartFieldDescriptor[]>(
     [],
   );
-  const [extras, setExtras] = useState<Record<string, string>>({});
+  const [fields, setFields] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (mode !== "fresh" || !type) {
@@ -1066,13 +1077,13 @@ function ChannelAddForm({
     if (mode === "existing") {
       const [t, a] = existingRef.split(".");
       if (!t || !a) return;
-      onAdd({ mode: "existing", channel_type: t, alias: a, extras: {} });
+      onAdd({ mode: "existing", channel_type: t, alias: a, fields: {} });
     } else {
       onAdd({
         mode: "fresh",
         channel_type: type,
         alias: alias.trim(),
-        extras,
+        fields,
       });
     }
   };
@@ -1132,7 +1143,7 @@ function ChannelAddForm({
                 const next = e.target.value;
                 setType(next);
                 setAlias((prev) => (prev === "" || prev === type ? next : prev));
-                setExtras({});
+                setFields({});
               }}
             >
               <option value="" disabled>
@@ -1158,8 +1169,8 @@ function ChannelAddForm({
               key={d.key}
               label={d.label}
               type={d.is_secret ? "password" : "text"}
-              value={extras[d.key] ?? ""}
-              onChange={(v) => setExtras((x) => ({ ...x, [d.key]: v }))}
+              value={fields[d.key] ?? ""}
+              onChange={(v) => setFields((x) => ({ ...x, [d.key]: v }))}
               placeholder={d.help}
             />
           ))}

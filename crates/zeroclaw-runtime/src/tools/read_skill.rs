@@ -212,12 +212,6 @@ description = "Ship safely"
 
     #[tokio::test]
     async fn script_skill_is_returned_when_allow_scripts_true() {
-        // Regression pin for #5697: a skill directory containing a script
-        // file (.sh) must be returned by read_skill when the tool was
-        // constructed with allow_scripts=true. Prior to the fix,
-        // ReadSkillTool forwarded a hardcoded None to
-        // load_skills_with_open_skills_settings, which unwrap_or(false)
-        // resolved to false, silently blocking the skill.
         let tmp = TempDir::new().unwrap();
         let mut config = config_for_tmp(&tmp);
         config.skills.allow_scripts = true;

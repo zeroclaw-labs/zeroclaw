@@ -1,21 +1,4 @@
 //! Gmail Pub/Sub push notification channel.
-//!
-//! Instead of polling via IMAP, this channel uses Google's Gmail Pub/Sub push
-//! notifications.  Google sends a POST to our webhook endpoint whenever the
-//! user's mailbox changes.  The notification body contains a base64-encoded
-//! JSON payload with `emailAddress` and `historyId`; we then call the Gmail
-//! History API to fetch newly arrived messages.
-//!
-//! ## Setup
-//!
-//! 1. Create a Google Cloud Pub/Sub topic and grant `gmail-api-push@system.gserviceaccount.com`
-//!    the **Pub/Sub Publisher** role on that topic.
-//! 2. Create a push subscription pointing to `https://<your-domain>/webhook/gmail`.
-//! 3. Configure `[channels_config.gmail_push]` in `config.toml` with `topic` and
-//!    `oauth_token`.
-//!
-//! The channel automatically calls `users.watch` to register the subscription
-//! and renews it before the 7-day expiry.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -163,16 +146,6 @@ pub struct WatchResponse {
 
 // ── Channel implementation ───────────────────────────────────────
 
-/// Gmail Pub/Sub push notification channel.
-///
-/// Incoming messages arrive via webhook (`POST /webhook/gmail`) and are
-/// dispatched to the agent.  The `listen` method registers the Gmail watch
-/// subscription and periodically renews it.
-///
-/// Inbound sender authorization lives in `peer_groups` in V3; this channel
-/// resolves the authorized senders at message-time via [`Self::peer_resolver`]
-/// rather than reading a per-channel `allowed_senders` field (it no longer
-/// exists on `GmailPushConfig`).
 pub struct GmailPushChannel {
     pub config: GmailPushConfig,
     /// The alias key under `[channels.gmail.<alias>]` this handle is
@@ -385,13 +358,6 @@ impl GmailPushChannel {
         Ok(resp.json().await?)
     }
 
-    /// Check if a sender email is in the allowlist.
-    ///
-    /// Email allowlist entries support three syntaxes — preserved from
-    /// the legacy `GmailPushConfig::allowed_senders` semantics:
-    /// - `*`                wildcard, allow anyone.
-    /// - `user@host`        full address, case-insensitive.
-    /// - `@host` / `host`   domain match, case-insensitive.
     pub fn is_sender_allowed(&self, email: &str) -> bool {
         let peers = (self.peer_resolver)();
         Self::is_email_sender_allowed(&peers, email)
@@ -781,7 +747,6 @@ pub fn sanitize_header_value(value: &str) -> String {
 }
 
 /// Extract the plain-text body from a Gmail message.
-///
 /// Walks MIME parts looking for `text/plain`; falls back to `text/html`
 /// with basic tag stripping; finally falls back to the `snippet`.
 pub fn extract_body_text(msg: &GmailMessage) -> String {

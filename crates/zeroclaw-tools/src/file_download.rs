@@ -16,12 +16,6 @@ static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 pub struct FileDownloadTool {
     security: Arc<SecurityPolicy>,
     config: FileDownloadConfig,
-    /// Whether the downloaded file persists on the host filesystem. `false` on
-    /// an ephemeral runtime (Docker tmpfs / no volume mount), where the file is
-    /// written inside the container but invisible on the host and discarded at
-    /// session end. When `false`, a successful download carries a loud
-    /// ephemeral-workspace warning. Mirrors
-    /// [`super::file_write::FileWriteTool`]. See issue #4627.
     persistent_writes: bool,
 }
 
@@ -324,11 +318,6 @@ impl Tool for FileDownloadTool {
         if !status.is_success() {
             let raw_body = response.text().await.unwrap_or_default();
             let truncated = if raw_body.len() > RESPONSE_BODY_LIMIT_BYTES {
-                // The body is attacker-influenceable, so split on a char boundary
-                // to avoid panicking when the byte cutoff lands inside a
-                // multi-byte UTF-8 sequence. floor_char_boundary is unstable, so
-                // walk down at most three bytes — a UTF-8 code point is at most
-                // four bytes wide, so a boundary is always within reach.
                 let mut cut = RESPONSE_BODY_LIMIT_BYTES;
                 while cut > 0 && !raw_body.is_char_boundary(cut) {
                     cut -= 1;
@@ -391,7 +380,7 @@ impl Tool for FileDownloadTool {
                     );
                     // The download landed in an ephemeral workspace and will not
                     // reach the host — warn loudly rather than report a bare
-                    // success (issue #4627).
+                    // success
                     let output = if self.persistent_writes {
                         output
                     } else {
@@ -650,9 +639,6 @@ mod tests {
         );
     }
 
-    /// On an ephemeral runtime a successful download lands in a workspace that
-    /// won't persist; the output must carry the loud warning while preserving
-    /// the original status, and the bytes must still be written (issue #4627).
     #[tokio::test]
     async fn execute_warns_on_ephemeral_workspace() {
         let server = MockServer::start().await;
@@ -857,9 +843,6 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
 
-        // The configured endpoint returns a 302 pointing at a sibling path.
-        // With redirects disabled, the tool must surface the 302 itself as a
-        // non-success status and must never contact the redirect target.
         Mock::given(method("GET"))
             .and(path("/download"))
             .respond_with(
@@ -910,11 +893,6 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
 
-        // Build a non-2xx body that is longer than RESPONSE_BODY_LIMIT_BYTES
-        // (4096) and where the byte at offset 4096 lands inside a multi-byte
-        // UTF-8 sequence. Pre-truncation pad — 4094 ASCII bytes — places the
-        // first byte of the next 3-byte character ("界") at offset 4094, so
-        // offset 4096 lies in the middle of that code point.
         let mut body = "x".repeat(4094);
         body.push_str("世界世界世界世界世界世界");
         assert!(!body.is_char_boundary(4096));

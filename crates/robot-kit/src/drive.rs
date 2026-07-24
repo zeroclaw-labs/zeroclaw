@@ -1,10 +1,4 @@
 //! Drive Tool - Motor control for omni-directional movement
-//!
-//! Supports multiple backends:
-//! - ROS2: Publishes geometry_msgs/Twist to cmd_vel topic
-//! - GPIO: Direct PWM control via rppal
-//! - Serial: Arduino/motor controller via serial commands
-//! - Mock: Logs commands for testing
 
 use crate::config::RobotConfig;
 use crate::traits::{Tool, ToolResult};

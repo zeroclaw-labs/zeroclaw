@@ -1,19 +1,4 @@
 //! Shared `allowed_users` matching used by every chat channel.
-//!
-//! Each channel (Slack, Discord, IRC, Telegram, Matrix, …) carries an
-//! `allowed_users: Vec<String>` allowlist with the same semantics:
-//!
-//! - `["*"]` (or any list containing `"*"`) means "anyone".
-//! - Empty list means "deny everyone" (channel is on but no inbound is
-//!   accepted yet — matches the "configured but not opened" stance the
-//!   channel docs use).
-//! - Otherwise, exact match against the user's identifier wins.
-//!
-//! IRC nicks are case-insensitive per RFC 2812; Matrix MXIDs are also
-//! case-insensitive. Most other channels (Slack user IDs, Discord
-//! snowflakes, Telegram usernames) are case-sensitive. The
-//! [`Match::Sensitive`] / [`Match::CaseInsensitive`] selector encodes
-//! that per-channel choice without growing a parallel impl.
 
 /// Case-sensitivity selector for the allowlist comparison. The chat
 /// platform defines which one applies; the helper does not infer.
@@ -25,12 +10,6 @@ pub enum Match {
     CaseInsensitive,
 }
 
-/// Return `true` when `user` is allowed under `allowed`.
-///
-/// Single source of truth for the per-channel `is_user_allowed` checks.
-/// Callers spell their channel's case-sensitivity by passing the
-/// matching [`Match`] variant; the helper handles the wildcard, empty,
-/// and per-entry comparisons identically across every channel.
 #[must_use]
 pub fn is_user_allowed(allowed: &[String], user: &str, mode: Match) -> bool {
     if allowed.iter().any(|u| u == "*") {
@@ -42,18 +21,6 @@ pub fn is_user_allowed(allowed: &[String], user: &str, mode: Match) -> bool {
     }
 }
 
-/// Return `true` when `user` is allowed under `allowed`, using a
-/// caller-provided `(entry, user) -> bool` comparison for the per-entry
-/// check.
-///
-/// Same single-source-of-truth shape as [`is_user_allowed`] — wildcard `"*"`
-/// admits everyone and the comparison runs against the caller's
-/// freshly-resolved `allowed` slice, so no allowlist state is cached. This
-/// covers the channels whose identity matching cannot be expressed by the
-/// two [`Match`] modes: E.164 phone normalization (WhatsApp), domain-class
-/// email matching (`@host` admitting a whole domain), etc. The `match_fn`
-/// owns only the per-entry comparison; the wildcard short-circuit stays here
-/// so every channel keeps identical wildcard semantics.
 #[must_use]
 pub fn is_user_allowed_by(
     allowed: &[String],

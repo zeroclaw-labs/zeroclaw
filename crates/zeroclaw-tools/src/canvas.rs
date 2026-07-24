@@ -1,9 +1,4 @@
 //! Live Canvas (A2UI) tool — push rendered content to a web canvas in real time.
-//!
-//! The agent can render HTML/SVG/Markdown to a named canvas, snapshot its
-//! current state, clear it, or evaluate a JavaScript expression in the canvas
-//! context. Content is stored in a shared [`CanvasStore`] and broadcast to
-//! connected WebSocket clients via per-canvas channels.
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -50,7 +45,6 @@ struct CanvasEntry {
 }
 
 /// Shared canvas store — holds all active canvases.
-///
 /// Thread-safe and cheaply cloneable (wraps `Arc`).
 #[derive(Clone)]
 pub struct CanvasStore {
@@ -406,11 +400,6 @@ mod tests {
 
     #[tokio::test]
     async fn canvas_tool_renders_into_shared_store() {
-        // Regression for #7563: WS chat / ACP sessions must build the
-        // `canvas` tool from the gateway's shared CanvasStore so frames
-        // pushed by the agent are visible to the `/canvas` reader. The
-        // store is Arc-backed, so a clone handed to the tool and the
-        // handle the gateway reads from must observe the same frames.
         let gateway_store = CanvasStore::new();
         let tool = CanvasTool::new(gateway_store.clone());
 

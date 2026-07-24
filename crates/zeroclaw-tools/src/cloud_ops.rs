@@ -1,8 +1,4 @@
 //! Cloud operations advisory tool for cloud transformation analysis.
-//!
-//! Provides read-only analysis capabilities: IaC review, migration assessment,
-//! cost analysis, and Well-Architected Framework architecture review.
-//! This tool does NOT create, modify, or delete cloud resources.
 
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
@@ -11,7 +7,6 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::CloudOpsConfig;
 
 /// Read-only cloud operations advisory tool.
-///
 /// Actions: `review_iac`, `assess_migration`, `cost_analysis`, `architecture_review`.
 pub struct CloudOpsTool {
     config: CloudOpsConfig,
@@ -368,11 +363,6 @@ fn scan_iac_best_practices(input: &str, cloud: &str) -> Vec<serde_json::Value> {
     findings
 }
 
-/// Scan for cost-related observations in IaC.
-///
-/// Only emits findings for resources whose estimated monthly cost exceeds
-/// `threshold`.  AWS-specific patterns (NAT Gateway, Elastic IP, ALB) are
-/// gated behind `cloud == "aws"`.
 fn scan_iac_cost(input: &str, cloud: &str, threshold: f64) -> Vec<serde_json::Value> {
     let lower = input.to_lowercase();
     let mut findings = Vec::new();

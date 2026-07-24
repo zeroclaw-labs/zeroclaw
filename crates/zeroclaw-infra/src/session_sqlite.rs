@@ -1,8 +1,4 @@
 //! SQLite-backed session persistence with FTS5 search.
-//!
-//! Stores sessions in `{workspace}/sessions/sessions.db` using WAL mode.
-//! Provides full-text search via FTS5 and automatic TTL-based cleanup.
-//! Designed as the default backend, replacing JSONL for new installations.
 
 use crate::session_backend::{
     SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
@@ -128,12 +124,6 @@ impl SqliteSessionBackend {
             );
         }
 
-        // Migration: structured routing columns. Each session metadata row
-        // gets the channel ref (`<type>.<alias>` like `discord.clamps`),
-        // the platform-side room/thread id, and the inbound sender id so
-        // dashboard filters and audit queries don't have to re-parse the
-        // `session_key` composition that orchestrator::conversation_history_key
-        // builds.  All three are nullable for backfill compatibility.
         for (column, ddl) in [
             (
                 "channel_id",
@@ -566,11 +556,6 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count.max(0) as usize)
     }
 
-    /// Cheap existence probe used by the gateway to skip cancelled-append
-    /// writes against a session the user just deleted (#7126). Mirrors the
-    /// row that `delete_session` wipes — once the metadata row is gone the
-    /// session is considered deleted, even if a stray DELETE on the
-    /// `sessions` table might still race ahead.
     fn session_exists(&self, session_key: &str) -> bool {
         let conn = self.conn.lock();
         conn.query_row(
@@ -903,11 +888,6 @@ impl SessionBackend for SqliteSessionBackend {
         let room_id = normalize(context.room_id);
         let sender_id = normalize(context.sender_id);
         let now = Utc::now().to_rfc3339();
-        // Insert a metadata stub row when missing so the per-platform
-        // fields land even before the first message append fires the
-        // upsert path. The COALESCE clauses preserve any field a prior
-        // append/set already stamped — channel-side updates only fill in
-        // gaps, they don't overwrite earlier routing context.
         conn.execute(
             "INSERT INTO session_metadata
                 (session_key, created_at, last_activity, message_count, channel_id, room_id, sender_id)
@@ -1168,9 +1148,6 @@ mod tests {
         assert!(!backend.delete_session("nonexistent").unwrap());
     }
 
-    /// #7126: `session_exists` must reflect the same row that
-    /// `delete_session` wipes, so the gateway's cancelled-append guard
-    /// stops resurrecting just-deleted sessions.
     #[test]
     fn session_exists_tracks_metadata_row() {
         let tmp = TempDir::new().unwrap();

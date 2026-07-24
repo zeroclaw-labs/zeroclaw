@@ -168,13 +168,6 @@ impl AuthProfilesStore {
         self.load_locked().await
     }
 
-    /// Read-only listing of persisted profile IDs.
-    ///
-    /// Reads and parses the on-disk store under the shared lock but never
-    /// decrypts token fields and never migrates or writes the payload back.
-    /// Diagnostics that only need to know which profile IDs exist must use
-    /// this instead of `load()`, whose decrypt-and-migrate path can rewrite the
-    /// store as a side effect and can fail on an unrelated undecryptable value.
     pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
         let _lock = self.acquire_lock().await?;
         let persisted = self.read_persisted_locked().await?;
@@ -604,6 +597,7 @@ impl Default for PersistedAuthProfiles {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedAuthProfile {
+    #[serde(alias = "provider")]
     model_provider: String,
     profile_name: String,
     kind: String,
@@ -685,6 +679,31 @@ mod tests {
             profile_id("openai-codex", "default"),
             "openai-codex:default"
         );
+    }
+
+    #[test]
+    fn persisted_profile_accepts_legacy_provider_key() {
+        let raw = r#"{
+            "schema_version": 2,
+            "updated_at": "2026-07-11T00:00:00Z",
+            "active_profiles": {
+                "openai-codex": "openai-codex:default"
+            },
+            "profiles": {
+                "openai-codex:default": {
+                    "provider": "openai-codex",
+                    "profile_name": "default",
+                    "kind": "oauth",
+                    "access_token": "access-token"
+                }
+            }
+        }"#;
+
+        let parsed: PersistedAuthProfiles = serde_json::from_str(raw).unwrap();
+        let profile = parsed.profiles.get("openai-codex:default").unwrap();
+
+        assert_eq!(profile.model_provider, "openai-codex");
+        assert_eq!(profile.profile_name, "default");
     }
 
     #[test]

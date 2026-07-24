@@ -2,10 +2,6 @@
 //! command per `slash`-tagged skill). Discord delivers application-command
 //! interactions over the same Gateway WebSocket as INTERACTION_CREATE; this
 //! module owns deriving the desired command set from installed skills and
-//! reconciling it against Discord's REST API — idempotent upsert + stale-command
-//! reaping, with persisted-fingerprint and `Retry-After` durability via
-//! `discord_slash_state`. The READY-time orchestration, the dispatch arm, and
-//! the interaction callbacks live in `mod.rs` / `interaction`.
 
 use serde_json::json;
 
@@ -16,11 +12,6 @@ use super::types::{DiscordSlashCommandSpec, ReconcileOutcome, SlashScope};
 /// headroom for `/ask` and future built-ins.
 pub(crate) const MAX_SKILL_SLASH_COMMANDS: usize = 90;
 
-/// Squeeze a skill name into Discord's command-name charset
-/// (`^[a-z0-9_-]{1,32}$`): ASCII-lowercase, runs of anything else collapse
-/// to a single `-`. Deliberately stricter than Discord's full unicode
-/// charset — an all-non-ASCII name slugs to empty and is dropped (with a
-/// WARN naming the skill), which is a documented limitation.
 pub(crate) fn discord_command_slug(name: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = true; // suppress leading '-'
@@ -39,19 +30,6 @@ pub(crate) fn discord_command_slug(name: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
-/// Map installed skills to slash-command specs. Exposure rules:
-/// - opt-in via the `slash` tag — skills run shell/HTTP tools, so surfacing
-///   one to a whole guild must be a deliberate per-skill decision;
-/// - community-synced skills (tag `open-skills`) are excluded even when
-///   tagged: their manifests are third-party-controlled, and a remote
-///   commit must not be able to surface new commands (name + description
-///   render in every guild's Discord UI) without operator action.
-///
-/// Specs are sorted by slug so the output (and everything derived from it:
-/// the registration fingerprint, collision winners, the cap cutoff) is
-/// deterministic regardless of filesystem iteration order. Reserved names,
-/// empty slugs, and collisions are dropped with a WARN; the set caps at
-/// `MAX_SKILL_SLASH_COMMANDS` with dropped names logged (no silent caps).
 pub fn discord_slash_specs_from_skills(
     skills: &[zeroclaw_runtime::skills::Skill],
 ) -> Vec<DiscordSlashCommandSpec> {
@@ -113,16 +91,6 @@ pub fn discord_slash_specs_from_skills(
     specs
 }
 
-/// Map a skill's `[[skill.slash_options]]` declarations into Discord option
-/// specs. Every authoring mistake is sanitised or dropped with a WARN rather
-/// than passed through to Discord, because an invalid registration body is
-/// rejected with a 400 and `reconcile_slash_commands` would then retry it on
-/// every READY (a re-registration loop). Specifically: an unknown `type` drops
-/// the option; the name is slugged to Discord's option-name charset (dropped if
-/// it slugs to empty) and de-duplicated within the command; numeric choices
-/// whose value doesn't parse to the option type are dropped; inverted `min`/
-/// `max` bounds are dropped. Required options are sorted first (Discord rejects
-/// a required option that follows an optional one).
 fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<OptionSpec> {
     let mut options = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -209,11 +177,6 @@ const DISCORD_LOCALES: &[&str] = &[
     "zh-CN", "ja", "zh-TW", "ko",
 ];
 
-/// Filter a skill-authored localization map to Discord-supported locale codes
-/// (case-sensitive, as Discord requires) and truncate each value to Discord's
-/// 100-char description limit. An authoring typo drops just that entry with a
-/// WARN rather than 400-ing the whole command registration; an empty result
-/// lets the caller omit the `*_localizations` key entirely.
 fn valid_discord_localizations(
     raw: &std::collections::BTreeMap<String, String>,
     skill: &str,
@@ -242,11 +205,6 @@ fn valid_discord_localizations(
         .collect()
 }
 
-/// Build the agent prompt for a skill slash command: the legacy single `input`
-/// for an untyped command, or the submitted `name: value` lines for a typed
-/// one. Returns `None` only when an *untyped* command was invoked with empty
-/// input — a typed command, even an all-optional one invoked with no arguments,
-/// still invokes the skill (rendering an empty argument list).
 pub(crate) fn skill_command_prompt(
     spec: &DiscordSlashCommandSpec,
     input: &str,
@@ -354,20 +312,8 @@ pub(crate) fn slash_command_registration_body(
     serde_json::Value::Array(commands)
 }
 
-/// The option description this feature writes on every skill command. It
-/// doubles as the ownership marker for stale-command reaping: Discord has
-/// no durable "registered by" field, and a structural shape alone (one
-/// required string option named `input`) is generic enough that foreign
-/// tooling could collide with it.
 pub(crate) const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the skill";
 
-/// Compiled-in Discord-locale translations for the channel's own built-in
-/// command/option descriptions. Compiled in (rather than sourced from the i18n
-/// FTL machinery) because that machinery only compiles in `en`/`zh-CN` - es/fr/ja
-/// load from a runtime locale dir that may not be deployed, so a stock binary
-/// would silently drop them. `en` is the default (the literal description) and
-/// is omitted. Initial translations - open to native-speaker refinement; skill
-/// authors localize their own commands via the skill manifest.
 mod builtin_localizations {
     /// `/ask` command description ("Ask the agent a question").
     pub(super) const ASK_COMMAND: &[(&str, &str)] = &[
@@ -416,24 +362,6 @@ fn localizations_object(entries: &[(&str, &str)]) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(map))
 }
 
-/// Ownership fingerprint for commands this feature owns: exactly one
-/// required string option named `input` carrying this feature's exact
-/// option description. Used to reap commands for uninstalled skills across
-/// restarts; commands registered by other tooling must never be touched —
-/// the description match makes accidental collision with a foreign
-/// `/x <input>` command effectively impossible.
-///
-/// Limitation: two slash-enabled aliases sharing one bot token would see
-/// each other's commands as reap candidates (commands are
-/// application-global, desired sets are per-alias). Enable slash commands
-/// on at most one alias per bot application.
-///
-/// Limitation (typed options): this recognizes only the legacy single-`input`
-/// shape. A skill command that declares typed options has a different shape and
-/// is therefore NOT auto-reaped when its skill is uninstalled — it is still
-/// upserted/updated normally while installed. This is deliberately conservative
-/// (it never risks deleting a foreign command); durable reaping of typed
-/// commands (persisting the registered slug set) is a follow-on.
 pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
     let Some(opts) = cmd.get("options").and_then(|o| o.as_array()) else {
         return false;
@@ -448,16 +376,6 @@ pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
         && o.get("description").and_then(|d| d.as_str()) == Some(SKILL_COMMAND_OPTION_DESCRIPTION)
 }
 
-/// Comparable projection of a command for change detection: description plus
-/// per-option (name, type, required, description) and, for typed options, the
-/// (choices, min/max value, min/max length, autocomplete) constraints. Discord
-/// decorates
-/// listed commands with server-side fields (id, version,
-/// default_member_permissions, …) that must not defeat the comparison; the
-/// numeric constraints are normalised (numbers → f64, lengths → u64, choice
-/// values → number-or-string) so an int-vs-float representation difference
-/// between what we send and what Discord echoes back doesn't force a spurious
-/// re-registration.
 pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
     json!({
         "description": cmd.get("description").cloned().unwrap_or_default(),
@@ -540,19 +458,6 @@ async fn rate_limit_deadline(resp: reqwest::Response) -> i64 {
     crate::discord_slash_state::retry_after_deadline(&headers, body.as_ref(), now)
 }
 
-/// Reconcile the application's global commands with the desired set:
-/// upsert each desired command (POST upserts by name) and delete stale
-/// skill-shaped commands left over from uninstalled skills. Commands
-/// registered by other tooling are never touched — this deliberately
-/// avoids the bulk-overwrite PUT. Global commands can take up to an hour
-/// to propagate the first time.
-///
-/// Returns `Err` when any owned stale command could not be deleted (other
-/// than a 404, which means it is already gone): the caller's fingerprint
-/// must not record such a pass as successful, or the stale command would
-/// never be retried while the desired set stays unchanged. Upserts for the
-/// desired set are still attempted first so a delete failure cannot block
-/// new registrations.
 pub(crate) async fn reconcile_slash_commands(
     client: &reqwest::Client,
     bot_token: &str,
@@ -573,11 +478,6 @@ pub(crate) async fn reconcile_slash_commands(
 
     let global_base = format!("{api_base}/applications/{app_id}/commands");
     let guild_base = |g: &str| format!("{api_base}/applications/{app_id}/guilds/{g}/commands");
-    // Active = where the commands live now; inactive = the other scope, whose
-    // leftover skill commands we reap so flipping `slash_command_scope` never
-    // leaves the same command registered in both places (the guild-scope
-    // migration hazard). `guild_ids` drives the active set under Guild and the
-    // reap set under Global.
     let (active, inactive): (Vec<String>, Vec<String>) = match scope {
         SlashScope::Global => (
             vec![global_base],
@@ -589,7 +489,7 @@ pub(crate) async fn reconcile_slash_commands(
         ),
     };
     // The canonical `/ask` we would register, used to prove ownership before
-    // reaping a `/ask` from the inactive scope (#7922): a foreign `/ask` whose
+    // reaping a `/ask` from the inactive scope a foreign `/ask` whose
     // projection differs is left untouched.
     let expected_ask = desired
         .iter()
@@ -614,11 +514,6 @@ pub(crate) async fn reconcile_slash_commands(
     Ok(ReconcileOutcome::Reconciled)
 }
 
-/// Reap every command this channel owns (`/ask` + skill-shaped) from an
-/// endpoint without upserting - used to clear the inactive scope after a
-/// `slash_command_scope` switch. Best-effort: a failed listing (e.g. the bot
-/// lacks `applications.commands` in a guild it has left) is logged and skipped,
-/// never fatal to the active-scope reconcile.
 async fn reap_all_owned_commands(
     client: &reqwest::Client,
     auth: &str,
@@ -667,7 +562,7 @@ async fn reap_all_owned_commands(
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
         // Only reap a `/ask` that is *ours* - one whose projection matches the
-        // `/ask` we register (#7922). Deleting by name alone would reap a `/ask`
+        // `/ask` we register Deleting by name alone would reap a `/ask`
         // registered by other tooling that happens to share the inactive scope.
         // Skill commands keep their own shape-based ownership marker.
         let is_owned_ask = name == "ask"

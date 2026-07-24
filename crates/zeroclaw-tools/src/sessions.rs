@@ -1,12 +1,4 @@
 //! Session-to-session messaging tools for inter-agent communication.
-//!
-//! Provides six tools:
-//! - `sessions_current` — identify the currently active session
-//! - `sessions_list` — list active sessions with metadata
-//! - `sessions_history` — read message history from a specific session
-//! - `sessions_send` — send a message to a specific session
-//! - `sessions_reset` — clear a session's message history
-//! - `sessions_delete` — permanently delete a session
 
 use async_trait::async_trait;
 use serde_json::json;

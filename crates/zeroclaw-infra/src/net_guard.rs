@@ -2,7 +2,6 @@
 //! local/private targets. Lives in `zeroclaw-infra` so both the tool layer
 //! (`zeroclaw-tools` domain guard) and the plugin host (`zeroclaw-plugins`
 //! `zc_http_request`) read one implementation without a tool-to-plugin
-//! dependency edge.
 
 /// True when `host` is loopback, private, link-local, a documentation/
 /// benchmark range, or one of the `localhost` / `*.local` name forms. Accepts

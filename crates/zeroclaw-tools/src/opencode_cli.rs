@@ -13,14 +13,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the OpenCode CLI (`opencode run`).
-///
-/// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
-/// tasks and delegates complex coding work to OpenCode, which has its own
-/// agent loop with file editing and shell tools.
-///
-/// Authentication uses the `opencode` binary's own session by default. No API
-/// key is needed unless `env_passthrough` includes provider-specific keys.
 pub struct OpenCodeCliTool {
     security: Arc<SecurityPolicy>,
     config: OpenCodeCliConfig,
@@ -93,11 +85,6 @@ impl Tool for OpenCodeCliTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            // Resolve relative working_directory against workspace_dir, NOT
-            // the daemon's current working directory. This prevents the bug
-            // where an external coding tool's relative working_directory
-            // would silently resolve to a path outside the workspace when
-            // the daemon cwd differs from workspace_dir.
             let wd_path = if wd_path.is_relative() {
                 self.security.workspace_dir.join(&wd_path)
             } else {

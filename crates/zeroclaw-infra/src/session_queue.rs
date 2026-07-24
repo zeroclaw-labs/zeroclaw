@@ -1,9 +1,4 @@
 //! Per-session actor queue for serializing concurrent access.
-//!
-//! Each session gets at most one concurrent turn. Additional requests queue up
-//! (bounded by `max_queue_depth`) and proceed in FIFO order. This prevents
-//! SQLite history corruption from overlapping writes and ensures consistent
-//! session state transitions.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,38 +1,4 @@
 //! Gemini CLI subprocess model_provider.
-//!
-//! Integrates with the Gemini CLI, spawning the `gemini` binary
-//! as a subprocess for each inference request. This allows using Google's
-//! Gemini models via the CLI without an interactive UI session.
-//!
-//! # Usage
-//!
-//! The `gemini` binary must be available in `PATH`, or its location can be
-//! set via the typed alias's `binary_path` field.
-//!
-//! Gemini CLI is invoked as:
-//! ```text
-//! gemini --prompt ""
-//! ```
-//! with prompt content written to stdin. The empty `--prompt ""` is the
-//! headless-mode trigger; the CLI appends stdin to it, so the actual prompt
-//! is never visible in `ps` / `/proc/<pid>/cmdline`. Older CLI builds used
-//! `--print -` for this; that flag was removed in Gemini CLI v0.40.x.
-//!
-//! # Limitations
-//!
-//! - **Conversation history**: Only the system prompt (if present) and the last
-//!   user message are forwarded. Full multi-turn history is not preserved because
-//!   the CLI accepts a single prompt per invocation.
-//! - **System prompt**: The system prompt is prepended to the user message with a
-//!   blank-line separator, as the CLI does not provide a dedicated system-prompt flag.
-//! - **Temperature**: The CLI does not expose a temperature parameter.
-//!   Only default values are accepted; custom values return an explicit error.
-//!
-//! # Authentication
-//!
-//! Authentication is handled by the Gemini CLI itself (its own credential store).
-//! No explicit API key is required by this model_provider.
-//!
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -54,7 +20,6 @@ const GEMINI_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
 /// ModelProvider that invokes the Gemini CLI as a subprocess.
-///
 /// Each inference request spawns a fresh `gemini` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
 pub struct GeminiCliModelProvider {
@@ -64,20 +29,49 @@ pub struct GeminiCliModelProvider {
     binary_path: PathBuf,
 }
 
-impl GeminiCliModelProvider {
-    /// Create a new `GeminiCliModelProvider`. Pass `None` to use the default
-    /// `"gemini"` (PATH lookup); pass an explicit path to override.
-    pub fn new(alias: &str, binary_path: Option<&str>) -> Self {
-        let binary_path = binary_path
+/// Typed builder for [`GeminiCliModelProvider`].
+///
+/// Only `alias` is required; the binary path defaults to the module's
+/// `DEFAULT_GEMINI_CLI_BINARY` (PATH lookup) when unset.
+#[must_use]
+pub struct GeminiCliBuilder {
+    alias: String,
+    binary_path: Option<String>,
+}
+
+impl GeminiCliBuilder {
+    /// Override the `gemini` CLI binary path. Whitespace-only inputs
+    /// fall back to the default (PATH lookup).
+    pub fn binary_path(mut self, path: Option<&str>) -> Self {
+        self.binary_path = path
             .map(str::trim)
             .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> GeminiCliModelProvider {
+        let binary_path = self
+            .binary_path
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_GEMINI_CLI_BINARY));
-        Self {
-            alias: alias.to_string(),
+        GeminiCliModelProvider {
+            alias: self.alias,
             binary_path,
         }
     }
+}
+
+impl GeminiCliModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`GeminiCliBuilder`].
+    pub fn builder(alias: &str) -> GeminiCliBuilder {
+        GeminiCliBuilder {
+            alias: alias.to_string(),
+            binary_path: None,
+        }
+    }
+
     /// Returns true if the model argument should be forwarded to the CLI.
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
@@ -116,11 +110,6 @@ impl GeminiCliModelProvider {
         format!("{clipped}...")
     }
 
-    /// Build the argv tail (excluding the binary itself) for a CLI invocation.
-    ///
-    /// `--prompt ""` is the headless-mode trigger; the CLI appends stdin to
-    /// it, so the actual prompt stays out of `ps` / `/proc/<pid>/cmdline`.
-    /// The pre-v0.40 syntax `--print -` was removed upstream in #6520.
     fn build_cli_args(model: &str) -> Vec<String> {
         let mut args = vec!["--prompt".to_string(), String::new()];
         if Self::should_forward_model(model) {
@@ -315,19 +304,25 @@ mod tests {
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = GeminiCliModelProvider::new("test", Some("/usr/local/bin/gemini"));
+        let p = GeminiCliModelProvider::builder("test")
+            .binary_path(Some("/usr/local/bin/gemini"))
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("/usr/local/bin/gemini"));
     }
 
     #[test]
     fn new_defaults_to_gemini() {
-        let p = GeminiCliModelProvider::new("test", None);
+        let p = GeminiCliModelProvider::builder("test")
+            .binary_path(None)
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("gemini"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = GeminiCliModelProvider::new("test", Some("   "));
+        let p = GeminiCliModelProvider::builder("test")
+            .binary_path(Some("   "))
+            .build();
         assert_eq!(p.binary_path, PathBuf::from("gemini"));
     }
 
@@ -365,7 +360,7 @@ mod tests {
         );
     }
 
-    // Regression for #6520. Gemini CLI v0.40.x removed `--print`; the
+    // Gemini CLI v0.40.x removed `--print`; the
     // headless-mode flag is now `--prompt`. The argv must (a) carry
     // `--prompt ""` so stdin still feeds the prompt content (keeping the
     // user message out of `ps`) and (b) NEVER carry `--print` or `-`.

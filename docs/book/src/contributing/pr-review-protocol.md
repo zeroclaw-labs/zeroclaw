@@ -110,6 +110,8 @@ Labels are maintainer metadata, not a contributor blocker. If the right label is
 
 Ask the author about labels only when the right label choice is ambiguous or nobody with label permissions is available. Do not request changes or hold merge solely because an author cannot edit labels.
 
+If your request-changes review leaves the next step on the author, include `needs-author-action` in the review posting packet. Skip it when the requested cleanup is maintainer-owned, another maintainer is taking over the branch, or the PR is waiting on a maintainer decision rather than author work.
+
 ## Template and public artifact checks
 
 Before approving, compare the live PR body against the current

@@ -1,9 +1,4 @@
 //! Deterministic built-in tools available to the replay agent.
-//!
-//! Replay fixtures script tool *calls*; for the agent loop to dispatch them, a
-//! tool of the same name must be registered. Phase 0 ships a small, side-effect-free
-//! set sufficient for the bundled sample suite. Later phases wire the real tool
-//! registry (sandboxed) for live evals.
 
 use async_trait::async_trait;
 use serde_json::json;

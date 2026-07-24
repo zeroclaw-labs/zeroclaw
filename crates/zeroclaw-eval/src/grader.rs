@@ -1,10 +1,4 @@
 //! Grading: non-panicking checks over a [`RunRecord`].
-//!
-//! Phase 0 ships the expectation checks reshaped to *return* structured results
-//! instead of asserting — so the harness can report every check (pass and fail) and
-//! exit with a status code rather than panicking on the first failure. The
-//! [`Grader`] trait is the extension point later phases hang side-effect, budget,
-//! and LLM-judge graders off of.
 
 use crate::case::TraceExpects;
 use crate::record::RunRecord;

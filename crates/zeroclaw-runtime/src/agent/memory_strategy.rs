@@ -2,12 +2,6 @@ use std::sync::Arc;
 use zeroclaw_api::memory_traits::{Memory, MemoryStrategy};
 use zeroclaw_api::model_provider::ModelProvider;
 
-/// Default memory strategy that delegates to existing implementations.
-///
-/// A thin wrapper over the memory lifecycle: it calls
-/// `consolidation::consolidate_turn` and `hygiene::run_if_due` directly.
-/// Context assembly is not the strategy's job; the turn engine renders the
-/// memory-context preamble via `agent::memory_inject`, keyed on `TurnOrigin`.
 pub struct DefaultMemoryStrategy {
     memory: Arc<dyn Memory>,
     memory_config: zeroclaw_config::schema::MemoryConfig,
@@ -20,22 +14,6 @@ impl DefaultMemoryStrategy {
         memory_config: zeroclaw_config::schema::MemoryConfig,
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
-        // #6722: rerank_enabled is declared on the config schema but the
-        // retrieval-pipeline rerank stage was never landed (PR #4245 closed
-        // unmerged).  Emit a one-time warning so operators who set these
-        // fields know they currently have no effect.
-        if memory_config.rerank_enabled {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "rerank_enabled": true,
-                        "rerank_threshold": memory_config.rerank_threshold,
-                    })),
-                "memory.rerank_enabled is set but the rerank stage is not yet implemented; this setting currently has no effect"
-            );
-        }
         Self {
             memory,
             memory_config,

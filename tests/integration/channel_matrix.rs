@@ -1,11 +1,4 @@
 //! Channel Matrix — comprehensive capability coverage tests.
-//!
-//! Validates every channel implementation against the full `Channel` trait
-//! contract, covering: identity semantics, threading, default methods,
-//! capability declarations, cross-channel parity, and edge cases.
-//!
-//! This matrix ensures ZeroClaw channels are fully tested to maintain
-//! competitive feature parity across all supported platforms.
 
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -594,10 +587,6 @@ async fn pin_multiple_messages_in_same_channel() {
 // 6. MESSAGE REDACTION SUPPORT
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Tests that MatrixTestChannel correctly records redaction events.
-/// This validates the mock contract, not the trait default or real implementation.
-/// Trait default coverage: `src/channels/traits.rs::default_redact_message_returns_success`
-/// Real implementation coverage: requires live Matrix integration tests (not in this suite).
 #[tokio::test]
 async fn redact_message_lifecycle() {
     let ch = MatrixTestChannel::new("matrix");
@@ -705,13 +694,6 @@ fn send_message_with_subject_preserves_thread() {
 // 8. CROSS-CHANNEL IDENTITY SEMANTICS PER PLATFORM
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Simulates the identity mapping for each platform:
-/// - Telegram: sender = chat_id (numeric), reply_target = chat_id
-/// - Discord: sender = user_id, reply_target = channel_id (distinct!)
-/// - Slack: sender = user_id, reply_target = channel_id (distinct!)
-/// - iMessage: sender = phone/email, reply_target = phone/email (same)
-/// - IRC: sender = nick, reply_target = channel_name (distinct!)
-/// - Email: sender = from@, reply_target = from@ (reply goes to sender)
 fn make_platform_message(platform: &str) -> ChannelMessage {
     match platform {
         "telegram" => ChannelMessage {
@@ -997,8 +979,6 @@ fn all_platforms_channel_field_matches_platform_name() {
     }
 }
 
-/// Discord, Slack, IRC, Mattermost, DingTalk, QQ, Nextcloud Talk all have
-/// reply_target != sender (channel-based platforms).
 #[test]
 fn channel_platforms_have_distinct_sender_and_reply_target() {
     let channel_based = [
@@ -1020,8 +1000,6 @@ fn channel_platforms_have_distinct_sender_and_reply_target() {
     }
 }
 
-/// Telegram, iMessage, Email, Signal, WhatsApp, CLI, Linq, WATI, WeCom
-/// are DM-style: reply_target == sender.
 #[test]
 fn dm_platforms_have_same_sender_and_reply_target() {
     let dm_platforms = [
@@ -1037,7 +1015,6 @@ fn dm_platforms_have_same_sender_and_reply_target() {
     }
 }
 
-/// Slack and Mattermost should have thread_ts populated for threaded replies.
 #[test]
 fn threaded_platforms_have_thread_ts() {
     let threaded = ["slack", "mattermost"];
@@ -1348,8 +1325,6 @@ async fn multi_channel_listen_produces_channel_tagged_messages() {
 // 13. CAPABILITY MATRIX DECLARATIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Documents the expected capability matrix for all channels. This test serves
-/// as a living spec — update it when channel capabilities change.
 #[tokio::test]
 async fn capability_matrix_spec() {
     // Channels with draft support (streaming edits)

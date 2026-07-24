@@ -8,11 +8,6 @@ use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
 
-/// Outcome of [`gate_tool_approval`] for one tool call.
-///
-/// `Deny`/`Replace` carry the synthesized [`ToolExecutionOutcome`] the caller
-/// records into its `ordered_results` slot before skipping execution;
-/// `Proceed::approved` feeds `set_runtime_approved_arg`.
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
@@ -97,13 +92,6 @@ pub(crate) async fn gate_tool_approval(
             (mgr.prompt_cli(&request), None)
         };
 
-        // The approval audit records which surface decided. On the streaming
-        // path `ctx.channel` is the approval bridge fanning out to several
-        // registered back-channels, and `ctx.channel_name` is the loop's
-        // static "cli"; prefer the back-channel that actually answered (carried
-        // on the decision via `decided_by`) so a WS/ACP approval is attributed
-        // to WS/ACP, not "cli". Single channels and the CLI prompt path leave it
-        // `None` and keep `channel_name`.
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 

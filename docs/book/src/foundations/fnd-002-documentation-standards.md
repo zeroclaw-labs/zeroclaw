@@ -1,8 +1,8 @@
 # FND-002: Intentional Documentation: Standards, Structure, and i18n Strategy
 
-> Starting v0.7.0 · Type: Documentation · Rev. 1
+> Starting v0.7.0 · Type: Documentation · Rev. 3
 >
-> **Canonical reference** · Ratified by the team · Rev. 1
+> **Canonical reference** · Ratified by the team · Rev. 3
 > Discussion thread and full revision history: [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576)
 
 ---
@@ -26,6 +26,16 @@
 9. [The Replacement docs-contract](#9-the-replacement-docs-contract)
 10. [Standards We Should Adopt](#10-standards-we-should-adopt)
 11. [Phased Roadmap](#11-phased-roadmap)
+
+---
+
+## Revision History
+
+| Rev | Date | Summary |
+|---|---|---|
+| 1 | 2026-04-20 | Initial ratified documentation standard |
+| 2 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions |
+| 3 | 2026-07-18 | Added proposed ADR-006 and ADR-007 records for the resolved runtime-channel-plugin and separate-gateway-process targets while keeping acceptance implementation-gated |
 
 ---
 
@@ -82,7 +92,7 @@ When this RFC was written, the project had two Architecture Decision Records in 
 - The choice of Rust over TypeScript
 - The trait-driven extensibility model
 - The WASM plugin system design
-- The choice of SQLite and Markdown as the two memory backends
+- The backend-neutral memory storage contract and SQLite default
 - The security model (pairing codes, autonomy levels, sandbox layers)
 
 Without these records, every new contributor must rediscover the reasoning through code archaeology. Every AI coding assistant that reads the codebase gets the *what* but not the *why*. This is one of the most expensive forms of undocumented technical debt.
@@ -294,19 +304,21 @@ Links to the relevant code files, issues, and external resources.
 - **ADRs live in `docs/book/src/architecture/decisions/`.** They are named `ADR-NNN-short-slug.md`.
 - **Significant architectural changes require an ADR.** "Significant" means: a decision that would be surprising to a new contributor, a decision that constrains future choices, or a decision that involves a non-obvious tradeoff.
 
-### 6.3 Retroactive ADRs
+<a id="63-retroactive-adrs"></a>
 
-The following key decisions should be documented retroactively. They represent the foundational reasoning a new contributor or AI tool needs to understand the codebase:
+### 6.3 Foundational ADR Set
 
-| Proposed ADR | Decision to record |
-|---|---|
-| ADR-001 | Rust as the implementation language (replacing TypeScript/OpenClaw) |
-| ADR-002 | Trait-driven extensibility as the primary architectural pattern |
-| ADR-003 | Extism as the initial WASM plugin execution bridge |
-| ADR-004 | Tool shared state ownership contract |
-| ADR-005 | SQLite + Markdown as the two memory backends |
-| ADR-006 | CLI as the only built-in channel; all others as plugins |
-| ADR-007 | Gateway extraction as a separate optional binary |
+The following foundational decisions and roadmap targets have durable ADRs. ADR-001 through ADR-005 are retroactive records of architecture that already exists. ADR-006 and ADR-007 describe implementation-gated targets from FND-001 and should remain proposed until their corresponding boundaries ship.
+
+| ADR | Decision to record | Classification |
+|---|---|---|
+| ADR-001 | Rust as the implementation language (replacing TypeScript/OpenClaw) | Retroactive; accepted |
+| ADR-002 | Trait-driven extensibility as the primary architectural pattern | Retroactive; accepted |
+| ADR-003 | Extism as the initial WASM plugin execution bridge | Retroactive; superseded by ADR-009 |
+| ADR-004 | Tool shared state ownership contract | Retroactive; accepted |
+| ADR-005 | Backend-neutral memory storage with SQLite as the default | Retroactive; accepted |
+| ADR-006 | Migrate optional channels from compiled feature gates to runtime plugins | Roadmap target; proposed until shipped |
+| ADR-007 | Extract the gateway as a separate optional binary | Roadmap target; proposed until shipped |
 
 Retroactive ADRs should be marked with a note:
 
@@ -327,7 +339,7 @@ When an AI coding assistant reads a repository, it sees the code as it is now. I
 
 ### 7.1 The Pattern
 
-The root `AGENTS.md` is the project's strongest existing contribution to AI-assisted development. It tells AI coding assistants the commands to run, the architecture to respect, the risk tiers to apply, and the anti-patterns to avoid. It works because it is specific, opinionated, and short.
+The root `AGENTS.md` is the project's compact, always-loaded contract for AI-assisted development. It owns project-wide safety, privacy, authorization, contribution, and validation policy. The architecture and contribution map routes non-trivial tasks to their relevant sources, while the coding agent guidelines hold optional detail such as examples, current stability assignments, skill discovery, and protected operational documents. This layered contract stays specific and opinionated without loading every detail into every session.
 
 As the workspace decomposes into crates (per the microkernel architecture RFC), each crate should have its own `AGENTS.md`. This is the mechanism by which architectural boundaries become enforceable at the AI-assistance layer, not just at compile time through crate dependencies, but at the reasoning layer before any code is written.
 
@@ -425,13 +437,15 @@ Implementations are registered by the binary crate, not by the kernel.
 
 ## Related ADRs
 - ADR-002: Trait-driven extensibility
-- ADR-006: CLI as the only built-in channel
-- ADR-007: Gateway extraction
+- ADR-006: Optional channels migrate to runtime plugins
+- ADR-007: Gateway extraction into a separate optional binary
 ```
 
 ### 7.4 The AGENTS.md Hierarchy
 
-The root `AGENTS.md` sets project-wide policy. Crate-level `AGENTS.md` files narrow that policy for their specific scope. When an AI tool reads a file in `crates/zeroclaw-api/`, it should read both the root `AGENTS.md` (project policy) and `crates/zeroclaw-api/AGENTS.md` (crate policy). Crate policy is more specific and takes precedence where they conflict.
+The root `AGENTS.md` sets the compact project-wide policy. The [architecture and contribution map](../contributing/architecture-map.md) routes tasks to maintained architecture, foundation, testing, security, and maintainer sources. [Coding agent guidelines](../contributing/agent-guidelines.md) provide detailed project-wide examples and registries that are useful on demand but are not part of the always-loaded bootstrap.
+
+Crate-level `AGENTS.md` files narrow that policy for their specific scope. When an AI tool reads a file in `crates/zeroclaw-api/`, it should read the root contract, follow the architecture map for the task, and read `crates/zeroclaw-api/AGENTS.md` when present. Crate policy is more specific and takes precedence within its scope, but it cannot weaken project-wide safety, privacy, or authorization requirements.
 
 ---
 
@@ -453,8 +467,8 @@ docs/book/src/
 │   │   ├── ADR-002-trait-driven-extensibility.md
 │   │   ├── ADR-003-wasm-plugin-model.md
 │   │   ├── ADR-004-tool-shared-state-ownership.md
-│   │   ├── ADR-005-memory-backends.md
-│   │   ├── ADR-006-cli-only-built-in-channel.md
+│   │   ├── ADR-005-pluggable-memory-backends.md
+│   │   ├── ADR-006-runtime-channel-plugins.md
 │   │   ├── ADR-007-gateway-extraction.md
 │   │   └── ADR-009-wit-wasmtime-plugin-execution.md
 │   └── diagrams/
@@ -665,7 +679,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Deliverables:**
 
-- [ ] Write ADR-005 through ADR-007 (retroactive, see Section 6.3)
+- [x] Write ADR-005 as a retroactive record of the current memory storage contract
+- [x] Write proposed ADR-006 and ADR-007 records for the implementation-gated FND-001 targets
 - [ ] Add a Vale configuration (`.vale.ini` + style rules) and CI check
 - [ ] Replace `docs-contract.md` in full with the version specified in Section 9
 - [ ] Migrate `docs/setup-guides/` content to the GitHub Wiki
@@ -674,7 +689,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 - [ ] Write root-level `AGENTS.md` for `crates/zeroclaw-api` (in anticipation of extraction)
 
 **Success metrics:**
-- ADR-001 through ADR-007 exist with accepted or superseded status as appropriate
+- ADR-001 through ADR-007 exist with accepted, proposed, or superseded status as appropriate
 - ADR-009 records the WIT/wasmtime decision that supersedes ADR-003
 - Vale CI check passes on all docs
 - Wiki has complete content for all migrated sections
@@ -704,7 +719,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Deliverables:**
 
-- [ ] Mark ADR-005 through ADR-007 as `accepted` (not `proposed`) once the corresponding code is shipped
+- [ ] Mark ADR-006 and ADR-007 as `accepted` once the corresponding code is shipped
 - [ ] Version the kernel IPC API documentation at `v1` with a stability guarantee
 - [ ] Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)
 - [ ] Publish the plugin SDK as a standalone document site (from `docs/book/src/developing/plugin-sdk.md`)
@@ -738,8 +753,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 ## Appendix B: Further Reading
 
-- [Diátaxis documentation framework](<https://diataxis.fr>): The definitive reference for structuring technical documentation by type.
-- [EA Artifacts on a Page (v2.2)](<https://eaonapage.com>): The classification framework used in Section 3.
+- [Diátaxis documentation framework](https://diataxis.fr): The definitive reference for structuring technical documentation by type.
+- [EA Artifacts on a Page (v2.2)](https://eaonapage.com): The classification framework used in Section 3.
 - **"Docs for Developers"**: Jared Bhatti et al.: A practical guide to technical documentation written by engineers who have maintained large documentation systems.
 - [Vale documentation](https://vale.sh/docs): Setup guide and configuration reference for the prose linter proposed in Section 10.
 - [Michael Nygard on ADRs](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions): The original post that introduced the ADR format used in Section 6.

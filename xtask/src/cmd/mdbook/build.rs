@@ -13,7 +13,6 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
-    build_refs(&root)?;
     build_api(&root)?;
     build_locales(&root, tag)?;
     crate::cmd::mdbook::linkcheck::check_internal_links(&root, tag.unwrap_or(DEFAULT_TAG))?;
@@ -40,20 +39,10 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
             .collect::<Vec<_>>()
             .join(" ")
     );
-    inject_lang_switcher_locales(&book, &entries)?;
-    crate::cmd::mdbook::themes::run(root)?;
-    crate::cmd::mdbook::keymap::run(root)?;
-    crate::cmd::mdbook::hardware::run(root)?;
-    crate::cmd::mdbook::feature_matrix::run(root)?;
-    crate::cmd::mdbook::plugins::run(root)?;
+    prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
     let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
-    // Search is enabled only for the primary locale. Per-locale searchindex is
-    // high-entropy (~6-7 MB raw each) and does not delta-compress across
-    // versions, so building it for every locale dominates gh-pages clone size.
-    // The primary locale (first in locales.toml, English) keeps full search;
-    // translated locales build without a search index or search box.
     let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
         let dest = format!("book/{}/{}", tag_dir, entry.code);
@@ -69,6 +58,20 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
         }
         run_cmd(&mut cmd)?;
     }
+    Ok(())
+}
+
+/// Generate every gitignored input that mdBook sources or hashes while
+/// rendering. Keep all entrypoints on this helper so a warm working tree cannot
+/// hide a missing generator from clean-checkout builds.
+pub fn prepare_generated_book_inputs(root: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
+    build_refs(root)?;
+    inject_lang_switcher_locales(&book_dir(root), entries)?;
+    crate::cmd::mdbook::themes::run(root)?;
+    crate::cmd::mdbook::keymap::run(root)?;
+    crate::cmd::mdbook::hardware::run(root)?;
+    crate::cmd::mdbook::feature_matrix::run(root)?;
+    crate::cmd::mdbook::plugins::run(root)?;
     Ok(())
 }
 
@@ -208,11 +211,6 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
         return Ok(());
     }
 
-    // Map each hashed chrome file (path relative to the locale dir, e.g.
-    // `theme/custom-abc12345.css`) to its unhashed `_shared`-relative path
-    // (e.g. `theme/custom.css`). The `../` prefix is applied per HTML file
-    // below, because a page's correct depth to the version root — and thus to
-    // `_shared` at the gh-pages root — depends on how deep the page sits.
     let mut replacements = Vec::new();
     let prefixes = [
         "css/chrome",
@@ -266,13 +264,6 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
     for entry in locale_entries() {
         let loc_dir = version_dir.join(&entry.code);
         for file in walk_dir(&loc_dir) {
-            // Depth of this HTML file below the locale dir. mdBook emits chrome
-            // refs as `<../ × (locale_depth + page_depth)>theme/foo-HASH.css`
-            // for an HTML page `page_depth` levels under the locale dir; the
-            // matching `_shared` ref needs the same total `../` count plus one
-            // to clear the version dir up to the gh-pages root where `_shared`
-            // lives. Concretely: page directly in `<tag>/<locale>/` -> `../../`,
-            // one level deeper -> `../../../`, and so on.
             let page_depth = file
                 .strip_prefix(&loc_dir)
                 .ok()

@@ -1,8 +1,4 @@
 //! Project delivery intelligence tool.
-//!
-//! Provides read-only analysis and generation for project management:
-//! status reports, risk detection, client communication drafting,
-//! sprint summaries, and effort estimation.
 
 use super::report_templates;
 use async_trait::async_trait;
@@ -12,7 +8,6 @@ use std::fmt::Write as _;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Project intelligence tool for consulting project management.
-///
 /// All actions are read-only analysis/generation; nothing is modified externally.
 pub struct ProjectIntelTool {
     default_language: String,

@@ -144,6 +144,20 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                     &[("value", &sop.max_concurrent.to_string())]
                 )
             );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-admission-policy",
+                    &[("value", &sop.admission_policy.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-max-pending-approvals",
+                    &[("value", &sop.max_pending_approvals.to_string())]
+                )
+            );
             if let Some(loc) = &sop.location {
                 println!(
                     "{}",
@@ -432,6 +446,8 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         };
 
@@ -465,6 +481,8 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         };
 

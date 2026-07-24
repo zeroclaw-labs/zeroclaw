@@ -16,12 +16,6 @@ pub struct PrunedOrphans {
     pub orphan_tool_call_ids: Vec<String>,
 }
 
-/// True when the assistant at `prev_idx` is itself an unresolved tool-call
-/// dispatch: it claims `tool_calls` but the rows between it and `next_idx`
-/// do not answer all of them. This is the genuinely poisoned shape where a
-/// second dispatch follows a first that never landed — distinct from a
-/// healthy `assistant(text preamble)` → `assistant(tool_calls)` turn, where
-/// the preamble has no tool_calls and is left untouched.
 fn assistant_is_unresolved_dispatch(
     messages: &[ChatMessage],
     prev_idx: usize,
@@ -46,29 +40,8 @@ impl PrunedOrphans {
     }
 }
 
-/// Remove `tool`-role messages whose `tool_call_id` has no matching
-/// `tool_use` / `tool_calls` entry in a preceding assistant message.
-///
-/// After any history truncation (drain, remove, prune) the first surviving
-/// message(s) may be `tool` results whose assistant request was trimmed away.
-/// The Anthropic API (and others) reject these with a 400 error.
 pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedOrphans {
     let mut outcome = PrunedOrphans::default();
-    // Pass 1: Remove a second `assistant(tool_calls)` (and its immediate
-    // tool results) only when the *preceding* assistant is itself
-    // problematic in a way that normalization would corrupt:
-    //
-    //   * a collapsed tool-exchange summary whose merge would orphan this
-    //     dispatch's results (the GLM-history case, #7013), or
-    //   * an unresolved tool-call dispatch — a first dispatch that never
-    //     landed, immediately followed by this one (the poisoned
-    //     double-dispatch case).
-    //
-    // A healthy turn shape `assistant(text preamble)` → `assistant(tool_calls)`
-    // → `tool` must NOT be touched: the preamble has no tool_calls and is
-    // neither a summary nor an unresolved dispatch, so it is left intact.
-    // Nuking the dispatch there produces the "amnesia mid-tool-loop"
-    // failure where the model sees the next turn with none of its work.
     let mut i = 0;
     while i < messages.len() {
         let assistant_tool_call_ids = if messages[i].role == "assistant" {
@@ -103,11 +76,6 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
         }
     }
 
-    // Pass 2: Remove remaining orphan tool messages whose tool_call_id
-    // is not in the preceding assistant's structured tool_calls array.
-    // A substring match on the assistant's *text* is NOT sufficient —
-    // compaction summaries are instructed to preserve identifiers, so an
-    // id can appear in prose without an actual tool_use block backing it.
     i = 0;
     while i < messages.len() {
         if messages[i].role != "tool" {
@@ -145,7 +113,6 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
 }
 
 /// Try to extract a `tool_call_id` from a tool-role message's JSON content.
-///
 /// Tool messages are stored as JSON like:
 /// `{"content": "...", "tool_call_id": "toolu_01Abc..."}`
 fn extract_tool_call_id(content: &str) -> Option<String> {
@@ -170,41 +137,7 @@ fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
     if ids.is_empty() { None } else { Some(ids) }
 }
 
-/// Strip `tool_calls` entries from assistant messages when no following
-/// `tool` message pairs with the call's id.
-///
-/// This complements [`remove_orphaned_tool_messages`], which only handles the
-/// inverse case (tool messages without a matching assistant). Unpaired
-/// `tool_use` blocks in assistant messages cause Bedrock/Anthropic to reject
-/// the next request with: "Expected toolResult blocks at messages.N.content
-/// for the following Ids: tooluse_*". The usual trigger is the agent loop
-/// hitting `max_tool_iterations` immediately after emitting a tool_use but
-/// before the runner recorded the tool_result.
-///
-/// Behaviour:
-/// * If SOME of an assistant's `tool_calls` ids pair with later `tool`
-///   messages and some do not, the unpaired entries are removed and the
-///   retained ones stay inside the JSON envelope.
-/// * If NONE of the `tool_calls` pair, the orphaned dispatch is reduced to a
-///   plain *text* turn carrying whatever assistant text it had. When there is
-///   no such text (the canonical `{"content":null,"tool_calls":[...]}`
-///   early-exit shape), the assistant message is dropped entirely — letting
-///   [`remove_orphaned_tool_messages`] and the provider converters backfill
-///   any role gap. Removing only the `tool_calls` key would leave a degenerate
-///   `{"content":null}` envelope that the provider converters (anthropic.rs /
-///   openai.rs) re-emit verbatim as literal assistant text, corrupting the
-///   exact graceful-shutdown request this sweep is meant to clean.
-///
-/// Returns the number of assistant messages that were rewritten or dropped
-/// because at least one of their `tool_calls` was unpaired.
 pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatMessage>) -> usize {
-    // Single reverse scan. `seen_tool_ids` accumulates the `tool_call_id`s of
-    // tool-role messages encountered *after* the current index (in original
-    // order), which is exactly the "answered later" relation an assistant's
-    // tool_calls must satisfy. Walking in reverse keeps this O(n) — no
-    // per-index HashSet clone — and makes an in-place `Vec::remove` safe for a
-    // fully-orphaned assistant, since every index past the current one has
-    // already been processed.
     let mut seen_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stripped = 0usize;
 
@@ -250,11 +183,6 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
             .collect();
 
         if paired_calls.is_empty() {
-            // Every tool_call is orphaned. Salvage any real assistant text into
-            // a bare text turn; otherwise drop the message so no degenerate
-            // envelope survives. A *bare* string (not a re-serialised
-            // `{"content":...}` object) is required — the converters only treat
-            // the un-enveloped string as plain assistant text.
             let salvaged_text = value
                 .get("content")
                 .and_then(serde_json::Value::as_str)
@@ -311,14 +239,6 @@ mod tests {
 
     #[test]
     fn strip_orphan_tool_calls_drops_tool_calls_when_no_result_follows() {
-        // Canonical case: loop hit max_tool_iterations after the assistant
-        // emitted a tool_use but before any tool_result landed. The Bedrock
-        // converter would then receive an orphaned tool_use and AWS returns:
-        // "Expected toolResult blocks at messages.N.content".
-        //
-        // With assistant text present, the orphaned dispatch is salvaged to a
-        // *bare* text turn — not a re-serialised `{"content":...}` envelope,
-        // which the provider converters would emit verbatim as literal text.
         let tool_calls_assistant = r#"{"content":"looking it up","tool_calls":[{"id":"toolu_ORPHAN","name":"search","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("user", "search for X"),
@@ -344,12 +264,6 @@ mod tests {
 
     #[test]
     fn strip_orphan_tool_calls_drops_message_when_content_null_all_orphan() {
-        // The exact max_tool_iterations early-exit shape: a canonical tool-call
-        // assistant `{"content":null,"tool_calls":[...]}` where every call is
-        // orphaned. Removing only the `tool_calls` key would leave a degenerate
-        // `{"content":null}` envelope, which anthropic.rs / openai.rs re-emit
-        // verbatim as literal assistant text (corrupting the graceful-shutdown
-        // request). The whole assistant message must be dropped instead.
         let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_ORPHAN","name":"search","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("user", "search for X"),
@@ -564,11 +478,6 @@ mod tests {
 
     #[test]
     fn back_to_back_unresolved_tool_calls_strips_later_dispatch() {
-        // Genuinely poisoned shape: `[A: tool_calls A]` followed
-        // immediately by `[A: tool_calls B]` with no tool result for A
-        // sitting between them. The earlier dispatch is unresolved, so
-        // the later assistant + its results are removed to restore a
-        // well-formed turn.
         let first_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_LOST","name":"shell","arguments":"{}"}]}"#;
         let second_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
@@ -584,12 +493,6 @@ mod tests {
             pruned.removed, 2,
             "second dispatch + its tool_result must be removed when prior dispatch is unresolved"
         );
-        // What survives: sys, user, first_dispatch (now orphaned), summary.
-        // Pass 2 then sweeps any remaining orphan tool messages — there
-        // are none after Pass 1, but the orphaned first_dispatch itself
-        // (assistant with tool_calls and no responses) stays, because
-        // this function only removes *tool*-role orphans in Pass 2,
-        // not stranded assistant dispatches.
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[2].content, first_dispatch);
         assert_eq!(messages[3].content, "summary");
@@ -612,12 +515,6 @@ mod tests {
         assert_eq!(messages.len(), 5);
     }
 
-    /// Regression test for issue #5813: a compaction summary preserves
-    /// identifiers by design (UUIDs, tokens, tool_call_ids). That means the
-    /// summary text may contain the tool_call_id of a tool_result whose
-    /// tool_use was dropped. The orphan detector must not be fooled by a
-    /// substring match on the summary — it must confirm the id appears in
-    /// a structured tool_calls array.
     #[test]
     fn orphan_tool_not_fooled_by_id_in_summary_text() {
         let summary = "[CONTEXT SUMMARY \u{2014} 4 messages compressed]\n\
@@ -640,9 +537,6 @@ mod tests {
         assert!(!messages.iter().any(|m| m.role == "tool"));
     }
 
-    /// Regression test for issue #5743: MiniMax rejects orphaned tool-role
-    /// messages whose assistant (with `tool_calls`) was trimmed by the
-    /// channel orchestrator's proactive history trimming.
     #[test]
     fn orphan_tool_from_trimmed_channel_history() {
         // Simulates the scenario: channel history was trimmed and the

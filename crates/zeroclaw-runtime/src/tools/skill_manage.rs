@@ -1,19 +1,4 @@
 //! Skill management tools for the background review fork.
-//!
-//! Three Tool impls exposed to the forked review agent:
-//! - `skills_list`: enumerate installed skills (name, description, version).
-//! - `skill_view`: read a single skill's SKILL.md (YAML front-matter + body
-//!   preview) plus the names of files in `references/`, `templates/`,
-//!   `scripts/`.
-//! - `skill_manage`: mutating actions — `patch` (atomically rewrite the
-//!   SKILL.md YAML front-matter via SkillImprover), `write_file` (add a file
-//!   under `references/|templates/|scripts/`), `archive` (move to `.archive/`).
-//!
-//! Format follows the agentskills.io / Anthropic Agent Skills standard:
-//! single `SKILL.md` per skill, YAML front-matter at top, Markdown body below.
-//! These tools are NOT registered in the default tool registry — the review
-//! fork builds them on demand so the main agent can't accidentally invoke
-//! them.
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -42,15 +27,6 @@ fn resolve_skill_dir(workspace_dir: &Path, slug: &str) -> Result<PathBuf> {
     Ok(skills_root(workspace_dir).join(slug))
 }
 
-/// Resolve `workspace/skills/<slug>` and verify the canonical resolved path is
-/// a non-symlinked directory inside the canonical skills root.
-///
-/// This is the OS-level boundary check that prevents a symlinked
-/// `workspace/skills/<slug>` from redirecting mutating operations outside the
-/// intended skills tree. The audit module already rejects symlinks *within* a
-/// skill at load time; this helper rejects them at the *root* before mutation.
-///
-/// Returns `(canonical_skills_root, canonical_skill_dir)`.
 fn safe_skill_dir(workspace_dir: &Path, slug: &str) -> Result<(PathBuf, PathBuf)> {
     let skill_dir = resolve_skill_dir(workspace_dir, slug)?;
     if !skill_dir.exists() {
@@ -389,13 +365,6 @@ impl Tool for SkillManageTool {
 }
 
 impl SkillManageTool {
-    /// Run the install/load audit on a skill directory and roll back on
-    /// failure. Returns `Ok(())` on clean audit and an error message string
-    /// on failure (the caller decides how to surface it).
-    ///
-    /// `pre_snapshot` is the original SKILL.md content captured before the
-    /// mutation; if `Some`, audit failure restores it. For non-`patch` callers,
-    /// the `_unused` parameter exists so this helper has one signature.
     async fn post_mutation_audit(
         &self,
         slug: &str,
@@ -493,11 +462,6 @@ impl SkillManageTool {
             .and_then(|v| v.as_str())
             .unwrap_or("Skill review");
 
-        // Check the kill switch before the cooldown so the agent gets a
-        // distinct, actionable error when improvement is disabled — otherwise
-        // both reasons collapse onto the cooldown message via
-        // `should_improve_skill`, and the agent wastes turns waiting for a
-        // cooldown that the disabled flag will never clear.
         if !self.config.enabled {
             return Ok(ToolResult {
                 success: false,
@@ -993,7 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_blocks_when_skill_is_on_cooldown() {
-        // Regression for #6683: with a non-zero cooldown configured, a skill
+        // with a non-zero cooldown configured, a skill
         // whose front-matter carries a fresh `updated_at` is on cooldown and
         // a patch must be refused with a structured error rather than writing.
         let dir = tempdir();
@@ -1032,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_proceeds_when_skill_is_stale() {
-        // Regression for #6683: an `updated_at` older than cooldown_secs is
+        // an `updated_at` older than cooldown_secs is
         // stale and a patch must proceed.
         let dir = tempdir();
         let stale = (chrono::Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
@@ -1062,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_proceeds_when_no_updated_at() {
-        // Regression for #6683: a skill with no `updated_at` is not on
+        // a skill with no `updated_at` is not on
         // cooldown — first patch must proceed even with a cooldown configured.
         let dir = tempdir();
         write_skill(dir.path(), "deploy", VALID_SKILL).await;
@@ -1300,7 +1264,6 @@ mod tests {
     }
 
     // ─── Symlink rejection (safe_skill_dir boundary) ────────
-    //
     // These tests verify that a symlinked `workspace/skills/<slug>` cannot be
     // used to redirect mutating operations outside the canonical skills root.
 

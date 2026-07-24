@@ -1,9 +1,4 @@
 //! RAG pipeline for hardware datasheet retrieval.
-//!
-//! Supports:
-//! - Markdown and text datasheets
-//! - Pin/alias tables (e.g. `red_led: 13`) for explicit lookup
-//! - Keyword retrieval (default) or semantic search via embeddings (optional)
 
 use std::collections::HashMap;
 use std::path::Path;

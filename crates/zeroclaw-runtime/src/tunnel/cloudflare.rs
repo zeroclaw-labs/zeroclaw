@@ -3,11 +3,6 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// Try to extract a real tunnel URL from a cloudflared log line.
-///
-/// Returns `Some(url)` when the line contains a genuine tunnel endpoint,
-/// skipping documentation and warning URLs (quic-go GitHub links,
-/// Cloudflare docs pages, etc.).
 fn extract_tunnel_url(line: &str) -> Option<String> {
     let idx = line.find("https://")?;
     let url_part = &line[idx..];
@@ -32,7 +27,6 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 }
 
 /// Cloudflare Tunnel — wraps the `cloudflared` binary.
-///
 /// Requires `cloudflared` installed and a tunnel token from the
 /// Cloudflare Zero Trust dashboard.
 pub struct CloudflareTunnel {

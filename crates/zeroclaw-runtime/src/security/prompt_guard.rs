@@ -1,14 +1,4 @@
 //! Prompt injection defense layer.
-//!
-//! Detects and blocks/warns about potential prompt injection attacks including:
-//! - System prompt override attempts
-//! - Role confusion attacks
-//! - Tool call JSON injection
-//! - Secret extraction attempts
-//! - Command injection patterns in tool arguments
-//! - Jailbreak attempts
-//!
-//! Contributed from RustyClaw (MIT licensed).
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};

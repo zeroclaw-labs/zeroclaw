@@ -155,11 +155,6 @@ pub fn discover_cli_tools(additional: &[String], excluded: &[String]) -> Vec<Dis
         probes.push((tool_name.as_str(), &["--version"], CliCategory::Build));
     }
 
-    // Probe concurrently. Each tool needs up to two short-lived child
-    // processes (`where`/`which` + `--version`); running them serially made
-    // `/api/cli-tools` visibly slow (wall time ~= sum of every probe). Scoped
-    // threads bound the scan by the slowest single tool instead. Output order
-    // is preserved because handles are joined in spawn order.
     std::thread::scope(|scope| {
         let handles: Vec<_> = probes
             .into_iter()
@@ -172,11 +167,6 @@ pub fn discover_cli_tools(additional: &[String], excluded: &[String]) -> Vec<Dis
     })
 }
 
-/// Suppress the console window that Windows otherwise spawns for each
-/// short-lived child process. Without this, hitting `/api/cli-tools` from the
-/// web UI flashes a `cmd`/console window for every probe — distracting in GUI
-/// and service contexts. No-op on non-Windows platforms. Mirrors the runtime
-/// shell-command fix from issue #5562.
 #[cfg(target_os = "windows")]
 fn hide_console(cmd: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;

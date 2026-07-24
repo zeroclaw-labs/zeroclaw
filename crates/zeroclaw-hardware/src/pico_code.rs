@@ -1,15 +1,4 @@
 //! Phase 7 — Dynamic code tools: `device_read_code`, `device_write_code`, `device_exec`.
-//!
-//! These tools let the LLM read, write, and execute code on any connected
-//! hardware device.  The `DeviceRuntime` on each device determines which
-//! host-side tooling is used:
-//!
-//! - **MicroPython / CircuitPython** — `mpremote` for code read/write/exec.
-//! - **Arduino / Nucleus / Linux** — not yet implemented; returns a clear error.
-//!
-//! When the `device` parameter is omitted, each tool auto-selects the device
-//! only when **exactly one** device is registered.  If multiple devices are
-//! present the tool returns an error and requires an explicit `device` parameter.
 
 use super::device::{DeviceRegistry, DeviceRuntime};
 use async_trait::async_trait;
@@ -35,12 +24,6 @@ const PORT_POLL_MS: u64 = 200;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolve the serial port path and runtime for a device.
-///
-/// If `device_alias` is provided, look it up; otherwise auto-selects the device
-/// only when exactly one device is registered.  With multiple devices present,
-/// returns an error requiring an explicit alias.
-/// Returns `(alias, port, runtime)` or an error `ToolResult`.
 async fn resolve_device_port(
     registry: &RwLock<DeviceRegistry>,
     device_alias: Option<&str>,
@@ -144,7 +127,6 @@ async fn run_mpremote(args: &[&str], timeout_secs: u64) -> Result<(String, Strin
 // ── DeviceReadCodeTool ────────────────────────────────────────────────────────
 
 /// Tool: read the current `main.py` from a connected device.
-///
 /// The LLM uses this to understand the current program before modifying it.
 pub struct DeviceReadCodeTool {
     registry: Arc<RwLock<DeviceRegistry>>,
@@ -242,7 +224,6 @@ impl Tool for DeviceReadCodeTool {
 // ── DeviceWriteCodeTool ───────────────────────────────────────────────────────
 
 /// Tool: write a complete program to a device as `main.py`.
-///
 /// This replaces the current `main.py` on the device and resets it so the new
 /// program starts executing immediately.
 pub struct DeviceWriteCodeTool {
@@ -427,7 +408,6 @@ impl Tool for DeviceWriteCodeTool {
 // ── DeviceExecTool ────────────────────────────────────────────────────────────
 
 /// Tool: run a one-off code snippet on a device without modifying `main.py`.
-///
 /// Good for one-time commands, sensor reads, and testing code before committing.
 pub struct DeviceExecTool {
     registry: Arc<RwLock<DeviceRegistry>>,
@@ -588,7 +568,6 @@ impl Tool for DeviceExecTool {
 // ── port wait helper ──────────────────────────────────────────────────────────
 
 /// Poll for a specific serial port to reappear after a device reset.
-///
 /// Returns `true` if the port exists within the timeout, `false` otherwise.
 async fn wait_for_port(
     port_path: &str,

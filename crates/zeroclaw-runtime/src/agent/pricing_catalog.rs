@@ -1,23 +1,5 @@
 //! Global pricing catalog: a last-resort fallback consulted by the cost engine
 //! when a model has no per-provider `pricing` entry in config.
-//!
-//! Loaded from `<data_dir>/pricing.json` if present. Populating that file is a
-//! build-specific CLI concern, never a public-feed fetch inside this shared
-//! daemon. A typical setup writes it from a public price feed (e.g. LiteLLM /
-//! OpenRouter) on a schedule; an air-gapped or self-hosted setup may write only
-//! the rates it cares about, or no file at all.
-//!
-//! When the file is present this makes `cost_usd` non-zero for cloud models the
-//! operator never hand-priced in `config.toml`. When absent the engine prices
-//! nothing here and self-hosted/free models stay `$0`.
-//!
-//! Matching is intentionally **exact and case-insensitive on the full model id
-//! only** — no leaf/substring fuzzy. Provider-qualified ids for self-hosted or
-//! private deployments (e.g. `myhost/...`) are typically absent from a public
-//! catalog, so an exact-only match leaves them at `$0` (correct: they are not
-//! billed). A broad fuzzy match would misprice a free self-hosted
-//! `gpt-oss-120b` against its public rate, or collapse `grok-4.3` onto
-//! `grok-4`; exact matching avoids both.
 
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -134,11 +116,6 @@ pub fn global_pricing_rates(model: &str) -> Option<(f64, f64, f64)> {
     global_pricing_catalog().rates_for(model)
 }
 
-/// Load `<data_dir>/pricing.json` into the process-global catalog. Returns the
-/// number of priced models loaded. A MISSING file clears the global catalog
-/// (so removing `pricing.json` reverts unmatched models to `$0` on the next
-/// reload, even same-PID); a corrupt or otherwise unreadable file keeps the
-/// previous catalog (never fatal — an unpriced run simply reports `$0`).
 pub fn load_global_pricing_catalog(data_dir: &Path) -> usize {
     let path = data_dir.join("pricing.json");
     match std::fs::read_to_string(&path) {

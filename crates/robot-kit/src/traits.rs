@@ -1,5 +1,4 @@
 //! Tool trait definition
-//!
 //! This defines the interface that all robot tools implement.
 //! It is compatible with ZeroClaw's Tool trait but standalone.
 
@@ -58,42 +57,6 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
-/// Core tool trait
-///
-/// Implement this trait to create a new tool that can be used
-/// by an AI agent to interact with the robot hardware.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use zeroclaw_robot_kit::{Tool, ToolResult};
-/// use async_trait::async_trait;
-/// use serde_json::{json, Value};
-///
-/// pub struct BeepTool;
-///
-/// #[async_trait]
-/// impl Tool for BeepTool {
-///     fn name(&self) -> &str { "beep" }
-///
-///     fn description(&self) -> &str { "Make a beep sound" }
-///
-///     fn parameters_schema(&self) -> Value {
-///         json!({
-///             "type": "object",
-///             "properties": {
-///                 "frequency": { "type": "number", "description": "Hz" }
-///             }
-///         })
-///     }
-///
-///     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-///         let freq = args["frequency"].as_f64().unwrap_or(440.0);
-///         // Play beep...
-///         Ok(ToolResult::success(format!("Beeped at {}Hz", freq)))
-///     }
-/// }
-/// ```
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Tool name (used in LLM function calling)
@@ -103,12 +66,10 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
 
     /// JSON Schema describing the tool's parameters
-    ///
     /// This is used by the LLM to understand how to call the tool.
     fn parameters_schema(&self) -> Value;
 
     /// Execute the tool with the given arguments
-    ///
     /// Arguments are passed as JSON matching the parameters_schema.
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult>;
 

@@ -1,16 +1,4 @@
 //! Shared request/response types for the ZeroClaw RPC + gateway API surface.
-//!
-//! **Single source of truth.** Every domain's wire types live here.
-//! The RPC dispatcher, the HTTP gateway, and the TUI client all
-//! import from this module. No ad-hoc `json!()`, no duplicated structs.
-//!
-//! ## Conventions
-//!
-//! - All structs derive `Debug, Clone, Serialize, Deserialize`.
-//! - All structs use `#[serde(rename_all = "snake_case")]`.
-//! - Optional fields use `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-//! - Types that already exist elsewhere (`MemoryEntry`, `CronJob`,
-//!   `CostSummary`, `SkillFrontmatter`) are re-exported, not re-defined.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +11,7 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
+pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -68,20 +57,6 @@ rpc_type! {
         /// daemon on their behalf. Omitted by older clients; defaults to empty.
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         pub env: std::collections::HashMap<String, String>,
-        /// Optional client-side capabilities the TUI advertises during the
-        /// handshake. Today the only inspected sub-key is `elicitation`,
-        /// parsed by `zeroclaw_api::elicitation::ElicitationCapabilities`
-        /// so the per-session `RpcApprovalChannel` can speak the ACP
-        /// `elicitation/create` RFD when the TUI signals support. The field
-        /// is a JSON pass-through so future capabilities can be added
-        /// without bumping the wire schema.
-        ///
-        /// Sourcing is camelCase to match the ACP convention used by the
-        /// elicitation RFD (`clientCapabilities.elicitation`); the runtime
-        /// dispatcher is the canonical owner of the parsed value for the
-        /// lifetime of the connection. Source of truth: the `initialize`
-        /// payload itself — the dispatcher caches the *parsed* form but
-        /// never copies the raw JSON.
         #[serde(
             default,
             rename = "clientCapabilities",
@@ -117,6 +92,14 @@ rpc_type! {
         pub protocol_version: u64,
         pub active_sessions: usize,
         pub session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_kind: Option<RuntimeConfigKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub local_ipc_endpoint: Option<String>,
     }
 }
 
@@ -328,11 +311,6 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// Params for `session/messages`. `limit` + `before_index`
-    /// page-window the load so a long session doesn't slurp every
-    /// message into client memory at once. Both default to the
-    /// legacy "load everything" behaviour for callers that pre-date
-    /// the pagination change.
     pub struct SessionMessagesParams {
         pub session_id: String,
         #[serde(default)]
@@ -848,11 +826,6 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// One skill in an agent's *effective* set (the runtime's four-source
-    /// union), with provenance — for `GET /api/agents/{alias}/skills` (#7757).
-    /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
-    /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
-    /// the source detail; `editable` is `true` only for `origin == "bundle"`.
     pub struct AgentSkillEntry {
         pub name: String,
         pub description: String,
@@ -866,14 +839,14 @@ rpc_type! {
         pub directory: Option<String>,
         pub editable: bool,
         /// Lower-precedence same-name skills this one shadows. Empty normally;
-        /// additive so old clients ignore it. (#7963)
+        /// additive so old clients ignore it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub shadowed: Vec<ShadowedSkillEntry>,
     }
 }
 
 rpc_type! {
-    /// A lower-precedence same-name skill shadowed by a winning skill (#7963).
+    /// A lower-precedence same-name skill shadowed by a winning skill
     pub struct ShadowedSkillEntry {
         pub name: String,
         /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
@@ -883,7 +856,7 @@ rpc_type! {
 
 rpc_type! {
     /// A candidate skill the audited resolver dropped (security audit failed,
-    /// unauditable, or manifest parse error) (#7963).
+    /// unauditable, or manifest parse error)
     pub struct DroppedSkillEntry {
         pub name: String,
         pub origin: String,
@@ -893,7 +866,7 @@ rpc_type! {
         pub reason: String,
         /// True when the secure-default script policy is the blocker, so the
         /// dashboard can surface the `skills.allow_scripts = true` remediation
-        /// without parsing `reason`. Additive; old clients ignore it. (#7963)
+        /// without parsing `reason`. Additive; old clients ignore it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub scripts_blocked: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -906,7 +879,7 @@ rpc_type! {
         pub agent: String,
         pub skills: Vec<AgentSkillEntry>,
         /// Audit-dropped candidates the resolver skipped. Empty normally;
-        /// additive so old clients ignore it. (#7963)
+        /// additive so old clients ignore it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub dropped: Vec<DroppedSkillEntry>,
     }
@@ -1398,11 +1371,11 @@ pub enum SessionUpdateEvent {
         /// at cancel point (Cancelled).
         content: String,
     },
-    /// Emitted whenever older whole turns were dropped from the context window
-    /// to fit the token budget. Surfaces a user-visible "context was cut here"
-    /// marker so trimming is never silent. `dropped_messages` is the count of
-    /// conversation messages removed; `kept_turns` is how many whole turns
-    /// remained after the cut.
+    /// Emitted whenever older whole turns were dropped from structured history
+    /// to fit a token budget or message cap. Surfaces a user-visible "context
+    /// was cut here" marker so trimming is never silent. `dropped_messages` is
+    /// the count of conversation messages removed; `kept_turns` is how many
+    /// whole turns remained after the cut.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: usize,
@@ -1422,16 +1395,6 @@ pub enum TurnCompletionOutcome {
     Failed,
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// ── Quickstart ───────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════
-//
-// RPC mirror of the HTTP `/api/quickstart/*` routes in
-// `zeroclaw-gateway`. The wire shapes are deliberately identical so the
-// drift test in `tests/quickstart_drift.rs` can submit the same fixture
-// `BuilderSubmission` through both transports and assert identical
-// on-disk delta + identical response shape.
-
 pub use crate::quickstart::{
     AppliedAgent, FieldDescriptor, FieldSection, QuickstartError, QuickstartStep, Surface,
 };
@@ -1444,6 +1407,9 @@ rpc_type! {
         pub agents: Vec<String>,
         pub risk_profiles: Vec<String>,
         pub runtime_profiles: Vec<String>,
+        /// Canonical runtime fallback for providers without a recommendation.
+        #[serde(default)]
+        pub default_runtime_profile: Option<String>,
         /// `<provider_type>.<alias>` refs.
         pub model_providers: Vec<String>,
         /// `<channel_type>.<alias>` refs.
@@ -1479,6 +1445,9 @@ rpc_type! {
         /// `true` when the entry runs locally and needs no remote
         /// credential. Always `false` for channels.
         pub local: bool,
+        /// Daemon-derived runtime preset to auto-select for this provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub default_runtime_profile: Option<String>,
     }
 }
 
@@ -1552,16 +1521,6 @@ rpc_type! {
 
 #[cfg(test)]
 mod tests {
-    //! Lock the wire shape down to what callers actually depend on:
-    //! - `#[serde(rename_all = "snake_case")]` on enums renames *variants*
-    //!   (and fields, when present). Changing the case convention would
-    //!   break every JSON-RPC client silently — these tests catch that.
-    //! - `#[serde(tag = "kind", ...)]` on tagged enums (`Quickstart*Result`)
-    //!   decides whether the discriminant is adjacent or inline; drift
-    //!   here breaks the web quickstart surface that consumes them.
-    //! - `#[serde(default, skip_serializing_if = "Option::is_none")]` on
-    //!   request/result optionals must stay symmetric so the dispatcher
-    //!   never sends an explicit `null` that older clients can't parse.
 
     use super::*;
     use serde_json::{Value, json};
@@ -1780,13 +1739,16 @@ mod tests {
             kind: "anthropic".into(),
             display_name: "Anthropic".into(),
             local: false,
+            default_runtime_profile: Some("unbounded".into()),
         };
         let v = serde_json::to_value(&opt).unwrap();
         assert_eq!(v["kind"], json!("anthropic"));
         assert_eq!(v["local"], json!(false));
+        assert_eq!(v["default_runtime_profile"], json!("unbounded"));
         let back: QuickstartTypeOption = serde_json::from_value(v).unwrap();
         assert_eq!(back.kind, opt.kind);
         assert_eq!(back.local, opt.local);
+        assert_eq!(back.default_runtime_profile, opt.default_runtime_profile);
     }
 
     #[test]

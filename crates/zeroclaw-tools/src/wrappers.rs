@@ -1,26 +1,4 @@
 //! Generic tool wrappers for crosscutting concerns.
-//!
-//! Each wrapper implements [`Tool`] by delegating to an inner tool while
-//! applying one crosscutting concern around the `execute` call.  Wrappers
-//! compose: stack them at construction time in `tools/mod.rs` rather than
-//! repeating the same guard blocks inside every tool's `execute` method.
-//!
-//! # Composition order (outermost first)
-//!
-//! ```text
-//! RateLimitedTool
-//!   └─ PathGuardedTool
-//!        └─ <concrete tool>
-//! ```
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! let tool = RateLimitedTool::new(
-//!     PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
-//!     security.clone(),
-//! );
-//! ```
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -33,31 +11,6 @@ type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 
 // ── RateLimitedTool ───────────────────────────────────────────────────────────
 
-/// Wraps any [`Tool`] and enforces the [`SecurityPolicy`] rate limit.
-///
-/// Replaces the repeated `is_rate_limited()` / `record_action()` guard blocks
-/// previously inlined in every tool's `execute` method (~30 files, ~50 call
-/// sites).
-///
-/// # Budget semantics
-///
-/// `record_action()` runs **after** the inner tool returns and only when
-/// `ToolResult.success == true`.  This matches the pre-wrapper behaviour: only
-/// calls that actually performed work consumed the action budget.  Validation,
-/// policy, path-allowlist, read-only, and command-validation failures all
-/// surface as `success: false` from the inner tool (or inner wrapper) and do
-/// not consume a slot.
-///
-/// ## Read-tool exception (anti-probing)
-///
-/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) in this crate
-/// intentionally calls `record_action()` *itself* on the post-`PathGuardedTool`
-/// `resolve_candidate` / `canonicalize` failure paths.
-/// This prevents an attacker from probing path existence for free: each
-/// attempt — successful or failed — consumes exactly one slot.  The outer
-/// `RateLimitedTool` only records on `success: true`, so the totals stay at
-/// one slot per attempt.  When introducing a new read-style tool, follow the
-/// same pattern.
 pub struct RateLimitedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
@@ -109,11 +62,6 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
             });
         }
 
-        // Delegate first; only record against the budget when the inner tool
-        // actually performed work (ToolResult.success == true).  This preserves
-        // the pre-wrapper semantics where validation/policy failures (forbidden
-        // paths, malformed args, disabled config, read-only blocks, command
-        // validation) did not consume the action budget.
         let result = self.inner.execute(args).await?;
 
         if result.success && !self.security.record_action() {
@@ -130,16 +78,6 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
 // ── PathGuardedTool ───────────────────────────────────────────────────────────
 
-/// Wraps any [`Tool`] and blocks calls whose arguments contain a forbidden path.
-///
-/// Replaces the `forbidden_path_argument()` guard blocks previously inlined in
-/// tools that accept a path-like argument (`shell`, `file_read`, `file_write`,
-/// `file_edit`, `content_search`, `glob_search`, `image_info`).
-///
-/// Path extraction is argument-name-driven: the wrapper inspects the `"path"`,
-/// `"command"`, `"pattern"`, and `"query"` fields of the JSON argument object.
-/// Tools whose path argument uses a different field name can pass a custom
-/// extractor at construction via [`PathGuardedTool::with_extractor`].
 pub struct PathGuardedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,

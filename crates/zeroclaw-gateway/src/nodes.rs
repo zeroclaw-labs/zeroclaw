@@ -1,17 +1,4 @@
 //! WebSocket endpoint for dynamic node discovery and capability advertisement.
-//!
-//! External processes/devices connect to `/ws/nodes` and advertise their
-//! capabilities at runtime. The gateway exposes these as dynamically available
-//! tools to the agent.
-//!
-//! ## Protocol
-//!
-//! ```text
-//! Node -> Gateway: {"type":"register","node_id":"phone-1","capabilities":[{"name":"camera.snap","description":"Take a photo","parameters":{...}}]}
-//! Gateway -> Node: {"type":"registered","node_id":"phone-1","capabilities_count":1}
-//! Gateway -> Node: {"type":"invoke","call_id":"uuid","capability":"camera.snap","args":{...}}
-//! Node -> Gateway: {"type":"result","call_id":"uuid","success":true,"output":"..."}
-//! ```
 
 use super::AppState;
 use axum::{
@@ -29,6 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
+
+pub mod mdns;
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -226,13 +215,6 @@ fn extract_node_ws_token<'a>(
     None
 }
 
-/// GET /ws/nodes — WebSocket upgrade for node connections
-/// Check the /ws/nodes access-control policy.
-///
-/// Returns `Some(status, body)` if the request should be rejected before
-/// the WebSocket upgrade, or `None` if it passes and the upgrade may proceed.
-/// Extracted so the auth decision matrix can be unit-tested without a WS
-/// handshake (which axum performs before calling the handler).
 pub(crate) fn check_node_auth(
     nodes_config: &zeroclaw_config::schema::NodesConfig,
     pairing: &PairingGuard,
@@ -401,13 +383,6 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                         "Node registered: with capabilities"
                     );
                     registered_node_id = Some(node_id.clone());
-
-                    // Send ack — we can't use `sender` here since it's moved
-                    // into the send task. Instead, send ack via the invoke channel
-                    // pattern isn't ideal. We'll use a workaround: send the ack
-                    // through a special invocation that the send task converts to
-                    // a registered message. For simplicity, we just log and the
-                    // ack is implicit in the protocol.
                 } else {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -472,7 +447,6 @@ mod tests {
         PairingGuard::new(require, &[])
     }
 
-    /// nodes.enabled=false → 404 before any WS upgrade attempt.
     #[test]
     fn nodes_disabled_returns_404() {
         let cfg = NodesConfig {
@@ -483,8 +457,6 @@ mod tests {
         assert_eq!(result.map(|(s, _)| s), Some(StatusCode::NOT_FOUND));
     }
 
-    /// nodes.enabled=true, no auth_token, pairing disabled → 503.
-    /// Previously this combination allowed unauthenticated registration.
     #[test]
     fn nodes_enabled_no_auth_no_pairing_returns_503() {
         let cfg = NodesConfig {
@@ -561,7 +533,6 @@ mod tests {
         assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
     }
 
-    /// nodes.auth_token set, correct token → auth passes (None = proceed to upgrade).
     #[test]
     fn nodes_auth_token_correct_token_passes() {
         let cfg = NodesConfig {
@@ -574,7 +545,6 @@ mod tests {
         assert!(result.is_none(), "correct token must pass auth gate");
     }
 
-    /// Pairing required, wrong/missing bearer token → 401.
     #[test]
     fn nodes_pairing_required_wrong_token_returns_401() {
         let cfg = NodesConfig {

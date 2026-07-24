@@ -11,12 +11,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-/// Cost tracker for API usage monitoring and budget enforcement.
-///
-/// The append-only JSONL file behind `storage` is the durable usage ledger.
-/// In-memory fields are process-local helpers for config reloads and cheap
-/// session summaries; goal and task budget views must derive consumed usage
-/// from persisted `CostRecord` rows instead of caching it elsewhere.
 pub struct CostTracker {
     /// Live cost policy. This is hot-swapped on config reload so budget checks
     /// see new global limits without rebuilding the tracker.
@@ -32,7 +26,6 @@ pub struct CostTracker {
 }
 
 /// Cheap process-local totals for one optional agent attribution bucket.
-///
 /// This never replaces the persisted ledger. It only avoids rereading JSONL for
 /// current-session summary fields while the daemon is alive.
 #[derive(Default, Clone, Copy)]
@@ -208,13 +201,6 @@ impl CostTracker {
         self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, true)
     }
 
-    /// Record usage for a call that already entered a scoped cost-tracked turn.
-    ///
-    /// The existence of the task-local scope is the admission decision for this
-    /// in-flight call. A concurrent config reload may disable cost tracking for
-    /// future turns, but it must not erase usage from a call that was already
-    /// admitted under cost tracking, especially when durable task budgets depend
-    /// on the ledger. The current config still controls per-agent rollups.
     pub fn record_scoped_usage_with_owned_task_attribution(
         &self,
         usage: TokenUsage,
@@ -283,11 +269,6 @@ impl CostTracker {
         self.get_summary_filtered(None)
     }
 
-    /// Filter persisted records by `[from, to)` (either side `None` is
-    /// unbounded) and roll up by_model / by_agent / window totals.
-    /// Bounds come from the caller (the dashboard computes them in the
-    /// operator's local timezone); the tracker doesn't decide what
-    /// "today" means.
     pub fn get_summary_in_bounds(
         &self,
         from: Option<DateTime<Utc>>,
@@ -342,11 +323,6 @@ impl CostTracker {
         storage.usage_totals_for_task(task_id)
     }
 
-    /// Get task totals plus whether every included row had reliable pricing.
-    ///
-    /// Token totals remain valid even when pricing is unavailable. Cost-limited
-    /// features use the boolean to fail closed instead of treating unknown cost
-    /// as free.
     pub fn get_usage_totals_for_task_with_pricing(
         &self,
         task_id: &str,
@@ -359,11 +335,6 @@ impl CostTracker {
         let (daily_cost, monthly_cost, daily_records) = {
             let mut storage = self.lock_storage();
             let (d, m) = storage.get_aggregated_costs()?;
-            // Always pull daily_records: per-model and per-agent rollups
-            // both want today's slice. The optional-skip optimisation tied
-            // to `track_per_agent` made the by-model rollup session-scoped,
-            // which surprised operators after a daemon restart and clashes
-            // with the daily totals in the same response.
             (d, m, storage.daily_records()?)
         };
 
@@ -638,11 +609,6 @@ fn add_usage_to_agent_stats(entry: &mut AgentCostStats, record: &CostRecord) {
     entry.request_count += 1;
 }
 
-/// Builder for a reporting summary derived from ledger records.
-///
-/// The accumulator exists only while scanning records. It deliberately stores
-/// totals in the same shape as `CostSummary` so callers get a single immutable
-/// result after the scan finishes.
 #[derive(Default)]
 struct CostSummaryAccumulator {
     /// Aggregated USD cost for the scanned records.
@@ -679,11 +645,6 @@ impl CostSummaryAccumulator {
     }
 }
 
-/// Persistent storage for cost records.
-///
-/// `path` is the canonical ledger location. The cached day/month values are
-/// invalidated on writes and rebuilt from JSONL when queried, so they are
-/// performance caches, not separate sources of truth.
 struct CostStorage {
     /// JSONL ledger path.
     path: PathBuf,
@@ -757,11 +718,6 @@ impl CostStorage {
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
                 Err(error) => {
-                    // A single line that fails to parse may be two or more
-                    // records concatenated without a newline (a legacy
-                    // interleaved-write artifact from before the atomic-append
-                    // fix). Try to stream multiple records out of it before
-                    // giving up, so old corrupted ledgers still aggregate fully.
                     let mut recovered = 0usize;
                     let stream =
                         serde_json::Deserializer::from_str(trimmed).into_iter::<CostRecord>();
@@ -855,12 +811,6 @@ impl CostStorage {
                 )
             })?;
 
-        // Build the full line (record + newline) and emit it with a SINGLE
-        // `write_all`. `writeln!` can lower to multiple `write` syscalls (one for
-        // the body, one for the newline); under concurrent appenders that
-        // interleaves and produces concatenated JSON like `{..}{..}` on one
-        // line. One `write_all` on an O_APPEND fd keeps each record's bytes
-        // contiguous, so the reader always sees one record per line.
         let mut line = serde_json::to_string(&record)?;
         line.push('\n');
         file.write_all(line.as_bytes()).with_context(|| {
@@ -1001,10 +951,6 @@ mod tests {
         }
     }
 
-    /// Regression: a legacy ledger whose records were concatenated onto a
-    /// single line (the pre-atomic-append interleave bug) must still have all
-    /// of its records recovered by `for_each_record`, so historical cost data
-    /// keeps aggregating.
     #[test]
     fn recovers_concatenated_records_from_legacy_ledger() {
         let tmp = TempDir::new().unwrap();
@@ -1260,11 +1206,6 @@ mod tests {
 
     #[test]
     fn summary_by_model_is_daily_scoped() {
-        // by_model rollup pulls from today's persisted records so the
-        // dashboard's per-model breakdown survives daemon restarts (matches
-        // by_agent's behaviour). A record from another session that
-        // happened today still shows up; only ones outside the day fall
-        // off — exercised by the storage layer's get_aggregated_costs.
         let tmp = TempDir::new().unwrap();
         let storage_path = resolve_storage_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {

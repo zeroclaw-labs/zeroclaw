@@ -1,14 +1,4 @@
 //! Unauthenticated cross-provider model catalog via models.dev.
-//!
-//! `https://models.dev/api.json` is a community-maintained public aggregator
-//! that lists model IDs for 100+ model_providers (Anthropic, OpenAI, Google,
-//! Bedrock, Azure, Moonshot, Qwen, …). No API key required, same shape for
-//! every model_provider. We fetch the catalog once per process and cache in
-//! memory.
-//!
-//! Providers that have a native public `/models` endpoint (OpenRouter,
-//! Ollama's `/api/tags`) override `ModelProvider::list_models` directly and
-//! skip this path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,17 +81,6 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
     Ok(ids)
 }
 
-/// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
-///
-/// First call fetches the catalog; subsequent calls hit the cache. The
-/// returned list is sorted for stable menu rendering.
-///
-/// Attribution: the models.dev catalog is a global, pre-authentication
-/// metadata source with no concrete `Attributable` thing of its own.
-/// We wrap the body with `scope!(model_provider_type: "models_dev",
-/// model_provider_alias: "catalog", …)` so the `filter_models` warning
-/// (and any future record! inside `fetch_catalog`) lands with the
-/// model_provider_type and model_provider_alias slots populated.
 pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
     ::zeroclaw_log::scope!(
         model_provider_type: "models_dev",
@@ -114,11 +93,6 @@ pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
     .await
 }
 
-/// Per-model pricing for one model_provider from a parsed catalog, as a
-/// `model_id -> ModelRates` map. Models with no `cost` block are omitted;
-/// like `rates_catalog`, this emptiness filter is load-bearing for downstream
-/// consumers. Pure, unit-testable without the network. Rates are USD per 1M
-/// tokens verbatim (no conversion).
 pub(crate) fn pricing_from_catalog(
     catalog: &Catalog,
     provider_key: &str,

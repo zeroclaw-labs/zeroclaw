@@ -1,13 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// V1/V2 supported a "colon-URL" provider string form (e.g.
-/// `"anthropic-custom:https://api.z.ai/api/anthropic"`) where the URL was
-/// embedded inline. V3 uses a typed `uri` field on the per-provider
-/// alias entry. This helper splits the colon-URL form into `(type, url)`
-/// so the migration can use `type` as the V3 provider key and store the
-/// URL in `uri` on the alias entry. Returns `(type_key, Some(url))`
-/// for colon-URL forms; otherwise `(raw.to_string(), None)`.
 fn split_colon_url_provider(raw: &str) -> (String, Option<String>) {
     if let Some(colon_idx) = raw.find(':') {
         let (prefix, rest) = raw.split_at(colon_idx);
@@ -73,12 +66,6 @@ fn default_v2_schema_version() -> u32 {
     2
 }
 
-/// Channel section keys subject to V3 alias-wrapping. A missing entry
-/// here sends its V2 `[channels.<type>]` block through the passthrough
-/// branch, which leaves it flat instead of `<type>.default`-shaped and
-/// the V3 deserializer then chokes on the typed `HashMap<String, T>`
-/// slot. Tests cross-check this list against the typed channel slots
-/// on `ChannelsConfig` to catch silent drift.
 pub const V3_CHANNEL_TYPES: &[&str] = &[
     "telegram",
     "discord",
@@ -136,19 +123,6 @@ impl V2Config {
             mut passthrough,
         } = self;
 
-        // autonomy → risk_profiles.default + runtime_profiles.default.
-        //
-        // Authorization fields (allowlists, sandbox, approval gates,
-        // env passthrough) land on the risk profile. Budget caps
-        // (`max_actions_per_hour`, `max_cost_per_day_cents`,
-        // `shell_timeout_secs`) and recursion/timeout fields
-        // (`max_delegation_depth`, `delegation_timeout_secs`,
-        // `agentic_timeout_secs`) land on the runtime profile because
-        // they are operational tuning enforced with subagent
-        // parent-subset discipline, not authorization decisions.
-        //
-        // V2 `non_cli_excluded_tools` renames to V3 `excluded_tools`
-        // (broader scope, same shape).
         if let Some(autonomy_value) = autonomy {
             let renamed = rename_table_keys(
                 autonomy_value,
@@ -189,20 +163,8 @@ impl V2Config {
             }
         }
 
-        // V3 RiskProfileConfig absorbed [security.sandbox]; the
-        // [security.resources] block is dropped (max_memory_mb,
-        // max_cpu_time_seconds, max_subprocesses, memory_monitoring
-        // were never wired to any enforcement codepath; sandbox
-        // backends carry their own resource budgets).
         fold_security_into_risk_profile(&mut passthrough);
 
-        // agent → runtime_profiles.default + risk_profiles.default.
-        //
-        // Most agent-section fields are operational tuning and land on
-        // the runtime profile. `allowed_tools` is the one authorization
-        // field on V2's `[agent]` block (which tools may the agent
-        // call), so it moves to `[risk_profiles.default.allowed_tools]`
-        // alongside `allowed_commands`.
         if let Some(toml::Value::Table(mut agent_table)) = agent {
             let allowed_tools = agent_table.remove("allowed_tools");
             if let Some(at_value) = allowed_tools {
@@ -359,12 +321,6 @@ impl V2Config {
         // all collapse into V3 [storage.<backend>.<alias>].
         fold_v2_storage_subsystems(&mut passthrough);
 
-        // Alias-wrap each [channels.<type>], fold discord_history into
-        // [channels.discord.<alias>].archive, and lift per-channel
-        // inbound peer-auth fields (allowed_users, allowed_contacts,
-        // allowed_from, allowed_numbers, allowed_senders, allowed_pubkeys)
-        // into synthesized [peer_groups.<type>_default] entries. The
-        // peer_groups sink is additive — operator entries survive.
         if let Some(channels_value) = channels {
             let mut peer_groups_for_fold = match passthrough.remove("peer_groups") {
                 Some(toml::Value::Table(t)) => t,
@@ -400,11 +356,6 @@ impl V2Config {
             );
         }
 
-        // V3 makes agents explicit — V1/V2 had an implicit single-agent
-        // model. Strip inline brain fields onto provider aliases; if no
-        // [agents] blocks but brain config exists, synthesize a default
-        // agent (with the profile entries it references) so the upgrade
-        // has at least one runnable agent.
         let new_agents = if !agents.is_empty() {
             synthesize_agent_brains(agents, &mut passthrough)
         } else {
@@ -452,11 +403,6 @@ impl V2Config {
     }
 }
 
-/// Rename `inner` to `replacement` inside the `[<parent>]` table when both
-/// the parent and the inner key are present. No-op if either is absent or
-/// if `replacement` already exists (operator wins; their explicit V3 key is
-/// the source of truth). Used for V3 schema field renames where the
-/// migration just needs to rewrite a flat scalar in place.
 fn rename_subkey(table: &mut toml::Table, parent: &str, inner: &str, replacement: &str) {
     let Some(toml::Value::Table(parent_tbl)) = table.get_mut(parent) else {
         return;
@@ -554,18 +500,6 @@ fn dot_delivery_channel(job: &mut toml::Table) {
     }
 }
 
-/// Normalize a V2 provider type string to its V3 canonical name plus the
-/// extras that the typed family config requires (region endpoint, auth_mode,
-/// alias rename, family-specific fields).
-///
-/// Returns `(canonical_type, alias_key, extras_to_inject)`. `extras_to_inject`
-/// is a vec of `(field_name, toml::Value)` pairs that the migration writes
-/// onto the alias entry table — typically `endpoint = "cn"` for regional
-/// collapses, `auth_mode = "oauth"` for oauth-mode collapses, `wire_api =
-/// "responses"` + `requires_openai_auth = true` for the openai_codex fold.
-///
-/// The alias spellings here mirror the V2 registry's match arms in
-/// `crates/zeroclaw-providers/src/lib.rs` (`is_<vendor>_alias` functions).
 fn normalize_provider_type(
     raw: &str,
     incoming_alias: &str,
@@ -657,11 +591,6 @@ fn normalize_provider_type(
         return ("anthropic".to_string(), "claude-code".to_string(), extras);
     }
 
-    // anthropic-custom is the V1/V2 colon-URL form for "Anthropic-API at
-    // a custom URL" (the URL was already split out into `uri` above by
-    // `alias_provider_models`). Folds under anthropic with alias "custom"
-    // so a stock `anthropic.default` entry and an `anthropic-custom:URL`
-    // entry both migrate cleanly without clobbering each other.
     if raw == "anthropic-custom" {
         return ("anthropic".to_string(), "custom".to_string(), extras);
     }
@@ -788,7 +717,7 @@ fn normalize_provider_type(
 
     // Unknown/passthrough: keep the raw key. Silent drop will happen at V3
     // deserialize if it doesn't match any typed slot — that's the migration's
-    // accountability gap, intentional per #6273. Operators with truly novel
+    // accountability gap, intentional Operators with truly novel
     // names (a forked custom backend) need a slot defined for it.
     (raw.to_string(), incoming_alias.to_string(), extras)
 }
@@ -810,12 +739,6 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
                 .or_insert(toml::Value::String(url));
         }
 
-        // V2 per-block `base_url` + optional `api_path` → V3 `uri` (full
-        // endpoint URL). Matches the same concatenation
-        // `fold_providers_globals_into_models` applies to V2 top-level
-        // globals — without this, per-block [model_providers.<id>] entries
-        // would survive into V3 with the unknown `base_url`/`api_path`
-        // keys, and V3 deserialize silently drops them.
         if let toml::Value::Table(t) = &mut config {
             fold_base_url_api_path_into_uri(t);
         }
@@ -841,27 +764,6 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
     aliased
 }
 
-/// Fold V2 `[providers]` global fields (which lived directly on `ProvidersConfig`)
-/// onto the V3 per-provider `ModelProviderConfig` entry.
-///
-/// Field renames applied during the fold:
-/// - `api_url` (+ optional `api_path` suffix) → `uri` (matches V3 `ModelProviderConfig.uri`)
-/// - `default_model` → `model`
-/// - `default_temperature` → `temperature`
-/// - `provider_timeout_secs` → `timeout_secs`
-/// - `provider_max_tokens` → `max_tokens`
-///
-/// Target entry resolution:
-/// - If `default_provider` is a string and matches a key in `aliased_models`, fold there.
-/// - Otherwise, if `aliased_models` already has at least one entry, fold onto its
-///   first entry's `default` alias (this matches V1 `[model_providers.<id>]` blocks
-///   that had no separate `default_provider` declaration).
-/// - Otherwise, synthesize a fresh `<default_provider | "openrouter">.default`
-///   entry to hold the globals (matches V1's documented default provider).
-///
-/// `claude-code` continues to map under `anthropic.claude-code` per the V3 fold.
-///
-/// Per-provider explicit fields take precedence: globals only fill in missing slots.
 fn fold_providers_globals_into_models(
     new_providers: &mut toml::Table,
     aliased_models: &mut toml::Table,
@@ -889,17 +791,6 @@ fn fold_providers_globals_into_models(
         return;
     }
 
-    // Determine target (provider_type, alias). For colon-URL forms like
-    // `"anthropic-custom:https://..."`, split the URL out of the type key so
-    // the V3 reference grammar (`<type>.<alias>`) doesn't tokenize at a URL
-    // dot. The URL is folded into `uri` below.
-    //
-    // Then run the V2-EOL provider name through `normalize_provider_type` so
-    // synonym kills + regional/oauth collapses + claude_code/openai_codex
-    // folds happen here too — same canonical-naming gate as
-    // `alias_provider_models`. Without this, an operator with
-    // `default_provider = "grok"` would land in a `grok` slot that doesn't
-    // exist on V3 ModelProviders and silently disappear.
     let (target_type, target_alias, colon_url, normalized_extras) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
@@ -933,12 +824,6 @@ fn fold_providers_globals_into_models(
         None => return,
     };
 
-    // The colon-URL form's URL portion (split from default_provider) takes
-    // precedence over the global `api_url` field — both originate from V2's
-    // top-level providers block, but the colon-URL form was the more specific
-    // hint when the user wrote `default_provider = "anthropic-custom:<url>"`.
-    // V3's `uri` field is the full endpoint URL — concatenate any V2 `api_path`
-    // suffix onto it, since `api_path` no longer exists separately.
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
     let uri_source = match (base_url_source, g_api_path) {
         (Some(toml::Value::String(b)), Some(toml::Value::String(p))) => {
@@ -1017,12 +902,6 @@ fn strip_cost_prices(cost_value: toml::Value) -> (Option<toml::Value>, toml::Tab
     (cost_passthrough, prices)
 }
 
-/// Drop V2 `[cost.prices.*]` entries. V2 keyed pricing by composite
-/// `"<provider>/<model>"` identifiers that don't carry the V3
-/// `<provider_type>.<alias>` path, so any automatic remap is fragile.
-/// Operators paste the rates manually under the right V3
-/// `[model_providers.<type>.<alias>].pricing` block; the INFO log per
-/// entry names the model id and last-known input/output rates.
 fn drop_cost_prices_with_logs(prices: &toml::Table) {
     for (model_id, price) in prices {
         let (input, output) = match price.as_table() {
@@ -1046,25 +925,6 @@ fn drop_cost_prices_with_logs(prices: &toml::Table) {
     }
 }
 
-/// Synthesize one `[peer_groups.<channel_type>_<alias>]` entry from a
-/// V2 channel's inbound peer-auth allow-list, and emit an INFO log.
-/// The per-channel arms in [`apply_v2_to_v3_channel_folds`] each:
-///
-///   1. `instance.remove("<field>")` (V3 has no slot for the field —
-///      strip regardless of whether the fold synthesizes a group).
-///   2. Call this helper with the removed array and the channel's V3
-///      `<type>.<alias>` ref so the synthesized group lands in
-///      `peer_groups`.
-///
-/// Skip rules: empty arrays and any list containing `"*"` produce no
-/// group (a peer group can't express "anyone"). Collisions with an
-/// operator-authored `[peer_groups.<type>_<alias>]` are left
-/// untouched.
-///
-/// V1/V2 had implicit single-agent semantics, so the synthesized
-/// group always binds the migration-bridge `default` agent. That is
-/// the *only* legitimate `default` usage in the V2→V3 fold path —
-/// post-migration the operator owns peer_group membership.
 fn synthesize_peer_group_from_allowlist(
     peer_groups: &mut toml::Table,
     channel_type: &str,
@@ -1118,20 +978,6 @@ fn synthesize_peer_group_from_allowlist(
     );
 }
 
-/// Wrap V2 `Option<T>` channel sections into V3 `HashMap<String, T>` keyed
-/// by `"default"`. Applies, per channel instance:
-///
-/// - **discord_history fold**: `[channels.discord_history]` →
-///   `[channels.discord]` with `archive = true`. Effective `enabled` is
-///   the OR of both sides so a user with only
-///   `discord_history.enabled = true` still ends up with an enabled
-///   merged discord block.
-/// - Singular→plural fold per channel type (`discord.guild_id` →
-///   `guild_ids[]`, `mattermost.channel_id` → `channel_ids[]`,
-///   `reddit.subreddit` → `subreddits[]`, `signal.group_id` →
-///   `group_ids[]` or `dm_only=true` for the `"dm"` sentinel).
-///
-/// `cli: bool` is preserved at the top-level `channels.cli`, not aliased.
 fn alias_wrap_channels(channels_value: toml::Value, peer_groups: &mut toml::Table) -> toml::Table {
     let mut channels_table = match channels_value {
         toml::Value::Table(t) => t,
@@ -1148,13 +994,6 @@ fn alias_wrap_channels(channels_value: toml::Value, peer_groups: &mut toml::Tabl
     // discord_history-only user with `enabled=true` survives into V3.
     fold_discord_history(&mut channels_table);
 
-    // V3 collapses Feishu and Lark to one channel type — they share the same
-    // bot framework, only the API endpoint differs (Feishu = open.feishu.cn
-    // for China, Lark = open.larksuite.com for international). Stash the V2
-    // [channels.feishu] block here so the alias-wrap loop processes the V2
-    // [channels.lark] block normally; the stash is re-injected after the loop
-    // as [channels.lark.feishu] (NOT lark.default) so two-bot deployments
-    // survive without operator intervention.
     let stashed_feishu_v2 = strip_feishu_block(&mut channels_table);
 
     // Per-channel-type: singular→plural fold, peer-auth lift into
@@ -1202,11 +1041,6 @@ fn alias_wrap_channels(channels_value: toml::Value, peer_groups: &mut toml::Tabl
         }
     }
 
-    // Re-inject the stashed V2 [channels.feishu] block as [channels.lark.feishu]
-    // with use_feishu = true. The alias name is "feishu" — not "default" — so a
-    // two-bot deployment with both [channels.lark] (international) AND
-    // [channels.feishu] (CN) survives as [channels.lark.default] +
-    // [channels.lark.feishu]; both bots remain reachable post-migration.
     inject_feishu_as_lark_alias(&mut new_channels, stashed_feishu_v2);
 
     new_channels
@@ -1231,16 +1065,6 @@ fn strip_feishu_block(channels: &mut toml::Table) -> Option<toml::Table> {
     }
 }
 
-/// Post-alias-wrap: insert the stashed V2 feishu block as
-/// `[channels.lark.feishu]` with `use_feishu = true`. The alias name is
-/// `feishu` (not `default`) so a two-bot V2 deployment with both
-/// `[channels.lark]` (international) AND `[channels.feishu]` (CN) survives as
-/// two distinct V3 aliases — `lark.default` and `lark.feishu` — without
-/// losing data or requiring operator intervention.
-///
-/// If a `lark.feishu` alias already exists in `new_channels` (impossible
-/// from V2 input but cheap to defend), we do not overwrite — the existing
-/// entry wins and a WARN names the dropped source.
 fn inject_feishu_as_lark_alias(new_channels: &mut toml::Table, feishu_table: Option<toml::Table>) {
     let Some(mut feishu_table) = feishu_table else {
         return;
@@ -1281,18 +1105,6 @@ fn inject_feishu_as_lark_alias(new_channels: &mut toml::Table, feishu_table: Opt
     );
 }
 
-/// Fold V2 `[channels.discord_history]` into `[channels.discord]` in place.
-/// Sets `archive = true`. Effective `enabled` = `discord.enabled` OR
-/// `discord_history.enabled`. Existing discord keys win over history keys
-/// for non-`enabled` fields (so a user-set discord.bot_token isn't
-/// overwritten by history's bot_token).
-///
-/// When both blocks have a `bot_token` and the values **differ**, emit
-/// one `WARN` line naming the source block whose token was dropped
-/// (`[channels.discord_history].bot_token`) and the surviving block
-/// (`[channels.discord]`). The dropped value itself is **not** logged
-/// — operators recover from the pre-migration `<config>.backup`.
-/// Two-bot deployments must reconfigure manually.
 fn fold_discord_history(channels: &mut toml::Table) {
     let history_value = match channels.remove("discord_history") {
         Some(v) => v,
@@ -1431,24 +1243,6 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
     }
 }
 
-/// V2 → V3 inbound peer-auth fold per channel. Each channel that had
-/// a user-allowlist field in V2 strips it from the instance and
-/// synthesizes the V3 peer_group binding `default` agent to this
-/// channel. Field name varies per platform; helper handles wildcard
-/// / empty / collision skip rules uniformly.
-///
-/// Field-name table (the only place this list lives):
-///
-/// - Most channels: `allowed_users`
-/// - iMessage:      `allowed_contacts`
-/// - Signal:        `allowed_from`
-/// - WhatsApp/Wati: `allowed_numbers`
-/// - Linq/Email/GmailPush: `allowed_senders`
-/// - Nostr:         `allowed_pubkeys`
-///
-/// Channels with no inbound peer-auth concept (Webhook, Reddit,
-/// Bluesky, MQTT, voice_*, ClawdTalk, CLI) return `None` and the
-/// function is a no-op.
 fn fold_channel_peer_auth_into_peer_groups(
     channel_type: &str,
     instance: &mut toml::Table,
@@ -1478,26 +1272,6 @@ fn fold_channel_peer_auth_into_peer_groups(
     }
 }
 
-/// Strip V2-specific fields from each agent and synthesize the V3 alias
-/// references / per-agent profile overrides. Specifically:
-///
-/// - Inline brain fields (`provider`/`model`/`api_key`/`temperature`)
-///   fold into a synthesized `model_providers.<provider>.agent_<id>`
-///   entry; the agent gets `model_provider = "<provider>.agent_<id>"`.
-/// - `max_iterations` is renamed to `max_tool_iterations` inline.
-/// - `agentic` / `allowed_tools` / `timeout_secs` / `agentic_timeout_secs`
-///   lift into a synthesized `runtime_profiles.agent_<id>`.
-/// - `max_depth` lifts into a synthesized
-///   `risk_profiles.agent_<id>.max_delegation_depth`.
-/// - `skills_directory` lifts into a synthesized
-///   `skill_bundles.agent_<id>.directory` and the alias is appended
-///   to the agent's `skill_bundles` array.
-/// - `memory_namespace` is dropped — V3 isolates memory under
-///   `[agents.<alias>.memory]` instead.
-/// - Every agent ends with `risk_profile` and `runtime_profile` set
-///   to either a synthesized `agent_<id>` alias or `default`, with
-///   the referenced profile entries guaranteed to exist (V3
-///   validation rejects dangling profile refs).
 fn synthesize_agent_brains(
     agents: HashMap<String, toml::Value>,
     passthrough: &mut toml::Table,
@@ -1594,11 +1368,6 @@ fn synthesize_agent_brains(
             .remove("max_iterations")
             .or_else(|| agent_table.remove("max_tool_iterations"));
 
-        // V2 per-agent overrides split into authorization (risk) and
-        // operational (runtime) buckets, matching the V3 profile shape:
-        //   risk: allowed_tools
-        //   runtime: agentic, max_delegation_depth (from V2 max_depth),
-        //            agentic_timeout_secs
         let allowed_tools = agent_table.remove("allowed_tools");
         let agentic_flag = agent_table.remove("agentic");
         let max_depth = agent_table.remove("max_depth");
@@ -1655,14 +1424,6 @@ fn synthesize_agent_brains(
             );
         }
 
-        // skills_directory → synthesize a per-agent skill_bundle and
-        // append its alias to agent.skill_bundles. V3 confines bundle
-        // directories to `<install>/shared/skills/<bundle_alias>/`, so
-        // V2 paths inside `shared/` survive verbatim; everything else
-        // (absolute paths, paths above `shared/`) drops the explicit
-        // directory and falls back to the default. The operator's
-        // V2 skills need to be copied into the new location after
-        // migration — surface a warning naming what was dropped.
         if let Some(toml::Value::String(skills_dir)) = agent_table.remove("skills_directory")
             && !skills_dir.is_empty()
         {
@@ -1734,11 +1495,6 @@ fn synthesize_agent_brains(
             toml::Value::String(runtime_alias),
         );
 
-        // V3 retired the V2 `memory_namespace` field on agents (and the
-        // top-level [memory_namespaces.<alias>] section it referenced)
-        // when per-agent memory backends landed under
-        // [agents.<alias>.memory]. Drop the V2 key so it doesn't carry
-        // through to the V3 deserialization step.
         agent_table.remove("memory_namespace");
 
         new_agents.insert(alias, toml::Value::Table(agent_table));
@@ -1796,11 +1552,6 @@ fn merge_into_table(top: &mut toml::Table, section: &str, extras: toml::Table) {
     }
 }
 
-/// Fold V2 `base_url` (+ optional `api_path`) into V3 `uri` on a single
-/// `[model_providers.<type>.<alias>]` entry table. No-op when `uri` is
-/// already set (operator wins) or when `base_url` is absent. Matches the
-/// top-level-globals fold so both V1/V2 entry points produce the same
-/// V3 shape.
 fn fold_base_url_api_path_into_uri(entry: &mut toml::Table) {
     if entry.contains_key("uri") {
         // Operator-set V3 key wins; drop stale V2 spellings so V3
@@ -1836,24 +1587,6 @@ fn fold_base_url_api_path_into_uri(entry: &mut toml::Table) {
     entry.insert("uri".to_string(), toml::Value::String(uri));
 }
 
-/// Rewrite any `peer_groups.<X>.agents = ["default"]` entries to point at
-/// a real agent alias when `agents.default` doesn't exist. Step 7
-/// synthesizes peer_groups with the bridge alias `"default"` before
-/// step 8 decides what the actual agent map looks like; this post-pass
-/// patches up the dangling reference in the multi-agent V2 case where
-/// `agents.default` is never created.
-///
-/// Also injects the peer_group's channel ref into the chosen agent's
-/// `channels` list. V3 validation rejects an agent listed in a peer_group
-/// for a channel it doesn't own (`agents.<X>.channels` must contain the
-/// peer_group's channel); V2 had no per-agent channel binding, so the
-/// migration extends the chosen agent's reach to cover what V2's implicit
-/// single-agent semantics expected.
-///
-/// No-op when `agents.default` exists (the bridge alias is valid) or
-/// when the agents map is empty (no fix possible — the operator will
-/// hit a different validation error). Operator-authored peer_groups
-/// whose agents list isn't exactly `["default"]` are left untouched.
 fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
     let replacement_alias = {
         let Some(agents_table) = passthrough.get("agents").and_then(toml::Value::as_table) else {
@@ -1899,11 +1632,6 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
         return;
     }
 
-    // Resolve each bare channel type back to the full set of
-    // `<type>.<alias>` ChannelRefs that exist in `[channels.<type>.*]`.
-    // peer_groups now bind to a type only, but agents.<X>.channels
-    // requires dotted form. The V1/V2 single-agent fold assigned every
-    // alias of that type to the bridge agent.
     let mut resolved_refs: Vec<String> = Vec::new();
     if let Some(toml::Value::Table(channels_table)) = passthrough.get("channels") {
         for channel_type in &rewritten_channel_types {
@@ -1949,11 +1677,6 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
     }
 }
 
-/// V2 → V3 backfill: when `[heartbeat] enabled = true` and `agent` is
-/// unset/empty, set `agent` to a configured agent alias. Picks `"default"`
-/// when present (matching the synthesized-default-agent path), otherwise
-/// the first agent in the table. No-op when `agents` is empty or
-/// `heartbeat.agent` is already set (operator wins).
 fn backfill_heartbeat_agent(passthrough: &mut toml::Table) {
     let needs_backfill = passthrough
         .get("heartbeat")
@@ -2012,13 +1735,6 @@ fn ensure_profile_entry(passthrough: &mut toml::Table, section: &str, alias: &st
     }
 }
 
-/// Lift the top-level `[identity]` table into each `[agents.<alias>.identity]`
-/// during V2 → V3. V3 demoted identity to a per-agent block; leaving the
-/// V2 top-level key intact would surface as an unknown field on the V3
-/// deserializer. Operators who already wrote a per-agent identity block
-/// keep it (no clobber). If no agents are present after the fold, the
-/// top-level block is dropped with a warn (lossy but intentional — V3
-/// has no other slot for it).
 fn lift_top_level_identity_into_agents(passthrough: &mut toml::Table) {
     let Some(identity_value) = passthrough.remove("identity") else {
         return;
@@ -2067,14 +1783,6 @@ fn lift_top_level_identity_into_agents(passthrough: &mut toml::Table) {
     );
 }
 
-/// If no agents were declared in V2 input but the V2→V3 fold synthesized at
-/// least one provider model entry, emit a single `agents.default` referencing
-/// the first provider-alias. This preserves V1/V2 implicit single-agent
-/// semantics: the V1 user with `default_provider = "openai"` and a brain
-/// configured globally gets a working V3 default agent automatically.
-///
-/// `passthrough` is read (not mutated) — the synthesized agent is returned so
-/// the caller decides whether to install it under `agents`.
 fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table {
     // V3 keeps every provider category under `[providers]`:
     // `[providers.models.<type>.<alias>]`. Walk in via the new path.
@@ -2122,15 +1830,6 @@ fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table 
 /// option fields.
 const V3_TTS_TYPES: &[&str] = &["openai", "elevenlabs", "google", "edge", "piper"];
 
-/// Promote V2 `[tts.<type>]` per-provider sub-blocks into V3's unified
-/// `[tts_providers.<type>.default]` alias map.
-///
-/// V2 `TtsConfig` had a separate `Option<*TtsConfig>` field per provider
-/// (`openai`, `elevenlabs`, `google`, `edge`, `piper`); V3 keys them all
-/// by `<type>.<alias>` like the model providers. `[tts]` top-level
-/// scalars (`enabled`, `default_voice`, `default_format`,
-/// `max_text_length`) stay on `[tts]`; `default_provider` is dropped —
-/// V3 has no global default TTS provider.
 fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut toml::Table) {
     let Some(toml::Value::Table(tts_table)) = passthrough.get_mut("tts") else {
         return;
@@ -2177,19 +1876,6 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
     }
 }
 
-/// Fold V2 `[transcription]` flat block + per-family sub-blocks into V3's
-/// typed `[transcription_providers.<family>.<alias>]` shape. The Groq
-/// fields lived directly on `[transcription]` in V2 (api_key, api_url,
-/// model, language, initial_prompt) — they migrate to
-/// `[transcription_providers.groq.default]`. Per-family sub-blocks
-/// (`[transcription.openai]`, etc.) migrate to
-/// `[transcription_providers.<family>.default]`.
-///
-/// Behavior fields (`enabled`, `transcribe_non_ptt_audio`,
-/// `max_duration_secs`) stay on `[transcription]`. Legacy default-provider
-/// keys (`default_provider`, `default_model_provider`,
-/// `default_transcription_provider`) are dropped — V3 has no global
-/// default; per-agent `transcription_provider` is the only selector.
 fn fold_v2_transcription_into_providers(
     passthrough: &mut toml::Table,
     new_providers: &mut toml::Table,
@@ -2216,11 +1902,6 @@ fn fold_v2_transcription_into_providers(
         }
     }
 
-    // Groq lived directly on [transcription] in V2. Extract its fields into
-    // [transcription_providers.groq.default] so V3 can find it via the typed
-    // family slot. Pulled fields: api_key, api_url, model, language,
-    // initial_prompt. Behavior fields (enabled, transcribe_non_ptt_audio,
-    // max_duration_secs) stay on [transcription].
     let mut groq_entry = toml::Table::new();
     for groq_field in &["api_key", "api_url", "model", "language", "initial_prompt"] {
         if let Some(v) = transcription_table.remove(*groq_field) {
@@ -2277,11 +1958,6 @@ fn fold_v2_transcription_into_providers(
     }
 }
 
-/// Rename each route entry's V2 `provider` field to V3 `model_provider`.
-/// Applies to `[providers.<routes_key>]` for `model_routes` and
-/// `embedding_routes`. Bare provider names get promoted to the V3 dotted
-/// form (`"openai"` → `"openai.default"`) so the dangling-reference
-/// validator sees a real `model_providers.<type>.<alias>` reference.
 fn rename_route_provider_field(new_providers: &mut toml::Table, routes_key: &str) {
     let Some(toml::Value::Array(routes)) = new_providers.get_mut(routes_key) else {
         return;
@@ -2331,23 +2007,6 @@ fn rename_route_provider_field(new_providers: &mut toml::Table, routes_key: &str
     }
 }
 
-/// Fold V2 `[memory.qdrant]`, `[memory.postgres]`, and
-/// `[storage.provider.config]` into V3 `[storage.<backend>.<alias>]`. V3
-/// unified V2's three storage sources under one typed map per backend:
-///
-/// - `[memory.qdrant]` → `[storage.qdrant.default]` (same field names).
-/// - `[memory.postgres]` contributes only `vector_enabled` and
-///   `vector_dimensions`; the remaining `db_url`, `schema`, `table`
-///   come from `[storage.provider.config]` when the operator set
-///   `provider = "postgres"` there.
-/// - `[storage.provider.config]`'s `provider` field selects the V3
-///   backend; remaining fields are adapted per-backend (sqlite extracts
-///   path from a `sqlite://...` URL; qdrant maps `db_url` → `url`;
-///   postgres maps directly).
-/// - `[memory].sqlite_open_timeout_secs` lifts onto
-///   `[storage.sqlite.default].open_timeout_secs`.
-///
-/// Operator-authored V3-shaped entries take precedence over the fold.
 fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
     let (memory_qdrant, memory_postgres, memory_sqlite_timeout) = match passthrough
         .get_mut("memory")
@@ -2456,11 +2115,6 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
     drop_empty_subsystem_blocks(passthrough);
 }
 
-/// Drop top-level blocks that the storage fold emptied. `[memory]` requires
-/// `backend` and `[storage]` requires at least one backend instance, so an
-/// empty table at either path would fail V3 schema validation. The default
-/// at parse time (struct Default for both) is the correct fallback when the
-/// operator hadn't authored anything beyond the now-lifted subentries.
 fn drop_empty_subsystem_blocks(passthrough: &mut toml::Table) {
     for key in ["memory", "storage"] {
         if let Some(toml::Value::Table(t)) = passthrough.get(key)
@@ -2548,23 +2202,6 @@ fn merge_storage_default(storage_table: &mut toml::Table, backend_type: &str, fi
     }
 }
 
-/// Fold V2 `[security.sandbox]` into `risk_profiles.default` and drop
-/// `[security.resources]`.
-///
-/// Field renames during the sandbox fold:
-/// - `security.sandbox.enabled` → `risk_profiles.default.sandbox_enabled`
-/// - `security.sandbox.backend` → `risk_profiles.default.sandbox_backend`
-/// - `security.sandbox.firejail_args` → `risk_profiles.default.firejail_args`
-///
-/// `[security.resources]` (max_memory_mb, max_cpu_time_seconds,
-/// max_subprocesses, memory_monitoring) is dropped: V2 carried the fields
-/// but no enforcement codepath ever consumed them. Sandbox backends
-/// (firejail/landlock) own the actual resource budgets they enforce.
-/// A WARN-level log names the dropped values so an operator who set
-/// them can reconfigure the equivalent in their sandbox backend.
-///
-/// Existing values on the V3 profile take precedence — sandbox globals
-/// only fill in missing slots.
 fn fold_security_into_risk_profile(passthrough: &mut toml::Table) {
     let (sandbox, resources) = {
         let security_table = match passthrough
@@ -2638,14 +2275,6 @@ fn fold_security_into_risk_profile(passthrough: &mut toml::Table) {
     );
 }
 
-/// Split a V2 `[autonomy]` block (already key-renamed where applicable)
-/// into the V3 risk-profile and runtime-profile field sets. The risk
-/// bucket holds authorization fields; the runtime bucket holds budget
-/// caps and other operational tuning that the V3 `RuntimeProfileConfig`
-/// now owns.
-///
-/// Returns `(risk_fields, runtime_fields)` as optional tables — `None`
-/// when the bucket is empty so callers can skip the destination block.
 fn split_autonomy_into_profile_buckets(
     value: toml::Value,
 ) -> (Option<toml::Table>, Option<toml::Table>) {
@@ -2737,15 +2366,6 @@ fn ensure_unique_key(existing: &toml::Table, key: String) -> String {
     }
 }
 
-// =============================================================================
-// V2 → V3 filesystem & memory-backend migration
-// =============================================================================
-//
-// One source of truth for every V2→V3 disk move and backend agent_id backfill.
-// The dispatch tables below drive both production migration and the e2e test;
-// adding a new legacy entry is one row, picked up by both sides without further
-// edits.
-
 use anyhow::{Context as MigContext, Result as MigResult};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -2767,13 +2387,6 @@ pub enum V2WorkspaceDest {
     MemorySubentryDispatch,
 }
 
-/// Single canonical V2 → V3 top-level workspace dispatch.
-///
-/// Anything not in this list falls through to
-/// [`V2WorkspaceDest::AgentDefault`].
-///
-/// Adding a new entry here is the ONLY edit needed to extend coverage —
-/// the orchestrator and the e2e test both iterate this table.
 pub const V2_WORKSPACE_TOPLEVEL_DISPATCH: &[(&str, V2WorkspaceDest)] = &[
     ("memory", V2WorkspaceDest::MemorySubentryDispatch),
     ("sessions", V2WorkspaceDest::DataDir),
@@ -2786,13 +2399,6 @@ pub const V2_WORKSPACE_TOPLEVEL_DISPATCH: &[(&str, V2WorkspaceDest)] = &[
     ("devices.db", V2WorkspaceDest::DataDir),
 ];
 
-/// Subentries of legacy `<install>/workspace/memory/` that belong to the
-/// shared instance memory dir (`<install>/data/memory/`).
-///
-/// Anything else under `workspace/memory/` (notably markdown daily files
-/// like `2025-04-12.md`) goes to
-/// `<install>/agents/default/workspace/memory/<name>` so the per-agent
-/// markdown backend (which reads from the agent workspace) can find them.
 pub const V2_MEMORY_DATA_NAMES: &[&str] = &[
     "brain.db",
     "audit.db",
@@ -2816,11 +2422,6 @@ pub fn v2_workspace_toplevel_dest(name: &str) -> V2WorkspaceDest {
         .unwrap_or(V2WorkspaceDest::AgentDefault)
 }
 
-/// V3 destination path for a top-level entry under legacy `workspace/`.
-///
-/// For `MemorySubentryDispatch` entries the returned path is the
-/// `data/<name>` prefix; the caller iterates the entry's subdir and uses
-/// [`memory_subentry_v3_path`] per subentry.
 pub fn workspace_toplevel_v3_path(install: &Path, name: &str) -> PathBuf {
     match v2_workspace_toplevel_dest(name) {
         V2WorkspaceDest::DataDir | V2WorkspaceDest::MemorySubentryDispatch => {
@@ -2859,21 +2460,6 @@ pub struct FilesystemMigrationReport {
     pub entries_relocated: usize,
 }
 
-/// V2 → V3 install-root filesystem migration.
-///
-/// 1. Back up the entire legacy `<install>/workspace/` tree under
-///    `<install>/backup-<ts>/legacy-workspace/` (copy-not-rename so a
-///    partial failure leaves the legacy data untouched).
-/// 2. Iterate legacy top-level entries; for each, look up the V3
-///    destination via [`workspace_toplevel_v3_path`] (or the
-///    [`memory_subentry_v3_path`] sub-dispatch for `memory/`) and move it.
-/// 3. Heal intermediate installs that landed under the old layout by relocating
-///    `agents/default/workspace/skills/` to `shared/skills/`.
-///
-/// Idempotent: on a fresh install or an already-migrated install the
-/// function is a no-op. Refuses to clobber an existing target —
-/// surfacing a WARN and leaving the legacy entry in place rather than
-/// overwriting operator data.
 pub fn migrate_v2_to_v3_install_filesystem(
     install_root: &Path,
 ) -> MigResult<FilesystemMigrationReport> {
@@ -3075,11 +2661,6 @@ fn relocate_memory_subentries(
     Ok(count)
 }
 
-/// Move `src` to `dst`, creating intermediate dirs and falling back to
-/// copy+remove for cross-filesystem moves. Returns `Ok(true)` if the
-/// move ran, `Ok(false)` if the destination already existed (operator
-/// data preserved, WARN logged, caller continues with the rest of the
-/// split).
 fn move_with_refuse_to_clobber(src: &Path, dst: &Path) -> MigResult<bool> {
     if dst.exists() {
         ::zeroclaw_log::record!(
@@ -3221,18 +2802,6 @@ fn postgres_memory_schema_version() -> MigResult<i32> {
         .context("Postgres memory schema version exceeds INTEGER range")
 }
 
-/// Migrate a SQLite memory database to the V3 multi-agent shape.
-///
-/// Adds the `agents` table, the `agent_id` column on `memories`,
-/// backfills existing rows to a synthesized `default` agent, and
-/// promotes the column to `NOT NULL REFERENCES agents(id)` via a table
-/// rebuild. Idempotent: re-running on an already-migrated DB is a
-/// no-op. Before any destructive step the file is backed up at
-/// `<db_path>.backup-<ts>` when there are rows that would be touched.
-///
-/// The caller is responsible for opening the connection with
-/// `PRAGMA foreign_keys = ON` (and any other backend-specific PRAGMA
-/// tuning); this function operates on the open connection.
 pub fn migrate_sqlite_memory_to_v3(db_path: &Path, conn: &Connection) -> MigResult<()> {
     if sqlite_memories_agent_id_is_not_null(conn)? && sqlite_memories_has_unique_agent_key(conn)? {
         return Ok(());
@@ -3393,11 +2962,6 @@ fn sqlite_memories_has_agent_id_column(conn: &Connection) -> MigResult<bool> {
         .any(|name| name == "agent_id"))
 }
 
-/// Returns `true` when the `memories` table has a UNIQUE index that covers
-/// exactly `(agent_id, key)` — the constraint required by the `ON CONFLICT`
-/// upsert clause.  A DB that has `agent_id NOT NULL` + FK but was created
-/// before the table-rebuild step (or had it skipped) will return `false`,
-/// causing `migrate_sqlite_memory_to_v3` to fall through and finish the job.
 fn sqlite_memories_has_unique_agent_key(conn: &Connection) -> MigResult<bool> {
     // `PRAGMA index_list` returns one row per index; `PRAGMA index_info`
     // returns one row per column in that index.  We want an index that is
@@ -3508,17 +3072,6 @@ fn backup_sqlite_for_multi_agent_migration(db_path: &Path) -> MigResult<()> {
 // Postgres agent_id backfill.
 // -----------------------------------------------------------------------------
 
-/// Migrate a Postgres memory schema to the V3 multi-agent shape.
-///
-/// Adds the `agents` table and the `agent_id` column on the qualified
-/// memories table, with a default-agent backfill. Idempotent: every
-/// step uses `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` so re-runs are
-/// no-ops. Uses the low-lock NOT VALID → VALIDATE pattern so the
-/// upgrade does not take ACCESS EXCLUSIVE on a populated table.
-///
-/// Backups are the operator's responsibility for Postgres (documented
-/// in the release notes); reaching across the network to dump a
-/// managed cluster from inside the binary is out of scope.
 #[cfg(feature = "memory-postgres")]
 pub fn migrate_postgres_memory_to_v3(
     client: &mut postgres::Client,
@@ -3622,30 +3175,8 @@ pub fn migrate_postgres_memory_to_v3(
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Qdrant agent_id backfill (NEW for V3; closes the gap where pre-V3 points
-// without `agent_id` payload would be silently filtered out by the
-// AgentScopedMemory `must` clause).
-// -----------------------------------------------------------------------------
-
-/// V3 default agent_id payload value on Qdrant collections.
-///
-/// Qdrant does not maintain an `agents` table; it stores the agent
-/// alias directly as the `agent_id` payload field. The
-/// `AgentScopedMemory` wrapper's `must` filter expects `agent_id ==
-/// "default"` for the V1/V2 single-agent bridge.
 pub const QDRANT_DEFAULT_AGENT_ID: &str = "default";
 
-/// Migrate a Qdrant collection to the V3 multi-agent shape.
-///
-/// Scrolls the collection in pages of 1000 points; for any point whose
-/// payload lacks `agent_id`, issues a `set payload` to add
-/// `agent_id = "default"`. Idempotent: subsequent runs skip points
-/// that already carry the field.
-///
-/// Backups are the operator's responsibility (documented in the
-/// release notes); we cannot snapshot a remote Qdrant cluster from
-/// inside the binary.
 pub async fn migrate_qdrant_collection_to_v3(
     client: &reqwest::Client,
     base_url: &str,
@@ -3758,14 +3289,6 @@ pub async fn migrate_qdrant_collection_to_v3(
 
 #[cfg(test)]
 mod fs_db_migration_tests {
-    //! End-to-end V2 → V3 filesystem & DB migration test.
-    //!
-    //! Lays down a V2 install in a `TempDir` (real disk), drives the
-    //! orchestrator, and asserts every relocated path matches the
-    //! shared dispatch fns (`workspace_toplevel_v3_path`,
-    //! `memory_subentry_v3_path`). The test loops over the canonical
-    //! dispatch tables — adding a new entry there auto-extends test
-    //! coverage with no companion edit here.
     use super::*;
     use rusqlite::Connection;
     use std::collections::BTreeSet;
@@ -4024,11 +3547,6 @@ mod fs_db_migration_tests {
         );
     }
 
-    /// Regression test: a DB that already has `agent_id NOT NULL` + FK to
-    /// `agents` but is **missing** the `UNIQUE (agent_id, key)` constraint
-    /// (e.g. created by an intermediate build) must still be migrated.
-    /// Before the fix the guard returned `Ok(true)` too early and the
-    /// `ON CONFLICT(agent_id, key)` upsert would fail at runtime.
     #[test]
     fn migrate_sqlite_memory_to_v3_adds_unique_constraint_when_missing() {
         use rusqlite::Connection;

@@ -1,8 +1,4 @@
 //! Event pattern matching for the routines engine.
-//!
-//! Supports three match strategies: exact, glob, and regex.  Each routine
-//! declares one or more [`EventPattern`]s; an incoming [`RoutineEvent`] fires
-//! the routine when **any** pattern matches.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,9 +1,4 @@
 //! Minimal GitHub REST client for the provider.
-//!
-//! Typed wrappers over the handful of endpoints the channel uses. Every
-//! method takes its auth credential (app JWT or installation token) as
-//! an argument; this module knows nothing about how credentials are
-//! minted, and nothing about polling or message mapping.
 
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -15,13 +10,6 @@ use super::payloads::{
 };
 use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
-/// Pages followed per list call. GitHub paginates list endpoints with a
-/// `Link: rel="next"` header; following it keeps a single 100-item page
-/// from starving a cursor that advances on the newest returned item — the
-/// busy-repo livelock where >100 items match `since` on one page, the
-/// newest sort off the page, and the cursor never reaches them. The cap
-/// bounds one poll tick's fetch: ascending streams still make forward
-/// progress across ticks, and a truncation is logged.
 const MAX_PAGES_PER_POLL: usize = 20;
 
 /// Pin a raw forge-call path under the configured API base. The leading-slash
@@ -33,7 +21,6 @@ fn forge_url(base: &str, path: &str) -> String {
 }
 
 /// Extract the `rel="next"` URL from a GitHub `Link` header, if present.
-///
 /// Example header value:
 /// `<https://api.github.com/…?page=2>; rel="next", <…?page=9>; rel="last"`.
 fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -63,7 +50,6 @@ impl GithubApi {
         }
     }
 
-    /// Point the client at a mock server instead of api.github.com.
     #[cfg(test)]
     pub(crate) fn with_base(base: String) -> Self {
         Self {
@@ -124,13 +110,6 @@ impl GithubApi {
         Err(Self::error_from(endpoint, resp).await)
     }
 
-    /// GET a list endpoint, following `Link: rel="next"` pagination and
-    /// concatenating the pages (bounded by [`MAX_PAGES_PER_POLL`]).
-    /// `extract` pulls the item vec out of each decoded page body, so both
-    /// bare-array endpoints (`|page| page`) and envelope endpoints
-    /// (`{ workflow_runs: [...] }`) share one pager. Following pagination
-    /// is what stops a full first page from livelocking a cursor that
-    /// advances on the newest returned item.
     async fn get_paged<P, T>(
         &self,
         endpoint: &str,
@@ -317,15 +296,6 @@ impl GithubApi {
         .await
     }
 
-    /// `GET /repos/{owner}/{repo}/issues?since=…` — issues and PRs
-    /// (opening posts plus close/merge transitions), oldest-updated first.
-    /// `since` filters on `updated_at`, so the stream is sorted by
-    /// `updated` and the caller advances its cursor on `updated_at` too
-    /// (see `fetch_issues`): sort, filter, and cursor share one dimension,
-    /// which is what guarantees the per-poll page cap cannot starve later
-    /// pages. Sorting by `created` instead let an old item whose
-    /// `updated_at` matches `since` but whose `created_at` predates the
-    /// cursor saturate the leading pages and stall the watermark forever.
     pub async fn list_issues_since(
         &self,
         token: &str,

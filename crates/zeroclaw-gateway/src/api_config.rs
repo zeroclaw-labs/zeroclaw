@@ -1,15 +1,4 @@
 //! Per-property CRUD endpoints for `/api/config/*`.
-//!
-//! These endpoints expose the same `Config::get_prop` / `set_prop` core that
-//! `zeroclaw config get/set/list/init/migrate` uses on the CLI. Both are thin
-//! frontends over the same mutation primitive.
-//!
-//! Returns structured `ConfigApiError` responses with stable codes the
-//! dashboard / scripts can match programmatically. Secret fields are
-//! write-only over HTTP per the secrets-handling boundary defined in
-//! the issue body.
-//!
-//! for the full surface and acceptance checklist.
 
 use axum::{
     Json,
@@ -55,15 +44,9 @@ pub struct PropPutBody {
     pub comment: Option<String>,
 }
 
-/// One JSON Patch (RFC 6902) operation. We support a strict subset:
-/// `add`, `remove`, `replace`, `test`. `move` and `copy` are explicitly
-/// rejected at apply time with `op_not_supported` because safe reference-
-/// graph rewriting isn't part of this PR.
-///
-/// `comment` is a ZeroClaw extension — when provided it accompanies the
-/// resulting TOML write so future maintainers can see why a value was set.
-/// Honored once the comment-preserving write path is wired through (step 7);
-/// accepted here so the API shape doesn't churn.
+/// One JSON Patch operation. Supports `add`, `remove`, `replace`, `test`, and
+/// ZeroClaw's `comment` extension. Every operation requires `path`; `add`,
+/// `replace`, and `test` require `value`, while `comment` requires `comment`.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PatchOp {
@@ -100,12 +83,7 @@ pub struct PatchOpResult {
 pub struct PatchResponse {
     pub saved: bool,
     pub results: Vec<PatchOpResult>,
-    /// Non-fatal validation warnings against the post-save config state.
-    /// Empty when nothing is flagged. Surfaces what the CLI prints on
-    /// stderr so dashboard callers see the same signal — e.g. an
-    /// `agents.<x>.model_provider` referencing an unconfigured model_provider
-    /// returns HTTP 200 with the save committed, plus a structured
-    /// validation warning here.
+    /// Non-fatal validation warnings against the saved configuration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
@@ -207,14 +185,7 @@ pub struct SecretResponse {
     pub populated: bool,
 }
 
-/// Single entry in the list response. Secrets carry only `path + populated`;
-/// non-secrets additionally carry `value`.
-///
-/// `kind` and `type_hint` are the wire form of the field's declared
-/// `PropKind` plus its Rust type signature. Frontends bind input renderers
-/// to these directly (no value-sniffing). `enum_variants` is populated for
-/// fields whose macro derive surfaces a variant list (drives `select`
-/// option rendering).
+/// Single entry in the list response for configuration properties.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ListEntry {
@@ -287,12 +258,7 @@ pub struct ListResponse {
     pub drifted: Vec<DriftEntry>,
 }
 
-/// One drift entry surfaced when in-memory `Config` diverges from the on-disk
-/// `config.toml` (some other process — typically a hand-edit while the daemon
-/// was stopped — wrote the file). For non-secret fields, both values are
-/// surfaced so the dashboard can show a clean diff. For secret fields, only
-/// the boolean `drifted` is surfaced — the secret values themselves never
-/// leave the server.
+/// One drift entry surfaced when in-memory Config diverges from the on-disk file.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DriftEntry {
@@ -377,21 +343,6 @@ fn lookup_prop_field(
         })
 }
 
-/// Save the config and refresh in-memory state. Captures a snapshot of the
-/// pre-write disk state and reverts to it if the save itself fails, so that
-/// on-disk and in-memory state stay consistent under any failure mode.
-///
-/// On the happy path: validate (caller's responsibility) → save to disk →
-/// swap in-memory → respond OK.
-///
-/// On save failure: best-effort restore the pre-write disk content (when
-/// readable), keep in-memory state untouched, return `reload_failed`.
-/// Run `validate()` and partition errors: if the failure path overlaps
-/// a dirty path on the working config, the save is rejected
-/// (`Err(Response)`); otherwise the error is downgraded to a
-/// non-fatal warning attached to the response. Saving a single field
-/// shouldn't be blocked by an unrelated pre-existing validation
-/// problem elsewhere in the config.
 fn scoped_validate(
     working: &zeroclaw_config::schema::Config,
 ) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
@@ -581,18 +532,6 @@ fn is_gateway_managed_field(name: &str) -> bool {
     matches!(name, "gateway.paired_tokens")
 }
 
-/// Compute drift between the in-memory config and what's on disk right now.
-/// Returns one entry per drifted property; empty when in-memory and disk
-/// agree (or when the on-disk file can't be parsed).
-///
-/// **Secrets:** never surface values. We compare in-memory and on-disk
-/// representations server-side — for secret paths, the comparison happens
-/// over the raw display strings (which include the encrypted form on disk
-/// vs. the decrypted form in memory, so most secret drift is false-positive
-/// against `Configurable`'s display layer). To stay honest about that, the
-/// on-disk side is round-tripped through the full deserializer + decrypt
-/// pass before comparison, so we only surface drift the daemon would
-/// actually pick up on its next read of the file.
 pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<DriftEntry> {
     let path = &in_memory.config_path;
     if !path.exists() {
@@ -632,11 +571,6 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
     all_names.extend(in_memory_props.keys().map(String::as_str));
     all_names.extend(on_disk_props.keys().map(String::as_str));
     for name in all_names {
-        // Gateway-managed internal state isn't operator-edited and the
-        // gateway persists it itself via `persist_pairing_tokens` /
-        // similar paths. Surfacing it as drift confuses operators who
-        // can't fix it from the dashboard and the banner sticks until
-        // the daemon happens to rewrite the file.
         if is_gateway_managed_field(name) {
             continue;
         }
@@ -692,11 +626,6 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/config/prop?path=agents.researcher.model_provider
-///
-/// Returns the user's current value for non-secret fields. For secret fields,
-/// returns `{path, populated}` only — the value, length, and any encoded form
-/// are deliberately withheld per the secrets-handling boundary.
 pub async fn handle_prop_get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -739,11 +668,6 @@ pub async fn handle_prop_get(
     }
 }
 
-/// PUT /api/config/prop with body `{path, value, comment?}`
-///
-/// Sets the value via `Config::set_prop`, validates the resulting whole-config
-/// state, persists, and swaps in-memory. For secret fields, response carries
-/// only `{path, populated: true}` — never echoes the value back.
 pub async fn handle_prop_put(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -843,14 +767,6 @@ pub async fn handle_prop_put(
     }
 }
 
-/// DELETE /api/config/prop?path=channels.matrix.allowed-users
-///
-/// Resets the field to its declared default. For `Option<T>` fields, this
-/// sets to `None`. For secrets, response carries only `{path, populated: false}`.
-///
-/// The current implementation routes through `set_prop` with an empty string,
-/// which exercises the same validator path. A more semantically pure reset
-/// (re-deriving the field's literal default) is a refinement for a later step.
 pub async fn handle_prop_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -897,11 +813,6 @@ pub async fn handle_prop_delete(
     }
 }
 
-/// GET /api/config/list?prefix=model_providers
-///
-/// Enumerates every property the schema exposes. Secret entries appear as
-/// `{path, populated}` with `value: None`; non-secrets carry the display
-/// value. Optional `prefix` query filters entries whose path starts with it.
 pub async fn handle_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -979,11 +890,8 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
-    /// `true` when one or more config writes have landed since the last
-    /// `/admin/reload`. Distinct from disk-vs-memory drift: this fires on
-    /// in-process PATCHes even though `persist_and_swap` updates the
-    /// in-memory config, because some subsystems (channels, providers,
-    /// scheduler) need to be re-instantiated to actually apply the change.
+    /// Whether any config write has landed since the last admin reload and may
+    /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
 }
 
@@ -1014,13 +922,6 @@ pub struct MapKeyResponse {
     pub path: String,
     pub key: String,
     pub created: bool,
-    /// Owned-state cascade warnings (agent delete only): a non-empty list means
-    /// the config delete succeeded but one or more side-effects (archive dir
-    /// creation, workspace archive `fs::rename`, memory / cron / acp / session
-    /// purge) did NOT complete. The operator must inspect the archive directory
-    /// and the agent-owned stores before reusing the alias. Omitted from the
-    /// JSON when empty (back-compat for the generic create-map-key path, which
-    /// has no owned state). See #7941.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
 }
@@ -1043,12 +944,6 @@ pub struct TemplateEntry {
     pub description: &'static str,
 }
 
-/// `GET /api/config/templates` — enumerate every map-keyed and list-shaped
-/// section the dashboard can offer "+ Add" affordances for. Discovered
-/// from the `Configurable` derive's `map_key_sections()` — single source of
-/// truth, no hand-maintained list. Adding a new `HashMap<String, T>` or
-/// `#[nested] Vec<T>` field anywhere in the schema makes it appear here
-/// automatically.
 pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -1232,11 +1127,6 @@ async fn delete_agent_cascade(
         );
     }
 
-    // Resolve the workspace dir BEFORE the config cascade removes the agents
-    // entry: `agent_workspace_dir` only returns an operator-set custom
-    // `workspace.path` while the entry exists; after removal it silently falls
-    // back to the default `install_root/agents/<alias>/workspace`, so a
-    // custom-workspace agent's real dir would otherwise never be archived.
     let workspace = working.agent_workspace_dir(alias);
 
     // Config cascade: scrub soft refs + remove the agents entry.
@@ -1258,16 +1148,6 @@ async fn delete_agent_cascade(
         }
     };
 
-    // Persist FIRST (so a persist failure leaves config naming the agent and
-    // its workspace / owned stores fully intact — the inverse of #7907's
-    // rename-direction split-brain). Mark EVERY entry the cascade touched
-    // dirty — the removed agent entry AND each other entry whose soft-ref was
-    // scrubbed. `save_dirty` writes only marked paths, so marking just
-    // `agents.<alias>` would leave a scrubbed referrer (another agent's
-    // `delegates`, a peer group's `agents`) correct in memory but STALE on
-    // disk, reappearing as a dangling reference on the next config reload
-    // (which `validate()` then rejects). Mirrors rename's
-    // `RenameReport.dirty_paths`.
     for path in cascade.dirty_paths() {
         working.mark_dirty(&path);
     }
@@ -1278,11 +1158,6 @@ async fn delete_agent_cascade(
     // Read it back from the (now-swapped) AppState for the side-effects below.
     let committed = state.config.read().clone();
 
-    // Archive into the shared graveyard `<data_dir>/agents/_deleted/<alias>-<ts>/`
-    // (not inside the deleted agent's own dir), and give the owned-state exports
-    // a home there even if the agent had no workspace dir. `workspace` was
-    // resolved above, before the cascade removed the entry; `data_dir` comes
-    // from the post-swap in-memory config (the persisted one).
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
     let archive_dir = committed
         .data_dir
@@ -1385,16 +1260,6 @@ async fn delete_config_cascade(
     .into_response()
 }
 
-/// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
-/// entry under a map-keyed section with default values, or append to a
-/// list-shaped one with `key` as the new entry's natural identifier.
-/// Idempotent for Map kinds: returns `{created: false}` if the key already
-/// exists.
-///
-/// Dispatch happens via `Config::create_map_key()` — emitted by the
-/// `Configurable` derive, single source of truth. Adding a new
-/// `HashMap<String, T>` or `#[nested] Vec<T>` field to the schema makes it
-/// addable here automatically.
 pub async fn handle_map_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1594,11 +1459,6 @@ pub struct RenameMapKeyResponse {
     pub from: String,
     pub to: String,
     pub renamed: bool,
-    /// Owned-state cascade warnings (agent rename only): a non-empty list means
-    /// the config rename succeeded but one or more owned stores (memory / cron /
-    /// acp / session) did **not** follow the rename, so they need operator
-    /// attention. Omitted from the JSON when empty (back-compat for the generic
-    /// and provider/channel rename paths, which have no owned state).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -1665,15 +1525,6 @@ fn delete_error_response(
     error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{key}")))
 }
 
-/// `POST /api/config/rename-map-key` — rename an alias within a map-keyed
-/// section, preserving the entry's value. Atomic: persists only on success.
-///
-/// Aliased sections (agents / providers / channels) route through
-/// `rename_with_cascade`, which rewrites every config reference to follow the new
-/// name (the generic key-swap alone would leave them dangling). Agent rename also
-/// re-points owned state (memory / cron / acp / session rows + the workspace
-/// dir). A missing source alias returns **404** for these. Non-aliased sections
-/// keep the generic key-swap behaviour.
 pub async fn handle_rename_map_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1755,15 +1606,6 @@ async fn rename_config_cascade(
     .into_response()
 }
 
-/// Agent rename cascade: rewrite config refs (`rename_with_cascade`), move the
-/// workspace dir, re-point owned DB state (memory/cron/acp/session), mark the
-/// touched paths dirty, persist. Mirrors `delete_agent_cascade` but in-place —
-/// no archive, no live-session refusal (a live ACP session follows the rename).
-/// Move the agent workspace dir for a rename. Returns `Some(warning)` when a
-/// move was attempted and FAILED — surfaced to the caller so a config/DB rename
-/// to `to` with the workspace stranded at `from` isn't reported as a clean
-/// success. Returns `None` on success or when there is nothing to move (a custom
-/// alias-independent path, or a source dir that doesn't exist).
 async fn move_renamed_workspace(
     old_ws: &std::path::Path,
     new_ws: &std::path::Path,
@@ -1797,28 +1639,6 @@ async fn move_renamed_workspace(
     }
 }
 
-/// Read-only residue probe for the agent-rename resume path (#7940).
-///
-/// Returns `true` if ANY store the rename side-effects touch still references
-/// `from` - the exact fingerprint a genuine post-persist partial failure leaves
-/// (config committed `to`, a follower lagging at `from`). The resume in
-/// `rename_agent_cascade` only fires when this is true, so an UNRELATED request
-/// `X -> to` (where `to` exists and `X` is absent from config but nothing lags
-/// under `X`) is NOT mistaken for a resume - it falls through to the normal
-/// branch, which surfaces the operator's NotFound/collision error.
-///
-/// MUST mirror every store `move_renamed_workspace` + `cascade_rename_agent`
-/// re-point, or a false negative here would break a real resume in the store it
-/// missed. Each probe is the read-only twin of the corresponding mutation:
-/// - workspace: the default per-alias dir for `from` still exists,
-/// - cron: `list_jobs_by_agent(from)` non-empty,
-/// - acp: any session (live OR killed) owned by `from` - `rename_sessions_by_agent`
-///   moves both, so the live-only count would miss killed-only residue,
-/// - memory: `Memory::count_agent(from)` (the `agents` row the SQL rename moves),
-/// - sessions: `SessionBackend::count_agent_attribution(from)`.
-///
-/// Best-effort like the cascade itself: a store that errors on probe is treated
-/// as "no residue from this store" (logged), never blocking the fall-through.
 async fn rename_residue_exists(
     state: &AppState,
     working: &zeroclaw_config::schema::Config,
@@ -1879,33 +1699,6 @@ async fn rename_agent_cascade(
     // (custom paths are read off the entry, which is about to move).
     let old_ws = working.agent_workspace_dir(from);
 
-    // Rewrite the config rename in-memory and persist it FIRST (#7907) before any
-    // external side-effect. Previously the workspace move and owned-state cascade
-    // ran *before* this durable write, so a persist failure after them left config
-    // naming `from` while the workspace + owned stores had moved to `to` - the
-    // inverse split-brain of what #7841 fixed. Persisting first means an early
-    // failure here leaves config, workspace, and owned state all consistently on
-    // `from`: a clean abort (`persist_and_swap` reverts the on-disk file and never
-    // swaps `state.config`).
-    //
-    // Resume-to-converge (#7940): if a *prior* call already persisted the rename
-    // but a post-persist side-effect did not follow, the committed config names
-    // `to` and no longer has `from`. A re-issued `from -> to` must then re-run the
-    // (idempotent) side-effects below rather than fail - `rename_with_cascade`
-    // would otherwise reject it (the `to` key already exists → `InvalidName`
-    // collision; or `from` absent → `NotFound`), so the documented recovery could
-    // never run. Detect that committed state up front and skip the already-done
-    // rewrite + persist, falling through to re-run only the lagging side-effects.
-    //
-    // But the committed-`to` shape alone is ambiguous: an UNRELATED `X -> to`
-    // (where `to` already exists and `X` is absent from config) matches it too,
-    // and silently treating that as a resume would run no-op side-effects and
-    // return 2xx instead of surfacing the operator's error. So request-correlate
-    // the resume to ACTUAL lagging residue under `from` - the fingerprint a real
-    // partial failure leaves (`rename_residue_exists`). With committed-`to` but NO
-    // residue, the else branch runs `rename_with_cascade(from -> to)` with `from`
-    // absent → NotFound (or `to` collision) → `rename_error_response`, which is the
-    // desired surfacing.
     let committed_to = working.agent(from).is_none() && working.agent(to).is_some();
     let dirty_count = if committed_to && rename_residue_exists(state, &working, from).await {
         0
@@ -1925,13 +1718,6 @@ async fn rename_agent_cascade(
         }
     };
 
-    // Config is now durably `to` and authoritative in `state.config` (committed by
-    // this call or an earlier one). Run the external side-effects against the
-    // committed config (read a short-lived clone - never hold the lock guard
-    // across an `.await`). Each side-effect is best-effort, surfaced as a warning,
-    // and idempotent: the workspace move early-returns once the source is gone,
-    // and every owned-store op re-points by `WHERE agent_alias = from` - so a
-    // re-issued rename converges.
     let cfg = state.config.read().clone();
     // The NEW workspace path off the committed config (the rewritten `to`).
     let new_ws = cfg.agent_workspace_dir(to);
@@ -1981,14 +1767,6 @@ async fn rename_agent_cascade(
     .into_response()
 }
 
-/// `POST /api/config/model-providers/{type}/{alias}/refresh-context-window`
-/// — fetch and update `context_window` from the provider's /models endpoint.
-///
-/// Returns the updated config value. Only works for providers that expose
-/// `context_length`/`context_window` in their `/models` endpoint
-/// (OpenRouter, Together, Groq, Fireworks, DeepInfra, Hyperbolic, Anyscale, Novita, Nebius).
-///
-/// If the provider doesn't support it or the fetch fails, returns 400 with an error.
 pub async fn handle_refresh_context_window(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2078,18 +1856,6 @@ pub async fn handle_refresh_context_window(
     .into_response()
 }
 
-/// PATCH /api/config — apply a JSON Patch document atomically.
-///
-/// Body is an array of operations executed in order against an in-memory
-/// copy of the config. After all ops apply, `Config::validate()` runs once;
-/// if it passes the snapshot is persisted and swapped in. If any op fails or
-/// validation fails, on-disk + in-memory state are unchanged and the response
-/// carries the offending op's index.
-///
-/// Supported ops: `add`, `remove`, `replace`, `test`.
-/// `move` and `copy` return `op_not_supported` (no reference-graph in this PR).
-/// `test` against a `#[secret]` or `#[derived_from_secret]` path is rejected
-/// with `secret_test_forbidden` (would leak the value via differential outcome).
 pub async fn handle_patch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2106,12 +1872,6 @@ pub async fn handle_patch(
 
     let working = state.config.read().clone();
 
-    // Drift guard: if the on-disk file diverges from in-memory state on any
-    // path the PATCH would touch, refuse with 409 ConfigChangedExternally
-    // unless the client explicitly opts in to overwrite via the
-    // `X-ZeroClaw-Override-Drift: true` header. The opt-in surface keeps
-    // the contract loud: the only way to silently overwrite a hand-edit is
-    // a deliberate header, never an accident.
     let override_drift = headers
         .get("x-zeroclaw-override-drift")
         .and_then(|v| v.to_str().ok())
@@ -2377,11 +2137,6 @@ pub async fn handle_patch(
     .into_response()
 }
 
-/// Convert a JSON Pointer (`/agents/researcher/model_provider`) to the
-/// dotted path the `Config::set_prop` machinery expects
-/// (`agents.researcher.model_provider`). Accepts both forms — passing
-/// already-dotted paths through unchanged so dashboard clients can use
-/// whichever is more natural.
 fn json_pointer_to_dotted(path: &str) -> String {
     if path.starts_with('/') {
         path.trim_start_matches('/').replace('/', ".")
@@ -2453,11 +2208,6 @@ pub struct MigrateResponse {
     pub schema_version: u32,
 }
 
-/// POST /api/config/migrate — apply the schema migration chain to the
-/// on-disk config file in place. Mirrors `zeroclaw config migrate`. Backs
-/// up the previous content alongside the original (`config.toml.bak`)
-/// before writing the migrated form. Returns `{migrated: false}` when the
-/// config is already at the current schema version.
 pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -2487,11 +2237,6 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
 
     match migrated {
         Some(new_content) => {
-            // Atomic write path mirrors `Config::save()` and `migration::migrate_file_in_place`
-            //: write temp + fsync → backup → atomic rename → fsync directory.
-            // Without this sequence the documented durability guarantee on the comment above
-            // doesn't hold: a copy-then-write window leaves both the original and the new
-            // content vulnerable to power loss.
             let backup_path = config_path.with_extension("toml.bak");
             let parent = match config_path.parent() {
                 Some(p) => p.to_path_buf(),
@@ -2606,13 +2351,6 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
     }
 }
 
-/// OPTIONS /api/config — whole-config schema (capabilities, not values)
-///
-/// Returns the JSON Schema document for the `Config` type. Distinguishes CORS
-/// preflight (carries `Access-Control-Request-Method`) from schema-discovery
-/// requests; preflight gets the standard CORS response only.
-///
-/// Static per build — clients should cache via the build-time ETag.
 pub async fn handle_options_config(headers: HeaderMap) -> Response {
     // CORS preflight short-circuit
     if headers.contains_key("access-control-request-method") {
@@ -2632,17 +2370,6 @@ pub async fn handle_options_config(headers: HeaderMap) -> Response {
     schema_response("zeroclaw_config_schema_full")
 }
 
-/// OPTIONS /api/config/prop?path=agents.researcher.model_provider — per-field schema fragment.
-///
-/// Returns 404 with `path_not_found` if the path doesn't resolve against the
-/// in-memory config — same contract as `GET /api/config/prop`. Previously
-/// returned the whole-config schema regardless, which silently masked typos.
-///
-/// Per-path subtree extraction (walking the JSON Schema tree by JSON Pointer
-/// to return just the relevant subtree) is a follow-up; today we still return
-/// the full schema with a `x-zeroclaw-requested-path` + per-field metadata
-/// (kind, type_hint, is_secret) so the frontend has everything it needs to
-/// render the input without a separate round-trip.
 pub async fn handle_options_prop(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2713,12 +2440,6 @@ fn schema_response(_label: &'static str) -> Response {
     response
 }
 
-/// Compute the OPTIONS schema body + ETag once and cache them. The schema is
-/// static per build (schemars output is deterministic for a given Config
-/// type), so re-rendering on every request is pure waste — we'd send the
-/// same bytes back every time and re-hash them too. The previous
-/// implementation re-rendered + re-hashed on every OPTIONS hit; this caches
-/// both behind a `OnceLock`.
 fn cached_schema() -> (&'static serde_json::Value, &'static str) {
     use std::sync::OnceLock;
     static CACHE: OnceLock<(serde_json::Value, String)> = OnceLock::new();
@@ -2766,12 +2487,6 @@ mod tests {
     use std::time::Duration;
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
-
-    // typed-value coercion tests live in zeroclaw_config::typed_value
-    // — shared helper, single source of truth.
-    //
-    // build_comment_prefix tests live in zeroclaw_config::comment_writer
-    // — same reason.
 
     // dirty_entry_for / CascadeReport::dirty_paths tests live in
     // zeroclaw_config::alias_refs — single source of truth (the gateway and CLI
@@ -2865,6 +2580,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -3115,11 +2831,6 @@ mod tests {
 
     #[test]
     fn delete_cascade_resolves_custom_workspace_before_removing_entry() {
-        // Regression: `delete_agent_cascade` must resolve `agent_workspace_dir`
-        // BEFORE `delete_with_cascade` removes the agents entry. The method only
-        // returns an operator-set custom `workspace.path` while the entry exists;
-        // resolving it after removal silently yields the DEFAULT path, so a
-        // custom-workspace agent's real dir would never be archived.
         let custom = std::path::PathBuf::from("/var/lib/zc-test/custom-victim-ws");
         let mut cfg = zeroclaw_config::schema::Config::default();
         cfg.agents.insert(
@@ -3176,12 +2887,6 @@ mod tests {
         assert!(move_renamed_workspace(&missing, &new_ws).await.is_none());
     }
 
-    /// #7907: when config persistence FAILS, the agent rename must not have
-    /// moved any owned state. Pre-fix the workspace move + owned-state cascade
-    /// ran *before* `persist_and_swap`, so a persist failure left config naming
-    /// `from` while the workspace and owned stores had moved to `to` (the
-    /// inverse split-brain). Persist-first means an early failure leaves config,
-    /// workspace, and owned state all consistently on `from`.
     #[tokio::test]
     async fn agent_rename_leaves_owned_state_put_when_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3253,8 +2958,6 @@ mod tests {
         assert!(!state.config.read().agents.contains_key("to"));
     }
 
-    /// #7907 happy path: when persist SUCCEEDS, owned state moves to `to` - so
-    /// the reorder didn't accidentally skip the side-effects.
     #[tokio::test]
     async fn agent_rename_moves_owned_state_after_successful_persist() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3318,12 +3021,6 @@ mod tests {
         // carries that one known memory line - cron + workspace prove the move.)
     }
 
-    /// #7940: the documented "re-issue the rename to converge" recovery actually
-    /// converges. Simulates the post-persist partial-failure window - config has
-    /// already committed the rename to `to`, but an owned-state row (cron) and the
-    /// workspace still lag at `from` - then re-issues `from -> to` and proves the
-    /// side-effects re-run rather than 404-ing, so the operator's documented
-    /// recovery command works.
     #[tokio::test]
     async fn agent_rename_resume_converges_when_config_already_to() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3371,7 +3068,7 @@ mod tests {
             from: "from".to_string(),
             to: "to".to_string(),
         };
-        // Re-issue the SAME rename. Before #7940 this returned 404 (from absent in
+        // Re-issue the SAME rename. Beforethis returned 404 (from absent in
         // the committed config); now it resumes and re-runs the lagging effects.
         let resp = rename_agent_cascade(&state, config.clone(), &body).await;
         assert!(
@@ -3404,12 +3101,6 @@ mod tests {
         assert!(!state.config.read().agents.contains_key("from"));
     }
 
-    /// #7940 (Audacity88's concern): the resume must be request-correlated, not
-    /// purely config-state-based. An UNRELATED `X -> to` where `to` already exists
-    /// and the source `X` is absent from config AND nothing lags under `X` matches
-    /// the committed-`to` shape but is NOT a resume - there is no residue to
-    /// converge. It must surface the operator's error (NotFound), not silently
-    /// return 2xx after running no-op side-effects.
     #[tokio::test]
     async fn agent_rename_unrelated_collision_is_not_treated_as_resume() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3508,20 +3199,6 @@ mod tests {
         assert_eq!(json_pointer_to_dotted("/"), "");
     }
 
-    // ── `test` op type-coercion invariants ─────────────────────────────
-    //
-    // The `test` JSON Patch op compares the incoming `value` against the
-    // current property value. `Config::get_prop` always returns a display
-    // string, regardless of the underlying field's PropKind. Before the
-    // fix, the handler wrapped that string in `Value::String(...)` and
-    // compared against the raw incoming `Value::Bool(true)` /
-    // `Value::Number(42)` / etc. — never equal even when the test should
-    // pass. The fix normalizes both sides to display strings via
-    // `json_to_setprop_string` (the same helper `add`/`replace` use).
-    //
-    // These tests pin the invariant: for every PropKind that surfaces on
-    // the API, `json_to_setprop_string(<typed JSON>, Some(kind))` equals
-    // the string `Config::get_prop` returns.
     use zeroclaw_config::traits::PropKind;
 
     #[test]
@@ -3574,11 +3251,6 @@ mod tests {
 
     #[test]
     fn test_op_coercion_float_typed_value_matches_stored() {
-        // `gateway.host` is a String, but [scheduler] / autonomy carry floats
-        // for things like temperatures. Pick a path that's a float field on
-        // the default config. If the schema gains/loses a float field this
-        // test will need updating; that's fine — we just need one float to
-        // pin the contract.
         let mut cfg = zeroclaw_config::schema::Config::default();
         // autonomy doesn't carry floats today; use a model_provider temperature
         // by setting a known model provider entry. The model providers map
@@ -3752,20 +3424,8 @@ mod tests {
 
     #[test]
     fn scrub_credentials_catches_credential_shaped_strings() {
-        // Defence-in-depth: scrub_credentials (the workspace's existing
-        // tracing scrubber) catches keyword=value patterns that are the
-        // most likely shape for accidental log leakage. Pin the contract
-        // here so a regression in either the regex or the assumed shapes
-        // gets caught — important for the new HTTP CRUD surface where the
-        // dashboard sends real bearer tokens, secret PUT bodies, etc.
         use zeroclaw_runtime::agent::loop_::scrub_credentials;
 
-        // Three realistic shapes a tracing call might emit. All must be
-        // redacted by the existing scrubber.
-        // The scrubber matches KEYWORD<:|=>VALUE patterns. These are the
-        // shapes most likely to appear in a tracing log line (`tracing`'s
-        // `?body` debug-format renders structs as `field: value` and JSON
-        // keys are typically written as `"key": "value"`).
         let cases = [
             // Field=value style log line.
             (
@@ -3964,20 +3624,8 @@ mod tests {
         );
     }
 
-    /// Guardrail against the original #7156 bug class: a new `#[secret]` field
-    /// added under `[gateway]` that the gateway also mints/rotates itself will
-    /// reproduce the permanent-banner symptom unless it is explicitly listed
-    /// in `is_gateway_managed_field` (or whitelisted below as operator-edited).
-    /// This test fails when such a field lands without a corresponding matcher
-    /// entry, forcing the author to make a deliberate decision instead of
-    /// silently re-introducing the bug.
     #[test]
     fn every_gateway_secret_is_classified() {
-        // Secrets under `[gateway]` that are OPERATOR-EDITED (not gateway-
-        // managed). Add the field's prop-field name here only if the gateway
-        // does NOT mint/rotate/persist it itself, so legitimate drift between
-        // disk and memory IS surfaceable. Empty for now — `paired_tokens` is
-        // the only `[gateway]` secret and it's gateway-managed.
         const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
 
         let cfg = zeroclaw_config::schema::Config::default();
@@ -4055,23 +3703,9 @@ mod tests {
         );
     }
 
-    /// #7941: when config persistence FAILS, the agent delete must not have
-    /// archived the workspace or purged any owned state. Pre-fix the archive
-    /// and the owned-state cascade ran *before* `persist_and_swap`, so a
-    /// persist failure left config naming the agent while its workspace had
-    /// been archived and its owned stores had been purged — the inverse
-    /// split-brain of #7907 (in the delete direction). Persist-first means an
-    /// early failure returns before any side-effect runs; the agent's
-    /// workspace, cron jobs, and other owned stores all stay on the original
-    /// alias.
     #[tokio::test]
     async fn agent_delete_leaves_owned_state_intact_when_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
-        // Force config persistence to FAIL by making `config_path` itself a
-        // directory — save_dirty's atomic write can't replace a dir. Its
-        // parent (the install root) stays a real dir, so the agent-workspace
-        // creation and the cron seed below still work. data_dir is separate
-        // + writable.
         let cfg_dir = tmp.path().join("config.toml");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let mut config = zeroclaw_config::schema::Config {
@@ -4136,10 +3770,6 @@ mod tests {
         assert!(state.config.read().agents.contains_key("victim"));
     }
 
-    /// #7941: when persist SUCCEEDS, the agent is gone from the persisted
-    /// config AND the workspace + owned state have been archived / purged.
-    /// This is the happy path that proves the reorder didn't accidentally
-    /// skip the side-effects (or return success without doing them).
     #[tokio::test]
     async fn agent_delete_purges_owned_state_after_successful_persist() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4202,13 +3832,6 @@ mod tests {
         );
     }
 
-    /// #7941 partial-failure surface: the response body must carry a
-    /// `warnings` array that aggregates (a) archive dir creation failures,
-    /// (b) workspace archive `fs::rename` failures, and (c) per-store failures
-    /// from the owned-state cascade. Pre-fix, `MapKeyResponse` had no
-    /// `warnings` field at all and every side-effect failure was WARN-logged
-    /// only — the operator got a clean 200 OK and had to scrape server logs
-    /// to learn that part of the cascade had silently failed.
     #[tokio::test]
     async fn agent_delete_response_carries_partial_failure_warnings() {
         use axum::body::to_bytes;
@@ -4231,20 +3854,6 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["echo".into()];
         config.runtime_profiles.entry("default".into()).or_default();
-        // Force the archive-dir side-effect to fail deterministically —
-        // regardless of uid — by planting a regular file at
-        // `<data_dir>/agents/_deleted`. `delete_agent_cascade` then calls
-        // `create_dir_all(<data_dir>/agents/_deleted/<alias>-<ts>)`, which
-        // walks name lookup through the file and returns ENOTDIR (os error
-        // 20). This is a filesystem-type error, not a permission check, so
-        // root — which some containerized CI runners execute as — cannot
-        // bypass it. The previous approach cleared the write bit on
-        // `_deleted` (mode 0o555); root ignores the mode and
-        // `create_dir_all` silently succeeded, leaving `warnings` empty of
-        // the archive line the test is asserting on, and the assertion
-        // then latched onto whatever other warning was present
-        // (historically a `MockMemory::purge_agent` "not supported" error,
-        // which we now suppress via a no-op impl in `api.rs`).
         let agents_dir = config.data_dir.join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
         let deleted_marker = agents_dir.join("_deleted");

@@ -1,13 +1,4 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
-//!
-//! Modelled directly on `zeroclaw_infra::acp_session_store::AcpSessionStore`
-//! (`parking_lot::Mutex<Connection>` + WAL pragmas + `CREATE TABLE IF NOT EXISTS`),
-//! so the supervision plane reuses the proven durability pattern rather than
-//! inventing a new one. One `tasks` table indexes every supervised unit of work;
-//! the producers' flat-JSON payloads stay where they are — this is the *index*.
-//!
-//! All methods are sync SQLite calls behind a `parking_lot::Mutex`; no `.await` is
-//! held across the lock, so the `#[async_trait]` futures stay `Send`.
 
 use std::path::Path;
 
@@ -22,18 +13,7 @@ mod goal;
 
 const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
 
-/// SQLite-backed durable task registry.
-///
-/// The `tasks` table in `control_plane.db` is the source of truth for generic
-/// task lifecycle, route, principal, ownership, and parentage. Goal-specific
-/// rows live in extension tables owned by `task_store_sqlite::goal`, sharing
-/// this connection so task and extension writes can be committed atomically.
 pub struct SqliteTaskStore {
-    /// Single SQLite connection protected by a synchronous mutex.
-    ///
-    /// This connection owns both the generic `tasks` table and goal extension
-    /// tables so cross-table registration can be atomic. It is not an in-memory
-    /// task cache; every query resolves from SQLite.
     conn: Mutex<Connection>,
 }
 
@@ -247,7 +227,7 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
 fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
-    // status back to NULL/running (review finding #11 — the documented idempotency).
+    // status back to NULL/running (review finding— the documented idempotency).
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
@@ -287,11 +267,6 @@ fn update_task_status_record(
     let finished_at = status
         .is_terminal()
         .then(|| chrono::Utc::now().to_rfc3339());
-    // Terminal-state guard: once a task has reached ANY terminal state this is a
-    // no-op. Closes the reaper-sweep TOCTOU where a task that legitimately Completed
-    // between the reaper's snapshot and its update could be clobbered back to
-    // TimedOut (and its real finished_at lost). Mirrors reconcile_lost's
-    // `AND status='running'` discipline (review finding #2).
     conn.execute(
         "UPDATE tasks
             SET status = ?1,

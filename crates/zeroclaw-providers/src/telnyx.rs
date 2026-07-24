@@ -1,17 +1,4 @@
 //! Telnyx AI inference model_provider.
-//!
-//! Telnyx provides AI inference through an OpenAI-compatible API at
-//! <https://api.telnyx.com/v2/ai> with access to 53+ models including
-//! GPT-4o, Claude, Llama, Mistral, and more.
-//!
-//! # Configuration
-//!
-//! Set the `TELNYX_API_KEY` environment variable or configure in `config.toml`:
-//!
-//! ```toml
-//! default_model_provider = "telnyx"
-//! default_model = "openai/gpt-4o"
-//! ```
 
 use crate::traits::{ChatMessage, ModelProvider};
 use async_trait::async_trait;
@@ -21,21 +8,6 @@ use serde::Deserialize;
 /// Telnyx Inference Engine public endpoint.
 pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 
-/// Telnyx AI inference model_provider.
-///
-/// Uses the OpenAI-compatible chat completions API at `/v2/ai/chat/completions`.
-/// Supports 53+ models including OpenAI, Anthropic (via API), Meta Llama,
-/// Mistral, and more.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use zeroclaw::providers::telnyx::TelnyxModelProvider;
-/// use zeroclaw::providers::ModelProvider;
-///
-/// let model_provider = TelnyxModelProvider::new("test", Some("your-api-key"));
-/// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
-/// ```
 pub struct TelnyxModelProvider {
     /// `[providers.models.telnyx.<alias>]` config-key alias.
     alias: String,
@@ -45,13 +17,28 @@ pub struct TelnyxModelProvider {
     client: Client,
 }
 
-impl TelnyxModelProvider {
-    /// Create a new Telnyx AI model_provider.
-    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
-        let resolved_key = resolve_telnyx_api_key(api_key);
-        Self {
-            alias: alias.to_string(),
-            api_key: resolved_key,
+/// Typed builder for [`TelnyxModelProvider`].
+///
+/// Only `alias` is required; `api_key` falls back to the
+/// `TELNYX_API_KEY` environment variable.
+#[must_use]
+pub struct TelnyxBuilder {
+    alias: String,
+    api_key: Option<String>,
+}
+
+impl TelnyxBuilder {
+    /// Set an explicit Telnyx API key. When unset, `build()` reads
+    /// `TELNYX_API_KEY` from the environment via `resolve_telnyx_api_key`.
+    pub fn api_key(mut self, api_key: Option<&str>) -> Self {
+        self.api_key = api_key.map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> TelnyxModelProvider {
+        TelnyxModelProvider {
+            alias: self.alias,
+            api_key: resolve_telnyx_api_key(self.api_key.as_deref()),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -59,14 +46,19 @@ impl TelnyxModelProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
-    /// Create a model_provider with a custom base URL (for testing or proxies).
-    pub fn with_base_url(alias: &str, api_key: Option<&str>, _base_url: &str) -> Self {
-        // Note: custom base URL support for testing
-        Self::new(alias, api_key)
+}
+
+impl TelnyxModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`TelnyxBuilder`].
+    pub fn builder(alias: &str) -> TelnyxBuilder {
+        TelnyxBuilder {
+            alias: alias.to_string(),
+            api_key: None,
+        }
     }
 
     /// List available models from Telnyx AI.
-    ///
     /// Returns a list of model IDs that can be used with the chat API.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
@@ -345,13 +337,15 @@ mod tests {
 
     #[test]
     fn creates_provider_with_key() {
-        let model_provider = TelnyxModelProvider::new("test", Some("test-key"));
+        let model_provider = TelnyxModelProvider::builder("test")
+            .api_key(Some("test-key"))
+            .build();
         assert!(model_provider.api_key.is_some());
     }
 
     #[test]
     fn creates_provider_without_key() {
-        let _provider = TelnyxModelProvider::new("test", None);
+        let _provider = TelnyxModelProvider::builder("test").api_key(None).build();
         // Will be None if env vars not set
     }
 

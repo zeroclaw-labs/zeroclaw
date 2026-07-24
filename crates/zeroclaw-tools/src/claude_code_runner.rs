@@ -8,14 +8,6 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
 
-/// Environment variables safe to pass through to the `claude` subprocess.
-///
-/// Note: This runner is Unix/WSL-only because it depends on `tmux` for session
-/// management. Windows native execution should use the foreground
-/// [`ClaudeCodeTool`](super::claude_code::ClaudeCodeTool) which handles the
-/// Windows-specific binary resolution and environment allowlist. The
-/// `clean_verbatim_path()` call in this runner is purely path hygiene for
-/// tmux compatibility and does not provide Windows subprocess launch support.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -35,17 +27,6 @@ pub struct ClaudeCodeHookEvent {
     pub summary: Option<String>,
 }
 
-/// Spawns Claude Code inside a tmux session with HTTP hooks that POST tool
-/// execution events back to ZeroClaw's gateway endpoint, enabling live Slack
-/// progress updates and SSH session handoff.
-///
-/// Unlike [`ClaudeCodeTool`](super::claude_code::ClaudeCodeTool) which runs
-/// `claude -p` inline and waits for completion, this runner:
-///
-/// 1. Creates a named tmux session (`<prefix><id>`)
-/// 2. Launches `claude` inside it with `--hook-url` pointing at the gateway
-/// 3. Returns immediately with the session ID and an SSH attach command
-/// 4. Receives streamed progress via the `/hooks/claude-code` endpoint
 pub struct ClaudeCodeRunnerTool {
     security: Arc<SecurityPolicy>,
     config: ClaudeCodeRunnerConfig,
@@ -142,11 +123,6 @@ impl Tool for ClaudeCodeRunnerTool {
         // Validate working directory
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            // Resolve relative working_directory against workspace_dir, NOT
-            // the daemon's current working directory. This prevents the bug
-            // where an external coding tool's relative working_directory
-            // would silently resolve to a path outside the workspace when
-            // the daemon cwd differs from workspace_dir.
             let wd_path = if wd_path.is_relative() {
                 self.security.workspace_dir.join(&wd_path)
             } else {

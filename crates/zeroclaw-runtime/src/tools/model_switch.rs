@@ -302,12 +302,6 @@ impl ModelSwitchTool {
             .unwrap_or(model_provider.as_str());
         let provider_family = provider_family.to_lowercase();
 
-        // Prefer the live, in-tree model catalog (models.dev, then the
-        // OpenRouter vendor index) resolved by `list_models_for_family`,
-        // which also maps the family to its catalog key (e.g. `gemini` ->
-        // `google`). Fall back to the hardcoded list below only when the
-        // catalog is unreachable (offline / fetch failure) or empty, so the
-        // offline path stays deterministic. See issue #8088.
         let models: Vec<String> = match self.resolve_catalog(&provider_family).await {
             Ok(live) if !live.is_empty() => live,
             Ok(_) => hardcoded_models_for(&provider_family),
@@ -367,7 +361,7 @@ impl ModelSwitchTool {
 /// Offline fallback catalog for known provider families. Used only when the
 /// live `list_models_for_family` catalog is unreachable or empty. Kept in
 /// sync with the families in `list_model_providers`; intentionally minimal —
-/// the live catalog is authoritative when reachable (issue #8088).
+/// the live catalog is authoritative when reachable
 fn hardcoded_models_for(provider_family: &str) -> Vec<String> {
     let models: Vec<&'static str> = match provider_family {
         "openai" => vec![
@@ -549,10 +543,6 @@ mod tests {
         );
     }
 
-    /// Offline fallback (issue #8088): when the live catalog is unreachable,
-    /// `handle_list_models` must fall back to the hardcoded per-family list
-    /// rather than returning an empty set. We assert the fallback table
-    /// directly so the test is deterministic regardless of network access.
     #[test]
     fn hardcoded_fallback_covers_known_families() {
         // The nine families that have hardcoded fallback arms.
@@ -578,10 +568,6 @@ mod tests {
         assert!(hardcoded_models_for("not_a_real_family").is_empty());
     }
 
-    /// When the live models.dev catalog IS reachable, `list_models` must
-    /// return the live catalog (which, unlike the stale hardcoded set,
-    /// surfaces current models such as the gpt-5 / o-series). Network-gated:
-    /// skipped automatically when offline so CI stays deterministic.
     #[tokio::test]
     async fn list_models_prefers_live_catalog_when_reachable() {
         let live = match zeroclaw_providers::catalog::list_models_for_family("openai").await {
@@ -709,10 +695,6 @@ mod tests {
                         .and_then(|v| v.as_str())
                         .map(|s| s.contains("live catalog unavailable, using hardcoded fallback"))
                         .unwrap_or(false);
-                    // Sibling tests (e.g. the `custom.local` short-circuit test)
-                    // emit the SAME fallback message on the shared process-global
-                    // broadcast bus, so match on the ollama family too to pin OUR
-                    // event rather than latching the first fallback WARN seen.
                     let is_ollama = value
                         .get("attributes")
                         .and_then(|a| a.get("provider_family"))

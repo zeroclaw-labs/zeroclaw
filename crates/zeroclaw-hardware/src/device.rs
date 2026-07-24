@@ -1,8 +1,4 @@
 //! Device types and registry — stable aliases for discovered hardware.
-//!
-//! The LLM always refers to devices by alias (`"pico0"`, `"arduino0"`), never
-//! by raw `/dev/` paths. The `DeviceRegistry` assigns these aliases at startup
-//! and provides lookup + context building for tool execution.
 
 use super::transport::Transport;
 use std::collections::HashMap;
@@ -10,11 +6,6 @@ use std::sync::Arc;
 
 // ── DeviceRuntime ─────────────────────────────────────────────────────────────
 
-/// The software runtime / execution environment of a device.
-///
-/// Determines which host-side tooling is used for code deployment and execution.
-/// Currently only [`MicroPython`](DeviceRuntime::MicroPython) is implemented;
-/// other variants return a clear "not yet supported" error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceRuntime {
     /// MicroPython — uses `mpremote` for code read/write/exec.
@@ -59,7 +50,6 @@ impl std::fmt::Display for DeviceRuntime {
 // ── DeviceKind ────────────────────────────────────────────────────────────────
 
 /// The category of a discovered hardware device.
-///
 /// Derived from USB Vendor ID or, for unknown VIDs, from a successful
 /// ping handshake (which yields `Generic`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +97,6 @@ impl std::fmt::Display for DeviceKind {
 }
 
 /// Capability flags for a connected device.
-///
 /// Populated from device handshake or static board metadata.
 /// Tools can check capabilities before attempting unsupported operations.
 #[derive(Debug, Clone, Default)]
@@ -154,7 +143,6 @@ impl Device {
 }
 
 /// Context passed to hardware tools during execution.
-///
 /// Provides the tool with access to the device identity, transport layer,
 /// and capability flags without the tool managing connections itself.
 pub struct DeviceContext {
@@ -178,12 +166,6 @@ struct RegisteredDevice {
 /// duplicating the literal.
 pub const NO_HW_DEVICES_SUMMARY: &str = "No hardware devices connected.";
 
-/// Registry of discovered devices with stable session aliases.
-///
-/// - Scans at startup (via `hardware::discover`)
-/// - Assigns aliases: `pico0`, `pico1`, `arduino0`, `nucleo0`, `device0`, etc.
-/// - Provides alias-based lookup for tool dispatch
-/// - Generates prompt summaries for LLM context
 pub struct DeviceRegistry {
     devices: HashMap<String, RegisteredDevice>,
     alias_counters: HashMap<String, u32>,
@@ -199,7 +181,6 @@ impl DeviceRegistry {
     }
 
     /// Register a discovered device and assign a stable alias.
-    ///
     /// Returns the assigned alias (e.g. `"pico0"`).
     pub fn register(
         &mut self,
@@ -244,7 +225,6 @@ impl DeviceRegistry {
     }
 
     /// Attach a transport and capabilities to a previously registered device.
-    ///
     /// Returns `Err` when `alias` is not found in the registry (should not
     /// happen in normal usage because callers pass aliases from `register`).
     pub fn attach_transport(
@@ -275,7 +255,6 @@ impl DeviceRegistry {
     }
 
     /// Build a `DeviceContext` for a device by alias.
-    ///
     /// Returns `None` if the alias is unknown or no transport is attached.
     pub fn context(&self, alias: &str) -> Option<DeviceContext> {
         self.devices.get(alias).and_then(|e| {
@@ -327,14 +306,6 @@ impl DeviceRegistry {
         lines.join("\n")
     }
 
-    /// Resolve a GPIO-capable device alias from tool arguments.
-    ///
-    /// If `args["device"]` is provided, uses that alias directly.
-    /// Otherwise, auto-selects the single GPIO-capable device, returning an
-    /// error description if zero or multiple GPIO devices are available.
-    ///
-    /// On success returns `(alias, DeviceContext)` — both are owned / Arc-based
-    /// so the caller can drop the registry lock before doing async I/O.
     pub fn resolve_gpio_device(
         &self,
         args: &serde_json::Value,
@@ -393,14 +364,6 @@ impl DeviceRegistry {
             .any(|e| e.device.kind == DeviceKind::Aardvark)
     }
 
-    /// Resolve an Aardvark device from tool arguments.
-    ///
-    /// If `args["device"]` is provided, uses that alias directly.
-    /// Otherwise auto-selects the single Aardvark device, returning an error
-    /// description if zero or multiple Aardvark devices are available.
-    ///
-    /// Returns `(alias, DeviceContext)` — both are owned/Arc-based so the
-    /// caller can drop the registry lock before doing async I/O.
     pub fn resolve_aardvark_device(
         &self,
         args: &serde_json::Value,
@@ -463,7 +426,6 @@ impl DeviceRegistry {
     }
 
     /// One-line summary per device: `"pico0: raspberry-pi-pico /dev/ttyACM0"`.
-    ///
     /// Suitable for CLI output and debug logging.
     pub fn summary(&self) -> String {
         if self.devices.is_empty() {
@@ -481,17 +443,6 @@ impl DeviceRegistry {
         lines.join("\n")
     }
 
-    /// Discover all connected serial devices and populate the registry.
-    ///
-    /// Steps:
-    /// 1. Call `discover::scan_serial_devices()` to enumerate port paths + VID/PID.
-    /// 2. For each device with a recognised VID: register and attach a transport.
-    /// 3. For unknown VID (`0`): attempt a 300 ms ping handshake; register only
-    ///    if the device responds with ZeroClaw firmware.
-    /// 4. Return the populated registry.
-    ///
-    /// Returns an empty registry when no devices are found or the `hardware`
-    /// feature is disabled.
     #[cfg(feature = "hardware")]
     pub async fn discover() -> Self {
         use super::{
@@ -568,14 +519,6 @@ impl DeviceRegistry {
 }
 
 impl DeviceRegistry {
-    /// Reconnect a device after reboot/reflash.
-    ///
-    /// Drops the old transport, creates a fresh [`HardwareSerialTransport`] for
-    /// the given (or existing) port path, runs the ping handshake to confirm
-    /// ZeroClaw firmware is alive, and re-attaches the transport.
-    ///
-    /// Pass `new_port` when the OS assigned a different path after reboot;
-    /// pass `None` to reuse the device's current path.
     #[cfg(feature = "hardware")]
     pub async fn reconnect(&mut self, alias: &str, new_port: Option<&str>) -> anyhow::Result<()> {
         use super::serial::{DEFAULT_BAUD, HardwareSerialTransport};

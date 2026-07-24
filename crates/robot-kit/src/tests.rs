@@ -1,9 +1,4 @@
 //! Integration tests for robot kit
-//!
-//! These tests verify the robot kit works correctly in various configurations:
-//! - Mock mode (no hardware) - for CI/development
-//! - Hardware simulation - for testing real scenarios
-//! - Live hardware - for on-device validation
 
 #[cfg(test)]
 mod unit_tests {

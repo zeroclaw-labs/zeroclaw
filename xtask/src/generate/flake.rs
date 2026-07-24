@@ -2,12 +2,6 @@
 //! source per-user, so it must expose feature selection (overridable), not a
 //! fixed set. We generate a sentinel-delimited zone defining the zeroclaw +
 //! zerocode packages with the canonical Dist feature list as the default
-//! `buildFeatures`, overridable via `.override { features = [...]; }`. The
-//! feature list and version come from the spec; nothing is typed.
-//!
-//! Git-dep NAR hashes (not derivable from Cargo.toml) live in nix/hashes.json
-//! and are loaded at Nix evaluation time via builtins.fromJSON. The generator
-//! only emits the structural reference — it never reads or embeds hash values.
 
 use super::spec::{self, Selection};
 use std::path::Path;

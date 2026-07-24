@@ -16,11 +16,6 @@ pub struct GiteaProvider {
 }
 
 impl GiteaProvider {
-    /// `api_base_url` is required and must be non-blank; there is no
-    /// default host. [`build_provider`](crate::git::channel) fails closed
-    /// before constructing this provider when the config omits it, so a
-    /// bearer `access_token` is never sent to a host the operator did not
-    /// name.
     pub fn new(api_base_url: String, access_token: String, proxy_url: Option<String>) -> Self {
         Self {
             api: GiteaApi::new(api_base_url, proxy_url),
@@ -48,13 +43,6 @@ impl GiteaProvider {
         let mut advance_to: Option<DateTime<Utc>> = None;
         for issue in self.api.list_issues_since(token, repo, since).await? {
             events.push(mapping::from_issue_opened(&issue, repo));
-            // Advance the cursor by the max timestamp of the events actually
-            // emitted for this issue, not just `created_at`. A PR created before
-            // the cursor but closed/merged after it emits a transition timed at
-            // `closed_at` (> created_at); advancing only by `created_at` would
-            // leave it inside the `since` window and re-fetch it every tick.
-            // Safe now that `list_issues_since` consumes all pages (no unseen
-            // older items can hide behind a page boundary).
             let mut newest = issue.created_at;
             if let Some(transition) = mapping::from_pull_transition(&issue, repo) {
                 newest = newest.max(transition.created_at());

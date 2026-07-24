@@ -2,7 +2,8 @@ name: CodeQL
 
 # Static analysis for JavaScript/TypeScript source under web/.
 # Uses the existing .github/codeql/codeql-config.yml (paths-ignore tests/).
-# Rust CodeQL support is currently in beta upstream — add once stable.
+# Rust CodeQL lives in the sibling ci-code-analysis.yml workflow (master push
+# + daily, alongside Semgrep); language coverage is split across the two.
 #
 # Triggers:
 #   push to master     — immediate feedback on merged code

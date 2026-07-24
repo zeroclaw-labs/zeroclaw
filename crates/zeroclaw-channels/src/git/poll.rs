@@ -107,12 +107,6 @@ impl PollState {
     }
 }
 
-/// Next `created>=` cursor for the workflow-runs stream. Runs are
-/// queried by *creation* time but only surface once *completed*, so the
-/// cursor must never pass the creation time of a still-running run —
-/// otherwise its completion would be invisible to later ticks. The
-/// earliest pending run therefore caps the advance; the dedup set
-/// absorbs the re-reads of completed runs behind that cap.
 pub fn runs_cursor_candidate(
     completed_max: Option<DateTime<Utc>>,
     pending_min: Option<DateTime<Utc>>,

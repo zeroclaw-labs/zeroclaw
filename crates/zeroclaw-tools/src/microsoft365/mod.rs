@@ -1,8 +1,5 @@
 //! Microsoft 365 integration tool — Graph API access for Mail, Teams, Calendar,
 //! OneDrive, and SharePoint via a single action-dispatched tool surface.
-//!
-//! Auth is handled through direct HTTP calls to the Microsoft identity platform
-//! (client credentials or device code flow) with token caching.
 
 pub mod auth;
 pub mod graph_client;

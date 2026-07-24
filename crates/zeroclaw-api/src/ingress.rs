@@ -1,18 +1,4 @@
-//! Universal ingress policy contract types (RFC #6971, phase 1).
-//!
-//! Layer: api (kernel ABI). Pure types, no logic, no IO. These describe the
-//! envelope that every inbound turn carries into the unified turn engine and
-//! the disposition the SOP policy layer returns for it.
-//!
-//! The entry layer (channel orchestrator, gateway, ACP, RPC, cron/SOP/subagent)
-//! stamps an [`IngressContext`] and threads it into `run_tool_call_loop`; the
-//! engine consults the policy front door (`ingress_policy`, in
-//! `zeroclaw-runtime`) which returns an [`IngressDecision`]. The default
-//! disposition is [`IngressDecision::Loop`] — run the agent, today's behavior.
-//!
-//! This module does NOT decide policy (that is the runtime front door) and does
-//! NOT stamp real identity (phase 2). Phase 1 ships these shapes and the
-//! always-on threading; only `Loop` is reachable under the default policy.
+//! Universal ingress policy contract types (RFC phase 1).
 
 use serde::{Deserialize, Serialize};
 
@@ -45,13 +31,6 @@ pub enum Transport {
     Internal,
 }
 
-/// Who initiated an inbound turn: the provenance axis, orthogonal to
-/// [`SourceClass`] (the external/internal trust split) and [`Transport`]
-/// (the arrival path). Origin exists so per-origin turn policy (first
-/// consumer: memory-context injection) can distinguish top-level turns
-/// that want their own context from nested sub-turns that must not
-/// re-inject the parent's, without overloading the trust semantics that
-/// `ingress_policy` keys on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOrigin {
@@ -92,7 +71,7 @@ pub enum TrustClass {
 pub struct UntrustedFraming {}
 
 /// The envelope stamped by the entry layer; travels with the turn into the
-/// engine. See the module docs and RFC #6971 §3.
+/// engine. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngressContext {
     /// Stable inbound id (e.g. a `ChannelMessage.id`) — provenance + audit
@@ -114,14 +93,6 @@ pub struct IngressContext {
 }
 
 impl IngressContext {
-    /// The shared phase-1 envelope shape: `source_class = Internal`,
-    /// `trust = Trusted`, `transport = Internal`, `sender = None`,
-    /// `message_id = None`, with only the origin varying. Real
-    /// source/transport/trust stamping at the entry edge is not wired
-    /// here yet; every constructor below keeps the phase-1
-    /// placeholders so trust-facing behavior is unchanged. Passing the
-    /// layer with any of these envelopes dispositions to
-    /// [`IngressDecision::Loop`] under the default policy.
     fn phase1(origin: TurnOrigin) -> Self {
         Self {
             message_id: None,
@@ -183,12 +154,6 @@ impl IngressContext {
     }
 }
 
-/// The SOP policy layer's disposition for one inbound turn (RFC #6971 §3/§5).
-///
-/// `Loop` is the default and the only disposition reachable under the default
-/// policy in phase 1. The other arms exist so the engine match is exhaustive
-/// and future-ready; they become reachable when phase 3 wires non-`Loop`
-/// policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IngressDecision {
     /// DEFAULT — run the agent. Free: allocates no SOP run, does no IO.

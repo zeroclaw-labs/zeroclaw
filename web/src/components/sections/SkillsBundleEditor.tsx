@@ -6,12 +6,13 @@
 // Lazy-load pattern mirrors PersonalityEditor — list endpoint hydrates
 // the picker, individual SKILL.md content is fetched on selection.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { githubLight } from '@uiw/codemirror-theme-github';
 import CodeMirror from '@uiw/react-codemirror';
+import { useLocation } from 'react-router-dom';
 import { useTheme } from '@/hooks/useTheme';
 import {
   createSkill,
@@ -37,6 +38,12 @@ interface EditorBuffer {
 }
 
 export default function SkillsBundleEditor({ bundle }: Props) {
+  const location = useLocation();
+  const requestedSkill = new URLSearchParams(location.search).get('skill');
+  const appliedRequestedSkill = useRef<string | null>(null);
+  const shouldFocusRequestedSkill = useRef(false);
+  const editorRef = useRef<HTMLDivElement | null>(null);
+
   // Match the SKILL.md editor to the active console scheme — a dark CodeMirror
   // theme inside a light palette is the light-mode bug we're fixing.
   // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
@@ -65,6 +72,26 @@ export default function SkillsBundleEditor({ bundle }: Props) {
   useEffect(() => {
     void loadList();
   }, [loadList]);
+
+  useEffect(() => {
+    if (!requestedSkill) return;
+    const requestedSkillKey = `${bundle}:${requestedSkill}`;
+    if (!skills.some((s) => s.name === requestedSkill)) {
+      setActive(null);
+      setBuffer(null);
+      return;
+    }
+    if (appliedRequestedSkill.current === requestedSkillKey) return;
+    appliedRequestedSkill.current = requestedSkillKey;
+    shouldFocusRequestedSkill.current = true;
+    setActive(requestedSkill);
+  }, [bundle, requestedSkill, skills]);
+
+  useEffect(() => {
+    if (!buffer || !shouldFocusRequestedSkill.current) return;
+    shouldFocusRequestedSkill.current = false;
+    editorRef.current?.focus();
+  }, [buffer]);
 
   const loadActive = useCallback(async () => {
     if (!active) return;
@@ -213,6 +240,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
           <button
             key={s.name}
             type="button"
+            aria-pressed={s.name === active}
             onClick={() => setActive(s.name)}
             className="text-xs px-3 py-1.5 rounded-lg border transition-colors"
             style={{
@@ -317,7 +345,13 @@ export default function SkillsBundleEditor({ bundle }: Props) {
 
       {/* Editor */}
       {active && buffer && (
-        <div className="flex flex-col gap-3">
+        <div
+          ref={editorRef}
+          tabIndex={-1}
+          aria-live="polite"
+          aria-label={`${t('common.edit')} ${active}`}
+          className="flex flex-col gap-3 focus:outline-none"
+        >
           <FrontmatterForm
             value={buffer.draft.frontmatter}
             onChange={setFrontmatterField}

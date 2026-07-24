@@ -11,12 +11,6 @@ use zeroclaw_plugins::registry::{
     install_command as plugin_install_command, read_cached_registry_index,
 };
 
-/// Server-side, post-submit install suggestions for cached skill/plugin registry metadata.
-///
-/// This layer intentionally runs before the normal LLM turn and only returns a
-/// suggestion. It does not install, enable, read skill bodies, write memory, or
-/// provide composer-time suggestions; richer inline UI needs client/protocol
-/// support on top of this server-side path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallableSkillCapability {
     name: String,
@@ -951,19 +945,6 @@ aliases = ["team calendar"]
         assert!(suggestion.is_none());
     }
 
-    /// Regression: a capability in the raw registry but absent from the
-    /// effective tool set must not suppress install suggestions.
-    ///
-    /// Before the fix, `process_message` built `runtime_capability_names`
-    /// from the raw `tools_registry` (all registered tools regardless of
-    /// exclusion). A tool excluded for the current turn was still treated
-    /// as "installed", causing `suggest_missing_skill_install` to skip the
-    /// suggestion. Using `effective_tool_names` instead ensures that only
-    /// tools available for this turn suppress suggestions.
-    ///
-    /// This test demonstrates the two outcomes:
-    /// - passing the raw name suppresses the suggestion (old behavior);
-    /// - omitting it (as the effective set does) returns the suggestion.
     #[test]
     fn excluded_tool_does_not_suppress_missing_skill_suggestion() {
         let catalog = vec![catalog_entry("calendar", &["calendar", "google calendar"])];

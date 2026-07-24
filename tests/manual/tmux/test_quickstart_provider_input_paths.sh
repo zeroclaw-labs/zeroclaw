@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Exercise zeroclaw quickstart's provider input paths via its non-interactive flags.
-# Replaces test_onboard_provider_input_paths.sh (deleted #6848).
 set -euo pipefail
 
 BIN="${BIN:-./target/debug/zeroclaw}"

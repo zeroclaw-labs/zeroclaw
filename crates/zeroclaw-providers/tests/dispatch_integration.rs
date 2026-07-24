@@ -2,9 +2,6 @@
 //! `attribution_span!(&*inner)`. Drives every wrapping method once and
 //! asserts every captured `LogEvent` carries the inner provider's
 //! `model_provider_type` / `model_provider_alias`.
-//!
-//! Locks in the contract that no future dispatcher addition can
-//! silently lose attribution.
 
 use std::sync::Arc;
 

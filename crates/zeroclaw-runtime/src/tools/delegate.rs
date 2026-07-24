@@ -105,20 +105,6 @@ impl BackgroundResultState {
     }
 }
 
-/// Tool that delegates a subtask to a named agent with a different
-/// model_provider/model configuration. Enables multi-agent workflows where
-/// a primary agent can hand off specialized work (research, coding,
-/// summarization) to purpose-built sub-agents.
-///
-/// Supports three execution modes:
-/// - **Synchronous** (default): blocks until the sub-agent completes.
-/// - **Background** (`background: true`): spawns the sub-agent in a tokio
-///   task and returns a `task_id` immediately.
-/// - **Parallel** (`parallel: [...]`): runs multiple agents concurrently
-///   and returns all results.
-///
-/// Background results are persisted to `workspace/delegate_results/{task_id}.json`
-/// and can be retrieved via `action: "check_result"`.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -167,12 +153,6 @@ enum DelegateAdmission {
     /// This call entered through the user-visible `delegate` tool and must run
     /// caller-side tool authorization plus target reachability checks.
     Required,
-    /// The parent path already admitted the request before spawning work.
-    ///
-    /// Background workers use this after the parent has returned a task id with
-    /// a resolved target policy. Re-running the full admission inside that
-    /// worker would ask whether the child target can delegate to itself, which
-    /// is not the authorization question being answered.
     Prevalidated,
 }
 
@@ -219,12 +199,6 @@ impl DelegateAction {
     }
 }
 
-/// The independent-delegate registry plus the deferred-MCP side-channels the
-/// sub-agent turn needs. Independent delegation assembles the target's full
-/// runtime registry (built-ins + granted MCP + skills), and deferred MCP mode
-/// surfaces its tools through a prompt section (`deferred_section`) and a live
-/// activated set (`activated_handle`) that the sub-agent loop must inject and
-/// thread - exactly as a fresh target turn (`Agent::from_config`) does.
 struct IndependentTargetTools {
     tools: Vec<Box<dyn Tool>>,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
@@ -233,20 +207,7 @@ struct IndependentTargetTools {
     /// Live handle to the deferred-MCP activated set (Some only when a deferred
     /// `tool_search` tool was registered), threaded into the sub-agent turn loop.
     activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    /// The TARGET agent's workspace dir (`config.agent_workspace_dir(target)`),
-    /// resolved once here so the sub-agent's skill *prompt* content is built from
-    /// the same workspace its skill *tools* were loaded from - matching a fresh
-    /// target turn (`loop_.rs` uses `config.agent_workspace_dir(agent_alias)` for
-    /// both). Without this the prompt would describe the *caller's* skills while
-    /// the tools come from the target's.
     workspace_dir: PathBuf,
-    /// The TARGET agent's skills, loaded via the canonical per-agent loader
-    /// (`load_skills_for_agent_from_config`, which unions the workspace,
-    /// open-skills, plugin, and `skill_bundles` sources). Threaded into the
-    /// sub-agent prompt so the SkillsSection describes exactly the skill tools
-    /// that were assembled; `build_enriched_system_prompt`'s local bundle resolver
-    /// only sees `skill_bundles`, so without this override the prompt could omit
-    /// skills the delegate can actually call.
     skills: Vec<crate::skills::Skill>,
 }
 
@@ -387,11 +348,6 @@ impl DelegateTool {
         self
     }
 
-    /// Resolve a target sub-agent's workspace dir for identity-file
-    /// loading. Delegates to `Config::agent_workspace_dir` so the
-    /// per-agent path lives in one place; returns `None` when no
-    /// `root_config` is attached (legacy unit-test constructors), which
-    /// callers treat as "no identity files to load".
     fn agent_workspace(&self, agent_alias: &str) -> Option<PathBuf> {
         self.root_config
             .as_ref()
@@ -459,19 +415,6 @@ impl DelegateTool {
         self
     }
 
-    /// Resolve the target's `SecurityPolicy` for delegation.
-    ///
-    /// Refuses when the caller's `delegation_policy` forbids delegation
-    /// or the target is outside the caller's reachable set. Bounded
-    /// targets share the caller's action/cost tracker and, for same-profile
-    /// targets, inherit the caller's session workspace boundary (issue
-    /// #7263). Cross-profile bounded targets still run under the target's
-    /// configured policy; the bounded ceiling is enforced by drawing
-    /// agentic tools from the caller's registry and intersecting with the
-    /// target risk profile. Independent targets run under their own
-    /// configured policy and tool registry. Falls back to the caller's
-    /// policy when no `root_config` is attached (legacy unit-test
-    /// constructors).
     fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
@@ -561,11 +504,6 @@ impl DelegateTool {
         Ok(Arc::new(target_policy))
     }
 
-    /// Build the user-facing refusal for a target outside the caller's roster.
-    ///
-    /// The reachability resolver intentionally returns only `None` for "not
-    /// reachable"; this helper re-reads canonical config to explain which
-    /// branch failed without duplicating the admission decision itself.
     fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
         let Some(caller) = config.agents.get(&self.caller_alias) else {
             return format!(
@@ -631,11 +569,6 @@ impl DelegateTool {
         )
     }
 
-    /// Resolve the target mode for execution paths that already admitted it.
-    ///
-    /// Legacy unit-test constructors have no root config, so they keep the old
-    /// bounded behavior. Production instances always carry `root_config` and
-    /// therefore resolve through the canonical roster.
     fn mode_for_target(&self, target_alias: &str) -> DelegateExecutionMode {
         self.root_config
             .as_ref()
@@ -643,27 +576,6 @@ impl DelegateTool {
             .unwrap_or(DelegateExecutionMode::Bounded)
     }
 
-    /// Runtime-only guard for independent targets whose risk profile still
-    /// declares `always_ask`.
-    ///
-    /// Independent delegation deliberately runs under the target agent's own
-    /// policy and tool registry (#8238, related to the broader delegation ask
-    /// in #7743). That is fine for target-owned authorization, but
-    /// `always_ask` is a runtime approval contract: starting an independent
-    /// child that can later ask for approval would require an approval
-    /// forwarding channel back through the parent. That channel is explicitly
-    /// out of scope for independent-delegates PR #8239, so fail closed
-    /// here before any target run, task id, or parallel spawn is created.
-    ///
-    /// Keep this centralized. Sync, background, and parallel paths all call
-    /// the same helper so the refusal string and structured diagnostics do not
-    /// drift, and so a future approval-forwarding implementation has one
-    /// temporary guard to remove.
-    ///
-    /// References:
-    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/8238
-    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/7743
-    /// - https://github.com/zeroclaw-labs/zeroclaw/pull/8239
     fn independent_always_ask_refusal(&self, target_alias: &str) -> Option<ToolResult> {
         let config = self.root_config.as_ref()?;
         if config.delegate_target_mode(&self.caller_alias, target_alias)
@@ -773,18 +685,6 @@ impl DelegateTool {
         ]
     }
 
-    /// Build the full target-owned registry for an independent agentic child.
-    ///
-    /// Bounded agentic delegation starts from the caller's already-filtered
-    /// `parent_tools`. Independent delegation is intentionally different: it is
-    /// equivalent to starting a fresh target-agent turn, so the registry comes
-    /// from the target risk profile, target workspace, target memory, and target
-    /// provider credentials, assembled through the same `ScopedToolRegistry::assemble`
-    /// seam a real target turn uses - including the target's granted MCP-bundle
-    /// tools and callable skill tools. The only cross-cutting restriction retained
-    /// here is stripping `delegate` itself, because recursive agentic delegation is
-    /// still not supported. Returns the registry plus the deferred-MCP prompt section
-    /// and activated-set handle the caller threads into the sub-agent turn.
     async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
@@ -852,32 +752,9 @@ impl DelegateTool {
             None,
         );
 
-        // Load the TARGET agent's skills - the same "fresh turn" loader run() and
-        // from_config use (`_from_config` resolves the target's workspace + skill_bundles
-        // from the alias) - so an independent delegate exposes the target's callable skill
-        // tools, not an empty set. Resolve the target workspace explicitly too, so the
-        // caller can build the sub-agent's skill *prompt* from the SAME workspace these
-        // skill *tools* came from (the loader resolves `config.agent_workspace_dir(target)`
-        // internally). NB: this is the target's config workspace, not `target_policy
-        // .workspace_dir` (which policy_for_target rebinds to the caller's cwd when caller
-        // and target share a risk profile) - matching loop_.rs, which uses
-        // `config.agent_workspace_dir(agent_alias)` for both skills and prompt.
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
 
-        // Route the independent-target registry through the one gated seam - the same
-        // `assemble` seam run(), process_message, and the gateway use. Independent
-        // delegation is "like opening a fresh chat with the target"
-        // (docs/book/src/agents/delegation.md), so it assembles the TARGET's FULL runtime
-        // registry: assemble step 2 filters with the TARGET's SecurityPolicy (the #8239
-        // invariant - target tools, not the caller's), `connect_mcp: true` connects the
-        // target's granted MCP bundles (omission is not a grant), and the target's skills
-        // register as tools. caller_allowed is None (no per-run allowlist here).
-        // `connect_peripherals` stays FALSE deliberately: a delegate sub-loop must not open
-        // the serial hardware the live daemon holds exclusively. `emit_assembly_logs: true`
-        // because this is an execution surface. The `delegate` tool is stripped afterward
-        // because `all_tools_with_runtime` injects it and an independent delegate must not
-        // recurse into further delegation.
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
@@ -892,6 +769,12 @@ impl DelegateTool {
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
+                // Delegate: targets are short-lived independent chat
+                // sessions with no cross-turn reuse contract, so the
+                // per-call `connect_all` is the correct choice. The
+                // daemon heartbeat worker is the only `mcp_registry`
+                // supplier.
+                mcp_registry: None,
             },
         )
         .await;
@@ -989,11 +872,6 @@ impl DelegateTool {
             .unwrap_or(false)
     }
 
-    /// Resolve the runtime-profile knobs the delegate sub-loop consumes.
-    ///
-    /// Production DelegateTool instances carry `root_config`, so use the
-    /// canonical config resolver there. The fallback only serves legacy unit
-    /// constructors that build DelegateTool from raw maps without a full Config.
     fn resolve_loop_runtime(
         &self,
         agent_alias: &str,
@@ -1029,21 +907,6 @@ impl DelegateTool {
         resolved
     }
 
-    /// Materialize the tool gate from the named risk profile (authorization).
-    ///
-    /// Returns `None` when the risk profile is unnamed or not configured.
-    /// `allowed_tools = Some(vec![])` means "deny all" and is preserved as
-    /// `Some(empty)` so the caller can distinguish it from "no risk profile."
-    ///
-    /// The resulting `SecurityPolicy` only carries the tool authorization
-    /// fields (`allowed_tools` and `excluded_tools`). Callers in
-    /// `execute_agentic` must use [`Self::delegate_admits_with_mcp`] — not the
-    /// raw `SecurityPolicy::is_tool_allowed` — to filter `parent_tools`,
-    /// because the delegate path applies the MCP `<server>__<tool>`
-    /// auto-admit exception described on `RiskProfileConfig::allowed_tools`.
-    /// The exception is intentionally scoped to the risk-profile gate; it
-    /// does not apply to caller-supplied per-run allow-lists (cron jobs and
-    /// other narrowers) — see PR #7547 review.
     fn resolve_tool_policy(&self, risk_profile: &str) -> Option<SecurityPolicy> {
         if risk_profile.is_empty() {
             return None;
@@ -1065,23 +928,6 @@ impl DelegateTool {
         })
     }
 
-    /// MCP-aware admission check used to filter `parent_tools` in
-    /// `execute_agentic`.
-    ///
-    /// Same contract as `SecurityPolicy::is_tool_allowed`, with one
-    /// addition that the delegate path needs: when the risk profile's
-    /// `allowed_tools` is `Some(non-empty)`, any name containing `__`
-    /// (the `<server>__<tool>` MCP wrapper convention) is auto-admitted
-    /// even if it is not explicitly listed in `allowed_tools`. The
-    /// `excluded_tools` deny-list always applies last, so destructive
-    /// MCP capabilities like `filesystem__write_file` can be blocked
-    /// individually.
-    ///
-    /// This auto-admit applies only to the risk-profile gate. Callers
-    /// that need a per-run narrowing (cron jobs, narrowed delegate
-    /// invocations) intersect their own allow-list against this result
-    /// with a strict `list.contains(name)` check — see
-    /// `ToolAccessPolicy::is_tool_allowed` and PR #7547.
     fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
         let denied = policy
             .excluded_tools
@@ -1112,9 +958,6 @@ impl DelegateTool {
         self.workspace_dir.join("delegate_results")
     }
 
-    /// Persist a background result atomically: write to a sibling temp file then
-    /// rename onto the final path, so a concurrent reader never observes a
-    /// half-written (or zero-length) JSON document.
     async fn write_result_atomic(
         result_path: &Path,
         result: &BackgroundDelegateResult,
@@ -1345,12 +1188,6 @@ impl DelegateTool {
             .await
     }
 
-    /// Execute one foreground delegate call after selecting the admission mode.
-    ///
-    /// `Required` is the public tool entry path. `Prevalidated` is reserved for
-    /// detached background workers that already performed caller-side admission
-    /// before returning a task id. Keeping the switch at this boundary prevents
-    /// sync/background/agentic variants from each inventing a different bypass.
     async fn execute_sync_with_admission(
         &self,
         agent_name: &str,
@@ -1702,12 +1539,6 @@ impl DelegateTool {
         let root_config = self.root_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
-        // Capture the parent loop's session-key task-local so the
-        // detached background task scopes its tool calls under the
-        // same key — channel tools (sessions_send, etc.) need the
-        // session key in scope to attribute correctly. Without this
-        // wrap, the spawned task would lose the parent's task-local
-        // and channel-scoped tool calls would land unattributed.
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
 
@@ -1795,11 +1626,6 @@ impl DelegateTool {
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
                 let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
 
-                // EPIC-A supervision: mirror the terminal state into the control-plane so
-                // the registry reflects the real outcome (and the reaper never reclaims a
-                // finished task). No-op when the plane is absent. The store's
-                // terminal-state guard makes a late write after a reaper TimedOut a safe
-                // no-op.
                 if let Some(cp) = crate::control_plane::control_plane() {
                     let cp_status = match final_result.status {
                         BackgroundTaskStatus::Completed => {
@@ -1927,13 +1753,6 @@ impl DelegateTool {
             }
         }
 
-        // Capture the current receipt scope so each spawned sub-agent task
-        // re-enters it. Spawned tasks do not propagate task-locals, so
-        // without this `execute_sync`'s `try_with` would resolve to `None`
-        // inside the spawn and the parallel agents would run unsigned even
-        // when the parent turn has receipts enabled. The collector is `Arc`'d
-        // inside `ReceiptScope`, so all parallel agents push into the same
-        // per-turn collector the orchestrator renders after the loop returns.
         let parent_receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -1997,12 +1816,6 @@ impl DelegateTool {
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
-                                // Parallel workers still carry the caller's
-                                // security policy, not a pre-resolved target
-                                // policy. Let each worker run normal admission
-                                // so the target policy is rebuilt for its own
-                                // agentic loop; the preflight above only
-                                // prevents partial fan-out.
                                 Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
                                     .await
                             })
@@ -2066,12 +1879,6 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
-    /// When a background task's flat-file status still reads `Running` but the durable
-    /// control-plane has reconciled it to a terminal-loss state — the owning daemon died
-    /// (`Lost`) or it exceeded its runtime (`TimedOut`) — return the loss label so result
-    /// readers surface the truth instead of a task that will never finish. `None` when
-    /// there is no loss to report: the control-plane is absent, has no record, or the
-    /// flat file is already authoritative (the task wrote its own terminal state).
     async fn reconciled_loss_label(
         task_id: &str,
         file_status: &BackgroundTaskStatus,
@@ -2370,12 +2177,6 @@ impl DelegateTool {
         })
     }
 
-    /// Live cancellation tokens for in-flight background delegate tasks, keyed by task_id.
-    /// `execute_background` registers a task's child token here before the detached spawn
-    /// and removes it when the task settles; `cancel_task` looks it up to ACTUALLY abort
-    /// the run. (The prior implementation only marked the result file, so a "cancelled"
-    /// task kept running.) Process-global because a background task outlives the tool
-    /// instance that spawned it.
     fn background_task_cancels() -> &'static parking_lot::Mutex<HashMap<String, CancellationToken>>
     {
         static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
@@ -2488,18 +2289,6 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
-    /// Compose an independent sub-agent's system prompt from the base (tools /
-    /// skills / identity) prompt and the target's deferred-MCP section.
-    ///
-    /// This mirrors a fresh target turn: the deferred-tools section is first run
-    /// through the turn engine's `apply_text_tool_prompt_policy`, which *clears*
-    /// it for a non-native, strict-tool-parsing target (such a target cannot use
-    /// the text `tool_search` protocol, so a fresh turn never advertises it). Only
-    /// then is a non-empty section appended. Reusing the shared policy helper keeps
-    /// the delegate path from drifting from the engine. The throwaway tool-descs
-    /// vec is intentionally unused - `build_enriched_system_prompt` already applied
-    /// the policy to the tool descriptions; here we only want its effect on the
-    /// deferred section.
     fn compose_independent_system_prompt(
         base: Option<String>,
         mut deferred_section: String,
@@ -2526,12 +2315,6 @@ impl DelegateTool {
         }
     }
 
-    /// Build an enriched system prompt for a sub-agent by composing structured
-    /// operational sections (tools, skills, workspace, datetime, shell policy)
-    /// with the per-agent identity files loaded from the target's own
-    /// workspace dir (`<install>/agents/<alias>/workspace/AGENTS.md`,
-    /// `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`,
-    /// `MEMORY.md`).
     fn build_enriched_system_prompt(
         &self,
         agent_alias: &str,
@@ -2542,13 +2325,6 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
-        // Skills for the prompt. An independent delegate passes the canonical
-        // per-agent skill set (`skills_override`) - the SAME set its skill tools
-        // were assembled from - so the SkillsSection describes exactly the exposed
-        // tools. Bounded delegation (override None) falls back to local bundle
-        // resolution: with configured bundles, load + concat from each; otherwise
-        // the workspace default. (The local resolver only sees `skill_bundles`,
-        // which is why independent delegation overrides it.)
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
             Some(s) => s,
@@ -2625,11 +2401,6 @@ impl DelegateTool {
             enriched.push_str("\n\n");
         }
 
-        // Append the per-agent identity files from the target
-        // sub-agent's own workspace dir. Each missing file is silently
-        // skipped — the operator may not have authored every file.
-        // Skipped entirely when no `root_config` is attached (legacy
-        // unit-test constructors); production paths always attach it.
         if let Some(target_workspace) = self.agent_workspace(agent_alias) {
             let identity_files = [
                 "AGENTS.md",
@@ -2715,11 +2486,6 @@ impl DelegateTool {
                     });
                 }
             },
-            // Background delegation performs the caller-side authorization before it
-            // returns a task id. The detached worker then runs with the resolved target
-            // policy in `self.security`; re-checking `policy_for_target` here would ask
-            // whether the child is allowed to delegate to itself, which is a different
-            // question and rejects legitimate background delegates after acceptance.
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
@@ -2848,11 +2614,6 @@ impl DelegateTool {
         let agentic_timeout_secs = self
             .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
-        // Forward the per-turn receipt scope from the parent loop so subagent
-        // tool calls land in the same collector as the top-level turn. When
-        // receipts are disabled (or no scope is set, e.g. CLI / background
-        // delegate spawn) this resolves to `None` and the sub-loop runs
-        // unsigned, matching the parent.
         let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -2863,6 +2624,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
@@ -2876,6 +2638,12 @@ impl DelegateTool {
                         silent: true,
                         approval: None,
                         multimodal_config: &self.multimodal_config,
+                        // Full config so the delegated sub-agent's vision route
+                        // resolves the configured `vision_model_provider`'s alias
+                        // options (the `vision` override, endpoint URI, credentials),
+                        // exactly as the parent turn does. `None` only on the
+                        // configless test builder (`root_config` unset).
+                        config: self.root_config.as_deref(),
                         hooks: None,
                         // Thread the target's deferred-MCP activated set so `tool_search`
                         // can activate the target's deferred tools mid-turn (Some only for
@@ -2912,11 +2680,12 @@ impl DelegateTool {
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -4475,7 +4244,7 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_empty_allowed_tools_inherits_caller_registry() {
         // Empty allowed_tools now means "inherit": the target runs with the
-        // caller's already-filtered tools instead of being rejected (#7470).
+        // caller's already-filtered tools instead of being rejected
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -5156,13 +4925,6 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_forwards_receipt_scope_into_subagent_loop() {
-        // Receipt forwarding through the delegate sub-loop is the activation
-        // pass for #6182's delegate.rs:1184 acceptance criterion. With
-        // `TOOL_LOOP_RECEIPT_CONTEXT` scoped, every sub-tool call inside the
-        // delegate must produce a receipt that lands in the same per-turn
-        // collector the parent passed in. Without the task-local read in
-        // `execute_sync` this test fails: the collector stays empty because
-        // the sub-loop runs unsigned with `None, None` for the receipt args.
         use crate::agent::tool_receipts::{
             ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
         };
@@ -5514,14 +5276,6 @@ mod tests {
         );
     }
 
-    /// PR #7547 review (Audacity88): the `<server>__<tool>` MCP-naming
-    /// convention must be auto-admitted by the delegate filter even when
-    /// the risk profile's explicit `allowed_tools` list does not mention
-    /// the tool. The pre-existing `mcp_tools_included_in_subagent_tool_list`
-    /// fixture uses `mcp_fake` (no double underscore) so it exercises the
-    /// explicit allow-list path, not the new auto-admit branch. This test
-    /// pins the new branch via the resolve_tool_policy + delegate_admits_with_mcp
-    /// pair that replaces the pre-#7608 resolve_allowed_tools helper.
     #[test]
     fn delegate_admits_with_mcp_auto_admits_double_underscore_mcp_names() {
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -5551,13 +5305,6 @@ mod tests {
         );
     }
 
-    /// Characterization test for the MCP resource/prompt capability tools'
-    /// subagent-propagation guarantee (issue #4467). `mcp_resources` and
-    /// `mcp_prompts` contain no `__`, so they are NOT auto-admitted the way
-    /// runtime `<server>__<tool>` MCP wrappers are: a narrowed `caller_allowed`
-    /// list that omits them must exclude them. This locks the boundary so a
-    /// narrowed delegate/spawn_subagent cannot reach resources/prompts unless
-    /// explicitly granted.
     #[test]
     fn caller_allowed_narrowing_excludes_mcp_capability_tools() {
         use zeroclaw_tools::tool_search::ToolAccessPolicy;
@@ -5572,12 +5319,6 @@ mod tests {
         assert!(!policy.is_tool_allowed("mcp_prompts"));
     }
 
-    /// PR #7547 review (Audacity88) — blocking comment: the PR body
-    /// claims MCP tools can still be blocked via `excluded_tools`. A
-    /// target profile that allow-lists `shell` and excludes
-    /// `filesystem__write_file` must NOT receive the MCP wrapper in an
-    /// agentic delegate even though it matches the `__` auto-admit
-    /// heuristic.
     #[test]
     fn delegate_admits_with_mcp_honors_excluded_tools_for_auto_admitted_mcp() {
         let mut profiles = HashMap::new();
@@ -5608,11 +5349,6 @@ mod tests {
         );
     }
 
-    /// Companion to the test above: `excluded_tools` must also subtract
-    /// from explicit allow-list entries, not just from the
-    /// double-underscore auto-admit set. delegate.rs previously ignored
-    /// `excluded_tools` entirely on the agentic path; this pins the fix
-    /// so it cannot regress.
     #[test]
     fn delegate_admits_with_mcp_honors_excluded_tools_for_explicit_allow_list_entries() {
         let mut profiles = HashMap::new();
@@ -5762,11 +5498,6 @@ mod tests {
         assert!(!prompt.contains("CURRENT DATE & TIME"));
         assert!(!prompt.contains("Time:"));
         assert!(!prompt.contains("ISO 8601:"));
-        // Identity files come from the target sub-agent's per-agent
-        // workspace dir. The test's install_root is unset, so no
-        // identity files exist for the dummy alias — the prompt still
-        // contains the structural sections verified above, which is
-        // the load-bearing assertion.
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -6850,10 +6581,6 @@ mod tests {
     }
 
     fn config_with_always_ask_delegate(mode: DelegateExecutionMode) -> Arc<Config> {
-        // Shared fixture for the temporary `always_ask` block: caller can
-        // delegate to both targets, but only `target` carries a trimmed
-        // always_ask entry. `peer` lets parallel tests prove fan-out fails
-        // before spawning any sibling when one target is blocked.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{RiskProfileConfig, RuntimeProfileConfig};
 
@@ -7282,13 +7009,6 @@ mod tests {
         );
     }
 
-    /// Regression for issue #7263: when the caller's policy was built
-    /// with a session cwd (the ACP / gateway path), delegating to a
-    /// sibling agent must carry that cwd into the target's policy.
-    /// Without this, the child run's file/shell tools jail to the
-    /// per-agent install dir declared in config rather than the IDE's
-    /// session cwd, breaking delegate-driven workflows in repos
-    /// outside the install root.
     #[tokio::test]
     async fn delegate_target_inherits_caller_session_workspace_dir() {
         let config = config_with_two_agents("caller", 5, "target", 5);
@@ -7736,10 +7456,6 @@ mod tests {
         );
     }
 
-    /// An independent delegate now receives the TARGET agent's callable SKILL tools,
-    /// not just its built-ins -- matching a fresh target turn. A skill declared in the
-    /// target's workspace surfaces as `{skill}__{tool}`. This fails on the old
-    /// `skills: &[]` wiring (the built-in-only registry).
     #[tokio::test]
     async fn independent_delegate_receives_target_skill_tools() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
@@ -7844,17 +7560,11 @@ command = "echo hi"
             .map(|t| t.name().to_string())
             .collect();
 
-        // The target skill tool reaches the delegate even though the target's allowed_tools
-        // is ["shell"]: skill tools are granted via skill config (skill_bundles/workspace),
-        // NOT the built-in allowlist, and builtin-kind skill tools are scoped-elevation
-        // wrappers meant to stay callable off the allowlist. Only excluded_tools subtracts a
-        // skill tool (see the seam fix in `register_skill_tools`), so this is correct
-        // documented behavior, not an allowlist bypass.
         assert!(
             names.iter().any(|n| n == "pdfify__run"),
             "independent delegate must expose the target's skill tools (fails with skills:&[]); got {names:?}"
         );
-        // The #8239 invariants still hold alongside the new skill tools.
+        // Theinvariants still hold alongside the new skill tools.
         assert!(
             names.iter().any(|n| n == "shell"),
             "target built-in must still be present, got {names:?}"
@@ -8079,11 +7789,6 @@ command = "echo hi"
             "delegate must build the target with its declared responses wire API"
         );
 
-        // Regression guard: the pre-fix path (bare factory, no config/alias
-        // context) cannot see the per-alias config — for the custom family it
-        // errors on the missing uri it can't resolve, which is exactly the
-        // "error in the provider" the bug report described. Either way it does
-        // not yield a working responses provider.
         let stale = zeroclaw_providers::create_model_provider_with_options(
             "custom",
             None,

@@ -5,20 +5,19 @@ be set with `zeroclaw config get/set/list/init/migrate` is also reachable via
 HTTP, so the dashboard, third-party tooling, and the CLI all drive the same
 underlying `Config` mutation core.
 
-This page is a high-level overview. Field-level definitions, request and
-response shapes, and "Try it out" forms are generated from the runtime types
-and live at `/api/docs` on a running gateway. The generator is the same set of
-schemas the daemon enforces, so the docs cannot drift from the implementation.
+This page is a high-level overview. Field-level definitions, request and response shapes, and "Try it out" forms for the currently documented OpenAPI subset live at `/api/docs` on a running gateway. Those schemas come from runtime types, but the route inventory is assembled separately and does not yet cover every route registered by the gateway. The router in `crates/zeroclaw-gateway/src/lib.rs` remains the authority for the full live surface.
 
 > Tracked under issue #6175.
 
 ## Authentication
 
-Every `/api/*` route is gated by the existing pairing/bearer auth. A first-run
-pairing code is printed when the daemon starts; subsequent calls send the
-derived bearer token in the `Authorization` header. The Scalar explorer at
-`/api/docs` exposes an "Authentication" panel where you paste the token before
-issuing live calls.
+The configuration value reads and mutations described on this page are gated
+by the existing pairing and bearer authentication. Shape discovery through `/api/docs`,
+`/api/openapi.json`, and config `OPTIONS` is public. A first-run pairing code is
+printed when the daemon starts; subsequent authenticated calls send the derived
+bearer token in the `Authorization` header. The Scalar explorer at `/api/docs`
+exposes an "Authentication" panel where you paste the token before issuing
+authenticated calls.
 
 Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
@@ -28,19 +27,14 @@ safe to expose unauthenticated regardless of TLS posture.
 
 Two endpoints answer the question "what can I do here?":
 
-- `OPTIONS /api/config` returns the JSON Schema for the whole-config type and
-  an `Allow` header listing the methods supported on the resource. Static per
-  build; clients should cache against the `ETag` header.
+- `OPTIONS /api/config` returns the JSON Schema for the whole-config type.
+  Static per build; clients should cache against the `ETag` header. Its current
+  `Allow` header still lists legacy `PUT`, which the router does not register.
 - `OPTIONS /api/config/prop?path=<dotted>` returns the schema fragment for a
   specific path with `Allow: GET, PUT, DELETE, OPTIONS`. Returns 404 if the
   path doesn't exist in the schema.
 
-`OPTIONS` returns capabilities. `GET /api/config/prop` and `GET /api/config/list`
-return the user's current values. Forms in the dashboard issue `OPTIONS` once
-at load time to learn types and constraints, then `GET` to populate fields,
-then `PUT`/`PATCH` to write. There is no whole-file `GET /api/config`,
-deliberately. Walk the per-property surface; the schema is the source of truth
-for what fields exist.
+`OPTIONS` returns capabilities. `GET /api/config/prop` and `GET /api/config/list` return the user's current values. Forms in the dashboard issue `OPTIONS` once at load time to learn types and constraints, then `GET` to populate fields, then `PUT`/`PATCH` to write. A compatibility `GET /api/config` also returns a whole-config snapshot with secrets masked so older bundled dashboard pages do not fail against newer gateways. New clients should prefer the per-property surface because it carries field metadata and explicit secret handling.
 
 CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
@@ -50,6 +44,7 @@ returned.
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/api/config` | Compatibility whole-config snapshot with secrets masked; new clients should prefer the per-property surface. |
 | `PATCH` | `/api/config` | Apply a JSON Patch (RFC 6902) document atomically. |
 | `OPTIONS` | `/api/config` | Whole-config JSON Schema (capabilities, not values). |
 | `GET` | `/api/config/prop?path=...` | Read one field. Secrets return `{path, populated}` only. |
@@ -62,12 +57,14 @@ returned.
 
 ## Atomic batch writes: JSON Patch
 
-`PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported op
-subset is `add`, `replace`, `remove`, `test`. Each op runs against an
-in-memory copy of the config; once every op has applied, `Config::validate()`
-runs once on the result. If validation passes, the new state is persisted and
-swapped in. If any op or the final validation fails, on-disk and in-memory
-state are unchanged.
+`PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported
+config operations are `add`, `replace`, `remove`, and `test`. ZeroClaw also
+accepts a `comment` extension for config annotations. Config operations run
+against an in-memory copy; once every operation has applied,
+`Config::validate()` runs once on the result. If validation passes, the new
+state is persisted and swapped in. If any operation or final validation fails,
+on-disk and in-memory state are unchanged. Comment annotations are applied
+after the save on a non-fatal, best-effort basis.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
 rewriting is not part of this surface. `test` against a `#[secret]` path is
@@ -84,11 +81,12 @@ response shape (`--json` for scripts).
 
 ## Secrets: write-only over HTTP
 
-Secret fields (those marked `#[secret]` or `#[derived_from_secret]` in the
-schema) are **never** readable over HTTP in any form. Responses for secrets
-carry `{populated: bool}` only, no value, no length, no masked stand-in, no
-hash. This is enforced at the response layer regardless of which endpoint is
-called.
+Per-property reads never expose secret fields (those marked `#[secret]` or
+`#[derived_from_secret]` in the schema). Their responses carry
+`{populated: bool}` only, with no value, length, masked stand-in, or hash. The
+compatibility `GET /api/config` instead serializes the whole config after
+applying `MaskSecrets`, so secret fields can appear there only as masked
+placeholders. Neither config read surface returns the underlying secret value.
 
 `PUT` and `PATCH` write the new secret value and respond with
 `{populated: true}`; `DELETE` clears it and responds with
@@ -113,10 +111,7 @@ Frontends and scripts match against the code; UI matches against the path.
 
 ## Live exploration
 
-Once a gateway is running, browse to `http://<gateway-host>:<port>/api/docs`
-for the Scalar API explorer. Schema definitions and "Try it out" forms come
-from the same `schemars` annotations the daemon uses, so the documentation
-cannot lie about the runtime surface.
+Once a gateway is running, browse to `http://<gateway-host>:<port>/api/docs` for the Scalar API explorer. The raw specification is available at `/api/openapi.json` for other compatible viewers.
 
 The explorer's authentication panel binds to the `bearerAuth` scheme declared
 in the spec, paste your pairing-derived bearer token there before issuing

@@ -245,6 +245,20 @@ code, kbd, pre {
   50% { transform: translateY(-4px); }
 }
 
+@keyframes progress-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+/* Subtle 2px vertical hint, paired with the sidebar's update-available
+   download-arrow icon. Built-in tailwind `animate-bounce` is too tall for a
+   9px-tall icon next to body text — this one nudges just enough to draw the
+   eye without looking like a tooltip popping. */
+@keyframes bounce-soft {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(2px); }
+}
+
 .animate-fade-in {
   animation: fade-in 0.3s ease-out;
 }
@@ -275,6 +289,14 @@ code, kbd, pre {
 
 .animate-float {
   animation: float 3s ease-in-out infinite;
+}
+
+.animate-progress-sweep {
+  animation: progress-sweep 1.5s ease-in-out infinite;
+}
+
+.animate-bounce-soft {
+  animation: bounce-soft 1.4s ease-in-out infinite;
 }
 
 .pulse-dot {
@@ -696,7 +718,9 @@ code, kbd, pre {
   .animate-slide-in-right,
   .animate-slide-in-up,
   .animate-pulse-glow,
-  .animate-float {
+  .animate-float,
+  .animate-progress-sweep,
+  .animate-bounce-soft {
     animation: none;
   }
   .pulse-dot {

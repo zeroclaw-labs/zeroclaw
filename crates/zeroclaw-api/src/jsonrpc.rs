@@ -1,8 +1,4 @@
 //! Shared JSON-RPC 2.0 types for the ACP server and runtime RPC layer.
-//!
-//! Extracted from `zeroclaw-channels::orchestrator::acp_server` so both the
-//! ACP stdio channel and the Unix socket RPC transport can share the same
-//! wire types without cross-crate dependency.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -127,12 +123,6 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
-/// Writer + outbound-call tracker shared between server loops and
-/// per-session bridges (e.g. AcpChannel, RpcDispatcher).
-///
-/// All writes go through `writer_tx` so concurrent notifications and
-/// outbound requests cannot interleave bytes. Outbound requests get string
-/// ids (`zc-out-<n>`) disjoint from any client-issued id space.
 #[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,

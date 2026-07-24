@@ -1,9 +1,4 @@
 //! WHO resolved a SOP approval gate, and from WHERE (EPIC C).
-//!
-//! `source` is the security-load-bearing field: it is ALWAYS derived from the
-//! transport that called `resolve_gate`, NEVER from a client-supplied JSON field.
-//! The constructors are the only way to build a principal, so a remote caller
-//! cannot claim to be the agent (or vice versa) by shaping a request body.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +17,10 @@ pub enum ApprovalSource {
     Http,
     /// The timeout tick (escalate/cancel). Not an approval, a transition.
     System,
+    /// A chat-channel gate answer (a SOP-gate button click or a
+    /// `<choice> <reference>` text reply), attributed to the channel user who
+    /// answered. Constructed only by the orchestrator's channel-gate intercept.
+    Channel,
 }
 
 /// WHO resolved a gate and from WHERE. Recorded into the append-only ledger.
@@ -73,6 +72,16 @@ impl ApprovalPrincipal {
         }
     }
 
+    /// A chat-channel gate answer. `channel_key` is the answering channel
+    /// (`discord.gnosis`), `user` the platform user id that clicked/replied.
+    pub fn channel(channel_key: String, user: Option<String>) -> Self {
+        Self {
+            source: ApprovalSource::Channel,
+            identity: user,
+            channel: Some(channel_key),
+        }
+    }
+
     /// The daemon timeout tick.
     pub fn system() -> Self {
         Self {
@@ -102,6 +111,41 @@ impl ApprovalPrincipal {
             .unwrap_or_else(|| self.source_label().to_string())
     }
 
+    /// The voter SOURCE for quorum distinctness. HTTP and WS collapse to a single
+    /// `gateway` source because they authenticate via the SAME PairingGuard token -
+    /// the derived subject (token hash) is identical whichever transport carries it,
+    /// so one credential presented over HTTP and over WS is ONE voter, not two, and
+    /// cannot inflate a quorum. Agent/CLI keep distinct sources (a CLI OS-user is a
+    /// genuinely different actor from a paired gateway device).
+    fn voter_source(&self) -> &'static str {
+        match self.source {
+            ApprovalSource::Http | ApprovalSource::Ws => "gateway",
+            _ => self.source_label(),
+        }
+    }
+
+    /// Quorum-distinctness key. Qualified by the *voter source* (see
+    /// `Self::voter_source`) so a different identity on a different source stays
+    /// distinct, while the same paired credential over HTTP+WS counts once. Channel
+    /// voters are additionally namespaced by channel key so same-looking sender ids
+    /// from different channels/aliases cannot satisfy each other's quorum. An
+    /// identity-less principal keys to its source (and channel, for channel answers)
+    /// so anonymous votes from one source count once and cannot inflate a quorum.
+    pub fn voter_key(&self) -> String {
+        if self.source == ApprovalSource::Channel {
+            return match (self.channel.as_deref(), self.identity.as_deref()) {
+                (Some(channel), Some(id)) => format!("channel:{channel}:{id}"),
+                (Some(channel), None) => format!("channel:{channel}"),
+                (None, Some(id)) => format!("channel:{id}"),
+                (None, None) => "channel".to_string(),
+            };
+        }
+        match &self.identity {
+            Some(id) => format!("{}:{}", self.voter_source(), id),
+            None => self.voter_source().to_string(),
+        }
+    }
+
     /// Stable wire label for the source (for ledger payloads / logs).
     pub fn source_label(&self) -> &'static str {
         match self.source {
@@ -110,6 +154,7 @@ impl ApprovalPrincipal {
             ApprovalSource::Ws => "ws",
             ApprovalSource::Http => "http",
             ApprovalSource::System => "system",
+            ApprovalSource::Channel => "channel",
         }
     }
 }
@@ -147,6 +192,44 @@ mod tests {
         );
         assert_eq!(ApprovalPrincipal::cli(None).actor_label(), "cli");
         assert_eq!(ApprovalPrincipal::system().actor_label(), "system");
+    }
+
+    #[test]
+    fn voter_key_collapses_gateway_transports_but_keeps_sources_distinct() {
+        // HTTP and WS share the paired credential -> one canonical gateway voter.
+        assert_eq!(
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            ApprovalPrincipal::ws("conn".into(), Some("sub".into())).voter_key(),
+            "the same subject over HTTP and WS is one voter"
+        );
+        assert_eq!(
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            "gateway:sub"
+        );
+        // A CLI actor with the same name is a genuinely distinct voter.
+        assert_ne!(
+            ApprovalPrincipal::cli(Some("sub".into())).voter_key(),
+            ApprovalPrincipal::http(Some("sub".into())).voter_key(),
+            "a CLI actor is distinct from a gateway subject"
+        );
+        // Different subjects on the gateway stay distinct.
+        assert_ne!(
+            ApprovalPrincipal::http(Some("a".into())).voter_key(),
+            ApprovalPrincipal::http(Some("b".into())).voter_key()
+        );
+    }
+
+    #[test]
+    fn voter_key_namespaces_channel_principals_by_channel_key() {
+        assert_eq!(
+            ApprovalPrincipal::channel("discord.ops".into(), Some("123".into())).voter_key(),
+            "channel:discord.ops:123"
+        );
+        assert_ne!(
+            ApprovalPrincipal::channel("discord.ops".into(), Some("123".into())).voter_key(),
+            ApprovalPrincipal::channel("slack.ops".into(), Some("123".into())).voter_key(),
+            "same-looking sender ids on different channels must be distinct voters"
+        );
     }
 
     #[test]

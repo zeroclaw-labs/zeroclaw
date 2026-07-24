@@ -111,15 +111,6 @@ pub(crate) fn split_message_for_discord_multi(content: &str, max_len: usize) -> 
     }
 }
 
-/// Choose the chunks to deliver for an outbound Discord message.
-///
-/// `split_message_for_discord_multi` returns an empty vec for empty input
-/// (its paragraph splitter has no segments to emit); the non-multi
-/// splitter returns `vec![""]`. When MultiMessage stream mode hands
-/// `send()` a paragraph that collapses to empty text after marker strip,
-/// the chunk loop would iterate zero times and silently skip an attached
-/// file upload. Force a single empty chunk in exactly that case so the
-/// multipart POST fires.
 pub(crate) fn chunks_for_send(
     content: &str,
     stream_mode: zeroclaw_config::schema::StreamMode,
@@ -137,16 +128,6 @@ pub(crate) fn chunks_for_send(
     }
     chunks
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Embed budgeting: clamp a message's embeds to Discord's documented limits.
-//
-// Length overruns on a single text field (title/description/field/footer/author)
-// are trimmed with an ellipsis silently — graceful degradation, no warning.
-// Structural overflow (too many embeds, too many fields, or a total character
-// count Discord would reject outright) drops the excess and reports `true`, so
-// the caller can surface a ⚠️ reaction the way a dropped media marker does.
-// ─────────────────────────────────────────────────────────────────────────────
 
 const EMBED_MAX_TITLE: usize = 256;
 const EMBED_MAX_DESCRIPTION: usize = 4096;
@@ -194,12 +175,6 @@ pub(crate) fn budget_embeds(embeds: &mut Vec<DiscordEmbed>) -> bool {
         }
     }
 
-    // Discord caps the character SUM across *all* of a message's embeds at 6000.
-    // Drop whole trailing embeds until the message total fits; if a single
-    // surviving embed still overflows (one embed alone can exceed 6000 via a
-    // full description + footer, or many fields), shrink it to fit — shave the
-    // description, then drop trailing fields. Title+footer+author alone can't
-    // exceed 2560, so this always converges.
     while total_embed_chars(embeds) > EMBED_MAX_TOTAL_CHARS {
         if embeds.len() > 1 {
             embeds.pop();

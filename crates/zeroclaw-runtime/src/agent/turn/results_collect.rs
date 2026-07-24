@@ -56,27 +56,10 @@ pub(crate) fn collect_tool_results(
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
         if !loop_ignore_tools.contains(tool_name.as_str()) {
-            // Keep failed outputs out of the hash-based identical-output abort
-            // (check_identical_output_abort) too, for the same reason the
-            // pattern detector below is gated: a burst of identical,
-            // argument-independent error strings (rate-limit / action-budget)
-            // would otherwise hash identically and hard-abort the turn — the
-            // exact misfire this PR removes. Successful output still feeds the
-            // hash so the #7143 productive-loop guard (identical *successful*
-            // output) still aborts.
             if outcome.success {
                 detection_relevant_output.push_str(&outcome.output);
             }
 
-            // Feed the pattern-based loop detector with name + args + result —
-            // but only for *successful* calls. Failed calls (e.g. rate-limit /
-            // action-budget errors, not-found, permission denials) return
-            // identical, path-independent error strings; counting them as
-            // "no progress" (different args, identical result) escalates a
-            // transient, recoverable failure into a hard turn abort and hides
-            // the real cause. The detector exists to catch productive-but-stuck
-            // loops — identical *successful* output (see #7143) — not walls of
-            // identical errors the model can still react to.
             let args = tool_calls
                 .get(result_index)
                 .map(|c| &c.arguments)
@@ -138,11 +121,6 @@ pub(crate) fn collect_tool_results(
                 }
             }
         }
-        // Provenance-gated: search/listing tools (content_search, glob_search)
-        // must not have incidental image paths promoted to routable [IMAGE:...]
-        // markers, or they falsely trigger vision routing on a text-only
-        // provider. Image-producing/fetching tools keep canonicalization.
-        // See PR #7345.
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
         let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
@@ -191,13 +169,6 @@ pub(crate) fn check_identical_output_abort(
     iteration: usize,
     turn_id: &str,
 ) -> Result<()> {
-    // ── Time-gated loop detection ──────────────────────────
-    // When pacing.loop_detection_min_elapsed_secs is set, identical-output
-    // loop detection activates after the task has been running that long.
-    // This avoids false-positive aborts on long-running browser/research
-    // workflows while keeping aggressive protection for quick tasks.
-    // When not configured, identical-output detection is disabled (preserving
-    // existing behavior where only max_iterations prevents runaway loops).
     let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
         Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
         None => false, // disabled when not configured (backwards compatible)
@@ -311,7 +282,7 @@ mod tests {
     #[test]
     fn successful_identical_results_still_trip_no_progress_breaker() {
         // Identical *successful* output across different args is the genuine
-        // stuck-loop signal (#7143) and must still hard-abort the turn.
+        // stuck-loop signaland must still hard-abort the turn.
         let err = match run(8, "byte-identical successful output", true) {
             Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
             Err(e) => e.to_string(),
@@ -319,13 +290,6 @@ mod tests {
         assert!(err.contains("loop detector"), "got: {err}");
     }
 
-    /// Drive the *hash-based* identical-output abort
-    /// (`check_identical_output_abort`) directly, with loop detection ACTIVE
-    /// (pacing configured + elapsed), over `n` iterations whose `file_read`
-    /// calls each use different args but return an identical `output` with the
-    /// given `success` flag. Mirrors `run`, but exercises the *second*
-    /// loop-detection mechanism (the hash path) rather than the pattern
-    /// detector.
     fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
         // `Some(0)` => loop detection active immediately (`elapsed() >= 0s`).
         let pacing = PacingConfig {
@@ -377,12 +341,6 @@ mod tests {
 
     #[test]
     fn failed_identical_outputs_do_not_trip_hash_based_abort() {
-        // The *other* loop-detection mechanism: with loop detection active
-        // (pacing configured + elapsed), a wall of identical *failed* outputs
-        // must not trip the hash-based `check_identical_output_abort`. Gating
-        // `detection_relevant_output` on `outcome.success` keeps failures out
-        // of the hash entirely, so the breaker never fires. Without the gate
-        // this aborts at the third identical failure.
         assert!(run_hash_path(8, RATE_LIMIT_ERR, false).is_ok());
     }
 }

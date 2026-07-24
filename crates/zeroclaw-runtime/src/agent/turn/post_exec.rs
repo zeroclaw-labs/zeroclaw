@@ -124,9 +124,6 @@ fn render_completion_progress(
 mod tests {
     use super::render_completion_progress;
 
-    /// The CLI progress line is a rendering surface, so credential-shaped
-    /// failure text must be scrubbed even though `error_reason` is raw on the
-    /// data path.
     #[test]
     fn completion_progress_scrubs_credential_error_reason() {
         let line = render_completion_progress(

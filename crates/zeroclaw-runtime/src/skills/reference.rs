@@ -1,18 +1,8 @@
-//! Skill identity + the disambiguation rule that every surface goes through.
-//!
-//! `SkillRef` is the canonical `(bundle, name)` pair. Fields are private; the
-//! only public constructor is [`resolve`], which enforces the rule "bundle
-//! optional when name is globally unique across configured bundles". CLI flag
-//! parsing, gateway URL parsing, TUI selection — all must call `resolve` to
-//! produce a `SkillRef`. If a future caller hand-builds one, they cannot:
-//! the constructor is module-private.
-
 use std::fmt;
 
 use zeroclaw_config::schema::Config;
 
 /// Canonical `(bundle-alias, skill-name)` identity for a skill on disk.
-///
 /// Construct via [`resolve`]; never by literal field assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SkillRef {
@@ -62,15 +52,6 @@ pub enum SkillRefError {
     },
 }
 
-/// Resolve a `(name, bundle?)` pair into a canonical [`SkillRef`].
-///
-/// Rule: `bundle` is optional iff `name` exists in exactly one configured
-/// bundle's directory. Otherwise the caller must qualify.
-///
-/// Filesystem state (which directories actually contain a `SKILL.md`) is
-/// checked by [`crate::skills::service::SkillsService::list_skills`]; this
-/// function operates over `Config` alone and is filesystem-free, so it can
-/// be unit-tested in isolation.
 pub fn resolve(
     config: &Config,
     name: &str,

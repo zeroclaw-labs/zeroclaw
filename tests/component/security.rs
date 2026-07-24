@@ -1,9 +1,4 @@
 //! Security component tests.
-//!
-//! The `security` module is `pub(crate)` so SecurityPolicy cannot be directly
-//! instantiated from integration tests. These tests validate security-related
-//! behavior through the public API surface: configuration defaults, autonomy
-//! config validation, and credential scrubbing patterns.
 
 use zeroclaw::config::{Config, RiskProfileConfig};
 
@@ -11,7 +6,6 @@ use zeroclaw::config::{Config, RiskProfileConfig};
 // Autonomy configuration defaults and validation
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Default autonomy level is "supervised".
 #[test]
 fn security_default_autonomy_is_supervised() {
     let config = RiskProfileConfig::default();
@@ -22,7 +16,6 @@ fn security_default_autonomy_is_supervised() {
     );
 }
 
-/// Default workspace_only is true (restricts file access to workspace).
 #[test]
 fn security_default_workspace_only() {
     let config = RiskProfileConfig::default();
@@ -32,7 +25,6 @@ fn security_default_workspace_only() {
     );
 }
 
-/// Require approval for medium risk is enabled by default.
 #[test]
 fn security_default_require_approval_for_medium_risk() {
     let config = RiskProfileConfig::default();
@@ -42,7 +34,6 @@ fn security_default_require_approval_for_medium_risk() {
     );
 }
 
-/// Block high risk commands is enabled by default.
 #[test]
 fn security_default_block_high_risk_commands() {
     let config = RiskProfileConfig::default();
@@ -56,7 +47,6 @@ fn security_default_block_high_risk_commands() {
 // Security configuration
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Secret encryption is enabled by default.
 #[test]
 fn security_secrets_encryption_default() {
     let config = Config::default();
@@ -66,8 +56,6 @@ fn security_secrets_encryption_default() {
     );
 }
 
-/// `RiskProfileConfig::default()` defaults to Supervised — the safe baseline
-/// used as the seed for migration-synthesized risk profiles.
 #[test]
 fn security_default_risk_profile_is_supervised() {
     let profile = RiskProfileConfig::default();
@@ -82,7 +70,6 @@ fn security_default_risk_profile_is_supervised() {
 // Autonomy level serialization round-trip
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// RiskProfileConfig serializes and deserializes correctly via TOML.
 #[test]
 fn security_autonomy_config_toml_roundtrip() {
     let original = RiskProfileConfig::default();
@@ -100,7 +87,6 @@ fn security_autonomy_config_toml_roundtrip() {
     );
 }
 
-/// ReadOnly autonomy level parses from TOML string (with all required fields).
 #[test]
 fn security_readonly_autonomy_parses() {
     let original = RiskProfileConfig::default();
@@ -111,7 +97,6 @@ fn security_readonly_autonomy_parses() {
     assert_eq!(format!("{:?}", config.level), "ReadOnly");
 }
 
-/// Full autonomy level parses from TOML string (with all required fields).
 #[test]
 fn security_full_autonomy_parses() {
     let original = RiskProfileConfig::default();
@@ -128,7 +113,6 @@ fn security_full_autonomy_parses() {
 // Credential pattern validation (via config/schema)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Config property readback does not expose raw API keys.
 #[test]
 fn security_config_secret_property_readback_masks_api_key() {
     let mut config = Config::default();

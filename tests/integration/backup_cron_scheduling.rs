@@ -4,10 +4,6 @@ use zeroclaw::config::Config;
 use zeroclaw::config::schema::{AliasedAgentConfig, CronJobDecl, CronScheduleDecl};
 use zeroclaw::cron::{JobType, Schedule, get_job, list_jobs, sync_declarative_jobs};
 
-/// Test fixture: configures a cron-scheduled backup and an agent that
-/// claims the synthetic `__builtin_backup` id through its `cron_jobs`
-/// list, matching the production requirement that every declarative
-/// cron entry have an owning agent.
 fn test_config(tmp: &TempDir, schedule_cron: Option<String>) -> Config {
     let mut config = Config {
         data_dir: tmp.path().join("data"),

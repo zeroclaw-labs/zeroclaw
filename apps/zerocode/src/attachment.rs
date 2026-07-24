@@ -1,10 +1,4 @@
 //! Client-side file attachment preparation.
-//!
-//! Validates files, detects MIME types, and builds `FileEntry` JSON
-//! values for the `session/prompt` RPC call. Transport-aware: sends
-//! `path` over Unix sockets, `data_b64` over WSS.
-//!
-//! Shared between Chat and ACP panes.
 
 use std::path::PathBuf;
 

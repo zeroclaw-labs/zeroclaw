@@ -1,8 +1,4 @@
 //! Hardware memory map tool — returns flash/RAM address ranges for connected boards.
-//!
-//! Phase B: When user asks "what are the upper and lower memory addresses?", this tool
-//! returns the memory map. Uses probe-rs for Nucleo/STM32 when available; otherwise
-//! returns static maps from datasheets.
 
 use async_trait::async_trait;
 use serde_json::json;

@@ -1,8 +1,4 @@
 //! Channel room-management tool.
-//!
-//! Exposes channel-backed room creation and user invites to agents without
-//! storing channel configuration or Matrix-specific state in the tool. The tool
-//! late-resolves the active channel handle and calls the [`Channel`] trait.
 
 use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// WeCom (WeChat Enterprise) Bot Webhook channel.
-///
 /// Sends messages via the WeCom Bot Webhook API. Incoming messages are received
 /// through a configurable callback URL that WeCom posts to.
 pub struct WeComChannel {
@@ -40,12 +39,6 @@ impl WeComChannel {
         )
     }
 
-    /// Check whether `user_id` is on the allowlist for this WeCom channel.
-    ///
-    /// WeCom Bot Webhook is send-only, so this gate is exercised only by
-    /// callback flows the gateway routes back through this channel handle.
-    /// The `alias` is included in the trace span so multi-WeCom deployments
-    /// can distinguish which channel made the decision.
     pub fn is_user_allowed(&self, user_id: &str) -> bool {
         let peers = (self.peer_resolver)();
         let allowed =
@@ -116,11 +109,6 @@ impl Channel for WeComChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // WeCom Bot Webhook is send-only by default. For receiving messages,
-        // an enterprise application with a callback URL is needed, which is
-        // handled via the gateway webhook subsystem.
-        //
-        // This listener keeps the channel alive and waits for the sender to close.
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),

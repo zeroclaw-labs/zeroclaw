@@ -1,40 +1,5 @@
 //! Agent-loop tool that sends a message to a configured peer on a
 //! shared channel.
-//!
-//! Validates the target against [`crate::peers::ResolvedPeers`] for
-//! the calling agent on the requested channel: peers must mutually
-//! opt in via a `[peer_groups.<name>]` block whose `agents` lists
-//! both, OR appear on the group's `external_peers` list, before this
-//! tool will deliver. Cross-channel sends from outside the resolver's
-//! authorization surface are rejected.
-//!
-//! Delivery splits by target type:
-//!
-//! - **Agent-alias targets** route in-process via
-//!   [`crate::agent::loop_::process_message`]: alpha calls
-//!   `send_message_to_peer(target = "beta", ...)` and beta's agent
-//!   loop runs the message. The two agents share the channel's bot
-//!   identity, so an outbound to the channel would loop the bot's
-//!   own handle back through inbound; the in-process path avoids
-//!   that and lets the orchestrator deliver beta's reply (if any)
-//!   through the same channel beta is configured on.
-//!
-//!   This path is fire-and-forget: the recipient runs on a detached
-//!   `zeroclaw_spawn::spawn!`, so the sender's `ToolResult.success = true`
-//!   means "accepted for processing", not "completed". Recipient
-//!   errors do NOT surface to the sender; they are emitted via
-//!   `tracing::warn!` inside the spawned task and via the recipient
-//!   agent's own observability (audit log, runtime trace, channel
-//!   reply). Observers diagnosing a missing peer message should look
-//!   at the recipient's spans, not the sender's tool output.
-//! - **External peers** (humans, external bots) route through
-//!   [`crate::cron::scheduler::deliver_announcement`] with the
-//!   external username as the platform target. The channel registry
-//!   the binary registers at startup forwards the send to the live
-//!   channel instance. This path is synchronous: the
-//!   `deliver_announcement` future resolves before the tool returns,
-//!   so a `success = false` here genuinely reflects a delivery
-//!   failure.
 
 use crate::cron::scheduler::deliver_announcement;
 use crate::peers::resolve_peer_set;
@@ -197,12 +162,6 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
-        // Agent-alias targets route in-process. The channel's bot
-        // identity is shared between alpha and beta, so an outbound
-        // to the channel would loop right back into inbound and the
-        // self-loop guard would drop it. Agent-to-agent messaging is
-        // process-internal by design; the channel registry only sees
-        // sends with external recipients.
         let target_norm = target.trim_start_matches('@').to_ascii_lowercase();
         let target_is_agent = self
             .config
@@ -223,11 +182,6 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
-            // Fire-and-forget: agent-to-agent peer messages do not
-            // synchronously block the sender on the recipient's full
-            // turn (that's what the SubAgent surface is for). The
-            // recipient processes on its own event loop and surfaces
-            // its result via its own observability.
             let cfg = (*self.config).clone();
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
@@ -288,11 +242,6 @@ const MAX_PEER_MAP_ITEMS: usize = 8;
 const MAX_PEER_MAP_CHARS: usize = 4_000;
 const MAX_PROMPT_VALUE_CHARS: usize = 80;
 
-/// Render current-channel peer guidance for the channel system prompt.
-///
-/// Source of truth is [`Config`]: this materializes a per-turn view from the
-/// inbound channel ref rather than storing channel-scoped state in the static
-/// tool registry.
 #[must_use]
 pub fn render_sender_peer_map_for_channel(
     config: &Config,

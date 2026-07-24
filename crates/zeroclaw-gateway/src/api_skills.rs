@@ -1,10 +1,4 @@
 //! HTTP adapter over `zeroclaw_runtime::skills::SkillsService`.
-//!
-//! Thin handlers — every endpoint translates request shape → `SkillsService`
-//! call → response shape. No filesystem logic, no validation, no error
-//! mapping that isn't already encoded in `SkillsService`. The dashboard,
-//! the CLI (`zeroclaw skills add/edit/bundle ...`), and the future TUI all
-//! reach the same canonical implementation through their respective surface.
 
 use axum::{
     Json,
@@ -138,11 +132,6 @@ pub async fn handle_list_skills(
     }
 }
 
-/// `GET /api/agents/:alias/skills` — the agent's *effective* resolved skill set
-/// (workspace / open-skills / plugin / bundle), with provenance (#7757). Unlike
-/// `/api/skills/bundles/:alias/skills` (bundle-only), this mirrors what the
-/// runtime actually loads for the agent, so the dashboard stops rendering an
-/// empty page when an agent has workspace/open-skills/plugin skills.
 pub async fn handle_agent_skills(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -197,7 +186,7 @@ fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
 
 /// Map a runtime [`DroppedSkill`] to its flat wire shape, splitting the
 /// [`SkillDropReason`] enum into a `(reason_kind, reason)` string pair the
-/// dashboard can group on without knowing the Rust enum. (#7963)
+/// dashboard can group on without knowing the Rust enum.
 fn dropped_skill_entry(d: DroppedSkill) -> DroppedSkillEntry {
     let (reason_kind, reason, scripts_blocked) = match d.reason {
         SkillDropReason::AuditFindings {
@@ -369,7 +358,7 @@ mod tests {
     use std::path::PathBuf;
     use zeroclaw_runtime::skills::{ShadowedSkill, SkillOrigin};
 
-    // #7963: the write-guard error maps to 403, distinct from 404/400.
+    // the write-guard error maps to 403, distinct from 404/400.
     #[test]
     fn not_editable_maps_to_forbidden() {
         let resp = service_error_response(ServiceError::NotEditable {
@@ -379,7 +368,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    // #7963: shadowed records ride through to the wire entry.
+    // shadowed records ride through to the wire entry.
     #[test]
     fn agent_skill_entry_maps_shadowed() {
         let s = EffectiveSkill {
@@ -401,7 +390,7 @@ mod tests {
         assert_eq!(entry.shadowed[0].origin, "bundle");
     }
 
-    // #7963: each SkillDropReason arm maps to the right reason_kind tag.
+    // each SkillDropReason arm maps to the right reason_kind tag.
     #[test]
     fn dropped_skill_entry_maps_each_reason_kind() {
         let mk = |reason| DroppedSkill {

@@ -2,7 +2,6 @@
 //! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
 //! install.sh@HEAD is the behavioral reference. The spec is the single source
 //! of truth; surfaces are derived and drift-checked. Surfaces are registered in
-//! one table so adding one is data, not control flow.
 
 pub mod container;
 pub mod container_base;
@@ -112,18 +111,18 @@ pub fn features(
     target: Option<&str>,
     excluded: &[String],
 ) -> anyhow::Result<()> {
-    let menu = Sel::menu();
-    let selection = menu
-        .iter()
-        .find(|s| s.id() == selection_id)
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "unknown selection `{selection_id}` (known: {})",
-                menu.iter().map(|s| s.id()).collect::<Vec<_>>().join(", ")
-            ))
-        })?;
+    let selection = Sel::from_id(selection_id).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "unknown selection `{selection_id}` (known: {})",
+            Sel::named()
+                .iter()
+                .map(Sel::id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
     let list = spec::exclude_features(
-        spec::resolve_feature_list_for_target(&workspace_root(), selection, target)?,
+        spec::resolve_feature_list_for_target(&workspace_root(), &selection, target)?,
         excluded,
     )?;
     println!("{}", list.join(","));

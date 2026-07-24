@@ -1,16 +1,5 @@
 use zeroclaw_config::schema::{ObservabilityConfig, OtelContentPolicy};
 
-/// Per-observer OTel content policy, derived once from [`ObservabilityConfig`]
-/// at the `OtelObserver` construction boundary.
-///
-/// This is NOT a source of truth — [`ObservabilityConfig`] is. It is an
-/// immutable, instance-owned snapshot that the OTel export boundary
-/// (`OtelObserver::record_event` and its attribute builders) consult to decide
-/// whether/how to emit LLM prompt/completion and tool argument/result content.
-///
-/// Storing this on each observer (rather than in a process-global mutable
-/// cell) prevents last-writer-wins drift between concurrently live observers
-/// with different privacy policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OtelContentConfig {
     pub(crate) genai_policy: OtelContentPolicy,

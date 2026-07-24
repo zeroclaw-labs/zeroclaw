@@ -22,11 +22,6 @@ use zeroclaw_config::schema::{TailscaleTunnelConfig, TunnelConfig};
 
 // ── Tunnel trait ─────────────────────────────────────────────────
 
-/// Agnostic tunnel abstraction — bring your own tunnel model_provider.
-///
-/// Implementations wrap an external tunnel binary (cloudflared, tailscale,
-/// ngrok, etc.) or a custom command. The gateway calls `start()` after
-/// binding its local port and `stop()` on shutdown.
 #[async_trait::async_trait]
 pub trait Tunnel: Send + Sync {
     /// Human-readable model_provider name (e.g. "cloudflare", "tailscale")

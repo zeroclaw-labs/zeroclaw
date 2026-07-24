@@ -1,11 +1,4 @@
 //! Shell-based tool derived from a skill's `[[tools]]` section.
-//!
-//! Each `SkillTool` with `kind = "shell"` or `kind = "script"` is converted
-//! into a `SkillShellTool` that implements the `Tool` trait. The tool name is
-//! prefixed with the skill name (e.g. `my_skill__run_lint`) to avoid collisions
-//! with built-in tools. The `__` separator matches the MCP server prefix
-//! convention and keeps names valid under OpenAI-compatible function-name
-//! rules (`^[a-zA-Z0-9_-]+$`), which reject `.`.
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
@@ -46,12 +39,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
-/// Maximum provider function-name length. Anthropic's current client-tool
-/// contract is the strictest we rely on: `name` must match
-/// `^[a-zA-Z0-9_-]{1,64}$`. The server error captured in #6678 mentioned
-/// `{1,128}`, but the published provider contract is 64, so we target the
-/// stricter bound rather than baking the looser observed string into the
-/// runtime.
 const MAX_TOOL_NAME_LEN: usize = 64;
 
 fn is_name_char(c: char) -> bool {
@@ -71,34 +58,10 @@ fn short_hash(s: &str) -> String {
     format!("{h:016x}")
 }
 
-/// Compose a skill tool's provider-visible name (`skill__tool`) and route it
-/// through the single [`sanitize_tool_name`] rule. Every registration path
-/// (shell, script, builtin, HTTP) and the skills prompt must call this so the
-/// advertised tool spec and the name the model is told to invoke stay
-/// identical. Do not re-derive the `{skill}__{tool}` string anywhere else.
-///
-/// This guarantees provider-*validity*, not global *uniqueness*: the hash
-/// suffix only reduces accidental collisions, so registration must still treat
-/// two skills' composed names as potentially equal and resolve duplicates
-/// itself rather than assuming this function makes them distinct.
 pub(crate) fn composed_tool_name(skill_name: &str, tool_name: &str) -> String {
     sanitize_tool_name(&format!("{skill_name}__{tool_name}"))
 }
 
-/// Sanitize a composed skill tool name so it satisfies provider function-name
-/// rules (`^[a-zA-Z0-9_-]{1,64}$`). The `__` separator is already safe, but a
-/// skill or tool name can itself contain illegal characters: dots, spaces, or
-/// colons (plugin-namespaced skills such as `pr-review-toolkit:code-reviewer`),
-/// or non-ASCII. Anthropic rejects non-conforming names outright (issue #6678).
-///
-/// Names that are already valid and within length are returned unchanged. Any
-/// name that must be altered (illegal characters or over-length) gets every
-/// disallowed character mapped to `_` and a short stable hash of the original
-/// composed name appended within the 64-char budget. The hash disambiguates
-/// common collisions: distinct inputs that would otherwise collapse to the same
-/// string, such as `a.b__run` vs `a:b__run`, or two tools under one skill name
-/// longer than 64 chars whose suffix would be truncated away, stay distinct. It
-/// is a strong reducer of accidental collisions, not a guarantee of injectivity.
 fn sanitize_tool_name(raw: &str) -> String {
     let already_valid =
         !raw.is_empty() && raw.len() <= MAX_TOOL_NAME_LEN && raw.chars().all(is_name_char);
@@ -147,7 +110,6 @@ pub struct SkillShellTool {
 
 impl SkillShellTool {
     /// Create a new skill shell tool.
-    ///
     /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
     pub fn new(
@@ -228,12 +190,6 @@ impl Tool for SkillShellTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
-
-        // Rate limiting is applied by the RateLimitedTool wrapper at
-        // registration time (see zeroclaw-runtime::tools::mod). The
-        // PathGuardedTool wrapper cannot inspect the substituted command
-        // built by substitute_args, so the forbidden_path_argument check
-        // below remains tool-local.
 
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
@@ -337,21 +293,6 @@ impl Tool for SkillShellTool {
 
 // ─── Builtin / MCP delegation tool ───────────────────────────────────────────
 
-/// A skill tool that delegates execution to another tool resolved from the
-/// resolution registry — either a built-in (`kind = "builtin"`) or an MCP tool
-/// (`kind = "mcp"`). This is the skill-scoped tool elevation mechanism: a
-/// policy blocking `shell` by name (or deferred MCP tools hidden from the
-/// model) does not block `my_skill__use_shell`, because the wrapper is
-/// registered under the prefixed name `{skill}__{tool}` and delegates to the
-/// resolved target.
-///
-/// `locked_args` are arguments fixed by the manifest. They are applied **on top
-/// of** the caller-supplied args (the caller cannot override them) and are
-/// stripped from the advertised parameter schema, so the model can neither see
-/// nor change them. This is what scopes a delegated tool — e.g.
-/// `target = "composio"` + `locked_args = { action_name = "TEXT_TO_PDF" }`
-/// exposes exactly one action, and `target = "images__generate"` exposes a
-/// single MCP capability.
 pub struct SkillBuiltinTool {
     tool_name: String,
     tool_description: String,
@@ -362,12 +303,6 @@ pub struct SkillBuiltinTool {
 }
 
 impl SkillBuiltinTool {
-    /// Create a new skill elevation tool delegating to `target_tool`.
-    ///
-    /// `target_tool` is the resolved built-in or MCP tool (looked up from the
-    /// resolution registry at registration time). `locked_args` are fixed by
-    /// the manifest: applied over caller args (non-overridable) and hidden from
-    /// the advertised schema.
     pub fn new(
         skill_name: &str,
         tool: &crate::skills::SkillTool,
@@ -539,7 +474,7 @@ mod tests {
     #[test]
     fn skill_tool_name_sanitized_for_provider_regex() {
         // Plugin-namespaced skill names (colons), dotted names, spaces, and
-        // non-ASCII must all yield a provider-valid function name (#6678).
+        // non-ASCII must all yield a provider-valid function name
         for (skill, tool_name) in [
             ("pr-review-toolkit:code-reviewer", "run.lint"),
             ("my skill", "do thing"),
@@ -577,7 +512,7 @@ mod tests {
     fn skill_tool_name_truncated_to_64_and_stays_distinct() {
         // A raw composed name over 64 chars must be sanitized to <= 64 while
         // two distinct tools under the same long skill name stay distinct, i.e.
-        // truncation must not collapse them (#6678). Anthropic's contract is
+        // truncation must not collapse them Anthropic's contract is
         // `^[a-zA-Z0-9_-]{1,64}$`, so 64 is the bound, not 128.
         let long = "a".repeat(200);
         let a = shell_tool_name(&long, "alpha");
@@ -1115,7 +1050,7 @@ mod tests {
 
     #[test]
     fn elevation_wrapper_survives_policy_filter_that_blocks_raw_target() {
-        // The trust-boundary contract (#6915): a SecurityPolicy blocking the
+        // The trust-boundary contract a SecurityPolicy blocking the
         // raw tool by name must keep it out of the model-visible registry,
         // while the skill's scoped wrapper — registered under the prefixed
         // name — remains the only callable path to that capability.

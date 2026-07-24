@@ -1,9 +1,4 @@
 //! SQLite-backed [`GoalTaskRegistry`] implementation.
-//!
-//! The concrete store remains [`SqliteTaskStore`](super::SqliteTaskStore) so
-//! goal creation can share one transaction with the canonical task row. This
-//! module only separates the goal-specific repository surface from the generic
-//! task registry implementation.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -19,18 +14,6 @@ use super::{
     log_unreadable_task_row, row_to_record, update_task_status_record,
 };
 
-/// Apply goal-extension schema migrations.
-///
-/// The root SQLite store owns the connection and generic `tasks` table. Goal
-/// extension tables, indexes, and continuation payload storage stay here with
-/// the `GoalTaskRegistry` implementation so the generic task store does not
-/// need to understand goal row serialization.
-///
-/// The database has one shared `PRAGMA user_version`, so this function still
-/// advances the control-plane schema version for goal-owned migrations. If a
-/// future generic-task migration lands, keep the version sequence coordinated
-/// from `task_store_sqlite::migrate_schema`; do not introduce a second version
-/// counter for goal tables.
 pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
     if version < 1 {
         conn.execute_batch(

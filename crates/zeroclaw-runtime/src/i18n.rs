@@ -1,5 +1,4 @@
 //! Fluent-based i18n for tool descriptions.
-//!
 //! English descriptions are embedded via `include_str!` at compile time.
 //! Non-English locales are loaded from disk and override English per-key.
 
@@ -104,10 +103,6 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
-/// Resolve a CLI string against the embedded English catalogue only, ignoring
-/// the process locale and the filesystem. Used by tests that assert the
-/// canonical English wording without depending on the host's configured
-/// locale (the global `LOCALE` OnceLock would otherwise make them flaky).
 #[cfg(test)]
 pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
     let english = CliFtlSources {
@@ -292,12 +287,6 @@ fn locale_from_system() -> Option<String> {
     pick_locale(sys_locale::get_locales())
 }
 
-/// Pure: take the first candidate that isn't a POSIX "no locale" sentinel.
-/// Split out from `locale_from_system` so it is testable without environment
-/// access. Walks every candidate rather than just the first: `LC_ALL=C`
-/// (common in CI/containers to force deterministic tool output) would
-/// otherwise shadow a perfectly usable `LANG=zh_CN.UTF-8` and we'd give up
-/// instead of trying it.
 fn pick_locale(mut candidates: impl Iterator<Item = String>) -> Option<String> {
     candidates.find_map(|raw| normalized_env_locale(&raw))
 }
@@ -318,12 +307,6 @@ fn normalized_env_locale(raw: &str) -> Option<String> {
 }
 
 fn read_config_table() -> Option<toml::Table> {
-    // An explicit config dir is authoritative: when set, locale detection and
-    // FTL loading resolve only against it and never fall back to the home
-    // config. This keeps the lookup hermetic — tests (and sandboxed runs) point
-    // it at a known dir without the host's real ~/.zeroclaw/config.toml leaking
-    // in. Without this, locale detection reads the developer's own config and
-    // is non-deterministic across machines.
     if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
@@ -627,6 +610,23 @@ mod tests {
                 "channel-runtime-model-switched",
                 &[("model", "gpt-test"), ("provider", "openai.default")][..],
                 ["gpt-test", "openai.default"].as_slice(),
+            ),
+            (
+                "channel-runtime-agent-scope-rejected",
+                &[
+                    ("sender", "zeroclaw_user"),
+                    ("agent", "agent-alpha"),
+                    ("model", "gpt-test"),
+                ][..],
+                [
+                    "zeroclaw_user",
+                    "agent-alpha",
+                    "/model --agent",
+                    "/model --user gpt-test",
+                    "admin_for_agent_scope",
+                    "true",
+                ]
+                .as_slice(),
             ),
             ("channel-runtime-request-timeout", &[][..], [].as_slice()),
             (
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn daemon_gateway_bind_cli_strings_format_from_fluent() {
-        // The daemon gateway-bind pre-flight messages (#7895) are routed through
+        // The daemon gateway-bind pre-flight messagesare routed through
         // Fluent from src/main.rs via `ta(...)`. Guard the key names and their
         // `{$host}`/`{$port}` placeholders so a typo can't silently degrade the
         // operator-facing fail-fast message back to a `{cli-...}` stub.

@@ -8,17 +8,6 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::FileUploadBundleConfig;
 
-/// Read at most `limit` bytes from a response body via streaming,
-/// then lossily convert to UTF-8. This avoids loading an unbounded
-/// response into memory.
-///
-/// Returns the captured (lossy-UTF-8) body together with a
-/// `was_truncated` flag that is `true` when reading stopped because the
-/// byte limit was reached while more body remained. Callers must rely on
-/// this flag rather than the captured length: a clean ASCII or otherwise
-/// valid-UTF-8 body that overruns the limit is clipped to exactly `limit`
-/// bytes, so its length alone is indistinguishable from a complete
-/// response that happens to be exactly `limit` bytes long.
 async fn read_response_bounded(response: reqwest::Response, limit: usize) -> (String, bool) {
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
@@ -522,14 +511,6 @@ impl Tool for FileUploadBundleTool {
         };
 
         let status = response.status();
-        // Bounded streaming read — never buffers more than the limit.
-        // `read_response_bounded` returns lossy UTF-8 so the result is
-        // always a valid String, and `truncate_utf8` never splits a
-        // multi-byte char. We gate the truncation marker on the reader's
-        // `was_truncated` flag rather than the captured length, because a
-        // clean ASCII/valid-UTF-8 body that overruns the limit is clipped
-        // to exactly `body_limit` bytes and would otherwise be reported as
-        // complete.
         let body_limit = self.config.max_response_body_bytes;
         let (raw_body, was_truncated) = read_response_bounded(response, body_limit).await;
         let truncated = if was_truncated {
@@ -1054,16 +1035,6 @@ mod tests {
         // without allocating megabytes.
         let body_limit: usize = 64;
 
-        // Build a response body that exceeds the limit and places a
-        // multi-byte UTF-8 character ("é" = 2 bytes, 0xC3 0xA9) right
-        // at the cut point so read_response_bounded slices mid-character.
-        //
-        // Layout: 63 bytes of ASCII padding + "é" (2 bytes) + more ASCII.
-        // read_response_bounded reads the first 64 raw bytes, which cuts
-        // the "é" after its first byte. from_utf8_lossy replaces the
-        // dangling 0xC3 with U+FFFD (3 bytes), making the String 66
-        // bytes — exceeding the 64-byte limit and triggering the
-        // truncate_utf8 + "[truncated]" path.
         let padding = "A".repeat(63);
         let oversized_body = format!("{padding}é{}", "B".repeat(200));
         assert!(
@@ -1107,11 +1078,6 @@ mod tests {
             result.output
         );
 
-        // The output (minus the "Uploaded bundle…" prefix and the
-        // "... [truncated]" suffix) must be valid UTF-8 and must not
-        // exceed the body limit.  We don't assert the exact byte count
-        // because the prefix is implementation detail, but we verify the
-        // response portion is bounded.
         let response_part = result
             .output
             .split("Response: ")
@@ -1132,13 +1098,6 @@ mod tests {
 
     #[tokio::test]
     async fn execute_marks_over_limit_ascii_response_as_truncated() {
-        // Regression: a clean ASCII (valid-UTF-8) response that overruns
-        // the limit is clipped by read_response_bounded to exactly
-        // `body_limit` bytes. The earlier `raw_body.len() > body_limit`
-        // gate was then false, so the tool returned a clipped body with no
-        // "[truncated]" marker — hiding from the agent that the receiver
-        // body was cut. The reader's `was_truncated` flag must drive the
-        // marker instead.
         let body_limit: usize = 64;
 
         // Pure ASCII, no multi-byte char near the cut point, so

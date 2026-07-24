@@ -1,11 +1,6 @@
 //! Anyhow error-chain rendering helper.
-//!
-//! Centralizes the `format!("{err:#}")` invocation so future evolution
-//! (e.g. plugging in `LeakDetector` to redact secrets from error messages)
-//! happens in one place.
 
 /// Render an `anyhow::Error` with its full `.context()` chain.
-///
 /// Uses the alternate Display formatter (`{:#}`) which walks the chain.
 /// Plain `{}` only prints the leaf message, losing every context layer.
 #[must_use]

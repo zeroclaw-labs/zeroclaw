@@ -1,28 +1,4 @@
 //! Comprehensive agent-loop test suite.
-//!
-//! Tests exercise the full `Agent.turn()` cycle with mock model_providers and tools,
-//! covering every edge case an agentic tool loop must handle:
-//!
-//!   1. Simple text response (no tools)
-//!   2. Single tool call → final response
-//!   3. Multi-step tool chain (tool A → tool B → response)
-//!   4. Max-iteration bailout
-//!   5. Unknown tool name recovery
-//!   6. Tool execution failure recovery
-//!   7. Parallel tool dispatch
-//!   8. History trimming during long conversations
-//!   9. Memory auto-save round-trip
-//!  10. Native vs XML dispatcher integration
-//!  11. Empty / whitespace-only LLM responses
-//!  12. Mixed text + tool call responses
-//!  13. Multi-tool batch in a single response
-//!  14. System prompt generation & tool instructions
-//!  15. Context enrichment from memory loader
-//!  16. ConversationMessage serialization round-trip
-//!  17. Tool call with stringified JSON arguments
-//!  18. Conversation history fidelity (tool call → tool result → assistant)
-//!  19. Builder validation (missing required fields)
-//!  20. Idempotent system prompt insertion
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
@@ -758,14 +734,37 @@ async fn history_trims_after_max_messages() {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
-    // System prompt (1) + trimmed messages
-    // Should not exceed max_history + 1 (system prompt)
+    let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+    let retained_messages: Vec<_> = agent
+        .history()
+        .iter()
+        .filter(|message| match message {
+            ConversationMessage::Chat(chat) => chat.role != "system" && chat.content != breadcrumb,
+            _ => true,
+        })
+        .collect();
+
     assert!(
-        agent.history().len() <= max_history + 1,
-        "History length {} exceeds max {} + 1 (system)",
-        agent.history().len(),
+        retained_messages.len() <= max_history,
+        "Retained history length {} exceeds max {}",
+        retained_messages.len(),
         max_history,
     );
+    let mut turns = retained_messages.chunks_exact(2);
+    assert!(
+        turns.remainder().is_empty(),
+        "history must retain whole turns"
+    );
+    assert!(turns.all(|turn| matches!(
+        turn,
+        [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
+            if user.role == "user" && assistant.role == "assistant"
+    )));
+    assert!(agent.history().iter().any(|message| matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "user" && chat.content.ends_with("msg 10")
+    )));
 
     // System prompt should always be preserved
     let first = &agent.history()[0];
@@ -1079,12 +1078,6 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 
     let _ = agent.turn("test").await.unwrap();
 
-    // Expected history entries:
-    //   0: system prompt
-    //   1: user message "test"
-    //   2: AssistantToolCalls
-    //   3: ToolResults
-    //   4: assistant "final answer"
     let history = agent.history();
     assert!(
         history.len() >= 5,

@@ -21,14 +21,6 @@ impl Default for TodoWriteTool {
     }
 }
 
-/// Parse and normalize the `todos` argument array into `PlanEntry`
-/// values. Shared by the tool's `execute` and by the tool-execution
-/// layer's `TurnEvent::Plan` emission so the shape is validated once.
-///
-/// Rules: `content` required; `status` required and must be one of
-/// `pending`/`in_progress`/`completed`; unknown `priority` coerces to
-/// `medium`; `activeForm` optional. An empty `todos` array is a valid
-/// clear.
 pub fn parse_entries(args: &Value) -> anyhow::Result<Vec<PlanEntry>> {
     let todos = args
         .get("todos")

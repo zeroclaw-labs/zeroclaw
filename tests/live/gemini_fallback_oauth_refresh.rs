@@ -1,19 +1,4 @@
 //! E2E test for Gemini fallback with OAuth token refresh.
-//!
-//! This test validates that when:
-//! 1. Primary model_provider (OpenAI Codex) fails
-//! 2. Fallback to Gemini is triggered
-//! 3. Gemini OAuth tokens are expired (we manually expire them)
-//!
-//! Then:
-//! - Gemini model_provider's warmup() automatically refreshes the tokens
-//! - The fallback request succeeds
-//!
-//! Requires:
-//! - Live Gemini OAuth profile in `~/.zeroclaw/auth-profiles.json` with refresh_token
-//! - GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET env vars
-//!
-//! Run manually: `cargo test gemini_fallback_oauth_refresh -- --ignored --nocapture`
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -27,14 +12,6 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// Tests that Gemini warmup() refreshes expired OAuth tokens.
-///
-/// This test:
-/// 1. Backs up real auth-profiles.json
-/// 2. Modifies it to set Gemini token as expired
-/// 3. Creates a Gemini model_provider and calls warmup()
-/// 4. Verifies token was refreshed
-/// 5. Restores original auth-profiles.json
 #[tokio::test]
 #[ignore = "requires live Gemini OAuth credentials with refresh_token"]
 async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
@@ -221,8 +198,6 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
     Ok(())
 }
 
-/// Simpler test: just verify warmup() doesn't fail with valid credentials.
-/// This test doesn't modify auth-profiles.json.
 #[tokio::test]
 #[ignore = "requires live Gemini OAuth credentials"]
 async fn gemini_warmup_with_valid_credentials() -> Result<()> {

@@ -2,19 +2,6 @@
 //! registry (`web/src/contexts/themes.json`) — the single source of truth
 //! shared with the React dashboard and the mdBook docs. The TUI mirrors it so
 //! all three surfaces expose the same named themes without a second hardcoded
-//! list.
-//!
-//! The web registry carries ~25 CSS custom properties per theme; the TUI needs
-//! nine `Theme` roles. The mapping below is the documented bridge. Themes may
-//! optionally provide a `tui` object to preserve terminal-specific role choices
-//! that do not map cleanly onto the web/docs CSS token set. Otherwise two roles
-//! the `--pc-*` vars do not express (`warn`, `tool`) are taken from the theme's
-//! `preview` swatch array, which every registry entry provides as
-//! `[bg, accent, accent2, accent3, fg]`.
-//!
-//! Output: `$OUT_DIR/theme_presets.rs`, `include!`d by `src/theme.rs`. Never
-//! committed — regenerated on every build so the registry cannot drift from the
-//! compiled table.
 
 use std::path::Path;
 

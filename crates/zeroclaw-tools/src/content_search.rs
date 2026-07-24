@@ -13,11 +13,6 @@ const MAX_RESULTS: usize = 1000;
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MB
 const TIMEOUT_SECS: u64 = 30;
 
-/// Search file contents by regex pattern within the workspace.
-///
-/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E` or an
-/// internal scanner when external search tools are unavailable.
-/// All searches are confined to the workspace directory by security policy.
 pub struct ContentSearchTool {
     security: Arc<SecurityPolicy>,
     backend: SearchBackend,
@@ -851,12 +846,6 @@ fn format_grep_output(
     format_line_output(raw, workspace_canon, output_mode, max_results)
 }
 
-/// Shared formatting for both rg and grep line-based outputs.
-///
-/// Both tools produce similar line-based output in our configuration:
-/// - content mode: `path:line:content` or `path-line-content` (context lines)
-/// - files_with_matches mode: `path`
-/// - count mode: `path:count`
 fn format_line_output(
     raw: &str,
     workspace_canon: &std::path::Path,
@@ -1001,11 +990,6 @@ fn relativize_path(line: &str, workspace_prefix: &str) -> String {
     line.to_string()
 }
 
-/// Parse content output line and determine whether it is a real match line.
-///
-/// Supported formats:
-/// - Match line: `path:line:content`
-/// - Context line: `path-line-content`
 fn parse_content_line(line: &str) -> Option<(&str, bool)> {
     static MATCH_RE: OnceLock<regex::Regex> = OnceLock::new();
     static CONTEXT_RE: OnceLock<regex::Regex> = OnceLock::new();
