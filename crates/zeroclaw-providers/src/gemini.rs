@@ -528,98 +528,156 @@ async fn refresh_gemini_cli_token_async(
     })?
 }
 
-impl GeminiModelProvider {
-    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
-        let oauth_cred_paths = Self::discover_oauth_cred_paths();
-        let resolved_auth = api_key
-            .and_then(Self::normalize_non_empty)
-            .map(GeminiAuth::ExplicitKey)
-            .or_else(|| {
-                Self::try_load_gemini_cli_token(oauth_cred_paths.first())
-                    .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))))
-            });
+/// Typed builder for [`GeminiModelProvider`].
+///
+/// Only `alias` is required; every credential input is optional and layered
+/// at [`Self::build`] time in this order:
+///   1. Explicit API key from [`Self::api_key`]
+///   2. Managed OAuth via [`Self::managed_auth`] (when wired and the
+///      profile exists)
+///   3. CLI OAuth tokens from `~/.gemini/oauth_creds.json`
+#[must_use]
+pub struct GeminiBuilder {
+    alias: String,
+    api_key: Option<String>,
+    auth_service: Option<AuthService>,
+    profile_override: Option<String>,
+    oauth_project_seed: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_client_secret: Option<String>,
+}
 
-        Self {
-            alias: alias.to_string(),
-            auth: resolved_auth,
-            oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
-            oauth_project_seed: None,
-            oauth_cred_paths,
-            oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
-            auth_service: None,
-            auth_profile_override: None,
-            oauth_client_id: None,
-            oauth_client_secret: None,
-        }
+impl GeminiBuilder {
+    /// Explicit API key (from `[providers.models.gemini.<alias>] api_key`).
+    /// When set (and non-empty after trimming), takes precedence over every
+    /// OAuth path.
+    pub fn api_key(mut self, key: Option<&str>) -> Self {
+        self.api_key = key.map(str::to_string);
+        self
     }
-    pub fn new_with_auth(
-        alias: &str,
-        api_key: Option<&str>,
+
+    /// Wire up managed OAuth via the shared [`AuthService`], with an
+    /// optional profile override. When set and no explicit API key is
+    /// provided, the builder probes the service at build time; if a
+    /// managed profile exists, the resulting provider uses managed OAuth
+    /// instead of falling through to the CLI creds.
+    pub fn managed_auth(
+        mut self,
         auth_service: AuthService,
         profile_override: Option<String>,
-        oauth_project_seed: Option<String>,
-        oauth_client_id: Option<String>,
-        oauth_client_secret: Option<String>,
     ) -> Self {
-        let oauth_cred_paths = Self::discover_oauth_cred_paths();
+        self.auth_service = Some(auth_service);
+        self.profile_override = profile_override;
+        self
+    }
 
-        // First check API keys
-        let resolved_auth = api_key
-            .and_then(Self::normalize_non_empty)
+    /// Seed value for the OAuth project resolution cache.
+    pub fn oauth_project_seed(mut self, seed: Option<String>) -> Self {
+        self.oauth_project_seed = seed;
+        self
+    }
+
+    /// Override the OAuth client credentials (defaults to the Gemini CLI
+    /// public client when unset).
+    pub fn oauth_client(
+        mut self,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    ) -> Self {
+        self.oauth_client_id = client_id;
+        self.oauth_client_secret = client_secret;
+        self
+    }
+
+    /// Resolve the credential layers and finalize the provider.
+    pub fn build(self) -> GeminiModelProvider {
+        let oauth_cred_paths = GeminiModelProvider::discover_oauth_cred_paths();
+
+        // Layer 1 — explicit API key.
+        let explicit_key = self
+            .api_key
+            .as_deref()
+            .and_then(GeminiModelProvider::normalize_non_empty)
             .map(GeminiAuth::ExplicitKey);
 
-        // If no API key, we'll use managed OAuth (checked at runtime)
-        // or fall back to CLI OAuth
-        let (auth, use_managed) = if resolved_auth.is_some() {
-            (resolved_auth, false)
-        } else {
-            // Check if we have a managed profile - this is a blocking check
-            // but we need to know at construction time
-            let has_managed = std::thread::scope(|s| {
-                s.spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .ok()?;
-                    rt.block_on(async {
-                        auth_service
-                            .get_gemini_profile(profile_override.as_deref())
-                            .await
-                            .ok()
-                            .flatten()
-                    })
-                })
-                .join()
-                .ok()
-                .flatten()
-                .is_some()
-            });
-
-            if has_managed {
-                (Some(GeminiAuth::ManagedOAuth), true)
-            } else {
-                // Fall back to CLI OAuth
-                let cli_auth = Self::try_load_gemini_cli_token(oauth_cred_paths.first())
-                    .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))));
-                (cli_auth, false)
-            }
+        // Layer 3 — CLI OAuth fallback. Used both when no managed service is
+        // wired at all, and when a managed service was wired but no profile
+        // was found on disk.
+        let load_cli_oauth = || {
+            GeminiModelProvider::try_load_gemini_cli_token(oauth_cred_paths.first())
+                .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))))
         };
 
-        Self {
-            alias: alias.to_string(),
+        // Layer 2 — managed OAuth (only probed when an AuthService is wired
+        // and no explicit key beat it).
+        let (auth, use_managed) = match (explicit_key, self.auth_service.as_ref()) {
+            (Some(a), _) => (Some(a), false),
+            (None, Some(service)) => {
+                let profile = self.profile_override.clone();
+                let has_managed = std::thread::scope(|s| {
+                    let service = service.clone();
+                    s.spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .ok()?;
+                        rt.block_on(async {
+                            service
+                                .get_gemini_profile(profile.as_deref())
+                                .await
+                                .ok()
+                                .flatten()
+                        })
+                    })
+                    .join()
+                    .ok()
+                    .flatten()
+                    .is_some()
+                });
+                if has_managed {
+                    (Some(GeminiAuth::ManagedOAuth), true)
+                } else {
+                    (load_cli_oauth(), false)
+                }
+            }
+            (None, None) => (load_cli_oauth(), false),
+        };
+
+        GeminiModelProvider {
+            alias: self.alias,
             auth,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
-            oauth_project_seed,
+            oauth_project_seed: self.oauth_project_seed,
             oauth_cred_paths,
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
-            auth_service: if use_managed {
-                Some(auth_service)
-            } else {
-                None
-            },
-            auth_profile_override: profile_override,
-            oauth_client_id,
-            oauth_client_secret,
+            auth_service: if use_managed { self.auth_service } else { None },
+            auth_profile_override: self.profile_override,
+            oauth_client_id: self.oauth_client_id,
+            oauth_client_secret: self.oauth_client_secret,
+        }
+    }
+}
+
+impl GeminiModelProvider {
+    /// Entry point for constructing a Gemini provider. Only `alias` is
+    /// required; layer optional credential inputs onto the returned
+    /// [`GeminiBuilder`].
+    ///
+    /// Authentication priority (evaluated at build time):
+    /// 1. Explicit API key ([`GeminiBuilder::api_key`], from
+    ///    `[providers.models.gemini.<alias>] api_key`)
+    /// 2. Managed OAuth via [`GeminiBuilder::managed_auth`], when wired
+    ///    and a profile exists
+    /// 3. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
+    pub fn builder(alias: &str) -> GeminiBuilder {
+        GeminiBuilder {
+            alias: alias.to_string(),
+            api_key: None,
+            auth_service: None,
+            profile_override: None,
+            oauth_project_seed: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
         }
     }
 
@@ -1700,14 +1758,16 @@ mod tests {
 
     #[test]
     fn provider_creates_without_key() {
-        let model_provider = GeminiModelProvider::new("test", None);
+        let model_provider = GeminiModelProvider::builder("test").build();
         // May pick up env vars; just verify it doesn't panic
         let _ = model_provider.auth_source();
     }
 
     #[test]
     fn provider_creates_with_key() {
-        let model_provider = GeminiModelProvider::new("test", Some("test-api-key"));
+        let model_provider = GeminiModelProvider::builder("test")
+            .api_key(Some("test-api-key"))
+            .build();
         assert!(matches!(
             model_provider.auth,
             Some(GeminiAuth::ExplicitKey(ref key)) if key == "test-api-key"
@@ -1716,7 +1776,9 @@ mod tests {
 
     #[test]
     fn provider_rejects_empty_key() {
-        let model_provider = GeminiModelProvider::new("test", Some(""));
+        let model_provider = GeminiModelProvider::builder("test")
+            .api_key(Some(""))
+            .build();
         assert!(!matches!(
             model_provider.auth,
             Some(GeminiAuth::ExplicitKey(_))

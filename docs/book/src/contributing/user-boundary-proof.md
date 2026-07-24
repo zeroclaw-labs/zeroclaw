@@ -1,0 +1,35 @@
+# User-Boundary Proof
+
+A user-visible behavior claim is proved by reaching the outermost production boundary affected by the claim and checking the result a user observes. Unit, component, and compile checks remain useful, but they do not by themselves prove a command, terminal, browser, channel, daemon, package, or external-service path.
+
+Use the smallest credible proof that reaches the changed boundary. A focused automated test is preferable when it exercises that boundary reliably. Add manual or environment-specific evidence only when the remaining uncertainty depends on a real terminal, browser, operating system, package manager, vendor service, credential exchange, reconnect, or side effect. Reserve a live test for the full-stack, real-external-service level defined in [Testing](./testing.md).
+
+## Choose the boundary
+
+1. State the user action and observable result claimed by the PR.
+2. Name the outermost production boundary affected by the claim: process, terminal, local or remote transport, HTTP or browser, channel API, provider API, approval front door, execution wrapper, lifecycle owner, installer, or package.
+3. Identify existing automated evidence that reaches that boundary on the current head.
+4. Add only the evidence needed for the uncovered part of the claim.
+
+Fresh required CI counts when it reaches the named boundary. Follow [CI & Actions](../maintainers/ci-and-actions.md) for the current required coverage and the gaps that justify additional evidence.
+
+## Proof matrix
+
+| Surface | User path and boundary | Smallest credible proof | Add manual or environment-specific proof when |
+|---|---|---|---|
+| CLI, including CLI quickstart | A user invokes the shipped command, follows flags or CLI prompts, and observes output, exit status, or saved state at the process and terminal boundary. TUI quickstart follows the zerocode row; web quickstart follows the gateway and dashboard row. | A binary-spawning automated test or script launches the real command with an isolated home or config directory and asserts the user-visible result; [Testing](./testing.md) determines the suite level. | The claim depends on interactive prompts, terminal rendering, shell or PATH behavior, platform permissions, or upgrade behavior from existing user state. |
+| zerocode and daemon transport | zerocode connects through the supported local Unix socket or Windows pipe, or through remote WSS, sends a real request, and renders or persists the returned state. | An integration or system test uses the real client, server, and claimed transport while mocking only external services. | The claim depends on keyboard input, terminal layout, socket paths or permissions, TLS or authentication, reconnect behavior, or daemon process lifecycle. |
+| Gateway, API, and dashboard | A client crosses the HTTP, WebSocket, or SSE boundary and a browser or API consumer observes the response, stream, auth result, or state change. | A server-level test reaches the real route and middleware stack; browser claims also include a UI test against that route contract. | The claim depends on browser layout or interaction, cookie or browser auth behavior, reconnect timing, streaming presentation, or a deployed-network constraint. |
+| Channels | A real channel-shaped inbound event passes through adapter parsing and runtime dispatch, then produces the intended outbound reply, thread, media, reaction, or status. | Adapter tests cover vendor payloads and a system test covers the inbound-to-outbound path with the vendor network mocked. | The uncertainty is vendor-side threading, mention rules, media limits, webhook verification, delivery behavior, or another contract unavailable in fixtures. Use a dedicated test account. |
+| Providers and model routing | User configuration and a request select the intended provider and model, then expose the expected stream, response, fallback, or error. | An integration or system test uses the real config and routing path against a mock provider endpoint with protocol-accurate responses. | The uncertainty is provider authentication, wire behavior, streaming quirks, rate limits, model availability, or another external contract not represented by the mock. |
+| Tool approval and execution | An operator receives an approval request through the changed CLI, channel, ACP, or web front door; the decision reaches common policy; an approved call executes through the production dispatcher or wrapper and exposes the expected result, receipt, observer event, denial, or side effect. | Test the changed approval front door through the common approval manager, then drive the production dispatch path with a harmless test tool and controlled filesystem or process fixtures. | The claim depends on terminal, channel, or browser presentation, operating-system permissions, a real external program, cancellation signals, hardware, network access, or an irreversible side effect. |
+| Background work | A cron job, SOP run, delegated task, or runtime-spawned subagent starts through its actual lifecycle owner and exposes only the status, persistence, cancellation, retry, or restart behavior that path supports. | Drive the changed path through its documented owner and status surface with a deterministic clock or controlled worker; use its configured store only when the claim includes persistence. | The claim depends on wall-clock scheduling, an actual service restart, process supervision, or an external scheduler or worker environment. |
+| Installers, packages, and release artifacts | A user runs the changed installer mode or installs the produced package or archive in a clean environment, then starts the installed binary and observes the expected version or capability. | Exercise the changed entrypoint: run the installer script through the affected mode, or extract or install the built artifact and run a minimal post-install command in a clean target environment. | The target is absent from required CI or the claim depends on package-manager permissions, shell integration, signing, notarization, service setup, or platform-specific upgrade behavior. |
+
+## Report evidence
+
+Validation evidence should name the user action, environment, expected result, and observed result. Link the automated check or include the exact safe command when that helps another reviewer reproduce it. Screenshots prove visible state, not hidden behavior; logs prove only the path and result they record.
+
+When a change cannot affect a user boundary and makes no user-visible claim, state that additional user-boundary proof is not applicable. A behavior-preserving refactor in a user-facing path should rely on existing boundary regression coverage; it does not require new manual or environment-specific evidence unless that coverage has a named gap.
+
+Use synthetic data and dedicated test accounts for live proof. Redact credentials, tokens, personal data, and private endpoints. Do not exercise production accounts, irreversible side effects, or paid external operations without explicit authorization.

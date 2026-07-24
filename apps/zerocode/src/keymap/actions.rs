@@ -118,7 +118,10 @@ use crossterm::event::{KeyCode, KeyModifiers};
 keyactions! {
     pub enum GlobalAction ("global") {
         Quit         [Chord::ctrl('c')]                                 => "quit",
-        Help         [Chord::char('?'), Chord::key(KeyCode::F(1)), Chord::with(KeyCode::F(1), KeyModifiers::CONTROL)]      => "help",
+        Help         [
+            Chord::char('?'),
+            Chord::ctrl('g'),
+        ]                                                              => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
@@ -136,8 +139,11 @@ keyactions! {
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
-        // and queue navigation conflict (alt+up/down). See
-        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)), Chord::ctrl('k')] => "enter browse mode",
+        // and queue navigation conflict (alt+up/down).
+        BrowseEnter             [
+            Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)),
+            Chord::ctrl('k'),
+        ] => "enter browse mode",
         BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
         BrowseDown              [Chord::key(KeyCode::Down)] => "browse next",

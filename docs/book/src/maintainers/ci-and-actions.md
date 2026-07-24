@@ -15,7 +15,7 @@ Composite job with multiple matrix legs:
 - **check**: all features + no-default-features
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
+- **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh`, plus `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
@@ -82,7 +82,7 @@ Fires after a successful stable release. Posts the release notes to the communit
 
 Fires after a successful stable release. Posts an announcement tweet.
 
-Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow: run `cargo mdbook sync --provider <name>` for dedicated translation-cache PRs, new locales, and release translation passes. Routine English docs PRs may defer broad generated `.po` churn. See [Docs & Translations](./docs-and-translations.md) for details.
+Docs are built and published as part of the release pipeline rather than on every `master` push. Translation is a local-only workflow for dedicated translation-cache PRs, new locales, and release translation passes. Routine English docs PRs may defer broad generated `.po` churn. See [Docs & Translations](./docs-and-translations.md) for contributor guidance and the [Release Runbook](./release-runbook.md#refresh-and-pin-translations) for the release procedure.
 
 ## Manual and Advisory Workflows
 
@@ -102,7 +102,7 @@ Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows 
 
 ### Release Stable (`release-stable-manual.yml`)
 
-Manual trigger for the full release pipeline. Builds all targets, creates the GitHub Release, pushes the prebuilt `latest`, versioned, and `debian` Docker images to GHCR, calls the generated Docker variant matrix at the release tag, triggers the website redeploy, and invokes the distribution sub-workflows (Scoop, AUR, Homebrew, Discord, tweet). Two environment gates require maintainer approval mid-run: `github-releases` (the `publish` job) and `docker`.
+Manual trigger for the full release pipeline. Builds all targets, creates the GitHub Release, pushes the prebuilt `latest`, versioned, and `debian` Docker images to GHCR, calls the generated Docker variant matrix at the release tag, triggers the website redeploy, and invokes the distribution sub-workflows (Scoop, AUR, Discord, tweet). Homebrew Core detects new releases through its own autobump service. Two environment gates require maintainer approval mid-run: `github-releases` (the `publish` job) and `docker`.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
@@ -113,8 +113,13 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 | Workflow | What it does |
 |---|---|
 | `pub-aur.yml` | Updates the Arch User Repository `PKGBUILD` and pushes to the AUR |
-| `pub-homebrew-core.yml` | Opens a PR against `homebrew/homebrew-core` with the new version |
 | `pub-scoop.yml` | Updates the Scoop manifest for Windows |
+
+Homebrew Core's
+[official autobump service](https://docs.brew.sh/Autobump) discovers stable
+GitHub releases and opens formula bumps independently. Do not restore a
+project-owned Homebrew publisher or fork token; that duplicates Homebrew's
+authoritative automation.
 
 ## Required secrets
 
@@ -123,12 +128,29 @@ Each fires on `workflow_dispatch` with a version input. They are also invoked fr
 | `AUR_SSH_KEY` | `pub-aur.yml` |
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
-| `HOMEBREW_CORE_BOT_TOKEN`, `HOMEBREW_UPSTREAM_PR_TOKEN` | `pub-homebrew-core.yml` |
-| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml` |
+| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 
 Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. The release pipeline does not publish to crates.io, so no `CARGO_REGISTRY_TOKEN` is required.
+
+The organization currently disables deploy keys on the Scoop bucket, and the
+automatic `GITHUB_TOKEN` cannot write another repository. Keep
+`SCOOP_BUCKET_TOKEN` narrowly scoped to the bucket; do not reuse a maintainer's
+broad CLI token. The publisher checks write access with `git push --dry-run`,
+then uses the same Git transport for the real update.
+
+### AUR package ownership
+
+The project-owned package is currently
+[`zeroclawlabs`](https://aur.archlinux.org/packages/zeroclawlabs), maintained by
+`zeroclaw-bot`. The canonical-name
+[`zeroclaw`](https://aur.archlinux.org/packages/zeroclaw) package is a
+third-party package and cannot be taken over by rotating `AUR_SSH_KEY`. If that
+maintainer remains inactive, follow the
+[AUR orphan-request process](https://wiki.archlinux.org/title/AUR_submission_guidelines#Requests)
+before changing `pkgname` or the workflow clone target. After ownership
+transfers, coordinate the package rename or merge in one reviewed change.
 
 ## Build cache behavior
 
@@ -144,6 +166,7 @@ Most Rust-heavy jobs in `ci.yml` use `Swatinem/rust-cache@v2`. The `fmt`, `nix-e
 
 | Symptom | First thing to check |
 |---|---|
+| `Release Stable` dies at `startup_failure` with zero jobs after a `uses:` ref changed | Check the run summary and repository Actions policy. If GitHub reports a selected-actions rejection, compare the changed ref with the [allowlist](#allowed-actions), add only the rejected pattern, wait for settings propagation, then dispatch a fresh run. Otherwise, investigate the workflow definition or other repository policy; `startup_failure` alone does not identify the cause |
 | `CI Required Gate` red | Start with `fmt`, then `lint`, then `test`, then `build` |
 | Release `validate` failed | `Cargo.toml` version doesn't match the workflow input, or the tag already exists |
 | Release build leg failed | The specific target's job log. Android is `experimental` and runs with `continue-on-error` |
@@ -214,7 +237,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 
 - Keep `CI Required Gate` deterministic and small. Adding jobs to the gate needs a clear quality argument.
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
-- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned, the same quality gates run locally and in CI.
+- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned. Shared gates must live in `scripts/ci/`; each caller invokes the helper instead of copying its commands. For the standalone firmware protocol gate, the documented local entry point is `./dev/ci.sh firmware-protocol`.
 - Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
 - The `docs-style` gate job runs `bash scripts/ci/docs_quality_gate.sh` (markdown lint + em-dash prose check) and `bash scripts/ci/docs_links_gate.sh` (changed-line link gate). Run both scripts locally before pushing docs changes.
 

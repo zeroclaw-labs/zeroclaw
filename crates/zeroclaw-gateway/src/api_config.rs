@@ -2580,6 +2580,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
