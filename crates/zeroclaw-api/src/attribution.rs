@@ -210,6 +210,7 @@ pub enum ModelProviderKind {
     Perplexity,
     Xai,
     Cerebras,
+    Crusoe,
     Sambanova,
     Hyperbolic,
     Deepinfra,
@@ -446,6 +447,14 @@ mod tests {
             Role::Channel(ChannelKind::Telegram)
                 .attribution_field()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn crusoe_kind_serializes_snake_case() {
+        assert_eq!(
+            <&'static str>::from(ModelProviderKind::Crusoe),
+            "crusoe"
         );
     }
 }
