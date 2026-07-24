@@ -1666,8 +1666,6 @@ fn sse_bytes_to_chunks(
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
     let handle = ::zeroclaw_spawn::spawn!(async move {
-        let mut buffer = String::new();
-
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
@@ -1678,72 +1676,8 @@ fn sse_bytes_to_chunks(
             }
         }
 
-        let mut bytes_stream = response.bytes_stream();
-        // Accumulate partial UTF-8 sequences that may be split across
-        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
-        let mut utf8_buf: Vec<u8> = Vec::new();
-
-        while let Some(item) = bytes_stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    utf8_buf.extend_from_slice(&bytes);
-                    let text = match std::str::from_utf8(&utf8_buf) {
-                        Ok(s) => {
-                            let owned = s.to_string();
-                            utf8_buf.clear();
-                            owned
-                        }
-                        Err(e) => {
-                            let valid_up_to = e.valid_up_to();
-                            if valid_up_to == 0 && utf8_buf.len() < 4 {
-                                // Could still be an incomplete multi-byte char; wait for more data
-                                continue;
-                            }
-                            let valid =
-                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
-                            utf8_buf.drain(..valid_up_to);
-                            valid
-                        }
-                    };
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    buffer.push_str(&text);
-
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].to_string();
-                        buffer.drain(..=pos);
-
-                        match parse_sse_line(&line) {
-                            Ok(Some(chunk)) => {
-                                let chunk = if count_tokens {
-                                    chunk.with_token_estimate()
-                                } else {
-                                    chunk
-                                };
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    return; // Receiver dropped
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                let _ = tx.send(Err(e)).await;
-                                return;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
-                    return;
-                }
-            }
-        }
-
-        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        let reader = crate::stream_guard::sse_reader(response);
+        parse_sse_chunks_from_reader(reader, count_tokens, &tx).await;
     });
 
     let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1751,6 +1685,42 @@ fn sse_bytes_to_chunks(
         rx.recv().await.map(|chunk| (chunk, (rx, guard)))
     })
     .boxed()
+}
+
+async fn parse_sse_chunks_from_reader<R>(
+    reader: R,
+    count_tokens: bool,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamChunk>>,
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut lines = reader.lines();
+
+    loop {
+        let line = crate::stream_guard::next_line_or_break!(lines, tx);
+
+        match parse_sse_line(&line) {
+            Ok(Some(chunk)) => {
+                let chunk = if count_tokens {
+                    chunk.with_token_estimate()
+                } else {
+                    chunk
+                };
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+
+    let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
 }
 
 /// Convert SSE byte stream to structured streaming events.
@@ -1769,12 +1739,6 @@ fn sse_bytes_to_events_for_contract(
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
     let handle = ::zeroclaw_spawn::spawn!(async move {
-        let mut buffer = String::new();
-        let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
-        let mut used_tool_call_ids = std::collections::HashSet::new();
-        let mut emitted_tool_calls = false;
-        let mut saw_completion = false;
-
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
@@ -1785,143 +1749,120 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
-        let mut bytes_stream = response.bytes_stream();
-        // Accumulate partial UTF-8 sequences split across chunk boundaries.
-        let mut utf8_buf: Vec<u8> = Vec::new();
-        while let Some(item) = bytes_stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    utf8_buf.extend_from_slice(&bytes);
-                    let text = match std::str::from_utf8(&utf8_buf) {
-                        Ok(s) => {
-                            let owned = s.to_string();
-                            utf8_buf.clear();
-                            owned
-                        }
-                        Err(e) => {
-                            let valid_up_to = e.valid_up_to();
-                            if valid_up_to == 0 && utf8_buf.len() < 4 {
-                                continue;
-                            }
-                            let valid =
-                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
-                            utf8_buf.drain(..valid_up_to);
-                            valid
-                        }
-                    };
-                    if text.is_empty() {
-                        continue;
-                    }
+        let reader = crate::stream_guard::sse_reader(response);
+        parse_sse_events_from_reader(
+            reader,
+            count_tokens,
+            targets_mistral_tool_call_contract,
+            &tx,
+        )
+        .await;
+    });
 
-                    buffer.push_str(&text);
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        rx.recv().await.map(|event| (event, (rx, guard)))
+    })
+    .boxed()
+}
 
-                    while let Some(pos) = buffer.find('\n') {
-                        let line = buffer[..pos].to_string();
-                        buffer.drain(..=pos);
+async fn parse_sse_events_from_reader<R>(
+    reader: R,
+    count_tokens: bool,
+    targets_mistral_tool_call_contract: bool,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
 
-                        // Custom proxy events for pre-executed tool calls
-                        // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)
-                        if let Some(event) = parse_proxy_tool_event(&line) {
-                            if tx.send(Ok(event)).await.is_err() {
-                                return;
-                            }
-                            continue;
-                        }
+    let mut lines = reader.lines();
+    let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
+    let mut used_tool_call_ids = std::collections::HashSet::new();
+    let mut emitted_tool_calls = false;
+    let mut saw_completion = false;
 
-                        let chunk = match parse_sse_chunk(&line) {
-                            Ok(Some(chunk)) => chunk,
-                            Ok(None) => {
-                                if line.trim().strip_prefix("data:").map(str::trim)
-                                    == Some("[DONE]")
-                                {
-                                    saw_completion = true;
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(e)).await;
-                                return;
-                            }
-                        };
+    loop {
+        let line = crate::stream_guard::next_line_or_break!(lines, tx);
 
-                        let mut should_emit_tool_calls = false;
-                        for choice in &chunk.choices {
-                            if choice.finish_reason.is_some() {
-                                saw_completion = true;
-                            }
-                            if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
-                                let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
-                                if tx
-                                    .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            if let Some(text_delta) = extract_sse_text_delta(choice) {
-                                let mut text_chunk = StreamChunk::delta(text_delta);
-                                if count_tokens {
-                                    text_chunk = text_chunk.with_token_estimate();
-                                }
-                                if tx
-                                    .send(Ok(StreamEvent::TextDelta(text_chunk)))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
+        // Custom proxy events for pre-executed tool calls
+        // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)
+        if let Some(event) = parse_proxy_tool_event(&line) {
+            if tx.send(Ok(event)).await.is_err() {
+                return;
+            }
+            continue;
+        }
 
-                            if let Some(deltas) = choice.delta.tool_calls.as_ref() {
-                                for delta in deltas {
-                                    let index = delta.index.unwrap_or(tool_calls.len());
-                                    if index >= tool_calls.len() {
-                                        tool_calls.resize_with(index + 1, Default::default);
-                                    }
-                                    if let Some(acc) = tool_calls.get_mut(index) {
-                                        acc.apply_delta(delta);
-                                    }
-                                }
-                            }
-
-                            if choice.finish_reason.as_deref() == Some("tool_calls") {
-                                should_emit_tool_calls = true;
-                            }
-                        }
-
-                        if let Some(usage) = chunk.usage.clone() {
-                            let token_usage = usage.into_provider_usage();
-                            if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
-                                return;
-                            }
-                        }
-
-                        if should_emit_tool_calls && !emitted_tool_calls {
-                            emitted_tool_calls = true;
-                            for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
-                                tool_call.into_provider_tool_call(
-                                    targets_mistral_tool_call_contract,
-                                    &mut used_tool_call_ids,
-                                )
-                            }) {
-                                if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
+        let chunk = match parse_sse_chunk(&line) {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => {
+                if line.trim().strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+                    saw_completion = true;
                 }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
+                continue;
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        };
+
+        let mut should_emit_tool_calls = false;
+        for choice in &chunk.choices {
+            if choice.finish_reason.is_some() {
+                saw_completion = true;
+            }
+            if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
+                let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
+                if tx
+                    .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
+            if let Some(text_delta) = extract_sse_text_delta(choice) {
+                let mut text_chunk = StreamChunk::delta(text_delta);
+                if count_tokens {
+                    text_chunk = text_chunk.with_token_estimate();
+                }
+                if tx
+                    .send(Ok(StreamEvent::TextDelta(text_chunk)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            if let Some(deltas) = choice.delta.tool_calls.as_ref() {
+                for delta in deltas {
+                    let index = delta.index.unwrap_or(tool_calls.len());
+                    if index >= tool_calls.len() {
+                        tool_calls.resize_with(index + 1, Default::default);
+                    }
+                    if let Some(acc) = tool_calls.get_mut(index) {
+                        acc.apply_delta(delta);
+                    }
+                }
+            }
+
+            if choice.finish_reason.as_deref() == Some("tool_calls") {
+                should_emit_tool_calls = true;
+            }
         }
 
-        if !emitted_tool_calls {
+        if let Some(usage) = chunk.usage.clone() {
+            let token_usage = usage.into_provider_usage();
+            if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
+                return;
+            }
+        }
+
+        if should_emit_tool_calls && !emitted_tool_calls {
+            emitted_tool_calls = true;
             for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
                 tool_call.into_provider_tool_call(
                     targets_mistral_tool_call_contract,
@@ -1933,16 +1874,22 @@ fn sse_bytes_to_events_for_contract(
                 }
             }
         }
+    }
 
-        crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
-            .await;
-    });
+    if !emitted_tool_calls {
+        for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
+            tool_call.into_provider_tool_call(
+                targets_mistral_tool_call_contract,
+                &mut used_tool_call_ids,
+            )
+        }) {
+            if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
+                return;
+            }
+        }
+    }
 
-    let guard = AbortOnDrop::new(handle.abort_handle());
-    stream::unfold((rx, guard), |(mut rx, guard)| async move {
-        rx.recv().await.map(|event| (event, (rx, guard)))
-    })
-    .boxed()
+    crate::stream_guard::finish_sse_stream(tx, saw_completion, "[DONE] or finish_reason").await;
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
@@ -3717,6 +3664,177 @@ mod tests {
             events.push(ev);
         }
         events
+    }
+
+    /// A reader that yields one buffer of bytes, then parks forever: models an
+    /// SSE connection that delivers a chunk and then goes silent with the
+    /// socket still open (llama-server at 0% CPU after 200 headers). Without the
+    /// idle timeout this hangs the parser indefinitely. Matches the Anthropic
+    /// provider's `StallAfterReader`.
+    struct StallAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        drained: bool,
+    }
+
+    impl tokio::io::AsyncRead for StallAfterReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.drained {
+                // Park without self-waking; the surrounding timeout's timer
+                // provides the wake. Self-waking here would busy-spin under
+                // paused time and starve the timer.
+                return std::task::Poll::Pending;
+            }
+            let before = buf.filled().len();
+            let inner = std::pin::Pin::new(&mut self.data);
+            let res = inner.poll_read(cx, buf);
+            // Once the seed buffer is exhausted, stall on the next read rather
+            // than reporting EOF (0 bytes); EOF would end the stream cleanly and
+            // never exercise the idle timeout.
+            if buf.filled().len() == before {
+                self.drained = true;
+                return std::task::Poll::Pending;
+            }
+            res
+        }
+    }
+
+    fn stalling_reader(seed: &[u8]) -> tokio::io::BufReader<StallAfterReader> {
+        tokio::io::BufReader::new(StallAfterReader {
+            data: std::io::Cursor::new(seed.to_vec()),
+            drained: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn events_parser_reader_emits_final_on_done() {
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n".to_vec(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        parse_sse_events_from_reader(reader, false, false, &tx).await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            "expected trailing Final, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_parser_reader_surfaces_read_error() {
+        struct ErrAfterReader {
+            data: std::io::Cursor<Vec<u8>>,
+            drained: bool,
+        }
+        impl tokio::io::AsyncRead for ErrAfterReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.drained {
+                    return std::task::Poll::Ready(Err(std::io::Error::other("boom")));
+                }
+                let before = buf.filled().len();
+                let inner = std::pin::Pin::new(&mut self.data);
+                let res = inner.poll_read(cx, buf);
+                if buf.filled().len() == before {
+                    self.drained = true;
+                    return std::task::Poll::Ready(Err(std::io::Error::other("boom")));
+                }
+                res
+            }
+        }
+
+        let reader = tokio::io::BufReader::new(ErrAfterReader {
+            data: std::io::Cursor::new(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec(),
+            ),
+            drained: false,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        parse_sse_events_from_reader(reader, false, false, &tx).await;
+        drop(tx);
+
+        let mut last_err = None;
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = ev {
+                last_err = Some(e);
+            }
+        }
+        let err = last_err.expect("a StreamError must be emitted on read error");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("read error")),
+            "expected read-error Http error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_parser_times_out_on_idle_stream() {
+        let reader = stalling_reader(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        let parser = ::zeroclaw_spawn::spawn!(async move {
+            parse_sse_events_from_reader(reader, false, false, &tx).await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            crate::stream_guard::SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let mut last_err = None;
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = ev {
+                last_err = Some(e);
+            }
+        }
+        parser.await.expect("parser task must finish, not hang");
+
+        let err = last_err.expect("a StreamError must be emitted on stall");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("stalled")),
+            "expected stalled-stream Http error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunks_parser_times_out_on_idle_stream() {
+        let reader = stalling_reader(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
+
+        let parser = ::zeroclaw_spawn::spawn!(async move {
+            parse_sse_chunks_from_reader(reader, false, &tx).await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            crate::stream_guard::SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let mut last_err = None;
+        while let Some(ev) = rx.recv().await {
+            if let Err(e) = ev {
+                last_err = Some(e);
+            }
+        }
+        parser.await.expect("parser task must finish, not hang");
+
+        let err = last_err.expect("a StreamError must be emitted on stall");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("stalled")),
+            "expected stalled-stream Http error, got: {err:?}"
+        );
     }
 
     #[tokio::test]
