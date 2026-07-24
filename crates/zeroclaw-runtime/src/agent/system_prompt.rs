@@ -356,7 +356,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         std::env::consts::OS,
     );
 
-    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
+    // ── 8. Channel Capabilities (full copy skipped in compact_context
+    //       mode; the timestamp orientation below emits in both modes) ──
     if !compact_context {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
@@ -383,7 +384,12 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
-    } // end if !compact_context (Channel Capabilities)
+    } // end if !compact_context (full Channel Capabilities copy)
+
+    // Emitted unconditionally: small local models mistake the enrichment
+    // prefix for log/API data without this orientation. The prefix format
+    // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
+    prompt.push_str("This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n");
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
@@ -447,5 +453,50 @@ fn inject_workspace_file(
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt_with_compact_context(compact_context: bool) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            compact_context,
+            0,
+            true,
+            false,
+        )
+    }
+
+    #[test]
+    fn compact_context_carries_timestamp_orientation() {
+        let prompt = prompt_with_compact_context(true);
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "compact system prompt must orient the model on the date/time-prefix convention: {prompt}"
+        );
+    }
+
+    #[test]
+    fn non_compact_context_keeps_full_channel_capabilities_section() {
+        let prompt = prompt_with_compact_context(false);
+        assert!(
+            prompt.contains("You are running as a messaging bot"),
+            "full system prompt must retain the existing Channel Capabilities copy: {prompt}"
+        );
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "full system prompt must carry the timestamp orientation too: {prompt}"
+        );
     }
 }
