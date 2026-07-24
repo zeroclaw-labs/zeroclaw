@@ -668,7 +668,11 @@ cli-status-model = {"   "}模型：         {$model}
 cli-status-observability = 📊 可观测性：  {$v}
 cli-status-trace-storage = 🧾 跟踪存储：  {$mode}（{$path}）
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<无 risk_profile>
 cli-status-runtime = ⚙️  运行时：       {$v}
+cli-status-web-ui-found = 🌐 Web UI：        已找到（{$path}）
+cli-status-web-ui-missing = 🌐 Web UI：        缺失
 cli-status-heartbeat = 💓 心跳：      {$v}
 cli-status-heartbeat-every-minutes = 每 {$minutes} 分钟
 cli-status-memory = 🧠 内存：         {$backend}（自动保存：{$auto_save}）
@@ -696,6 +700,8 @@ cli-status-word-off = 关闭
 cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，

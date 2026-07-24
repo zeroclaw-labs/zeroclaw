@@ -753,7 +753,11 @@ cli-status-model = {"   "}Model:         {$model}
 cli-status-observability = 📊 Observability:  {$v}
 cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        MISSING
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -781,6 +785,8 @@ cli-status-word-off = off
 cli-status-word-none = (none)
 cli-status-word-configured = configured
 cli-status-word-not-configured = not configured
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
