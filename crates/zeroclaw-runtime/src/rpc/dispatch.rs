@@ -2647,7 +2647,8 @@ impl RpcDispatcher {
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
-            if config.ensure_map_key_for_path(&req.prop) {
+            let (refused, created_alias) = config.ensure_map_key_for_path_tracked(&req.prop);
+            if refused {
                 // Refused to vivify the reserved `default` agent: return a
                 // reserved error rather than a downstream "Unknown property".
                 return Err(rpc_err(
@@ -2655,6 +2656,14 @@ impl RpcDispatcher {
                     "alias `default` is reserved and cannot be created",
                 ));
             }
+            // Any failure after this point must undo an alias THIS call
+            // created — the write lock is on the live daemon config, so an
+            // early error return would otherwise commit a phantom entry.
+            let rollback_created_alias = |config: &mut zeroclaw_config::schema::Config| {
+                if let Some((section, alias)) = &created_alias {
+                    let _ = config.delete_map_key(section, alias);
+                }
+            };
             let info = config
                 .prop_fields()
                 .into_iter()
@@ -2662,11 +2671,16 @@ impl RpcDispatcher {
             // Polymorphic value: strings pass through, everything else coerced.
             let value_str = match &req.value {
                 Value::String(s) => s.clone(),
-                other => zeroclaw_config::typed_value::coerce_for_set_prop(
+                other => match zeroclaw_config::typed_value::coerce_for_set_prop(
                     other,
                     info.as_ref().map(|i| i.kind),
-                )
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+                ) {
+                    Ok(coerced) => coerced,
+                    Err(e) => {
+                        rollback_created_alias(&mut config);
+                        return Err(rpc_err(INVALID_PARAMS, e.message));
+                    }
+                },
             };
             // Reject the masked sentinel for secrets — surfaces echo the
             // masked display value back when no real edit happened, and
@@ -2681,6 +2695,7 @@ impl RpcDispatcher {
                     || value_str == "****"
                     || value_str.is_empty())
             {
+                rollback_created_alias(&mut config);
                 return Err(rpc_err(
                     INVALID_PARAMS,
                     format!(
@@ -2689,9 +2704,10 @@ impl RpcDispatcher {
                     ),
                 ));
             }
-            config
-                .set_prop_persistent(&req.prop, &value_str)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+            if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
+                rollback_created_alias(&mut config);
+                return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
+            }
         }
         self.flush_config().await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
@@ -8217,6 +8233,108 @@ mod tests {
             stored.as_deref(),
             Some("sk-live-secret"),
             "live secret must NOT be clobbered by a masked write"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_unknown_field_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.anthropic.new_bot.not_a_real_field",
+            "value": "anything"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set on an unknown tail field must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "the alias auto-created to resolve the write must be rolled back, \
+             not left as a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_bad_value_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot.temperature",
+            "value": "abc"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an unparsable value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "a set_prop value failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_coercion_failure_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        // Non-string JSON value so the failure happens in coerce_for_set_prop,
+        // not in the later set_prop parse.
+        let params = json!({
+            "prop": "providers.models.openai.new_bot3.temperature",
+            "value": {"not": "a-float"}
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an uncoercible value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot3")),
+            "a value coercion failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_masked_secret_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot2.api_key",
+            "value": "****"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with a masked secret value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot2")),
+            "the masked-secret rejection after alias auto-creation must roll \
+             the alias back, not leave a phantom in the live daemon config"
         );
     }
 
