@@ -86,6 +86,7 @@
   - [Discord](./channels/discord.md)
   - [Slack](./channels/slack.md)
   - [Mattermost](./channels/mattermost.md)
+  - [Microsoft Teams](./channels/msteams.md)
   - [LINE](./channels/line.md)
   - [Nextcloud Talk](./channels/nextcloud-talk.md)
   - [Signal](./channels/signal.md)

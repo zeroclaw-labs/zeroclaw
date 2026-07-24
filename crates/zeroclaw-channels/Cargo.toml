@@ -192,6 +192,7 @@ channels-full = [
   "channel-linq",
   "channel-mattermost",
   "channel-mochat",
+  "channel-msteams",
   "channel-mqtt",
   "channel-amqp",
   "channel-nextcloud",
@@ -244,6 +245,10 @@ channel-discord = []
 channel-slack = []
 channel-signal = []
 channel-mattermost = []
+# Microsoft Teams (Azure Bot Service). jsonwebtoken validates the Bot
+# Framework JWT on inbound activities (same aws-lc-rs backend note as the
+# GitHub App channel above).
+channel-msteams = ["dep:jsonwebtoken", "dep:thiserror"]
 channel-irc = []
 channel-twitch = ["channel-irc"]
 channel-imessage = []

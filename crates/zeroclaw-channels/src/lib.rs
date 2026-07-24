@@ -64,6 +64,8 @@ pub mod matrix;
 pub mod mattermost;
 #[cfg(feature = "channel-mochat")]
 pub mod mochat;
+#[cfg(feature = "channel-msteams")]
+pub mod msteams;
 #[cfg(feature = "channel-nextcloud")]
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]

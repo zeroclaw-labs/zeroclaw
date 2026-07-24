@@ -351,6 +351,10 @@ impl Channel for PacedChannel {
         self.inner.supports_draft_updates()
     }
 
+    fn supports_draft_updates_for(&self, message: &ChannelMessage) -> bool {
+        self.inner.supports_draft_updates_for(message)
+    }
+
     fn supports_multi_message_streaming(&self) -> bool {
         self.inner.supports_multi_message_streaming()
     }

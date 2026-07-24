@@ -37,6 +37,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.lark",
     "channel.matrix",
     "channel.mattermost",
+    "channel.msteams",
     "channel.nextcloud_talk",
     "channel.qq",
     "channel.signal",
@@ -12839,6 +12840,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mattermost: HashMap<String, MattermostConfig>,
+    /// Microsoft Teams bot channel instances (`[channels.msteams.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub msteams: HashMap<String, MSTeamsConfig>,
     /// Webhook channel instances (`[channels.webhook.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13041,6 +13046,12 @@ impl ChannelsConfig {
                 name: "Mattermost",
                 desc: "connect to your bot",
                 configured: !self.mattermost.is_empty(),
+            },
+            ChannelInfo {
+                kind: "msteams",
+                name: "Microsoft Teams",
+                desc: "Azure Bot Service bot",
+                configured: !self.msteams.is_empty(),
             },
             ChannelInfo {
                 kind: "imessage",
@@ -13247,6 +13258,7 @@ impl ChannelsConfig {
             || self.discord.values().any(|c| c.enabled)
             || self.slack.values().any(|c| c.enabled)
             || self.mattermost.values().any(|c| c.enabled)
+            || self.msteams.values().any(|c| c.enabled)
             || self.webhook.values().any(|c| c.enabled)
             || self.imessage.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
@@ -13288,12 +13300,13 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
             ("slack", !self.slack.is_empty(), true),
             ("mattermost", !self.mattermost.is_empty(), true),
+            ("msteams", !self.msteams.is_empty(), true),
             ("webhook", !self.webhook.is_empty(), true),
             ("imessage", !self.imessage.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
@@ -13380,6 +13393,7 @@ impl Default for ChannelsConfig {
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            msteams: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
@@ -14087,6 +14101,138 @@ impl ChannelConfig for MattermostConfig {
     }
 }
 
+fn default_msteams_port() -> u16 {
+    3978
+}
+
+fn default_msteams_path() -> String {
+    "/api/messages".to_string()
+}
+
+/// Microsoft Teams bot channel configuration (Azure Bot Service /
+/// Bot Framework). Inbound activities arrive on a channel-hosted HTTP
+/// listener whose public URL is registered as the Azure Bot messaging
+/// endpoint; outbound replies go to the Bot Connector API.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.msteams"]
+pub struct MSTeamsConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Azure Bot application (client) ID from the Entra app registration.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub app_id: String,
+    /// Azure Bot client secret for the Entra app registration.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub app_password: String,
+    /// Entra (Azure AD) tenant ID. Single-tenant bots only.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub tenant_id: String,
+    /// Port the inbound activity listener binds to. The operator points a
+    /// public HTTPS domain/reverse proxy at this port and registers
+    /// `https://<domain><path>` as the Azure Bot messaging endpoint.
+    /// Default: `3978`.
+    #[tab(Connection)]
+    #[serde(default = "default_msteams_port")]
+    pub port: u16,
+    /// URL path for the inbound activity route. Default: `/api/messages`.
+    #[tab(Advanced)]
+    #[serde(default = "default_msteams_path")]
+    pub path: String,
+    /// Whether the bot responds in personal (1:1) chats. When `false`,
+    /// inbound personal-chat activities are dropped. Default: `true`.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub allow_dms: bool,
+    /// When true (default when unset), only respond to team-channel and
+    /// group-chat messages that @-mention the bot. Personal chats always
+    /// bypass this filter (a DM is definitionally addressed to the bot)
+    /// and are gated by `allow_dms` instead.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_only: Option<bool>,
+    /// Streaming mode for progressive response delivery. `partial` uses
+    /// Teams' native streaming protocol (the gray in-progress bubble) in
+    /// personal chats and message edits in group chats/channels.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft updates. Teams rate-limits
+    /// streaming updates to roughly one per second. Default: `1000`.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// When true, a newer Teams message from the same sender in the same
+    /// conversation cancels the in-flight request and starts a fresh
+    /// response with preserved history.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
+}
+
+impl Default for MSTeamsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: String::new(),
+            app_password: String::new(),
+            tenant_id: String::new(),
+            port: default_msteams_port(),
+            path: default_msteams_path(),
+            allow_dms: true,
+            mention_only: None,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            proxy_url: None,
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+        }
+    }
+}
+
+impl ChannelConfig for MSTeamsConfig {
+    fn name() -> &'static str {
+        "Microsoft Teams"
+    }
+    fn desc() -> &'static str {
+        "Azure Bot Service bot"
+    }
+}
+
 /// Webhook channel configuration.
 ///
 /// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
@@ -14609,6 +14755,7 @@ impl_reply_pacing!(
     DiscordConfig,
     SlackConfig,
     MattermostConfig,
+    MSTeamsConfig,
     WebhookConfig,
     IMessageConfig,
     MatrixConfig,
@@ -19078,6 +19225,7 @@ impl Config {
             .chain(rows("discord", &c.discord))
             .chain(rows("slack", &c.slack))
             .chain(rows("mattermost", &c.mattermost))
+            .chain(rows("msteams", &c.msteams))
             .chain(rows("webhook", &c.webhook))
             .chain(rows("imessage", &c.imessage))
             .chain(rows("matrix", &c.matrix))
@@ -24444,6 +24592,7 @@ auto_save = true
                 discord: HashMap::new(),
                 slack: HashMap::new(),
                 mattermost: HashMap::new(),
+                msteams: HashMap::new(),
                 webhook: HashMap::new(),
                 imessage: HashMap::new(),
                 matrix: HashMap::new(),
@@ -26158,6 +26307,7 @@ allowed_users = ["@u:matrix.org"]
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            msteams: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::from([(
                 "default".to_string(),
@@ -26683,6 +26833,7 @@ allowed_numbers = ["+1", "+2"]
             discord: HashMap::new(),
             slack: HashMap::new(),
             mattermost: HashMap::new(),
+            msteams: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
             matrix: HashMap::new(),
