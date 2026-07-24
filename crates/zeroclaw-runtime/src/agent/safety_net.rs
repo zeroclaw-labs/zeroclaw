@@ -2123,7 +2123,7 @@ async fn usage_then_tool_events_then_usage_again_proves_drain_unblocked() {
     let positions = |pred: &dyn Fn(&TurnEvent) -> bool| {
         events
             .iter()
-            .position(|e| pred(e))
+            .position(pred)
             .expect("expected event not found")
     };
 

@@ -15728,6 +15728,7 @@ Let me check the result."#;
             false,
             0,
             0,
+            0, // model_context_window: disabled for test
             None,
             TurnOrigin::SubTurn,
             None,
