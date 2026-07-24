@@ -1515,14 +1515,59 @@ impl TelegramChannel {
         identities.into_iter().any(|id| self.is_user_allowed(id))
     }
 
+    /// True when `message` carries content one of the update parsers
+    /// would actually process for an authorized sender, mirroring each
+    /// parser's own bail conditions: top-level `text` is always
+    /// processable (`parse_update_message`); a `voice`/`audio` payload
+    /// (`parse_voice_metadata`) only when the transcription config and
+    /// manager `try_parse_voice_message` requires are both present; a
+    /// `document`/`photo` payload (`parse_attachment_metadata`) only
+    /// when the workspace dir `try_parse_attachment_message` downloads
+    /// into is set. The voice `max_duration_secs` cap is deliberately
+    /// NOT mirrored: it is content-dependent and over-limit voice notes
+    /// are silently dropped even for authorized senders, so silence is
+    /// already the shared behavior there.
+    fn message_has_processable_content(&self, message: &serde_json::Value) -> bool {
+        if message.get("text").is_some() {
+            return true;
+        }
+        if self.transcription.is_some()
+            && self.transcription_manager.is_some()
+            && (message.get("voice").is_some() || message.get("audio").is_some())
+        {
+            return true;
+        }
+        self.workspace_dir.is_some()
+            && (message.get("document").is_some() || message.get("photo").is_some())
+    }
+
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
         let Some(message) = update.get("message") else {
             return;
         };
 
-        let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
+        // Only updates an authorized sender would have gotten processed
+        // deserve the unauthorized notice. Everything else — service
+        // messages (joins/leaves/pins), stickers, locations, contacts,
+        // or media this deployment is not configured to process — stays
+        // silent exactly as before; a notice would either spam group
+        // chats on every join, or promise processing that can never
+        // happen.
+        if !self.message_has_processable_content(message) {
             return;
-        };
+        }
+
+        // Media updates carry no top-level `text`, only an optional
+        // `caption`; fall back to it so a captioned `/bind <code>` still
+        // reaches the pairing flow below. Captionless media yields "",
+        // which simply finds no bind code and falls through to the
+        // unauthorized-approval notice — the same outcome unauthorized
+        // text senders already get.
+        let text = message
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| message.get("caption").and_then(serde_json::Value::as_str))
+            .unwrap_or("");
 
         let username_opt = message
             .get("from")
@@ -6977,6 +7022,31 @@ mod tests {
             .await;
     }
 
+    /// Mount a `sendMessage` responder that must be hit exactly
+    /// `expect_calls` times. When `body_fragments` is non-empty the mock
+    /// only matches requests whose body contains every fragment, so a
+    /// send with the wrong chat or the wrong message goes unmatched and
+    /// fails the expectation instead of passing vacuously.
+    async fn mount_telegram_send_message_ok(
+        mock_server: &wiremock::MockServer,
+        expect_calls: u64,
+        body_fragments: &[&str],
+    ) {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mut mock = Mock::given(method("POST")).and(path_regex(r"/bot[^/]+/sendMessage$"));
+        for fragment in body_fragments {
+            mock = mock.and(body_string_contains(*fragment));
+        }
+        mock.respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true, "result": {}})),
+        )
+        .expect(expect_calls)
+        .mount(mock_server)
+        .await;
+    }
+
     /// Every main-loop `getUpdates` request body (`"timeout": 30`, excluding
     /// the startup probe), in the order the mock server received them.
     async fn telegram_main_loop_getupdates_bodies(
@@ -7302,59 +7372,75 @@ mod tests {
         handle.abort();
     }
 
-    /// An unauthorized-sender VOICE update must be acknowledged like any
-    /// other permanent skip — the voice parser rejects it before any
-    /// download, the attachment parser does not match voice payloads, and
-    /// the offset still ends up past it and the authorized update behind it.
-    #[tokio::test]
-    async fn listen_acknowledges_unauthorized_voice_update_without_download() {
+    /// Drive `listen()` with `unauthorized_update` (sent by "mallory",
+    /// who is not on the allowlist) followed by an authorized text update
+    /// in the same chat, asserting the shared unauthorized-update
+    /// contract: no `getFile` download, exactly `expected_notices`
+    /// unauthorized-approval notices sent to the update's chat, the
+    /// offset advancing past both updates, and only the authorized
+    /// message reaching `tx`. `decorate` lets each caller add
+    /// channel-specific config (transcription, workspace dir, ...).
+    async fn assert_listen_skips_unauthorized_update(
+        unauthorized_update: serde_json::Value,
+        decorate: impl FnOnce(TelegramChannel) -> TelegramChannel,
+        expected_notices: u64,
+    ) {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         mount_telegram_startup_probe(&mock_server).await;
 
-        let uid1 = 5_000; // unauthorized voice sender
-        let uid2 = 5_001; // authorized text sender
-        let voice_update = telegram_voice_update(uid1, 30, 999, "mallory", "voice789");
-        let text_update = telegram_text_update(uid2, 31, 999, "alice", "world");
+        let uid1 = unauthorized_update
+            .get("update_id")
+            .and_then(serde_json::Value::as_i64)
+            .expect("unauthorized update must carry an update_id");
+        let uid2 = uid1 + 1; // authorized text sender right behind it
+        let chat_id = unauthorized_update["message"]["chat"]["id"]
+            .as_i64()
+            .expect("unauthorized update must carry a chat id");
+        let text_update = telegram_text_update(uid2, 1, chat_id, "alice", "world");
 
         mount_telegram_get_updates(
             &mock_server,
             0,
-            serde_json::json!([voice_update, text_update]),
+            serde_json::json!([unauthorized_update, text_update]),
         )
         .await;
         mount_telegram_get_updates(&mock_server, uid2 + 1, serde_json::json!([])).await;
 
-        // The unauthorized voice update must be rejected before any file
-        // I/O — this mock existing with `.expect(0)` is the assertion.
+        // The unauthorized update must be rejected before any file I/O —
+        // this mock existing with `.expect(0)` is the assertion.
         Mock::given(method("GET"))
             .and(path_regex(r"/bot[^/]+/getFile$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
-                "result": {"file_path": "voice/file.ogg"}
+                "result": {"file_path": "unauthorized/never-downloaded"}
             })))
             .expect(0)
             .mount(&mock_server)
             .await;
 
-        let tc = zeroclaw_config::schema::TranscriptionConfig {
-            enabled: true,
-            api_key: Some("test_key".to_string()),
-            max_duration_secs: 120,
-            ..Default::default()
+        // With zero expected notices any sendMessage at all must fail the
+        // expectation; otherwise pin the notice to this chat and to the
+        // approval text so a stray send cannot satisfy the mock.
+        let chat_fragment = format!(r#""chat_id":"{chat_id}""#);
+        let fragments = if expected_notices == 0 {
+            vec![]
+        } else {
+            vec![chat_fragment.as_str(), "requires operator approval"]
         };
-        let ch = Arc::new(
+        mount_telegram_send_message_ok(&mock_server, expected_notices, &fragments).await;
+
+        let ch = Arc::new(decorate(
             TelegramChannel::new(
                 "test-token".into(),
                 "telegram_test_alias",
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
-            .with_transcription(tc),
-        );
+            .with_api_base(mock_server.uri()),
+        ));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
@@ -7367,7 +7453,7 @@ mod tests {
         assert_eq!(msg.sender, "alice");
         assert_eq!(msg.content, "world");
 
-        // The unauthorized voice update must never be delivered.
+        // The unauthorized update must never be delivered.
         let extra = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
         assert!(
             extra.is_err(),
@@ -7377,10 +7463,156 @@ mod tests {
         assert!(
             telegram_wait_for_main_loop_offset(&mock_server, uid2 + 1, Duration::from_secs(5))
                 .await,
-            "offset never advanced past the unauthorized voice update"
+            "offset never advanced past the unauthorized update"
         );
 
         handle.abort();
+    }
+
+    /// An unauthorized-sender VOICE update must be acknowledged like any
+    /// other permanent skip — the voice parser rejects it before any
+    /// download, the attachment parser does not match voice payloads, the
+    /// offset still ends up past it and the authorized update behind it —
+    /// and, since media carries no top-level `text`, the sender must still
+    /// get the same "requires operator approval" notice a text sender gets.
+    #[tokio::test]
+    async fn listen_acknowledges_unauthorized_voice_update_without_download() {
+        let voice_update = telegram_voice_update(5_000, 30, 999, "mallory", "voice789");
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        assert_listen_skips_unauthorized_update(voice_update, |ch| ch.with_transcription(tc), 1)
+            .await;
+    }
+
+    /// An unauthorized-sender DOCUMENT update must get the same treatment
+    /// as voice: no `getFile` download, the offset advances past it, it is
+    /// never delivered to `tx`, and — the point of this fix — the sender
+    /// still receives the unauthorized-approval notice even though the
+    /// update carries no top-level `text`, only a `document` payload.
+    #[tokio::test]
+    async fn listen_notifies_unauthorized_document_update_without_download() {
+        let document_update =
+            telegram_document_update(6_000, 40, 1_010, "mallory", "file999", "report.pdf");
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        assert_listen_skips_unauthorized_update(
+            document_update,
+            |ch| ch.with_workspace_dir(workspace_path),
+            1,
+        )
+        .await;
+    }
+
+    /// Updates without any content the bot could process for an
+    /// authorized sender — stickers, service messages like
+    /// `new_chat_members` — must stay silent even from unauthorized
+    /// senders: no notice, no download, offset still advances. Without
+    /// this gate every join/leave/pin by a non-allowlisted group member
+    /// would spam the chat with approval notices.
+    #[tokio::test]
+    async fn listen_stays_silent_for_unauthorized_update_without_processable_content() {
+        let sticker_update = serde_json::json!({
+            "update_id": 7_000,
+            "message": {
+                "message_id": 60,
+                "chat": {"id": 1_020, "type": "private"},
+                "from": {"id": 160_000, "username": "mallory"},
+                "sticker": {"file_id": "sticker123", "width": 512, "height": 512},
+            }
+        });
+        assert_listen_skips_unauthorized_update(sticker_update, |ch| ch, 0).await;
+
+        let service_update = serde_json::json!({
+            "update_id": 7_100,
+            "message": {
+                "message_id": 61,
+                "chat": {"id": 1_030, "type": "group"},
+                "from": {"id": 161_000, "username": "mallory"},
+                "new_chat_members": [{"id": 161_000, "username": "mallory"}],
+            }
+        });
+        assert_listen_skips_unauthorized_update(service_update, |ch| ch, 0).await;
+    }
+
+    /// Media the deployment is not configured to process must not draw a
+    /// notice either: with transcription unconfigured the voice parser
+    /// would drop the update even from an authorized sender, so telling
+    /// an unauthorized one to "send your message again" after approval
+    /// would promise processing that cannot happen. Same for documents
+    /// without a workspace dir. The undecorated helper channel has
+    /// neither configured.
+    #[tokio::test]
+    async fn listen_stays_silent_for_unauthorized_media_the_deployment_cannot_process() {
+        let voice_update = telegram_voice_update(7_200, 62, 1_040, "mallory", "voice321");
+        assert_listen_skips_unauthorized_update(voice_update, |ch| ch, 0).await;
+
+        let document_update =
+            telegram_document_update(7_300, 63, 1_050, "mallory", "file222", "notes.pdf");
+        assert_listen_skips_unauthorized_update(document_update, |ch| ch, 0).await;
+    }
+
+    /// A captioned media update from an unauthorized sender must have its
+    /// `caption` treated the same as a text sender's `text` — specifically,
+    /// a `/bind <code>` in the caption must reach `extract_bind_code` and
+    /// take the pairing branch, not the plain unauthorized-approval notice.
+    /// Exercised directly against `handle_unauthorized_message` since no
+    /// listen()-level pairing harness exists yet and building one is not
+    /// justified for this single assertion.
+    #[tokio::test]
+    async fn handle_unauthorized_message_reads_bind_code_from_caption() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 1, &[r#""chat_id":"2020""#]).await;
+
+        // An empty peer list auto-provisions an active pairing guard (with
+        // a random 6-digit code), the same precondition the pairing branch
+        // needs. The workspace dir makes document updates processable, so
+        // the content gate lets the captioned update through.
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let mut update =
+            telegram_document_update(9_000, 50, 2_020, "mallory", "file111", "notes.pdf");
+        // Generated pairing codes are always exactly six digits, so a
+        // non-digit code can never accidentally match and the invalid-code
+        // branch is deterministic.
+        update["message"]["caption"] = serde_json::json!("/bind not-a-real-code");
+
+        ch.handle_unauthorized_message(&update).await;
+
+        let send_message_bodies: Vec<serde_json::Value> = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .filter_map(|r| serde_json::from_slice(&r.body).ok())
+            .collect();
+        assert_eq!(
+            send_message_bodies.len(),
+            1,
+            "expected exactly one sendMessage request, got: {send_message_bodies:?}"
+        );
+        let sent_text = send_message_bodies[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            sent_text.contains("Invalid binding code"),
+            "expected the pairing branch's wrong-code reply from a captioned /bind, got: {sent_text}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
