@@ -959,8 +959,16 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let uses_memory: Option<i64> = row.get(19)?;
     let agent_alias: Option<String> = row.get(20)?;
     let shell_output_format_raw: Option<String> = row.get(21)?;
-    let shell_output_format = decode_shell_output_format(shell_output_format_raw.as_deref())
-        .map_err(sql_conversion_error)?;
+    // Declarative jobs never own this column — sync_declarative_jobs skips it
+    // and resolve_declarative_shell_output_format() overwrites from config.
+    // Decoding a NULL / corrupt / future shadow here would kill valid
+    // config-owned jobs before the overlay runs.
+    let shell_output_format = if source.as_deref() == Some("declarative") {
+        CronShellOutputFormat::default()
+    } else {
+        decode_shell_output_format(shell_output_format_raw.as_deref())
+            .map_err(sql_conversion_error)?
+    };
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -2380,6 +2388,141 @@ mod tests {
         assert!(
             msg.contains("NULL"),
             "Error should identify the NULL shell_output_format column, got: {msg}"
+        );
+    }
+
+    /// Regression: a declarative job whose DB shadow for `shell_output_format`
+    /// is NULL or corrupt must still be visible through get_job / due_jobs /
+    /// all_overdue_jobs, with the canonical value resolved from config.
+    /// The strict decode must not kill valid config-owned jobs before the
+    /// declarative overlay runs.
+    #[test]
+    fn declarative_job_ignores_invalid_db_shadow_for_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+
+        // Simulate a forward-compatible database where shell_output_format was
+        // added as a nullable column by a different schema version.
+        // add_column_if_missing skips the column if it already exists, so NULL
+        // or garbage can reach map_cron_job_row.
+        let db_path = cron_db(&config);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id                   TEXT PRIMARY KEY,
+                    expression           TEXT NOT NULL,
+                    command              TEXT NOT NULL,
+                    schedule             TEXT,
+                    job_type             TEXT NOT NULL DEFAULT 'shell',
+                    prompt               TEXT,
+                    name                 TEXT,
+                    session_target       TEXT NOT NULL DEFAULT 'isolated',
+                    model                TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 1,
+                    delivery             TEXT,
+                    delete_after_run     INTEGER NOT NULL DEFAULT 0,
+                    allowed_tools        TEXT,
+                    created_at           TEXT NOT NULL,
+                    next_run             TEXT NOT NULL,
+                    last_run             TEXT,
+                    last_status          TEXT,
+                    last_output          TEXT,
+                    source               TEXT DEFAULT 'imperative',
+                    uses_memory          INTEGER NOT NULL DEFAULT 1,
+                    agent_alias          TEXT NOT NULL DEFAULT '',
+                    shell_output_format  TEXT
+                );",
+            )
+            .unwrap();
+
+            let now = Utc::now();
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, source, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'declarative', 1)",
+                params![
+                    "raw-shadow",
+                    "0 2 * * *",
+                    "echo shadow",
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::hours(1)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        // config.cron owns the canonical shell_output_format for this job.
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("raw-shadow".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo shadow".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        config.cron.insert("raw-shadow".to_string(), decl);
+
+        // --- NULL shadow ---
+        // DB column is NULL (from the nullable table above), config says Raw.
+        let job = get_job(&config, "raw-shadow").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must resolve config value when DB shadow is NULL"
+        );
+        assert_eq!(job.source, "declarative");
+
+        // --- Garbage shadow ---
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET shell_output_format = 'garbage' WHERE id = ?1",
+                params!["raw-shadow"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let job = get_job(&config, "raw-shadow").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must resolve config value when DB shadow is garbage"
+        );
+
+        // --- due_jobs / all_overdue_jobs with NULL shadow ---
+        // Reset to NULL and force into the due window.
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET shell_output_format = NULL, next_run = ?1 WHERE id = ?2",
+                params![
+                    (Utc::now() - ChronoDuration::hours(1)).to_rfc3339(),
+                    "raw-shadow"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let now = Utc::now();
+        let due = due_jobs(&config, now).unwrap();
+        assert!(
+            due.iter().any(|j| j.id == "raw-shadow"
+                && j.shell_output_format == zeroclaw_config::schema::CronShellOutputFormat::Raw),
+            "due_jobs must include declarative job despite NULL DB shadow"
+        );
+        let overdue = all_overdue_jobs(&config, now).unwrap();
+        assert!(
+            overdue.iter().any(|j| j.id == "raw-shadow"
+                && j.shell_output_format == zeroclaw_config::schema::CronShellOutputFormat::Raw),
+            "all_overdue_jobs must include declarative job despite NULL DB shadow"
         );
     }
 
