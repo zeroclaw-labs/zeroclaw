@@ -1271,6 +1271,16 @@ impl Chat {
             return false;
         }
 
+        // The attachment manager is modal within the input surface. Higher
+        // overlays above have already had first refusal; handle it before queue,
+        // browse, and other pane-level shortcuts.
+        if state.pending_approval().is_none() && state.input_bar.has_attachment_manager() {
+            state.clear_mouse_highlight();
+            let _ = state.input_bar.handle_key(key);
+            state.mark_dirty_full();
+            return false;
+        }
+
         {
             use crate::keymap::ChatTabAction as QAction;
             let qaction = QAction::from_chord(&key);
@@ -2186,8 +2196,11 @@ impl Chat {
             && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
             && !state.turn_in_flight
             && !state.input_bar.has_file_explorer()
+            && !state.input_bar.has_attachment_manager()
             && matches!(state.session_overlay, SessionOverlay::None)
             && !state.model_picker.is_open()
+            && state.pending_approval().is_none()
+            && state.pending_elicitation().is_none()
             && state.title_hit_target_at(mouse.column, mouse.row) == Some(TitleHitTarget::Agent)
         {
             let current_alias = state.agent_alias.clone();
@@ -2196,8 +2209,8 @@ impl Chat {
         }
 
         if let ChatPhase::Active(ref mut state) = self.phase {
-            // Let the file explorer handle mouse events first when open.
-            if state.input_bar.handle_mouse(mouse) {
+            // The file explorer renders above every parent overlay.
+            if state.input_bar.has_file_explorer() && state.input_bar.handle_mouse(mouse) {
                 state.clear_mouse_highlight();
                 return;
             }
@@ -2252,6 +2265,17 @@ impl Chat {
                 if let Some(entry) = confirm_session {
                     Self::switch_to_session_entry(&self.rpc, self.pane_kind, state, entry).await;
                 }
+                return;
+            }
+
+            // Approval and elicitation overlays are keyboard-driven but still
+            // block clicks from reaching controls rendered beneath them.
+            if state.pending_approval().is_some() || state.pending_elicitation().is_some() {
+                return;
+            }
+
+            if state.input_bar.handle_mouse(mouse) {
+                state.clear_mouse_highlight();
                 return;
             }
 
@@ -2588,6 +2612,9 @@ impl Chat {
                     return true;
                 }
                 if !matches!(s.session_overlay, SessionOverlay::None) {
+                    return false;
+                }
+                if s.pending_approval().is_some() {
                     return false;
                 }
                 // Browse mode: single-char bindings active.
@@ -3083,6 +3110,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
 
     render_conversation(f, state, actual_conv);
     state.input_bar.render_autocomplete_popup(f);
+    state.input_bar.render_attachment_manager(f, area);
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
@@ -7421,6 +7449,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_manager_makes_chat_claim_text_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("one.png"),
+            mime_type: "image/png".into(),
+            filename: "one.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        active.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            active
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            crate::input_bar::InputBarAction::Consumed
+        ));
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        assert!(chat.wants_text_input());
+    }
+
+    #[tokio::test]
     async fn pending_elicitation_makes_chat_claim_text_input() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -8293,6 +8349,52 @@ mod tests {
             LinesDirty::Full,
             "clearing the highlight must invalidate rendered transcript lines"
         );
+    }
+
+    #[tokio::test]
+    async fn model_picker_blocks_attachment_remove_click() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("one.png"),
+            mime_type: "image/png".into(),
+            filename: "one.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        active.model_picker =
+            ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut active, area, PaneKind::Chat))
+            .expect("draw chat");
+        let attachment_area = active
+            .input_bar
+            .attachment_area()
+            .expect("attachment row rendered");
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: attachment_area.x + attachment_area.width - 2,
+                row: attachment_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(active) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(active.input_bar.pending_attachments().len(), 1);
     }
 
     #[tokio::test]
