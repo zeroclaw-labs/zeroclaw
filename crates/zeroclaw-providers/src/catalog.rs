@@ -68,6 +68,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
         "telnyx" => (None, None),
+        "crusoe" => (None, None),
         // Families with no public catalog: local-only servers (no public
         // /models index without a running server) or credential-required
         // APIs with no published catalog. Operator pastes a credential and

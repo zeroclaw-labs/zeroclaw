@@ -1399,6 +1399,71 @@ pub struct GroqModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Crusoe ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CrusoeEndpoint {
+    #[default]
+    Default,
+}
+
+impl ModelEndpoint for CrusoeEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.inference.crusoecloud.com/v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.crusoe"]
+pub struct CrusoeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod crusoe_tests {
+    use super::*;
+
+    #[test]
+    fn crusoe_endpoint_uri() {
+        assert_eq!(
+            CrusoeEndpoint::Default.uri(),
+            "https://api.inference.crusoecloud.com/v1"
+        );
+    }
+
+    #[test]
+    fn crusoe_config_defaults_empty() {
+        let cfg = CrusoeModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn crusoe_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.crusoe.default]
+model = "zai/GLM-5.2"
+"#;
+        let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .crusoe
+            .get("default")
+            .expect("crusoe.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("zai/GLM-5.2"));
+    }
+}
+
 // ── Mistral ──
 
 #[derive(
@@ -3259,6 +3324,7 @@ impl_default_family_endpoint! {
     PerplexityModelProviderConfig,
     XaiModelProviderConfig,
     CerebrasModelProviderConfig,
+    CrusoeModelProviderConfig,
     SambanovaModelProviderConfig,
     HyperbolicModelProviderConfig,
     DeepinfraModelProviderConfig,
