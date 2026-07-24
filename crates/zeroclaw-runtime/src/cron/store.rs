@@ -1320,7 +1320,7 @@ fn with_existing_initialized_connection<T>(
     f(&conn).map(Some)
 }
 
-fn with_initialized_connection<T>(
+pub(super) fn with_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
@@ -1476,6 +1476,9 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+
+    #[cfg(feature = "plugins-wasm")]
+    super::outbox::initialize_schema(conn)?;
 
     Ok(())
 }

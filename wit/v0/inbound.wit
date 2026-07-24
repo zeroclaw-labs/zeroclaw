@@ -33,11 +33,13 @@ interface inbound {
     }
 
     /// Return the next queued inbound message, or `none` when the queue is
-    /// empty. Non-blocking: the plugin's `poll-message` is expected to back off
-    /// between empty polls exactly as it does today.
+    /// empty or the active service frame exhausted its custom-import budget.
+    /// Non-blocking: the plugin's `poll-message` is expected to back off between
+    /// empty polls exactly as it does today.
     inbound-poll: func() -> option<host-inbound-message>;
 
-    /// Number of messages currently waiting in the host queue. Lets a plugin
+    /// Number of messages currently waiting in the host queue, or zero when the
+    /// active service frame exhausted its custom-import budget. Lets a plugin
     /// drain in batches without a sentinel empty poll between each.
     inbound-pending: func() -> u32;
 }

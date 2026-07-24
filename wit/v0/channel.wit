@@ -30,10 +30,11 @@ interface channel {
         sender: string,
         reply-target: string,
         content: string,
-        /// Platform type identifier (e.g. `"telegram"`, `"discord"`).
+        /// Legacy platform hint. The host ignores this for routing and stamps
+        /// the channel type from the admitted logical endpoint.
         channel: string,
-        /// ZeroClaw channel alias, when the platform supports multiple bot
-        /// instances. Used to compute distinct session IDs per bot.
+        /// Legacy alias hint. The host ignores this for routing and stamps the
+        /// alias from the admitted instance binding.
         channel-alias: option<string>,
         /// Unix timestamp in milliseconds.
         timestamp: u64,
@@ -84,6 +85,17 @@ interface channel {
         always-approve,
         /// Deny this call and supply an edited replacement for the arguments.
         deny-with-edit(string),
+    }
+
+    /// A webhook rejection with an explicit public HTTP classification. The
+    /// string is private diagnostic context for host logs and is never returned
+    /// verbatim to the unauthenticated caller.
+    @unstable(feature = plugins-wit-v0)
+    variant webhook-rejection {
+        /// Platform signature or authenticity verification failed (HTTP 401).
+        unauthorized(string),
+        /// The authenticated payload is malformed or unsupported (HTTP 400).
+        bad-request(string),
     }
 
     /// Bitmask of optional capabilities this plugin implements.
@@ -137,6 +149,8 @@ interface channel {
         request-approval,
         request-choice,
         supports-free-form-ask,
+        // Serves inbound webhooks: exports `webhook-path` + `parse-webhook`.
+        webhook-ingress,
     }
 
     // ── Required methods (no Rust default) ────────────────────────────────────
@@ -144,14 +158,11 @@ interface channel {
     /// Human-readable channel name.
     name: func() -> string;
 
-    /// Hand the plugin its resolved configuration section once at load time,
-    /// before any other call. `config` is a JSON object of the plugin's own
-    /// `[channels.<type>.<alias>]` settings, including secrets the host has
-    /// already decrypted. It is supplied only when the manifest grants
-    /// `config-read`; otherwise the host passes `"{}"`. This mirrors the
-    /// `__config` injection tool plugins receive, so a channel never has to
-    /// hardcode its field names into a host surface to be configured.
-    configure: func(config: string) -> result<_, string>;
+    /// Complete load-time initialization. Read the current schema-validated
+    /// public object through `config.get` and secret properties through
+    /// `secrets.get`; both imports share one resolved canonical revision for
+    /// this call. Do not retain config-derived values for later operations.
+    configure: func() -> result<_, string>;
 
     /// Send a message through this channel.
     send: func(message: send-message) -> result<_, string>;
@@ -302,6 +313,41 @@ interface channel {
     /// `ask-user` questions via the standard send + poll flow.
     /// Stub: return `true`.
     supports-free-form-ask: func() -> bool;
+
+    /// The URL path segment this channel serves inbound webhooks on, e.g.
+    /// `"whatsapp"`. The host mounts it under a fixed `/plugin/<segment>` prefix
+    /// on the gateway — disjoint from every native channel route, so a plugin
+    /// path can never shadow a built-in one. `none` = a poll-only channel.
+    /// Called once at load time.
+    /// Gated by `webhook-ingress`; stub: return `none`.
+    webhook-path: func() -> option<string>;
+
+    /// Decode a raw inbound webhook the host received at this channel's
+    /// `/plugin/<segment>` route into inbound messages. The plugin owns both its
+    /// platform payload shape and its authenticity check: it verifies the
+    /// platform signature over `body` (secret from its own config, signature
+    /// from `headers`) and returns a typed rejection to make the gateway reply
+    /// 401 or 400 and enqueue nothing. `headers` are lower-cased; `body` is the
+    /// exact received bytes.
+    ///
+    /// The host also serves GET on the route and surfaces the request line via
+    /// two reserved lower-cased headers: `x-webhook-method` (`"GET"`/`"POST"`)
+    /// and `x-webhook-query` (the raw query string, e.g. carrying
+    /// `hub.challenge`). To answer a verification handshake that must echo a
+    /// challenge in the HTTP *response* body (Slack `url_verification` POST,
+    /// WhatsApp/wecom `hub.challenge` GET), return exactly one `inbound-message`
+    /// whose `channel` is the reserved value `__webhook_reply__` and whose
+    /// `content` is the body to send. The content may contain at most 4 KiB
+    /// (4096 UTF-8 bytes). The host replies 200 with a body within that limit and
+    /// enqueues nothing; for an oversized body, the gateway returns a fixed 502
+    /// response and enqueues nothing. This keeps the response-body path additive
+    /// — the signature here is unchanged, so existing plugins need no rebuild.
+    /// Gated by `webhook-ingress`; stub: return
+    /// `err(bad-request("unsupported"))`.
+    parse-webhook: func(
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    ) -> result<list<inbound-message>, webhook-rejection>;
 }
 
 /// A component that exports `channel` is a messaging-platform channel plugin.
@@ -314,6 +360,16 @@ interface channel {
 @unstable(feature = plugins-wit-v0)
 world channel-plugin {
     import logging;
+    /// Read the schema-validated public config object at point of use.
+    import config;
+    /// Read schema-designated secrets from host-dispatched configuration and
+    /// operational calls for this admitted channel instance. Calls during
+    /// instantiation and static metadata discovery return `unavailable`.
+    import secrets;
+    /// Read and update encrypted durable state for this admitted channel
+    /// instance. Calls outside host-dispatched service frames return
+    /// `unavailable`.
+    import state;
     import inbound;
     export plugin-info;
     export channel;

@@ -518,6 +518,165 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn plugin_config_values(
+    config: &Config,
+    instance_key: &str,
+    package: &str,
+) -> Result<Option<HashMap<String, String>>, zeroclaw_plugins::error::PluginError> {
+    config
+        .plugins
+        .entry_config(instance_key)
+        .map(|configured| configured.cloned())
+        .map_err(|_| {
+            zeroclaw_plugins::error::PluginError::InvalidConfig(format!(
+                "plugin '{package}' has duplicate config entries for its instance key"
+            ))
+        })
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[derive(Clone)]
+enum PluginConfigSource {
+    Live(Arc<parking_lot::RwLock<Config>>),
+    Fixed(Arc<Config>),
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl PluginConfigSource {
+    fn new(config: Arc<Config>, live: Option<Arc<parking_lot::RwLock<Config>>>) -> Self {
+        live.map_or(Self::Fixed(config), Self::Live)
+    }
+
+    fn with<T>(&self, use_config: impl FnOnce(&Config) -> T) -> T {
+        match self {
+            Self::Live(config) => use_config(&config.read()),
+            Self::Fixed(config) => use_config(config),
+        }
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn parse_plugin_secret_reference(
+    property: String,
+) -> Result<zeroclaw_api::plugin_key::SecretPropertyRef, zeroclaw_plugins::egress::EgressError> {
+    zeroclaw_api::plugin_key::SecretPropertyRef::parse(property.clone())
+        .map_err(|_| zeroclaw_plugins::egress::EgressError::InvalidSecretReference(property))
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn resolved_plugin_egress_policy(
+    config: &Config,
+    scope: &zeroclaw_plugins::instance::PluginInstanceScope,
+) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    use zeroclaw_plugins::egress::{
+        EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
+    };
+
+    let instance_key = scope.id().config_entry_key().map_err(|error| {
+        EgressError::PolicyUnavailable(format!(
+            "failed to derive the requesting instance's config key: {error}"
+        ))
+    })?;
+    let entry = config.plugins.entry(&instance_key).map_err(|_| {
+        EgressError::PolicyUnavailable(
+            "duplicate config rows for the requesting plugin instance".to_string(),
+        )
+    })?;
+    let Some(egress) = entry.map(|entry| &entry.egress) else {
+        return EgressPolicy::new(
+            [],
+            [],
+            [],
+            config.plugins.limits.max_connections_per_instance,
+        );
+    };
+    let profiles = egress
+        .tls_profiles
+        .iter()
+        .map(|profile| {
+            let name = TlsProfileName::new(profile.name.clone())?;
+            let custom_ca = profile
+                .custom_ca_secret
+                .clone()
+                .map(parse_plugin_secret_reference)
+                .transpose()?;
+            let client_identity = match (
+                profile.client_certificate_secret.clone(),
+                profile.client_private_key_secret.clone(),
+            ) {
+                (Some(certificate), Some(private_key)) => Some(TlsClientIdentity::new(
+                    parse_plugin_secret_reference(certificate)?,
+                    parse_plugin_secret_reference(private_key)?,
+                )),
+                (None, None) => None,
+                _ => {
+                    return Err(EgressError::InvalidTlsProfile {
+                        profile: profile.name.clone(),
+                        reason: "client certificate and private key references must be configured together"
+                            .to_string(),
+                    });
+                }
+            };
+            TlsProfile::new(
+                name,
+                profile.hosts.clone(),
+                profile.system_roots,
+                custom_ca,
+                client_identity,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    EgressPolicy::new(
+        egress.private_network_hosts.clone(),
+        egress.plaintext_hosts.clone(),
+        profiles,
+        config.plugins.limits.max_connections_per_instance,
+    )
+}
+
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn plugin_host_services(
+    host: Arc<zeroclaw_plugins::host::PluginHost>,
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> zeroclaw_plugins::services::PluginHostServices {
+    let data_dir = config.data_dir.clone();
+    let config_dir = config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    // One canonical source handle is shared by both resolvers. A daemon uses
+    // the live handle; a one-shot caller uses its fixed command config.
+    let source = PluginConfigSource::new(config, live_config);
+    let config_source = source.clone();
+    let config = zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
+        let package = scope.id().package();
+        let config_entry_key = scope.id().config_entry_key()?;
+        let manifest = host
+            .manifest(package)
+            .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
+        config_source.with(|config| {
+            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                // Transient per-call view: schema/grant checks happen before
+                // guest setup.
+                plugin_config_values(config, &config_entry_key, package)
+            })
+        })
+    });
+    let state = zeroclaw_plugins::services::PluginStateService::new(
+        crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
+    );
+    let egress = zeroclaw_plugins::egress::EgressHostService::new(
+        zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
+            source.with(|config| resolved_plugin_egress_policy(config, scope))
+        }),
+    );
+    zeroclaw_plugins::services::PluginHostServices::new(config, state, egress)
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(
     clippy::implicit_hasher,
@@ -1445,86 +1604,118 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_path = config.plugins.resolved_plugins_dir();
-
-        if plugin_path.exists() && config.plugins.enabled {
-            let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
-                &config.plugins.security.signature_mode,
-            );
-            let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
-                &plugin_path,
-                signature_mode,
-                trusted_publisher_keys,
-            ) {
+        if config.plugins.enabled && config.plugins.auto_discover {
+            match crate::plugin_runtime::plugin_host(&config) {
                 Ok(host) => {
-                    let details = host.tool_plugin_details();
-                    let discovered_count = details.len();
-                    let mut registered_count = 0_usize;
-                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
-                        call_fuel: config.plugins.limits.call_fuel,
-                        max_memory_bytes: config
-                            .plugins
-                            .limits
-                            .max_memory_mb
-                            .saturating_mul(1024 * 1024),
-                        max_table_elements: config.plugins.limits.max_table_elements,
-                        max_instances: config.plugins.limits.max_instances,
-                    };
-                    for (manifest, wasm_path) in details {
-                        let plugin_config = config
-                            .plugins
-                            .entry_config(&manifest.name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let tool = (|| -> anyhow::Result<_> {
-                            let scope =
-                                zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
-                                    manifest,
-                                    zeroclaw_plugins::PluginCapability::Tool,
-                                    manifest.name.clone(),
-                                    manifest.permissions.iter().copied(),
-                                )?;
-                            zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-                                wasm_path.to_path_buf(),
-                                scope,
-                                plugin_config,
-                                plugin_limits,
-                            )
-                        })();
-                        match tool {
-                            Ok(tool) => {
-                                tool_arcs.push(Arc::new(tool));
-                                registered_count += 1;
-                            }
-                            Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Load
+                    let host = Arc::new(host);
+                    match crate::plugin_runtime::PluginActivationPlan::build(&config, &host) {
+                        Ok(plan) => {
+                            let mut details = host.tool_plugin_details();
+                            details.sort_unstable_by(|(left, _), (right, _)| {
+                                left.name.cmp(&right.name)
+                            });
+                            let discovered_count = details.len();
+                            let admitted: Vec<_> = details
+                                .into_iter()
+                                .filter_map(|(manifest, component)| {
+                                    plan.scope(
+                                        &manifest.name,
+                                        zeroclaw_plugins::PluginCapability::Tool,
+                                        &manifest.name,
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(
-                                        ::serde_json::json!({
-                                            "plugin": manifest.name,
-                                            "error": format!("{e:#}"),
-                                        })
-                                    ),
-                                    "Failed to register WASM plugin tool"
-                                );
+                                    .map(|scope| (manifest, component, scope))
+                                })
+                                .collect();
+                            let admitted_count = admitted.len();
+                            let host_services = plugin_host_services(
+                                Arc::clone(&host),
+                                Arc::clone(&config),
+                                live_config.clone(),
+                            );
+                            let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
+                            let mut registered_count = 0_usize;
+                            let mut registered_names: std::collections::HashSet<String> = tool_arcs
+                                .iter()
+                                .map(|tool| tool.name().to_string())
+                                .collect();
+                            if root_config.pipeline.enabled {
+                                registered_names.insert(PipelineTool::NAME.to_string());
                             }
+                            for (manifest, component, scope) in admitted {
+                                match zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                                    component.clone(),
+                                    scope,
+                                    host_services.clone(),
+                                    plugin_limits,
+                                ) {
+                                    Ok(tool) => {
+                                        if !claim_plugin_tool_name(
+                                            &mut registered_names,
+                                            tool.name(),
+                                        ) {
+                                            ::zeroclaw_log::record!(
+                                                WARN,
+                                                ::zeroclaw_log::Event::new(
+                                                    module_path!(),
+                                                    ::zeroclaw_log::Action::Load
+                                                )
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                                .with_attrs(::serde_json::json!({
+                                                    "plugin": manifest.name,
+                                                    "tool": tool.name(),
+                                                    "error_key": "plugin_tool_name_conflict",
+                                                })),
+                                                "Plugin tool conflicts with an already registered tool"
+                                            );
+                                            continue;
+                                        }
+                                        tool_arcs.push(Arc::new(tool));
+                                        registered_count += 1;
+                                    }
+                                    Err(e) => {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Load
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "plugin": manifest.name,
+                                                "error": format!("{e:#}"),
+                                            })),
+                                            "Failed to register WASM plugin tool"
+                                        );
+                                    }
+                                }
+                            }
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "discovered": discovered_count,
+                                    "admitted": admitted_count,
+                                    "registered": registered_count,
+                                })),
+                                "Registered WASM plugin tools"
+                            );
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Load
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                                "Failed to admit logical plugin instances"
+                            );
                         }
                     }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "discovered": discovered_count,
-                                "registered": registered_count,
-                            })),
-                        "Registered WASM plugin tools"
-                    );
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -1576,6 +1767,14 @@ pub fn all_tools_with_runtime(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn claim_plugin_tool_name(
+    registered_names: &mut std::collections::HashSet<String>,
+    plugin_name: &str,
+) -> bool {
+    registered_names.insert(plugin_name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1613,6 +1812,170 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_host_services_isolate_live_instance_keys() {
+        let plugins_dir = TempDir::new().unwrap();
+        let plugin_dir = plugins_dir.path().join("fixture-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"name = "fixture-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read", "http_client", "socket_client"]
+
+[config_schema]
+type = "object"
+required = ["enabled"]
+additionalProperties = false
+
+[config_schema.properties.enabled]
+type = "boolean"
+const = true
+"#,
+        )
+        .unwrap();
+        let host = Arc::new(
+            zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins_dir.path()).unwrap(),
+        );
+        let manifest = host.manifest("fixture-plugin").unwrap();
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            "work",
+            [
+                zeroclaw_plugins::PluginPermission::ConfigRead,
+                zeroclaw_plugins::PluginPermission::HttpClient,
+                zeroclaw_plugins::PluginPermission::SocketClient,
+            ],
+        )
+        .unwrap();
+        let backup_scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            "backup",
+            [
+                zeroclaw_plugins::PluginPermission::ConfigRead,
+                zeroclaw_plugins::PluginPermission::HttpClient,
+                zeroclaw_plugins::PluginPermission::SocketClient,
+            ],
+        )
+        .unwrap();
+        let instance_key = scope.id().config_entry_key().unwrap();
+        let backup_instance_key = backup_scope.id().config_entry_key().unwrap();
+        let entry = |name: &str, enabled: &str| zeroclaw_config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
+            ..Default::default()
+        };
+        let mut snapshot = Config::default();
+        snapshot.plugins.entries = vec![
+            entry(&instance_key, "false"),
+            entry(&backup_instance_key, "false"),
+        ];
+        let mut current = Config::default();
+        current.plugins.entries = vec![
+            entry("fixture-plugin", "true"),
+            entry("work", "true"),
+            entry("backup", "true"),
+            entry(&instance_key, "true"),
+            entry(&backup_instance_key, "false"),
+        ];
+        for key in ["backup", instance_key.as_str()] {
+            current
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .unwrap()
+                .egress
+                .private_network_hosts
+                .push("private.example".to_string());
+        }
+        let live = Arc::new(parking_lot::RwLock::new(current));
+        let services = plugin_host_services(
+            Arc::clone(&host),
+            Arc::new(snapshot),
+            Some(Arc::clone(&live)),
+        );
+
+        assert!(services.resolve_config(&scope).is_ok());
+        assert!(
+            services.resolve_config(&backup_scope).is_err(),
+            "backup must use its invalid canonical entry, not a valid raw-name decoy"
+        );
+        let private_request = |scope| {
+            zeroclaw_plugins::egress::EgressRequest::new(
+                scope,
+                zeroclaw_plugins::egress::EgressTransport::Tls,
+                "private.example",
+                443,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(
+            services
+                .egress()
+                .authorize_addresses(
+                    private_request(scope.clone()),
+                    ["10.0.0.2:443".parse().unwrap()],
+                )
+                .is_ok(),
+            "work must resolve policy from its exact canonical entry"
+        );
+        assert!(
+            services
+                .egress()
+                .authorize_addresses(
+                    private_request(backup_scope.clone()),
+                    ["10.0.0.2:443".parse().unwrap()],
+                )
+                .is_err(),
+            "backup must not borrow the private-network exception from work or its raw-name decoy"
+        );
+        for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
+            live.write()
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key.as_str())
+                .unwrap()
+                .config
+                .insert("enabled".to_string(), enabled.to_string());
+        }
+        assert!(
+            services.resolve_config(&scope).is_err(),
+            "work must observe its own canonical key's live update"
+        );
+        assert!(
+            services.resolve_config(&backup_scope).is_ok(),
+            "backup must resolve independently through the shared service"
+        );
+        live.write()
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == backup_instance_key)
+            .unwrap()
+            .egress
+            .private_network_hosts
+            .push("private.example".to_string());
+        assert!(
+            services
+                .egress()
+                .authorize_addresses(
+                    private_request(backup_scope),
+                    ["10.0.0.2:443".parse().unwrap()],
+                )
+                .is_ok(),
+            "backup must observe a live update to its own canonical egress policy"
+        );
+    }
+
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
@@ -1635,6 +1998,7 @@ mod tests {
 
         let mut config = test_config(&tmp);
         config.plugins.enabled = true;
+        config.plugins.auto_discover = true;
         config.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
         let security = Arc::new(SecurityPolicy::default());
         let memory: Arc<dyn Memory> = Arc::from(
@@ -1677,6 +2041,27 @@ mod tests {
         assert!(
             tools.iter().all(|tool| tool.name() != "metadata-probe"),
             "a component whose required metadata probe fails must not receive manifest fallback metadata"
+        );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_cannot_shadow_native_reserved_or_prior_plugin_tools() {
+        let mut registered_names =
+            std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
+        let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
+            .into_iter()
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(accepted, vec!["novel-tool"]);
+        assert_eq!(
+            registered_names,
+            std::collections::HashSet::from([
+                "shell".to_string(),
+                PipelineTool::NAME.to_string(),
+                "novel-tool".to_string(),
+            ])
         );
     }
 

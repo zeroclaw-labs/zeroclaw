@@ -1,0 +1,24 @@
+name = "channel-fixture"
+version = "0.0.0"
+wasm_path = "channel-fixture.wasm"
+capabilities = ["channel"]
+permissions = ["config_read", "state_read", "state_write"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+required = ["retry_count", "credential_epoch", "api_token"]
+additionalProperties = false
+
+[config_schema.properties.retry_count]
+type = "integer"
+minimum = 1
+
+[config_schema.properties.credential_epoch]
+type = "string"
+minLength = 1
+
+[config_schema.properties.api_token]
+type = "string"
+minLength = 1
+"x-secret" = true

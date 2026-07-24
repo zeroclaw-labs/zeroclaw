@@ -103,6 +103,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "mqtt",
     "amqp",
     "filesystem",
+    "plugin",
 ];
 
 impl V2Config {

@@ -5,16 +5,25 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/egress.rs"]
+mod egress_support;
+#[path = "support/state.rs"]
+mod state_support;
+
 use std::fs;
 use std::path::PathBuf;
 
 use tokio::sync::Mutex;
 use zeroclaw_config::schema::Config;
 use zeroclaw_plugins::component::PluginLimits;
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
-use zeroclaw_plugins::{PluginCapability, PluginPermission};
+use zeroclaw_plugins::services::PluginHostServices;
+use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use state_support::state_service;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -31,15 +40,30 @@ fn seed_config_dir(dir: &std::path::Path) -> bool {
     let plugin_dir = dir.join("plugins").join("zeroclaw-reference-plugin");
     fs::create_dir_all(&plugin_dir).unwrap();
     fs::copy(&fixture, plugin_dir.join("reference-plugin.wasm")).unwrap();
-    fs::write(
-        plugin_dir.join("manifest.toml"),
-        "name = \"zeroclaw-reference-plugin\"\n\
+    let manifest_toml = "name = \"zeroclaw-reference-plugin\"\n\
          version = \"0.1.0\"\n\
          wasm_path = \"reference-plugin.wasm\"\n\
          capabilities = [\"tool\"]\n\
-         permissions = [\"config_read\"]\n",
+         permissions = [\"config_read\"]\n\n\
+         [config_schema]\n\
+         \"$schema\" = \"https://json-schema.org/draft/2020-12/schema\"\n\
+         type = \"object\"\n\
+         additionalProperties = false\n\n\
+         [config_schema.properties.replacement]\n\
+         type = \"string\"\n\n\
+         [config_schema.properties.redact_emails]\n\
+         type = \"string\"\n\n\
+         [config_schema.properties.patterns]\n\
+         type = \"string\"\n";
+    fs::write(plugin_dir.join("manifest.toml"), manifest_toml).unwrap();
+    let manifest: PluginManifest = toml::from_str(manifest_toml).unwrap();
+    let scope = PluginInstanceScope::for_package_binding(
+        &manifest,
+        PluginCapability::Tool,
+        manifest.permissions.iter().copied(),
     )
     .unwrap();
+    let instance_key = scope.id().config_entry_key().unwrap();
 
     fs::write(
         dir.join("config.toml"),
@@ -50,12 +74,13 @@ fn seed_config_dir(dir: &std::path::Path) -> bool {
              auto_discover = true\n\
              plugins_dir = \"{}\"\n\n\
              [[plugins.entries]]\n\
-             name = \"zeroclaw-reference-plugin\"\n\n\
+             name = \"{}\"\n\n\
              [plugins.entries.config]\n\
              replacement = \"<MASK>\"\n\
              redact_emails = \"true\"\n\
              patterns = \"project-zeus\"\n",
-            dir.join("plugins").display()
+            dir.join("plugins").display(),
+            instance_key
         ),
     )
     .unwrap();
@@ -84,31 +109,40 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     let host = PluginHost::from_plugins_dir(&plugins_dir).expect("scan throwaway plugins dir");
     let details = host.tool_plugin_details();
     assert_eq!(details.len(), 1, "exactly the reference tool discovered");
-    let (manifest, wasm_path) = details[0];
+    let (manifest, component) = details[0];
     assert_eq!(manifest.name, "zeroclaw-reference-plugin");
     assert!(manifest.capabilities.contains(&PluginCapability::Tool));
     assert!(manifest.permissions.contains(&PluginPermission::ConfigRead));
 
+    let scope = PluginInstanceScope::for_package_binding(
+        manifest,
+        PluginCapability::Tool,
+        manifest.permissions.iter().copied(),
+    )
+    .expect("discovered manifest admits its requested tool grants");
     let section = config
         .plugins
-        .entry_config(&manifest.name)
+        .entry_config(&scope.id().config_entry_key().unwrap())
+        .expect("plugin config entry must be unique")
         .expect("plugin config section resolved")
         .clone();
     assert_eq!(
         section.get("replacement").map(String::as_str),
         Some("<MASK>")
     );
-
-    let scope = PluginInstanceScope::from_manifest(
-        manifest,
-        PluginCapability::Tool,
-        manifest.name.clone(),
-        manifest.permissions.iter().copied(),
-    )
-    .expect("discovered manifest admits its requested tool grants");
+    let resolver_manifest = manifest.clone();
+    let resolver_section = section.clone();
+    let services = PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
+        }),
+        state_service(),
+        egress_support::egress_service(),
+    );
     let mut plugin = runtime::create_plugin(
-        wasm_path,
+        component,
         &scope,
+        &services,
         PluginLimits {
             call_fuel: 1_000_000_000,
             max_memory_bytes: 256 * 1024 * 1024,
@@ -127,7 +161,6 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     let result = runtime::call_execute(
         &mut plugin,
         br#"{"text":"mail bob@corp.com about project-zeus, key sk-abcdef0123456789"}"#,
-        &section,
     )
     .await
     .expect("execute discovered tool");

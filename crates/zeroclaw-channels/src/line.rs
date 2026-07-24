@@ -709,16 +709,13 @@ impl LineChannel {
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         webhook_port: u16,
     ) -> Self {
-        let token = if channel_access_token.is_empty() {
-            std::env::var("LINE_CHANNEL_ACCESS_TOKEN").unwrap_or_default()
-        } else {
-            channel_access_token
+        let credential_view = zeroclaw_config::schema::LineConfig {
+            channel_access_token,
+            channel_secret,
+            ..Default::default()
         };
-        let secret = if channel_secret.is_empty() {
-            std::env::var("LINE_CHANNEL_SECRET").unwrap_or_default()
-        } else {
-            channel_secret
-        };
+        let token = credential_view.resolved_channel_access_token();
+        let secret = credential_view.resolved_channel_secret();
 
         let alias = alias.into();
         let configured_peers = peer_resolver();

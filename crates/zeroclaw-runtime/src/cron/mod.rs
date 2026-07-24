@@ -6,6 +6,8 @@ mod schedule;
 mod store;
 mod types;
 
+#[cfg(feature = "plugins-wasm")]
+pub mod outbox;
 pub mod scheduler;
 
 #[allow(unused_imports)]

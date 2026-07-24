@@ -19,6 +19,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 directories = "6.0"
 hex = "0.4"
 hostname = "0.4.2"
+hmac.workspace = true
+zeroize.workspace = true
 parking_lot = "0.12"
 postgres = { version = "0.19", default-features = false, features = ["with-chrono-0_4"], optional = true }
 rand = "0.10"

@@ -9,6 +9,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use base64::Engine as _;
+
 use crate::error::PluginError;
 use crate::{PluginCapability, PluginManifest, PluginPermission};
 
@@ -78,6 +80,30 @@ impl PluginInstanceId {
     pub fn binding(&self) -> &str {
         &self.binding
     }
+
+    /// Dotted-config-safe key for host-owned state belonging to this instance.
+    ///
+    /// The versioned payload is a Base64URL encoding of the canonical JSON
+    /// tuple `(package, capability, binding)`. It is derived on demand rather
+    /// than stored, and includes every identity dimension so two packages or
+    /// capability worlds can safely reuse the same binding name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::InvalidInstanceId`] if the canonical identity
+    /// tuple cannot be serialized.
+    pub fn config_entry_key(&self) -> Result<String, PluginError> {
+        let identity = serde_json::to_vec(&(&self.package, self.capability, &self.binding))
+            .map_err(|_| {
+                PluginError::InvalidInstanceId(
+                    "failed to serialize canonical plugin instance identity".to_string(),
+                )
+            })?;
+        Ok(format!(
+            "zpi1_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity)
+        ))
+    }
 }
 
 /// Immutable effective permissions for one admitted instance.
@@ -123,6 +149,19 @@ struct PluginInstanceScopeInner {
 }
 
 impl PluginInstanceScope {
+    /// Admit the package-name binding used by package-scoped runtime adapters.
+    ///
+    /// This centralizes the default-binding convention without storing a
+    /// second copy of it. Alias-owned adapters should call [`Self::from_manifest`]
+    /// with their actual configured binding instead.
+    pub fn for_package_binding(
+        manifest: &PluginManifest,
+        capability: PluginCapability,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> Result<Self, PluginError> {
+        Self::from_manifest(manifest, capability, manifest.name.clone(), grants)
+    }
+
     /// Admit a host-selected binding from a validated manifest and grant set.
     ///
     /// The caller remains responsible for signature and publisher policy. This
@@ -176,13 +215,22 @@ impl PluginInstanceScope {
         &self.inner.grants
     }
 
+    /// Whether both handles refer to the same host admission decision.
+    ///
+    /// Equal IDs are insufficient: separately issued scopes can carry
+    /// different effective grants.
+    #[must_use]
+    #[cfg(any(feature = "plugins-wasmtime", test))]
+    pub(crate) fn same_issuance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Reject wiring this scope into an adapter for another capability world.
     ///
     /// # Errors
     ///
     /// Returns [`PluginError::InvalidInstanceId`] when the instance capability
     /// does not equal `expected`.
-    #[cfg(any(feature = "plugins-wasmtime", test))]
     pub(crate) fn require_capability(&self, expected: PluginCapability) -> Result<(), PluginError> {
         if self.id().capability() != expected {
             return Err(PluginError::InvalidInstanceId(format!(
@@ -199,22 +247,7 @@ impl PluginInstanceScope {
 /// Validate the package-name grammar once for both manifest admission and
 /// runtime instance construction.
 pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
-    let bytes = name.as_bytes();
-    let valid = (1..=128).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
-    let valid = valid
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
-        });
-    if !valid {
-        return Err(format!(
-            "plugin package must be a 1-128 character lowercase ASCII slug, start with a letter or digit, end with a letter or digit, and use only '-', '_', or '.' as separators (got {name:?})"
-        ));
-    }
-    Ok(())
+    zeroclaw_api::plugin::validate_plugin_package_name(name).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -244,8 +277,10 @@ fn test_manifest(
         description: None,
         author: None,
         wasm_path: Some("plugin.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![capability],
         permissions,
+        config_schema: None,
         signature: None,
         publisher_key: None,
     }
@@ -274,6 +309,42 @@ mod tests {
             base,
             id("messaging", PluginCapability::Channel, "telegram.main"),
             "artifact version and digest are deliberately not identity fields"
+        );
+        let keys = identities
+            .iter()
+            .map(PluginInstanceId::config_entry_key)
+            .collect::<Result<HashSet<_>, _>>()
+            .expect("valid identities must have config keys");
+        assert_eq!(keys.len(), 4);
+    }
+
+    #[test]
+    fn config_entry_key_is_reversible_and_dotted_path_safe() {
+        let instance = id(
+            "messaging.plugin",
+            PluginCapability::Channel,
+            "primary.東京",
+        );
+        let key = instance.config_entry_key().expect("valid config key");
+
+        assert_eq!(
+            key, "zpi1_WyJtZXNzYWdpbmcucGx1Z2luIiwiY2hhbm5lbCIsInByaW1hcnku5p2x5LqsIl0",
+            "persisted namespace encoding is a compatibility contract"
+        );
+        assert!(!key.contains('.'));
+        let payload = key.strip_prefix("zpi1_").expect("versioned prefix");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url payload");
+        let tuple: (String, PluginCapability, String) =
+            serde_json::from_slice(&decoded).expect("canonical JSON tuple");
+        assert_eq!(
+            tuple,
+            (
+                "messaging.plugin".to_string(),
+                PluginCapability::Channel,
+                "primary.東京".to_string()
+            )
         );
     }
 
@@ -304,6 +375,8 @@ mod tests {
         let clone = scope.clone();
 
         assert!(std::ptr::eq(scope.id(), clone.id()));
+        assert!(scope.same_issuance(&clone));
+        assert!(!scope.same_issuance(&test_scope(PluginCapability::Channel, "telegram.main", [])));
         assert!(scope.require_capability(PluginCapability::Channel).is_ok());
         assert!(scope.require_capability(PluginCapability::Tool).is_err());
     }
@@ -311,6 +384,14 @@ mod tests {
     #[test]
     fn manifest_admission_rejects_undeclared_capabilities_and_grants() {
         let manifest = test_manifest(PluginCapability::Tool, vec![PluginPermission::ConfigRead]);
+
+        let package_scope = PluginInstanceScope::for_package_binding(
+            &manifest,
+            PluginCapability::Tool,
+            [PluginPermission::ConfigRead],
+        )
+        .expect("package binding uses the admitted manifest name");
+        assert_eq!(package_scope.id().binding(), manifest.name.as_str());
 
         assert!(
             PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, "main", [])

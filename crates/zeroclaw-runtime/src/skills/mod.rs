@@ -2634,22 +2634,11 @@ pub fn install_extra_registry_skill_source(
 pub fn load_plugin_skills_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> (Vec<Skill>, Vec<DroppedSkill>) {
-    if !config.plugins.enabled {
+    if !config.plugins.enabled || !config.plugins.auto_discover {
         return (Vec::new(), Vec::new());
     }
 
-    let plugins_dir = config.plugins.resolved_plugins_dir();
-
-    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
-        &config.plugins.security.signature_mode,
-    );
-    let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
-
-    let host = match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
-        &plugins_dir,
-        signature_mode,
-        trusted_keys,
-    ) {
+    let host = match crate::plugin_runtime::plugin_host(config) {
         Ok(host) => host,
         Err(err) => {
             ::zeroclaw_log::record!(
@@ -2662,11 +2651,34 @@ pub fn load_plugin_skills_from_config(
             return (Vec::new(), Vec::new());
         }
     };
+    let plan = match crate::plugin_runtime::PluginActivationPlan::build(config, &host) {
+        Ok(plan) => plan,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                "failed to admit plugin skills"
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
 
     let allow_scripts = config.skills.allow_scripts;
     let mut skills = Vec::new();
     let mut dropped = Vec::new();
     for (manifest, skills_dir) in host.skill_plugin_details() {
+        if plan
+            .scope(
+                &manifest.name,
+                zeroclaw_plugins::PluginCapability::Skill,
+                &manifest.name,
+            )
+            .is_none()
+        {
+            continue;
+        }
         let (raw_skills, raw_dropped) = load_skills_from_directory(&skills_dir, allow_scripts);
         for raw in raw_skills {
             skills.push(namespace_plugin_skill(&manifest.name, raw));

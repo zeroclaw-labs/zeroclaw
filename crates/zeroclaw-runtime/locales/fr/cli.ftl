@@ -717,8 +717,8 @@ cli-plugin-install-resolving = Résolution de '{$source}' depuis le registre de 
 cli-plugin-installed-from = Plugin installé depuis {$source}
 cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clé de configuration ({$capability}) : {$key}
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : les noms de plugin contenant '.' ne peuvent pas être adressés par des chemins de configuration pointés (`config set` découpe sur '.'). Ajoutez manuellement un bloc [[plugins.entries]] avec `name = "{$name}"` au fichier de configuration.
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.

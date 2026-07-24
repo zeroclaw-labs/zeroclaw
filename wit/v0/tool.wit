@@ -39,6 +39,10 @@ interface tool {
 @unstable(feature = plugins-wit-v0)
 world tool-plugin {
     import logging;
+    /// Read schema-designated secrets for this admitted tool instance.
+    import secrets;
+    /// Read and update encrypted durable state for this admitted tool instance.
+    import state;
     export plugin-info;
     export tool;
 }

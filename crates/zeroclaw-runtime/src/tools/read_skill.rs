@@ -359,6 +359,7 @@ description = "Ship safely"
 
         let mut config = config_for_tmp(&tmp);
         config.plugins.enabled = true;
+        config.plugins.auto_discover = true;
         config.plugins.plugins_dir = plugins_dir.to_string_lossy().into_owned();
         let tool = make_tool(config);
 

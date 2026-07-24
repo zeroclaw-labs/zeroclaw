@@ -96,16 +96,7 @@ pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 // plugin host share one implementation (see zeroclaw-infra::net_guard).
 pub(crate) use zeroclaw_infra::net_guard::{is_non_global_v4, is_non_global_v6};
 
-pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
-    const EC2_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
-    const EC2_IMDS_V6: std::net::Ipv6Addr =
-        std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
-
-    match ip {
-        std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4,
-        std::net::IpAddr::V6(v6) => v6 == EC2_IMDS_V6,
-    }
-}
+pub(crate) use zeroclaw_infra::net_guard::is_cloud_metadata_ip;
 
 pub(crate) fn validate_resolved_ips_are_public(
     host: &str,
