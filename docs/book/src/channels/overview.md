@@ -29,6 +29,9 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Channel | Feature flag | Dedicated guide |
 |---|---|---|
 | Matrix | `channel-matrix` | [Matrix](./matrix.md) |
+| Telegram | `channel-telegram` | [Telegram](./telegram.md) |
+| Discord | `channel-discord` | [Discord](./discord.md) |
+| Slack | `channel-slack` | [Slack](./slack.md) |
 | Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
@@ -36,7 +39,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Twitch | `channel-twitch` | No dedicated guide |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
-| Discord, Slack, Telegram, iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
