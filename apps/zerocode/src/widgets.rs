@@ -292,6 +292,7 @@ use ratatui::{
     layout::Rect,
     widgets::{Block, Borders, Clear, List, ListItem, ListState},
 };
+use unicode_width::UnicodeWidthStr;
 
 pub struct PickerModal<'a> {
     title: &'a str,
@@ -317,10 +318,10 @@ impl<'a> PickerModal<'a> {
         // on the same rows the user sees.
         let longest = items
             .iter()
-            .map(|s| s.chars().count())
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
             .max()
             .unwrap_or(0)
-            .max(title.chars().count());
+            .max(UnicodeWidthStr::width(title));
         let inner_w = longest + 2; // 1 col padding each side
         let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
         let box_h = (items.len() + 2).clamp(3, area.height as usize) as u16;
@@ -472,6 +473,25 @@ mod info_bar_tests {
 #[cfg(test)]
 mod picker_tests {
     use super::*;
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_items() {
+        let items = vec!["界界界界界界".to_string()];
+
+        let area = PickerModal::area_for("Pick", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 16);
+    }
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_title() {
+        let items = vec!["one".to_string()];
+
+        let area =
+            PickerModal::area_for("界界界界界界界", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 18);
+    }
 
     #[test]
     fn new_defaults_to_first_when_no_default() {
