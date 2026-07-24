@@ -843,6 +843,38 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// Whether an endpoint explicitly rejected combining function tools with
+/// `reasoning_effort`.
+///
+/// This predicate is intentionally narrow: callers may retry once without the
+/// effort field only when the endpoint itself reports this exact capability
+/// mismatch. Other reasoning or tool errors must propagate unchanged.
+pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let lower = body.to_ascii_lowercase();
+    let mentions_reasoning_effort =
+        lower.contains("reasoning_effort") || lower.contains("reasoning effort");
+    let mentions_tools = lower.contains("tool");
+    let reports_incompatibility = [
+        "not supported",
+        "unsupported",
+        "cannot be used",
+        "can't be used",
+        "incompatible",
+        "not allowed",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint));
+
+    mentions_reasoning_effort && mentions_tools && reports_incompatibility
+}
+
 /// Format an error including its full source chain and sanitize the result.
 pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut formatted = String::new();
@@ -862,7 +894,17 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    let sanitized = sanitize_api_error(&body);
+    api_error_from_parts(model_provider, status, &body)
+}
+
+/// Build a sanitized model_provider error after a caller has already consumed
+/// the response body to classify a narrowly bounded fallback.
+pub(crate) fn api_error_from_parts(
+    model_provider: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    let sanitized = sanitize_api_error(body);
     ::zeroclaw_log::record!(
         ERROR,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -3426,6 +3468,27 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn tool_reasoning_rejection_detection_is_narrow() {
+        let reported = r#"{"error":{"message":"Function tools with reasoning effort are not supported for this model.","param":"reasoning_effort"}}"#;
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            reported
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNAUTHORIZED,
+            reported
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"function tools are not supported"}}"#
+        ));
+    }
 
     #[test]
     fn format_error_chain_includes_sources_and_sanitizes_output() {

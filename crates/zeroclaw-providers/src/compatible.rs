@@ -2925,7 +2925,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         let tools = self.convert_tool_specs_for_model(request.tools, model);
-        let native_request = self.build_native_tool_chat_request(
+        let mut native_request = self.build_native_tool_chat_request(
             &effective_messages,
             tools,
             model,
@@ -2933,6 +2933,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             !merge,
         );
         let tools_count = native_request.tools.as_ref().map_or(0, Vec::len);
+        let reasoning_effort_omitted =
+            self.reasoning_effort.is_some() && native_request.reasoning_effort.is_none();
+        let reasoning_effort_omission_reason =
+            reasoning_effort_omitted.then_some("model_ineligible");
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -2946,28 +2950,58 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         "native_tool_calling": self.native_tool_calling,
                         "tools_count": tools_count,
                         "tool_choice": native_request.tool_choice.as_deref(),
+                        "reasoning_effort_omitted": reasoning_effort_omitted,
+                        "reasoning_effort_omission_reason": reasoning_effort_omission_reason,
                     })),
                 "compatible provider request prepared"
             );
         }
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(
-                self.http_client().post(&url).json(&native_request),
-                credential.as_deref(),
-            )
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
-        };
+        let response = loop {
+            let response = match self
+                .apply_auth_header(
+                    self.http_client().post(&url).json(&native_request),
+                    credential.as_deref(),
+                )
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(chat_error) => return Err(chat_error.into()),
+            };
+            if response.status().is_success() {
+                break response;
+            }
 
-        if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
+
+            if tools_count > 0
+                && native_request.reasoning_effort.is_some()
+                && super::rejects_tools_with_reasoning_effort(status, &error)
+            {
+                native_request.reasoning_effort = None;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "provider": &self.name,
+                            "alias": &self.alias,
+                            "request_api": "chat_completions",
+                            "model": model,
+                            "stream": false,
+                            "tools_count": tools_count,
+                            "reasoning_effort_omitted": true,
+                            "reasoning_effort_omission_reason": "endpoint_rejected_tools_with_reasoning",
+                            "status": status.as_u16(),
+                        })),
+                    "compatible provider retrying without reasoning effort after endpoint capability rejection"
+                );
+                continue;
+            }
 
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
@@ -2984,7 +3018,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
-        }
+        };
 
         let native_response: ApiChatResponse = response.json().await?;
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
@@ -3055,35 +3089,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let has_tools = tools_owned.as_ref().is_some_and(|tools| !tools.is_empty());
             let effective_messages = Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            if ::zeroclaw_log::debug_enabled() {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                        .with_attrs(::serde_json::json!({
-                            "provider": &provider.name,
-                            "alias": &provider.alias,
-                            "request_api": "chat_completions",
-                            "model": &model,
-                            "stream": options_enabled,
-                            "native_tool_calling": provider.native_tool_calling,
-                            "tools_count": tools_count,
-                            "tool_choice": tools.as_ref().map(|_| "auto"),
-                        })),
-                    "compatible streaming provider request prepared"
-                );
-            }
+            let has_tools = tools_count > 0;
+            let reasoning_effort = provider.reasoning_effort_for_model(&model);
+            let reasoning_effort_omitted =
+                provider.reasoning_effort.is_some() && reasoning_effort.is_none();
+            let reasoning_effort_omission_reason =
+                reasoning_effort_omitted.then_some("model_ineligible");
 
             let payload_result = if has_tools {
                 serde_json::to_value(NativeChatRequest {
                     model: model.clone(),
                     messages: provider.convert_messages_for_native(&effective_messages, !merge),
                     temperature,
-                    reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    reasoning_effort: reasoning_effort.clone(),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(true)
                     } else {
@@ -3120,7 +3142,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     model: model.clone(),
                     messages,
                     temperature,
-                    reasoning_effort: provider.reasoning_effort_for_model(&model),
+                    reasoning_effort: reasoning_effort.clone(),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(false)
                     } else {
@@ -3136,13 +3158,32 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 })
             };
 
-            let payload = match payload_result {
+            let mut payload = match payload_result {
                 Ok(payload) => payload,
                 Err(error) => {
                     let _ = tx.send(Err(StreamError::Json(error))).await;
                     return;
                 }
             };
+            if ::zeroclaw_log::debug_enabled() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": &provider.name,
+                            "alias": &provider.alias,
+                            "request_api": "chat_completions",
+                            "model": &model,
+                            "stream": options_enabled,
+                            "native_tool_calling": provider.native_tool_calling,
+                            "tools_count": tools_count,
+                            "tool_choice": payload.get("tool_choice"),
+                            "reasoning_effort_omitted": reasoning_effort_omitted,
+                            "reasoning_effort_omission_reason": reasoning_effort_omission_reason,
+                        })),
+                    "compatible streaming provider request prepared"
+                );
+            }
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -3158,34 +3199,66 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             let targets_mistral_tool_call_contract = provider.targets_mistral_tool_call_contract();
 
-            let mut req_builder = client.post(&url).json(&payload);
-            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
-            req_builder = req_builder.header("Accept", "text/event-stream");
+            let response = loop {
+                let mut req_builder = client.post(&url).json(&payload);
+                req_builder =
+                    apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
+                req_builder = req_builder.header("Accept", "text/event-stream");
 
-            let response = match req_builder.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
-                        .await;
-                    return;
+                let response = match req_builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                            .await;
+                        return;
+                    }
+                };
+                if response.status().is_success() {
+                    break response;
                 }
-            };
 
-            if !response.status().is_success() {
                 let status = response.status();
                 let error = match response.text().await {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
+                if tools_count > 0
+                    && payload.get("reasoning_effort").is_some()
+                    && super::rejects_tools_with_reasoning_effort(status, &error)
+                {
+                    if let Some(object) = payload.as_object_mut() {
+                        object.remove("reasoning_effort");
+                    }
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "provider": &provider.name,
+                                "alias": &provider.alias,
+                                "request_api": "chat_completions",
+                                "model": &model,
+                                "stream": options_enabled,
+                                "tools_count": tools_count,
+                                "reasoning_effort_omitted": true,
+                                "reasoning_effort_omission_reason": "endpoint_rejected_tools_with_reasoning",
+                                "status": status.as_u16(),
+                            })),
+                        "compatible streaming provider retrying without reasoning effort after endpoint capability rejection"
+                    );
+                    continue;
+                }
+
                 let _ = tx
                     .send(Err(StreamError::ModelProvider(format!(
                         "{}: {}",
-                        status, error
+                        status,
+                        super::sanitize_api_error(&error)
                     ))))
                     .await;
                 return;
-            }
+            };
 
             let mut event_stream = sse_bytes_to_events_for_contract(
                 response,
@@ -3611,6 +3684,314 @@ mod tests {
             Some("auto"),
             "tool_choice must be 'auto' when tools are present; got: {value}"
         );
+    }
+
+    // A compatible endpoint may support tools and reasoning together. Preserve
+    // the operator-selected effort on the first request; the bounded HTTP
+    // fallback handles only endpoints that explicitly reject the combination.
+    #[test]
+    fn build_native_tool_chat_request_keeps_reasoning_effort_when_tools_present() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "description": "", "parameters": {} }
+        })];
+
+        let req = p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "capable endpoints must receive reasoning_effort with tools on the first request; got: {value}"
+        );
+    }
+
+    // Regression guard: the no-tools path must keep sending reasoning_effort
+    // for models that qualify, so the tool-bearing fix above doesn't
+    // regress the common case.
+    #[test]
+    fn build_native_tool_chat_request_keeps_reasoning_effort_when_no_tools() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "reasoning_effort must be present when no tools are sent; got: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capable_endpoint_keeps_reasoning_effort_with_tools_without_retry() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "capable endpoint must not be retried");
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert!(bodies[0].get("tools").is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejecting_endpoint_retries_once_without_reasoning_effort() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body.get("reasoning_effort").is_some();
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must be bounded to one retry");
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert!(
+            bodies[1].get("reasoning_effort").is_none(),
+            "retry must omit only reasoning_effort"
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_rejection_retries_once_without_reasoning_effort() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use futures_util::StreamExt as _;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body.get("reasoning_effort").is_some();
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let events = provider
+            .stream_chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Ok(StreamEvent::TextDelta(StreamChunk { delta, .. })) if delta == "ok"
+            )
+        }));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "stream fallback must retry exactly once");
+        assert!(bodies[0].get("reasoning_effort").is_some());
+        assert!(bodies[1].get("reasoning_effort").is_none());
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
     }
 
     #[test]
