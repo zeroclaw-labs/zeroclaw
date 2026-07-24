@@ -2324,18 +2324,37 @@ mod tests {
         let db_path = cron_db(&config);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
-        // Pre-create the DB with shell_output_format as nullable TEXT so that
-        // the normal migration path sees it already exists and leaves it as-is.
+        // Pre-create the DB with the complete legacy table shape (all columns
+        // that get_job() SELECTs) so SQLite can prepare the statement and
+        // map_cron_job_row() reaches decode_shell_output_format. The
+        // shell_output_format column is intentionally nullable so the normal
+        // migration path sees it already exists and leaves it as-is.
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS cron_jobs (
-                    id               TEXT PRIMARY KEY,
-                    expression       TEXT NOT NULL,
-                    command          TEXT NOT NULL,
-                    created_at       TEXT NOT NULL,
-                    next_run         TEXT NOT NULL,
-                    shell_output_format TEXT
+                    id                   TEXT PRIMARY KEY,
+                    expression           TEXT NOT NULL,
+                    command              TEXT NOT NULL,
+                    schedule             TEXT,
+                    job_type             TEXT NOT NULL DEFAULT 'shell',
+                    prompt               TEXT,
+                    name                 TEXT,
+                    session_target       TEXT NOT NULL DEFAULT 'isolated',
+                    model                TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 1,
+                    delivery             TEXT,
+                    delete_after_run     INTEGER NOT NULL DEFAULT 0,
+                    allowed_tools        TEXT,
+                    created_at           TEXT NOT NULL,
+                    next_run             TEXT NOT NULL,
+                    last_run             TEXT,
+                    last_status          TEXT,
+                    last_output          TEXT,
+                    source               TEXT DEFAULT 'imperative',
+                    uses_memory          INTEGER NOT NULL DEFAULT 1,
+                    agent_alias          TEXT NOT NULL DEFAULT '',
+                    shell_output_format  TEXT
                 );",
             )
             .unwrap();
@@ -2354,9 +2373,13 @@ mod tests {
             .unwrap();
         }
 
+        let err = get_job(&config, "shell-output-format-null").expect_err(
+            "NULL shell_output_format must surface an error, not silently become Wrapped",
+        );
+        let msg = err.to_string();
         assert!(
-            get_job(&config, "shell-output-format-null").is_err(),
-            "NULL shell_output_format must surface an error, not silently become Wrapped"
+            msg.contains("NULL"),
+            "Error should identify the NULL shell_output_format column, got: {msg}"
         );
     }
 
