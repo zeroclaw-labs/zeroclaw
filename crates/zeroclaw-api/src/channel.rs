@@ -649,7 +649,9 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Minimum delay (ms) between successive messages in multi-message mode.
+    /// The message boundary is channel-specific (for example, Telegram uses
+    /// completed agent turns).
     fn multi_message_delay_ms(&self) -> u64 {
         800
     }
@@ -671,6 +673,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Show a progress/status update (e.g. tool execution status).
     async fn update_draft_progress(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Flush the current agent text turn as an outbound message in multi-message
+    /// streaming mode. Called when an LLM turn completes (e.g. before tool
+    /// execution). Default: no-op.
+    async fn flush_draft_turn(
         &self,
         _recipient: &str,
         _message_id: &str,

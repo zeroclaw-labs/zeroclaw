@@ -13518,7 +13518,9 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
-    /// Send the response as multiple separate messages at paragraph boundaries.
+    /// Send the response as multiple separate messages. The boundary between
+    /// messages is channel-specific (for example, Telegram splits at completed
+    /// agent turns).
     #[serde(rename = "multi_message")]
     MultiMessage,
 }
@@ -13546,8 +13548,12 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+/// Default pacing between consecutive messages in MultiMessage stream mode.
+/// Channel constructors must reference this instead of duplicating the value.
+pub const DEFAULT_MULTI_MESSAGE_DELAY_MS: u64 = 800;
+
 fn default_multi_message_delay_ms() -> u64 {
-    800
+    DEFAULT_MULTI_MESSAGE_DELAY_MS
 }
 
 fn default_telegram_approval_timeout_secs() -> u64 {
@@ -13605,6 +13611,13 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Minimum delay (ms) between successive multi_message narration messages
+    /// (and before the approval prompt) for one recipient. Does not apply to the
+    /// fixed pacing between physical fragments of a single over-4096-character
+    /// message. Only used when `stream_mode = "multi_message"`.
+    #[tab(Behavior)]
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
     /// Inbound message debounce window in milliseconds for this Telegram alias.
     /// When set, overrides the global `[channels].debounce_ms` for this channel
     /// only. `0` or unset falls back to the global value.
@@ -13664,6 +13677,7 @@ impl Default for TelegramConfig {
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
@@ -24808,6 +24822,7 @@ auto_save = true
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
+                        multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
@@ -26255,6 +26270,7 @@ default_temperature = 0.7
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
             ack_reactions: None,
@@ -30824,6 +30840,7 @@ high_entropy_tokens = false
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
+                multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,

@@ -5162,12 +5162,32 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
+            let multi_message_flush = channel.supports_multi_message_streaming();
             Some(zeroclaw_spawn::spawn!(async move {
                 use zeroclaw_runtime::agent::loop_::StreamDelta;
                 let mut accumulated = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
                         StreamDelta::Status(text) => {
+                            if multi_message_flush {
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .flush_draft_turn(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft turn flush failed"
+                                    );
+                                }
+                            }
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -5201,6 +5221,32 @@ async fn process_channel_message_body(
                                     "Draft update failed"
                                 );
                             }
+                        }
+                        StreamDelta::FlushBarrier(ack) => {
+                            // Queue FIFO guarantees all prior Text deltas were
+                            // consumed above; flush the turn narration, then
+                            // release the agent loop (approval gate) waiting
+                            // on the ack.
+                            if multi_message_flush {
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .flush_draft_turn(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft barrier flush failed"
+                                    );
+                                }
+                            }
+                            StreamDelta::ack_flush_barrier(&ack);
                         }
                     }
                 }
@@ -14641,6 +14687,88 @@ api_key = "anthropic-key"
         }
     }
 
+    /// Native-tools provider that narrates before requesting a tool call
+    /// (first turn), then finishes with plain text (second turn). Drives the
+    /// multi_message approval-order regression test end to end.
+    #[cfg(feature = "channel-telegram")]
+    struct NarratingNativeToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl ModelProvider for NarratingNativeToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("Понял, запускаю инструмент".to_string()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "mock_price".to_string(),
+                        arguments: r#"{"symbol":"BTC"}"#.to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("Инструмент отклонён, завершаю ход.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    impl ::zeroclaw_api::attribution::Attributable for NarratingNativeToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NarratingNativeToolProvider"
+        }
+    }
+
     struct SessionsCurrentModelProvider;
 
     #[async_trait::async_trait]
@@ -16000,6 +16128,193 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    /// End-to-end multi_message regression: in MultiMessage stream mode the
+    /// turn's pre-tool narration must reach Telegram *before* the tool-approval
+    /// inline keyboard. The narration rides the async delta queue into the
+    /// draft updater while `request_approval` goes to the channel directly; the
+    /// approval gate's flush barrier (zeroclaw-runtime `turn/approval_gate.rs`)
+    /// makes the gate wait until the updater consumed and flushed the
+    /// narration, so the `sendMessage` order on the wire is narration then
+    /// approval prompt.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn multi_message_narration_reaches_telegram_before_approval_prompt() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Catch-all for every Bot API POST the flow hits (sendMessage,
+        // sendChatAction, setMessageReaction, ...). The test asserts on the
+        // chronological *order* of recorded requests, not on mock matching.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{Config, TelegramConfig};
+
+        let mut cfg = Config::default();
+        cfg.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                multi_message_delay_ms: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(cfg));
+
+        let telegram: Arc<dyn Channel> = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_persistence(config_arc)
+            .with_streaming(zeroclaw_config::schema::StreamMode::MultiMessage, 750)
+            .with_api_base(mock_server.uri())
+            .with_approval_timeout_secs(0),
+        );
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(telegram.name().to_string(), telegram);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(NarratingNativeToolProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "123".to_string(),
+                content: "Запусти инструмент".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        let send_message_bodies: Vec<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+
+        let narration_idx = send_message_bodies
+            .iter()
+            .position(|body| body.contains("Понял, запускаю инструмент"))
+            .unwrap_or_else(|| {
+                panic!("narration sendMessage missing; bodies: {send_message_bodies:?}")
+            });
+        let approval_idx = send_message_bodies
+            .iter()
+            .position(|body| body.contains("Tool approval required"))
+            .unwrap_or_else(|| {
+                panic!("approval sendMessage missing; bodies: {send_message_bodies:?}")
+            });
+        assert!(
+            narration_idx < approval_idx,
+            "narration (sendMessage #{narration_idx}) must reach Telegram before \
+             the approval prompt (sendMessage #{approval_idx}); bodies: \
+             {send_message_bodies:?}"
+        );
     }
 
     #[tokio::test]
@@ -25812,6 +26127,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,
@@ -25841,6 +26157,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 ack_reactions: None,

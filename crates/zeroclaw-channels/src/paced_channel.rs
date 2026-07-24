@@ -380,6 +380,12 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn flush_draft_turn(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        self.inner
+            .flush_draft_turn(recipient, message_id, text)
+            .await
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
