@@ -524,18 +524,21 @@ fn attachment_row_at(
 fn attachment_remove_at(
     area: Option<Rect>,
     first_index: usize,
+    attachments: &[PendingAttachment],
     column: u16,
     row: u16,
 ) -> Option<usize> {
     let area = area?;
+    let index = attachment_row_at(Some(area), first_index, column, row)?;
+    let attachment = attachments.get(index)?;
+    let (_, remove_col) = attachment_line(index, &attachment.label(), area.width);
+    let remove_col = remove_col?;
     let remove_width = crate::display_width::display_width(ATTACHMENT_REMOVE_LABEL) as u16;
-    if area.width < remove_width
-        || column < area.x + area.width - remove_width
-        || !mouse::in_rect(column, row, area)
-    {
+    let relative_col = column - area.x;
+    if relative_col < remove_col || relative_col >= remove_col + remove_width {
         return None;
     }
-    Some(first_index + usize::from(row - area.y))
+    Some(index)
 }
 
 fn attachment_line(index: usize, label: &str, width: u16) -> (String, Option<u16>) {
@@ -545,11 +548,15 @@ fn attachment_line(index: usize, label: &str, width: u16) -> (String, Option<u16
     }
 
     let main_width = width - remove_width;
+    if main_width == 0 {
+        return (String::new(), Some(0));
+    }
+
     let raw = format!(" [{index}] {label}");
-    let mut main = truncate_to_cells(&raw, main_width as usize);
-    let padding = main_width as usize - crate::display_width::display_width(&main);
-    main.push_str(&" ".repeat(padding));
-    (main, Some(main_width))
+    let mut main = truncate_to_cells(&raw, main_width.saturating_sub(1) as usize);
+    main.push(' ');
+    let remove_col = crate::display_width::display_width(&main) as u16;
+    (main, Some(remove_col))
 }
 
 fn truncate_to_cells(text: &str, max_width: usize) -> String {
@@ -1330,6 +1337,7 @@ impl InputBarState {
                     if let Some(index) = attachment_remove_at(
                         self.last_attachment_manager_area,
                         first_index,
+                        &self.pending_attachments,
                         mouse.column,
                         mouse.row,
                     ) {
@@ -1354,8 +1362,13 @@ impl InputBarState {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(index) =
-                attachment_remove_at(self.last_attachment_area, 0, mouse.column, mouse.row)
+            && let Some(index) = attachment_remove_at(
+                self.last_attachment_area,
+                0,
+                &self.pending_attachments,
+                mouse.column,
+                mouse.row,
+            )
         {
             self.remove_attachment(index);
             return true;
@@ -2108,7 +2121,15 @@ mod tests {
 
         assert_eq!(remove_col, Some(17));
         assert_eq!(crate::display_width::display_width(&main), 17);
-        assert!(main.ends_with('…'));
+        assert!(main.trim_end().ends_with('…'));
+    }
+
+    #[test]
+    fn attachment_line_places_remove_control_next_to_short_label() {
+        let (main, remove_col) = attachment_line(0, "one.png", 40);
+
+        assert_eq!(main, " [0] one.png ");
+        assert_eq!(remove_col, Some(13));
     }
 
     #[test]
@@ -2414,6 +2435,18 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
 
+        assert!(!consumed);
+        assert_eq!(bar.pending_attachments().len(), 2);
+
+        let (_, remove_col) = attachment_line(1, &bar.pending_attachments()[1].label(), area.width);
+
+        let consumed = bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + remove_col.expect("remove control rendered"),
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
         assert!(consumed);
         assert_eq!(bar.pending_attachments().len(), 1);
         assert_eq!(bar.pending_attachments()[0].filename, "one.png");
@@ -2437,10 +2470,11 @@ mod tests {
         let area = bar
             .last_attachment_manager_area
             .expect("attachment manager rendered");
+        let (_, remove_col) = attachment_line(9, &bar.pending_attachments()[9].label(), area.width);
 
         let consumed = bar.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: area.x + area.width - 2,
+            column: area.x + remove_col.expect("remove control rendered"),
             row: area.y + 7,
             modifiers: KeyModifiers::NONE,
         });
