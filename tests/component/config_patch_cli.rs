@@ -277,6 +277,56 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
     );
 }
 
+#[test]
+fn config_patch_json_missing_value_field_emits_structured_error_envelope() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/gateway/host"}]"#,
+    );
+
+    assert_eq!(envelope["code"], "value_type_mismatch");
+    assert_eq!(envelope["path"], "gateway.host");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("missing `value` field"),
+        "message should describe the missing `value` field: {envelope}"
+    );
+}
+
+#[test]
+fn config_patch_json_value_coercion_failure_emits_structured_error_envelope() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // `enabled` is a bool field; a JSON array is the wrong shape and must be
+    // rejected by `coerce_for_set_prop` before ever reaching `set_prop`.
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/channels/telegram/coercebot/enabled","value":["not","a","bool"]}]"#,
+    );
+
+    assert_eq!(envelope["code"], "value_type_mismatch");
+    assert_eq!(envelope["path"], "channels.telegram.coercebot.enabled");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("bool field requires"),
+        "message should describe the bool coercion failure: {envelope}"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("coercebot"),
+        "a coercion failure must not leave a phantom alias on disk: {saved}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Alias auto-materialization (mirrors `PATCH /api/config`'s
 // `ensure_map_key_for_path` guard in `handle_patch`, api_config.rs:2040-2051)
