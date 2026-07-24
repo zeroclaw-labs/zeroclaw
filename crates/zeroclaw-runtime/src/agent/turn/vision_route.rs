@@ -54,9 +54,8 @@ pub(crate) fn resolve_vision_provider(
                         })),
                     "vision model_provider construction failed"
                 );
-                anyhow::Error::msg(format!(
-                    "failed to create vision model_provider '{vp}': {error}"
-                ))
+                let context = format!("failed to create vision model_provider '{vp}': {error}");
+                error.context(context)
             })?;
             let vision_model = multimodal_config
                 .vision_model
@@ -170,6 +169,35 @@ pub(crate) async fn prepare_messages_for_iteration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NonVisionTestProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NonVisionTestProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for NonVisionTestProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NonVisionTestProvider"
+        }
+    }
 
     #[tokio::test]
     async fn prepare_messages_for_iteration_populates_and_reuses_image_cache() {
@@ -298,32 +326,6 @@ mod tests {
     fn resolve_vision_provider_honors_configured_alias_vision_override() {
         use zeroclaw_config::schema::{Config, MultimodalConfig};
 
-        struct NonVisionPrimary;
-        #[async_trait::async_trait]
-        impl ModelProvider for NonVisionPrimary {
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-        }
-        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
-            fn role(&self) -> zeroclaw_api::attribution::Role {
-                zeroclaw_api::attribution::Role::Provider(
-                    zeroclaw_api::attribution::ProviderKind::Model(
-                        zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-            fn alias(&self) -> &str {
-                "NonVisionPrimary"
-            }
-        }
-
         let config: Config = toml::from_str(
             r#"
 schema_version = 3
@@ -343,7 +345,7 @@ vision = false
         // so `expect_err` will not compile).
         let err = resolve_vision_provider(
             Some(&config),
-            &NonVisionPrimary,
+            &NonVisionTestProvider,
             &history,
             &multimodal,
             "primary",
@@ -354,6 +356,43 @@ vision = false
         assert!(
             err.to_string().contains("does not support vision"),
             "expected the vision-route capability error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_vision_provider_preserves_hailo_capability_error_type() {
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.hailo_ollama.text_only]
+model = "qwen3:1.7b"
+vision = true
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("hailo_ollama.text_only".to_string()),
+            ..Default::default()
+        };
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let error = resolve_vision_provider(
+            Some(&config),
+            &NonVisionTestProvider,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .err()
+        .expect("Hailo must reject a forced vision route");
+        let capability = error
+            .downcast_ref::<ProviderCapabilityError>()
+            .expect("vision construction failure must preserve its capability type");
+        assert_eq!(capability.capability, "vision");
+        assert!(
+            error.to_string().contains("does not support vision=true"),
+            "construction context must retain the actionable cause: {error}"
         );
     }
 
@@ -382,32 +421,6 @@ vision = false
             Json(json!({
                 "choices": [{"message": {"content": "ok"}}]
             }))
-        }
-
-        struct NonVisionPrimary;
-        #[async_trait::async_trait]
-        impl ModelProvider for NonVisionPrimary {
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-        }
-        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
-            fn role(&self) -> zeroclaw_api::attribution::Role {
-                zeroclaw_api::attribution::Role::Provider(
-                    zeroclaw_api::attribution::ProviderKind::Model(
-                        zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-            fn alias(&self) -> &str {
-                "NonVisionPrimary"
-            }
         }
 
         let (model_tx, mut model_rx) = mpsc::unbounded_channel();
@@ -444,7 +457,7 @@ model = "vision-model"
 
         let (vision_provider, degrade) = resolve_vision_provider(
             Some(&config),
-            &NonVisionPrimary,
+            &NonVisionTestProvider,
             &history,
             &multimodal,
             "primary",
@@ -491,7 +504,7 @@ model = "vision-model"
         };
         let (vision_provider, _) = resolve_vision_provider(
             Some(&config),
-            &NonVisionPrimary,
+            &NonVisionTestProvider,
             &history,
             &explicit,
             "primary",

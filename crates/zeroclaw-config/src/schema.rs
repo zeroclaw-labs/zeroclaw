@@ -29,6 +29,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.copilot",
     "model_provider.gemini",
     "model_provider.glm",
+    "model_provider.hailo_ollama",
     "model_provider.ollama",
     "model_provider.openai",
     "model_provider.openrouter",
@@ -1310,6 +1311,39 @@ pub struct OllamaModelProviderConfig {
     /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_override: Option<f64>,
+}
+
+// ── Hailo-Ollama (native local-default endpoint) ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HailoOllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for HailoOllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => "http://localhost:8000",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hailo_ollama"]
+pub struct HailoOllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Maximum time to wait for Hailo's single generation slot.
+    /// Uses the provider default when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_secs: Option<u64>,
 }
 
 // ── Together ──
@@ -3250,6 +3284,7 @@ impl_default_family_endpoint! {
     AtomicChatModelProviderConfig,
     OpenRouterModelProviderConfig,
     OllamaModelProviderConfig,
+    HailoOllamaModelProviderConfig,
     TogetherModelProviderConfig,
     FireworksModelProviderConfig,
     GroqModelProviderConfig,
@@ -9808,23 +9843,63 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
     client
 }
 
-pub fn build_runtime_proxy_client_with_timeouts(
+/// Build and cache a runtime-proxy-aware HTTP client with explicit deadlines.
+///
+/// Unlike [`build_runtime_proxy_client_with_timeouts`], this helper never
+/// substitutes an unconfigured default client when construction fails.
+///
+/// # Errors
+///
+/// Returns an error when the canonical runtime proxy configuration is invalid
+/// or when the configured HTTP client cannot be built.
+pub fn try_build_runtime_proxy_client_with_timeouts(
     service_key: &str,
     timeout_secs: u64,
     connect_timeout_secs: u64,
-) -> reqwest::Client {
+) -> Result<reqwest::Client> {
     let cache_key =
         runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs));
     if let Some(client) = runtime_proxy_cached_client(&cache_key) {
-        return client;
+        return Ok(client);
     }
 
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
-    let builder = apply_runtime_proxy_to_builder(builder, service_key);
-    let client = builder.build().unwrap_or_else(|error| {
-        ::zeroclaw_log::record!(
+    let proxy = runtime_proxy_config();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "runtime_proxy_config_invalid",
+                        "service_key": service_key,
+                    })),
+                "Runtime proxy configuration is invalid"
+            );
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    let builder = proxy.apply_to_reqwest_builder(builder, service_key);
+    let client = builder
+        .build()
+        .with_context(|| format!("Failed to build proxied timeout client for {service_key}"))?;
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    Ok(client)
+}
+
+pub fn build_runtime_proxy_client_with_timeouts(
+    service_key: &str,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    try_build_runtime_proxy_client_with_timeouts(service_key, timeout_secs, connect_timeout_secs)
+        .unwrap_or_else(|error| {
+            ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
@@ -9833,10 +9908,8 @@ pub fn build_runtime_proxy_client_with_timeouts(
                 ),
             "Failed to build proxied timeout client: "
         );
-        reqwest::Client::new()
-    });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
-    client
+            reqwest::Client::new()
+        })
 }
 
 /// Build an HTTP client for a channel, using an explicit per-channel proxy URL
@@ -24578,6 +24651,36 @@ auto_save = true
     }
 
     #[test]
+    async fn hailo_ollama_alias_resolves_independently_from_ollama() {
+        let config = parse_test_config(
+            r#"
+[providers.models.hailo_ollama.edge]
+uri = "http://127.0.0.1:11436"
+model = "qwen3:1.7b"
+native_tools = false
+queue_timeout_secs = 9
+"#,
+        );
+
+        let hailo = config
+            .providers
+            .models
+            .find("hailo_ollama", "edge")
+            .expect("typed hailo_ollama alias must resolve");
+        assert_eq!(hailo.uri.as_deref(), Some("http://127.0.0.1:11436"));
+        assert_eq!(hailo.model.as_deref(), Some("qwen3:1.7b"));
+        assert_eq!(hailo.native_tools, Some(false));
+        assert_eq!(
+            config.providers.models.hailo_ollama["edge"].queue_timeout_secs,
+            Some(9)
+        );
+        assert!(
+            config.providers.models.find("ollama", "edge").is_none(),
+            "hailo_ollama must not populate the ordinary ollama slot"
+        );
+    }
+
+    #[test]
     async fn ollama_alias_tuning_fields_roundtrip() {
         // Ollama-specific tuning lives on `OllamaModelProviderConfig`,
         // not on the generic `ModelProviderConfig` base. These knobs
@@ -28969,6 +29072,24 @@ api_token = "tok"
     }
 
     #[test]
+    async fn proxy_config_accepts_exact_hailo_model_provider_selector() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        proxy
+            .validate()
+            .expect("canonical Hailo selector validates");
+        assert!(ProxyConfig::supported_service_keys().contains(&"model_provider.hailo_ollama"));
+        assert!(proxy.should_apply_to_service("model_provider.hailo_ollama"));
+        assert!(!proxy.should_apply_to_service("model_provider.ollama"));
+    }
+
+    #[test]
     async fn google_workspace_allowed_operations_require_methods() {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -29085,8 +29206,18 @@ api_token = "tok"
         }
     }
 
+    static RUNTIME_PROXY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn runtime_proxy_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        match RUNTIME_PROXY_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _guard = runtime_proxy_test_guard();
         let service_key = format!(
             "model_provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -29107,7 +29238,68 @@ api_token = "tok"
     }
 
     #[test]
+    async fn fallible_runtime_proxy_timeout_client_uses_canonical_cache() {
+        let _guard = runtime_proxy_test_guard();
+        let service_key = format!(
+            "model_provider.fallible_cache_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(10));
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&cache_key));
+
+        let _client = try_build_runtime_proxy_client_with_timeouts(&service_key, 30, 10)
+            .expect("fallible client builder succeeds");
+        assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn fallible_runtime_proxy_timeout_client_rejects_invalid_proxy_config() {
+        let _guard = runtime_proxy_test_guard();
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("not-a-proxy-url".to_string()),
+            ..Default::default()
+        });
+
+        let result =
+            try_build_runtime_proxy_client_with_timeouts("model_provider.hailo_ollama", 30, 10);
+        set_runtime_proxy_config(previous);
+
+        let error = result
+            .expect_err("fallible proxy client must reject an invalid runtime proxy")
+            .to_string();
+        assert!(
+            error.contains("Invalid runtime proxy configuration"),
+            "unexpected invalid-proxy error: {error}"
+        );
+    }
+
+    #[test]
+    async fn fallible_runtime_proxy_timeout_client_ignores_invalid_disabled_proxy() {
+        let _guard = runtime_proxy_test_guard();
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: false,
+            http_proxy: Some("not-a-proxy-url".to_string()),
+            ..Default::default()
+        });
+
+        let result =
+            try_build_runtime_proxy_client_with_timeouts("model_provider.hailo_ollama", 30, 10);
+        set_runtime_proxy_config(previous);
+
+        result.expect("disabled proxy configuration must not affect Hailo transport");
+    }
+
+    #[test]
     async fn proxy_reload_applies_new_config_through_rwlock() {
+        let _guard = runtime_proxy_test_guard();
         set_runtime_proxy_config(ProxyConfig {
             enabled: true,
             http_proxy: Some("http://boot.example:3128".to_string()),
@@ -29134,6 +29326,7 @@ api_token = "tok"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _guard = runtime_proxy_test_guard();
         let service_key = format!(
             "model_provider.cache_timeout_test.{}",
             std::time::SystemTime::now()

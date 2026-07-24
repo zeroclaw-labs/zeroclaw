@@ -26,6 +26,15 @@ OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "resp
 
 Local inference via Ollama's native `/api/chat`. Schema-based structured output via `format`. No API key.
 
+### Hailo-Ollama: slot `hailo_ollama`
+
+Local Hailo-accelerated inference through Hailo-Ollama's native `/api/chat` and
+`/api/tags` endpoints. The explicit compatibility mode normalizes and bounds
+history, disables streaming and thinking, and serializes access through a shared
+per-endpoint hardware gate. Ambiguous post-connect transport failures, including
+request timeouts, quarantine that endpoint until ZeroClaw restarts. No API key,
+native tool calling, or vision.
+
 ### Bedrock: slot `bedrock`
 
 ### Gemini: slot `gemini`
