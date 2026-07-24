@@ -376,29 +376,30 @@ pub(crate) fn fallback_auth_ready_for_alias(
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtomicChatModelProviderConfig, AuthMode, AvianModelProviderConfig, AzureModelProviderConfig,
-    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
-    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
-    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
-    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
-    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
+    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
+    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
+    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
+    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
+    FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
+    GeminiModelProviderConfig, GithubModelsModelProviderConfig, GlmModelProviderConfig,
+    GroqModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
+    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 /// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
@@ -414,6 +415,7 @@ pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
         "novita" => <NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
         "nebius" => <NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
         "nvidia" => <NvidiaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "atlascloud" => <AtlasCloudModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
         _ => return None,
     })
 }
@@ -434,6 +436,12 @@ impl CompatFamilySpec for CloudflareModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://gateway.ai.cloudflare.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("cloudflare-ai-gateway");
+}
+impl CompatFamilySpec for AtlasCloudModelProviderConfig {
+    const DISPLAY: &'static str = "Atlas Cloud";
+    const DEFAULT_URL: &'static str = "https://api.atlascloud.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
 }
 impl CompatFamilySpec for SyntheticModelProviderConfig {
     const DISPLAY: &'static str = "Synthetic";
@@ -1617,6 +1625,20 @@ mod tests {
         assert_eq!(
             KiloEndpoint::default().uri(),
             "https://api.kilo.ai/api/gateway"
+        );
+    }
+
+    #[test]
+    fn atlascloud_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{AtlasCloudEndpoint, ModelEndpoint};
+        assert_eq!(
+            <AtlasCloudModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            AtlasCloudEndpoint::default().uri(),
+            "schema AtlasCloudEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert_eq!(
+            get_default_url("atlascloud"),
+            Some("https://api.atlascloud.ai/v1")
         );
     }
 

@@ -880,16 +880,26 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
 }
 
 /// Resolve API key for a model_provider from config and environment variables.
-/// Return the typed-alias `api_key` field, trimmed. Env-var overrides land on
-/// the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
+/// Return the typed-alias `api_key` field, trimmed. Most env-var overrides land
+/// on the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
 fn resolve_model_provider_credential(
-    _name: &str,
+    name: &str,
     credential_override: Option<&str>,
 ) -> Option<String> {
     credential_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+        .or_else(|| {
+            if name == "atlascloud" {
+                std::env::var("ATLASCLOUD_API_KEY")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            } else {
+                None
+            }
+        })
 }
 
 /// Single source of truth for `(key_prefix, canonical_model_provider_family)`
@@ -1025,6 +1035,7 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "lambda-ai" => "lambda_ai",
         "github-models" => "github_models",
         "step" => "stepfun",
+        "atlas" | "atlas-cloud" | "atlas_cloud" => "atlascloud",
         // Moonshot / Kimi (regional + code variants fold to one family).
         "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
         | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
@@ -1886,6 +1897,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
+            ("atlascloud", "Atlas Cloud", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2115,6 +2127,42 @@ mod tests {
     fn resolve_provider_credential_filters_empty_override() {
         assert!(resolve_model_provider_credential("openrouter", Some("   ")).is_none());
         assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn resolve_atlascloud_credential_falls_back_to_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ATLASCLOUD_API_KEY", Some("  atlas-env-key  "));
+        assert_eq!(
+            resolve_model_provider_credential("atlascloud", None).as_deref(),
+            Some("atlas-env-key")
+        );
+        assert_eq!(
+            resolve_model_provider_credential("atlascloud", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+        assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn atlascloud_aliases_are_canonicalized() {
+        for alias in ["atlas", "atlas-cloud", "atlas_cloud", "atlascloud"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), "atlascloud");
+        }
+    }
+
+    #[test]
+    fn atlascloud_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let atlascloud = providers
+            .iter()
+            .find(|provider| provider.name == "atlascloud")
+            .expect("Atlas Cloud provider should be listed");
+        assert_eq!(atlascloud.display_name, "Atlas Cloud");
+        assert!(
+            create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
+            "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
     }
 
     #[test]
