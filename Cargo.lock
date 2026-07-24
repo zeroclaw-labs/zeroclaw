@@ -13733,6 +13733,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "url",
+ "zeroclaw-commands",
 ]
 
 [[package]]
