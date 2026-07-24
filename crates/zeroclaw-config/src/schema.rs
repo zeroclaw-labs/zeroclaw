@@ -14724,12 +14724,28 @@ pub struct NextcloudTalkConfig {
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     #[tab(Connection)]
     pub base_url: String,
-    /// Bot app token used for OCS API bearer auth.
+    /// Deprecated, unused. Nextcloud Talk sends do not authenticate via
+    /// OCS bearer auth (see `bot_token`); this field is only accepted so
+    /// existing configs that set it don't fail to parse. Safe to remove
+    /// from your config.
+    #[serde(default)]
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub app_token: String,
-    /// Shared secret for webhook signature verification.
+    pub app_token: Option<String>,
+    /// Bot secret used to sign outbound bot-API requests. Nextcloud issues
+    /// ONE secret per installed bot, used for both directions: verifying
+    /// inbound webhook signatures and signing outbound bot-API requests.
+    /// If unset, falls back to `webhook_secret`; set this only if your
+    /// bot genuinely uses two different secrets. Sending fails closed
+    /// (no request is sent) when neither is configured.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub bot_token: Option<String>,
+    /// Shared secret for webhook signature verification (and, when
+    /// `bot_token` is unset, for signing outbound bot-API requests too;
+    /// see `bot_token`).
     ///
     /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
     #[serde(default)]
@@ -28985,7 +29001,8 @@ group_policy = "disabled"
         let nc = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
+            app_token: None,
+            bot_token: None,
             webhook_secret: Some("webhook-secret".into()),
             proxy_url: None,
             bot_name: None,
@@ -28997,15 +29014,26 @@ group_policy = "disabled"
         let json = serde_json::to_string(&nc).unwrap();
         let parsed: NextcloudTalkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.base_url, "https://cloud.example.com");
-        assert_eq!(parsed.app_token, "app-token");
+        assert!(parsed.app_token.is_none());
         assert_eq!(parsed.webhook_secret.as_deref(), Some("webhook-secret"));
     }
 
     #[test]
     async fn nextcloud_talk_config_defaults_optional_fields() {
-        let json = r#"{"base_url":"https://cloud.example.com","app_token":"app-token"}"#;
+        let json = r#"{"base_url":"https://cloud.example.com"}"#;
         let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.webhook_secret.is_none());
+        assert!(parsed.app_token.is_none());
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_accepts_legacy_app_token_without_using_it() {
+        // Pre-existing configs may still set the now-deprecated app_token;
+        // it must parse (not fail-closed the whole config) and just be
+        // carried as a no-op field.
+        let json = r#"{"base_url":"https://cloud.example.com","app_token":"legacy-value"}"#;
+        let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.app_token.as_deref(), Some("legacy-value"));
     }
 
     // ── Config file permission hardening (Unix only) ───────────────
