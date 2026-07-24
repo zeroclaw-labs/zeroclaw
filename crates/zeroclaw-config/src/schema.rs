@@ -21021,7 +21021,7 @@ impl Config {
             .context("Failed to parse existing config for incremental save")?;
 
         for path in &self.dirty_paths {
-            apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table);
+            apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
         // Stamp the current schema version. An incremental save writes
@@ -21176,10 +21176,10 @@ fn apply_dirty_path(
     dotted: &str,
     full_table: &toml::Table,
     default_table: &toml::Table,
-) {
+) -> Result<()> {
     let raw: Vec<&str> = dotted.split('.').collect();
     if raw.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Natural-key `Vec<T>` sections (`#[natural_key = "<f>"]`, currently
@@ -21194,7 +21194,21 @@ fn apply_dirty_path(
     // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
     if let Some(section) = find_natural_key_section_for_path(dotted) {
         apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
-        return;
+        return Ok(());
+    }
+
+    // `HashMap<String, T>` sections whose key is a `#[resource_key]`
+    // (drawn from another domain — a model id, tool name, …) may
+    // themselves contain dots, e.g. `gpt-4.1` in
+    // `cost.rates.providers.models.openai.gpt-4.1.input_per_mtok`. The
+    // blind `raw.split('.')` above and the generic walker below both
+    // assume one segment == one dot-delimited token, so a dotted key
+    // fragments into bogus segments (`gpt-4`, `1`), the lookup below
+    // finds nothing, and the write silently turns into a no-op delete.
+    // Longest-match the key against the section's live keys instead —
+    // same precedent as the natural-key branch above.
+    if let Some(section) = find_map_key_section_for_path(dotted) {
+        return apply_dirty_map_key_path(root, &section, dotted, full_table, default_table);
     }
 
     // Resolve each segment against the in-memory table: struct fields
@@ -21205,23 +21219,8 @@ fn apply_dirty_path(
     // "delete this path" — silently dropping every cost.rates save.
     let segments: Vec<String> = resolve_dirty_segments(full_table, &raw);
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
-
-    let mem_val = lookup_path_in_table(full_table, &segs);
-    let default_val = lookup_path_in_table(default_table, &segs);
-
-    let should_delete = match (mem_val, default_val) {
-        (None, _) => true,
-        (Some(m), Some(d)) if m == d => true,
-        _ => false,
-    };
-
-    if should_delete {
-        delete_path_in_doc(root, &segs);
-    } else if let Some(value) = mem_val {
-        let mut pruned = value.clone();
-        prune_empty_leaves(&mut pruned);
-        set_path_in_doc(root, &segs, &pruned);
-    }
+    write_or_delete_leaf(root, full_table, default_table, &segs);
+    Ok(())
 }
 
 /// Resolved metadata for a `#[natural_key]` Vec section that matches a
@@ -21512,6 +21511,153 @@ fn apply_dirty_natural_key_path(
                 alias,
             );
         }
+    }
+}
+
+/// Return the longest `MapKeyKind::Map` section whose path is a strict
+/// prefix of `dotted` (i.e. `dotted` starts with `<path>.`). Longest-match
+/// mirrors `find_natural_key_section_for_path`: a nested `HashMap` field's
+/// own section always outscores a shorter ancestor section.
+fn find_map_key_section_for_path(dotted: &str) -> Option<crate::traits::MapKeySection> {
+    use crate::traits::MapKeyKind;
+
+    let mut best: Option<crate::traits::MapKeySection> = None;
+    for section in Config::map_key_sections() {
+        if section.kind != MapKeyKind::Map {
+            continue;
+        }
+        let Some(after) = dotted
+            .strip_prefix(section.path)
+            .and_then(|s| s.strip_prefix('.'))
+        else {
+            continue;
+        };
+        if after.is_empty() {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .is_none_or(|b| section.path.len() > b.path.len());
+        if better {
+            best = Some(section);
+        }
+    }
+    best
+}
+
+/// Apply a dirty path of the form `<section_path>.<key>[.<inner_suffix>...]`
+/// against a `HashMap<String, T>` section. `<key>` is the literal map key
+/// and, for `#[resource_key]` sections (a model id, tool name, … rather
+/// than an operator-chosen alias), may itself contain dots — e.g. `gpt-4.1`
+/// in `cost.rates.providers.models.openai.gpt-4.1.input_per_mtok`.
+///
+/// Longest-match `<key>` against the union of keys live in `full_table`
+/// (the in-memory state) and in the doc (`root`), so a key that only
+/// survives on one side — the delete half of a rename, or a fresh
+/// alias not yet flushed — still resolves. This mirrors
+/// `apply_dirty_natural_key_path`'s two-sided lookup for `mcp.servers`.
+///
+/// A whole-entry write (no inner suffix — `<section_path>.<key>` addresses
+/// the map value itself, e.g. the create-map-key path) is the case where
+/// `<key>` consumes the entire remainder; that always wins over any
+/// shorter prefix-plus-dot match into the same key space, so it's checked
+/// first.
+///
+/// Once `<key>` is resolved, the rest of the path reuses the exact
+/// mem-vs-default comparison and doc write/delete the generic Table-shaped
+/// walker in `apply_dirty_path` uses — the dotted key is just folded into
+/// one opaque segment instead of being split on '.' with everything else.
+fn apply_dirty_map_key_path(
+    root: &mut toml_edit::Table,
+    section: &crate::traits::MapKeySection,
+    dotted: &str,
+    full_table: &toml::Table,
+    default_table: &toml::Table,
+) -> Result<()> {
+    let section_segs: Vec<&str> = section.path.split('.').collect();
+    let remainder = &dotted[section.path.len() + 1..];
+
+    let mem_table = lookup_path_in_table(full_table, &section_segs).and_then(|v| v.as_table());
+    let doc_table = lookup_table_in_doc(root, &section_segs);
+
+    let keys: Vec<&str> = mem_table
+        .into_iter()
+        .flat_map(|t| t.keys().map(String::as_str))
+        .chain(doc_table.into_iter().flat_map(|t| t.iter().map(|(k, _)| k)))
+        .collect();
+
+    // Exact match first: a whole-entry path for key `gpt-4.1` must not be
+    // swallowed by `route_hashmap_path` matching the shorter key `gpt-4`
+    // plus a bogus inner suffix `1...`. The cost is the inverse shadow: a
+    // pathological key literally named `<other-key>.<field>` wins over a
+    // field write addressed to `<other-key>` — acceptable because the
+    // exact key is the more specific interpretation of the same bytes.
+    let key_match: Option<(&str, Option<String>)> = if keys.contains(&remainder) {
+        Some((remainder, None))
+    } else {
+        crate::helpers::route_hashmap_path(dotted, "", section.path, "", keys.iter().copied())
+            .map(|(key, inner)| (key, Some(inner)))
+    };
+
+    let Some((key, inner)) = key_match else {
+        anyhow::bail!(
+            "save_dirty: dirty path `{dotted}` addresses map-key section `{}` but its key \
+             resolves in neither the in-memory config nor the on-disk file; refusing to \
+             silently drop the write",
+            section.path
+        );
+    };
+
+    let mut segments: Vec<String> = section_segs.iter().map(|s| (*s).to_string()).collect();
+    segments.push(key.to_string());
+
+    if let Some(inner) = inner {
+        // Same dash-aware segment resolution `apply_dirty_natural_key_path`
+        // uses for its inner suffix, rooted at the matched key's own
+        // serialized table so kebab inner segments (`tool-timeout-secs`)
+        // resolve to the snake struct field on disk.
+        let key_table = mem_table
+            .and_then(|t| t.get(key))
+            .and_then(|v| v.as_table());
+        let inner_raw: Vec<&str> = inner.split('.').collect();
+        let inner_segments: Vec<String> = match key_table {
+            Some(t) => resolve_dirty_segments(t, &inner_raw),
+            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
+        };
+        segments.extend(inner_segments);
+    }
+
+    let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    write_or_delete_leaf(root, full_table, default_table, &segs);
+    Ok(())
+}
+
+/// Shared tail of the generic and map-key dirty-path walkers: reconcile
+/// the resolved `segs` against the doc — delete the leaf when the
+/// in-memory value is absent or equals the schema default, otherwise
+/// write the pruned in-memory value. One copy so a future fix to the
+/// delete-vs-write rule cannot land in one walker only.
+fn write_or_delete_leaf(
+    root: &mut toml_edit::Table,
+    full_table: &toml::Table,
+    default_table: &toml::Table,
+    segs: &[&str],
+) {
+    let mem_val = lookup_path_in_table(full_table, segs);
+    let default_val = lookup_path_in_table(default_table, segs);
+
+    let should_delete = match (mem_val, default_val) {
+        (None, _) => true,
+        (Some(m), Some(d)) if m == d => true,
+        _ => false,
+    };
+
+    if should_delete {
+        delete_path_in_doc(root, segs);
+    } else if let Some(value) = mem_val {
+        let mut pruned = value.clone();
+        prune_empty_leaves(&mut pruned);
+        set_path_in_doc(root, segs, &pruned);
     }
 }
 
@@ -21827,13 +21973,41 @@ fn lookup_path_in_table<'a>(root: &'a toml::Table, segs: &[&str]) -> Option<&'a 
     current
 }
 
+/// Read-only walk to the table-like node at `segs`, or `None` if any
+/// segment is missing or not table-shaped on disk. Used to read a map-key
+/// section's live on-disk keys without mutating the doc. `TableLike`
+/// rather than `Table` because ZeroClaw loads (though never writes)
+/// hand-edited inline tables — `openai = { "gpt-4.1" = { ... } }` parses
+/// as `Item::Value(Value::InlineTable)`, which `as_table()` rejects; a
+/// key living only in such a section must still resolve here or the
+/// unresolvable-key bail in `apply_dirty_map_key_path` aborts the whole
+/// `save_dirty` batch.
+fn lookup_table_in_doc<'a>(
+    root: &'a toml_edit::Table,
+    segs: &[&str],
+) -> Option<&'a dyn toml_edit::TableLike> {
+    let mut cursor: &dyn toml_edit::TableLike = root;
+    for seg in segs {
+        cursor = cursor.get(seg)?.as_table_like()?;
+    }
+    Some(cursor)
+}
+
+/// `TableLike` rather than `Table` for the traversal cursor — same reason
+/// as `lookup_table_in_doc` above: a map-key section may live inside a
+/// hand-edited inline table (`openai = { "gpt-4.1" = { ... } }`), which
+/// parses as `Item::Value(Value::InlineTable)`. `as_table_mut()` returns
+/// `None` for that shape, so a `Table`-only cursor would silently return
+/// without removing anything — `save_dirty` reports success while the key
+/// stays on disk. `as_table_like_mut()` descends into both `Table` and
+/// `InlineTable`, and `TableLike::remove` deletes from either.
 fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
     let Some((last, parents)) = segs.split_last() else {
         return;
     };
-    let mut cursor: &mut toml_edit::Table = root;
+    let mut cursor: &mut dyn toml_edit::TableLike = root;
     for seg in parents {
-        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
+        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_like_mut()) {
             Some(t) => t,
             None => return,
         };
@@ -21841,16 +22015,20 @@ fn delete_path_in_doc(root: &mut toml_edit::Table, segs: &[&str]) {
     cursor.remove(last);
 }
 
+/// Same `TableLike` traversal as `delete_path_in_doc`, for the same
+/// reason: a write into a key that already lives inside a hand-edited
+/// inline table must land in that inline table rather than silently
+/// no-op-ing because the cursor only understood standard `Table` nodes.
 fn set_path_in_doc(root: &mut toml_edit::Table, segs: &[&str], value: &toml::Value) {
     let Some((last, parents)) = segs.split_last() else {
         return;
     };
-    let mut cursor: &mut toml_edit::Table = root;
+    let mut cursor: &mut dyn toml_edit::TableLike = root;
     for seg in parents {
         if !cursor.contains_key(seg) {
             cursor.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
         }
-        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
+        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_like_mut()) {
             Some(t) => t,
             None => return,
         };
@@ -29450,6 +29628,342 @@ group_policy = "disabled"
         assert!(
             written.contains("name = \"fs\""),
             "natural-key `name` must survive the incremental save; got:\n{written}"
+        );
+    }
+
+    /// `cost.rates.providers.models.<type>` is a
+    /// `#[resource_key]` `HashMap<String, ModelCostRates>` — its key is a
+    /// model id, not an operator-chosen alias, and may contain dots
+    /// (`gpt-4.1`). Before the map-key-section branch landed,
+    /// `apply_dirty_path` blindly split the dirty path on `.`, fragmenting
+    /// the key into `gpt-4` + `1`, finding neither in the in-memory table,
+    /// and silently deleting (no-op-ing) the write instead of persisting
+    /// it.
+    #[test]
+    async fn save_dirty_persists_dotted_map_key_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [cost.rates.providers.models.openai.\"gpt-4.1\"]\n\
+             input_per_mtok = 1.0\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+
+        config
+            .set_prop_persistent(
+                "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "9.9",
+            )
+            .expect("set_prop_persistent must route through the dotted resource key");
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|r| r.input_per_mtok),
+            Some(9.9)
+        );
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("9.9"),
+            "save_dirty must write the new input_per_mtok for the dotted model key; \
+             on-disk file still reads:\n{written}"
+        );
+        assert!(
+            written.contains("\"gpt-4.1\""),
+            "the dotted key must survive as one quoted TOML key, not be split apart; got:\n{written}"
+        );
+
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert_eq!(
+            reloaded
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|r| r.input_per_mtok),
+            Some(9.9),
+            "reloaded config must see the persisted value; got:\n{written}"
+        );
+    }
+
+    /// Control for `save_dirty_persists_dotted_map_key_field`: a dot-free
+    /// resource key must keep working through the same map-key-section
+    /// branch (it's no longer special-cased out — every `HashMap<String,
+    /// T>` write now routes through `apply_dirty_map_key_path`).
+    #[test]
+    async fn save_dirty_persists_dot_free_map_key_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [cost.rates.providers.models.openai.gpt-4o]\n\
+             input_per_mtok = 1.0\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4o".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+
+        config
+            .set_prop_persistent(
+                "cost.rates.providers.models.openai.gpt-4o.input_per_mtok",
+                "5.5",
+            )
+            .unwrap();
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("5.5"),
+            "dot-free map key writes must still persist; got:\n{written}"
+        );
+    }
+
+    /// Delete path: removing a dotted map key in memory
+    /// (`delete_map_key`) must still drop the matching on-disk table.
+    /// Before this fix the on-disk key was never located because the
+    /// dirty path (`<section>.<key>`, no inner suffix) is exactly the
+    /// shape the naive `raw.split('.')` walker mis-parses.
+    #[test]
+    async fn save_dirty_removes_dotted_map_key_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [cost.rates.providers.models.openai.\"gpt-4.1\"]\n\
+             input_per_mtok = 1.0\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+
+        let removed = config
+            .delete_map_key("cost.rates.providers.models.openai", "gpt-4.1")
+            .expect("delete_map_key must accept the dotted resource key");
+        assert!(removed);
+        config.mark_dirty("cost.rates.providers.models.openai.gpt-4.1");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("gpt-4.1"),
+            "deleted dotted map key must be dropped from disk; got:\n{written}"
+        );
+    }
+
+    /// ZeroClaw never writes inline tables but loads hand-edited ones
+    /// fine, so a map-key section shaped `openai = { "gpt-4.1" = { ... } }`
+    /// parses as `Item::Value(Value::InlineTable)` — invisible to a
+    /// `Table`-only doc walk. Both halves must go through `TableLike`:
+    /// resolving the key (read side) so the batch doesn't abort, and
+    /// actually removing it from the inline table (write side) so the
+    /// deletion isn't reported as successful while the key survives on
+    /// disk — a mutable traversal that only understood `Table` would
+    /// resolve the key, then silently return without deleting anything.
+    #[test]
+    async fn save_dirty_resolves_map_key_from_inline_table_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [cost.rates.providers.models]\n\
+             openai = {{ \"gpt-4.1\" = {{ input_per_mtok = 1.0 }} }}\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        // Key absent from memory (the delete half): resolution can only
+        // come from the on-disk doc, i.e. through the inline table.
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mark_dirty("cost.rates.providers.models.openai.gpt-4.1");
+
+        config.save_dirty().await.expect(
+            "a key living only in an on-disk inline table must resolve, not abort the save",
+        );
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let doc = written
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+
+        // The delete must actually take effect on disk, not just resolve
+        // and then no-op: reporting `Ok(())` while the key survives is
+        // the silent-persistence failure this section of `save_dirty`
+        // exists to eliminate.
+        assert!(
+            !written.contains("gpt-4.1"),
+            "deleted key must not remain anywhere in the rewritten file; got:\n{written}"
+        );
+        let openai_item = doc
+            .get("cost")
+            .and_then(|i| i.get("rates"))
+            .and_then(|i| i.get("providers"))
+            .and_then(|i| i.get("models"))
+            .and_then(|i| i.get("openai"))
+            .expect("openai entry must survive the delete of its only sub-key");
+        let openai_table = openai_item.as_table_like().expect(
+            "openai entry must still be table-like (Table or InlineTable) after the delete",
+        );
+        assert!(
+            !openai_table.contains_key("gpt-4.1"),
+            "gpt-4.1 must be removed from the on-disk openai inline table; got:\n{written}"
+        );
+    }
+
+    /// Write half of the inline-table fix: a value living inside a
+    /// hand-edited inline table must be updated in place, not just
+    /// resolved-and-ignored. Same doc shape as
+    /// `save_dirty_resolves_map_key_from_inline_table_on_disk`, but the
+    /// key stays in memory with a changed value instead of being dropped.
+    #[test]
+    async fn save_dirty_persists_write_into_inline_table_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [cost.rates.providers.models]\n\
+             openai = {{ \"gpt-4.1\" = {{ input_per_mtok = 1.0 }} }}\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        config
+            .set_prop_persistent(
+                "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "9.9",
+            )
+            .expect("set_prop_persistent must route through the dotted resource key");
+
+        config.save_dirty().await.expect(
+            "a write into a key resolved through an on-disk inline table must not abort the save",
+        );
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let doc = written
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+
+        assert!(
+            written.contains("9.9"),
+            "save_dirty must write the new input_per_mtok into the inline table; got:\n{written}"
+        );
+        let rates_item = doc
+            .get("cost")
+            .and_then(|i| i.get("rates"))
+            .and_then(|i| i.get("providers"))
+            .and_then(|i| i.get("models"))
+            .and_then(|i| i.get("openai"))
+            .and_then(|i| i.get("gpt-4.1"))
+            .and_then(|i| i.get("input_per_mtok"))
+            .expect("input_per_mtok must survive as a leaf inside the on-disk inline table");
+        assert_eq!(
+            rates_item.as_float(),
+            Some(9.9),
+            "the on-disk inline-table leaf must reflect the written value; got:\n{written}"
+        );
+    }
+
+    /// Loud-failure guard: a dirty path that resolves to a
+    /// map-key section but whose key exists in neither the in-memory
+    /// config nor the on-disk doc must fail `save_dirty` instead of
+    /// silently no-op-ing (the original bug's symptom — reported success,
+    /// nothing written).
+    #[test]
+    async fn save_dirty_errors_on_unresolvable_map_key_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [observability]\n\
+             backend = \"none\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        // Neither `full_table` nor the on-disk doc has a
+        // `cost.rates.providers.models.openai.ghost-model` entry — mark it
+        // dirty directly the way a stale/duplicate `mark_dirty` call
+        // (e.g. a bug elsewhere, or a manually crafted RPC) would.
+        config.mark_dirty("cost.rates.providers.models.openai.ghost-model.input_per_mtok");
+
+        let err = config
+            .save_dirty()
+            .await
+            .expect_err("an unresolvable map-key dirty path must fail loudly, not no-op");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cost.rates.providers.models.openai.ghost-model.input_per_mtok"),
+            "error must name the offending dirty path; got: {msg}"
         );
     }
 
