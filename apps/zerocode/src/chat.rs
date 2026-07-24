@@ -3092,7 +3092,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
         render_elicitation_overlay(f, state, area);
     }
 
-    match &state.session_overlay {
+    match &mut state.session_overlay {
         SessionOverlay::List {
             sessions,
             list_state,
@@ -4191,7 +4191,7 @@ fn render_session_list_overlay(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionEntry],
-    list_state: &ListState,
+    list_state: &mut ListState,
     title: String,
 ) {
     let overlay_area = session_list_overlay_area(area);
@@ -4218,9 +4218,11 @@ fn render_session_list_overlay(
         .collect();
 
     let list = List::new(items).highlight_style(theme::list_highlight_style());
-    // Copy state to pass as mutable.
-    let mut ls = *list_state;
-    f.render_stateful_widget(list, inner, &mut ls);
+    // Render through the caller's state so the scroll offset ratatui computes
+    // to keep the selection visible is retained. Mouse hit-testing later reads
+    // `list_state.offset()`, so a discarded offset would make clicks after a
+    // scroll resolve to the wrong row.
+    f.render_stateful_widget(list, inner, list_state);
 }
 
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
@@ -9015,7 +9017,7 @@ mod tests {
                     frame,
                     area,
                     &sessions,
-                    &list_state,
+                    &mut list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
                 );
             })
@@ -9039,6 +9041,66 @@ mod tests {
             selected_text_cell.style().bg,
             Some(expected_bg),
             "selected session row must keep the themed fill background"
+        );
+    }
+
+    #[test]
+    fn session_overlay_retains_scroll_offset_for_mouse_hit_test() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Regression for the picker selecting the wrong row after scrolling:
+        // the renderer must persist the offset it computes so mouse hit-testing
+        // reads the same geometry that was drawn.
+        let sessions: Vec<SessionEntry> = (0..30)
+            .map(|i| SessionEntry {
+                session_id: format!("session-{i}"),
+                session_key: format!("session-{i}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                agent_alias: Some("agent".to_string()),
+                channel_id: None,
+                name: Some(format!("prompt {i}")),
+                message_count: 1,
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        // Select a row far enough down that the list must scroll to show it.
+        list_state.select(Some(25));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                );
+            })
+            .expect("draw session list overlay");
+
+        // The renderer scrolled the list to reveal the selection; that offset
+        // must survive the draw. Before the fix it was computed on a discarded
+        // copy and stayed 0.
+        let offset = list_state.offset();
+        assert!(
+            offset > 0,
+            "rendering a scrolled selection must retain a nonzero offset, got {offset}"
+        );
+
+        // A click on the third visible row must resolve through the retained
+        // offset, not the pre-scroll top of the list.
+        let clicked_row = overlay_area.y + 1 + 2;
+        let idx = crate::mouse::list_click_index(clicked_row, overlay_area, offset, sessions.len())
+            .expect("click inside the visible list resolves to a row");
+        assert_eq!(
+            idx,
+            offset + 2,
+            "clicked row must map to offset + visible row, not the unscrolled index"
         );
     }
 
