@@ -972,9 +972,14 @@ fn clean_for_display(content: &str) -> String {
         cleaned.replace_range(start..(end + think_end.len()), "");
     }
 
-    // Remove timestamp patterns like [2026-06-30 16:44:51 +08:00]
-    let timestamp_regex =
-        regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]").unwrap();
+    // Remove timestamp patterns, bare like [2026-06-30 16:44:51 +08:00] or
+    // labeled like [CURRENT DATE & TIME: 2026-06-30 16:44:51 +08:00]. The
+    // labeled shape is canonical in agent.rs `Agent::enrich_user_message` —
+    // keep in sync.
+    let timestamp_regex = regex::Regex::new(
+        r"\[(?:CURRENT DATE & TIME:\s*)?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]",
+    )
+    .unwrap();
     cleaned = timestamp_regex.replace_all(&cleaned, "").to_string();
 
     // Remove tool results prefix
@@ -2006,6 +2011,20 @@ mod tests {
         let input = "Hello world[2026-06-30 16:44:51 UTC]";
         let cleaned = clean_for_display(input);
         assert_eq!(cleaned, "Hello world");
+    }
+
+    #[test]
+    fn clean_for_display_removes_labeled_timestamp_prefix() {
+        let input = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 +08:00]\n\nHello world";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "Hello world");
+    }
+
+    #[test]
+    fn clean_for_display_removes_labeled_timestamp_with_named_tz() {
+        let input = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nWhat is the weather today";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, "What is the weather today");
     }
 
     #[test]

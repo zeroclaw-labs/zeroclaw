@@ -6593,8 +6593,9 @@ impl ChatState {
         for m in messages {
             match m.role() {
                 crate::client::MessageRole::User => {
-                    if self.first_message.is_none() {
-                        self.first_message = Some(m.content.clone());
+                    let stripped = strip_enrichment_prefix(&m.content);
+                    if self.first_message.is_none() && !stripped.trim().is_empty() {
+                        self.first_message = Some(stripped.to_string());
                     }
                     self.entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
@@ -6651,6 +6652,22 @@ impl ChatState {
         self.context_max_tokens = None;
         self.clear_queue();
     }
+}
+
+/// Strip the runtime's date/time enrichment prefix from a persisted user
+/// message. The gateway returns history with the prefix baked into the
+/// content; the pinned first-message row renders a single line, so with the
+/// prefix intact only the timestamp would be visible. The prefix format is
+/// canonical in zeroclaw-runtime's agent.rs `Agent::enrich_user_message` —
+/// keep in sync. Content without the prefix passes through unchanged.
+fn strip_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    rest[bracket_end + 1..].trim_start()
 }
 
 /// Body-only clipboard text.
@@ -10293,6 +10310,45 @@ mod tests {
         assert_eq!(s.entries.len(), before + 3);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_strips_enrichment_prefix_from_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session("sess-resume".to_string(), None);
+        s.load_history(vec![MessageEntry {
+            role: "user".to_string(),
+            content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+        }]);
+        // The pinned row renders a single line; it must show the message
+        // text, not the runtime's timestamp prefix.
+        assert_eq!(s.first_message.as_deref(), Some("first ask"));
+        // The transcript entry keeps the persisted content untouched.
+        assert!(matches!(
+            &s.entries[s.entries.len() - 1],
+            ChatEntry::UserMessage { text: Some(t), .. }
+                if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
+        ));
+    }
+
+    #[test]
+    fn load_history_skips_prefix_only_content_when_seeding_first_message() {
+        use crate::client::MessageEntry;
+        let mut s = state();
+        s.reset_for_session("sess-resume".to_string(), None);
+        s.load_history(vec![MessageEntry {
+            role: "user".to_string(),
+            content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+        }]);
+        // A message that strips to nothing must not claim the pinned row —
+        // Some("") would block a later real message from ever seeding it.
+        assert!(s.first_message.is_none());
+        s.load_history(vec![MessageEntry {
+            role: "user".to_string(),
+            content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+        }]);
+        assert_eq!(s.first_message.as_deref(), Some("real ask"));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
