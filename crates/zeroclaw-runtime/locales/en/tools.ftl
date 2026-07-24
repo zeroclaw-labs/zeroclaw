@@ -119,6 +119,42 @@ tool-http-request = Make HTTP requests to external APIs. Supports GET, POST, PUT
 
 tool-image-info = Read image file metadata (format, dimensions, size) and optionally return base64-encoded data.
 
+# image_gen tool (fal.ai Flux) — description, parameters, and SSRF-gate errors
+tool-image-gen = Generate an image from a text prompt using fal.ai (Flux models). Saves the result to the workspace images directory and returns the file path.
+tool-image-gen-param-prompt = Text prompt describing the image to generate.
+tool-image-gen-param-filename = Output filename without extension (default: 'generated_image'). Saved as PNG in workspace/images/.
+tool-image-gen-param-size = Image aspect ratio / size preset (default: 'square_hd').
+tool-image-gen-param-model = fal.ai model identifier (default: 'fal-ai/flux/schnell').
+
+# validate_image_url (URL-string gate)
+tool-image-gen-error-url-empty = image URL cannot be empty
+tool-image-gen-error-url-whitespace = image URL cannot contain whitespace
+tool-image-gen-error-url-scheme = Only http:// and https:// image URLs are allowed
+tool-image-gen-error-url-parse = Invalid image URL format: { $err }
+tool-image-gen-error-url-userinfo = image URL userinfo is not allowed
+tool-image-gen-error-url-no-host = image URL has no host
+tool-image-gen-error-url-metadata-host = Blocked cloud metadata host: { $host }
+tool-image-gen-error-url-private-host = Blocked local/private image host: { $host }. To allow, add it (or "*") to image_gen.allowed_private_hosts in config.toml
+
+# validate_image_url_resolved (DNS gate)
+tool-image-gen-error-resolved-url-parse = Invalid image URL: { $err }
+tool-image-gen-error-resolved-url-no-host = Image URL has no host
+tool-image-gen-error-resolved-url-no-port = Image URL has no known port
+tool-image-gen-error-resolved-url-resolve-failed = Failed to resolve image download host
+tool-image-gen-error-resolved-url-resolve-empty = Failed to resolve image download host '{ $host }'
+
+# Secure-client builder
+tool-image-gen-error-client-build = Failed to build secure image download client: { $err }
+
+# resolved-IP gate (DNS rebinding)
+tool-image-gen-error-resolved-ip-metadata = Image host '{ $host }' resolves to cloud metadata address { $ip }
+tool-image-gen-error-resolved-ip-non-global = Image host '{ $host }' resolves to non-global address { $ip }. To allow, add the host (or "*") to image_gen.allowed_private_hosts in config.toml
+
+# manual redirect loop
+tool-image-gen-error-redirect-limit = Too many image-URL redirects (max { $max })
+tool-image-gen-error-redirect-location-missing = Redirect response from image host is missing a Location header
+tool-image-gen-error-redirect-location-invalid = Invalid redirect Location from image host: { $err }
+
 tool-jira = Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues.
 
 tool-knowledge = Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and relationship links.

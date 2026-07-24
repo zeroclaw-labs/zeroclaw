@@ -1127,13 +1127,26 @@ pub fn all_tools_with_runtime(
 
     // Standalone image generation tool (config-gated)
     if root_config.image_gen.enabled {
-        tool_arcs.push(Arc::new(ImageGenTool::new_with_persistence(
+        match ImageGenTool::new_with_config(
             security.clone(),
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
-        )));
+            root_config.image_gen.allowed_private_hosts.clone(),
+        ) {
+            Ok(tool) => tool_arcs.push(Arc::new(tool)),
+            Err(err) => ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": "image_gen",
+                        "err": err.to_string(),
+                    })),
+                "image_gen: invalid allowed_private_hosts in config; tool disabled"
+            ),
+        }
     }
 
     // File upload tool — enabled iff [file_upload].url is set
