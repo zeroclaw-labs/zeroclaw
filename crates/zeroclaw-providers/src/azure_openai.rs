@@ -298,13 +298,7 @@ impl AzureOpenAiModelProvider {
     /// Return the configured `reasoning_effort` when the model accepts it
     /// (GPT-5.x / o-series), otherwise `None`.  Mirrors the compatible
     /// provider's `reasoning_effort_for_model` so Azure parity is maintained.
-    /// Azure OpenAI is a Chat Completions-compatible wire, so it rejects
-    /// `reasoning_effort` on tool-bearing requests the same way; `has_tools`
-    /// short-circuits to `None` before the model-name gating below.
-    fn reasoning_effort_for_model(&self, model: &str, has_tools: bool) -> Option<String> {
-        if has_tools {
-            return None;
-        }
+    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let effort = self.reasoning_effort.as_ref()?;
         let id = model
             .rsplit('/')
@@ -322,6 +316,54 @@ impl AzureOpenAiModelProvider {
             || id.starts_with("o4-")
             || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
         is_reasoning_model.then(|| effort.clone())
+    }
+
+    async fn send_native_chat_request(
+        &self,
+        credential: &str,
+        request: &mut NativeChatRequest,
+    ) -> anyhow::Result<reqwest::Response> {
+        let tools_count = request.tools.as_ref().map_or(0, Vec::len);
+        loop {
+            let response = self
+                .http_client()
+                .post(self.chat_completions_url())
+                .header("api-key", credential)
+                .json(request)
+                .send()
+                .await?;
+            if response.status().is_success() {
+                return Ok(response);
+            }
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_else(|_| {
+                "<failed to read Azure OpenAI error response body>".to_string()
+            });
+            if tools_count > 0
+                && request.reasoning_effort.is_some()
+                && super::rejects_tools_with_reasoning_effort(status, &body)
+            {
+                request.reasoning_effort = None;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "alias": &self.alias,
+                            "request_api": "chat_completions",
+                            "tools_count": tools_count,
+                            "reasoning_effort_omitted": true,
+                            "reasoning_effort_omission_reason": "endpoint_rejected_tools_with_reasoning",
+                            "status": status.as_u16(),
+                        })),
+                    "azure_openai: retrying without reasoning effort after endpoint capability rejection"
+                );
+                continue;
+            }
+
+            return Err(super::api_error_from_parts("Azure OpenAI", status, &body));
+        }
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -518,7 +560,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let request = ChatRequest {
             messages,
             temperature,
-            reasoning_effort: self.reasoning_effort_for_model(model, false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
         };
 
@@ -572,8 +614,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
-        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
-        let native_request = NativeChatRequest {
+        let mut native_request = NativeChatRequest {
             messages: Self::convert_messages(request.messages),
             temperature,
             // Omit tool_choice when the tool list is empty — Azure (and
@@ -583,21 +624,13 @@ impl ModelProvider for AzureOpenAiModelProvider {
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
-            reasoning_effort: self.reasoning_effort_for_model(model, has_tools),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
         };
 
         let response = self
-            .http_client()
-            .post(self.chat_completions_url())
-            .header("api-key", credential.as_str())
-            .json(&native_request)
-            .send()
+            .send_native_chat_request(credential, &mut native_request)
             .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Azure OpenAI", response).await);
-        }
 
         let native_response: NativeChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {
@@ -656,8 +689,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             )
         };
 
-        let has_tools = native_tools.as_ref().is_some_and(|t| !t.is_empty());
-        let native_request = NativeChatRequest {
+        let mut native_request = NativeChatRequest {
             messages: Self::convert_messages(messages),
             temperature,
             // See above: omit tool_choice when the tool list is empty.
@@ -665,21 +697,13 @@ impl ModelProvider for AzureOpenAiModelProvider {
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
-            reasoning_effort: self.reasoning_effort_for_model(model, has_tools),
+            reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
         };
 
         let response = self
-            .http_client()
-            .post(self.chat_completions_url())
-            .header("api-key", credential.as_str())
-            .json(&native_request)
-            .send()
+            .send_native_chat_request(credential, &mut native_request)
             .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Azure OpenAI", response).await);
-        }
 
         let native_response: NativeChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {
@@ -805,12 +829,8 @@ mod tests {
         assert!(p.credential.is_none());
     }
 
-    // Regression test: Azure OpenAI mirrors the Chat Completions
-    // provider's rejection of `reasoning_effort` on tool-bearing requests.
-    // `has_tools=true` must omit the field even for a model that otherwise
-    // qualifies; `has_tools=false` must keep behaving as before.
     #[test]
-    fn reasoning_effort_for_model_omits_field_when_tools_present() {
+    fn reasoning_effort_for_model_keeps_configured_effort_for_eligible_models() {
         let p = AzureOpenAiModelProvider::builder("test")
             .resource_name("resource")
             .deployment_name("deployment")
@@ -819,20 +839,96 @@ mod tests {
             .build();
 
         assert_eq!(
-            p.reasoning_effort_for_model("gpt-5", false),
+            p.reasoning_effort_for_model("gpt-5"),
             Some("high".to_string()),
-            "no-tools path must keep reasoning_effort for a matching model"
+            "eligible models keep the operator-selected effort"
         );
         assert_eq!(
-            p.reasoning_effort_for_model("gpt-5", true),
+            p.reasoning_effort_for_model("gpt-5-chat-latest"),
             None,
-            "has_tools=true must omit reasoning_effort even for a matching model"
+            "ineligible router models still omit reasoning_effort"
         );
-        assert_eq!(
-            p.reasoning_effort_for_model("o1-preview", true),
-            None,
-            "has_tools=true must omit reasoning_effort even for a matching model"
+    }
+
+    #[tokio::test]
+    async fn endpoint_capability_rejection_retries_once_without_reasoning_effort() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body.get("reasoning_effort").is_some();
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
         );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must retry exactly once");
+        assert!(bodies[0].get("reasoning_effort").is_some());
+        assert!(bodies[1].get("reasoning_effort").is_none());
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
     }
 
     #[test]
