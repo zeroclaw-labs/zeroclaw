@@ -1015,6 +1015,8 @@ api_token = "{encrypted}"
 
     #[tokio::test]
     async fn execute_sends_auth_secret_as_authorization_header() {
+        const DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 loopback is unavailable in this environment.
@@ -1065,7 +1067,7 @@ api_token = "Bearer from-secret"
         .unwrap();
 
         let result = tokio::time::timeout(
-            Duration::from_secs(5),
+            DEADLOCK_GUARD,
             tool.execute(json!({
                 "url": format!("http://[::1]:{port}/"),
                 "auth_secret": "api_token",
@@ -1075,12 +1077,12 @@ api_token = "Bearer from-secret"
             })),
         )
         .await
-        .unwrap()
+        .expect("http_request auth-secret execution should not hang")
         .unwrap();
 
-        let saw_auth_header = tokio::time::timeout(Duration::from_secs(5), seen_rx)
+        let saw_auth_header = tokio::time::timeout(DEADLOCK_GUARD, seen_rx)
             .await
-            .unwrap()
+            .expect("test server should observe the request")
             .unwrap();
         server_handle.abort();
 

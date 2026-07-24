@@ -135,6 +135,32 @@ mod markers {
 mod mention {
     use matrix_sdk::ruma::UserId;
 
+    pub(super) fn strip_leading_command_address<'a>(
+        bot_user_id: &UserId,
+        bot_display_name: Option<&str>,
+        body: &'a str,
+    ) -> Option<&'a str> {
+        // Matrix clients reserve naked `/commands`, so users often address bot
+        // commands as mentions. Strip only when the addressed payload is itself
+        // a runtime slash command; normal conversational mentions stay intact.
+        // Matrix has several user-visible address forms, while `Channel`
+        // exposes only one canonical address for cross-channel callers.
+        let mut addresses = vec![bot_user_id.to_string()];
+        let localpart = format!("@{}", bot_user_id.localpart());
+        addresses.push(localpart);
+        if let Some(display_name) = bot_display_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            addresses.push(display_name.to_string());
+            if !display_name.starts_with('@') {
+                addresses.push(format!("@{display_name}"));
+            }
+        }
+
+        crate::addressed_command::strip_leading_addressed_command(body, addresses)
+    }
+
     pub(super) fn is_mentioned(
         bot_user_id: &UserId,
         bot_display_name: Option<&str>,
@@ -310,6 +336,10 @@ mod context {
         } else {
             format!("[Thread root from {sender}]: {body}\n\n")
         }
+    }
+
+    pub(super) fn should_prepend_thread_preamble(body: &str) -> bool {
+        !body.trim_start().starts_with('/')
     }
 
     /// Returns `true` iff this thread had not been seen before — caller should
@@ -1455,8 +1485,7 @@ mod inbound {
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals:
-            Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+        pub pending_approvals: Arc<TokioMutex<HashMap<String, PendingApproval>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -1465,6 +1494,39 @@ mod inbound {
         /// could not be decrypted. Tracked so the bot reacts ❓ exactly once
         /// per event across sync catchup deliveries.
         pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    }
+
+    pub(super) struct PendingApproval {
+        pub(super) expected_principal: Option<String>,
+        pub(super) sender: oneshot::Sender<ChannelApprovalResponse>,
+    }
+
+    pub(super) enum PendingApprovalMatch {
+        Matched(PendingApproval),
+        PrincipalMismatch,
+        Missing,
+    }
+
+    pub(super) fn take_pending_approval(
+        approvals: &mut HashMap<String, PendingApproval>,
+        token: &str,
+        sender: &str,
+    ) -> PendingApprovalMatch {
+        match approvals.get(token) {
+            Some(pending)
+                if pending
+                    .expected_principal
+                    .as_deref()
+                    .is_none_or(|expected| expected == sender) =>
+            {
+                approvals
+                    .remove(token)
+                    .map(PendingApprovalMatch::Matched)
+                    .unwrap_or(PendingApprovalMatch::Missing)
+            }
+            Some(_) => PendingApprovalMatch::PrincipalMismatch,
+            None => PendingApprovalMatch::Missing,
+        }
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
@@ -1603,9 +1665,27 @@ mod inbound {
         // Approval reply has highest priority — operator answer must work even
         // if the room/user filters would otherwise drop the message.
         if let Some((token, response)) = approval::parse_reply(&body) {
-            let waiter = ctx.pending_approvals.lock().await.remove(&token);
-            if let Some(tx) = waiter {
-                let _ = tx.send(response);
+            let pending = {
+                let mut approvals = ctx.pending_approvals.lock().await;
+                match take_pending_approval(&mut approvals, &token, sender) {
+                    PendingApprovalMatch::Matched(pending) => Some(pending),
+                    PendingApprovalMatch::PrincipalMismatch => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(::serde_json::json!({"sender": sender})),
+                            "matrix: ignored approval reply from non-bound principal"
+                        );
+                        return Ok(());
+                    }
+                    PendingApprovalMatch::Missing => None,
+                }
+            };
+            if let Some(pending) = pending {
+                let _ = pending.sender.send(response);
                 return Ok(());
             }
         }
@@ -1630,8 +1710,8 @@ mod inbound {
             return Ok(());
         }
 
+        let display_name = ctx.bot_display_name.read().await.clone();
         if ctx.config.mention_only && is_group_room(&room).await {
-            let display_name = ctx.bot_display_name.read().await.clone();
             let mention_user_ids = extract_mentions_user_ids(&raw);
             if !mention::is_mentioned(
                 &ctx.bot_user_id,
@@ -1650,8 +1730,15 @@ mod inbound {
         }
 
         let thread_id = extract_thread_id(&raw);
-        let mut content = body.clone();
-        if let Some(tid) = thread_id.as_ref()
+        let mut content = mention::strip_leading_command_address(
+            &ctx.bot_user_id,
+            display_name.as_deref(),
+            &body,
+        )
+        .unwrap_or(&body)
+        .to_string();
+        if ctx_mod::should_prepend_thread_preamble(&content)
+            && let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
         {
             match room.event(tid, None).await {
@@ -3149,7 +3236,7 @@ pub struct MatrixChannel {
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<Arc<TranscriptionConfig>>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, inbound::PendingApproval>>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -3162,6 +3249,48 @@ pub struct MatrixChannel {
     /// `[channels].ack_reactions` here at construction time, so the
     /// read site doesn't need to re-resolve on every reaction.
     ack_reactions: bool,
+}
+
+struct PendingApprovalCleanup {
+    pending_approvals: Arc<TokioMutex<HashMap<String, inbound::PendingApproval>>>,
+    token: String,
+    armed: bool,
+}
+
+impl PendingApprovalCleanup {
+    fn new(
+        pending_approvals: Arc<TokioMutex<HashMap<String, inbound::PendingApproval>>>,
+        token: String,
+    ) -> Self {
+        Self {
+            pending_approvals,
+            token,
+            armed: true,
+        }
+    }
+
+    fn arm_expiry(mut self, deadline: tokio::time::Instant) {
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        let token = self.token.clone();
+        self.armed = false;
+        ::zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep_until(deadline).await;
+            pending_approvals.lock().await.remove(&token);
+        });
+    }
+}
+
+impl Drop for PendingApprovalCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        let token = self.token.clone();
+        ::zeroclaw_spawn::spawn!(async move {
+            pending_approvals.lock().await.remove(&token);
+        });
+    }
 }
 
 impl MatrixChannel {
@@ -3735,6 +3864,31 @@ impl Channel for MatrixChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        self.request_approval_inner(recipient, None, request).await
+    }
+
+    async fn request_approval_for_principal(
+        &self,
+        recipient: &str,
+        principal: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
+        let principal = principal.trim();
+        if principal.is_empty() {
+            return Ok(None);
+        }
+        self.request_approval_inner(recipient, Some(principal), request)
+            .await
+    }
+}
+
+impl MatrixChannel {
+    async fn request_approval_inner(
+        &self,
+        recipient: &str,
+        expected_principal: Option<&str>,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
         let token = approval::generate_token_default();
         let prompt = format!(
             "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply `{token} approve` / `{token} deny` / `{token} always`.",
@@ -3742,22 +3896,22 @@ impl Channel for MatrixChannel {
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            inbound::PendingApproval {
+                expected_principal: expected_principal.map(str::to_string),
+                sender: tx,
+            },
+        );
+        let cleanup =
+            PendingApprovalCleanup::new(Arc::clone(&self.pending_approvals), token.clone());
 
         let send_msg = SendMessage::new(prompt, recipient);
-        if let Err(e) = self.send(&send_msg).await {
-            self.pending_approvals.lock().await.remove(&token);
-            return Err(e);
-        }
-
-        let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
-        let result = tokio::time::timeout(timeout, rx).await;
-        if result.is_err() {
-            self.pending_approvals.lock().await.remove(&token);
-        }
+        self.send(&send_msg).await?;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.approval_timeout_secs.max(1));
+        cleanup.arm_expiry(deadline);
+        let result = tokio::time::timeout_at(deadline, rx).await;
         match result {
             Ok(Ok(resp)) => Ok(Some(resp)),
             Ok(Err(_)) => Ok(Some(ChannelApprovalResponse::Deny)),
@@ -3856,9 +4010,11 @@ mod tests {
         use super::super::approval::{
             TOKEN_LEN, generate_token, generate_token_default, parse_reply,
         };
+        use super::super::inbound::{PendingApproval, PendingApprovalMatch, take_pending_approval};
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
+        use tokio::sync::oneshot;
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
         #[test]
@@ -3881,6 +4037,28 @@ mod tests {
                 "too many collisions: {}",
                 1000 - seen.len()
             );
+        }
+
+        #[test]
+        fn bound_principal_mismatch_does_not_consume_approval_token() {
+            let (tx, _rx) = oneshot::channel();
+            let mut pending = HashMap::from([(
+                "token".to_string(),
+                PendingApproval {
+                    expected_principal: Some("@owner:example.test".into()),
+                    sender: tx,
+                },
+            )]);
+            assert!(matches!(
+                take_pending_approval(&mut pending, "token", "@other:example.test"),
+                PendingApprovalMatch::PrincipalMismatch
+            ));
+            assert!(pending.contains_key("token"));
+            assert!(matches!(
+                take_pending_approval(&mut pending, "token", "@owner:example.test"),
+                PendingApprovalMatch::Matched(_)
+            ));
+            assert!(!pending.contains_key("token"));
         }
 
         #[test]
@@ -3996,7 +4174,7 @@ mod tests {
     }
 
     mod mention {
-        use super::super::mention::is_mentioned;
+        use super::super::mention::{is_mentioned, strip_leading_command_address};
         use matrix_sdk::ruma::user_id;
 
         #[test]
@@ -4037,6 +4215,65 @@ mod tests {
         fn body_fallback_display_name() {
             let bot = user_id!("@bot:example.org");
             assert!(is_mentioned(bot, Some("ZeroClaw"), None, "hi zeroclaw!"));
+        }
+
+        #[test]
+        fn addressed_runtime_command_strips_localpart_alias() {
+            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            assert_eq!(
+                strip_leading_command_address(bot, None, "@zc-architect /goal status"),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, None, "@zc-architect: /goal start ship it"),
+                Some("/goal start ship it")
+            );
+        }
+
+        #[test]
+        fn addressed_runtime_command_strips_full_mxid_and_display_name() {
+            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Architect"),
+                    "@zc-architect:crayfish.lflat.org: /goal status"
+                ),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@architect /goal status"),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Task Orchestrator"),
+                    "Task Orchestrator: /goal status"
+                ),
+                Some("/goal status")
+            );
+        }
+
+        #[test]
+        fn addressed_runtime_command_does_not_strip_non_commands_or_other_mentions() {
+            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@zc-architect hello /goal"),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Architect"),
+                    "@zc-architect-helper: /goal"
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@other: /goal status"),
+                None
+            );
         }
 
         #[test]
@@ -4144,7 +4381,9 @@ mod tests {
     }
 
     mod context {
-        use super::super::context::{claim_first_visit, format_preamble, mark_seen};
+        use super::super::context::{
+            claim_first_visit, format_preamble, mark_seen, should_prepend_thread_preamble,
+        };
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id};
         use std::{collections::HashSet, sync::Arc};
         use tokio::sync::RwLock;
@@ -4163,6 +4402,16 @@ mod tests {
         fn preamble_skips_body_when_empty() {
             let p = format_preamble("@alice:server", "");
             assert_eq!(p, "[Thread root from @alice:server]\n\n");
+        }
+
+        #[test]
+        fn thread_preamble_is_skipped_for_runtime_slash_commands() {
+            // Runtime slash commands are parsed by the channel orchestrator
+            // before the model sees the message. A Matrix thread-root preamble
+            // would hide the leading command token and leak `/goal` to the LLM.
+            assert!(!should_prepend_thread_preamble("/goal start ship it"));
+            assert!(!should_prepend_thread_preamble(" \n\t/models openrouter"));
+            assert!(should_prepend_thread_preamble("please run /goal later"));
         }
 
         #[tokio::test]

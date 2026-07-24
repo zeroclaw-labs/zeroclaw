@@ -61,6 +61,14 @@ The agent loop applies a per-turn duplicate-call guard: a tool called twice with
 
 When parallel tool execution is enabled (`parallel_tools = true` in the runtime profile), multiple `spawn_subagent` calls in one turn run concurrently and every child's final response is returned to the parent, keyed to its own tool call. `delegate` has its own explicit fan-out via the `parallel: [...]` argument (see the output-strings section); that path spawns each target on its own task and aggregates all results.
 
+### Goal-mode constraint
+
+When a durable goal is active, synchronous `delegate` work can run under the
+goal context and its model usage is attributed to that goal. Background
+delegation is rejected while the goal is active. Detached background work does
+not yet have parent-linked completion and usage reporting, so allowing it would
+let goal work escape the goal lifecycle and budget boundary.
+
 ## Permission inheritance
 
 A SubAgent inherits the parent's permissions verbatim unless the spawn site supplies a narrowing `SubAgentOverrides`. Today both in-tree spawn sites pass `SubAgentOverrides::default()` (inherit everything). The override surface is shipped and validated; a future caller-supplied narrowing path drops in without runtime changes.

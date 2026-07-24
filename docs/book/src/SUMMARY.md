@@ -69,6 +69,7 @@
   - [Anatomy of an agent](./agents/anatomy.md)
   - [Filesystem components](./agents/filesystem.md)
   - [Running agents](./agents/operating.md)
+  - [Goal mode](./agents/goal-mode.md)
   - [Delegation & SubAgents](./agents/delegation.md)
   - [Runtime internals](./agents/internals.md)
   - [History management](./agents/history-management.md)

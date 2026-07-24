@@ -799,6 +799,7 @@ pub async fn run_gateway(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                tools::GoalAdmissionToolPolicy::Omit,
             );
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -932,6 +933,7 @@ pub async fn run_gateway(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only

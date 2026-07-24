@@ -91,6 +91,13 @@ impl CostTracker {
         self.lock_storage().path.clone()
     }
 
+    /// Confirm that the canonical JSONL ledger can accept a durable record
+    /// without writing one. Goal admission uses this before accepting a finite
+    /// cost limit; provider-boundary preflight uses it before spending.
+    pub fn ensure_storage_ready(&self) -> Result<()> {
+        self.lock_storage().ensure_appendable()
+    }
+
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
         let config = self.config_snapshot();
@@ -248,7 +255,11 @@ impl CostTracker {
 
         {
             let mut storage = self.lock_storage();
-            storage.add_record(record)?;
+            // Token-only goal accounting must durably append the canonical row,
+            // but it must not calculate or refresh cost aggregates while cost
+            // tracking is disabled. A later enabled read rebuilds from the
+            // ledger, which remains the source of truth.
+            storage.add_record(record, enabled)?;
         }
 
         {
@@ -326,7 +337,7 @@ impl CostTracker {
     pub fn get_usage_totals_for_task_with_pricing(
         &self,
         task_id: &str,
-    ) -> Result<(u64, f64, bool)> {
+    ) -> Result<(u64, f64, bool, bool)> {
         let mut storage = self.lock_storage();
         storage.usage_totals_for_task_with_pricing(task_id)
     }
@@ -431,10 +442,44 @@ impl CostTracker {
         Self::resolve_global(slot, config, workspace_dir)
     }
 
+    /// Return the process-global `CostTracker` only if it already exists for
+    /// the current workspace path.
+    ///
+    /// Unlike [`Self::get_or_init_global`], this never initializes storage and
+    /// never calls the legacy migration path. Read-only status surfaces use this
+    /// to render "budget unavailable" without creating or migrating the ledger.
+    pub fn existing_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get()?;
+        Self::existing_global_in_slot(slot, config, workspace_dir)
+    }
+
+    /// Return the shared canonical usage ledger for goal-owned calls.
+    ///
+    /// A disabled cost policy suppresses ordinary cost collection, not the
+    /// durable token-attribution record required by goal mode. Callers must
+    /// use the scoped goal-write API; this method does not enable unscoped
+    /// cost tracking.
+    pub fn get_or_init_global_goal_usage_ledger(
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
+        Self::resolve_global_with_policy(slot, config, workspace_dir, true)
+    }
+
     fn resolve_global(
         slot: &RwLock<Option<Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        Self::resolve_global_with_policy(slot, config, workspace_dir, false)
+    }
+
+    fn resolve_global_with_policy(
+        slot: &RwLock<Option<Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+        initialize_when_disabled: bool,
     ) -> Option<Arc<Self>> {
         let storage_path = match resolve_storage_path(workspace_dir) {
             Ok(path) => path,
@@ -451,19 +496,19 @@ impl CostTracker {
         };
 
         if let Some(ct) = slot.read().as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
+            && (ct.storage_path() == storage_path || (!config.enabled && !initialize_when_disabled))
         {
             ct.update_config(config);
             return Some(ct);
         }
 
-        if !config.enabled {
+        if !config.enabled && !initialize_when_disabled {
             return None;
         }
 
         let mut guard = slot.write();
         if let Some(ct) = guard.as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
+            && (ct.storage_path() == storage_path || (!config.enabled && !initialize_when_disabled))
         {
             ct.update_config(config);
             return Some(ct);
@@ -486,6 +531,20 @@ impl CostTracker {
                 None
             }
         }
+    }
+
+    fn existing_global_in_slot(
+        slot: &RwLock<Option<Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let storage_path = workspace_dir.join("state").join("costs.jsonl");
+        let tracker = slot.read().as_ref().cloned()?;
+        if tracker.storage_path() != storage_path {
+            return None;
+        }
+        tracker.update_config(config);
+        tracker.is_enabled().then_some(tracker)
     }
 }
 
@@ -685,6 +744,15 @@ impl CostStorage {
         })
     }
 
+    fn ensure_appendable(&self) -> Result<()> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open cost storage for append at {}", self.path.display()))?;
+        Ok(())
+    }
+
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
     where
         F: FnMut(CostRecord),
@@ -797,8 +865,10 @@ impl CostStorage {
     }
 
     /// Add a new record.
-    fn add_record(&mut self, record: CostRecord) -> Result<()> {
-        self.ensure_period_cache_current()?;
+    fn add_record(&mut self, record: CostRecord, update_cost_aggregates: bool) -> Result<()> {
+        if update_cost_aggregates {
+            self.ensure_period_cache_current()?;
+        }
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -826,12 +896,16 @@ impl CostStorage {
             )
         })?;
 
-        let timestamp = record.usage.timestamp.naive_utc();
-        if timestamp.date() == self.cached_day {
-            self.daily_cost_usd += record.usage.cost_usd;
-        }
-        if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
-            self.monthly_cost_usd += record.usage.cost_usd;
+        if update_cost_aggregates {
+            let timestamp = record.usage.timestamp.naive_utc();
+            if timestamp.date() == self.cached_day {
+                self.daily_cost_usd += record.usage.cost_usd;
+            }
+            if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
+                self.monthly_cost_usd += record.usage.cost_usd;
+            }
+        } else {
+            self.aggregates_current = false;
         }
         Ok(())
     }
@@ -889,15 +963,19 @@ impl CostStorage {
     }
 
     fn usage_totals_for_task(&mut self, task_id: &str) -> Result<(u64, f64)> {
-        let (total_tokens, cost_usd, _pricing_available) =
+        let (total_tokens, cost_usd, _pricing_available, _usage_available) =
             self.usage_totals_for_task_with_pricing(task_id)?;
         Ok((total_tokens, cost_usd))
     }
 
-    fn usage_totals_for_task_with_pricing(&mut self, task_id: &str) -> Result<(u64, f64, bool)> {
+    fn usage_totals_for_task_with_pricing(
+        &mut self,
+        task_id: &str,
+    ) -> Result<(u64, f64, bool, bool)> {
         let mut total_tokens = 0_u64;
         let mut cost_usd = 0.0_f64;
         let mut pricing_available = true;
+        let mut usage_available = true;
         self.for_each_record(|record| {
             if record.task_id.as_deref() == Some(task_id) {
                 total_tokens = total_tokens.saturating_add(record.usage.total_tokens);
@@ -905,9 +983,12 @@ impl CostStorage {
                 if !record.usage.pricing_available {
                     pricing_available = false;
                 }
+                if !record.usage.usage_available {
+                    usage_available = false;
+                }
             }
         })?;
-        Ok((total_tokens, cost_usd, pricing_available))
+        Ok((total_tokens, cost_usd, pricing_available, usage_available))
     }
 
     /// Get cost for a specific date.
@@ -1087,13 +1168,14 @@ mod tests {
             )
             .unwrap();
 
-        let (tokens, cost, pricing_available) = tracker
+        let (tokens, cost, pricing_available, usage_available) = tracker
             .get_usage_totals_for_task_with_pricing("goal-a")
             .unwrap();
 
         assert_eq!(tokens, 2_250);
         assert!(cost > 0.0);
         assert!(!pricing_available);
+        assert!(usage_available);
     }
 
     #[test]
@@ -1111,12 +1193,13 @@ mod tests {
                 Some("goal-a"),
             )
             .unwrap();
-        let (tokens, cost, pricing_available) = tracker
+        let (tokens, cost, pricing_available, usage_available) = tracker
             .get_usage_totals_for_task_with_pricing("goal-a")
             .unwrap();
         assert_eq!(tokens, 1_500);
         assert!(cost > 0.0);
         assert!(pricing_available);
+        assert!(usage_available);
 
         let mut unpriced = TokenUsage::new("test/unpriced", 500, 250, 0, 0.0, 0.0, 0.0);
         unpriced.pricing_available = false;
@@ -1134,7 +1217,7 @@ mod tests {
                 .map(|stats| stats.request_count),
             Some(2)
         );
-        let (tokens, _cost, pricing_available) = tracker
+        let (tokens, _cost, pricing_available, usage_available) = tracker
             .get_usage_totals_for_task_with_pricing("goal-a")
             .unwrap();
         assert_eq!(tokens, 2_250);
@@ -1142,6 +1225,7 @@ mod tests {
             !pricing_available,
             "one unpriced row must make task cost-budget enforcement fail closed"
         );
+        assert!(usage_available);
     }
 
     #[test]
@@ -1510,6 +1594,32 @@ mod tests {
         assert!(
             resolve_storage_path(second_tmp.path()).unwrap().exists(),
             "usage after data-dir change must land in the new canonical ledger"
+        );
+    }
+
+    #[test]
+    fn existing_global_does_not_initialize_or_migrate_storage() {
+        let tmp = TempDir::new().unwrap();
+        let legacy_dir = tmp.path().join(".zeroclaw");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("costs.db");
+        fs::write(&legacy_path, b"legacy ledger").unwrap();
+        let canonical_path = tmp.path().join("state").join("costs.jsonl");
+        let slot = RwLock::new(None);
+
+        let existing = CostTracker::existing_global_in_slot(&slot, enabled_config(), tmp.path());
+
+        assert!(
+            existing.is_none(),
+            "read-only lookup must not construct a process-global tracker"
+        );
+        assert!(
+            legacy_path.exists(),
+            "read-only lookup must not migrate legacy storage"
+        );
+        assert!(
+            !canonical_path.exists(),
+            "read-only lookup must not create the canonical ledger path"
         );
     }
 

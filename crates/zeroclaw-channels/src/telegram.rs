@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_commands::{CommandExecution, CommandSurface, commands_for_surface};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
@@ -82,6 +83,23 @@ fn truncate_telegram_command_description(raw: &str) -> String {
         .collect();
     truncated.push('…');
     truncated
+}
+
+fn telegram_builtin_command_values() -> Vec<serde_json::Value> {
+    commands_for_surface(CommandSurface::Channel)
+        .filter(|spec| {
+            matches!(
+                spec.execution,
+                CommandExecution::RuntimeCommand | CommandExecution::GoalAdmission
+            )
+        })
+        .map(|spec| {
+            serde_json::json!({
+                "command": spec.name,
+                "description": zeroclaw_runtime::i18n::get_required_cli_string(spec.description_key),
+            })
+        })
+        .collect()
 }
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -990,14 +1008,7 @@ impl TelegramChannel {
     /// Includes built-in runtime commands, user-installed skill commands, and
     /// enabled tool commands from the configuration.
     async fn register_bot_commands(&self) {
-        let mut commands: Vec<serde_json::Value> = vec![
-            serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
-            serde_json::json!({ "command": "clear",  "description": "Clear this conversation session" }),
-            serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
-            serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
-            serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
-            serde_json::json!({ "command": "config", "description": "Show current configuration" }),
-        ];
+        let mut commands = telegram_builtin_command_values();
 
         // Track registered names to deduplicate across skills and tools.
         let mut used_names: std::collections::HashSet<String> = commands
@@ -7602,23 +7613,19 @@ mod tests {
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
     }
 
+    fn expected_bot_commands_body(extra_commands: Vec<serde_json::Value>) -> serde_json::Value {
+        let mut commands = telegram_builtin_command_values();
+        commands.extend(extra_commands);
+        serde_json::json!({ "commands": commands })
+    }
+
     #[tokio::test]
     async fn register_bot_commands_sends_correct_payload() {
         use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",    "description": "Start a new conversation session" },
-                { "command": "clear",  "description": "Clear this conversation session" },
-                { "command": "stop",   "description": "Cancel the current in-flight task" },
-                { "command": "model",  "description": "Show or switch the current model" },
-                { "command": "models", "description": "List available model_providers or switch model_provider" },
-                { "command": "config", "description": "Show current configuration" },
-            ]
-        });
+        let expected_body = expected_bot_commands_body(Vec::new());
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7764,17 +7771,10 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",     "description": "Start a new conversation session" },
-                { "command": "clear",   "description": "Clear this conversation session" },
-                { "command": "stop",    "description": "Cancel the current in-flight task" },
-                { "command": "model",   "description": "Show or switch the current model" },
-                { "command": "models",  "description": "List available model_providers or switch model_provider" },
-                { "command": "config",  "description": "Show current configuration" },
-                { "command": "weather", "description": "Check the weather forecast" },
-            ]
-        });
+        let expected_body = expected_bot_commands_body(vec![serde_json::json!({
+            "command": "weather",
+            "description": "Check the weather forecast",
+        })]);
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7807,17 +7807,10 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = serde_json::json!({
-            "commands": [
-                { "command": "new",       "description": "Start a new conversation session" },
-                { "command": "clear",     "description": "Clear this conversation session" },
-                { "command": "stop",      "description": "Cancel the current in-flight task" },
-                { "command": "model",     "description": "Show or switch the current model" },
-                { "command": "models",    "description": "List available model_providers or switch model_provider" },
-                { "command": "config",    "description": "Show current configuration" },
-                { "command": "test_tool", "description": "A test tool" },
-            ]
-        });
+        let expected_body = expected_bot_commands_body(vec![serde_json::json!({
+            "command": "test_tool",
+            "description": "A test tool",
+        })]);
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
