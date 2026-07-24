@@ -104,3 +104,26 @@ A handful of fields live as schema fields, reachable via the standard mapping:
 4. **KiloCLI / Gemini CLI paths**: `[providers.models.kilocli.<alias>] binary_path` and `[providers.models.gemini_cli.<alias>] binary_path`.
 5. **Transcription / TTS keys**: `[transcription].api_key`, `[providers.tts.openai.<alias>].api_key`, `[providers.tts.elevenlabs.<alias>].api_key`, `[providers.tts.google.<alias>].api_key`.
 6. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).
+
+## Native bridge exceptions
+
+V0.8.0 eradicated all per-provider native env-var fallbacks. The schema-mirror grammar (`ZEROCLAW_*`) is the only supported env override surface. One intentional exception exists:
+
+### OpenAI STT (`TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY`)
+
+The OpenAI Whisper STT provider resolves its API key on demand during provider construction via `resolve_openai_stt_api_key()` in `zeroclaw-config`. This is a config-layer, stateless resolver — the environment value is never written into `Config` or persisted to disk.
+
+**Precedence (highest wins):**
+
+1. Explicit config: `[transcription.openai].api_key` or `[providers.transcription.openai.<alias>].base.api_key`
+2. Schema-mirror env: `ZEROCLAW_transcription__openai__api_key=...` or `ZEROCLAW_providers__transcription__openai__<alias>__api_key=...`
+3. `TRANSCRIPTION_API_KEY` (dedicated transcription credential)
+4. `OPENAI_API_KEY` (generic OpenAI key, last resort)
+
+**Provider registration guard:** the env-only OpenAI STT provider registers only when no `[transcription.openai]` table is configured *and* no other explicit STT provider (Groq, Deepgram, AssemblyAI, Google, local_whisper) registered successfully. An ambient `OPENAI_API_KEY` exported for model integration does not perturb explicit STT provider selection or change the registered provider count.
+
+**Migration:** operators relying on `TRANSCRIPTION_API_KEY` or `OPENAI_API_KEY` for STT can keep them working without changes. To migrate to the canonical surface:
+
+```sh
+export ZEROCLAW_transcription__openai__api_key="$TRANSCRIPTION_API_KEY"
+```

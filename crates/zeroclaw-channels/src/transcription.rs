@@ -268,7 +268,11 @@ impl OpenAiWhisperProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
-            model: cfg.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
+            model: cfg
+                .model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or_else(|| "whisper-1".to_string()),
         })
     }
 }
@@ -964,11 +968,6 @@ impl TranscriptionManager {
             if let Ok(p) = OpenAiWhisperProvider::from_config("openai", openai_cfg) {
                 transcription_providers.insert("openai".to_string(), Box::new(p));
             }
-        } else {
-            let effective = OpenAiSttConfig::default();
-            if let Ok(p) = OpenAiWhisperProvider::from_config("openai", &effective) {
-                transcription_providers.insert("openai".to_string(), Box::new(p));
-            }
         }
 
         if let Some(ref deepgram_cfg) = config.deepgram
@@ -1003,6 +1002,19 @@ impl TranscriptionManager {
                         "local_whisper config invalid, provider skipped"
                     );
                 }
+            }
+        }
+
+        // Env-only OpenAI fallback: when no [transcription.openai] table is
+        // configured AND no other explicit STT provider registered, attempt
+        // to resolve credentials from TRANSCRIPTION_API_KEY / OPENAI_API_KEY.
+        // This must NOT perturb explicit provider selection — an ambient
+        // OPENAI_API_KEY (e.g. for model integration) must not change the
+        // provider count when the operator configured Groq/Deepgram/etc.
+        if config.openai.is_none() && transcription_providers.is_empty() {
+            let effective = OpenAiSttConfig::default();
+            if let Ok(p) = OpenAiWhisperProvider::from_config("openai", &effective) {
+                transcription_providers.insert("openai".to_string(), Box::new(p));
             }
         }
     }
@@ -1233,6 +1245,60 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    /// Serialises all env-mutating tests in this module (and the nested
+    /// `openai_stt_env_tests`) so that concurrent tests never race on
+    /// `TRANSCRIPTION_API_KEY` or `OPENAI_API_KEY`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialised env isolation that snapshots and restores
+    /// `TRANSCRIPTION_API_KEY` and `OPENAI_API_KEY` to give the
+    /// production resolver a deterministic view. Acquires
+    /// `ENV_LOCK` on construction and holds it for the guard's
+    /// lifetime so sibling tests are fully serialised.
+    ///
+    /// Rust 2024 requires `unsafe` for `std::env::set_var` /
+    /// `std::env::remove_var`; this matches the contract used by
+    /// `LegacyEnvFixture` in `zeroclaw-config`.
+    struct EnvIsolation {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_transcription: Option<String>,
+        saved_openai: Option<String>,
+    }
+
+    impl EnvIsolation {
+        fn isolate() -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let saved_transcription = std::env::var("TRANSCRIPTION_API_KEY").ok();
+            let saved_openai = std::env::var("OPENAI_API_KEY").ok();
+            // SAFETY: lock is held, no other test can touch these vars.
+            unsafe {
+                std::env::remove_var("TRANSCRIPTION_API_KEY");
+                std::env::remove_var("OPENAI_API_KEY");
+            }
+            Self {
+                _lock: lock,
+                saved_transcription,
+                saved_openai,
+            }
+        }
+    }
+
+    impl Drop for EnvIsolation {
+        fn drop(&mut self) {
+            // SAFETY: lock is still held (we drop _lock after this impl).
+            unsafe {
+                match &self.saved_transcription {
+                    Some(v) => std::env::set_var("TRANSCRIPTION_API_KEY", v),
+                    None => std::env::remove_var("TRANSCRIPTION_API_KEY"),
+                }
+                match &self.saved_openai {
+                    Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                    None => std::env::remove_var("OPENAI_API_KEY"),
+                }
+            }
+        }
+    }
+
     struct StaticTranscriptionProvider {
         calls: Arc<AtomicUsize>,
     }
@@ -1368,6 +1434,7 @@ mod tests {
 
     #[test]
     fn manager_creation_with_default_config() {
+        let _iso = EnvIsolation::isolate();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
@@ -1377,12 +1444,14 @@ mod tests {
         // until an orchestrator wires it via `with_agent_transcription_provider`.
         // No global default-provider concept.
         assert!(manager.agent_transcription_provider.is_empty());
-        // Groq won't be registered without a key.
+        // Groq won't be registered without a key; env-only OpenAI won't
+        // register without env credentials.
         assert!(manager.transcription_providers.is_empty());
     }
 
     #[test]
     fn manager_registers_groq_with_key() {
+        let _iso = EnvIsolation::isolate();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
@@ -1398,6 +1467,7 @@ mod tests {
 
     #[test]
     fn manager_registers_multiple_providers() {
+        let _iso = EnvIsolation::isolate();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
@@ -1423,6 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn manager_rejects_unconfigured_provider() {
+        let _iso = EnvIsolation::isolate();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
@@ -1444,6 +1515,7 @@ mod tests {
 
     #[test]
     fn manager_agent_transcription_provider_via_setter() {
+        let _iso = EnvIsolation::isolate();
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
@@ -1463,6 +1535,7 @@ mod tests {
 
     #[test]
     fn manager_from_config_for_agent_registers_dotted_provider_refs() {
+        let _iso = EnvIsolation::isolate();
         let mut config = zeroclaw_config::schema::Config {
             transcription: TranscriptionConfig {
                 enabled: true,
@@ -2127,6 +2200,7 @@ mod tests {
 
     #[test]
     fn local_whisper_registered_when_config_present() {
+        let _iso = EnvIsolation::isolate();
         let config = TranscriptionConfig {
             local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
             ..TranscriptionConfig::default()
@@ -2142,6 +2216,7 @@ mod tests {
 
     #[test]
     fn local_whisper_misconfigured_section_fails_manager_construction() {
+        let _iso = EnvIsolation::isolate();
         // A misconfigured local_whisper section logs a warning and skips
         // registration. When transcription is enabled and no other provider
         // section is set, the safety net in TranscriptionManager surfaces
@@ -2370,61 +2445,6 @@ mod tests {
     #[cfg(test)]
     mod openai_stt_env_tests {
         use super::*;
-        use std::sync::Mutex;
-
-        /// Serialises all `EnvIsolation` instances in this module so
-        /// that concurrent tests never race on `TRANSCRIPTION_API_KEY`
-        /// or `OPENAI_API_KEY`.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        /// Serialised env isolation that snapshots and restores
-        /// `TRANSCRIPTION_API_KEY` and `OPENAI_API_KEY` to give the
-        /// production resolver a deterministic view. Acquires
-        /// `ENV_LOCK` on construction and holds it for the guard's
-        /// lifetime so sibling tests are fully serialised.
-        ///
-        /// Rust 2024 requires `unsafe` for `std::env::set_var` /
-        /// `std::env::remove_var`; this matches the contract used by
-        /// `LegacyEnvFixture` in `zeroclaw-config`.
-        struct EnvIsolation {
-            _lock: std::sync::MutexGuard<'static, ()>,
-            saved_transcription: Option<String>,
-            saved_openai: Option<String>,
-        }
-
-        impl EnvIsolation {
-            fn isolate() -> Self {
-                let lock = ENV_LOCK.lock().unwrap();
-                let saved_transcription = std::env::var("TRANSCRIPTION_API_KEY").ok();
-                let saved_openai = std::env::var("OPENAI_API_KEY").ok();
-                // SAFETY: lock is held, no other test can touch these vars.
-                unsafe {
-                    std::env::remove_var("TRANSCRIPTION_API_KEY");
-                    std::env::remove_var("OPENAI_API_KEY");
-                }
-                Self {
-                    _lock: lock,
-                    saved_transcription,
-                    saved_openai,
-                }
-            }
-        }
-
-        impl Drop for EnvIsolation {
-            fn drop(&mut self) {
-                // SAFETY: lock is still held (we drop _lock after this impl).
-                unsafe {
-                    match &self.saved_transcription {
-                        Some(v) => std::env::set_var("TRANSCRIPTION_API_KEY", v),
-                        None => std::env::remove_var("TRANSCRIPTION_API_KEY"),
-                    }
-                    match &self.saved_openai {
-                        Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-                        None => std::env::remove_var("OPENAI_API_KEY"),
-                    }
-                }
-            }
-        }
 
         // ── unit: from_config / from_typed_config ────────────────
 
@@ -2562,14 +2582,48 @@ mod tests {
             }
             let mut config = TranscriptionConfig::default();
             config.enabled = true;
-            // No [transcription.openai] table.
+            // No [transcription.openai] table, no other providers.
             assert!(config.openai.is_none());
+            assert!(config.api_key.is_none());
 
             let manager = TranscriptionManager::new(&config).unwrap();
             let providers = manager.available_providers();
             assert!(
                 providers.contains(&"openai"),
-                "env-only legacy path must register 'openai' provider; got: {providers:?}"
+                "env-only legacy path must register 'openai' provider when no other provider is configured; got: {providers:?}"
+            );
+        }
+
+        #[test]
+        fn ambient_openai_key_does_not_perturb_explicit_groq_selection() {
+            // Regression: an ambient OPENAI_API_KEY (e.g. for model integration)
+            // must NOT register an OpenAI STT provider when the operator has
+            // explicitly configured Groq. WATI/Lark/Mattermost/Telegram/QQ
+            // auto-bind only when exactly one provider is registered.
+            let _iso = EnvIsolation::isolate();
+            unsafe {
+                std::env::set_var("OPENAI_API_KEY", "sk-ambient-model-key");
+            }
+            let config = TranscriptionConfig {
+                enabled: true,
+                api_key: Some("gsk-explicit-groq-key".to_string()),
+                ..TranscriptionConfig::default()
+            };
+
+            let manager = TranscriptionManager::new(&config).unwrap();
+            let providers = manager.available_providers();
+            assert!(
+                providers.contains(&"groq"),
+                "explicit Groq must be registered; got: {providers:?}"
+            );
+            assert!(
+                !providers.contains(&"openai"),
+                "ambient OPENAI_API_KEY must NOT register OpenAI STT when Groq is explicit; got: {providers:?}"
+            );
+            assert_eq!(
+                providers.len(),
+                1,
+                "exactly one provider so direct-channel auto-bind works; got: {providers:?}"
             );
         }
 
@@ -2580,7 +2634,10 @@ mod tests {
             config.enabled = true;
             assert!(config.openai.is_none());
 
-            let err = TranscriptionManager::new(&config).unwrap_err();
+            let err = match TranscriptionManager::new(&config) {
+                Ok(_) => panic!("expected error when enabled with no providers"),
+                Err(e) => e,
+            };
             let msg = err.to_string();
             assert!(
                 msg.contains("Transcription is enabled"),
