@@ -140,7 +140,7 @@ wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcd
 waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.18", optional = true }
 whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
 whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
