@@ -204,6 +204,233 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
     Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
 }
 
+#[derive(Debug, Default)]
+enum InteractivePhase {
+    #[default]
+    Idle,
+    Active {
+        cancellation_token: CancellationToken,
+    },
+    Stopping,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InteractiveInterruptAction {
+    Exit,
+    CancelTurn,
+}
+
+impl InteractivePhase {
+    fn begin_turn(&mut self) -> Option<CancellationToken> {
+        if !matches!(self, Self::Idle) {
+            return None;
+        }
+
+        let cancellation_token = CancellationToken::new();
+        *self = Self::Active {
+            cancellation_token: cancellation_token.clone(),
+        };
+        Some(cancellation_token)
+    }
+
+    fn finish_turn(&mut self) -> bool {
+        let Self::Active { cancellation_token } = self else {
+            return false;
+        };
+        let was_cancelled = cancellation_token.is_cancelled();
+        *self = Self::Idle;
+        was_cancelled
+    }
+
+    fn on_interrupt(&mut self) -> InteractiveInterruptAction {
+        match self {
+            Self::Idle => {
+                *self = Self::Stopping;
+                InteractiveInterruptAction::Exit
+            }
+            Self::Active { cancellation_token } => {
+                cancellation_token.cancel();
+                InteractiveInterruptAction::CancelTurn
+            }
+            Self::Stopping => InteractiveInterruptAction::Exit,
+        }
+    }
+}
+
+struct InteractiveInterrupt {
+    #[cfg(unix)]
+    signal: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    signal: tokio::signal::windows::CtrlC,
+    #[cfg(not(any(unix, windows)))]
+    _private: (),
+}
+
+impl InteractiveInterrupt {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                signal: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                signal: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Self { _private: () })
+        }
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.signal.recv().await.ok_or_else(|| {
+                std::io::Error::other("interactive Ctrl+C signal stream closed unexpectedly")
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            tokio::signal::ctrl_c().await
+        }
+    }
+}
+
+#[derive(Debug)]
+enum InteractiveSignalNotice {
+    Exit,
+    Failed(std::io::Error),
+}
+
+struct InteractiveSignalTask {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl InteractiveSignalTask {
+    async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for InteractiveSignalTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn spawn_interactive_signal_task(
+    phase: Arc<parking_lot::Mutex<InteractivePhase>>,
+) -> std::io::Result<(
+    tokio::sync::mpsc::Receiver<InteractiveSignalNotice>,
+    InteractiveSignalTask,
+)> {
+    let mut interrupt = InteractiveInterrupt::new()?;
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        loop {
+            if let Err(error) = interrupt.recv().await {
+                let _ = notice_tx.send(InteractiveSignalNotice::Failed(error)).await;
+                break;
+            }
+
+            let action = phase.lock().on_interrupt();
+            if action == InteractiveInterruptAction::Exit {
+                let _ = notice_tx.send(InteractiveSignalNotice::Exit).await;
+                break;
+            }
+        }
+    });
+    Ok((
+        notice_rx,
+        InteractiveSignalTask {
+            handle: Some(handle),
+        },
+    ))
+}
+
+struct InteractiveInputTask {
+    request_tx: tokio::sync::mpsc::Sender<()>,
+    result_rx: tokio::sync::mpsc::Receiver<std::io::Result<CappedLine>>,
+}
+
+fn interactive_input_result_is_terminal(result: &std::io::Result<CappedLine>) -> bool {
+    matches!(result, Ok(CappedLine::Eof))
+}
+
+impl InteractiveInputTask {
+    fn spawn() -> std::io::Result<Self> {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel(1);
+
+        let input_thread = std::thread::Builder::new()
+            .name("zeroclaw-interactive-input".to_string())
+            .spawn(move || {
+                let stdin = std::io::stdin();
+                let mut reader = stdin.lock();
+                while request_rx.blocking_recv().is_some() {
+                    let result = read_capped_line(&mut reader, MAX_INTERACTIVE_INPUT_BYTES);
+                    let terminal = interactive_input_result_is_terminal(&result);
+                    if result_tx.blocking_send(result).is_err() || terminal {
+                        break;
+                    }
+                }
+            })?;
+        drop(input_thread);
+
+        Ok(Self {
+            request_tx,
+            result_rx,
+        })
+    }
+
+    fn request_line(&self) -> std::io::Result<()> {
+        self.request_tx.try_send(()).map_err(|error| {
+            std::io::Error::other(format!("interactive input task unavailable: {error}"))
+        })
+    }
+}
+
+#[derive(Debug)]
+enum InteractiveIdleEvent {
+    Input(std::io::Result<CappedLine>),
+    Interrupt,
+}
+
+async fn wait_for_interactive_idle_event(
+    input: &mut InteractiveInputTask,
+    signal_notices: &mut tokio::sync::mpsc::Receiver<InteractiveSignalNotice>,
+) -> std::io::Result<InteractiveIdleEvent> {
+    input.request_line()?;
+    tokio::select! {
+        biased;
+        notice = signal_notices.recv() => match notice {
+            Some(InteractiveSignalNotice::Exit) => Ok(InteractiveIdleEvent::Interrupt),
+            Some(InteractiveSignalNotice::Failed(error)) => Err(error),
+            None => Err(std::io::Error::other(
+                "interactive Ctrl+C signal task stopped unexpectedly",
+            )),
+        },
+        input_result = input.result_rx.recv() => match input_result {
+            Some(result) => Ok(InteractiveIdleEvent::Input(result)),
+            None => Err(std::io::Error::other(
+                "interactive input task stopped unexpectedly",
+            )),
+        },
+    }
+}
+
 fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
     loop {
         let buf = reader.fill_buf()?;
@@ -2146,6 +2373,13 @@ pub async fn run(
                     .await;
             }
         } else {
+            let interactive_phase = Arc::new(parking_lot::Mutex::new(InteractivePhase::Idle));
+            let (mut signal_notices, signal_task) =
+                spawn_interactive_signal_task(Arc::clone(&interactive_phase))
+                    .context("failed to initialize interactive Ctrl+C handling")?;
+            let mut input_task = InteractiveInputTask::spawn()
+                .context("failed to initialize interactive input handling")?;
+
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
             let cli = CLI_CHANNEL_FN.get().expect(
@@ -2159,28 +2393,35 @@ pub async fn run(
                 vec![ChatMessage::system(&system_prompt)]
             };
 
-            loop {
+            'interactive: loop {
                 print!("> ");
                 let _ = std::io::stdout().flush();
 
-                let input = {
-                    let stdin = std::io::stdin().lock();
-                    match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
-                        Ok(CappedLine::Eof) => break,
-                        Ok(CappedLine::Line(s)) => s,
-                        Ok(CappedLine::Truncated) => {
-                            eprintln!(
-                                "\nWarning: input line exceeds {} bytes and was discarded.",
-                                MAX_INTERACTIVE_INPUT_BYTES
-                            );
-                            continue;
+                let input =
+                    match wait_for_interactive_idle_event(&mut input_task, &mut signal_notices)
+                        .await
+                        .context("interactive input lifecycle failed")?
+                    {
+                        InteractiveIdleEvent::Interrupt => {
+                            println!();
+                            break 'interactive;
                         }
-                        Err(e) => {
-                            eprintln!("\nError reading input: {e}\n");
-                            break;
-                        }
-                    }
-                };
+                        InteractiveIdleEvent::Input(result) => match result {
+                            Ok(CappedLine::Eof) => break,
+                            Ok(CappedLine::Line(s)) => s,
+                            Ok(CappedLine::Truncated) => {
+                                eprintln!(
+                                    "\nWarning: input line exceeds {} bytes and was discarded.",
+                                    MAX_INTERACTIVE_INPUT_BYTES
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("\nError reading input: {e}\n");
+                                break;
+                            }
+                        },
+                    };
 
                 let user_input = input.trim().to_string();
                 if user_input.is_empty() {
@@ -2206,15 +2447,28 @@ pub async fn run(
                         print!("Continue? [y/N] ");
                         let _ = std::io::stdout().flush();
 
-                        let confirm = {
-                            let stdin = std::io::stdin().lock();
-                            match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
+                        let confirm = match wait_for_interactive_idle_event(
+                            &mut input_task,
+                            &mut signal_notices,
+                        )
+                        .await
+                        .context("interactive confirmation input lifecycle failed")?
+                        {
+                            InteractiveIdleEvent::Interrupt => {
+                                println!();
+                                break 'interactive;
+                            }
+                            InteractiveIdleEvent::Input(result) => match result {
                                 Ok(CappedLine::Line(s)) => s,
-                                Ok(CappedLine::Truncated) | Ok(CappedLine::Eof) | Err(_) => {
+                                Ok(CappedLine::Eof) => {
+                                    println!("Cancelled.\n");
+                                    break 'interactive;
+                                }
+                                Ok(CappedLine::Truncated) | Err(_) => {
                                     println!("Cancelled.\n");
                                     continue;
                                 }
-                            }
+                            },
                         };
                         if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                             println!("Cancelled.\n");
@@ -2245,6 +2499,10 @@ pub async fn run(
                     }
                     _ => {}
                 }
+
+                let Some(cancel_token) = interactive_phase.lock().begin_turn() else {
+                    break 'interactive;
+                };
 
                 // ── Parse thinking directive from interactive input ───
                 let (thinking_directive, effective_input) =
@@ -2305,15 +2563,22 @@ pub async fn run(
                     config.skills.install_suggestions.enabled,
                 ) {
                     final_output = suggestion;
-                    if let Err(e) = zeroclaw_api::channel::Channel::send(
-                        &*cli,
-                        &zeroclaw_api::channel::SendMessage::new(
-                            format!("\n{final_output}\n"),
-                            "user",
-                        ),
-                    )
-                    .await
-                    {
+                    let suggestion_message = zeroclaw_api::channel::SendMessage::new(
+                        format!("\n{final_output}\n"),
+                        "user",
+                    );
+                    let send_result = tokio::select! {
+                        biased;
+                        () = cancel_token.cancelled() => None,
+                        result = zeroclaw_api::channel::Channel::send(
+                            &*cli,
+                            &suggestion_message,
+                        ) => Some(result),
+                    };
+                    if cancel_token.is_cancelled() {
+                        final_output.clear();
+                        eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
+                    } else if let Some(Err(e)) = send_result {
                         eprintln!("\nError sending CLI response: {e}\n");
                     }
                     observer.record_event(&ObserverEvent::TurnComplete);
@@ -2322,6 +2587,7 @@ pub async fn run(
                     {
                         sys_msg.content.clone_from(&base_system_prompt);
                     }
+                    interactive_phase.lock().finish_turn();
                     continue;
                 }
 
@@ -2332,14 +2598,23 @@ pub async fn run(
                 {
                     let user_key = autosave_memory_key("user_msg");
                     let store_start = std::time::Instant::now();
-                    let store_result = mem
-                        .store(
+                    let store_result = tokio::select! {
+                        biased;
+                        () = cancel_token.cancelled() => None,
+                        result = mem.store(
                             &user_key,
                             &effective_input,
                             MemoryCategory::Conversation,
                             memory_session_id.as_deref(),
-                        )
-                        .await;
+                        ) => Some(result),
+                    };
+                    let Some(store_result) = store_result else {
+                        final_output.clear();
+                        eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
+                        observer.record_event(&ObserverEvent::TurnComplete);
+                        interactive_phase.lock().finish_turn();
+                        continue;
+                    };
                     observer.record_event(&ObserverEvent::MemoryStore {
                         category: MemoryCategory::Conversation.to_string(),
                         backend: mem.name().to_string(),
@@ -2411,15 +2686,6 @@ pub async fn run(
                                 let _ = std::io::stdout().flush();
                             }
                         }
-                    }
-                });
-
-                // Ctrl+C cancels the in-flight turn instead of killing the process.
-                let cancel_token = CancellationToken::new();
-                let cancel_token_clone = cancel_token.clone();
-                let ctrlc_handle = zeroclaw_spawn::spawn!(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        cancel_token_clone.cancel();
                     }
                 });
 
@@ -2710,21 +2976,28 @@ pub async fn run(
                     }
                 };
 
-                // Clean up: stop the Ctrl+C listener and flush streaming events.
-                ctrlc_handle.abort();
                 drop(delta_tx);
                 let _ = consumer_handle.await;
 
                 final_output = response;
                 if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
                     println!();
-                } else if let Err(e) = zeroclaw_api::channel::Channel::send(
-                    &*cli,
-                    &zeroclaw_api::channel::SendMessage::new(format!("\n{final_output}\n"), "user"),
-                )
-                .await
-                {
-                    eprintln!("\nError sending CLI response: {e}\n");
+                } else {
+                    let response_message = zeroclaw_api::channel::SendMessage::new(
+                        format!("\n{final_output}\n"),
+                        "user",
+                    );
+                    let send_result = tokio::select! {
+                        biased;
+                        () = cancel_token.cancelled() => None,
+                        result = zeroclaw_api::channel::Channel::send(
+                            &*cli,
+                            &response_message,
+                        ) => Some(result),
+                    };
+                    if let Some(Err(e)) = send_result {
+                        eprintln!("\nError sending CLI response: {e}\n");
+                    }
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
 
@@ -2781,7 +3054,11 @@ pub async fn run(
                 if let Some(path) = session_state_file.as_deref() {
                     save_interactive_session_history(path, &history)?;
                 }
+
+                interactive_phase.lock().finish_turn();
             }
+
+            signal_task.shutdown().await;
         }
 
         let duration = start.elapsed();
@@ -15739,6 +16016,212 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    #[test]
+    fn interactive_signal_lifecycle_idle_ctrl_c_requests_clean_exit() {
+        let mut phase = InteractivePhase::Idle;
+
+        assert_eq!(phase.on_interrupt(), InteractiveInterruptAction::Exit);
+        assert!(matches!(phase, InteractivePhase::Stopping));
+        assert!(phase.begin_turn().is_none());
+    }
+
+    #[test]
+    fn interactive_signal_lifecycle_active_ctrl_c_cancels_only_the_turn() {
+        let mut phase = InteractivePhase::Idle;
+        let cancellation_token = phase.begin_turn().expect("idle phase should start a turn");
+
+        assert_eq!(phase.on_interrupt(), InteractiveInterruptAction::CancelTurn);
+        assert!(cancellation_token.is_cancelled());
+        assert!(matches!(phase, InteractivePhase::Active { .. }));
+        assert!(phase.finish_turn());
+        assert!(matches!(phase, InteractivePhase::Idle));
+    }
+
+    #[test]
+    fn interactive_signal_lifecycle_turn_completion_rearms_idle_exit() {
+        let mut phase = InteractivePhase::Idle;
+        let cancellation_token = phase.begin_turn().expect("idle phase should start a turn");
+
+        assert!(!cancellation_token.is_cancelled());
+        assert!(!phase.finish_turn());
+        assert_eq!(phase.on_interrupt(), InteractiveInterruptAction::Exit);
+        assert!(matches!(phase, InteractivePhase::Stopping));
+    }
+
+    #[test]
+    fn interactive_signal_lifecycle_input_worker_stops_only_at_eof() {
+        assert!(interactive_input_result_is_terminal(&Ok(CappedLine::Eof)));
+        assert!(!interactive_input_result_is_terminal(&Ok(
+            CappedLine::Truncated
+        )));
+        assert!(!interactive_input_result_is_terminal(&Err(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "retry input")
+        )));
+    }
+
+    fn interactive_test_input_task() -> (
+        InteractiveInputTask,
+        tokio::sync::mpsc::Receiver<()>,
+        tokio::sync::mpsc::Sender<std::io::Result<CappedLine>>,
+    ) {
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel(1);
+        (
+            InteractiveInputTask {
+                request_tx,
+                result_rx,
+            },
+            request_rx,
+            result_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn interactive_signal_lifecycle_idle_wait_returns_completed_input() {
+        let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(1);
+        result_tx
+            .send(Ok(CappedLine::Line("hello".to_string())))
+            .await
+            .unwrap();
+
+        let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
+            .await
+            .unwrap();
+
+        assert!(request_rx.recv().await.is_some());
+        drop(notice_tx);
+        match event {
+            InteractiveIdleEvent::Input(Ok(CappedLine::Line(line))) => {
+                assert_eq!(line, "hello");
+            }
+            other => panic!("expected completed input, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_signal_lifecycle_idle_wait_prioritizes_ctrl_c() {
+        let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(1);
+        result_tx
+            .send(Ok(CappedLine::Line("must not win".to_string())))
+            .await
+            .unwrap();
+        notice_tx.send(InteractiveSignalNotice::Exit).await.unwrap();
+
+        let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
+            .await
+            .unwrap();
+
+        assert!(request_rx.recv().await.is_some());
+        assert!(matches!(event, InteractiveIdleEvent::Interrupt));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_signal_lifecycle_windows_subprocess_exits_zero() {
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let mut child = std::process::Command::new(current_exe)
+            .args([
+                "interactive_signal_lifecycle_windows_child_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Windows Ctrl+C helper process should start");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("query helper process status") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().expect("terminate timed-out helper process");
+                break child.wait().expect("reap timed-out helper process");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .stdout
+            .take()
+            .expect("helper stdout pipe")
+            .read_to_string(&mut stdout)
+            .expect("read helper stdout");
+        child
+            .stderr
+            .take()
+            .expect("helper stderr pipe")
+            .read_to_string(&mut stderr)
+            .expect("read helper stderr");
+
+        assert!(
+            !timed_out,
+            "Windows Ctrl+C helper process timed out\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "idle Ctrl+C must exit cleanly instead of 0xC000013A\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "subprocess helper for the Windows Ctrl+C exit-code regression"]
+    async fn interactive_signal_lifecycle_windows_child_helper() {
+        use windows::Win32::System::Console::{
+            CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        };
+
+        // GitHub's test process can carry Windows' inheritable "ignore Ctrl+C"
+        // attribute. Clear it before Tokio installs the same listener used by
+        // the REPL; otherwise GenerateConsoleCtrlEvent succeeds but Windows
+        // deliberately skips every handler in this isolated helper.
+        unsafe { SetConsoleCtrlHandler(None, false) }
+            .expect("enable Ctrl+C handling in helper process");
+        eprintln!("Windows Ctrl+C helper: handling enabled");
+
+        let phase = Arc::new(parking_lot::Mutex::new(InteractivePhase::Idle));
+        let (mut notice_rx, signal_task) =
+            spawn_interactive_signal_task(Arc::clone(&phase)).expect("install Ctrl+C listener");
+        let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        eprintln!("Windows Ctrl+C helper: listener installed");
+
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: this helper is the only process in its isolated test console.
+            // Group id 0 broadcasts CTRL_C_EVENT only within that console.
+            unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) }
+                .expect("generate CTRL_C_EVENT in helper console");
+            eprintln!("Windows Ctrl+C helper: event generated");
+        });
+
+        let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
+            .await
+            .expect("idle wait should receive Ctrl+C");
+        eprintln!("Windows Ctrl+C helper: event received");
+        assert!(request_rx.recv().await.is_some());
+        assert!(matches!(event, InteractiveIdleEvent::Interrupt));
+        assert!(matches!(*phase.lock(), InteractivePhase::Stopping));
+
+        drop(result_tx);
+        signal_thread.join().expect("Ctrl+C generator thread");
+        signal_task.shutdown().await;
     }
 
     /// When the caller pre-mints a turn id (`process_message` does, so its

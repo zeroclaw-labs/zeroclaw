@@ -332,6 +332,13 @@ jobs:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Test interactive Ctrl+C lifecycle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+          cargo test --profile ci --locked -p zeroclaw-runtime --lib
+          interactive_signal_lifecycle
+          --target x86_64-pc-windows-msvc
 
   check:
     name: Check (${{ matrix.name }})
