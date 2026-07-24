@@ -24,6 +24,7 @@ pub mod policy;
 pub mod presets;
 pub mod provider_aliases;
 pub mod providers;
+pub mod sandbox_policy;
 pub mod scattered_types;
 pub mod schema;
 #[cfg(feature = "schema-export")]

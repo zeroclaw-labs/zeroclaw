@@ -179,6 +179,17 @@ impl FileEditTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
+        if !self.security.is_resolved_path_allowed(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_target),
+                ),
+            });
+        }
+
         if self.security.is_runtime_config_path(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
@@ -978,5 +989,60 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    fn deny_write_guardrail_tool(workspace: std::path::PathBuf) -> FileEditTool {
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, &workspace));
+        FileEditTool::new(security)
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_mandatory_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_deny_write_env");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(".env"), "SECRET=old")
+            .await
+            .unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".env", "old_string": "old", "new_string": "new"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "edit of .env must be denied");
+        let content = tokio::fs::read_to_string(dir.join(".env")).await.unwrap();
+        assert_eq!(
+            content, "SECRET=old",
+            "denied edit must not mutate the file"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_nested_git_config_deny_write_target() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_deny_write_git_config");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir.join(".git")).await.unwrap();
+        tokio::fs::write(dir.join(".git/config"), "[core]\nbare = false")
+            .await
+            .unwrap();
+
+        let tool = deny_write_guardrail_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": ".git/config", "old_string": "false", "new_string": "true"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "edit of .git/config must be denied");
+        let content = tokio::fs::read_to_string(dir.join(".git/config"))
+            .await
+            .unwrap();
+        assert_eq!(content, "[core]\nbare = false");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -1427,7 +1427,7 @@ impl Agent {
                 format!("agents.{agent_alias}: failed to build security policy")
             })?;
             if let Some(cwd) = session_cwd {
-                policy.workspace_dir = cwd.to_path_buf();
+                policy.rebase_workspace(cwd.to_path_buf());
                 policy.allowed_roots.push(agent_workspace.clone());
             }
             policy

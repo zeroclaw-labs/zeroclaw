@@ -497,7 +497,7 @@ impl DelegateTool {
             target_policy.tracker = self.security.tracker.clone();
 
             if self.security.risk_profile_name == target_policy.risk_profile_name {
-                target_policy.workspace_dir = self.security.workspace_dir.clone();
+                target_policy.rebase_workspace(self.security.workspace_dir.clone());
             }
         }
 
@@ -7091,6 +7091,55 @@ mod tests {
         );
     }
 
+    /// Regression: a bounded same-profile delegate's resolved policy has its
+    /// `workspace_dir` overwritten to the caller's workspace, but its
+    /// `deny_write` guardrails (`.env`, `.git/hooks/`, etc.) were resolved
+    /// against the target's own workspace during `SecurityPolicy::for_agent`.
+    /// Without rebasing those entries alongside the workspace, the guardrail
+    /// stays scoped to a workspace the bounded delegate never touches, and
+    /// the caller's actual workspace gets none of the write-deny protection.
+    #[tokio::test]
+    async fn bounded_same_profile_delegate_rebases_deny_write_guardrails_to_caller_workspace() {
+        let config = config_with_two_agents("caller", 5, "target", 5);
+
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let caller_workspace = caller_policy.workspace_dir.clone();
+        let target_workspace = config.agent_workspace_dir("target");
+        assert_ne!(
+            caller_workspace, target_workspace,
+            "test precondition: caller and target must have distinct per-agent workspaces"
+        );
+
+        let mut delegate_agents = HashMap::new();
+        for (name, agent) in &config.agents {
+            delegate_agents.insert(name.clone(), agent.clone());
+        }
+        let tool = DelegateTool::new(delegate_agents, None, Arc::clone(&caller_policy))
+            .with_root_config(config.clone())
+            .with_caller_alias("caller");
+
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("bounded same-profile target resolves");
+        assert_eq!(target_policy.workspace_dir, caller_workspace);
+
+        assert!(
+            !target_policy.is_resolved_path_allowed(&caller_workspace.join(".env")),
+            "mandatory deny-write guardrail must protect .env under the effective \
+             (caller) workspace the bounded delegate actually runs in"
+        );
+        assert!(
+            target_policy
+                .deny_write
+                .iter()
+                .all(|p| !p.starts_with(&target_workspace)),
+            "no resolved deny_write entry should still point at the stale target \
+             workspace after rebasing, got: {:?}",
+            target_policy.deny_write
+        );
+    }
+
     #[tokio::test]
     async fn independent_delegate_target_uses_target_risk_profile_restrictions() {
         // Independent mode should not be confused with unrestricted mode. It
@@ -7160,8 +7209,20 @@ mod tests {
 
         assert_eq!(target_policy.risk_profile_name, "target");
         assert_eq!(target_policy.allowed_commands, vec!["target-only"]);
+        // The "target" risk profile leaves workspace_only at its schema
+        // default (true), which forces write access to the workspace root
+        // regardless of allowed_roots (see
+        // `EffectiveSandboxInputs::from_profile`) — so the legacy
+        // allowed_roots entry lands in the READ-ONLY tier, not the
+        // read+write tier. Checking both is the actual property under test
+        // (the target's own allowed_roots reached the resolved policy at
+        // all), not which specific tier it landed in.
         assert!(
-            target_policy.allowed_roots.contains(&target_extra_root),
+            target_policy
+                .allowed_roots
+                .iter()
+                .chain(target_policy.allowed_roots_read_only.iter())
+                .any(|p| p == &target_extra_root),
             "target policy must retain target allowed_roots"
         );
         assert!(
