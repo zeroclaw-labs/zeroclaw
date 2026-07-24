@@ -951,6 +951,7 @@ Examples:
   zeroclaw config set channels.matrix.access-token      # secret: masked input
   zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
   zeroclaw config init channels.matrix                  # init section with defaults
+  zeroclaw config init risk_profiles.strict             # create a new dynamic-map alias
   zeroclaw config schema                                # print JSON Schema to stdout
   zeroclaw config schema > schema.json
 
@@ -2456,17 +2457,68 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
     Some(key)
 }
 
-fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
-    let Some((section_path, key)) = Config::map_key_sections()
+/// Split `section_arg` into the map key under `section_path` with NOTHING after
+/// it, the `config init <section>.<alias>` shape.
+fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
+    let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
+    (!tail.is_empty() && !tail.contains('.')).then_some(tail)
+}
+
+/// Longest alias-materializable section whose path prefixes `path`, plus the
+/// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
+/// are values from another domain (model id, voice, tool name) and may
+/// themselves contain dots, so a dot split would yield a bogus alias.
+fn alias_target_for_path<'a>(
+    path: &'a str,
+    split: impl Fn(&str, &'a str) -> Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    Config::map_key_sections()
         .into_iter()
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
         .filter(|section| !section.resource_key)
-        .filter_map(|section| {
-            let key = map_key_for_prop_path(section.path, prop_path)?;
-            Some((section.path, key))
-        })
+        .filter_map(|section| split(section.path, path).map(|key| (section.path, key)))
         .max_by_key(|(section_path, _)| section_path.len())
+}
+
+/// `config init <section>.<alias>`: materialize a dynamic-map alias with schema
+/// defaults. Returns the created `"<section>.<alias>"` path, or `None` when
+/// `section_arg` is not a `<map-section>.<new-alias>` shape (the alias already
+/// exists, the section is resource-keyed or a natural-key list, or the argument
+/// is a plain nested prefix that `init_defaults` already handles). A reserved
+/// alias is an error, not a silent no-op.
+fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
+    let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
+        return Ok(None);
+    };
+    match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
+        Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
+        Ok(false) => Ok(None),
+        Err(e) => Err(anyhow::Error::msg(e.to_string())),
+    }
+}
+
+/// Dirty every generated leaf under a newly created map alias so required
+/// default-valued fields survive the incremental writer's empty-leaf pruning.
+fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
+    let prefix = format!("{alias_path}.");
+    let leaf_paths: Vec<String> = config
+        .prop_fields()
+        .into_iter()
+        .filter_map(|field| field.name.starts_with(&prefix).then_some(field.name))
+        .collect();
+
+    if leaf_paths.is_empty() {
+        config.mark_dirty(alias_path);
+    } else {
+        for path in leaf_paths {
+            config.mark_dirty(&path);
+        }
+    }
+}
+
+fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
+    let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
     };
 
@@ -2810,7 +2862,7 @@ enum ConfigCommands {
     },
     /// Initialize unconfigured sections with defaults (enabled=false)
     Init {
-        /// Section prefix (e.g. channels.matrix). Omit to init all.
+        /// Section prefix (e.g. channels.matrix), or <section>.<alias> to create a new dynamic-map alias (e.g. risk_profiles.strict). Omit to init all.
         section: Option<String>,
         /// Emit a structured JSON envelope ({initialized: [...]}) instead of plain text.
         #[arg(long)]
@@ -5509,15 +5561,24 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             ConfigCommands::Init { section, json } => {
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
-                let initialized: Vec<String> = config
+                let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
                     .map(str::to_string)
                     .collect();
+                for section in &initialized {
+                    config.mark_dirty(section);
+                }
+                // `init_defaults` only instantiates nested struct sections. A
+                // `<section>.<alias>` argument names a dynamic-map entry, which
+                // has to be materialized through `create_map_key` instead.
+                if let Some(arg) = section.as_deref()
+                    && let Some(created) = init_map_alias(&mut config, arg)?
+                {
+                    mark_new_map_alias_dirty(&mut config, &created);
+                    initialized.push(created);
+                }
                 if !initialized.is_empty() {
-                    for section in &initialized {
-                        config.mark_dirty(section);
-                    }
                     Box::pin(config.save_dirty()).await?;
                 }
                 if json {
@@ -9268,6 +9329,100 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    // `config init` alias tests. Every test in this module builds a bare
+    // `Config::default()`, whose `config_path` points at the developer's real
+    // `~/.zeroclaw/config.toml`, and no gate catches a write from `src/`. These
+    // stay safe only by calling `init_map_alias` and in-memory readers such as
+    // `get_map_keys` — never `save()`, `save_dirty()`, a persisting `set_prop`,
+    // `ensure_disk_at_current_version`, or the real `ConfigCommands::Init` arm.
+    // End-to-end coverage of the handler lives in `tests/component/`.
+
+    #[test]
+    fn config_init_materializes_new_map_alias() {
+        for (arg, section) in [
+            ("risk_profiles.strict", "risk_profiles"),
+            ("peer_groups.pi400_owner", "peer_groups"),
+        ] {
+            let mut config = Config::default();
+            let created = init_map_alias(&mut config, arg)
+                .expect("alias-shaped section arguments should materialize");
+            assert_eq!(created.as_deref(), Some(arg));
+            let alias = arg.rsplit('.').next().expect("alias segment");
+            assert!(
+                config
+                    .get_map_keys(section)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|k| k == alias),
+                "{arg} should be present under {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_init_alias_is_idempotent() {
+        let mut config = Config::default();
+        init_map_alias(&mut config, "risk_profiles.strict").expect("first create");
+        let again = init_map_alias(&mut config, "risk_profiles.strict").expect("second create");
+        assert!(again.is_none(), "an existing alias is not re-reported");
+        assert_eq!(
+            config.get_map_keys("risk_profiles").unwrap_or_default(),
+            vec!["strict".to_string()],
+        );
+    }
+
+    #[test]
+    fn config_init_ignores_plain_section_prefixes() {
+        let mut config = Config::default();
+        for arg in ["channels.telegram", "gateway"] {
+            assert!(
+                init_map_alias(&mut config, arg)
+                    .expect("plain prefixes are not an error")
+                    .is_none(),
+                "{arg} has no trailing alias segment; init_defaults keeps ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn config_init_ignores_resource_keyed_sections() {
+        let mut config = Config::default();
+        assert!(
+            init_map_alias(&mut config, "cost.rates.providers.models.openai.gpt-5")
+                .expect("resource-keyed sections are ignored, not rejected")
+                .is_none()
+        );
+        assert!(config.cost.rates.providers.models.openai.is_empty());
+    }
+
+    #[test]
+    fn config_init_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+        let err = init_map_alias(&mut config, "agents.default")
+            .expect_err("the reserved agent guard must surface, not exit 0");
+        assert!(
+            err.to_string().contains("reserved"),
+            "message should name the reserved alias: {err}"
+        );
+        assert!(config.agents.is_empty());
+
+        assert_eq!(
+            init_map_alias(&mut config, "agents.researcher")
+                .expect("non-reserved agent aliases still materialize")
+                .as_deref(),
+            Some("agents.researcher"),
+        );
+    }
+
+    #[test]
+    fn config_init_rejects_invalid_alias_key() {
+        let mut config = Config::default();
+        assert!(
+            init_map_alias(&mut config, "risk_profiles.Bad-Name").is_err(),
+            "validate_alias_key's refusal must propagate"
         );
     }
 
