@@ -3277,6 +3277,10 @@ mod tests {
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
         );
+        assert_eq!(
+            default_model_provider_url("crusoe"),
+            Some("https://api.inference.crusoecloud.com/v1")
+        );
     }
 
     #[test]
