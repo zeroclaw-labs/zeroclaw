@@ -3680,8 +3680,9 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     // Determine transient overlays (live streaming / approval) up front from
-    // cheap state reads. Transient frames append uncached lines and must use
-    // the full-buffer path; idle/scroll frames render only the viewport slice.
+    // cheap state reads. Both frame kinds render only a viewport slice;
+    // transient frames additionally append the uncached overlay lines when
+    // the window reaches past the cached history.
     let has_stream_text = !state.streaming_text.is_empty();
     let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
     let has_approval = state.pending_approval().is_some();
@@ -3716,38 +3717,22 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         inner.height.saturating_sub(first_row_h),
     );
 
-    // Build the full line buffer (history + transient overlays) only on
-    // transient frames; idle/scroll frames never materialize the whole
-    // history and instead slice the viewport below.
-    let transient_lines: Vec<Line<'static>> = if transient {
-        let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
-        if has_stream_text {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-                theme::agent_label_style(),
-            )]));
-            lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
-        }
-        if has_stream_thought {
-            lines.push(Line::from(vec![
-                Span::styled("(thinking) ", theme::thought_style()),
-                Span::styled(state.streaming_thought.clone(), theme::dim_style()),
-            ]));
-        }
-        if has_approval {
-            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
-                lines.push(Line::default());
-            }
-        }
-        lines
+    // Build the overlay-only line buffer (streaming text / thinking /
+    // approval padding) on transient frames. History is never cloned here —
+    // `visible_transient_slice` slices the cached history the same bounded
+    // way idle frames do and appends this small overlay only once the
+    // viewport window reaches it.
+    let overlay_lines: Vec<Line<'static>> = if transient {
+        state.build_overlay_lines(inner_width)
     } else {
         Vec::new()
     };
 
     let total_rows = if transient {
-        Paragraph::new(transient_lines.clone())
+        let overlay_rows = Paragraph::new(overlay_lines.iter().map(borrow_line).collect::<Vec<_>>())
             .wrap(Wrap { trim: false })
-            .line_count(inner_width) as u16
+            .line_count(inner_width) as u16;
+        state.cached_total_rows.saturating_add(overlay_rows)
     } else {
         state.cached_total_rows
     };
@@ -3758,12 +3743,12 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.scroll_offset.min(max_scroll)
     };
 
-    // Non-transient frames (idle, scrolling) render only the viewport slice so
-    // per-frame work stays O(visible) instead of O(history). Transient frames
-    // (live streaming, approval overlay) append uncached lines and keep the
-    // full-buffer path.
+    // Both branches now render only the viewport slice so per-frame work
+    // stays O(visible) instead of O(history), including on transient frames
+    // (live streaming, approval overlay) where only the small overlay buffer
+    // above is materialized in full.
     let (render_lines, render_scroll) = if transient {
-        (transient_lines, scroll)
+        state.visible_transient_slice(scroll, inner_height, overlay_lines)
     } else {
         state.visible_line_slice(scroll, inner_height)
     };
@@ -5652,10 +5637,10 @@ impl ChatState {
         self.rebuild_screen_ranges(width);
     }
 
-    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
-        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
-            return (self.cached_lines.clone(), scroll);
-        }
+    /// Finds the span of `cached_screen_ranges` indices whose screen rows
+    /// overlap `[scroll, scroll + height)`. Shared scan behind
+    /// `visible_line_slice`, `visible_copy_scan`, and `visible_transient_slice`.
+    fn screen_range_scan(&self, scroll: u16, height: u16) -> Option<(usize, usize)> {
         let view_end = scroll.saturating_add(height);
         let mut first: Option<usize> = None;
         let mut last: usize = 0;
@@ -5667,7 +5652,14 @@ impl ChatState {
                 last = i;
             }
         }
-        let Some(first) = first else {
+        first.map(|first| (first, last))
+    }
+
+    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
+            return (self.cached_lines.clone(), scroll);
+        }
+        let Some((first, last)) = self.screen_range_scan(scroll, height) else {
             return (self.cached_lines.clone(), scroll);
         };
         let line_lo = self.cached_line_ranges[first].1;
@@ -5676,22 +5668,64 @@ impl ChatState {
         (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
     }
 
+    /// Builds the transient overlay lines — the live streaming text (with
+    /// its agent label), the thinking line, and the approval padding rows —
+    /// exactly as they are appended below the committed history on transient
+    /// frames. Rebuilt fresh every frame by design; never cached.
+    fn build_overlay_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if !self.streaming_text.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                theme::agent_label_style(),
+            )]));
+            lines.extend(markdown_to_lines(&self.streaming_text, width));
+        }
+        if self.show_thoughts && !self.streaming_thought.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("(thinking) ", theme::thought_style()),
+                Span::styled(self.streaming_thought.clone(), theme::dim_style()),
+            ]));
+        }
+        if self.pending_approval.is_some() {
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
+        }
+        lines
+    }
+
+    /// Like `visible_line_slice`, but the virtual buffer is cached history
+    /// rows (`0..cached_total_rows`) followed by `overlay` rows — the
+    /// transient streaming/thinking/approval lines, which are rebuilt fresh
+    /// every frame and never cached. Slices the history the same bounded way
+    /// `visible_line_slice` does, and appends the (small) overlay in full
+    /// once the viewport window reaches it, letting the `Paragraph`'s local
+    /// scroll handle any partial visibility.
+    fn visible_transient_slice(
+        &self,
+        scroll: u16,
+        height: u16,
+        overlay: Vec<Line<'static>>,
+    ) -> (Vec<Line<'static>>, u16) {
+        let cached_total_rows = self.cached_total_rows;
+        if scroll >= cached_total_rows {
+            // Window is entirely within the overlay (includes the empty
+            // history case, where cached_total_rows is 0).
+            return (overlay, scroll - cached_total_rows);
+        }
+        let (mut lines, local_scroll) = self.visible_line_slice(scroll, height);
+        if scroll.saturating_add(height) > cached_total_rows {
+            lines.extend(overlay);
+        }
+        (lines, local_scroll)
+    }
+
     fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
         if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
             return (self.cached_lines.clone(), 0);
         }
-        let view_end = scroll.saturating_add(height);
-        let mut first: Option<usize> = None;
-        let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
-            if screen_hi > scroll && screen_lo < view_end {
-                if first.is_none() {
-                    first = Some(i);
-                }
-                last = i;
-            }
-        }
-        let Some(first) = first else {
+        let Some((first, last)) = self.screen_range_scan(scroll, height) else {
             return (self.cached_lines.clone(), 0);
         };
         let line_lo = self.cached_line_ranges[first].1;
@@ -7260,6 +7294,234 @@ mod tests {
         let max_scroll = s.cached_total_rows.saturating_sub(height);
         let (bottom, _) = s.visible_line_slice(max_scroll, height);
         assert!(!bottom.is_empty(), "bottom extent must still yield lines");
+    }
+
+    /// Transient-inclusive total row count (`cached_total_rows +
+    /// overlay_rows`), computed the same way the transient branch of
+    /// `render_conversation` does.
+    fn transient_total_rows(s: &ChatState, overlay: &[Line<'static>], width: u16) -> u16 {
+        let overlay_rows = Paragraph::new(overlay.iter().map(borrow_line).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .line_count(width) as u16;
+        s.cached_total_rows.saturating_add(overlay_rows)
+    }
+
+    fn approval() -> PendingApproval {
+        PendingApproval {
+            request_id: "req-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn visible_transient_slice_bounded_not_o_of_history() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "streaming reply in progress".to_string();
+        s.pending_approval = Some(approval());
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        let height = 20u16;
+        let max_scroll = total_rows.saturating_sub(height);
+        let mid_scroll = max_scroll / 2;
+
+        let (slice, local_scroll) = s.visible_transient_slice(mid_scroll, height, overlay);
+
+        assert!(
+            slice.len() <= (height as usize) + 8,
+            "transient slice ({}) should be bounded near the viewport height ({height}), not the history",
+            slice.len()
+        );
+        assert!(
+            local_scroll < height + APPROVAL_OVERLAY_HEIGHT,
+            "local scroll ({local_scroll}) must land inside the visible window"
+        );
+    }
+
+    #[test]
+    fn visible_transient_slice_bottom_anchored_includes_overlay() {
+        let mut s = state();
+        for i in 0..30 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "unique-streaming-marker currently in flight".to_string();
+        s.pinned_to_bottom = true;
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        let height = 12u16;
+        let max_scroll = total_rows.saturating_sub(height);
+
+        let (slice, local_scroll) = s.visible_transient_slice(max_scroll, height, overlay);
+
+        let joined: String = slice
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("unique-streaming-marker"),
+            "bottom-anchored slice must contain the streaming overlay text, got: {joined:?}"
+        );
+        assert!(
+            (local_scroll as usize) < slice.len() + height as usize,
+            "local scroll ({local_scroll}) must position the overlay's tail within the viewport"
+        );
+    }
+
+    #[test]
+    fn visible_transient_slice_mid_history_scroll_matches_idle_slice() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "should-not-appear-mid-history streaming text".to_string();
+        s.pinned_to_bottom = false;
+
+        let overlay = s.build_overlay_lines(width);
+        let height = 20u16;
+        // Scroll far above the bottom so the window sits entirely in history.
+        let scroll = 10u16;
+
+        let (transient_slice, transient_local) = s.visible_transient_slice(scroll, height, overlay);
+        let (idle_slice, idle_local) = s.visible_line_slice(scroll, height);
+
+        assert_eq!(
+            transient_slice, idle_slice,
+            "a window entirely within history must match the idle-path slice"
+        );
+        assert_eq!(transient_local, idle_local);
+
+        let joined: String = transient_slice
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(
+            !joined.contains("should-not-appear-mid-history"),
+            "a window entirely within history must not include overlay content"
+        );
+    }
+
+    #[test]
+    fn transient_total_rows_matches_full_concatenation() {
+        let width_cases = [80u16, 24u16];
+        for width in width_cases {
+            for (streaming, thinking, approve) in [
+                (true, false, false),
+                (false, false, true),
+                (true, true, true),
+            ] {
+                let mut s = state();
+                for i in 0..10 {
+                    s.entries
+                        .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                            "entry {i}"
+                        ))));
+                }
+                s.mark_dirty_full();
+                s.rebuild_lines(width);
+                if streaming {
+                    s.streaming_text = "a long streaming reply that should wrap across a narrow column width when the terminal is small".to_string();
+                }
+                if thinking {
+                    s.streaming_thought = "pondering the right approach".to_string();
+                }
+                if approve {
+                    s.pending_approval = Some(approval());
+                }
+
+                let overlay = s.build_overlay_lines(width);
+                let total_rows = transient_total_rows(&s, &overlay, width);
+
+                let mut full: Vec<Line<'static>> = s.cached_lines.clone();
+                full.extend(overlay);
+                let authoritative = Paragraph::new(full)
+                    .wrap(Wrap { trim: false })
+                    .line_count(width) as u16;
+
+                assert_eq!(
+                    total_rows, authoritative,
+                    "cached_total_rows + overlay_rows must equal the full concatenation's line_count \
+                     (width={width}, streaming={streaming}, thinking={thinking}, approve={approve})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visible_transient_slice_empty_history_overlay_only() {
+        let mut s = state();
+        s.pending_approval = Some(approval());
+        let width = 80u16;
+        s.rebuild_lines(width);
+        assert_eq!(s.cached_total_rows, 0, "no entries means no history rows");
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        let height = 5u16;
+
+        let (slice, local_scroll) = s.visible_transient_slice(0, height, overlay.clone());
+        assert_eq!(
+            slice, overlay,
+            "overlay-only history renders the overlay verbatim"
+        );
+        assert_eq!(local_scroll, 0);
+        assert!(total_rows >= APPROVAL_OVERLAY_HEIGHT);
+    }
+
+    #[test]
+    fn visible_transient_slice_tiny_history_large_overlay() {
+        let mut s = state();
+        s.entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("one line")));
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "overlay-marker some streaming reply text".to_string();
+        s.pending_approval = Some(approval());
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        assert!(
+            total_rows > s.cached_total_rows,
+            "overlay must contribute rows beyond the tiny history"
+        );
+
+        // Window starting past the tiny history sits entirely in the overlay.
+        let height = 6u16;
+        let scroll = s.cached_total_rows;
+        let (slice, local_scroll) = s.visible_transient_slice(scroll, height, overlay);
+        assert_eq!(local_scroll, 0);
+        let joined: String = slice
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(joined.contains("overlay-marker"));
     }
 
     #[test]
