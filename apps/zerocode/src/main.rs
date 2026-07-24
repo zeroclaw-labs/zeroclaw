@@ -8,9 +8,9 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{ExitCode, ExitStatus};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -50,7 +50,8 @@ mod wire;
 mod zerocode_pane;
 
 const DAEMON_CONNECT_INTERVAL: Duration = Duration::from_millis(50);
-const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SPAWNED_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_STDERR_LIMIT: usize = 8 * 1024;
 
 /// Set to `true` once the alternate screen is active so signal/panic
 /// handlers know they need to restore the terminal before exiting.
@@ -172,6 +173,12 @@ fn format_startup_error(err: &anyhow::Error) -> String {
         return i18n::t_args(
             "zc-error-daemon-initialize-timeout",
             &[("seconds", &timeout.timeout_seconds().to_string())],
+        );
+    }
+    if let Some(startup) = err.downcast_ref::<SpawnedDaemonStartupFailure>() {
+        return i18n::t_args(
+            "zc-error-spawned-daemon-startup",
+            &[("details", startup.details())],
         );
     }
     format!("{err:#}")
@@ -327,9 +334,17 @@ async fn run() -> anyhow::Result<()> {
                 Err(e) if is_terminal_connection_error(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
-                    spawn_ephemeral_daemon(&config_dir, socket)?;
-                    owns_ephemeral = true;
-                    await_daemon_ready(socket).await?
+                    let mut daemon = spawn_owned_ephemeral_daemon(&config_dir, socket)?;
+                    match await_spawned_daemon_ready(socket, &mut daemon).await {
+                        Ok(client) => {
+                            daemon.detach();
+                            owns_ephemeral = true;
+                            client
+                        }
+                        Err(startup_error) => {
+                            return Err(spawned_daemon_startup_failure(startup_error, &mut daemon));
+                        }
+                    }
                 }
             }
         }
@@ -416,6 +431,24 @@ pub(crate) fn spawn_ephemeral_daemon(
     config_dir: &std::path::Path,
     socket: &std::path::Path,
 ) -> anyhow::Result<()> {
+    let mut cmd = ephemeral_daemon_command(config_dir, socket);
+    cmd.stderr(std::process::Stdio::null());
+    cmd.spawn()
+        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
+    Ok(())
+}
+
+fn spawn_owned_ephemeral_daemon(
+    config_dir: &std::path::Path,
+    socket: &std::path::Path,
+) -> anyhow::Result<SpawnedDaemon> {
+    SpawnedDaemon::spawn(ephemeral_daemon_command(config_dir, socket))
+}
+
+fn ephemeral_daemon_command(
+    config_dir: &std::path::Path,
+    socket: &std::path::Path,
+) -> std::process::Command {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("zeroclaw")))
@@ -437,13 +470,8 @@ pub(crate) fn spawn_ephemeral_daemon(
     }
 
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    cmd.spawn()
-        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
-
-    Ok(())
+        .stdout(std::process::Stdio::null());
+    cmd
 }
 
 fn configure_ephemeral_daemon_command(
@@ -460,13 +488,278 @@ fn configure_ephemeral_daemon_command(
         .env("ZEROCLAW_SOCKET", socket);
 }
 
-async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::RpcClient> {
-    let deadline = tokio::time::Instant::now() + DAEMON_CONNECT_TIMEOUT;
+struct SpawnedDaemon {
+    child: std::process::Child,
+    stderr: Arc<Mutex<std::collections::VecDeque<u8>>>,
+    capture_stderr: Arc<AtomicBool>,
+    stderr_done: Option<std::sync::mpsc::Receiver<()>>,
+    stderr_collector: Option<std::thread::JoinHandle<()>>,
+    cleanup_on_drop: bool,
+}
+
+impl SpawnedDaemon {
+    fn spawn(mut cmd: std::process::Command) -> anyhow::Result<Self> {
+        use std::io::Read;
+
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
+        let mut stderr_pipe = match child.stderr.take() {
+            Some(pipe) => pipe,
+            None => {
+                let cleanup_error = terminate_child(&mut child).err();
+                let mut message = "spawned daemon stderr pipe was unavailable".to_owned();
+                if let Some(error) = cleanup_error {
+                    message.push_str("; cleanup also failed: ");
+                    message.push_str(&format!("{error:#}"));
+                }
+                return Err(anyhow::Error::msg(message));
+            }
+        };
+        let stderr = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+            DAEMON_STDERR_LIMIT,
+        )));
+        let capture_stderr = Arc::new(AtomicBool::new(true));
+        let collector_buffer = Arc::clone(&stderr);
+        let collector_capture = Arc::clone(&capture_stderr);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stderr_collector = match std::thread::Builder::new()
+            .name("zerocode-daemon-stderr".to_owned())
+            .spawn(move || {
+                let mut chunk = [0_u8; 1024];
+                while let Ok(read) = stderr_pipe.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    if !collector_capture.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let mut buffer = collector_buffer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !collector_capture.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    buffer.extend(&chunk[..read]);
+                    while buffer.len() > DAEMON_STDERR_LIMIT {
+                        buffer.pop_front();
+                    }
+                }
+                let _ = done_tx.send(());
+            }) {
+            Ok(collector) => collector,
+            Err(spawn_error) => {
+                let cleanup_error = terminate_child(&mut child).err();
+                let mut message = format!("failed to start daemon stderr collector: {spawn_error}");
+                if let Some(error) = cleanup_error {
+                    message.push_str("; cleanup also failed: ");
+                    message.push_str(&format!("{error:#}"));
+                }
+                return Err(anyhow::Error::msg(message));
+            }
+        };
+
+        Ok(Self {
+            child,
+            stderr,
+            capture_stderr,
+            stderr_done: Some(done_rx),
+            stderr_collector: Some(stderr_collector),
+            cleanup_on_drop: true,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        let stderr = self.finish_stderr_collection();
+        Ok(Some(SpawnedDaemonExit { status, stderr }))
+    }
+
+    fn terminate_and_wait(&mut self) -> anyhow::Result<SpawnedDaemonExit> {
+        let status = terminate_child(&mut self.child);
+        let stderr = self.finish_stderr_collection();
+        status.map(|status| SpawnedDaemonExit { status, stderr })
+    }
+
+    fn finish_stderr_collection(&mut self) -> String {
+        if let Some(done) = self.stderr_done.take() {
+            let _ = done.recv_timeout(Duration::from_millis(100));
+        }
+        self.capture_stderr.store(false, Ordering::Release);
+
+        let mut buffer = self
+            .stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = buffer.drain(..).collect::<Vec<_>>();
+        drop(buffer);
+
+        self.stderr_collector.take();
+        sanitize_daemon_stderr(&bytes)
+    }
+
+    fn detach(mut self) {
+        self.cleanup_on_drop = false;
+        self.capture_stderr.store(false, Ordering::Release);
+        self.stderr_done.take();
+        self.stderr_collector.take();
+    }
+}
+
+impl Drop for SpawnedDaemon {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = self.terminate_and_wait();
+        }
+    }
+}
+
+fn terminate_child(child: &mut std::process::Child) -> anyhow::Result<ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+
+    if let Err(kill_error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => Err(anyhow::Error::msg(format!(
+                "failed to terminate daemon: {kill_error}"
+            ))),
+            Err(poll_error) => Err(anyhow::Error::msg(format!(
+                "failed to terminate daemon: {kill_error}; failed to re-check daemon: {poll_error}"
+            ))),
+        };
+    }
+
+    child
+        .wait()
+        .map_err(|error| anyhow::Error::msg(format!("failed to reap daemon: {error}")))
+}
+
+fn sanitize_daemon_stderr(bytes: &[u8]) -> String {
+    let mut rendered = String::new();
+    for character in String::from_utf8_lossy(bytes).chars() {
+        match character {
+            '\n' | '\r' | '\t' => rendered.push(character),
+            character if character.is_control() => rendered.push('\u{fffd}'),
+            character => rendered.push(character),
+        }
+    }
+
+    if rendered.len() <= DAEMON_STDERR_LIMIT {
+        return rendered;
+    }
+    let mut start = rendered.len() - DAEMON_STDERR_LIMIT;
+    while !rendered.is_char_boundary(start) {
+        start += 1;
+    }
+    rendered[start..].to_owned()
+}
+
+#[derive(Debug)]
+struct SpawnedDaemonExit {
+    status: ExitStatus,
+    stderr: String,
+}
+
+impl SpawnedDaemonExit {
+    #[cfg(test)]
+    fn stderr(&self) -> &str {
+        &self.stderr
+    }
+}
+
+impl std::fmt::Display for SpawnedDaemonExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "daemon exited before ready (status: {})",
+            self.status
+        )?;
+        if !self.stderr.trim().is_empty() {
+            write!(formatter, "; stderr: {}", self.stderr.trim())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SpawnedDaemonExit {}
+
+#[derive(Debug)]
+struct SpawnedDaemonStartupFailure {
+    details: String,
+}
+
+impl SpawnedDaemonStartupFailure {
+    fn details(&self) -> &str {
+        &self.details
+    }
+}
+
+impl std::fmt::Display for SpawnedDaemonStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.details)
+    }
+}
+
+impl std::error::Error for SpawnedDaemonStartupFailure {}
+
+fn spawned_daemon_startup_failure(
+    startup_error: anyhow::Error,
+    daemon: &mut SpawnedDaemon,
+) -> anyhow::Error {
+    let startup_exit = startup_error.downcast_ref::<SpawnedDaemonExit>();
+    let mut details = if let Some(exit) = startup_exit {
+        format!("daemon exited before ready (status: {})", exit.status)
+    } else {
+        format_startup_error(&startup_error)
+    };
+
+    let cleanup = daemon.terminate_and_wait();
+    let stderr = startup_exit
+        .map(|exit| exit.stderr.as_str())
+        .filter(|stderr| !stderr.trim().is_empty())
+        .or_else(|| {
+            cleanup
+                .as_ref()
+                .ok()
+                .map(|exit| exit.stderr.as_str())
+                .filter(|stderr| !stderr.trim().is_empty())
+        })
+        .unwrap_or_default();
+    if !stderr.trim().is_empty() {
+        details.push_str("; stderr: ");
+        details.push_str(stderr.trim());
+    }
+    if let Err(error) = cleanup {
+        details.push_str("; cleanup also failed: ");
+        details.push_str(&format!("{error:#}"));
+    }
+
+    anyhow::Error::new(SpawnedDaemonStartupFailure { details })
+}
+
+async fn await_spawned_daemon_ready(
+    socket: &std::path::Path,
+    daemon: &mut SpawnedDaemon,
+) -> anyhow::Result<client::RpcClient> {
+    let deadline = tokio::time::Instant::now() + SPAWNED_DAEMON_CONNECT_TIMEOUT;
     loop {
+        if let Some(exit) = daemon.poll_exit()? {
+            return Err(anyhow::Error::new(exit));
+        }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "daemon did not become ready within {}s (socket: {})",
-                DAEMON_CONNECT_TIMEOUT.as_secs(),
+                SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
                 socket.display(),
             );
         }
@@ -495,6 +788,150 @@ mod connection_tests {
     use super::*;
     use crate::config::WssSection;
     use std::ffi::OsStr;
+
+    fn spawned_daemon_helper_command(mode: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        );
+        cmd.args([
+            "connection_tests::spawned_daemon_subprocess_helper",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_SPAWNED_DAEMON_HELPER", mode);
+        cmd
+    }
+
+    #[test]
+    fn spawned_daemon_cleanup_terminates_and_reaps_running_child() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+        assert!(daemon.try_wait().expect("poll helper").is_none());
+
+        let exit = daemon.terminate_and_wait().expect("terminate helper");
+
+        assert!(!exit.status.success());
+        assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[test]
+    fn spawned_daemon_early_exit_reports_bounded_stderr() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("stderr")).expect("spawn helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let exit = loop {
+            if let Some(exit) = daemon.poll_exit().expect("poll helper") {
+                break exit;
+            }
+            assert!(std::time::Instant::now() < deadline, "helper did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let rendered = exit.to_string();
+
+        assert!(rendered.contains("status"));
+        assert!(rendered.contains("spawned-daemon-stderr-tail"));
+        assert!(exit.stderr().len() <= DAEMON_STDERR_LIMIT);
+    }
+
+    #[test]
+    fn spawned_daemon_exit_does_not_wait_for_inherited_stderr() {
+        let mut exercise = spawned_daemon_helper_command("exercise-inherited-stderr")
+            .spawn()
+            .expect("spawn inherited-stderr exercise");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+
+        loop {
+            if let Some(status) = exercise.try_wait().expect("poll exercise") {
+                assert!(status.success(), "exercise failed with {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = exercise.kill();
+                let _ = exercise.wait();
+                panic!("poll_exit blocked while a descendant held stderr open");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn spawned_daemon_stderr_is_rendered_safely_within_limit() {
+        let mut daemon = SpawnedDaemon::spawn(spawned_daemon_helper_command("unsafe-stderr"))
+            .expect("spawn helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let exit = loop {
+            if let Some(exit) = daemon.poll_exit().expect("poll helper") {
+                break exit;
+            }
+            assert!(std::time::Instant::now() < deadline, "helper did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(exit.stderr().len() <= DAEMON_STDERR_LIMIT);
+        assert!(!exit.stderr().contains('\u{1b}'));
+        assert!(!exit.stderr().contains('\0'));
+        assert!(exit.stderr().contains("unsafe-stderr-tail"));
+    }
+
+    #[test]
+    fn spawned_daemon_readiness_allows_cold_start_window() {
+        assert_eq!(SPAWNED_DAEMON_CONNECT_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for spawned-daemon lifecycle tests"]
+    fn spawned_daemon_subprocess_helper() {
+        match std::env::var("ZEROCODE_SPAWNED_DAEMON_HELPER").as_deref() {
+            Ok("sleep") => std::thread::sleep(Duration::from_secs(60)),
+            Ok("sleep-short") => std::thread::sleep(Duration::from_secs(3)),
+            Ok("stderr") => {
+                eprint!("{}", "x".repeat(DAEMON_STDERR_LIMIT * 2));
+                eprintln!("spawned-daemon-stderr-tail");
+                std::process::exit(23);
+            }
+            Ok("unsafe-stderr") => {
+                use std::io::Write;
+
+                let mut stderr = std::io::stderr().lock();
+                stderr
+                    .write_all(&vec![0xff; DAEMON_STDERR_LIMIT * 2])
+                    .expect("write invalid stderr");
+                stderr
+                    .write_all(b"\x1b[2J\0unsafe-stderr-tail\n")
+                    .expect("write control stderr");
+                std::process::exit(23);
+            }
+            Ok("stderr-descendant") => {
+                spawned_daemon_helper_command("sleep-short")
+                    .spawn()
+                    .expect("spawn stderr-inheriting descendant");
+                eprintln!("stderr-descendant-parent-exit");
+                std::process::exit(23);
+            }
+            Ok("exercise-inherited-stderr") => {
+                let mut daemon =
+                    SpawnedDaemon::spawn(spawned_daemon_helper_command("stderr-descendant"))
+                        .expect("spawn stderr-descendant helper");
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                loop {
+                    if daemon
+                        .poll_exit()
+                        .expect("poll stderr-descendant")
+                        .is_some()
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "stderr-descendant helper did not exit"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            other => panic!("unexpected helper mode: {other:?}"),
+        }
+    }
 
     #[test]
     fn ephemeral_daemon_command_sets_selected_socket() {

@@ -29,6 +29,7 @@ zc-app-reload-status-signalled = Rechargement du démon signalé — reconnexion
 zc-app-reload-confirm-row = { $confirm_chord } = recharger   { $cancel_chord } = annuler
 zc-error-daemon-version-mismatch = Incompatibilité de version : zerocode est en { $client_version }, mais le démon est en { $server_version }. Recompilez et redémarrez le démon depuis le même checkout que zerocode.
 zc-error-daemon-initialize-timeout = zerocode s’est connecté au démon, mais l’initialisation ne s’est pas terminée en { $seconds } s. Redémarrez le démon et réessayez.
+zc-error-spawned-daemon-startup = zerocode a démarré un démon éphémère, mais il n'a pas été prêt : { $details }
 zc-zerocode-tab-theme = Thème
 zc-zerocode-tab-agent-theme = Thèmes d'agent
 zc-zerocode-tab-presets = Préréglages
