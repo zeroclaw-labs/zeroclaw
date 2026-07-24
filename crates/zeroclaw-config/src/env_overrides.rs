@@ -203,11 +203,39 @@ pub(crate) async fn env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     LOCK.lock().await
 }
 
+/// Resolve the effective OpenAI STT API key, applying the precedence:
+/// explicit config value > `TRANSCRIPTION_API_KEY` env > `OPENAI_API_KEY` env.
+///
+/// This is a config-layer, stateless resolver. It never writes into a
+/// config struct — the caller owns the returned `Option<String>` and
+/// decides whether to construct a provider. The environment value is the
+/// single source of truth for the override; it is never fanned out into
+/// multiple mutable config fields.
+pub fn resolve_openai_stt_api_key(existing: Option<&str>) -> Option<String> {
+    if let Some(key) = existing {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    for name in &["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(val) = std::env::var(name) {
+            let trimmed = val.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::Config;
 
+    /// RAII-ish helper: removes the named var on drop so failed asserts don't
+    /// leak state into sibling tests.
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {
         fn set(name: &'static str, value: &str) -> Self {
@@ -222,6 +250,52 @@ mod tests {
             unsafe { std::env::remove_var(self.0) };
         }
     }
+
+    /// RAII fixture that fully owns the legacy env-var namespace
+    /// (`TRANSCRIPTION_API_KEY`, `OPENAI_API_KEY`) while the shared
+    /// `env_test_lock()` is held. Snapshots pre-existing values on
+    /// construction, clears them both, and restores originals on drop.
+    /// Tests that exercise `resolve_openai_stt_api_key` use this instead
+    /// of bare `EnvVarGuard` so their behaviour is deterministic
+    /// regardless of what the dev or CI shell has set.
+    struct LegacyEnvFixture {
+        saved_transcription: Option<String>,
+        saved_openai: Option<String>,
+    }
+    impl LegacyEnvFixture {
+        /// Clear both legacy env vars and snapshot their previous values
+        /// (if any). Callers then set exactly the vars their test needs.
+        fn isolate() -> Self {
+            // SAFETY: caller (the test function) holds `env_test_lock()`.
+            let saved_transcription = std::env::var("TRANSCRIPTION_API_KEY").ok();
+            let saved_openai = std::env::var("OPENAI_API_KEY").ok();
+            unsafe {
+                std::env::remove_var("TRANSCRIPTION_API_KEY");
+                std::env::remove_var("OPENAI_API_KEY");
+            }
+            Self {
+                saved_transcription,
+                saved_openai,
+            }
+        }
+    }
+    impl Drop for LegacyEnvFixture {
+        fn drop(&mut self) {
+            // SAFETY: caller holds `env_test_lock()`.
+            unsafe {
+                match &self.saved_transcription {
+                    Some(v) => std::env::set_var("TRANSCRIPTION_API_KEY", v),
+                    None => std::env::remove_var("TRANSCRIPTION_API_KEY"),
+                }
+                match &self.saved_openai {
+                    Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                    None => std::env::remove_var("OPENAI_API_KEY"),
+                }
+            }
+        }
+    }
+
+    // ── apply_env_overrides tests ─────────────────────────────────
 
     #[tokio::test]
     async fn walker_resolves_typed_family_alias_default() {
@@ -433,5 +507,81 @@ mod tests {
             msg.contains("schema_version") && msg.contains("not overridable"),
             "error must name the path and the reason: {msg}",
         );
+    }
+
+    // ── resolve_openai_stt_api_key tests ──────────────────────────
+
+    #[tokio::test]
+    async fn resolver_returns_config_key_when_set() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env");
+        assert_eq!(
+            resolve_openai_stt_api_key(Some("sk-config")),
+            Some("sk-config".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_returns_transcription_api_key_env() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-transcription-test");
+        assert_eq!(
+            resolve_openai_stt_api_key(None),
+            Some("sk-transcription-test".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_returns_openai_api_key_env() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-openai-test");
+        assert_eq!(
+            resolve_openai_stt_api_key(None),
+            Some("sk-openai-test".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_config_wins_over_env() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env-value");
+        assert_eq!(
+            resolve_openai_stt_api_key(Some("sk-config-value")),
+            Some("sk-config-value".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_empty_config_key_falls_back_to_env() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-from-env");
+        assert_eq!(
+            resolve_openai_stt_api_key(Some("")),
+            Some("sk-from-env".to_string()),
+        );
+        assert_eq!(
+            resolve_openai_stt_api_key(Some("   ")),
+            Some("sk-from-env".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_no_env_and_no_config_returns_none() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        assert_eq!(resolve_openai_stt_api_key(None), None);
+        assert_eq!(resolve_openai_stt_api_key(Some("")), None);
+    }
+
+    #[tokio::test]
+    async fn default_model_is_whisper_1() {
+        let default_cfg = crate::schema::OpenAiSttConfig::default();
+        assert_eq!(default_cfg.model, "whisper-1");
+        assert!(default_cfg.api_key.is_none());
     }
 }

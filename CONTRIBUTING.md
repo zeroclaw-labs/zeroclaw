@@ -102,6 +102,8 @@ The lowercase tail mirrors the dotted TOML path 1:1; each `__` (double underscor
 
 V0.8.0 eradicated every per-provider env-var fallback (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, …), the generic `ZEROCLAW_API_KEY` / `API_KEY`, and the legacy `ZEROCLAW_PROVIDER` / `PROVIDER` / `ZEROCLAW_MODEL` dispatchers. Legacy names have no runtime effect — they're silently ignored. See `docs/book/src/reference/env-vars.md` for the migration table and the `💉` visibility behavior.
 
+**Documented native bridge exception — OpenAI STT.** `TRANSCRIPTION_API_KEY` and `OPENAI_API_KEY` are resolved on demand during OpenAI STT provider construction as a last-resort credential fallback. Precedence: explicit config (`[transcription.openai].api_key` or `[providers.transcription.openai.<alias>].base.api_key`) > `ZEROCLAW_*` schema-mirror > `TRANSCRIPTION_API_KEY` > `OPENAI_API_KEY`. The env-only OpenAI provider registers only when no other explicit STT provider is configured, so an ambient `OPENAI_API_KEY` (e.g. for model integration) does not perturb explicit Groq/Deepgram/etc. selection. Values are resolved at construction time and never persisted into `Config` or written to disk. See `docs/book/src/reference/env-vars.md` § Native bridge exceptions.
+
 **Never commit:** `.env`, API keys / tokens / passwords / OAuth tokens / webhook signing secrets, `~/.zeroclaw/.secret_key`, or any personal identifier in tests or fixtures. The full content discipline is in **[Privacy & PII](docs/book/src/contributing/privacy.md)**.
 
 **Pre-commit secret scan.** `.githooks/pre-commit` runs `gitleaks protect --staged --redact` when `gitleaks` is installed; if it's not installed, the hook prints a warning and continues. Install one of:
