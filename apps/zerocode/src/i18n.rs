@@ -230,6 +230,28 @@ mod tests {
     }
 
     #[test]
+    fn daemon_initialize_timeout_formats_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            let timeout = format_ftl_message(
+                source,
+                locale,
+                "zc-error-daemon-initialize-timeout",
+                &[("seconds", "10")],
+            )
+            .unwrap_or_else(|| panic!("timeout message must format for {locale}"));
+            assert!(timeout.contains("10"));
+        }
+    }
+
+    #[test]
     fn missing_key_returns_brace_form() {
         let value = t("zc-definitely-not-a-real-key");
         assert_eq!(value, "{zc-definitely-not-a-real-key}");

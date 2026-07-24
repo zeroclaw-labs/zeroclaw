@@ -280,6 +280,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 &scopes,
                 &turn_memory.cfg,
                 exclude_conversation,
+                TurnMeta {
+                    agent_alias,
+                    parent_agent_alias,
+                    turn_id,
+                    channel_name,
+                },
             )
             .await;
             if !context.is_empty() {
