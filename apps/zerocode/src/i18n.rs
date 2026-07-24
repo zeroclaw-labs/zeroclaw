@@ -252,6 +252,28 @@ mod tests {
     }
 
     #[test]
+    fn spawned_daemon_startup_failure_formats_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            let failure = format_ftl_message(
+                source,
+                locale,
+                "zc-error-spawned-daemon-startup",
+                &[("details", "test failure")],
+            )
+            .unwrap_or_else(|| panic!("spawned-daemon failure must format for {locale}"));
+            assert!(failure.contains("test failure"));
+        }
+    }
+
+    #[test]
     fn missing_key_returns_brace_form() {
         let value = t("zc-definitely-not-a-real-key");
         assert_eq!(value, "{zc-definitely-not-a-real-key}");

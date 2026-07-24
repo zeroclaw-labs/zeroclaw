@@ -29,6 +29,7 @@ zc-app-reload-status-signalled = 已发出守护进程重新加载信号 — 正
 zc-app-reload-confirm-row = { $confirm_chord } = 重新加载   { $cancel_chord } = 取消
 zc-error-daemon-version-mismatch = 版本不匹配：zerocode 是 { $client_version }，但守护进程是 { $server_version }。请从同一个检出重新构建并重启守护进程。
 zc-error-daemon-initialize-timeout = zerocode 已连接到守护进程，但初始化未能在 { $seconds } 秒内完成。请重启守护进程后重试。
+zc-error-spawned-daemon-startup = zerocode 已启动临时守护进程，但该进程未能就绪：{ $details }
 zc-zerocode-tab-theme = 主题
 zc-zerocode-tab-agent-theme = 代理主题
 zc-zerocode-tab-presets = 预设
