@@ -4,8 +4,10 @@ fluent = "run --release -p xtask --bin fluent --"
 web = "run --release -p xtask --bin web --"
 generate = "run --release -p xtask --bin generate --"
 
-[build]
-rustdocflags = ["--default-theme=ayu"]
+# The default rustdoc theme is a documentation-site preference, not a build
+# setting. `xtask::build_api` owns it for the build, serve, and refs paths;
+# keeping it out of global rustdocflags prevents `cargo test --doc` from
+# receiving the theme argument twice.
 
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
