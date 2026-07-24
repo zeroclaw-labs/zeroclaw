@@ -248,13 +248,49 @@ impl Doctor {
                 crate::i18n::t("zc-doctor-loading"),
                 theme::dim_style(),
             ))]
-        } else if let Some(entry) = self.selected_entry() {
-            detail_lines(entry)
         } else {
-            vec![Line::from(Span::styled(
-                crate::i18n::t("zc-doctor-no-selection"),
-                theme::dim_style(),
-            ))]
+            let mut out: Vec<Line<'_>> = Vec::new();
+
+            // Surface the resolved active log path first when the daemon
+            // advertised one — it is the operator's primary entry point for
+            // post-mortem log navigation (8650).
+            if let Some(log_path) = self.result.as_ref().and_then(|r| r.log_path.as_deref()) {
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t_args("zc-doctor-log-path", &[("path", log_path)]),
+                    theme::body_style(),
+                )));
+                out.push(Line::from(""));
+            }
+
+            // Always show the partial-results banner when a phase timed
+            // out, even if the user has selected a specific diagnostic row.
+            // This ensures the incomplete-run state from 8647 stays
+            // persistently visible alongside any selected-row detail.
+            let is_partial = self
+                .result
+                .as_ref()
+                .is_some_and(|r| r.timed_out_phase.is_some());
+            if is_partial {
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-doctor-partial-banner"),
+                    severity_style(DoctorSeverity::Warn),
+                )));
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-doctor-partial-hint"),
+                    theme::dim_style(),
+                )));
+            }
+
+            if let Some(entry) = self.selected_entry() {
+                out.extend(detail_lines(entry));
+            } else if !is_partial {
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-doctor-no-selection"),
+                    theme::dim_style(),
+                )));
+            }
+
+            out
         };
 
         let para = Paragraph::new(lines)
@@ -508,10 +544,20 @@ fn truncate_first_line(s: &str, max: usize) -> String {
 
 fn format_doctor_error(error: &str) -> String {
     if error.contains("Unknown method") || error.contains("-32601") {
-        crate::i18n::t("zc-doctor-error-unsupported-daemon")
-    } else {
-        error.to_string()
+        return crate::i18n::t("zc-doctor-error-unsupported-daemon");
     }
+    // Whole-RPC timeout: the daemon may have failed to return for any
+    // reason (model-probe deadline, network drop, daemon overload, etc.).
+    // Without a response we cannot identify the phase — keep the message
+    // generic so the user checks the right subsystem.
+    if error.contains("timed out") || error.contains("timeout") {
+        return format!(
+            "{}\n\n{}",
+            error,
+            crate::i18n::t("zc-doctor-error-daemon-timeout"),
+        );
+    }
+    error.to_string()
 }
 
 #[cfg(test)]
@@ -549,6 +595,8 @@ mod tests {
                 warnings: 1,
                 errors: 1,
             },
+            log_path: None,
+            timed_out_phase: None,
         }
     }
 
@@ -608,6 +656,103 @@ mod tests {
         assert!(!message.contains("-32601"));
     }
 
+    #[test]
+    fn doctor_timeout_error_is_generic_not_model_probing_specific() {
+        // A whole-RPC timeout (no response) must not suggest model probing —
+        // the daemon may have timed out for any reason.
+        let message = format_doctor_error("RPC doctor/run: request timed out");
+
+        assert!(message.contains("request timed out"));
+        assert!(
+            message.contains("daemon may be busy"),
+            "whole-RPC timeout must be generic, got: {message}"
+        );
+        assert!(
+            !message.contains("Model probing") && !message.contains("provider API"),
+            "whole-RPC timeout must NOT name model probing, got: {message}"
+        );
+    }
+
+    /// Pairs with `doctor_timeout_error_is_generic_not_model_probing_specific`
+    /// above to pin the whole-RPC-vs-structured-probe discrimination from
+    /// review 8647: the "model probing" hint must only surface on the
+    /// structured-partial banner path, never on the error path. A future
+    /// refactor that swaps the discriminator (e.g. on freeform substring
+    /// matching) will be caught here even though `format_doctor_error`'s own
+    /// test would still pass in isolation.
+    #[test]
+    fn doctor_timeout_discriminator_pins_each_path_to_its_own_text() {
+        // Error path — generic daemon-side timeout text only.
+        let error_msg = format_doctor_error("RPC doctor/run: request timed out");
+        assert!(
+            error_msg.contains("daemon may be busy"),
+            "error path must surface generic daemon-busy hint; got: {error_msg}"
+        );
+        assert!(
+            !error_msg.contains("model probing"),
+            "error path must NEVER mention model probing; got: {error_msg}"
+        );
+        assert!(
+            !error_msg.contains("Partial results"),
+            "error path must NEVER render partial-results chrome; got: {error_msg}"
+        );
+
+        // Structured-partial path — only the partial-banner string is allowed
+        // to surface probe-specific copy; the error path's generic text must
+        // not appear.
+        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
+        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
+
+        assert!(
+            partial_banner.contains("model probing"),
+            "partial-banner FTL must carry the probe-specific substring; got: {partial_banner}"
+        );
+        assert!(
+            partial_hint.contains("provider catalog"),
+            "partial-hint FTL must explain which phase was lost; got: {partial_hint}"
+        );
+        assert!(
+            daemon_busy.contains("daemon"),
+            "daemon-timeout FTL must remain the generic copy; got: {daemon_busy}"
+        );
+        assert!(
+            !daemon_busy.contains("model probing"),
+            "daemon-timeout FTL must NOT leak the probe-specific copy; got: {daemon_busy}"
+        );
+        assert!(
+            !partial_banner.contains("daemon may be busy"),
+            "partial-banner FTL must NOT collide with error-path copy; got: {partial_banner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_partial_result_banner_visible_alongside_selection() {
+        // When timed_out_phase is set and sync_selection selects the
+        // auto-added timeout warning, the partial banner must still be
+        // reachable — not hidden behind selected_entry().
+        let mut doctor = Doctor::new(test_client());
+        let mut result = sample_result();
+        result.timed_out_phase = Some("probe_models".into());
+        doctor.result = Some(result);
+        doctor.sync_selection();
+
+        // selected_entry() returns the warning (confirming the scenario).
+        assert!(
+            doctor.selected_entry().is_some(),
+            "should select the timeout warning entry"
+        );
+
+        // The partial flag is still set — draw_detail can show the banner.
+        assert!(
+            doctor
+                .result
+                .as_ref()
+                .is_some_and(|r| r.timed_out_phase.is_some()),
+            "partial-results state must survive sync_selection"
+        );
+    }
+
     #[tokio::test]
     async fn doctor_refresh_starts_in_background_and_sets_loading() {
         let (client, _outbound, mut rx) = test_client_with_rpc();
@@ -663,5 +808,220 @@ mod tests {
         doctor.handle_mouse(click, Rect::new(0, 0, 80, 20));
 
         assert_eq!(doctor.filter, DoctorFilter::Errors);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Tests from 8650 (log_path) — kept verbatim with `timed_out_phase: None`
+    // to match the merged DoctorRunResult shape.
+    // ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn doctor_detail_panel_includes_log_path_when_no_entry_selected() {
+        let mut doctor = Doctor::new(test_client());
+        let mut result = sample_result();
+        result.log_path = Some("/home/user/.local/share/zeroclaw/logs/trace.jsonl".into());
+        doctor.result = Some(result);
+
+        // No entry is selected → draw_detail renders log_path before
+        // "No diagnostic selected".
+        assert!(
+            doctor.selected_entry().is_none(),
+            "no diagnostic entry should be selected after initial result load"
+        );
+        assert!(
+            doctor
+                .result
+                .as_ref()
+                .and_then(|r| r.log_path.as_deref())
+                .is_some(),
+            "log_path must be accessible to draw_detail when no entry selected"
+        );
+    }
+
+    /// Render Doctor with `log_persistence = "file"` and a long realistic
+    /// resolved path. Asserts the path appears in the detail panel buffer
+    /// (the operator's discoverability contract from 8650) and dumps the
+    /// rendered buffer to stdout so `cargo test -- --nocapture` produces a
+    /// capture suitable for pasting into the PR as first-hand evidence.
+    #[tokio::test]
+    async fn render_screenshot_log_path_file() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        doctor.result = Some(DoctorRunResult {
+            results: vec![],
+            summary: DoctorSummary {
+                ok: 0,
+                warnings: 0,
+                errors: 0,
+            },
+            log_path: Some(
+                "/home/operator/.local/share/zeroclaw/logs/trace-2026-07-13T08-30-00Z.jsonl"
+                    .to_string(),
+            ),
+            timed_out_phase: None,
+        });
+        doctor.filter = DoctorFilter::Problems;
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+
+        // The path must be discoverable in the detail panel. The detail panel
+        // inner width is narrower than the path, so ratatui's wrap may split
+        // the path across two lines — both halves must be present.
+        assert!(
+            rendered.contains("trace-2026-07-13T08-30"),
+            "first half of resolved log path must render in detail panel; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-00Z.jsonl"),
+            "second half of resolved log path must render in detail panel; got:\n{rendered}"
+        );
+        // The "No diagnostic selected" line should also be present so the
+        // operator sees the discoverability affordance is part of the
+        // empty-selection fallback rather than a hidden field.
+        assert!(
+            rendered.contains("No diagnostic selected"),
+            "fallback hint must render alongside log_path; got:\n{rendered}"
+        );
+
+        println!(
+            "\n=== CAPTURE: zerocode doctor with log_persistence = \"file\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+        );
+    }
+
+    /// Render Doctor with `log_persistence = "none"`. Asserts the path is
+    /// absent and the fallback "No diagnostic selected" message renders.
+    #[tokio::test]
+    async fn render_screenshot_log_path_none() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        doctor.result = Some(DoctorRunResult {
+            results: vec![],
+            summary: DoctorSummary {
+                ok: 0,
+                warnings: 0,
+                errors: 0,
+            },
+            log_path: None,
+            timed_out_phase: None,
+        });
+        doctor.filter = DoctorFilter::Problems;
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+
+        // No resolved-path text should appear when persistence is disabled.
+        assert!(
+            !rendered.contains("/home/operator/"),
+            "log_path must be absent when persistence is disabled; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("trace-2026-07-13"),
+            "log_path must be absent when persistence is disabled; got:\n{rendered}"
+        );
+        // The fallback "No diagnostic selected" line should still render.
+        assert!(
+            rendered.contains("No diagnostic selected"),
+            "fallback hint must still render when persistence is disabled; got:\n{rendered}"
+        );
+
+        println!(
+            "\n=== CAPTURE: zerocode doctor with log_persistence = \"none\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Test from 8647 (partial-results banner) — kept verbatim.
+    // ─────────────────────────────────────────────────────────
+
+    /// Render Doctor when `probe_models` has timed out: the partial-results
+    /// banner must appear above the selected entry's detail in the detail
+    /// panel. Mirrors the Scenario 1 capture in the PR body, but produced
+    /// via `Doctor::draw` against a `ratatui::backend::TestBackend` at
+    /// 120x24 so it can be regenerated on demand:
+    ///
+    ///   cargo test --locked --bin zerocode -p zerocode \
+    ///     render_screenshot -- --nocapture
+    #[tokio::test]
+    async fn render_screenshot_partial_results_banner() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut doctor = Doctor::new(test_client());
+        let mut result = sample_result();
+        result.timed_out_phase = Some("probe_models".to_string());
+        doctor.result = Some(result);
+        // sync_selection so the highlight lands on the first visible row.
+        doctor.sync_selection();
+
+        let area = Rect::new(0, 0, 120, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                doctor.draw(frame, area);
+            })
+            .expect("draw doctor");
+
+        let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
+
+        // The banner from 8647 must be discoverable in the detail panel,
+        // above the selected entry's `detail_lines` content.
+        assert!(
+            rendered.contains("⚠ Partial results"),
+            "partial-results banner must render in detail panel; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model probing timed out"),
+            "banner subtitle must render in detail panel; got:\n{rendered}"
+        );
+        // The Diagnostics list still surfaces surviving entries (the probe
+        // row is missing) — both warn and error entries are visible.
+        assert!(
+            rendered.contains("workspace"),
+            "warn entry must still appear in Diagnostics list; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("daemon"),
+            "error entry must still appear in Diagnostics list; got:\n{rendered}"
+        );
+
+        println!(
+            "\n=== CAPTURE: zerocode doctor with probe_models timed_out (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+        );
+    }
+
+    /// Helper: flatten a ratatui buffer to a string the way a user would
+    /// see it on the terminal. Each row becomes one line; trailing
+    /// whitespace is trimmed so the capture looks like the rendered TUI
+    /// rather than a 120-column ragged dump.
+    fn render_buffer_to_string(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+        let mut out = String::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
+        out
     }
 }

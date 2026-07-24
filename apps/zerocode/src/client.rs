@@ -1514,7 +1514,12 @@ impl RpcClient {
     }
 
     pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
-        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+        self.call_with_timeout(
+            method::DOCTOR_RUN,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(30),
+        )
+        .await
     }
 
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {

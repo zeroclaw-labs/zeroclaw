@@ -228,6 +228,38 @@ pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     results
 }
 
+/// Run Doctor with a per-phase timeout for the network-dependent probe phase.
+///
+/// Returns partial results if `probe_models` exceeds `probe_timeout`, along
+/// with a `timed_out_phase` label so callers can surface the incomplete state
+/// to the user.  The synchronous `diagnose` and the Codex auth check always
+/// run to completion first, so the common config/workspace/daemon diagnostics
+/// are never lost to a slow provider catalog endpoint.
+pub async fn run_structured_with_timeout(
+    config: &Config,
+    probe_timeout: std::time::Duration,
+) -> (Vec<DiagResult>, Option<String>) {
+    let mut results = diagnose(config);
+    results.extend(check_codex_auth_wiring(config).await);
+
+    let (probe_results, timed_out) =
+        match tokio::time::timeout(probe_timeout, probe_models(config)).await {
+            Ok(probes) => (probes, None),
+            Err(_) => {
+                let msg = "Model probing timed out. Some provider catalogs may be unreachable. \
+                       You can retry Doctor to refresh.";
+                results.push(DiagResult {
+                    severity: Severity::Warn,
+                    category: "doctor".into(),
+                    message: msg.into(),
+                });
+                (vec![], Some("probe_models".into()))
+            }
+        };
+    results.extend(probe_results);
+    (results, timed_out)
+}
+
 /// Run diagnostics and print human-readable report to stdout.
 pub async fn run(config: &Config) -> Result<()> {
     let results = run_structured(config).await;

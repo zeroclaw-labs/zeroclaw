@@ -165,6 +165,10 @@ zc-doctor-detail-title = Detail
 zc-doctor-no-selection = No diagnostic selected
 zc-doctor-label-message = Message
 zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
+zc-doctor-error-timeout-hint = Model probing against live provider APIs can be slow. Try again or check provider endpoint URLs.
+zc-doctor-error-daemon-timeout = The doctor check timed out. The daemon may be busy, unreachable, or processing a long-running request. Try again or check daemon connectivity.
+zc-doctor-partial-banner = ⚠ Partial results — model probing timed out
+zc-doctor-partial-hint = Some provider catalogs could not be reached. Results from config, workspace, and daemon checks are shown below. Press the refresh key to retry.
 
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions
@@ -553,3 +557,5 @@ zc-config-footer-action-new-line = new line
 ## Inline hint shown on the selected config field row. The { $keys } placeholder
 ## is resolved from the current keybinding for ConfigTabAction::Enter.
 zc-config-field-edit-hint = { $keys } → press to edit
+
+zc-doctor-log-path = log: { $path }
