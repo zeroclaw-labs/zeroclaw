@@ -1,6 +1,7 @@
 //! JSONL-based session persistence for channel conversations.
 
-use crate::session_backend::SessionBackend;
+use crate::session_backend::{SessionBackend, SessionMetadata};
+use chrono::{DateTime, Utc};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -141,8 +142,8 @@ impl SessionStore {
 }
 
 impl SessionBackend for SessionStore {
-    fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        self.load(session_key)
+    fn load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        Ok(self.load(session_key))
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
@@ -153,13 +154,16 @@ impl SessionBackend for SessionStore {
         self.remove_last(session_key)
     }
 
-    fn list_sessions(&self) -> Vec<String> {
-        self.list_sessions()
+    fn list_sessions(&self) -> std::io::Result<Vec<String>> {
+        Ok(self.list_sessions())
     }
 
-    fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
+    fn list_sessions_with_metadata(
+        &self,
+    ) -> std::io::Result<Vec<crate::session_backend::SessionMetadata>> {
         use chrono::{DateTime, Utc};
-        self.list_sessions()
+        Ok(self
+            .list_sessions()
             .into_iter()
             .map(|key| {
                 let last_activity: DateTime<Utc> = self
@@ -178,7 +182,7 @@ impl SessionBackend for SessionStore {
                     sender_id: None,
                 }
             })
-            .collect()
+            .collect())
     }
 
     fn compact(&self, session_key: &str) -> std::io::Result<()> {
@@ -196,8 +200,36 @@ impl SessionBackend for SessionStore {
     /// Quick existence probe mirroring how `delete_session` decides whether
     /// the session is on disk Checking file presence is the same
     /// O(1) `stat` that `delete_session` itself performs.
-    fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+    fn session_exists(&self, session_key: &str) -> std::io::Result<bool> {
+        Ok(self.session_path(session_key).exists())
+    }
+
+    fn get_session_metadata(&self, session_key: &str) -> std::io::Result<Option<SessionMetadata>> {
+        let path = self.session_path(session_key);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let last_activity: DateTime<Utc> = self
+            .session_mtime(session_key)
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now);
+
+        // Count messages by reading the file line count
+        // Propagate IO errors instead of defaulting to 0
+        let message_count = std::fs::read_to_string(&path)?.lines().count();
+
+        Ok(Some(SessionMetadata {
+            key: session_key.to_string(),
+            name: None,
+            created_at: last_activity,
+            last_activity,
+            message_count,
+            agent_alias: None,
+            channel_id: None,
+            room_id: None,
+            sender_id: None,
+        }))
     }
 }
 
@@ -370,7 +402,7 @@ mod tests {
         backend
             .append("trait_test", &ChatMessage::user("hello"))
             .unwrap();
-        let msgs = backend.load("trait_test");
+        let msgs = backend.load("trait_test").unwrap();
         assert_eq!(msgs.len(), 1);
     }
 
@@ -480,11 +512,11 @@ mod tests {
         backend
             .append("trait_delete", &ChatMessage::user("hello"))
             .unwrap();
-        assert_eq!(backend.load("trait_delete").len(), 1);
+        assert_eq!(backend.load("trait_delete").unwrap().len(), 1);
 
         let deleted = backend.delete_session("trait_delete").unwrap();
         assert!(deleted);
-        assert!(backend.load("trait_delete").is_empty());
+        assert!(backend.load("trait_delete").unwrap().is_empty());
     }
 
     // ── session_exists─────────────────────────────────────
@@ -494,15 +526,15 @@ mod tests {
         let store = SessionStore::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &store;
 
-        assert!(!backend.session_exists("ghost"));
+        assert!(!backend.session_exists("ghost").unwrap());
 
         backend
             .append("ghost", &ChatMessage::user("first"))
             .unwrap();
-        assert!(backend.session_exists("ghost"));
+        assert!(backend.session_exists("ghost").unwrap());
 
         backend.delete_session("ghost").unwrap();
-        assert!(!backend.session_exists("ghost"));
+        assert!(!backend.session_exists("ghost").unwrap());
     }
 
     // ── get_session_metadata (trait default) tests ──────────────────
@@ -512,7 +544,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
         let backend: &dyn SessionBackend = &store;
-        assert!(backend.get_session_metadata("nonexistent").is_none());
+        assert!(
+            backend
+                .get_session_metadata("nonexistent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -528,7 +565,10 @@ mod tests {
             .append("test_session", &ChatMessage::assistant("hi"))
             .unwrap();
 
-        let meta = backend.get_session_metadata("test_session").unwrap();
+        let meta = backend
+            .get_session_metadata("test_session")
+            .unwrap()
+            .unwrap();
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());

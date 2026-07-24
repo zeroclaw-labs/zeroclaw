@@ -37,6 +37,7 @@ pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 pub mod security_headers;
+pub mod session_async;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -1182,6 +1183,8 @@ pub async fn run_gateway(
         match zeroclaw_infra::make_session_backend(
             &config.data_dir,
             &config.channels.session_backend,
+            config.channels.postgres_url.as_deref(),
+            config.channels.pool_size,
         ) {
             Ok(backend) => {
                 ::zeroclaw_log::record!(

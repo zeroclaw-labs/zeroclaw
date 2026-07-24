@@ -586,7 +586,10 @@ impl RpcDispatcher {
             return true;
         }
         if let Some(backend) = self.ctx.session_backend.as_ref()
-            && backend.count_agent_attribution(from).unwrap_or(0) > 0
+            && crate::session_async::count_agent_attribution(backend.clone(), from.to_string())
+                .await
+                .unwrap_or(0)
+                > 0
         {
             return true;
         }
@@ -893,7 +896,17 @@ impl RpcDispatcher {
             .ctx
             .session_backend
             .as_ref()
-            .map(|b| b.list_sessions_with_metadata().len())
+            .map(|b| {
+                b.list_sessions_with_metadata()
+                    .map(|sessions| sessions.len())
+                    .map_err(|e| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to list persisted sessions: {e}"),
+                        )
+                    })
+            })
+            .transpose()?
             .unwrap_or(0);
         let total = ids.len().max(persisted_count);
         to_result(StatusResult {
@@ -1261,16 +1274,40 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let session_key = format!("rpc_{session_id}");
-                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    let stored = backend.load(&session_key);
-                    if !stored.is_empty() {
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_history_with_event(&session_id, &stored)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        message_count = stored.len();
+                    let _ = crate::session_async::set_session_agent_alias(
+                        backend.clone(),
+                        session_key.clone(),
+                        req.agent_alias.clone(),
+                    )
+                    .await;
+                    let stored_result =
+                        crate::session_async::load(backend.clone(), session_key.clone()).await;
+                    match stored_result {
+                        Ok(stored) if !stored.is_empty() => {
+                            let seed_event = self
+                                .ctx
+                                .sessions
+                                .seed_history_with_event(&session_id, &stored)
+                                .await;
+                            self.forward_seed_event(&session_id, seed_event).await;
+                            message_count = stored.len();
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "session_id": session_id,
+                                    "error": format!("{e}"),
+                                })),
+                                "RPC chat session load failed"
+                            );
+                        }
                     }
                 }
             }
@@ -1851,15 +1888,30 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
+                    let _ = crate::session_async::append(
+                        backend.clone(),
+                        key.clone(),
+                        ChatMessage::user(&prompt),
+                    )
+                    .await;
                     match &outcome {
                         Ok(TurnOutcome::Completed { text, .. }) => {
-                            let _ = backend.append(&key, &ChatMessage::assistant(text));
+                            let _ = crate::session_async::append(
+                                backend.clone(),
+                                key.clone(),
+                                ChatMessage::assistant(text),
+                            )
+                            .await;
                         }
                         Ok(TurnOutcome::Cancelled { partial_text, .. })
                             if !partial_text.is_empty() =>
                         {
-                            let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
+                            let _ = crate::session_async::append(
+                                backend.clone(),
+                                key.clone(),
+                                ChatMessage::assistant(partial_text),
+                            )
+                            .await;
                         }
                         _ => {}
                     }
@@ -2152,19 +2204,45 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
 
         // Use FTS when a query is provided, plain list otherwise.
-        let all = if let Some(ref keyword) = req.query {
-            if keyword.trim().is_empty() {
-                backend.list_sessions_with_metadata()
+        // Both branches run on the blocking pool — the foundation
+        // contract has to stay correct once a remote-database
+        // session backend lands in a follow-up PR; today's
+        // sqlite/jsonl pay only the spawn-and-join round trip.
+        let all: Vec<zeroclaw_infra::session_backend::SessionMetadata> =
+            if let Some(ref keyword) = req.query {
+                if keyword.trim().is_empty() {
+                    crate::session_async::list_sessions_with_metadata(backend.clone())
+                        .await
+                        .map_err(|e| JsonRpcError {
+                            code: INTERNAL_ERROR,
+                            message: format!("session backend error: {e}"),
+                            data: None,
+                        })?
+                } else {
+                    use zeroclaw_infra::session_backend::SessionQuery;
+                    crate::session_async::search(
+                        backend.clone(),
+                        SessionQuery {
+                            keyword: Some(keyword.clone()),
+                            limit: req.limit,
+                        },
+                    )
+                    .await
+                    .map_err(|e| JsonRpcError {
+                        code: INTERNAL_ERROR,
+                        message: format!("session backend error: {e}"),
+                        data: None,
+                    })?
+                }
             } else {
-                use zeroclaw_infra::session_backend::SessionQuery;
-                backend.search(&SessionQuery {
-                    keyword: Some(keyword.clone()),
-                    limit: req.limit,
-                })
-            }
-        } else {
-            backend.list_sessions_with_metadata()
-        };
+                crate::session_async::list_sessions_with_metadata(backend.clone())
+                    .await
+                    .map_err(|e| JsonRpcError {
+                        code: INTERNAL_ERROR,
+                        message: format!("session backend error: {e}"),
+                        data: None,
+                    })?
+            };
 
         let sessions: Vec<SessionEntry> = all
             .into_iter()
@@ -2250,10 +2328,25 @@ impl RpcDispatcher {
         ];
         let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
         for key in &candidates {
-            let loaded = backend.load(key);
-            if !loaded.is_empty() {
-                raw = loaded;
-                break;
+            match crate::session_async::load(backend.clone(), key.clone()).await {
+                Ok(loaded) if !loaded.is_empty() => {
+                    raw = loaded;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": req.session_id,
+                                "key": key,
+                                "error": format!("{e}"),
+                            })),
+                        "RPC session load failed"
+                    );
+                }
             }
         }
 
@@ -2327,7 +2420,7 @@ impl RpcDispatcher {
             format!("gw_{}", req.session_id),
         ];
         for key in &candidates {
-            match backend.get_session_state(key) {
+            match crate::session_async::get_session_state(backend.clone(), key.clone()).await {
                 Ok(Some(ss)) => {
                     return to_result(SessionStateResult {
                         session_id: req.session_id,
@@ -3278,7 +3371,13 @@ impl RpcDispatcher {
         let rpc_counts = self.ctx.sessions.count_by_agent().await;
         let mut backend_counts = std::collections::HashMap::<String, usize>::new();
         if let Some(ref backend) = self.ctx.session_backend {
-            for meta in backend.list_sessions_with_metadata() {
+            let sessions = backend.list_sessions_with_metadata().map_err(|e| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to list sessions from backend: {e}"),
+                )
+            })?;
+            for meta in sessions {
                 let alias = meta.agent_alias.or_else(|| {
                     meta.channel_id
                         .as_deref()
@@ -7493,7 +7592,10 @@ mod tests {
         );
 
         assert!(
-            chat_backend.load(&format!("rpc_{sid}")).is_empty(),
+            chat_backend
+                .load(&format!("rpc_{sid}"))
+                .expect("load session")
+                .is_empty(),
             "ACP session must NOT touch chat session_backend"
         );
     }
@@ -7565,7 +7667,7 @@ mod tests {
         // regression for the ACP-store fallback.
         for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
             assert!(
-                chat_backend.load(&key).is_empty(),
+                chat_backend.load(&key).expect("load session").is_empty(),
                 "precondition: unified backend has no rows for {key}"
             );
         }
@@ -7895,7 +7997,9 @@ mod tests {
         );
 
         let key = format!("rpc_{sid}");
-        let metadata = chat_backend.list_sessions_with_metadata();
+        let metadata = chat_backend
+            .list_sessions_with_metadata()
+            .expect("list sessions");
         let entry = metadata
             .iter()
             .find(|m| m.key == key)

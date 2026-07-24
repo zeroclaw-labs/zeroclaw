@@ -488,6 +488,8 @@ pub async fn run(
         let session_backend = zeroclaw_infra::make_session_backend(
             &config.data_dir,
             &config.channels.session_backend,
+            config.channels.postgres_url.as_deref(),
+            config.channels.pool_size,
         )
         .ok();
 

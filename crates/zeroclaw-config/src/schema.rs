@@ -12995,6 +12995,14 @@ pub struct ChannelsConfig {
     pub session_persistence: bool,
     /// Session persistence backend: `"jsonl"` (legacy) or `"sqlite"` (new default).
     /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
+    ///
+    /// Future per-database options (each gated on its own Cargo feature in
+    /// follow-up PRs of the multi-database session backend series):
+    /// - `"postgres"` — Postgres
+    /// - `"mysql"` — MySQL
+    /// - `"mariadb"` — MariaDB
+    /// - `"oracle"` — Oracle
+    /// - `"db2"` — IBM Db2
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
@@ -13005,6 +13013,34 @@ pub struct ChannelsConfig {
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
     #[serde(default)]
     pub debounce_ms: u64,
+    // ── Remote (non-embedded) session backend credentials ────────
+    //
+    // These fields are the canonical config surface for the
+    // multi-database session-backend series. They are populated by
+    // the operator whether or not the corresponding Cargo feature is
+    // compiled into this binary — that is how factory code in
+    // `zeroclaw-infra` can hard-fail on a KNOWN-but-uncompiled
+    // backend name (vs. falling through to SQLite) without depending
+    // on the per-feature module being linked in. A follow-up PR per
+    // backend reads these fields and constructs the driver-specific
+    // pool / connection handle.
+    //
+    // Every DSN / password field is `#[secret]`-tagged and routed
+    // through the encrypted-on-disk config secret pipeline, matching
+    // the convention already used for webhook tokens, MCP headers,
+    // composio tokens, browser bearer tokens, etc.
+    /// Postgres connection URL used by the `postgres` session backend
+    /// (`postgres://user:pass@host:port/db`). Reads through `crate::env_overrides`
+    /// via the standard dotted-path injection (`ZEROCLAW_channels__postgres_url`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub postgres_url: Option<String>,
+    /// Connection-pool size for the PostgreSQL session backend.
+    /// Local backends (sqlite, jsonl) ignore this. Defaults to `5`.
+    #[serde(default = "default_session_pool_size")]
+    pub pool_size: u32,
 }
 
 impl ChannelsConfig {
@@ -13372,6 +13408,10 @@ fn default_session_backend() -> String {
     "sqlite".into()
 }
 
+fn default_session_pool_size() -> u32 {
+    5
+}
+
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
@@ -13420,6 +13460,8 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            postgres_url: None,
+            pool_size: default_session_pool_size(),
         }
     }
 }
@@ -24484,6 +24526,8 @@ auto_save = true
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
                 debounce_ms: 0,
+                postgres_url: None,
+                pool_size: default_session_pool_size(),
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -26229,6 +26273,8 @@ allowed_users = ["@u:matrix.org"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            postgres_url: None,
+            pool_size: default_session_pool_size(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -26751,6 +26797,8 @@ allowed_numbers = ["+1", "+2"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            postgres_url: None,
+            pool_size: default_session_pool_size(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

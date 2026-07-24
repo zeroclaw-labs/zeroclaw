@@ -466,7 +466,7 @@ async fn session_backend_persists_messages() {
 
     // Load from fresh instance
     let backend2 = SqliteSessionBackend::new(tmp.path()).unwrap();
-    let messages = backend2.load("session_1");
+    let messages = backend2.load("session_1").unwrap();
     assert_eq!(messages.len(), 2, "Both messages should persist");
 }
 

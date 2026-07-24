@@ -441,6 +441,8 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
             zeroclaw_infra::make_session_backend(
                 &config.data_dir,
                 &config.channels.session_backend,
+                config.channels.postgres_url.as_deref(),
+                config.channels.pool_size,
             )
             .context("open session backend for the owned-state cascade")?,
         )
