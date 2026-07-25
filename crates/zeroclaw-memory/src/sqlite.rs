@@ -842,7 +842,7 @@ impl SqliteMemory {
     /// when the caller already knows the scope of relevant memories.
     ///
     /// A `session_id` filter still admits durable global rows (see
-    /// [`Self::is_durable_global_row`]): global `core`/`daily` facts must be
+    /// `Self::is_durable_global_row`): global `core`/`daily` facts must be
     /// semantically recallable from sessions that did not write them, while
     /// session-bound rows from other sessions stay excluded.
     pub fn vector_search(

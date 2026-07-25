@@ -173,6 +173,7 @@
   - [Communication](./contributing/communication.md)
   - [Privacy & PII discipline](./contributing/privacy.md)
   - [Testing](./contributing/testing.md)
+  - [User-boundary proof](./contributing/user-boundary-proof.md)
   - [Agent-policy parity](./contributing/agent-policy-parity-harness.md)
   - [PR review protocol](./contributing/pr-review-protocol.md)
   - [Multi-agent setup](./contributing/multi-agent-setup.md)

@@ -946,11 +946,14 @@ from_address = "a@example.com"
     }
 
     #[test]
-    fn broken_telegram_alias_is_dropped_and_recorded() {
-        // Telegram alias missing the required `bot_token` must not abort the
-        // load; the dropped alias path must be recorded verbatim so `doctor`
-        // can name the exact malformed section (see zeroclaw-runtime's
-        // check_degraded_sections).
+    fn partial_telegram_alias_survives_salvage() {
+        // A Telegram alias with no `bot_token` (e.g. just created via
+        // create_map_key, then round-tripped through save_dirty's
+        // prune_empty_leaves, which strips the empty string) must survive
+        // salvage instead of being dropped: `bot_token` now has
+        // `#[serde(default)]`, so a missing token deserializes the same as
+        // an explicit `bot_token = ""`. Runtime safety is enforced
+        // separately by `validate_bot_token` when `enabled = true`.
         let raw = r#"
 schema_version = 3
 
@@ -959,23 +962,75 @@ enabled = true
 "#;
         let load = migrate_to_current_salvaged(raw);
         assert!(
-            !load.config.channels.telegram.contains_key("default"),
-            "invalid alias must be pruned, got {:?}",
+            load.config.channels.telegram.contains_key("default"),
+            "a partial (tokenless) alias must survive salvage, got {:?}",
+            load.config.channels.telegram.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            load.dropped.is_empty(),
+            "a partial (tokenless) alias must not be reported as dropped, got {:?}",
+            load.dropped
+        );
+    }
+
+    #[test]
+    fn corrupt_telegram_alias_is_still_dropped_and_recorded() {
+        // Guard that salvage still prunes genuine garbage: a `bot_token`
+        // with the wrong type (int instead of string) is a real type error,
+        // not merely a missing field, and must still be dropped with the
+        // exact path recorded so `doctor` can name it (see zeroclaw-runtime's
+        // check_degraded_sections).
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.bad]
+enabled = true
+bot_token = 42
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            !load.config.channels.telegram.contains_key("bad"),
+            "type-corrupt alias must be pruned, got {:?}",
             load.config.channels.telegram.keys().collect::<Vec<_>>()
         );
         assert_eq!(
             load.dropped,
-            vec!["channels.telegram.default"],
+            vec!["channels.telegram.bad"],
             "dropped list must pin the exact malformed section path, got {:?}",
             load.dropped
         );
     }
 
     #[test]
+    fn partial_discord_alias_survives_salvage() {
+        // Discord twin of partial_telegram_alias_survives_salvage: a Discord
+        // alias with no `bot_token` must survive salvage now that
+        // `DiscordConfig.bot_token` also has `#[serde(default)]`.
+        let raw = r#"
+schema_version = 3
+
+[channels.discord.default]
+enabled = true
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.config.channels.discord.contains_key("default"),
+            "a partial (tokenless) alias must survive salvage, got {:?}",
+            load.config.channels.discord.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            load.dropped.is_empty(),
+            "a partial (tokenless) alias must not be reported as dropped, got {:?}",
+            load.dropped
+        );
+    }
+
+    #[test]
     fn complete_telegram_alias_survives() {
-        // Regression companion to broken_telegram_alias_is_dropped_and_recorded:
-        // a complete [channels.telegram.default] (bot_token present) must
-        // survive intact and must not appear in `dropped`.
+        // Companion to partial_telegram_alias_survives_salvage and
+        // corrupt_telegram_alias_is_still_dropped_and_recorded: a complete
+        // [channels.telegram.default] (bot_token present) must survive
+        // intact and must not appear in `dropped`.
         let raw = r#"
 schema_version = 3
 
