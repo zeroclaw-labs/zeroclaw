@@ -1053,12 +1053,12 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_deferred_mcp_excludes_denied_tool_from_prompt_and_search() {
-        // Regression for #8054 Surface 1(b): the deferred-MCP access-policy
-        // omission. This test drives `ScopedToolRegistry::assemble` with a
-        // deferred MCP server and a policy that denies one tool, then verifies
-        // BOTH the assembled prompt section and the assembled `tool_search`
-        // exclude the denied schema. This proves the production assembly
-        // boundary (not just helper tests) enforces the invariant.
+        // Regression for the deferred-MCP access-policy omission. This test
+        // drives `ScopedToolRegistry::assemble` with a deferred MCP server
+        // and a policy that denies one tool, then verifies BOTH the assembled
+        // prompt section and the assembled `tool_search` exclude the denied
+        // schema. This proves the production assembly boundary (not just
+        // helper tests) enforces the invariant.
         use crate::tools::{DeferredMcpToolSet, McpRegistry};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
