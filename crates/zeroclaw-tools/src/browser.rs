@@ -1057,7 +1057,10 @@ impl BrowserTool {
 
                 // Replace with canonical target
                 if let Some(obj) = args.as_object_mut() {
-                    obj.insert("path".to_string(), Value::String(resolved_target.to_string_lossy().to_string()));
+                    obj.insert(
+                        "path".to_string(),
+                        Value::String(resolved_target.to_string_lossy().to_string()),
+                    );
                 }
                 Ok(args)
             }
@@ -1081,7 +1084,8 @@ impl BrowserTool {
 
         // Validate screenshot path before forwarding to sidecar
         let screenshot_args = if action == "screenshot" {
-            self.validate_screenshot_path_for_computer_use(action, args.clone()).await?
+            self.validate_screenshot_path_for_computer_use(action, args.clone())
+                .await?
         } else {
             args.clone()
         };
@@ -3183,5 +3187,406 @@ mod tests {
             err.contains("local/private host"),
             "expected private-host block, got: {err}",
         );
+    }
+
+    // ============ Screenshot path validation tests ============
+
+    use zeroclaw_config::policy::AutonomyLevel;
+
+    fn screenshot_tool_with_workspace(ws: &std::path::Path) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.to_path_buf(),
+            allowed_roots: vec![ws.to_path_buf()],
+            ..SecurityPolicy::default()
+        });
+        BrowserTool::new(security, vec!["*".into()], None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_allows_path_inside_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let shots = ws.join("shots");
+        tokio::fs::create_dir_all(&shots).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("shots/page.png".into()),
+            full_page: false,
+        };
+
+        // Canonicalize the expected workspace path first (macOS fix)
+        let expected_canonical = std::fs::canonicalize(&ws).unwrap();
+
+        tool.validate_screenshot_path(&mut action).await.unwrap();
+
+        // Verify path is replaced with canonical form
+        if let BrowserAction::Screenshot { path, .. } = action {
+            let canonical_path = path.unwrap();
+            // Compare canonical forms, not raw strings
+            assert!(canonical_path.starts_with(&expected_canonical.to_string_lossy().as_ref()));
+            assert!(canonical_path.ends_with("page.png"));
+        } else {
+            panic!("action should still be Screenshot");
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_rejects_path_outside_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("../outside/page.png".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("outside-workspace")
+                || err.to_string().contains("parent-not-exist")
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_rejects_traversal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("../../etc/passwd".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("path-not-allowed"));
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_noop_when_path_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: None,
+            full_page: false,
+        };
+
+        tool.validate_screenshot_path(&mut action).await.unwrap();
+        assert!(matches!(
+            action,
+            BrowserAction::Screenshot { path: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_rejects_runtime_config_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        // Use a path that passes is_resolved_path_allowed but fails is_runtime_config_path
+        // For this test, we just check that config.toml in workspace is rejected
+        let config_path = ws.join("config.toml");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
+        });
+
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let mut action = BrowserAction::Screenshot {
+            path: Some(config_path.to_string_lossy().to_string()),
+            full_page: false,
+        };
+
+        // The default runtime_config_dirs includes common locations, so this should be rejected
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        // Either rejected as runtime-config or as outside-workspace (if ws not in allowed_roots)
+        assert!(
+            err.to_string().contains("runtime-config")
+                || err.to_string().contains("outside-workspace")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_screenshot_path_rejects_existing_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a symlink inside workspace pointing outside
+        let link_path = ws.join("page.png");
+        let target_path = outside.join("real.txt");
+        tokio::fs::write(&target_path, b"real").await.unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("page.png".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_screenshot_path_allows_existing_regular_file_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        // Create a regular file (not symlink) inside workspace
+        let file_path = ws.join("existing.png");
+        tokio::fs::write(&file_path, b"existing").await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("existing.png".into()),
+            full_page: false,
+        };
+
+        // Should succeed - regular files are OK
+        tool.validate_screenshot_path(&mut action).await.unwrap();
+    }
+
+    // ============ ComputerUse dispatch tests ============
+
+    fn test_computer_use_config() -> ComputerUseConfig {
+        ComputerUseConfig {
+            endpoint: "http://127.0.0.1:8787".to_string(),
+            api_key: None,
+            timeout_ms: 5000,
+            allow_remote_endpoint: true,
+            window_allowlist: vec![],
+            max_coordinate_x: None,
+            max_coordinate_y: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn browser_tool_with_computer_use(config: ComputerUseConfig) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::current_dir().unwrap(),
+            allowed_roots: vec![std::env::current_dir().unwrap()],
+            ..SecurityPolicy::default()
+        });
+        BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_traversal_path_before_sidecar() {
+        let tool = browser_tool_with_computer_use(test_computer_use_config());
+        let args = json!({
+            "action": "screenshot",
+            "path": "../etc/passwd"
+        });
+
+        let err = tool.execute(args).await.unwrap_err();
+        assert!(err.to_string().contains("path-not-allowed"));
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_sends_canonicalized_path_to_sidecar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"ok": true}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = browser_tool_with_computer_use(config);
+
+        let args = json!({
+            "action": "screenshot",
+            "path": "ws/page.png"
+        });
+
+        // Should succeed and forward to sidecar
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success);
+
+        // Verify sidecar received canonical path
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let params = body.get("params").unwrap().as_object().unwrap();
+        let path_sent = params.get("path").unwrap().as_str().unwrap();
+
+        // Path should be canonical (starts with canonical ws)
+        let canonical_ws = std::fs::canonicalize(&ws).unwrap();
+        assert!(path_sent.starts_with(&canonical_ws.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_remote_endpoint_with_path() {
+        // Setup: remote endpoint (public IP with https)
+        let mut config = test_computer_use_config();
+        config.endpoint = "https://8.8.8.8:8787".to_string();
+        config.allow_remote_endpoint = true;
+
+        let tool = browser_tool_with_computer_use(config);
+        let args = json!({
+            "action": "screenshot",
+            "path": "ws/screenshot.png"
+        });
+
+        // Must fail through Tool::execute with endpoint_is_different_filesystem rejection
+        let err = tool.execute(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("remote") || err.to_string().contains("different filesystem")
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_non_string_path_before_sidecar() {
+        let tool = browser_tool_with_computer_use(test_computer_use_config());
+
+        // Integer path
+        let args = json!({
+            "action": "screenshot",
+            "path": 12345
+        });
+        let err = tool.execute(args).await.unwrap_err();
+        assert!(err.to_string().contains("must be a string"));
+
+        // Array path
+        let args = json!({
+            "action": "screenshot",
+            "path": ["path1", "path2"]
+        });
+        let err = tool.execute(args).await.unwrap_err();
+        assert!(err.to_string().contains("must be a string"));
+
+        // Object path
+        let args = json!({
+            "action": "screenshot",
+            "path": {"key": "value"}
+        });
+        let err = tool.execute(args).await.unwrap_err();
+        assert!(err.to_string().contains("must be a string"));
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_passes_through_empty_string_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"ok": true}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = browser_tool_with_computer_use(config);
+
+        // Empty string path → inline PNG semantics, forwarded to sidecar
+        let args = json!({
+            "action": "screenshot",
+            "path": ""
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success);
+
+        // Verify sidecar received empty string
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let params = body.get("params").unwrap().as_object().unwrap();
+        let path_sent = params.get("path").unwrap().as_str().unwrap();
+        assert_eq!(path_sent, "");
+    }
+
+    #[tokio::test]
+    async fn endpoint_is_different_filesystem_loopback_is_false() {
+        let mut config = test_computer_use_config();
+        config.endpoint = "http://127.0.0.1:8787".to_string();
+        config.allow_remote_endpoint = true;
+        let tool = browser_tool_with_computer_use(config);
+        assert!(!tool.endpoint_is_different_filesystem());
+    }
+
+    #[tokio::test]
+    async fn endpoint_is_different_filesystem_private_network_is_true() {
+        let mut config = test_computer_use_config();
+        config.endpoint = "http://192.168.1.100:8787".to_string();
+        config.allow_remote_endpoint = true;
+        let tool = browser_tool_with_computer_use(config);
+        assert!(tool.endpoint_is_different_filesystem());
+    }
+
+    #[tokio::test]
+    async fn endpoint_is_different_filesystem_remote_endpoint_disabled_is_false() {
+        let mut config = test_computer_use_config();
+        config.endpoint = "http://192.168.1.100:8787".to_string();
+        config.allow_remote_endpoint = false;
+        let tool = browser_tool_with_computer_use(config);
+        assert!(!tool.endpoint_is_different_filesystem());
     }
 }
