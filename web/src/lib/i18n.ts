@@ -1373,7 +1373,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'workspace.layout_split': 'Split view',
     'workspace.layout_tabs': 'Tabs view',
     'workspace.picker_error': "Couldn't load agents",
-    'workspace.no_more_agents': 'All agents are open',
+    // Every agent is now offered by the picker even when already open, so the
+    // empty state means "none configured", not "none left to open".
+    'workspace.no_agents': 'No agents configured',
+    'workspace.open_another': 'Open another',
 
     // ACP Console
     'acp.title': 'ACP Console',
@@ -1480,6 +1483,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.session_delete_confirm': 'Delete “{name}”?',
     'agent.session_delete_failed': "Couldn't delete this conversation.",
     'agent.session_loading': 'Loading conversation…',
+    'agent.session_open_elsewhere': 'Open in another tab',
     'agent.sessions_not_stored': 'This gateway does not store conversations.',
     'agent.sessions_unavailable': 'Conversation switching is unavailable until session storage is confirmed.',
     'agent.session_delete_confirm_action': 'Delete',

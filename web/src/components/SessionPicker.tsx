@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, MessagesSquare, Pencil, Plus, Trash2, X } from 'lucide-react';
 import { useAgent } from '@/contexts/AgentContext';
 import { getSessions } from '@/lib/api';
@@ -38,11 +38,18 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const {
     sessionId,
     sessionPersistence,
+    reservedSessionIds,
     startNewSession,
     goToSession,
     removeSession,
     renameConversation,
   } = useAgent();
+
+  // Conversations another pane of this agent is showing. Opening one here would
+  // put two sockets on one gateway session — two Agents with diverging
+  // histories, each able to abort or wipe the other's turn — so those rows are
+  // shown but inert.
+  const reserved = useMemo(() => new Set(reservedSessionIds), [reservedSessionIds]);
 
   // With persistence off the gateway keeps no record of a conversation, so a
   // new one would strand the current transcript with nothing to switch back to.
@@ -367,17 +374,23 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
               );
             }
 
+            const takenElsewhere = reserved.has(row.id);
+
             return (
               <div
                 key={row.id}
                 className={`group flex items-center gap-1 pr-2 transition-colors ${
-                  isActive ? 'bg-pc-accent/10' : 'hover:bg-[var(--pc-hover)]'
+                  isActive ? 'bg-pc-accent/10' : takenElsewhere ? '' : 'hover:bg-[var(--pc-hover)]'
                 }`}
               >
                 <button
                   type="button"
                   onClick={() => handleSelect(row.id)}
-                  disabled={!isActive && !storesConversations}
+                  // Two independent reasons a row cannot be opened: another pane
+                  // already owns that conversation, or this agent cannot persist
+                  // conversations so there is no route back to the live one.
+                  disabled={takenElsewhere || (!isActive && !storesConversations)}
+                  title={takenElsewhere ? t('agent.session_open_elsewhere') : undefined}
                   className="flex-1 min-w-0 text-left px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span
@@ -386,9 +399,11 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
                     {rowLabel(row)}
                   </span>
                   <span className="block text-[11px] text-pc-text-muted truncate">
-                    {row.persisted
-                      ? `${row.messageCount} ${t('agent.session_messages')} · ${formatRelative(row.lastActivity)}`
-                      : t('agent.session_unsaved')}
+                    {takenElsewhere
+                      ? t('agent.session_open_elsewhere')
+                      : row.persisted
+                        ? `${row.messageCount} ${t('agent.session_messages')} · ${formatRelative(row.lastActivity)}`
+                        : t('agent.session_unsaved')}
                   </span>
                 </button>
 
@@ -406,6 +421,8 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
                         setRenamingId(row.id);
                         setRenameDraft(row.name ?? '');
                       }}
+                      // Renaming is safe from either pane; only opening and
+                      // deleting would collide.
                       aria-label={`${t('agent.session_rename')}: ${rowLabel(row)}`}
                       title={t('agent.session_rename')}
                       className="p-1 rounded-[var(--radius-md)] text-pc-text-muted opacity-60 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 hover:text-pc-text"
@@ -413,15 +430,21 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
 
+                    {/* Deleting a conversation another pane is live on would
+                        leave that pane streaming into a session the gateway no
+                        longer has. */}
                     <button
                       type="button"
                       onClick={() => {
                         setRenamingId(null);
                         setConfirmingDeleteId(row.id);
                       }}
+                      disabled={takenElsewhere}
                       aria-label={`${t('agent.session_delete')}: ${rowLabel(row)}`}
-                      title={t('agent.session_delete')}
-                      className="p-1 rounded-[var(--radius-md)] text-pc-text-muted opacity-60 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 hover:text-status-error"
+                      title={takenElsewhere ? t('agent.session_open_elsewhere') : t('agent.session_delete')}
+                      className={`p-1 rounded-[var(--radius-md)] text-pc-text-muted opacity-60 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 ${
+                        takenElsewhere ? 'cursor-not-allowed' : 'hover:text-status-error'
+                      }`}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>

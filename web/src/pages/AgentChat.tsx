@@ -128,6 +128,9 @@ export function AgentChatInner({
     contextInputTokens,
   } = useAgent();
 
+  // Keyed by conversation, not just alias: with the same agent open in two
+  // panes an alias-only key would make both share one draft, so typing in one
+  // would overwrite the other's unsent message.
   const draftKey = `${DRAFT_KEY_PREFIX}.${agentAlias}.${sessionId}`;
   const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [input, setInput] = useState(draft);
