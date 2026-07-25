@@ -1238,7 +1238,8 @@ mod tests {
         iss: String,
         aud: String,
         exp: i64,
-        serviceurl: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        serviceurl: Option<String>,
     }
 
     fn mint_service_token() -> String {
@@ -1249,13 +1250,24 @@ mod tests {
     /// `service_url`, so binding tests can vary it independently of the
     /// activity body.
     fn mint_service_token_for(service_url: &str) -> String {
+        mint_service_token_with(Some(service_url.to_string()))
+    }
+
+    /// Mint a valid service token that carries no `serviceurl` claim at all,
+    /// so the binding path can be tested for a missing (not just mismatched)
+    /// claim.
+    fn mint_service_token_without_serviceurl() -> String {
+        mint_service_token_with(None)
+    }
+
+    fn mint_service_token_with(service_url: Option<String>) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
         let claims = TestClaims {
             iss: auth::BOT_FRAMEWORK_ISSUER.to_string(),
             aud: APP_ID.to_string(),
             exp: chrono::Utc::now().timestamp() + 3600,
-            serviceurl: service_url.to_string(),
+            serviceurl: service_url,
         };
         let key = EncodingKey::from_rsa_pem(auth::TEST_KEY_PEM.as_bytes()).unwrap();
         jsonwebtoken::encode(&header, &claims, &key).unwrap()
@@ -1460,6 +1472,31 @@ mod tests {
         assert!(
             ch.conversations.get("a:1conv").is_none(),
             "a mismatched serviceUrl must not record a conversation reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_serviceurl_claim_is_rejected_without_recording_reference() {
+        let auth_server = MockServer::start().await;
+        mock_jwks(&auth_server).await;
+        let ch = channel_with(test_config(), vec!["*".to_string()], &auth_server);
+        let (url, mut rx) = spawn_listener(&ch).await;
+
+        // The claim is absent rather than mismatched: the body's serviceUrl
+        // is well-formed and would be usable, but nothing signed it, so
+        // there is no validated URL to pin the outbound request to.
+        let token = mint_service_token_without_serviceurl();
+        let activity = personal_activity("hi");
+
+        assert_eq!(post_activity(&url, &token, &activity).await, 401);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unsigned serviceUrl must not produce a message"
+        );
+        assert!(
+            ch.conversations.get("a:1conv").is_none(),
+            "an unsigned serviceUrl must not record a conversation reference, \
+             so no outbound Connector request can be addressed"
         );
     }
 

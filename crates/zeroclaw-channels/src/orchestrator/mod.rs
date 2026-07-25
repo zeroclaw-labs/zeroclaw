@@ -26266,6 +26266,42 @@ This is an example JSON object for profile settings."#;
         assert!(!cfg.enabled_for_channel("telegram"));
     }
 
+    /// Teams resolves `interrupt_on_new_message` from the `default` alias
+    /// only and then applies it by channel name. That narrowing is what the
+    /// setup guide documents, so pin both halves here: a non-`default` alias
+    /// cannot turn it on, and `default` turns it on for every Teams alias.
+    #[test]
+    fn interrupt_on_new_message_config_reads_msteams_default_alias_only() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.msteams.insert(
+            "secondary".to_string(),
+            zeroclaw_config::schema::MSTeamsConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+        assert!(
+            !cfg.enabled_for_channel("msteams"),
+            "a non-default alias must not enable Teams interruption"
+        );
+
+        channels.msteams.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MSTeamsConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+        assert!(
+            cfg.enabled_for_channel("msteams"),
+            "the default alias's value applies to every Teams alias"
+        );
+    }
+
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
         let cfg = InterruptOnNewMessageConfig {

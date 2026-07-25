@@ -155,8 +155,8 @@ and enabling it on `default` turns it on for all Teams conversations.
 
 Teams rejects any single activity larger than ~100 KB with a `413`
 (`MessageSizeTooBig`). Outbound replies that exceed a conservative size budget
-are split into ordered chunks — preferring paragraph, then line, then word
-boundaries — so a long response is delivered in full rather than dropped. This
+are split into ordered chunks, preferring paragraph, then line, then word
+boundaries, so a long response is delivered in full rather than dropped. This
 applies to every `stream_mode` (including each `multi_message` paragraph); a
 reply that fits the budget is sent unchanged as a single message.
 

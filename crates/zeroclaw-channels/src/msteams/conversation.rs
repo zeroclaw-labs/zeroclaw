@@ -3,7 +3,7 @@
 //! Teams delivers the `serviceUrl` + conversation id pair on every inbound
 //! activity; proactive (outbound) sends need them back. The pair exists
 //! nowhere else in the codebase, so this map is the source of truth —
-//! created here from platform data, not copied from config. MVP keeps it
+//! created here from platform data, not copied from config. The store is
 //! in memory only: after a daemon restart, proactive sends fail until the
 //! peer messages the bot again (see `docs/msteams-channel-design.md`).
 
