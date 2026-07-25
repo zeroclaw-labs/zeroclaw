@@ -18,6 +18,12 @@ pub struct Activity {
     /// Platform activity id (used as the reply/thread anchor).
     #[serde(default)]
     pub id: Option<String>,
+    /// Originating channel id (`msteams` for Teams). Bound to the signing
+    /// key's endorsements during authentication: the listener rejects an
+    /// activity whose `channelId` the signing key is not published to sign
+    /// for. Absent on some activities from older Connector versions.
+    #[serde(default)]
+    pub channel_id: Option<String>,
     /// RFC 3339 timestamp.
     #[serde(default)]
     pub timestamp: Option<String>,
@@ -69,6 +75,28 @@ pub struct Entity {
     pub entity_type: String,
     #[serde(default)]
     pub mentioned: Option<Mentioned>,
+    /// Literal `<at>…</at>` substring this mention occupies in the message
+    /// text. Teams includes it on `mention` entities so the exact span can
+    /// be located; used to strip only the bot's own mention while keeping
+    /// other mentioned users' names in the prompt.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl Entity {
+    /// The `<at>…</at>` literal this mention occupies, preferring the
+    /// entity's own `text` and falling back to reconstructing it from the
+    /// mentioned display name.
+    #[must_use]
+    pub fn mention_literal(&self) -> Option<String> {
+        if let Some(text) = self.text.as_deref().filter(|t| !t.is_empty()) {
+            return Some(text.to_string());
+        }
+        self.mentioned
+            .as_ref()
+            .and_then(|mentioned| mentioned.name.as_deref())
+            .map(|name| format!("<at>{name}</at>"))
+    }
 }
 
 /// The account referenced by a `mention` entity.
@@ -76,6 +104,10 @@ pub struct Entity {
 #[serde(rename_all = "camelCase")]
 pub struct Mentioned {
     pub id: String,
+    /// Display name Teams rendered inside the `<at>…</at>` tag. Used as a
+    /// fallback to locate the mention span when the entity omits `text`.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Activity {
@@ -98,6 +130,24 @@ impl Activity {
                     .as_ref()
                     .is_some_and(|mentioned| mentioned.id == bot_id)
         })
+    }
+
+    /// The `<at>…</at>` literals for the bot's own mentions (`bot_id`).
+    /// These are stripped entirely from the prompt; every other mention is
+    /// unwrapped to its display name so it survives into model ingress.
+    #[must_use]
+    pub fn bot_mention_literals(&self, bot_id: &str) -> Vec<String> {
+        self.entities
+            .iter()
+            .filter(|entity| entity.entity_type == "mention")
+            .filter(|entity| {
+                entity
+                    .mentioned
+                    .as_ref()
+                    .is_some_and(|mentioned| mentioned.id == bot_id)
+            })
+            .filter_map(Entity::mention_literal)
+            .collect()
     }
 
     /// Activity timestamp as Unix seconds; `0` when absent or unparsable
@@ -125,17 +175,25 @@ pub fn split_conversation_id(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Strip `<at>…</at>` mention tags (tag and inner name) from message
-/// text, collapsing the surrounding whitespace. Teams inserts these for
-/// every @mention, including the bot's own.
+/// Unwrap `<at>…</at>` mention tags to their inner display name,
+/// collapsing surrounding whitespace. Teams inserts these tags around
+/// every @mention; unwrapping (rather than deleting) keeps the mentioned
+/// user's name in the text, so a prompt like `@Bot ask @Alice` still
+/// carries "Alice" to the model. The bot's own mention is removed
+/// upstream by [`clean_message_text`] before this runs.
 #[must_use]
-pub fn strip_mention_tags(text: &str) -> String {
+pub fn unwrap_mention_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<at>") {
         out.push_str(&rest[..start]);
-        match rest[start..].find("</at>") {
-            Some(end_rel) => rest = &rest[start + end_rel + "</at>".len()..],
+        let after = &rest[start + "<at>".len()..];
+        match after.find("</at>") {
+            Some(end_rel) => {
+                // Keep the inner display name, drop only the tags.
+                out.push_str(&after[..end_rel]);
+                rest = &after[end_rel + "</at>".len()..];
+            }
             None => {
                 // Unclosed tag: keep the remainder verbatim rather than
                 // dropping user text.
@@ -197,10 +255,21 @@ pub fn decode_html_entities(text: &str) -> String {
     out
 }
 
-/// Full inbound text cleanup: strip mention tags, then decode entities.
+/// Full inbound text cleanup: remove the bot's own `<at>…</at>` mentions
+/// entirely, unwrap every remaining mention tag to its display name, then
+/// decode HTML entities. `bot_mention_literals` come from
+/// [`Activity::bot_mention_literals`].
 #[must_use]
-pub fn clean_message_text(text: &str) -> String {
-    decode_html_entities(&strip_mention_tags(text))
+pub fn clean_message_text(text: &str, bot_mention_literals: &[String]) -> String {
+    let mut without_bot = text.to_string();
+    for literal in bot_mention_literals {
+        if !literal.is_empty() {
+            // Replace with a space so adjacent words don't fuse; the
+            // whitespace collapse in `unwrap_mention_tags` tidies up.
+            without_bot = without_bot.replace(literal.as_str(), " ");
+        }
+    }
+    decode_html_entities(&unwrap_mention_tags(&without_bot))
 }
 
 #[cfg(test)]
@@ -225,6 +294,7 @@ mod tests {
             "text": "hello"
         }));
         assert_eq!(activity.activity_type, "message");
+        assert_eq!(activity.channel_id.as_deref(), Some("msteams"));
         assert!(activity.is_personal());
         assert_eq!(activity.from.as_ref().unwrap().id, "29:user-x");
         assert_eq!(
@@ -284,19 +354,68 @@ mod tests {
     }
 
     #[test]
-    fn mention_tags_are_stripped() {
+    fn mention_tags_are_unwrapped_to_names() {
+        // Unwrapping keeps every mentioned name; the bot's own mention is
+        // removed separately by clean_message_text, not here.
         assert_eq!(
-            strip_mention_tags("<at>ZeroClaw</at> run the report"),
-            "run the report"
+            unwrap_mention_tags("<at>ZeroClaw</at> run the report"),
+            "ZeroClaw run the report"
         );
         assert_eq!(
-            strip_mention_tags("hey <at>ZeroClaw</at>, and <at>Alice</at> too"),
-            "hey , and too"
+            unwrap_mention_tags("hey <at>ZeroClaw</at>, and <at>Alice</at> too"),
+            "hey ZeroClaw, and Alice too"
         );
-        assert_eq!(strip_mention_tags("no mentions here"), "no mentions here");
+        assert_eq!(unwrap_mention_tags("no mentions here"), "no mentions here");
         assert_eq!(
-            strip_mention_tags("broken <at>tag stays"),
+            unwrap_mention_tags("broken <at>tag stays"),
             "broken <at>tag stays"
+        );
+    }
+
+    #[test]
+    fn bot_mention_literals_target_only_the_bot() {
+        let activity = parse(serde_json::json!({
+            "type": "message",
+            "recipient": { "id": "28:bot-app-id", "name": "ZeroClaw" },
+            "text": "<at>ZeroClaw</at> ask <at>Alice</at>",
+            "entities": [
+                { "type": "mention", "mentioned": { "id": "28:bot-app-id", "name": "ZeroClaw" }, "text": "<at>ZeroClaw</at>" },
+                { "type": "mention", "mentioned": { "id": "29:alice", "name": "Alice" }, "text": "<at>Alice</at>" }
+            ]
+        }));
+        assert_eq!(
+            activity.bot_mention_literals("28:bot-app-id"),
+            vec!["<at>ZeroClaw</at>".to_string()]
+        );
+    }
+
+    #[test]
+    fn bot_mention_literal_falls_back_to_display_name() {
+        // Older Connector payloads omit the entity `text`; reconstruct the
+        // literal from the mentioned display name instead.
+        let entity: Entity = serde_json::from_value(serde_json::json!({
+            "type": "mention",
+            "mentioned": { "id": "28:bot", "name": "ZeroClaw" }
+        }))
+        .unwrap();
+        assert_eq!(
+            entity.mention_literal().as_deref(),
+            Some("<at>ZeroClaw</at>")
+        );
+    }
+
+    #[test]
+    fn clean_message_text_drops_bot_mention_keeps_others() {
+        let bot = ["<at>ZeroClaw</at>".to_string()];
+        // Bot mention removed; the other mentioned user's name survives.
+        assert_eq!(
+            clean_message_text("<at>ZeroClaw</at> ask <at>Alice</at> to review", &bot),
+            "ask Alice to review"
+        );
+        // No bot literals: every mention is unwrapped to its name.
+        assert_eq!(
+            clean_message_text("<at>Alice</at> and <at>Bob</at>", &[]),
+            "Alice and Bob"
         );
     }
 
@@ -317,7 +436,10 @@ mod tests {
     #[test]
     fn clean_message_text_combines_both() {
         assert_eq!(
-            clean_message_text("<at>ZeroClaw</at> 1 &lt; 2 &amp;&amp; 3 &gt; 2"),
+            clean_message_text(
+                "<at>ZeroClaw</at> 1 &lt; 2 &amp;&amp; 3 &gt; 2",
+                &["<at>ZeroClaw</at>".to_string()]
+            ),
             "1 < 2 && 3 > 2"
         );
     }

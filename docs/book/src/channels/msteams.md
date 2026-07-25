@@ -9,6 +9,14 @@ Requires an Azure Bot resource (free F0 tier works) with a single-tenant
 Entra app registration. No Microsoft Graph permissions are needed for
 messaging.
 
+> **Build note.** The Teams channel is opt-in and is **not** part of the
+> default build or the prebuilt release binaries / Docker images (which ship
+> the lean standard distribution set). To use it you must build from source
+> with the `channel-msteams` feature enabled (it is also included in the
+> `channels-full` bundle), e.g.
+> `cargo build --release --no-default-features --features "dist,channel-msteams"`
+> or `cargo build --release --features channels-full`.
+
 ## Who can talk to the agent
 
 {{#peer-group msteams}}
@@ -108,8 +116,10 @@ Inbound messages pass three gates, in order:
 3. **Peer-group allowlist**: the sender must match the channel's peer group
    (empty group = deny everyone, `"*"` = allow everyone).
 
-`<at>…</at>` mention tags and HTML entities are stripped from the text before
-it reaches the agent.
+The bot's own `<at>…</at>` mention is removed from the text before it reaches
+the agent, and HTML entities are decoded. Mentions of **other** users are
+unwrapped to their display name (so "@ZeroClaw ask @Alice" reaches the model as
+"ask Alice") rather than dropped.
 
 ## Streaming replies
 
@@ -131,8 +141,24 @@ Set `stream_mode = "partial"` for progressive responses:
 Personal-chat updates are throttled by `draft_update_interval_ms` (default
 1000 ms; Teams rate-limits streaming updates to roughly one per second).
 
-`stream_mode = "multi_message"` sends the response as separate messages at
-paragraph boundaries instead.
+`stream_mode = "multi_message"` sends the response as separate messages split
+on paragraph boundaries instead, in every conversation type (personal, group,
+and team channels). `multi_message_delay_ms` (default 800 ms) paces the sends.
+Group chats and team channels also show the ordinary typing indicator while the
+turn runs, regardless of `stream_mode`.
+
+`interrupt_on_new_message` is resolved from the `default` alias and applied to
+every `msteams` alias: a value set only on a non-`default` alias is not honored,
+and enabling it on `default` turns it on for all Teams conversations.
+
+## Long messages
+
+Teams rejects any single activity larger than ~100 KB with a `413`
+(`MessageSizeTooBig`). Outbound replies that exceed a conservative size budget
+are split into ordered chunks — preferring paragraph, then line, then word
+boundaries — so a long response is delivered in full rather than dropped. This
+applies to every `stream_mode` (including each `multi_message` paragraph); a
+reply that fits the budget is sent unchanged as a single message.
 
 ## Threading
 

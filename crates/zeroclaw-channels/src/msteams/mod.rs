@@ -87,6 +87,18 @@ struct DraftStream {
     next_sequence: u64,
 }
 
+/// Per-recipient `multi_message` streaming state. Source of truth created
+/// here: how many bytes of the accumulated response have already been
+/// flushed as separate messages, and the thread anchor replies address.
+/// Dropped on finalize/cancel.
+struct MultiMessageState {
+    /// Byte offset into the accumulated response already delivered.
+    sent_len: usize,
+    /// Thread anchor (`thread_ts`) carried from the triggering message so
+    /// team-channel paragraphs stay in-thread.
+    thread_ts: Option<String>,
+}
+
 /// A `typing`/`message` activity carrying a Teams `streaminfo` entity
 /// (the native streaming protocol; design §4).
 fn streaming_activity_body(
@@ -111,6 +123,103 @@ fn streaming_activity_body(
         "text": text,
         "entities": [entity],
     })
+}
+
+/// Find the first paragraph break (a blank line, `\n\n`) that is not
+/// inside a fenced code block, for `multi_message` splitting. Returns the
+/// trimmed paragraph text before the break and the number of bytes
+/// consumed (the paragraph plus its trailing blank line). `None` when no
+/// complete paragraph boundary has arrived yet, so the caller waits for
+/// more streamed text rather than splitting mid-paragraph or mid-fence.
+fn next_paragraph_boundary(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut in_fence = false;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let ch = bytes[pos];
+        if ch == b'`'
+            && pos + 2 < bytes.len()
+            && bytes[pos + 1] == b'`'
+            && bytes[pos + 2] == b'`'
+            && (pos == 0 || bytes[pos - 1] == b'\n')
+        {
+            in_fence = !in_fence;
+        }
+        if !in_fence && ch == b'\n' && pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' {
+            return Some((text[..pos].trim().to_string(), pos + 2));
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// Per-message size ceiling for outbound Teams activities, in characters.
+///
+/// Teams measures a message's size in UTF-16 code units — including
+/// `@`-mentions and reactions — and rejects anything past ~100 KB with a
+/// `413` (`MessageSizeTooBig`); Microsoft recommends staying under 80 KB. This
+/// budget is deliberately conservative: even all-surrogate-pair text (2 UTF-16
+/// units per `char`) stays well under the hard limit, leaving headroom for the
+/// mention/reaction/JSON-envelope overhead the limit also counts.
+const TEAMS_MAX_MESSAGE_CHARS: usize = 18_000;
+
+/// Split `message` into ordered chunks that each stay within
+/// [`TEAMS_MAX_MESSAGE_CHARS`]. Prefers to break at a paragraph boundary
+/// (blank line), then a single newline, then a space, and only hard-cuts
+/// mid-token when a single unbroken run exceeds the budget. Every character is
+/// preserved (no trimming), so concatenating the chunks reproduces the input
+/// exactly. Returns the input as a single chunk when it already fits, so the
+/// common case is byte-for-byte identical to sending without splitting.
+fn split_message_for_teams(message: &str) -> Vec<String> {
+    if message.chars().count() <= TEAMS_MAX_MESSAGE_CHARS {
+        return vec![message.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = message;
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= TEAMS_MAX_MESSAGE_CHARS {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        // Byte offset just past the budget-th character.
+        let hard_split = remaining
+            .char_indices()
+            .nth(TEAMS_MAX_MESSAGE_CHARS)
+            .map_or(remaining.len(), |(idx, _)| idx);
+        let chunk_end = preferred_teams_split_end(&remaining[..hard_split]);
+        chunks.push(remaining[..chunk_end].to_string());
+        remaining = &remaining[chunk_end..];
+    }
+    chunks
+}
+
+/// Pick the byte offset to end a chunk within `search_area` (already trimmed to
+/// the character budget). Prefers a paragraph break, then a newline, then a
+/// space — but only when it leaves a non-trivial chunk (at least half the
+/// budget), to avoid a cascade of tiny fragments. Falls back to a hard cut at
+/// the budget. The result is always `>= 1`, so the caller always makes
+/// progress.
+fn preferred_teams_split_end(search_area: &str) -> usize {
+    let min_keep = TEAMS_MAX_MESSAGE_CHARS / 2;
+    let long_enough = |prefix: &str| prefix.chars().count() >= min_keep;
+
+    if let Some(pos) = search_area.rfind("\n\n")
+        && long_enough(&search_area[..pos])
+    {
+        return pos + 2;
+    }
+    if let Some(pos) = search_area.rfind('\n')
+        && long_enough(&search_area[..pos])
+    {
+        return pos + 1;
+    }
+    if let Some(pos) = search_area.rfind(' ')
+        && long_enough(&search_area[..pos])
+    {
+        return pos + 1;
+    }
+    search_area.len()
 }
 
 /// Microsoft Teams channel handle.
@@ -139,6 +248,8 @@ pub struct MsTeamsChannel {
     /// `draft_update_interval_ms` floor (Teams rate-limits streaming
     /// updates to roughly one per second).
     last_draft_update: parking_lot::Mutex<HashMap<String, Instant>>,
+    /// Per-recipient `multi_message` progress (see [`MultiMessageState`]).
+    multi_message: parking_lot::Mutex<HashMap<String, MultiMessageState>>,
     #[cfg(test)]
     token_url_override: Option<String>,
 }
@@ -163,6 +274,7 @@ impl MsTeamsChannel {
             draft_streams: parking_lot::Mutex::new(HashMap::new()),
             draft_counter: AtomicU64::new(0),
             last_draft_update: parking_lot::Mutex::new(HashMap::new()),
+            multi_message: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             token_url_override: None,
         }
@@ -362,6 +474,82 @@ impl MsTeamsChannel {
         removed.and_then(|draft| draft.stream_id)
     }
 
+    /// `multi_message` streaming: flush every paragraph of `text` that has
+    /// fully arrived (past the per-recipient sent offset) as its own Teams
+    /// message, pausing `multi_message_delay_ms` between sends. Non-fatal
+    /// send failures are logged and swallowed — the finalize pass carries
+    /// whatever remains.
+    async fn flush_multi_message_paragraphs(&self, recipient: &str, text: &str) {
+        let delay_ms = self
+            .config()
+            .map(|cfg| cfg.multi_message_delay_ms)
+            .unwrap_or(0);
+        loop {
+            let (paragraph, thread_ts) = {
+                let mut state = self.multi_message.lock();
+                let Some(entry) = state.get_mut(recipient) else {
+                    return;
+                };
+                // A shorter accumulation than we have already delivered
+                // means the stream was cleared/restarted; reset and wait.
+                if text.len() < entry.sent_len {
+                    entry.sent_len = 0;
+                    return;
+                }
+                match next_paragraph_boundary(&text[entry.sent_len..]) {
+                    Some((paragraph, consumed)) => {
+                        entry.sent_len += consumed;
+                        (paragraph, entry.thread_ts.clone())
+                    }
+                    None => return,
+                }
+            };
+            if paragraph.is_empty() {
+                // Blank paragraph (e.g. consecutive blank lines); the
+                // offset advanced, so keep scanning without a send.
+                continue;
+            }
+            let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts);
+            if let Err(err) = self.send(&msg).await {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "Teams multi-message paragraph send failed"
+                );
+            }
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    /// `multi_message` finalize: flush any complete paragraphs, then send
+    /// the trailing text (which has no closing blank line) as a last
+    /// message. Drops the per-recipient state.
+    async fn finalize_multi_message(&self, recipient: &str, text: &str) -> Result<()> {
+        self.flush_multi_message_paragraphs(recipient, text).await;
+        let (remaining, thread_ts) = {
+            let mut state = self.multi_message.lock();
+            match state.remove(recipient) {
+                Some(entry) => {
+                    let tail = if text.len() > entry.sent_len {
+                        text[entry.sent_len..].trim().to_string()
+                    } else {
+                        String::new()
+                    };
+                    (tail, entry.thread_ts)
+                }
+                None => (String::new(), None),
+            }
+        };
+        if !remaining.is_empty() {
+            let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
+            self.send(&msg).await?;
+        }
+        Ok(())
+    }
+
     /// POST one streaminfo activity for a draft, opening the Teams
     /// stream on the first call. The first activity carries real
     /// content — never a placeholder — mirroring OpenClaw's lazy
@@ -455,19 +643,22 @@ async fn handle_activity(
     let Some(token) = token else {
         return StatusCode::UNAUTHORIZED;
     };
-    let issuers = auth::allowed_issuers(&cfg.tenant_id);
-    if let Err(err) = state.validator.validate(token, &cfg.app_id, &issuers).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{err}")})),
-            "rejecting inbound Teams activity: JWT validation failed"
-        );
-        return StatusCode::UNAUTHORIZED;
-    }
+    let issuers = auth::connector_issuers();
+    let claims = match state.validator.validate(token, &cfg.app_id, &issuers).await {
+        Ok(claims) => claims,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                "rejecting inbound Teams activity: JWT validation failed"
+            );
+            return StatusCode::UNAUTHORIZED;
+        }
+    };
 
-    let activity: Activity = match serde_json::from_slice(&body) {
+    let mut activity: Activity = match serde_json::from_slice(&body) {
         Ok(a) => a,
         Err(err) => {
             ::zeroclaw_log::record!(
@@ -481,7 +672,67 @@ async fn handle_activity(
         }
     };
 
+    // Bind the activity to the signed token before any state is recorded
+    // or any outbound request is made: the channelId must be endorsed by
+    // the signing key, and the outbound serviceUrl must match the signed
+    // claim (retaining only the validated value). A replayed valid token
+    // with a tampered body is rejected here, so the bot's Connector token
+    // can never be attached to an attacker-chosen serviceUrl.
+    if let Err(reason) = bind_activity_to_claims(&mut activity, &claims) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"reason": reason})),
+            "rejecting inbound Teams activity: token/body binding failed"
+        );
+        return StatusCode::UNAUTHORIZED;
+    }
+
     process_activity(&state, &cfg, activity).await
+}
+
+/// Confirm the activity is bound to the token that authenticated it, and
+/// pin the outbound `serviceUrl` to the signed value.
+///
+/// Two checks, both required by Microsoft's Bot Connector authentication
+/// contract:
+///
+/// 1. The activity's `channelId` must appear in the signing key's
+///    `endorsements` — the key must be published to sign for this channel.
+/// 2. The activity's `serviceUrl` must match the signed `serviceurl`
+///    claim. On success the activity keeps only the validated value, so
+///    every downstream conversation reference and outbound Connector call
+///    addresses the URL the issuer signed, never a body-supplied one.
+fn bind_activity_to_claims(
+    activity: &mut Activity,
+    claims: &auth::ValidatedClaims,
+) -> Result<(), &'static str> {
+    let channel_id = activity
+        .channel_id
+        .as_deref()
+        .ok_or("activity carries no channelId")?;
+    if !claims.endorsements.iter().any(|e| e == channel_id) {
+        return Err("activity channelId is not endorsed by the token's signing key");
+    }
+
+    let signed = claims
+        .serviceurl
+        .as_deref()
+        .ok_or("service token carries no serviceUrl claim")?;
+    match activity.service_url.as_deref() {
+        Some(body_url) if service_url_matches(signed, body_url) => {}
+        _ => return Err("activity serviceUrl does not match the signed serviceUrl claim"),
+    }
+    activity.service_url = Some(signed.to_string());
+    Ok(())
+}
+
+/// Compare a signed `serviceUrl` claim against the activity's `serviceUrl`,
+/// tolerating only a trailing-slash difference (both forms appear in
+/// practice for the same Connector endpoint).
+fn service_url_matches(signed: &str, activity: &str) -> bool {
+    signed.trim_end_matches('/') == activity.trim_end_matches('/')
 }
 
 /// Everything after authentication: reference recording, gating, and
@@ -563,10 +814,17 @@ async fn process_activity(
         return StatusCode::OK;
     }
 
+    // Strip only the bot's own @mention; other mentioned users' names are
+    // preserved so a prompt like "@Bot ask @Alice" keeps "Alice".
+    let bot_mention_literals = activity
+        .recipient
+        .as_ref()
+        .map(|recipient| activity.bot_mention_literals(&recipient.id))
+        .unwrap_or_default();
     let text = activity
         .text
         .as_deref()
-        .map(activity::clean_message_text)
+        .map(|raw| activity::clean_message_text(raw, &bot_mention_literals))
         .unwrap_or_default();
     if text.is_empty() {
         return StatusCode::OK;
@@ -643,11 +901,17 @@ impl Channel for MsTeamsChannel {
         let (_, ctx) = self.send_context(&message.recipient).await?;
         let conversation_id = Self::conversation_id_for_thread(&ctx, message.thread_ts.as_deref());
         let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
-        let mut body = serde_json::json!({ "type": "message", "text": message.content });
-        if let Some(reply_to_id) = message.in_reply_to.as_deref() {
-            body["replyToId"] = serde_json::Value::String(reply_to_id.to_string());
+        // Teams rejects any single activity past ~100 KB (413
+        // MessageSizeTooBig), so split oversize content into ordered chunks —
+        // a long response then lands in full instead of failing outright. The
+        // common (in-budget) case is a single chunk, unchanged from a plain send.
+        for chunk in split_message_for_teams(&message.content) {
+            let mut body = serde_json::json!({ "type": "message", "text": chunk });
+            if let Some(reply_to_id) = message.in_reply_to.as_deref() {
+                body["replyToId"] = serde_json::Value::String(reply_to_id.to_string());
+            }
+            Self::activity_request(&ctx, reqwest::Method::POST, url.clone(), &body).await?;
         }
-        Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
         Ok(())
     }
 
@@ -715,64 +979,129 @@ impl Channel for MsTeamsChannel {
             .is_some_and(|reference| reference.is_personal())
     }
 
+    /// Show a typing indicator by POSTing a one-shot Bot Framework
+    /// `typing` activity. Teams auto-expires the indicator after a few
+    /// seconds, so the orchestrator re-invokes this on its refresh
+    /// interval for the duration of the turn. Personal-chat native
+    /// streaming renders its own gray bubble and the orchestrator
+    /// suppresses typing there; this covers group chats, team channels,
+    /// non-streaming (`off`) turns, and `multi_message`.
+    async fn start_typing(&self, recipient: &str) -> Result<()> {
+        let (_, ctx) = self.send_context(recipient).await?;
+        let conversation_id = Self::conversation_id_for_thread(&ctx, None);
+        let url = Self::activities_url(&ctx.reference, &conversation_id, None)?;
+        let body = serde_json::json!({ "type": "typing" });
+        Self::activity_request(&ctx, reqwest::Method::POST, url, &body).await?;
+        Ok(())
+    }
+
+    /// Teams has no explicit "stop typing" activity — the indicator
+    /// expires shortly after the last `typing` activity — so this is a
+    /// no-op beyond the trait contract.
+    async fn stop_typing(&self, _recipient: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode() == StreamMode::Partial
+        self.stream_mode() != StreamMode::Off
     }
 
     fn supports_draft_updates_for(&self, message: &ChannelMessage) -> bool {
-        self.supports_draft_updates() && self.is_direct_message(message)
+        match self.stream_mode() {
+            StreamMode::Off => false,
+            // Teams' native streaming (the gray bubble) is personal-chat
+            // only; group chats and channels use a typing indicator plus
+            // one final reply instead.
+            StreamMode::Partial => self.is_direct_message(message),
+            // Paragraph-split delivery is a sequence of ordinary sends, so
+            // it works in every conversation type.
+            StreamMode::MultiMessage => true,
+        }
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
         self.stream_mode() == StreamMode::MultiMessage
     }
 
-    /// Register a lazy streaming draft for a personal chat. No activity
-    /// is POSTed here — the placeholder text the orchestrator passes is
-    /// deliberately dropped, and the Teams stream opens on the first
-    /// real update instead, so the gray bubble never flashes "..." (and
-    /// fast answers skip the stream entirely). Team channels and group
-    /// chats don't open drafts: they use the ordinary typing indicator
-    /// and deliver one final reply.
-    async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
-        if self.stream_mode() != StreamMode::Partial {
-            return Ok(None);
-        }
-        // Personal-chat check straight from the in-memory conversation
-        // store; no token acquisition or network traffic happens until
-        // the stream actually opens.
-        let (base_id, _) = activity::split_conversation_id(&message.recipient);
-        if !self
-            .conversations
-            .get(base_id)
-            .is_some_and(|reference| reference.is_personal())
-        {
-            return Ok(None);
-        }
-        let draft_id = format!(
-            "draft-{}",
-            self.draft_counter.fetch_add(1, Ordering::Relaxed)
-        );
-        self.draft_streams.lock().insert(
-            draft_id.clone(),
-            DraftStream {
-                stream_id: None,
-                next_sequence: 1,
-            },
-        );
-        Ok(Some(draft_id))
+    fn multi_message_delay_ms(&self) -> u64 {
+        self.config()
+            .map(|cfg| cfg.multi_message_delay_ms)
+            .unwrap_or(0)
     }
 
-    /// Stream accumulated content into the draft, opening the Teams
-    /// stream on the first call. Non-fatal failures are logged and
-    /// swallowed — the finalize pass carries the full text.
+    /// Open a streaming draft for the response.
+    ///
+    /// - `partial` (personal chats only): register a lazy native-streaming
+    ///   draft. No activity is POSTed here — the placeholder the
+    ///   orchestrator passes is dropped, and the Teams stream opens on the
+    ///   first real update, so the gray bubble never flashes "..." (fast
+    ///   answers skip the stream entirely). Group chats and team channels
+    ///   don't open a partial draft: they use the typing indicator and
+    ///   deliver one final reply.
+    /// - `multi_message` (any conversation type): register per-recipient
+    ///   paragraph-split state. Nothing is POSTed until the first complete
+    ///   paragraph arrives via `update_draft`.
+    async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
+        match self.stream_mode() {
+            StreamMode::Off => Ok(None),
+            StreamMode::Partial => {
+                // Personal-chat check straight from the in-memory
+                // conversation store; no token acquisition or network
+                // traffic happens until the stream actually opens.
+                let (base_id, _) = activity::split_conversation_id(&message.recipient);
+                if !self
+                    .conversations
+                    .get(base_id)
+                    .is_some_and(|reference| reference.is_personal())
+                {
+                    return Ok(None);
+                }
+                let draft_id = format!(
+                    "draft-{}",
+                    self.draft_counter.fetch_add(1, Ordering::Relaxed)
+                );
+                self.draft_streams.lock().insert(
+                    draft_id.clone(),
+                    DraftStream {
+                        stream_id: None,
+                        next_sequence: 1,
+                    },
+                );
+                Ok(Some(draft_id))
+            }
+            StreamMode::MultiMessage => {
+                self.multi_message.lock().insert(
+                    message.recipient.clone(),
+                    MultiMessageState {
+                        sent_len: 0,
+                        thread_ts: message.thread_ts.clone(),
+                    },
+                );
+                let draft_id = format!(
+                    "multi-{}",
+                    self.draft_counter.fetch_add(1, Ordering::Relaxed)
+                );
+                Ok(Some(draft_id))
+            }
+        }
+    }
+
+    /// Stream accumulated content into the draft. For `partial`, open/edit
+    /// the Teams native stream on the first call; for `multi_message`,
+    /// flush any newly completed paragraphs as separate messages. Non-fatal
+    /// failures are logged and swallowed — the finalize pass carries the
+    /// remaining text.
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
-        let Some(cfg) = self.config() else {
-            return Ok(());
-        };
         if text.trim().is_empty() {
             return Ok(());
         }
+        if self.stream_mode() == StreamMode::MultiMessage {
+            self.flush_multi_message_paragraphs(recipient, text).await;
+            return Ok(());
+        }
+        let Some(cfg) = self.config() else {
+            return Ok(());
+        };
         if !self.draft_update_allowed(recipient, cfg.draft_update_interval_ms) {
             return Ok(());
         }
@@ -799,6 +1128,12 @@ impl Channel for MsTeamsChannel {
         message_id: &str,
         text: &str,
     ) -> Result<()> {
+        // Status lines belong to the native streaming bubble; in
+        // `multi_message` mode there is no bubble, and delivering them as
+        // standalone messages would spam the conversation, so skip them.
+        if self.stream_mode() == StreamMode::MultiMessage {
+            return Ok(());
+        }
         let Some(cfg) = self.config() else {
             return Ok(());
         };
@@ -834,6 +1169,9 @@ impl Channel for MsTeamsChannel {
         text: &str,
         _suppress_voice: bool,
     ) -> Result<()> {
+        if self.stream_mode() == StreamMode::MultiMessage {
+            return self.finalize_multi_message(recipient, text).await;
+        }
         let (_, ctx) = self.send_context(recipient).await?;
         let text = crate::util::strip_tool_call_tags(text);
         let url = Self::activities_url(&ctx.reference, &ctx.base_id, None)?;
@@ -849,8 +1187,14 @@ impl Channel for MsTeamsChannel {
     }
 
     /// Best-effort removal of an abandoned draft. Drafts whose stream
-    /// never opened have nothing on the wire to delete.
+    /// never opened have nothing on the wire to delete; already-sent
+    /// `multi_message` paragraphs stay delivered (Teams cannot recall
+    /// them), so cancel just drops the per-recipient state.
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
+        if self.stream_mode() == StreamMode::MultiMessage {
+            self.multi_message.lock().remove(recipient);
+            return Ok(());
+        }
         let Some(stream_id) = self.clear_draft_state(recipient, message_id) else {
             return Ok(());
         };
@@ -885,20 +1229,33 @@ mod tests {
                               ncuYW7nTso4MmLosar3qCDKgsA-MjKVyQDEq0Qb22WIMjVmF68NSah6IilXmjoIL\
                               G2OCDnwGMmWFll6E9WYuAQ";
 
+    /// The Connector base URL the test activities and the signed token
+    /// agree on.
+    const SERVICE_URL: &str = "https://smba.trafficmanager.net/teams/";
+
     #[derive(Serialize)]
     struct TestClaims {
         iss: String,
         aud: String,
         exp: i64,
+        serviceurl: String,
     }
 
     fn mint_service_token() -> String {
+        mint_service_token_for(SERVICE_URL)
+    }
+
+    /// Mint a valid service token whose signed `serviceurl` claim is
+    /// `service_url`, so binding tests can vary it independently of the
+    /// activity body.
+    fn mint_service_token_for(service_url: &str) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
         let claims = TestClaims {
             iss: auth::BOT_FRAMEWORK_ISSUER.to_string(),
             aud: APP_ID.to_string(),
             exp: chrono::Utc::now().timestamp() + 3600,
+            serviceurl: service_url.to_string(),
         };
         let key = EncodingKey::from_rsa_pem(auth::TEST_KEY_PEM.as_bytes()).unwrap();
         jsonwebtoken::encode(&header, &claims, &key).unwrap()
@@ -916,7 +1273,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/keys"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "keys": [{ "kty": "RSA", "use": "sig", "kid": TEST_KID, "n": TEST_KEY_N, "e": "AQAB" }]
+                "keys": [{ "kty": "RSA", "use": "sig", "kid": TEST_KID, "n": TEST_KEY_N, "e": "AQAB", "endorsements": ["msteams"] }]
             })))
             .mount(server)
             .await;
@@ -965,7 +1322,8 @@ mod tests {
             "type": "message",
             "id": "1712345",
             "timestamp": "2026-07-18T02:00:00.000Z",
-            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "serviceUrl": SERVICE_URL,
+            "channelId": "msteams",
             "from": { "id": "29:user-x", "name": "User X", "aadObjectId": "00000000-0000-0000-0000-00000000feed" },
             "recipient": { "id": "28:bot", "name": "ZeroClaw" },
             "conversation": { "id": "a:1conv", "conversationType": "personal" },
@@ -1029,7 +1387,14 @@ mod tests {
         let (url, mut rx) = spawn_listener(&ch).await;
 
         let token = mint_service_token();
-        let activity = personal_activity("<at>ZeroClaw</at> 1 &lt; 2");
+        // Teams pairs a bot `<at>` mention with a `mention` entity; the
+        // bot's own mention is stripped, entities are decoded.
+        let mut activity = personal_activity("<at>ZeroClaw</at> 1 &lt; 2");
+        activity["entities"] = serde_json::json!([{
+            "type": "mention",
+            "mentioned": { "id": "28:bot", "name": "ZeroClaw" },
+            "text": "<at>ZeroClaw</at>"
+        }]);
         assert_eq!(post_activity(&url, &token, &activity).await, 200);
 
         let msg = rx.recv().await.unwrap();
@@ -1074,6 +1439,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tampered_serviceurl_is_rejected_without_recording_reference() {
+        let auth_server = MockServer::start().await;
+        mock_jwks(&auth_server).await;
+        let ch = channel_with(test_config(), vec!["*".to_string()], &auth_server);
+        let (url, mut rx) = spawn_listener(&ch).await;
+
+        // A validly signed token, but the body's serviceUrl was swapped
+        // for an attacker-controlled host — the classic token-replay
+        // redirect that would leak the Connector bearer token.
+        let token = mint_service_token();
+        let mut activity = personal_activity("hi");
+        activity["serviceUrl"] = serde_json::json!("https://evil.example.invalid/teams/");
+
+        assert_eq!(post_activity(&url, &token, &activity).await, 401);
+        assert!(
+            rx.try_recv().is_err(),
+            "a mismatched serviceUrl must not produce a message"
+        );
+        assert!(
+            ch.conversations.get("a:1conv").is_none(),
+            "a mismatched serviceUrl must not record a conversation reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_channel_id_is_rejected() {
+        let auth_server = MockServer::start().await;
+        mock_jwks(&auth_server).await;
+        let ch = channel_with(test_config(), vec!["*".to_string()], &auth_server);
+        let (url, mut rx) = spawn_listener(&ch).await;
+
+        let token = mint_service_token();
+        let mut activity = personal_activity("hi");
+        activity.as_object_mut().unwrap().remove("channelId");
+
+        assert_eq!(post_activity(&url, &token, &activity).await, 401);
+        assert!(rx.try_recv().is_err());
+        assert!(ch.conversations.get("a:1conv").is_none());
+    }
+
+    #[tokio::test]
+    async fn unendorsed_channel_id_is_rejected() {
+        let auth_server = MockServer::start().await;
+        mock_jwks(&auth_server).await;
+        let ch = channel_with(test_config(), vec!["*".to_string()], &auth_server);
+        let (url, mut rx) = spawn_listener(&ch).await;
+
+        // The signing key endorses only `msteams`; a `directline` activity
+        // signed with it must be rejected.
+        let token = mint_service_token();
+        let mut activity = personal_activity("hi");
+        activity["channelId"] = serde_json::json!("directline");
+
+        assert_eq!(post_activity(&url, &token, &activity).await, 401);
+        assert!(rx.try_recv().is_err());
+        assert!(ch.conversations.get("a:1conv").is_none());
+    }
+
+    #[tokio::test]
+    async fn recorded_reference_uses_signed_serviceurl() {
+        let auth_server = MockServer::start().await;
+        mock_jwks(&auth_server).await;
+        let ch = channel_with(test_config(), vec!["*".to_string()], &auth_server);
+        let (url, mut rx) = spawn_listener(&ch).await;
+
+        // Signed claim and body agree only up to a trailing slash; the
+        // stored reference must keep the validated (signed) value.
+        let token = mint_service_token_for("https://smba.trafficmanager.net/teams");
+        let activity = personal_activity("hi");
+        assert_eq!(post_activity(&url, &token, &activity).await, 200);
+        assert!(rx.recv().await.is_some());
+        assert_eq!(
+            ch.conversations.get("a:1conv").unwrap().service_url,
+            "https://smba.trafficmanager.net/teams",
+            "the stored reference must retain the signed serviceUrl, not the body's"
+        );
+    }
+
+    #[tokio::test]
     async fn dm_gate_drops_personal_chats_when_disabled() {
         let auth_server = MockServer::start().await;
         mock_jwks(&auth_server).await;
@@ -1101,7 +1545,8 @@ mod tests {
         serde_json::json!({
             "type": "message",
             "id": "1800",
-            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "serviceUrl": SERVICE_URL,
+            "channelId": "msteams",
             "from": { "id": "29:user-x" },
             "recipient": { "id": "28:bot", "name": "ZeroClaw" },
             "conversation": {
@@ -1145,6 +1590,28 @@ mod tests {
         assert_eq!(msg.content, "status?");
         assert_eq!(msg.sender, "29:user-x");
         assert!(!ch.is_direct_message(&msg));
+    }
+
+    /// A channel message that @-mentions the bot and another user drops
+    /// only the bot's mention; the other user's name reaches the model.
+    #[tokio::test]
+    async fn non_bot_mentions_are_preserved_in_prompt() {
+        let auth_server = MockServer::start().await;
+        mock_jwks(&auth_server).await;
+        let ch = channel_with(test_config(), vec!["*".to_string()], &auth_server);
+        let (url, mut rx) = spawn_listener(&ch).await;
+        let token = mint_service_token();
+
+        let mut activity =
+            channel_activity("<at>ZeroClaw</at> ask <at>Alice</at> for status", true);
+        activity["entities"] = serde_json::json!([
+            { "type": "mention", "mentioned": { "id": "28:bot", "name": "ZeroClaw" }, "text": "<at>ZeroClaw</at>" },
+            { "type": "mention", "mentioned": { "id": "29:alice", "name": "Alice" }, "text": "<at>Alice</at>" }
+        ]);
+        assert_eq!(post_activity(&url, &token, &activity).await, 200);
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.content, "ask Alice for status");
     }
 
     #[tokio::test]
@@ -1205,7 +1672,8 @@ mod tests {
         let token = mint_service_token();
         let update = serde_json::json!({
             "type": "conversationUpdate",
-            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "serviceUrl": SERVICE_URL,
+            "channelId": "msteams",
             "conversation": { "id": "a:1conv", "conversationType": "personal" },
             "recipient": { "id": "28:bot", "name": "ZeroClaw" },
         });
@@ -1415,9 +1883,12 @@ mod tests {
         assert!(partial.supports_draft_updates());
         assert!(!partial.supports_multi_message_streaming());
 
+        // MultiMessage uses the draft pipeline (paragraph-split sends), so
+        // it reports draft support in every conversation type.
         let multi = connector_dummy(StreamMode::MultiMessage);
-        assert!(!multi.supports_draft_updates());
+        assert!(multi.supports_draft_updates());
         assert!(multi.supports_multi_message_streaming());
+        assert_eq!(multi.multi_message_delay_ms(), 800);
     }
 
     #[tokio::test]
@@ -1578,6 +2049,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_message_supports_drafts_in_every_conversation_type() {
+        let connector = MockServer::start().await;
+        let cfg = MSTeamsConfig {
+            stream_mode: StreamMode::MultiMessage,
+            multi_message_delay_ms: 0,
+            ..test_config()
+        };
+        let ch = draft_channel(cfg, &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+        record_reference(&ch, &connector, "19:general@thread.tacv2", "channel");
+
+        let personal =
+            ChannelMessage::new("inbound-personal", "sender", "a:1conv", "hi", "msteams", 0);
+        let channel = ChannelMessage::new(
+            "inbound-channel",
+            "sender",
+            "19:general@thread.tacv2",
+            "hi",
+            "msteams",
+            0,
+        );
+        assert!(ch.supports_draft_updates_for(&personal));
+        assert!(ch.supports_draft_updates_for(&channel));
+    }
+
+    /// `multi_message` splits the streamed response on paragraph
+    /// boundaries: each completed paragraph ships as its own message while
+    /// it arrives, and finalize flushes the trailing paragraph.
+    #[tokio::test]
+    async fn multi_message_streaming_sends_paragraphs_then_flushes_tail() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "m" })),
+            )
+            .mount(&connector)
+            .await;
+
+        let cfg = MSTeamsConfig {
+            stream_mode: StreamMode::MultiMessage,
+            multi_message_delay_ms: 0,
+            ..test_config()
+        };
+        let ch = draft_channel(cfg, &connector);
+        record_reference(&ch, &connector, "a:1conv", "personal");
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("", "a:1conv"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(draft_id.starts_with("multi-"));
+        assert_eq!(
+            connector.received_requests().await.unwrap().len(),
+            0,
+            "opening a multi-message draft must not hit the network"
+        );
+
+        // Only the first, fully-arrived paragraph flushes; the partial
+        // second one waits for its closing blank line.
+        ch.update_draft("a:1conv", &draft_id, "First paragraph.\n\nSecond para")
+            .await
+            .unwrap();
+        ch.update_draft(
+            "a:1conv",
+            &draft_id,
+            "First paragraph.\n\nSecond paragraph.\n\nThird",
+        )
+        .await
+        .unwrap();
+        ch.finalize_draft(
+            "a:1conv",
+            &draft_id,
+            "First paragraph.\n\nSecond paragraph.\n\nThird and final.",
+            false,
+        )
+        .await
+        .unwrap();
+
+        let texts: Vec<String> = connector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/activities"))
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["text"].as_str().unwrap_or_default().to_string()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "First paragraph.".to_string(),
+                "Second paragraph.".to_string(),
+                "Third and final.".to_string(),
+            ]
+        );
+        assert!(
+            ch.multi_message.lock().is_empty(),
+            "multi-message state must be cleared after finalize"
+        );
+    }
+
+    /// The outbound typing indicator is a one-shot Bot Framework `typing`
+    /// activity; `stop_typing` posts nothing.
+    #[tokio::test]
+    async fn start_typing_posts_typing_activity() {
+        let connector = MockServer::start().await;
+        mock_token_endpoint(&connector).await;
+        Mock::given(method("POST"))
+            .and(path("/teams/v3/conversations/a:1conv/activities"))
+            .and(body_partial_json(serde_json::json!({ "type": "typing" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&connector)
+            .await;
+
+        let ch = draft_channel(test_config(), &connector);
+        record_reference(&ch, &connector, "a:1conv", "channel");
+
+        ch.start_typing("a:1conv").await.unwrap();
+        ch.stop_typing("a:1conv").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn draft_updates_respect_rate_limit_floor() {
         let connector = MockServer::start().await;
         mock_token_endpoint(&connector).await;
@@ -1712,5 +2311,48 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("403"), "missing status in: {text}");
         assert!(text.contains("BotNotInConversationRoster"));
+    }
+
+    #[test]
+    fn in_budget_message_is_a_single_unchanged_chunk() {
+        let msg = "hello\n\nworld ```code```";
+        assert_eq!(split_message_for_teams(msg), vec![msg.to_string()]);
+        // Empty content stays a single (empty) chunk, matching a plain send.
+        assert_eq!(split_message_for_teams(""), vec![String::new()]);
+    }
+
+    #[test]
+    fn oversize_message_splits_into_budget_sized_chunks_losslessly() {
+        // A single unbroken run (no break points) forces hard cuts.
+        let msg = "x".repeat(TEAMS_MAX_MESSAGE_CHARS * 2 + 500);
+        let chunks = split_message_for_teams(&msg);
+        assert!(
+            chunks.len() >= 3,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= TEAMS_MAX_MESSAGE_CHARS,
+                "chunk exceeds budget: {} chars",
+                chunk.chars().count()
+            );
+        }
+        // Every character is preserved and the order is stable.
+        assert_eq!(chunks.concat(), msg);
+    }
+
+    #[test]
+    fn oversize_message_prefers_paragraph_and_newline_boundaries() {
+        // Two paragraphs, each just under the budget, joined by a blank line.
+        let para = "a".repeat(TEAMS_MAX_MESSAGE_CHARS - 100);
+        let msg = format!("{para}\n\n{para}");
+        let chunks = split_message_for_teams(&msg);
+        assert_eq!(chunks.len(), 2, "should break at the paragraph boundary");
+        // The blank line is kept at the tail of the first chunk (lossless), so
+        // the second chunk starts cleanly at the next paragraph, not a newline.
+        assert!(chunks[0].ends_with("\n\n"));
+        assert!(!chunks[1].starts_with('\n'));
+        assert_eq!(chunks.concat(), msg);
     }
 }

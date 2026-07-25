@@ -14259,7 +14259,10 @@ pub struct MSTeamsConfig {
     pub mention_only: Option<bool>,
     /// Streaming mode for progressive response delivery. `partial` uses
     /// Teams' native streaming protocol (the gray in-progress bubble) in
-    /// personal chats and message edits in group chats/channels.
+    /// personal chats; group chats and channels fall back to a typing
+    /// indicator and one final reply. `multi_message` delivers the
+    /// response as separate messages split on paragraph boundaries and
+    /// works in every conversation type.
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
@@ -14268,9 +14271,20 @@ pub struct MSTeamsConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Delay (ms) between sending each paragraph when
+    /// `stream_mode = "multi_message"`. Default: `800`.
+    #[tab(Behavior)]
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
     /// When true, a newer Teams message from the same sender in the same
     /// conversation cancels the in-flight request and starts a fresh
     /// response with preserved history.
+    ///
+    /// Resolved from the `default` alias and applied to every `msteams`
+    /// alias: a value set only on a non-`default` alias is not honored,
+    /// and enabling it on `default` turns it on for all Teams
+    /// conversations. (Per-alias scoping is a shared channel limitation
+    /// tracked separately.)
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
@@ -14311,6 +14325,7 @@ impl Default for MSTeamsConfig {
             mention_only: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             proxy_url: None,
             excluded_tools: Vec::new(),

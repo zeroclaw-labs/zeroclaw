@@ -5,8 +5,11 @@
 //! - **Inbound** — every activity POST from the Bot Connector service
 //!   carries a `Authorization: Bearer <JWT>` header. [`JwtValidator`]
 //!   verifies the RS256 signature against the issuer's JWKS document
-//!   (discovered through OpenID metadata), plus issuer, audience
-//!   (= the bot's `app_id`) and expiry, before any payload is trusted.
+//!   (discovered through OpenID metadata), plus issuer (the Bot Framework
+//!   issuer only), audience (= the bot's `app_id`), expiry and
+//!   validity-start, before any payload is trusted. It also surfaces the
+//!   signing key's channel `endorsements` and the signed `serviceurl`
+//!   claim so the listener can bind them to the activity body.
 //! - **Outbound** — Connector API calls authenticate with an Entra
 //!   client-credentials token. [`ConnectorTokenProvider`] fetches one and
 //!   caches it until shortly before expiry.
@@ -40,6 +43,13 @@ const JWT_CLOCK_SKEW_LEEWAY_SECS: u64 = 300;
 /// tokens each triggering an outbound fetch.
 const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Force a JWKS re-fetch once the cache reaches this age, even for a
+/// `kid` that is still cached. Microsoft asks callers to refresh the Bot
+/// Framework keys at least daily; without this bound a key the issuer has
+/// *withdrawn* would stay trusted until the next unknown-`kid` miss (or a
+/// process restart), leaving a rotated-out key usable indefinitely.
+const JWKS_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Refresh the cached connector token this long before it expires, so an
 /// outbound send never races token expiry mid-request.
 const CONNECTOR_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
@@ -50,16 +60,16 @@ pub fn connector_token_url(tenant_id: &str) -> String {
     format!("https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token")
 }
 
-/// Issuers accepted on inbound service tokens for a single-tenant bot:
-/// the Bot Framework issuer plus the tenant's Entra v2 and v1 issuers
-/// (which one mints the token depends on the bot's registration type).
+/// Issuers accepted on inbound service tokens. Connector-to-bot tokens
+/// are always minted by the Bot Framework issuer
+/// ([`BOT_FRAMEWORK_ISSUER`]); the tenant's Entra issuers mint tokens for
+/// *outbound* Graph/SSO flows, not for the activity POSTs this listener
+/// authenticates, so accepting them here would widen the trust boundary
+/// with no legitimate caller. The set is a single entry, kept as a `Vec`
+/// for `jsonwebtoken`'s `set_issuer` API.
 #[must_use]
-pub fn allowed_issuers(tenant_id: &str) -> Vec<String> {
-    vec![
-        BOT_FRAMEWORK_ISSUER.to_string(),
-        format!("https://login.microsoftonline.com/{tenant_id}/v2.0"),
-        format!("https://sts.windows.net/{tenant_id}/"),
-    ]
+pub fn connector_issuers() -> Vec<String> {
+    vec![BOT_FRAMEWORK_ISSUER.to_string()]
 }
 
 /// Extract the token from an `Authorization` header value. Returns `None`
@@ -93,14 +103,30 @@ pub enum AuthError {
     Http(#[from] reqwest::Error),
 }
 
-/// Claims surfaced from a validated inbound service token. Issuer,
-/// audience and expiry are enforced during validation and not re-exposed;
-/// `serviceurl` is kept so the listener can cross-check it against the
-/// activity's `serviceUrl` before replying there.
-#[derive(Debug, Deserialize)]
+/// Everything a validated inbound service token surfaces for the
+/// listener's downstream binding checks. Issuer, audience, expiry and
+/// validity-start are enforced during validation and not re-exposed.
+///
+/// - `serviceurl` is the *signed* Connector base URL; the listener must
+///   confirm it matches the activity's `serviceUrl` before recording any
+///   conversation reference or attaching the bot's Connector token to an
+///   outbound request there.
+/// - `endorsements` are the channel ids the *signing key* is published to
+///   sign for; the listener confirms the activity's `channelId` is among
+///   them, per Microsoft's Bot Connector authentication contract.
+#[derive(Debug)]
 pub struct ValidatedClaims {
-    #[serde(default)]
     pub serviceurl: Option<String>,
+    pub endorsements: Vec<String>,
+}
+
+/// Registered claims decoded from a service token. Only `serviceurl` is
+/// surfaced to the caller; the rest are enforced by `jsonwebtoken` via
+/// [`Validation`] and never re-read here.
+#[derive(Deserialize)]
+struct ServiceTokenClaims {
+    #[serde(default)]
+    serviceurl: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,14 +148,31 @@ struct Jwk {
     n: Option<String>,
     #[serde(default)]
     e: Option<String>,
+    /// Channel ids this key is authorized to sign for. Bot Framework
+    /// keys publish this; an activity's `channelId` must appear here.
+    #[serde(default)]
+    endorsements: Vec<String>,
+}
+
+/// A usable RSA signing key from the issuer's JWKS, with the channel
+/// endorsements published alongside it.
+#[derive(Clone)]
+struct JwkKey {
+    /// RSA modulus `n` (base64url).
+    n: String,
+    /// RSA public exponent `e` (base64url).
+    e: String,
+    /// Channel ids this key may sign for (see [`Jwk::endorsements`]).
+    endorsements: Vec<String>,
 }
 
 #[derive(Default)]
 struct JwksCache {
-    /// `kid` -> RSA `(n, e)` components (base64url), as served by the
-    /// issuer's JWKS document. Materialized view of the issuer's keys;
-    /// refreshed on unknown-`kid` misses, never edited locally.
-    keys: HashMap<String, (String, String)>,
+    /// `kid` -> RSA key + endorsements, as served by the issuer's JWKS
+    /// document. Materialized view of the issuer's keys; refreshed on
+    /// unknown-`kid` misses and once the cache passes [`JWKS_MAX_AGE`],
+    /// never edited locally.
+    keys: HashMap<String, JwkKey>,
     last_fetch: Option<Instant>,
 }
 
@@ -140,6 +183,7 @@ pub struct JwtValidator {
     openid_metadata_url: String,
     jwks: tokio::sync::RwLock<JwksCache>,
     refresh_min_interval: Duration,
+    max_age: Duration,
 }
 
 impl JwtValidator {
@@ -156,6 +200,7 @@ impl JwtValidator {
             openid_metadata_url: openid_metadata_url.into(),
             jwks: tokio::sync::RwLock::new(JwksCache::default()),
             refresh_min_interval: JWKS_REFRESH_MIN_INTERVAL,
+            max_age: JWKS_MAX_AGE,
         }
     }
 
@@ -167,11 +212,19 @@ impl JwtValidator {
         self
     }
 
+    /// Test hook: shrink the max cache age so the daily-refresh path can
+    /// be exercised without waiting out the production 24h bound.
+    #[cfg(test)]
+    fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
     /// Validate a bearer token (without the `Bearer ` prefix).
     ///
     /// `app_id` is the expected audience; `issuers` the accepted issuer
-    /// set (see [`allowed_issuers`]). Both are resolved from canonical
-    /// config by the caller at call time.
+    /// set (see [`connector_issuers`]). `app_id` is resolved from
+    /// canonical config by the caller at call time.
     pub async fn validate(
         &self,
         token: &str,
@@ -183,23 +236,35 @@ impl JwtValidator {
             return Err(AuthError::UnsupportedAlgorithm(header.alg));
         }
         let kid = header.kid.ok_or(AuthError::MissingKeyId)?;
-        let key = self.decoding_key(&kid).await?;
+        let (key, endorsements) = self.decoding_key(&kid).await?;
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.leeway = JWT_CLOCK_SKEW_LEEWAY_SECS;
+        // Reject tokens whose validity window has not opened yet; the
+        // leeway above applies to `nbf` as well as `exp`.
+        validation.validate_nbf = true;
         validation.set_required_spec_claims(&["exp", "aud", "iss"]);
         validation.set_audience(&[app_id]);
         validation.set_issuer(issuers);
 
-        jsonwebtoken::decode::<ValidatedClaims>(token, &key, &validation)
+        let claims = jsonwebtoken::decode::<ServiceTokenClaims>(token, &key, &validation)
             .map(|data| data.claims)
-            .map_err(AuthError::Rejected)
+            .map_err(AuthError::Rejected)?;
+        Ok(ValidatedClaims {
+            serviceurl: claims.serviceurl,
+            endorsements,
+        })
     }
 
-    /// Resolve `kid` from the cache, refreshing from the issuer once
-    /// (rate-limited) on a miss to pick up rotated keys.
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
-        if let Some(key) = self.cached_key(kid).await? {
+    /// Resolve `kid` from the cache, returning the RSA key and its channel
+    /// endorsements. Refreshes from the issuer once (rate-limited) on a
+    /// miss to pick up rotated keys, and once the cache passes
+    /// [`JWKS_MAX_AGE`] so a withdrawn key stops validating even while its
+    /// `kid` is still cached.
+    async fn decoding_key(&self, kid: &str) -> Result<(DecodingKey, Vec<String>), AuthError> {
+        if self.cache_within_max_age().await
+            && let Some(key) = self.cached_key(kid).await?
+        {
             return Ok(key);
         }
         self.refresh_jwks().await?;
@@ -209,13 +274,22 @@ impl JwtValidator {
         }
     }
 
-    async fn cached_key(&self, kid: &str) -> Result<Option<DecodingKey>, AuthError> {
+    /// Whether the cached JWKS is younger than [`JwtValidator::max_age`]
+    /// (and thus usable without a refresh). An empty cache is never fresh.
+    async fn cache_within_max_age(&self) -> bool {
         let cache = self.jwks.read().await;
-        let Some((n, e)) = cache.keys.get(kid) else {
+        cache
+            .last_fetch
+            .is_some_and(|last| last.elapsed() < self.max_age)
+    }
+
+    async fn cached_key(&self, kid: &str) -> Result<Option<(DecodingKey, Vec<String>)>, AuthError> {
+        let cache = self.jwks.read().await;
+        let Some(jwk) = cache.keys.get(kid) else {
             return Ok(None);
         };
-        DecodingKey::from_rsa_components(n, e)
-            .map(Some)
+        DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
+            .map(|key| Some((key, jwk.endorsements.clone())))
             .map_err(|err| AuthError::UnusableJwk {
                 kid: kid.to_string(),
                 reason: err.to_string(),
@@ -262,7 +336,14 @@ impl JwtValidator {
             .into_iter()
             .filter(|key| key.kty == "RSA")
             .filter_map(|key| match (key.kid, key.n, key.e) {
-                (Some(kid), Some(n), Some(e)) => Some((kid, (n, e))),
+                (Some(kid), Some(n), Some(e)) => Some((
+                    kid,
+                    JwkKey {
+                        n,
+                        e,
+                        endorsements: key.endorsements,
+                    },
+                )),
                 _ => None,
             })
             .collect();
@@ -448,16 +529,29 @@ mod tests {
         aud: String,
         exp: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
+        nbf: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         serviceurl: Option<String>,
     }
 
     fn mint(iss: &str, aud: &str, exp: i64, kid: Option<&str>) -> String {
+        mint_with_nbf(iss, aud, exp, None, kid)
+    }
+
+    fn mint_with_nbf(
+        iss: &str,
+        aud: &str,
+        exp: i64,
+        nbf: Option<i64>,
+        kid: Option<&str>,
+    ) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = kid.map(str::to_string);
         let claims = TestClaims {
             iss: iss.to_string(),
             aud: aud.to_string(),
             exp,
+            nbf,
             serviceurl: Some("https://smba.trafficmanager.net/teams/".to_string()),
         };
         let key = EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).unwrap();
@@ -471,7 +565,7 @@ mod tests {
     fn jwks_body(kid: &str, n: &str) -> serde_json::Value {
         serde_json::json!({
             "keys": [
-                { "kty": "RSA", "use": "sig", "kid": kid, "n": n, "e": "AQAB" },
+                { "kty": "RSA", "use": "sig", "kid": kid, "n": n, "e": "AQAB", "endorsements": ["msteams", "directline"] },
                 { "kty": "EC", "use": "sig", "kid": "ec-key-ignored" }
             ]
         })
@@ -499,11 +593,11 @@ mod tests {
     }
 
     fn issuers() -> Vec<String> {
-        vec![BOT_FRAMEWORK_ISSUER.to_string()]
+        connector_issuers()
     }
 
     #[tokio::test]
-    async fn valid_token_is_accepted_and_serviceurl_surfaced() {
+    async fn valid_token_is_accepted_and_serviceurl_and_endorsements_surfaced() {
         let server = MockServer::start().await;
         mock_issuer(&server, TEST_KID).await;
 
@@ -516,6 +610,54 @@ mod tests {
             claims.serviceurl.as_deref(),
             Some("https://smba.trafficmanager.net/teams/")
         );
+        // Endorsements from the signing key are surfaced so the listener
+        // can bind them to the activity's channelId.
+        assert!(claims.endorsements.iter().any(|e| e == "msteams"));
+    }
+
+    #[tokio::test]
+    async fn token_not_yet_valid_is_rejected() {
+        let server = MockServer::start().await;
+        mock_issuer(&server, TEST_KID).await;
+
+        // `nbf` sits past the clock-skew leeway in the future.
+        let nbf = chrono::Utc::now().timestamp() + (JWT_CLOCK_SKEW_LEEWAY_SECS as i64) + 100;
+        let token = mint_with_nbf(
+            BOT_FRAMEWORK_ISSUER,
+            APP_ID,
+            future_exp(),
+            Some(nbf),
+            Some(TEST_KID),
+        );
+        let err = validator(&server)
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::Rejected(ref e)
+                if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ImmatureSignature)
+        ));
+    }
+
+    #[tokio::test]
+    async fn token_valid_within_nbf_leeway_is_accepted() {
+        let server = MockServer::start().await;
+        mock_issuer(&server, TEST_KID).await;
+
+        // `nbf` a little in the future but inside the skew leeway: accepted.
+        let nbf = chrono::Utc::now().timestamp() + 30;
+        let token = mint_with_nbf(
+            BOT_FRAMEWORK_ISSUER,
+            APP_ID,
+            future_exp(),
+            Some(nbf),
+            Some(TEST_KID),
+        );
+        validator(&server)
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -722,11 +864,57 @@ mod tests {
     }
 
     #[test]
-    fn allowed_issuers_cover_bot_framework_and_tenant() {
-        let issuers = allowed_issuers("tenant-123");
-        assert!(issuers.contains(&BOT_FRAMEWORK_ISSUER.to_string()));
-        assert!(issuers.contains(&"https://login.microsoftonline.com/tenant-123/v2.0".to_string()));
-        assert!(issuers.contains(&"https://sts.windows.net/tenant-123/".to_string()));
+    fn connector_issuers_is_bot_framework_only() {
+        // Connector-to-bot tokens are always minted by the Bot Framework
+        // issuer; tenant Entra issuers must not be accepted here.
+        assert_eq!(connector_issuers(), vec![BOT_FRAMEWORK_ISSUER.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stale_cache_refetches_even_for_known_kid() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": BOT_FRAMEWORK_ISSUER,
+                "jwks_uri": format!("{}/keys", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body(TEST_KID, TEST_KEY_N)))
+            .mount(&server)
+            .await;
+
+        // Zero max-age forces a fresh fetch on every validate, even though
+        // the kid is already cached — this is the daily-refresh bound that
+        // drops keys the issuer has withdrawn.
+        let validator = JwtValidator::new(format!("{}/metadata", server.uri()))
+            .with_refresh_min_interval(Duration::ZERO)
+            .with_max_age(Duration::ZERO);
+
+        let token = mint(BOT_FRAMEWORK_ISSUER, APP_ID, future_exp(), Some(TEST_KID));
+        validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap();
+        validator
+            .validate(&token, APP_ID, &issuers())
+            .await
+            .unwrap();
+
+        let key_fetches = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/keys")
+            .count();
+        assert!(
+            key_fetches >= 2,
+            "a stale cache must re-fetch the JWKS even when the kid is known, got {key_fetches}"
+        );
     }
 
     #[tokio::test]
