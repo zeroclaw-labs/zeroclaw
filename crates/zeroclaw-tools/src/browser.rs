@@ -805,6 +805,122 @@ impl BrowserTool {
         })
     }
 
+    /// Validates screenshot destination path against workspace policy.
+    /// Runs before any backend (agent-browser, rust-native, ComputerUse) writes a screenshot file.
+    ///
+    /// Applies the same guards as `file_write` / `file_edit`:
+    /// 1. String-level `is_path_allowed` — rejects null bytes, `..` traversal, URL-encoded traversal
+    /// 2. `resolve_tool_path` + `canonicalize` parent — resolves relative/tilde paths
+    /// 3. `is_resolved_path_allowed` — confirms canonical parent is inside workspace allowlist
+    /// 4. `is_runtime_config_path` — rejects `config.toml`, `config.toml.bak`, `.config.toml.tmp-*`
+    /// 5. `symlink_metadata` — rejects existing symlink targets
+    ///
+    /// Replaces the raw path with the canonical target so backends write the checked string.
+    async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
+        let BrowserAction::Screenshot { path, .. } = action else {
+            return Ok(());
+        };
+        let Some(path_str) = path.as_ref() else {
+            return Ok(());
+        };
+
+        // String-level reject (null bytes, .. traversal, URL-encoded traversal)
+        if !self.security.is_path_allowed(path_str) {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-not-allowed",
+                &[("path", path_str)],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Resolve relative / tilde paths against the workspace directory.
+        let full = self.security.resolve_tool_path(path_str);
+
+        // The file does not exist yet, so canonicalize the *parent* directory
+        // to verify it is inside the workspace allowlist.
+        let parent = full.parent().unwrap_or(&full);
+        let canonical = tokio::fs::canonicalize(parent).await.with_context(|| {
+            crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-parent-not-exist",
+                &[
+                    ("path", path_str),
+                    ("parent", &parent.display().to_string()),
+                ],
+            )
+        })?;
+
+        if !self.security.is_resolved_path_allowed(&canonical) {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-outside-workspace",
+                &[
+                    ("path", path_str),
+                    ("canonical", &canonical.display().to_string()),
+                ],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Build the final *target* path (parent + file name) so we can apply
+        // the same target-level guards the file_write / file_edit tools use.
+        let Some(file_name) = full.file_name() else {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-missing-filename",
+                &[("path", path_str)],
+            );
+            anyhow::bail!("{msg}");
+        };
+        let resolved_target = canonical.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-runtime-config-target",
+                &[
+                    ("path", path_str),
+                    ("target", &resolved_target.display().to_string()),
+                ],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // If the target already exists and is a symlink, refuse to follow it.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
+            && meta.file_type().is_symlink()
+        {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-symlink-target",
+                &[("target", &resolved_target.display().to_string())],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Replace the raw user path with the canonical target.
+        *path = Some(resolved_target.to_string_lossy().to_string());
+        Ok(())
+    }
+
+    /// Returns `true` if the ComputerUse sidecar is on a different filesystem
+    /// than the ZeroClaw daemon. Private-network endpoints (RFC1918) are
+    /// considered different-host unless they are provably loopback.
+    fn endpoint_is_different_filesystem(&self) -> bool {
+        if !self.computer_use.allow_remote_endpoint {
+            return false;
+        }
+        match reqwest::Url::parse(&self.computer_use.endpoint) {
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => {
+                    // Loopback addresses are same-host
+                    if host == "127.0.0.1" || host == "::1" || host == "localhost" {
+                        return false;
+                    }
+                    // All other addresses (including RFC1918 private) are different-host
+                    true
+                }
+                None => true, // Unparseable → conservative fallback
+            },
+            Err(_) => true, // Unparseable → conservative fallback
+        }
+    }
+
     fn validate_computer_use_action(
         &self,
         action: &str,
@@ -844,6 +960,118 @@ impl BrowserTool {
         Ok(())
     }
 
+    /// Validates screenshot path for ComputerUse backend before forwarding to sidecar.
+    /// Applies the same workspace policy / runtime-config / symlink guards as
+    /// `validate_screenshot_path`, plus rejects paths when the sidecar is on a
+    /// different filesystem (private-network endpoints).
+    async fn validate_screenshot_path_for_computer_use(
+        &self,
+        action_str: &str,
+        args: Value,
+    ) -> anyhow::Result<Value> {
+        if action_str != "screenshot" {
+            // Not a screenshot action, pass through unchanged
+            return Ok(args);
+        }
+
+        let path = args.get("path").cloned();
+
+        // Classify path into Absent/String/NonString
+        match &path {
+            None | Some(Value::Null) => {
+                // Absent: no path or null → inline PNG return
+                Ok(args)
+            }
+            Some(Value::String(s)) if s.is_empty() => {
+                // Absent: empty string → inline PNG return
+                Ok(args)
+            }
+            Some(Value::String(_)) => {
+                // String: validate against workspace
+                let mut args = args;
+                let path_str = path.as_ref().unwrap().as_str().unwrap();
+
+                // String-level reject
+                if !self.security.is_path_allowed(path_str) {
+                    let msg = crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-path-not-allowed",
+                        &[("path", path_str)],
+                    );
+                    anyhow::bail!("{msg}");
+                }
+
+                // Resolve and canonicalize
+                let full = self.security.resolve_tool_path(path_str);
+                let parent = full.parent().unwrap_or(&full);
+                let canonical = tokio::fs::canonicalize(parent).await.with_context(|| {
+                    crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-parent-not-exist",
+                        &[
+                            ("path", path_str),
+                            ("parent", &parent.display().to_string()),
+                        ],
+                    )
+                })?;
+
+                if !self.security.is_resolved_path_allowed(&canonical) {
+                    let msg = crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-path-outside-workspace",
+                        &[
+                            ("path", path_str),
+                            ("canonical", &canonical.display().to_string()),
+                        ],
+                    );
+                    anyhow::bail!("{msg}");
+                }
+
+                // Build target and apply target-level guards
+                let Some(file_name) = full.file_name() else {
+                    let msg = crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-missing-filename",
+                        &[("path", path_str)],
+                    );
+                    anyhow::bail!("{msg}");
+                };
+                let resolved_target = canonical.join(file_name);
+
+                if self.security.is_runtime_config_path(&resolved_target) {
+                    let msg = crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-runtime-config-target",
+                        &[
+                            ("path", path_str),
+                            ("target", &resolved_target.display().to_string()),
+                        ],
+                    );
+                    anyhow::bail!("{msg}");
+                }
+
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved_target)
+                    && meta.file_type().is_symlink()
+                {
+                    let msg = crate::i18n::get_required_tool_string_with_args(
+                        "tool-browser-screenshot-error-symlink-target",
+                        &[("target", &resolved_target.display().to_string())],
+                    );
+                    anyhow::bail!("{msg}");
+                }
+
+                // Replace with canonical target
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert("path".to_string(), Value::String(resolved_target.to_string_lossy().to_string()));
+                }
+                Ok(args)
+            }
+            Some(_) => {
+                // NonString: integer, array, object → reject
+                let msg = crate::i18n::get_required_tool_string_with_args(
+                    "tool-browser-screenshot-error-computeruse-non-string-path",
+                    &[("path", &format!("{path:?}"))],
+                );
+                anyhow::bail!("{msg}");
+            }
+        }
+    }
+
     async fn execute_computer_use_action(
         &self,
         action: &str,
@@ -851,14 +1079,20 @@ impl BrowserTool {
     ) -> anyhow::Result<ToolResult> {
         let endpoint = self.computer_use_endpoint_url()?;
 
-        let mut params = args.as_object().cloned().ok_or_else(|| {
+        // Validate screenshot path before forwarding to sidecar
+        let screenshot_args = if action == "screenshot" {
+            self.validate_screenshot_path_for_computer_use(action, args.clone()).await?
+        } else {
+            args.clone()
+        };
+        let mut params = screenshot_args.as_object().cloned().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "browser: browser args must be a JSON object"
+                "browser: validated screenshot args must be a JSON object"
             );
-            anyhow::Error::msg("browser args must be a JSON object")
+            anyhow::Error::msg("validated screenshot args must be a JSON object")
         })?;
         params.remove("action");
 
