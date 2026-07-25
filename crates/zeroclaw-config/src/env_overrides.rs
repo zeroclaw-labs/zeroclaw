@@ -203,26 +203,52 @@ pub(crate) async fn env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     LOCK.lock().await
 }
 
-/// Resolve the effective OpenAI STT API key, applying the precedence:
-/// explicit config value > `TRANSCRIPTION_API_KEY` env > `OPENAI_API_KEY` env.
+/// Detect whether the operator has explicitly configured any STT provider
+/// (legacy `[transcription.*]` tables or typed `[providers.transcription.*]`).
+/// When intent exists, the native env bridge must NOT inject an ambient
+/// OpenAI fallback, preserving explicit configuration failures.
+pub fn has_explicit_stt_intent(config: &Config) -> bool {
+    // Legacy intent: any [transcription.*] provider table or Groq api_key
+    config.transcription.api_key.is_some()
+        || config.transcription.openai.is_some()
+        || config.transcription.deepgram.is_some()
+        || config.transcription.assemblyai.is_some()
+        || config.transcription.google.is_some()
+        || config.transcription.local_whisper.is_some()
+        // Typed intent: any [providers.transcription.<type>.<alias>] entry
+        || !config.providers.transcription.is_empty()
+}
+
+/// Apply the documented native environment bridge for OpenAI STT credentials.
 ///
-/// This is a config-layer, stateless resolver. It never writes into a
-/// config struct — the caller owns the returned `Option<String>` and
-/// decides whether to construct a provider. The environment value is the
-/// single source of truth for the override; it is never fanned out into
-/// multiple mutable config fields.
-pub fn resolve_openai_stt_api_key(existing: Option<&str>) -> Option<String> {
-    if let Some(key) = existing {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
+/// When no explicit STT provider intent exists and `TRANSCRIPTION_API_KEY` or
+/// `OPENAI_API_KEY` is set, this maps the credential into the typed config
+/// field `transcription.openai.api_key` at load time, satisfying the
+/// config-lifecycle contract (credential inputs stay typed, visible to
+/// `env_overridden_paths`, save masking, drift reporting, and reload).
+///
+/// Returns the overridden dotted path (`"transcription.openai.api_key"`) when
+/// the bridge injected a value, or `None` when no injection occurred.
+///
+/// Precedence: `TRANSCRIPTION_API_KEY` > `OPENAI_API_KEY`.
+pub fn apply_native_stt_bridge(config: &mut Config) -> Option<String> {
+    if has_explicit_stt_intent(config) {
+        return None;
     }
     for name in &["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"] {
         if let Ok(val) = std::env::var(name) {
             let trimmed = val.trim().to_string();
             if !trimmed.is_empty() {
-                return Some(trimmed);
+                let mut openai_cfg = crate::schema::OpenAiSttConfig::default();
+                openai_cfg.api_key = Some(trimmed);
+                config.transcription.openai = Some(openai_cfg);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"env_var": name, "path": "transcription.openai.api_key"})),
+                    "Native STT env bridge applied: mapped credential into typed config"
+                );
+                return Some("transcription.openai.api_key".to_string());
             }
         }
     }
@@ -509,73 +535,128 @@ mod tests {
         );
     }
 
-    // ── resolve_openai_stt_api_key tests ──────────────────────────
+    // ── apply_native_stt_bridge tests ──────────────────────────
 
     #[tokio::test]
-    async fn resolver_returns_config_key_when_set() {
+    async fn bridge_injects_transcription_api_key_when_no_intent() {
         let _guard = super::env_test_lock().await;
         let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env");
+        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env-bridge");
+        let mut config = Config::default();
+        let path = apply_native_stt_bridge(&mut config);
+        assert_eq!(path, Some("transcription.openai.api_key".to_string()));
         assert_eq!(
-            resolve_openai_stt_api_key(Some("sk-config")),
-            Some("sk-config".to_string()),
+            config
+                .transcription
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-env-bridge"),
         );
     }
 
     #[tokio::test]
-    async fn resolver_returns_transcription_api_key_env() {
+    async fn bridge_injects_openai_api_key_as_fallback() {
         let _guard = super::env_test_lock().await;
         let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-transcription-test");
+        let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-openai-ambient");
+        let mut config = Config::default();
+        let path = apply_native_stt_bridge(&mut config);
+        assert_eq!(path, Some("transcription.openai.api_key".to_string()));
         assert_eq!(
-            resolve_openai_stt_api_key(None),
-            Some("sk-transcription-test".to_string()),
+            config
+                .transcription
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-openai-ambient"),
         );
     }
 
     #[tokio::test]
-    async fn resolver_returns_openai_api_key_env() {
+    async fn bridge_transcription_key_wins_over_openai_key() {
         let _guard = super::env_test_lock().await;
         let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-openai-test");
+        let _v1 = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-dedicated");
+        let _v2 = EnvVarGuard::set("OPENAI_API_KEY", "sk-generic");
+        let mut config = Config::default();
+        apply_native_stt_bridge(&mut config);
         assert_eq!(
-            resolve_openai_stt_api_key(None),
-            Some("sk-openai-test".to_string()),
+            config
+                .transcription
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-dedicated"),
         );
     }
 
     #[tokio::test]
-    async fn resolver_config_wins_over_env() {
+    async fn bridge_skipped_when_legacy_groq_intent() {
         let _guard = super::env_test_lock().await;
         let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env-value");
+        let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-ambient");
+        let mut config = Config::default();
+        config.transcription.api_key = Some("gsk-explicit".to_string());
+        let path = apply_native_stt_bridge(&mut config);
+        assert_eq!(path, None);
+        assert!(config.transcription.openai.is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_skipped_when_explicit_openai_table() {
+        let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
+        let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-ambient");
+        let mut config = Config::default();
+        config.transcription.openai = Some(crate::schema::OpenAiSttConfig {
+            api_key: Some("sk-explicit".to_string()),
+            ..Default::default()
+        });
+        let path = apply_native_stt_bridge(&mut config);
+        assert_eq!(path, None);
+        // Explicit value preserved, not overwritten.
         assert_eq!(
-            resolve_openai_stt_api_key(Some("sk-config-value")),
-            Some("sk-config-value".to_string()),
+            config
+                .transcription
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-explicit"),
         );
     }
 
     #[tokio::test]
-    async fn resolver_empty_config_key_falls_back_to_env() {
+    async fn bridge_skipped_when_typed_provider_intent() {
         let _guard = super::env_test_lock().await;
         let _fixture = LegacyEnvFixture::isolate();
-        let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-from-env");
-        assert_eq!(
-            resolve_openai_stt_api_key(Some("")),
-            Some("sk-from-env".to_string()),
+        let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-ambient");
+        let mut config = Config::default();
+        config.providers.transcription.groq.insert(
+            "default".into(),
+            crate::schema::GroqTranscriptionProviderConfig::default(),
         );
-        assert_eq!(
-            resolve_openai_stt_api_key(Some("   ")),
-            Some("sk-from-env".to_string()),
-        );
+        let path = apply_native_stt_bridge(&mut config);
+        assert_eq!(path, None);
+        assert!(config.transcription.openai.is_none());
     }
 
     #[tokio::test]
-    async fn resolver_no_env_and_no_config_returns_none() {
+    async fn bridge_no_env_returns_none() {
         let _guard = super::env_test_lock().await;
         let _fixture = LegacyEnvFixture::isolate();
-        assert_eq!(resolve_openai_stt_api_key(None), None);
-        assert_eq!(resolve_openai_stt_api_key(Some("")), None);
+        let mut config = Config::default();
+        let path = apply_native_stt_bridge(&mut config);
+        assert_eq!(path, None);
+        assert!(config.transcription.openai.is_none());
     }
 
     #[tokio::test]

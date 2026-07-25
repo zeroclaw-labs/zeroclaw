@@ -111,16 +111,16 @@ V0.8.0 eradicated all per-provider native env-var fallbacks. The schema-mirror g
 
 ### OpenAI STT (`TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY`)
 
-The OpenAI Whisper STT provider resolves its API key on demand during provider construction via `resolve_openai_stt_api_key()` in `zeroclaw-config`. This is a config-layer, stateless resolver; the environment value is never written into `Config` or persisted to disk.
+The OpenAI Whisper STT provider supports a native environment bridge mapped into typed config at load time via `apply_native_stt_bridge()` in `zeroclaw-config`. The resolved credential lands on `transcription.openai.api_key` in memory, is tracked in `env_overridden_paths`, and is masked during saves; it is never persisted to disk.
 
 **Precedence (highest wins):**
 
-1. Explicit config: `[transcription.openai].api_key` or `[providers.transcription.openai.<alias>].base.api_key`
+1. Explicit config: `[transcription.openai].api_key` or `[providers.transcription.openai.<alias>].api_key`
 2. Schema-mirror env: `ZEROCLAW_transcription__openai__api_key=...` or `ZEROCLAW_providers__transcription__openai__<alias>__api_key=...`
 3. `TRANSCRIPTION_API_KEY` (dedicated transcription credential)
 4. `OPENAI_API_KEY` (generic OpenAI key, last resort)
 
-**Provider registration guard:** the env-only OpenAI STT provider registers only when no `[transcription.openai]` table is configured *and* no other explicit STT provider (Groq, Deepgram, AssemblyAI, Google, local_whisper) registered successfully. An ambient `OPENAI_API_KEY` exported for model integration does not perturb explicit STT provider selection or change the registered provider count.
+**Provider registration guard:** the native bridge injects the credential only when no explicit STT provider intent exists (no `[transcription.*]` legacy table and no `[providers.transcription.*]` typed entry). An ambient `OPENAI_API_KEY` exported for model integration does not perturb explicit STT provider selection or change the registered provider count. Invalid explicit provider configurations surface their error rather than silently falling back to OpenAI.
 
 **Migration:** operators relying on `TRANSCRIPTION_API_KEY` or `OPENAI_API_KEY` for STT can keep them working without changes. To migrate to the canonical surface:
 

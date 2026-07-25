@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
-use zeroclaw_config::env_overrides::resolve_openai_stt_api_key;
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
 use zeroclaw_config::schema::{Config, OpenAiSttConfig, TranscriptionConfig};
 
@@ -226,14 +225,18 @@ impl OpenAiWhisperProvider {
         alias: &str,
         config: &zeroclaw_config::schema::OpenAiSttConfig,
     ) -> Result<Self> {
-        let api_key = resolve_openai_stt_api_key(config.api_key.as_deref()).context(
-            "Missing OpenAI STT API key for [transcription.openai]. Set \
-                 `api_key` in config, or use the schema-mirror grammar \
-                 `ZEROCLAW_transcription__openai__api_key=...`, or set \
-                 `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` environment \
-                 variable (both are resolved on demand during provider \
-                 construction).",
-        )?;
+        let api_key = config
+            .api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .context(
+                "Missing OpenAI STT API key for [transcription.openai]. Set \
+                     `api_key` in config, or use the schema-mirror grammar \
+                     `ZEROCLAW_transcription__openai__api_key=...`, or set \
+                     `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` environment \
+                     variable (mapped into typed config at load time via the \
+                     native STT bridge).",
+            )?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -251,16 +254,18 @@ impl OpenAiWhisperProvider {
         alias: &str,
         cfg: &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig,
     ) -> Result<Self> {
-        let api_key = resolve_openai_stt_api_key(cfg.base.api_key.as_deref()).ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "Missing API key for [providers.transcription.openai.{alias}]. Set \
-                     `base.api_key` in config, or use the schema-mirror grammar \
-                     `ZEROCLAW_providers__transcription__openai__{alias}__api_key=...`, \
-                     or set `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` environment \
-                     variable (both are resolved on demand during provider \
-                     construction)."
-            ))
-        })?;
+        let api_key = cfg
+            .base
+            .api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Missing API key for [providers.transcription.openai.{alias}]. Set \
+                         `api_key` in config, or use the schema-mirror grammar \
+                         `ZEROCLAW_providers__transcription__openai__{alias}__api_key=...`."
+                ))
+            })?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -999,19 +1004,6 @@ impl TranscriptionManager {
                         "local_whisper config invalid, provider skipped"
                     );
                 }
-            }
-        }
-
-        // Env-only OpenAI fallback: when no [transcription.openai] table is
-        // configured AND no other explicit STT provider registered, attempt
-        // to resolve credentials from TRANSCRIPTION_API_KEY / OPENAI_API_KEY.
-        // This must NOT perturb explicit provider selection — an ambient
-        // OPENAI_API_KEY (e.g. for model integration) must not change the
-        // provider count when the operator configured Groq/Deepgram/etc.
-        if config.openai.is_none() && transcription_providers.is_empty() {
-            let effective = OpenAiSttConfig::default();
-            if let Ok(p) = OpenAiWhisperProvider::from_config("openai", &effective) {
-                transcription_providers.insert("openai".to_string(), Box::new(p));
             }
         }
     }
@@ -2473,11 +2465,8 @@ mod tests {
         }
 
         #[test]
-        fn from_config_explicit_wins_over_env() {
+        fn from_config_explicit_key_is_used() {
             let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("TRANSCRIPTION_API_KEY", "sk-env-value");
-            }
             let config = OpenAiSttConfig {
                 api_key: Some("sk-explicit".to_string()),
                 model: "whisper-1".to_string(),
@@ -2488,32 +2477,18 @@ mod tests {
         }
 
         #[test]
-        fn from_config_env_resolves_when_config_key_is_none() {
+        fn from_config_errors_when_key_is_none() {
             let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("TRANSCRIPTION_API_KEY", "sk-from-env");
-            }
             let config = OpenAiSttConfig {
                 api_key: None,
                 model: "whisper-1".to_string(),
             };
-            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
-            assert_eq!(provider.api_key, "sk-from-env");
-            assert_eq!(provider.model, "whisper-1");
-        }
-
-        #[test]
-        fn from_config_env_openai_fallback() {
-            let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("OPENAI_API_KEY", "sk-openai-fallback");
-            }
-            let config = OpenAiSttConfig {
-                api_key: None,
-                model: "whisper-1".to_string(),
-            };
-            let provider = OpenAiWhisperProvider::from_config("test", &config).unwrap();
-            assert_eq!(provider.api_key, "sk-openai-fallback");
+            let err = OpenAiWhisperProvider::from_config("test", &config).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("transcription.openai"),
+                "error should mention the config section: {msg}"
+            );
         }
 
         #[test]
@@ -2552,11 +2527,8 @@ mod tests {
         }
 
         #[test]
-        fn from_typed_config_env_resolves_when_base_key_is_none() {
+        fn from_typed_config_errors_when_base_key_is_none() {
             let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("TRANSCRIPTION_API_KEY", "sk-from-env");
-            }
             let cfg = zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
                 base: zeroclaw_config::schema::TranscriptionProviderConfig {
                     api_key: None,
@@ -2565,31 +2537,36 @@ mod tests {
                 },
                 model: Some("whisper-1".to_string()),
             };
-            let provider = OpenAiWhisperProvider::from_typed_config("test", &cfg).unwrap();
-            assert_eq!(provider.api_key, "sk-from-env");
+            let err = OpenAiWhisperProvider::from_typed_config("test", &cfg).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("transcription.openai"),
+                "error should mention the config section: {msg}"
+            );
         }
 
         // ── production-path: TranscriptionManager ─────────────────
 
         #[test]
-        fn legacy_path_env_only_registers_openai_provider() {
+        fn legacy_path_bridge_injected_config_registers_openai_provider() {
             let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("TRANSCRIPTION_API_KEY", "sk-env-test");
-            }
+            // Simulate what apply_native_stt_bridge does at config load time:
+            // when no explicit STT intent and env var is set, it populates
+            // config.transcription.openai with the resolved key.
             let config = TranscriptionConfig {
                 enabled: true,
+                openai: Some(OpenAiSttConfig {
+                    api_key: Some("sk-bridge-injected".to_string()),
+                    ..OpenAiSttConfig::default()
+                }),
                 ..TranscriptionConfig::default()
             };
-            // No [transcription.openai] table, no other providers.
-            assert!(config.openai.is_none());
-            assert!(config.api_key.is_none());
 
             let manager = TranscriptionManager::new(&config).unwrap();
             let providers = manager.available_providers();
             assert!(
                 providers.contains(&"openai"),
-                "env-only legacy path must register 'openai' provider when no other provider is configured; got: {providers:?}"
+                "bridge-injected config must register 'openai' provider; got: {providers:?}"
             );
         }
 
@@ -2647,19 +2624,15 @@ mod tests {
         }
 
         #[test]
-        fn typed_path_env_resolves_through_from_config_for_agent() {
+        fn typed_path_with_explicit_key_registers_provider() {
             let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("TRANSCRIPTION_API_KEY", "sk-typed-env");
-            }
             let mut config = Config::default();
             config.transcription.enabled = true;
-            // Typed alias with unset api_key — resolver must fall back to env.
             config.providers.transcription.openai.insert(
                 "default".to_string(),
                 zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
                     base: zeroclaw_config::schema::TranscriptionProviderConfig {
-                        api_key: None,
+                        api_key: Some("sk-typed-explicit".to_string()),
                         language: None,
                         initial_prompt: None,
                     },
@@ -2671,7 +2644,7 @@ mod tests {
             let providers = manager.available_providers();
             assert!(
                 providers.contains(&"openai.default"),
-                "typed path must register 'openai.default' via env fallback; got: {providers:?}"
+                "typed path must register 'openai.default' with explicit key; got: {providers:?}"
             );
         }
 
@@ -2706,15 +2679,13 @@ mod tests {
         }
 
         #[test]
-        fn provider_constructed_from_default_uses_whisper_1_model() {
+        fn provider_constructed_with_explicit_key_uses_whisper_1_model() {
             let _iso = EnvIsolation::isolate();
-            unsafe {
-                std::env::set_var("TRANSCRIPTION_API_KEY", "sk-model-test");
-            }
-            // OpenAiSttConfig::default() has model = "whisper-1" and api_key = None.
-            // from_config should resolve api_key from env and keep model as default.
-            let default_cfg = OpenAiSttConfig::default();
-            let provider = OpenAiWhisperProvider::from_config("test", &default_cfg).unwrap();
+            let cfg = OpenAiSttConfig {
+                api_key: Some("sk-model-test".to_string()),
+                ..OpenAiSttConfig::default()
+            };
+            let provider = OpenAiWhisperProvider::from_config("test", &cfg).unwrap();
             assert_eq!(provider.api_key, "sk-model-test");
             assert_eq!(provider.model, "whisper-1");
         }
