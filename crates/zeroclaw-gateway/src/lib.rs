@@ -512,6 +512,9 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// LAN-local peer hints discovered by multicast. These are informational
+    /// only; they never authorize or connect a peer.
+    pub mdns_peer_registry: nodes::mdns::MdnsPeerRegistry,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
@@ -613,7 +616,8 @@ pub async fn run_gateway(
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
     let (boot_family, boot_alias, boot_entry) = config
@@ -1443,6 +1447,46 @@ pub async fn run_gateway(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_peer_registry =
+        nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
+    let mdns_task = if config.nodes.mdns.enabled
+        && nodes::mdns::is_advertisable_gateway_addr(&actual_addr)
+    {
+        let mdns_config = config.nodes.mdns.clone();
+        let advertised_gateway = nodes::mdns::MdnsAdvertisedGateway::new(actual_port, path_prefix);
+        let mdns_registry = mdns_peer_registry.clone();
+        let mdns_shutdown_rx = shutdown_tx.subscribe();
+        Some(zeroclaw_spawn::spawn!(async move {
+            if let Err(err) = nodes::mdns::run_peer_discovery(
+                mdns_config,
+                advertised_gateway,
+                mdns_registry,
+                mdns_shutdown_rx,
+            )
+            .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "mDNS local peer discovery stopped"
+                );
+            }
+        }))
+    } else if config.nodes.mdns.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"bind_addr": actual_addr.to_string()})),
+            "mDNS local peer discovery skipped because the gateway is bound to a loopback-only host"
+        );
+        None
+    } else {
+        None
+    };
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
@@ -1516,6 +1560,7 @@ pub async fn run_gateway(
         shutdown_tx,
         reload_tx,
         node_registry,
+        mdns_peer_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
@@ -2044,8 +2089,27 @@ pub async fn run_gateway(
         .await?;
     }
 
-    drop(broadcast_hook_guard);
+    if let Some(task) = mdns_task {
+        let mut task = task;
+        tokio::select! {
+            result = &mut task => {
+                if let Err(err) = result {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                        "LAN peer discovery task join failed"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                task.abort();
+            }
+        }
+    }
 
+    drop(broadcast_hook_guard);
     Ok(())
 }
 
@@ -4353,6 +4417,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -4981,6 +5046,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5068,6 +5134,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5662,6 +5729,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5767,6 +5835,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5887,6 +5956,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -5987,6 +6057,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6106,6 +6177,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6191,6 +6263,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6281,6 +6354,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6378,6 +6452,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6471,6 +6546,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -6616,6 +6692,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7439,6 +7516,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7525,6 +7603,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7685,6 +7764,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,

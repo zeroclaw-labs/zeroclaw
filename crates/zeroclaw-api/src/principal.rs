@@ -285,4 +285,51 @@ mod tests {
         let j = serde_json::to_string(&AuthMethod::SshKey).expect("serialize");
         assert_eq!(j, "\"ssh_key\"");
     }
+
+    #[test]
+    fn authenticated_outcome_is_allowed_and_exposes_principal() {
+        // Existing tests cover Trusted and Denied but not the Authenticated arm.
+        let outcome = AuthOutcome::Authenticated(Principal::shared_operator());
+        assert!(outcome.is_allowed());
+        assert!(outcome.principal().is_some());
+    }
+
+    #[test]
+    fn none_auth_method_is_not_authenticated() {
+        let mut p = Principal::shared_operator();
+        p.auth_method = AuthMethod::None;
+        assert!(!p.is_authenticated());
+    }
+
+    #[test]
+    fn builder_methods_set_fields() {
+        let p = Principal::shared_operator()
+            .with_roles(vec!["admin".to_owned()])
+            .with_scopes(vec!["read".to_owned(), "write".to_owned()])
+            .with_mfa_verified(true)
+            .with_expires_at(42)
+            .with_allowed_aliases(vec![AgentAlias("bot".to_owned())]);
+        assert_eq!(p.roles, vec!["admin".to_owned()]);
+        assert_eq!(p.scopes.len(), 2);
+        assert!(p.mfa_verified);
+        assert_eq!(p.expires_at, 42);
+        assert_eq!(p.allowed_aliases.len(), 1);
+        assert_eq!(p.allowed_aliases[0].as_str(), "bot");
+    }
+
+    #[test]
+    fn every_deny_reason_is_not_allowed() {
+        for reason in [
+            DenyReason::NoCredential,
+            DenyReason::BadCredential,
+            DenyReason::TokenExpired,
+            DenyReason::MfaRequired,
+            DenyReason::AliasNotEntitled,
+            DenyReason::Misconfigured,
+        ] {
+            let outcome = AuthOutcome::Denied { reason };
+            assert!(!outcome.is_allowed());
+            assert!(outcome.principal().is_none());
+        }
+    }
 }

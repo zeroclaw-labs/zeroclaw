@@ -28,6 +28,7 @@ import {
   type JsonRpcId,
 } from '@/lib/acp';
 import { t } from '@/lib/i18n';
+import { ThoughtChunkBuffer } from './acp-console/thought-stream';
 
 type ConsoleMessageKind = 'user' | 'assistant' | 'thought' | 'tool' | 'system';
 
@@ -128,6 +129,7 @@ export default function AcpConsole() {
   const connectionSeqRef = useRef(0);
   const sessionIdRef = useRef<string | null>(null);
   const streamBufferRef = useRef('');
+  const thoughtBufferRef = useRef(new ThoughtChunkBuffer());
   const [status, setStatus] = useState<AcpConnectionStatus>('disconnected');
   const [initializing, setInitializing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -194,6 +196,16 @@ export default function AcpConsole() {
     setStreamingText(streamBufferRef.current);
   }, []);
 
+  const flushThoughtStream = useCallback(() => {
+    const thought = thoughtBufferRef.current.take();
+    if (!thought) return;
+    addMessage(setMessages, {
+      kind: 'thought',
+      title: t('acp.agent_thought'),
+      content: thought,
+    });
+  }, []);
+
   const resetTurnStream = useCallback(() => {
     streamBufferRef.current = '';
     setStreamingText('');
@@ -213,20 +225,16 @@ export default function AcpConsole() {
     if (!update || typeof update !== 'object') return;
 
     const updateKind = update.sessionUpdate;
-    if (updateKind === 'agent_message_chunk') {
-      appendAssistantChunk(getUpdateText(update));
+    if (updateKind === 'agent_thought_chunk') {
+      const thought = getUpdateText(update);
+      if (thought) thoughtBufferRef.current.append(thought);
       return;
     }
 
-    if (updateKind === 'agent_thought_chunk') {
-      const thought = getUpdateText(update);
-      if (thought) {
-        addMessage(setMessages, {
-          kind: 'thought',
-          title: t('acp.agent_thought'),
-          content: thought,
-        });
-      }
+    flushThoughtStream();
+
+    if (updateKind === 'agent_message_chunk') {
+      appendAssistantChunk(getUpdateText(update));
       return;
     }
 
@@ -246,13 +254,14 @@ export default function AcpConsole() {
       content: typeof updateKind === 'string' ? updateKind : t('acp.unknown_update'),
       detail: stringifyDetail(update),
     });
-  }, [appendAssistantChunk]);
+  }, [appendAssistantChunk, flushThoughtStream]);
 
   const handlePermissionRequest = useCallback((request: AcpRequest) => {
     if (!request.params || typeof request.params !== 'object') return;
     const params = request.params as Record<string, unknown>;
     const requestSessionId = typeof params.sessionId === 'string' ? params.sessionId : undefined;
     if (requestSessionId && sessionIdRef.current && requestSessionId !== sessionIdRef.current) return;
+    flushThoughtStream();
     const toolCall = params.toolCall;
     const toolRecord = toolCall && typeof toolCall === 'object'
       ? toolCall as Record<string, unknown>
@@ -276,7 +285,7 @@ export default function AcpConsole() {
     };
     setPermissions((current) => [...current, permission]);
     pushEvent(`permission requested: ${permission.title}`);
-  }, [pushEvent]);
+  }, [flushThoughtStream, pushEvent]);
 
   const handleNotification = useCallback((notification: AcpNotification) => {
     if (notification.method === 'session/update') {
@@ -356,6 +365,7 @@ export default function AcpConsole() {
     setCancelRequested(false);
     setMessages([]);
     setEvents([]);
+    thoughtBufferRef.current.clear();
     resetTurnStream();
     const agentAlias = selectedAgentAlias;
     let client: AcpWebSocketClient;
@@ -368,6 +378,7 @@ export default function AcpConsole() {
       },
       onClose: () => {
         if (!isCurrentConnection(client, connectionSeq)) return;
+        flushThoughtStream();
         setStatus('disconnected');
         setBusy(false);
         setCancelRequested(false);
@@ -375,6 +386,7 @@ export default function AcpConsole() {
       },
       onError: () => {
         if (!isCurrentConnection(client, connectionSeq)) return;
+        flushThoughtStream();
         setStatus('disconnected');
         setError(t('acp.error.websocket'));
       },
@@ -397,6 +409,7 @@ export default function AcpConsole() {
     handleFrame,
     handleNotification,
     handleRequest,
+    flushThoughtStream,
     hasEnabledAgent,
     initializeSession,
     isCurrentConnection,
@@ -432,6 +445,7 @@ export default function AcpConsole() {
     const connectionSeq = connectionSeqRef.current;
 
     const outgoing = prompt.trim();
+    flushThoughtStream();
     addMessage(setMessages, { kind: 'user', content: outgoing });
     setPrompt('');
     resetTurnStream();
@@ -445,6 +459,7 @@ export default function AcpConsole() {
         prompt: outgoing,
       });
       if (!isCurrentConnection(client, connectionSeq)) return;
+      flushThoughtStream();
       const streamed = streamBufferRef.current.trim();
       const finalContent = result.content?.trim();
       if (finalContent && finalContent !== streamed) {
@@ -464,6 +479,7 @@ export default function AcpConsole() {
       pushEvent(`prompt complete: ${result.stopReason ?? 'end_turn'}`);
     } catch (err) {
       if (isCurrentConnection(client, connectionSeq)) {
+        flushThoughtStream();
         setError(err instanceof Error ? err.message : t('acp.error.prompt_failed'));
       }
     } finally {
@@ -478,6 +494,7 @@ export default function AcpConsole() {
     const client = clientRef.current;
     if (!client?.connected || !sessionId) return;
     client.notify('session/cancel', { sessionId });
+    flushThoughtStream();
     setCancelRequested(true);
     pushEvent('cancel requested');
   };

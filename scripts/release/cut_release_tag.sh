@@ -91,5 +91,6 @@ if [[ "$PUSH_TAG" == "true" ]]; then
   echo "Monitor: gh workflow view 'Release Stable' --web"
 else
   echo "Next step: git push origin $TAG"
-  echo "This will auto-trigger the Release Stable workflow (builds, Docker, crates.io, website, Scoop, AUR, Homebrew, tweet)."
+  echo "This will auto-trigger the Release Stable workflow (builds, Docker, website, Scoop, AUR, tweet)."
+  echo "Homebrew Core detects the release independently through its official autobump service."
 fi

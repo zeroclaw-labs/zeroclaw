@@ -182,7 +182,7 @@ impl SopCapability for LlmGenerateCapability {
 
 /// [`LlmGenerateAdapter`] over a configured [`ModelProvider`]: one
 /// `chat_with_system` call, run on a dedicated bridge thread (see
-/// [`super::bridge::run_bridged`] for why the host runtime must not be used).
+/// `super::bridge::run_bridged` for why the host runtime must not be used).
 pub struct ProviderLlmAdapter {
     provider: Arc<dyn ModelProvider>,
     model: String,

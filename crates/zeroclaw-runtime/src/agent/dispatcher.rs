@@ -518,6 +518,11 @@ mod tests {
         );
     }
 
+    fn native_tool_message_content(message: &ChatMessage) -> String {
+        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        payload["content"].as_str().unwrap().to_owned()
+    }
+
     fn native_round_trip_tool_content(
         dispatcher: &NativeToolDispatcher,
         result: ToolExecutionResult,
@@ -526,7 +531,7 @@ mod tests {
         let messages = dispatcher.to_provider_messages(&[stored]);
         assert_eq!(messages.len(), 1, "one tool result -> one provider message");
         assert_eq!(messages[0].role, "tool");
-        messages[0].content.clone()
+        native_tool_message_content(&messages[0])
     }
 
     #[test]
@@ -597,7 +602,7 @@ mod tests {
         let messages = native.to_provider_messages(&history);
         assert_eq!(messages.len(), 1);
         assert!(
-            messages[0].content.contains(&format!("[IMAGE:{path}]")),
+            native_tool_message_content(&messages[0]).contains(&format!("[IMAGE:{path}]")),
             "unknown-provenance result must still promote a real image path"
         );
     }
