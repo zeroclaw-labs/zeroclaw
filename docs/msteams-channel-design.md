@@ -15,8 +15,8 @@
   credential) and adds a required CI lane. No existing boundary is
   weakened, but the new one gets focused review.
 - Reference implementations studied:
-  - OpenClaw `extensions/msteams/` (TypeScript, Bot Framework model) —
-    primary architectural reference
+  - OpenClaw `extensions/msteams/` at `db3213264a` (TypeScript, Bot
+    Framework model) — primary architectural reference
   - `osodevops/ms-teams-cli` (Rust, Graph API delegated-auth model) —
     Rust-level reference for OAuth token flows only; its auth model is
     explicitly NOT suitable for unattended bot messaging (its own
