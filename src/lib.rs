@@ -598,6 +598,27 @@ pub enum MigrateCommands {
     },
 }
 
+/// Shared delivery flags for the cron creation and update subcommands.
+///
+/// Flattened into `add`, `add-at`, `add-every`, `once`, and `update` so a job's
+/// output can be routed to a channel. When none of these are set the job keeps
+/// delivery mode `"none"` (output is computed but not announced anywhere).
+#[derive(clap::Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CronDeliveryArgs {
+    /// Announce job output to this channel (e.g. telegram, discord, slack).
+    #[arg(long = "channel")]
+    pub delivery_channel: Option<String>,
+    /// Target chat/recipient id for the channel (e.g. a Telegram chat id).
+    #[arg(long = "to")]
+    pub delivery_to: Option<String>,
+    /// Optional thread/conversation id, for channels that route on it (webhook).
+    #[arg(long = "thread")]
+    pub delivery_thread: Option<String>,
+    /// Fail the job if delivery fails (default: delivery errors are non-fatal).
+    #[arg(long = "no-best-effort")]
+    pub no_best_effort: bool,
+}
+
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CronCommands {
@@ -636,6 +657,10 @@ Examples:
         /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -665,6 +690,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -693,6 +722,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -722,6 +755,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -766,6 +803,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
     },
     /// Pause a scheduled task
     Pause {

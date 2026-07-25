@@ -39,6 +39,47 @@ fn parse_explicit_rfc3339_utc(raw: &str) -> Result<chrono::DateTime<chrono::Utc>
         })
 }
 
+/// Build a `DeliveryConfig` from the shared CLI delivery flags.
+///
+/// Returns `None` (leaving the job's delivery mode `"none"`) when no delivery
+/// flag is set, so omitting the flags keeps the pre-existing behaviour. When a
+/// flag is present the config is `"announce"`; `validate_delivery_config`,
+/// called by the create/update paths, then enforces that channel and recipient
+/// are both provided.
+fn build_delivery(args: crate::CronDeliveryArgs) -> Option<DeliveryConfig> {
+    if args.delivery_channel.is_none()
+        && args.delivery_to.is_none()
+        && args.delivery_thread.is_none()
+    {
+        return None;
+    }
+    Some(DeliveryConfig {
+        mode: "announce".to_string(),
+        channel: args.delivery_channel,
+        to: args.delivery_to,
+        thread_id: args.delivery_thread,
+        best_effort: !args.no_best_effort,
+    })
+}
+
+/// Print where a created/updated job's output will go, so an `ok` job status is
+/// never mistaken for a successful delivery.
+fn print_delivery_line(job: &CronJob) {
+    let value = if job.delivery.mode.eq_ignore_ascii_case("announce") {
+        match (job.delivery.channel.as_deref(), job.delivery.to.as_deref()) {
+            (Some(channel), Some(to)) => format!("{channel} \u{2192} {to}"),
+            (Some(channel), None) => channel.to_string(),
+            _ => "announce".to_string(),
+        }
+    } else {
+        get_required_cli_string("cli-cron-delivery-disabled")
+    };
+    println!(
+        "{}",
+        get_required_cli_string_with_args("cli-cron-delivery", &[("v", &value)])
+    );
+}
+
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
         crate::CronCommands::List => {
@@ -98,6 +139,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -105,6 +147,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 expr: expression,
                 tz,
             };
+            let delivery = build_delivery(delivery);
             if prompt {
                 let job = add_agent_job(
                     config,
@@ -114,7 +157,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -145,11 +188,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(
+                    config,
+                    &agent_alias,
+                    None,
+                    schedule,
+                    &command,
+                    delivery,
+                    false,
+                )?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-added", &[("id", &job.id)])
@@ -169,6 +221,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -178,11 +231,13 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
             let at = parse_explicit_rfc3339_utc(&at)?;
             let schedule = Schedule::At { at };
+            let delivery = build_delivery(delivery);
             if prompt {
                 let job = add_agent_job(
                     config,
@@ -192,7 +247,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -222,11 +277,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(
+                    config,
+                    &agent_alias,
+                    None,
+                    schedule,
+                    &command,
+                    delivery,
+                    false,
+                )?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-added-oneshot", &[("id", &job.id)])
@@ -242,6 +306,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -251,10 +316,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
             let schedule = Schedule::Every { every_ms };
+            let delivery = build_delivery(delivery);
             if prompt {
                 let job = add_agent_job(
                     config,
@@ -264,7 +331,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -301,11 +368,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(
+                    config,
+                    &agent_alias,
+                    None,
+                    schedule,
+                    &command,
+                    delivery,
+                    false,
+                )?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args(
@@ -331,6 +407,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd3", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -340,9 +417,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             prompt,
             allowed_tools,
             uses_memory,
+            delivery,
             command,
         } => {
             require_configured_agent(config, &agent_alias)?;
+            let delivery = build_delivery(delivery);
             if prompt {
                 let duration = parse_delay(&delay)?;
                 let at = chrono::Utc::now() + duration;
@@ -355,7 +434,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -385,11 +464,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         &[("v", job.prompt.as_deref().unwrap_or_default())]
                     )
                 );
+                print_delivery_line(&job);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
-                let job = add_once(config, &agent_alias, &delay, &command)?;
+                let job = add_once(config, &agent_alias, &delay, &command, delivery)?;
                 println!(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-added-oneshot", &[("id", &job.id)])
@@ -405,6 +485,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     "{}",
                     get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
                 );
+                print_delivery_line(&job);
             }
             Ok(())
         }
@@ -417,14 +498,20 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             name,
             allowed_tools,
             uses_memory,
+            delivery,
         } => {
             require_configured_agent(config, &agent_alias)?;
+            let delivery = build_delivery(delivery);
+            // The create paths validate delivery inside `add_*_with_approval`;
+            // the update path does not, so validate here before patching.
+            validate_delivery_config(delivery.as_ref())?;
             if expression.is_none()
                 && tz.is_none()
                 && command.is_none()
                 && name.is_none()
                 && allowed_tools.is_empty()
                 && uses_memory.is_none()
+                && delivery.is_none()
             {
                 bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
             }
@@ -476,6 +563,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     Some(allowed_tools)
                 },
                 uses_memory,
+                delivery,
                 ..CronJobPatch::default()
             };
 
@@ -499,6 +587,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 "{}",
                 get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
             );
+            print_delivery_line(&job);
             Ok(())
         }
         crate::CronCommands::Remove { id } => {
@@ -576,6 +665,7 @@ mod tests {
                 prompt: false,
                 allowed_tools: vec![],
                 uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
                 command: "echo at".into(),
             },
             &config,
@@ -589,5 +679,188 @@ mod tests {
         );
         assert!(message.contains("2026-05-18T09:00:00Z"));
         assert!(message.contains("2026-05-18T09:00:00-04:00"));
+    }
+
+    #[test]
+    fn cli_add_persists_delivery_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: Some("12345".into()),
+                    delivery_thread: None,
+                    no_best_effort: true,
+                },
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("telegram"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("12345"));
+        assert!(!jobs[0].delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_add_with_thread_persists_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("webhook".into()),
+                    delivery_to: Some("hook-1".into()),
+                    delivery_thread: Some("thread-9".into()),
+                    no_best_effort: false,
+                },
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs[0].delivery.thread_id.as_deref(), Some("thread-9"));
+        assert!(jobs[0].delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_add_without_delivery_flags_defaults_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs[0].delivery.mode, "none");
+    }
+
+    #[test]
+    fn cli_update_patches_delivery_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: id.clone(),
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("discord".into()),
+                    delivery_to: Some("chan-42".into()),
+                    delivery_thread: None,
+                    no_best_effort: false,
+                },
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &id).unwrap();
+        assert_eq!(updated.delivery.mode, "announce");
+        assert_eq!(updated.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("chan-42"));
+        assert!(updated.delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_update_rejects_announce_without_recipient() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: "echo test".into(),
+            },
+            &config,
+        )
+        .unwrap();
+        let id = list_jobs(&config).unwrap()[0].id.clone();
+
+        // --channel without --to is an incomplete announce config; the update
+        // path must reject it rather than persist an unroutable delivery.
+        let result = handle_command(
+            crate::CronCommands::Update {
+                id,
+                agent_alias: "test-agent".into(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs {
+                    delivery_channel: Some("telegram".into()),
+                    delivery_to: None,
+                    delivery_thread: None,
+                    no_best_effort: false,
+                },
+            },
+            &config,
+        );
+        let err = result.expect_err("announce without --to must be rejected");
+        assert!(
+            err.to_string().contains("delivery.to is required"),
+            "unexpected error: {err}"
+        );
     }
 }
