@@ -101,12 +101,11 @@ pub struct ImageGenTool {
     workspace_dir: PathBuf,
     default_model: String,
     api_key_env: String,
-    /// Normalized host allowlist (entries from `ImageGenConfig::allowed_private_hosts`).
-    /// Empty by default. A bare `"*"` blanket-tolerates any private/local host;
-    /// otherwise each entry is a host or suffix checked against the image-download
-    /// host. Mirrors the same field on `[file_download]`, `[http_request]`,
-    /// `[web_fetch]`, and the browser tools.
-    allowed_private_hosts: Vec<String>,
+    /// Live resolver for the allowlist, resolved from the canonical
+    /// `Config.image_gen.allowed_private_hosts` at use time. This avoids
+    /// storing a duplicate policy copy in the tool handle, per the
+    /// repository's single-source-of-truth rule (AGENTS.md).
+    allowed_private_hosts_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Whether the saved image persists on the host filesystem. `false` on an
     /// ephemeral runtime (Docker tmpfs / no volume mount), where the PNG is
     /// written inside the container but invisible on the host and discarded at
@@ -128,7 +127,7 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
-            allowed_private_hosts: Vec::new(),
+            allowed_private_hosts_resolver: Arc::new(Vec::new),
             persistent_writes: true,
         }
     }
@@ -148,15 +147,41 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
-            allowed_private_hosts: Vec::new(),
+            allowed_private_hosts_resolver: Arc::new(Vec::new),
             persistent_writes,
         }
     }
 
-    /// Construct with the full config (including `allowed_private_hosts`).
-    /// The host allowlist is normalized via `domain_guard::normalize_allowed_domains`
-    /// at construction time so per-request validation is a constant-time
-    /// allowlist match (no per-call parsing).
+    /// Construct with a resolver closure that reads the allowlist from the
+    /// canonical config at use time. The resolver is called on each request
+    /// to get the current normalized allowlist.
+    ///
+    /// This avoids storing a duplicate `Vec<String>` in the tool handle,
+    /// per the repository's single-source-of-truth rule (AGENTS.md).
+    pub fn new_with_config_resolver<F>(
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        default_model: String,
+        api_key_env: String,
+        persistent_writes: bool,
+        allowed_private_hosts_resolver: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: Fn() -> Vec<String> + Send + Sync + 'static,
+    {
+        Ok(Self {
+            security,
+            workspace_dir,
+            default_model,
+            api_key_env,
+            allowed_private_hosts_resolver: Arc::new(allowed_private_hosts_resolver),
+            persistent_writes,
+        })
+    }
+
+    /// Deprecated: use `new_with_config_resolver` instead to avoid
+    /// storing a duplicate policy copy in the tool handle.
+    #[deprecated(since = "0.8.3", note = "Use new_with_config_resolver instead")]
     pub fn new_with_config(
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
@@ -174,7 +199,7 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
-            allowed_private_hosts: normalized,
+            allowed_private_hosts_resolver: Arc::new(move || normalized.clone()),
             persistent_writes,
         })
     }
@@ -245,9 +270,12 @@ impl ImageGenTool {
             ));
         }
 
+        // Resolve the allowlist at use time from the canonical config
+        let allowed_private_hosts = (self.allowed_private_hosts_resolver)();
+
         let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
         let private_match = if host_is_private_or_local {
-            domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts)
+            domain_guard::host_matches_allowlist(&host, &allowed_private_hosts)
         } else {
             false
         };
@@ -329,8 +357,11 @@ impl ImageGenTool {
 
         let ips: Vec<std::net::IpAddr> = addrs.iter().map(|sa| sa.ip()).collect();
 
+        // Resolve the allowlist at use time from the canonical config
+        let allowed_private_hosts = (self.allowed_private_hosts_resolver)();
+
         let private_resolution_allowed =
-            domain_guard::host_matches_allowlist(host, &self.allowed_private_hosts);
+            domain_guard::host_matches_allowlist(host, &allowed_private_hosts);
 
         for ip in &ips {
             // The metadata check is unconditional — never lifted by the

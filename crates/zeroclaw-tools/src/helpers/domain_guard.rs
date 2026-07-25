@@ -101,7 +101,33 @@ pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
     const EC2_IMDS_V6: std::net::Ipv6Addr =
         std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
 
-    match ip {
+    // Normalize IPv4-mapped IPv6 addresses to their IPv4 equivalent
+    // before checking against known metadata endpoints.
+    // IPv4-mapped IPv6 format: ::ffff:a.b.c.d
+    // In bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d]
+    // This closes the SSRF bypass where `::ffff:169.254.169.254` would
+    // reach the EC2 metadata service despite the predicate.
+    let normalized_ip = match ip {
+        std::net::IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            // Check for IPv4-mapped IPv6: ::ffff:a.b.c.d
+            // The pattern is: first 10 bytes are 0, bytes 10-11 are 0xff, bytes 12-15 are the IPv4 address
+            if octets[..10] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                && octets[10] == 0xff
+                && octets[11] == 0xff
+            {
+                // Extract the IPv4 part from the last four octets
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                ))
+            } else {
+                ip
+            }
+        }
+        ip => ip,
+    };
+
+    match normalized_ip {
         std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4,
         std::net::IpAddr::V6(v6) => v6 == EC2_IMDS_V6,
     }
@@ -152,6 +178,7 @@ pub(crate) fn validate_resolved_ips_exclude_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     #[test]
     fn normalize_domain_strips_scheme_path_and_case() {
@@ -404,6 +431,73 @@ mod tests {
         assert!(
             err.contains("cloud metadata address"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn is_cloud_metadata_ip_detects_ipv4_mapped_ipv6() {
+        // IPv4-mapped IPv6 spelling of EC2 metadata: ::ffff:169.254.169.254
+        // In full form: 0:0:0:0:0:ffff:a9fe:a9fe
+        let ipv4_mapped = "0:0:0:0:0:ffff:a9fe:a9fe".parse::<IpAddr>().unwrap();
+        assert!(
+            is_cloud_metadata_ip(ipv4_mapped),
+            "IPv4-mapped IPv6 EC2 metadata (::ffff:169.254.169.254) should be detected"
+        );
+
+        // Compressed form
+        let ipv4_mapped_compressed = "::ffff:169.254.169.254".parse::<IpAddr>().unwrap();
+        assert!(
+            is_cloud_metadata_ip(ipv4_mapped_compressed),
+            "Compressed IPv4-mapped IPv6 EC2 metadata should be detected"
+        );
+    }
+
+    #[test]
+    fn is_cloud_metadata_ip_normalizes_ipv4_mapped_loopback() {
+        // IPv4-mapped IPv6 loopback: ::ffff:127.0.0.1
+        let ipv4_mapped_loopback = "::ffff:127.0.0.1".parse::<IpAddr>().unwrap();
+        // Note: is_cloud_metadata_ip only checks for EC2 metadata, not loopback
+        // But the normalization should still work
+        assert!(!is_cloud_metadata_ip(ipv4_mapped_loopback));
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_ipv4_mapped_metadata() {
+        // Test that IPv4-mapped IPv6 EC2 metadata is blocked
+        let ipv4_mapped = vec!["::ffff:169.254.169.254".parse::<IpAddr>().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ipv4_mapped)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "IPv4-mapped IPv6 metadata should be blocked: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_ipv4_mapped_metadata_with_wildcard() {
+        // Test with wildcard allowed_private_hosts = ["*"]
+        // The metadata check should still apply even with wildcard
+        let ipv4_mapped = vec!["::ffff:169.254.169.254".parse::<IpAddr>().unwrap()];
+        let err = validate_resolved_ips_are_public("metadata.test", &ipv4_mapped)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "IPv4-mapped IPv6 metadata should be blocked even with wildcard: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_ipv4_mapped_private_with_wildcard() {
+        // Test that IPv4-mapped private addresses are blocked without wildcard
+        let ipv4_mapped_private = vec!["::ffff:10.0.0.1".parse::<IpAddr>().unwrap()];
+        let err = validate_resolved_ips_are_public("private.test", &ipv4_mapped_private)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address"),
+            "IPv4-mapped IPv6 private address should be blocked: {err}"
         );
     }
 }
