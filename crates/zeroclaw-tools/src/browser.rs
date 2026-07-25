@@ -816,6 +816,7 @@ impl BrowserTool {
     /// 5. `symlink_metadata` — rejects existing symlink targets
     ///
     /// Replaces the raw path with the canonical target so backends write the checked string.
+    #[allow(dead_code)] // Used only in tests, but that's intentional for coverage
     async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
         let BrowserAction::Screenshot { path, .. } = action else {
             return Ok(());
@@ -901,6 +902,7 @@ impl BrowserTool {
     /// Returns `true` if the ComputerUse sidecar is on a different filesystem
     /// than the ZeroClaw daemon. Private-network endpoints (RFC1918) are
     /// considered different-host unless they are provably loopback.
+    #[allow(dead_code)] // Used only in tests, but that's intentional for coverage
     fn endpoint_is_different_filesystem(&self) -> bool {
         if !self.computer_use.allow_remote_endpoint {
             return false;
@@ -3225,7 +3227,7 @@ mod tests {
         if let BrowserAction::Screenshot { path, .. } = action {
             let canonical_path = path.unwrap();
             // Compare canonical forms, not raw strings
-            assert!(canonical_path.starts_with(&expected_canonical.to_string_lossy().as_ref()));
+            assert!(canonical_path.starts_with(expected_canonical.to_string_lossy().as_ref()));
             assert!(canonical_path.ends_with("page.png"));
         } else {
             panic!("action should still be Screenshot");
@@ -3472,7 +3474,7 @@ mod tests {
 
         // Path should be canonical (starts with canonical ws)
         let canonical_ws = std::fs::canonicalize(&ws).unwrap();
-        assert!(path_sent.starts_with(&canonical_ws.to_string_lossy().as_ref()));
+        assert!(path_sent.starts_with(canonical_ws.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
