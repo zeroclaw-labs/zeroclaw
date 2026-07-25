@@ -9,11 +9,12 @@ Requires an Azure Bot resource (free F0 tier works) with a single-tenant
 Entra app registration. No Microsoft Graph permissions are needed for
 messaging.
 
-> **Build note.** The Teams channel is opt-in and is **not** part of the
-> default build or the prebuilt release binaries / Docker images (which ship
-> the lean standard distribution set). To use it you must build from source
-> with the `channel-msteams` feature enabled (it is also included in the
-> `channels-full` bundle), e.g.
+> **Build note.** The Teams channel is opt-in. It is **not** in the `default`
+> feature set, and not in the lean `dist` selection used for the prebuilt
+> release binaries and the `minimal`, `default-features`, and `dist` container
+> tags, so those artifacts cannot run it. It **is** part of the `channels-full`
+> bundle, so the published `all-features` container tag and the installer's
+> `all` preset do include it. On any other artifact, build from source, e.g.
 > `cargo build --release --no-default-features --features "dist,channel-msteams"`
 > or `cargo build --release --features channels-full`.
 
