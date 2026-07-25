@@ -934,7 +934,11 @@ mod tests {
 
         assert!(!result.success, "the escaping write must be refused");
         assert!(
-            result.error.as_deref().unwrap_or("").contains("Path blocked"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked"),
             "expected a path-block error, got: {:?}",
             result.error
         );
