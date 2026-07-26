@@ -233,11 +233,70 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
+/// Conservative token estimate for one `[IMAGE:...]` marker.
+///
+/// The multimodal pipeline expands a marker into a base64 data URI at
+/// send-time without downscaling (`multimodal::normalize_image_reference`), so
+/// the provider sees roughly `bytes * 4 / 3` characters of payload. At the
+/// shared ~4 chars/token heuristic that is `bytes / 3` tokens — orders of
+/// magnitude more than the ~30-character marker string the text heuristic would
+/// otherwise count (#9332).
+///
+/// Local files are sized from disk; already-inlined base64 data URIs from their
+/// payload length. References we cannot size here (remote URLs, missing files)
+/// fall back to a non-trivial constant so the estimate errs high rather than
+/// reporting an image-heavy turn as nearly free.
+fn estimate_image_marker_tokens(payload: &str) -> usize {
+    const IMAGE_BYTES_PER_TOKEN: usize = 3;
+    // Best-effort floor for references that cannot be sized locally; keeps an
+    // unsizable image from being counted as free without wildly over-trimming.
+    const UNSIZABLE_IMAGE_TOKENS: usize = 1_000;
+
+    if let Some(base64_payload) = payload
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+        .map(|(_, data)| data)
+    {
+        return base64_payload.len().div_ceil(4);
+    }
+
+    if payload.starts_with("http://") || payload.starts_with("https://") {
+        return UNSIZABLE_IMAGE_TOKENS;
+    }
+
+    match std::fs::metadata(payload) {
+        Ok(meta) => (meta.len() as usize).div_ceil(IMAGE_BYTES_PER_TOKEN),
+        Err(_) => UNSIZABLE_IMAGE_TOKENS,
+    }
+}
+
 /// Estimate the token cost of a single message using the ~4 chars/token
-/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
-/// history and system-floor estimates stay in lock-step.
+/// heuristic plus ~4 framing tokens (role, delimiters). `[IMAGE:...]` markers
+/// are additionally charged for the multimodal payload they expand into at
+/// send-time, so image-heavy turns are not reported as nearly free (#9332).
+/// Single-sourced so the history and system-floor estimates stay in lock-step.
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    message.content.len().div_ceil(4) + 4
+    let text_tokens = message.content.len().div_ceil(4) + 4;
+    text_tokens + sum_image_marker_tokens(&message.content)
+}
+
+/// Sum the multimodal token estimate over every `[IMAGE:...]` marker in
+/// `content`, counting each occurrence (repeated images each cost payload) so
+/// a batch of identical images is not under-counted.
+fn sum_image_marker_tokens(content: &str) -> usize {
+    const OPEN: &str = "[IMAGE:";
+    let mut total = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = content[from..].find(OPEN) {
+        let inner_start = from + rel + OPEN.len();
+        let Some(rel_end) = content[inner_start..].find(']') else {
+            break;
+        };
+        let inner_end = inner_start + rel_end;
+        total += estimate_image_marker_tokens(content[inner_start..inner_end].trim());
+        from = inner_end + 1;
+    }
+    total
 }
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
@@ -446,6 +505,59 @@ mod tests {
         // Floor = system message only; conversation turns are prunable.
         assert_eq!(estimate_system_floor_tokens(&history), 8);
         assert!(estimate_system_floor_tokens(&history) < estimate_history_tokens(&history));
+    }
+
+    #[test]
+    fn estimate_charges_image_markers_for_multimodal_payload() {
+        // Five image markers in one tool result must not be estimated as a few
+        // dozen text tokens — the markers expand to un-downscaled base64 at
+        // send-time, so each ~1.5 MiB image is ~500K tokens (#9332).
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = 1_500_000usize;
+        let mut content = String::from("Here are the slides:\n");
+        for i in 0..5 {
+            let path = dir.path().join(format!("slide{i}.png"));
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+            content.push_str(&format!("[IMAGE:{}]\n", path.display()));
+        }
+        let history = vec![ChatMessage::user(&content)];
+
+        let estimate = estimate_history_tokens(&history);
+        // Text alone (marker strings included) is only a few hundred tokens.
+        let text_only = content.len().div_ceil(4) + 4;
+        assert!(
+            text_only < 1_000,
+            "text-only estimate should be small: {text_only}"
+        );
+        // Each image contributes ~bytes/3 tokens; five images dominate.
+        let expected_image_floor = 5 * (bytes / 3);
+        assert!(
+            estimate >= expected_image_floor,
+            "image-heavy turn must be charged for its payload: estimate={estimate}, \
+             expected at least {expected_image_floor}"
+        );
+    }
+
+    #[test]
+    fn estimate_image_marker_unsizable_reference_is_not_free() {
+        // A missing local file and a remote URL cannot be sized here, but must
+        // still cost more than their marker text so the meter errs high.
+        assert_eq!(
+            estimate_image_marker_tokens("/no/such/file/missing.png"),
+            1_000
+        );
+        assert_eq!(
+            estimate_image_marker_tokens("https://example.com/photo.jpg"),
+            1_000
+        );
+    }
+
+    #[test]
+    fn estimate_image_marker_sizes_base64_data_uri_from_payload() {
+        // 400 base64 chars -> 100 tokens, independent of the filesystem.
+        let payload = "A".repeat(400);
+        let uri = format!("data:image/png;base64,{payload}");
+        assert_eq!(estimate_image_marker_tokens(&uri), 100);
     }
 
     #[test]
