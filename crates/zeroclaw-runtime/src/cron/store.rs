@@ -512,34 +512,68 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     }
 
     with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-             WHERE id = ?16",
-            params![
-                job.expression,
-                job.command,
-                serde_json::to_string(&job.schedule)?,
-                <JobType as Into<&str>>::into(job.job_type).to_string(),
-                job.prompt,
-                job.name,
-                job.session_target.as_str(),
-                job.model,
-                if job.enabled { 1 } else { 0 },
-                serde_json::to_string(&job.delivery)?,
-                if job.delete_after_run { 1 } else { 0 },
-                encode_allowed_tools(job.allowed_tools.as_ref())?,
-                job.next_run.to_rfc3339(),
-                if job.uses_memory { 1 } else { 0 },
-                match job.shell_output_format {
-                    CronShellOutputFormat::Wrapped => "wrapped",
-                    CronShellOutputFormat::Raw => "raw",
-                },
-                job.id,
-            ],
-        )
+        // Declarative jobs don't own `shell_output_format` — the config is the
+        // canonical source, and `resolve_declarative_shell_output_format()` overlays
+        // it on every read. Writing the synthesized (Wrapped) value back into the
+        // column during an unrelated patch would overwrite whatever was stored
+        // there (NULL, garbage, or a future value) with a value the DB doesn't
+        // own. Omit the column from the UPDATE for declarative rows so the
+        // non-owned shadow stays untouched.
+        if job.source == "declarative" {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+                 WHERE id = ?15",
+                params![
+                    job.expression,
+                    job.command,
+                    serde_json::to_string(&job.schedule)?,
+                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    serde_json::to_string(&job.delivery)?,
+                    if job.delete_after_run { 1 } else { 0 },
+                    encode_allowed_tools(job.allowed_tools.as_ref())?,
+                    job.next_run.to_rfc3339(),
+                    if job.uses_memory { 1 } else { 0 },
+                    job.id,
+                ],
+            )
+        } else {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
+                 WHERE id = ?16",
+                params![
+                    job.expression,
+                    job.command,
+                    serde_json::to_string(&job.schedule)?,
+                    <JobType as Into<&str>>::into(job.job_type).to_string(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    serde_json::to_string(&job.delivery)?,
+                    if job.delete_after_run { 1 } else { 0 },
+                    encode_allowed_tools(job.allowed_tools.as_ref())?,
+                    job.next_run.to_rfc3339(),
+                    if job.uses_memory { 1 } else { 0 },
+                    match job.shell_output_format {
+                        CronShellOutputFormat::Wrapped => "wrapped",
+                        CronShellOutputFormat::Raw => "raw",
+                    },
+                    job.id,
+                ],
+            )
+        }
         .context("Failed to update cron job")?;
         Ok(())
     })?;
@@ -958,16 +992,17 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let source: Option<String> = row.get(18)?;
     let uses_memory: Option<i64> = row.get(19)?;
     let agent_alias: Option<String> = row.get(20)?;
-    let shell_output_format_raw: Option<String> = row.get(21)?;
     // Declarative jobs never own this column — sync_declarative_jobs skips it
     // and resolve_declarative_shell_output_format() overwrites from config.
-    // Decoding a NULL / corrupt / future shadow here would kill valid
-    // config-owned jobs before the overlay runs.
+    // Skip reading column 21 entirely for declarative rows: the source
+    // ownership is already determined, and attempting a typed String read
+    // on a non-owned BLOB shadow would fail before the ownership branch
+    // can take effect.
     let shell_output_format = if source.as_deref() == Some("declarative") {
         CronShellOutputFormat::default()
     } else {
-        decode_shell_output_format(shell_output_format_raw.as_deref())
-            .map_err(sql_conversion_error)?
+        let raw: Option<String> = row.get(21)?;
+        decode_shell_output_format(raw.as_deref()).map_err(sql_conversion_error)?
     };
 
     Ok(CronJob {
@@ -2526,6 +2561,104 @@ mod tests {
         );
     }
 
+    /// Regression: SQLite permits a BLOB storage class in a TEXT-affinity
+    /// column. With `x'80'` in `shell_output_format`, a declarative row must
+    /// still be readable — the typed `row.get::<String>` for column 21 must
+    /// not run before the ownership branch can skip it.
+    #[test]
+    fn declarative_job_ignores_blob_db_shadow_for_shell_output_format() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+
+        let db_path = cron_db(&config);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cron_jobs (
+                    id                   TEXT PRIMARY KEY,
+                    expression           TEXT NOT NULL,
+                    command              TEXT NOT NULL,
+                    schedule             TEXT,
+                    job_type             TEXT NOT NULL DEFAULT 'shell',
+                    prompt               TEXT,
+                    name                 TEXT,
+                    session_target       TEXT NOT NULL DEFAULT 'isolated',
+                    model                TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 1,
+                    delivery             TEXT,
+                    delete_after_run     INTEGER NOT NULL DEFAULT 0,
+                    allowed_tools        TEXT,
+                    created_at           TEXT NOT NULL,
+                    next_run             TEXT NOT NULL,
+                    last_run             TEXT,
+                    last_status          TEXT,
+                    last_output          TEXT,
+                    source               TEXT DEFAULT 'imperative',
+                    uses_memory          INTEGER NOT NULL DEFAULT 1,
+                    agent_alias          TEXT NOT NULL DEFAULT '',
+                    shell_output_format  TEXT
+                );",
+            )
+            .unwrap();
+
+            let now = Utc::now();
+            // Insert a declarative row with a BLOB in shell_output_format.
+            // SQLite allows BLOB storage in TEXT-affinity columns.
+            // Set next_run in the past so the job is due for due_jobs().
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, source, enabled, shell_output_format)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'declarative', 1, x'80')",
+                params![
+                    "blob-shadow",
+                    "0 2 * * *",
+                    "echo blob",
+                    now.to_rfc3339(),
+                    (now - ChronoDuration::hours(1)).to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("blob-shadow".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo blob".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+        };
+        config.cron.insert("blob-shadow".to_string(), decl);
+
+        // get_job must succeed despite the BLOB shadow: the ownership branch
+        // skips reading column 21 for declarative rows entirely.
+        let job = get_job(&config, "blob-shadow").unwrap();
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must resolve config value when DB shadow is a BLOB"
+        );
+        assert_eq!(job.source, "declarative");
+
+        // due_jobs must also succeed.
+        let now = Utc::now();
+        let due = due_jobs(&config, now).unwrap();
+        assert!(
+            due.iter().any(|j| j.id == "blob-shadow"
+                && j.shell_output_format == zeroclaw_config::schema::CronShellOutputFormat::Raw),
+            "due_jobs must include declarative job despite BLOB DB shadow"
+        );
+    }
+
     #[test]
     fn migration_falls_back_to_legacy_expression() {
         let tmp = TempDir::new().unwrap();
@@ -3293,9 +3426,29 @@ schedule = { kind = "every", every_ms = 300000 }
         config.cron.insert("raw-decl".to_string(), decl.clone());
         sync_declarative_jobs(&config, &decls).unwrap();
 
+        // Read the raw DB column value before the unrelated update.
+        // sync_declarative_jobs does not write shell_output_format, so the
+        // column stays at its DEFAULT ('wrapped').
+        let raw_before = with_read_connection(&config, |conn| {
+            let val: Option<String> = conn
+                .query_row(
+                    "SELECT shell_output_format FROM cron_jobs WHERE id = ?1",
+                    params!["raw-decl"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            Ok(val)
+        })
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(
+            raw_before.as_deref(),
+            Some("wrapped"),
+            "baseline: sync should not write shell_output_format for declarative jobs"
+        );
+
         // Unrelated patch: only toggles `uses_memory`, never touches
-        // `shell_output_format`. Must not freeze the currently-resolved
-        // `Raw` value into the DB column.
+        // `shell_output_format`. Must not overwrite the DB column.
         update_job(
             &config,
             "raw-decl",
@@ -3306,9 +3459,27 @@ schedule = { kind = "every", every_ms = 300000 }
         )
         .unwrap();
 
+        // Assert the raw SQLite column was NOT modified by the unrelated update.
+        let raw_after = with_read_connection(&config, |conn| {
+            let val: Option<String> = conn
+                .query_row(
+                    "SELECT shell_output_format FROM cron_jobs WHERE id = ?1",
+                    params!["raw-decl"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            Ok(val)
+        })
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(
+            raw_after, raw_before,
+            "unrelated update must not overwrite the non-owned shell_output_format column"
+        );
+
         // Config changes after the update — if the update had snapshotted
-        // `Raw` into the DB column, every read path below would still
-        // report `Raw` instead of following this change.
+        // a value into the DB column, every read path below would still
+        // report the old value instead of following this change.
         decl.shell_output_format = zeroclaw_config::schema::CronShellOutputFormat::Wrapped;
         config.cron.insert("raw-decl".to_string(), decl);
 
