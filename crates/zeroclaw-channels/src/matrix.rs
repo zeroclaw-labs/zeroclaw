@@ -1583,7 +1583,7 @@ mod inbound {
         }
     }
 
-    async fn handle_message(
+    pub(super) async fn handle_message(
         ctx: HandlerCtx,
         ev: OriginalSyncRoomMessageEvent,
         room: Room,
@@ -1911,11 +1911,8 @@ mod inbound {
 
                 if should_transcribe(&info.kind, transcription) {
                     let t = transcription.expect("should_transcribe guarantees Some");
-                    let transcribe_name = transcription_safe_filename(
-                        &info.file_name,
-                        info.mime.as_deref(),
-                        &info.kind,
-                    );
+                    let transcribe_name =
+                        transcription_safe_filename(&info.file_name, info.mime.as_deref());
                     match transcribe_from_disk(t, &path, &transcribe_name).await {
                         Ok(text) if !text.trim().is_empty() => {
                             content = format!("[voice transcript]: {text}\n\n{content}");
@@ -2157,36 +2154,21 @@ mod inbound {
     }
 
     /// Internal name for `transcribe()` only — never stored or shown.
-    pub(super) fn transcription_safe_filename(
-        file_name: &str,
-        mime: Option<&str>,
-        kind: &MediaCategory,
-    ) -> String {
-        let accepted = file_name
+    /// Preserves a name whose extension the resolver accepts; substitutes a
+    /// MIME-derived stand-in only when the MIME maps to an accepted format;
+    /// otherwise passes the unsupported name through so the resolver rejects
+    /// it locally before any request is sent.
+    pub(super) fn transcription_safe_filename(file_name: &str, mime: Option<&str>) -> String {
+        let ext_accepted = file_name
             .rsplit_once('.')
-            .is_some_and(|(_, ext)| is_transcription_accepted_extension(ext));
-        if accepted {
+            .is_some_and(|(_, ext)| crate::transcription::mime_for_audio(ext).is_some());
+        if ext_accepted {
             return file_name.to_string();
         }
-        format!("attachment.{}", default_extension(kind, mime))
-    }
-
-    // Mirrors `mime_for_audio`'s accepted set in transcription.rs.
-    fn is_transcription_accepted_extension(ext: &str) -> bool {
-        matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "flac"
-                | "mp3"
-                | "mpeg"
-                | "mpga"
-                | "mp4"
-                | "m4a"
-                | "ogg"
-                | "oga"
-                | "opus"
-                | "wav"
-                | "webm"
-        )
+        match mime.and_then(crate::transcription::extension_for_audio_mime) {
+            Some(ext) => format!("attachment.{ext}"),
+            None => file_name.to_string(),
+        }
     }
 
     fn format_media_marker(info: &MediaInfo, path: &std::path::Path) -> String {
@@ -3918,7 +3900,6 @@ mod tests {
     }
 
     mod media_filename_resolution {
-        use super::super::inbound::MediaCategory;
         use super::super::inbound::{build_transcription_manager, transcription_safe_filename};
         use zeroclaw_config::schema::TranscriptionConfig;
 
@@ -3933,79 +3914,61 @@ mod tests {
 
         #[test]
         fn unaccepted_extension_with_supported_mime_uses_mime_derived_name() {
-            let resolved = transcription_safe_filename(
-                "recording.bin",
-                Some("audio/ogg"),
-                &MediaCategory::Audio,
-            );
+            let resolved = transcription_safe_filename("recording.bin", Some("audio/ogg"));
             assert_eq!(resolved, "attachment.ogg");
         }
 
         #[test]
         fn accepted_extension_is_preserved_even_when_mime_differs() {
-            let resolved = transcription_safe_filename(
-                "recording.mp3",
-                Some("audio/ogg"),
-                &MediaCategory::Audio,
-            );
+            let resolved = transcription_safe_filename("recording.mp3", Some("audio/ogg"));
             assert_eq!(resolved, "recording.mp3");
         }
 
         #[test]
         fn accepted_extension_matching_mime_is_passed_through_unchanged() {
-            let resolved = transcription_safe_filename(
-                "recording.ogg",
-                Some("audio/ogg"),
-                &MediaCategory::Audio,
-            );
+            let resolved = transcription_safe_filename("recording.ogg", Some("audio/ogg"));
             assert_eq!(resolved, "recording.ogg");
         }
 
         #[test]
         fn accepted_extension_is_matched_case_insensitively() {
-            let resolved = transcription_safe_filename(
-                "recording.OGG",
-                Some("audio/ogg"),
-                &MediaCategory::Audio,
-            );
+            let resolved = transcription_safe_filename("recording.OGG", Some("audio/ogg"));
             assert_eq!(resolved, "recording.OGG");
         }
 
         #[test]
         fn oga_extension_is_accepted_and_preserved() {
-            let resolved =
-                transcription_safe_filename("note.oga", Some("audio/ogg"), &MediaCategory::Voice);
+            let resolved = transcription_safe_filename("note.oga", Some("audio/ogg"));
             assert_eq!(resolved, "note.oga");
         }
 
         #[test]
         fn no_mime_with_an_accepted_extension_is_passed_through() {
-            let resolved =
-                transcription_safe_filename("recording.mp3", None, &MediaCategory::Audio);
+            let resolved = transcription_safe_filename("recording.mp3", None);
             assert_eq!(resolved, "recording.mp3");
         }
 
         #[test]
-        fn unaccepted_extension_with_no_mime_falls_back_to_kind_default() {
-            let resolved =
-                transcription_safe_filename("recording.bin", None, &MediaCategory::Audio);
-            assert_eq!(resolved, "attachment.ogg");
+        fn unaccepted_extension_with_no_mime_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("recording.bin", None);
+            assert_eq!(resolved, "recording.bin");
         }
 
         #[test]
-        fn no_mime_and_no_extension_falls_back_to_kind_default() {
-            let resolved =
-                transcription_safe_filename("Meeting recap", None, &MediaCategory::Audio);
-            assert_eq!(resolved, "attachment.ogg");
+        fn no_mime_and_no_extension_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("Meeting recap", None);
+            assert_eq!(resolved, "Meeting recap");
+        }
+
+        #[test]
+        fn unsupported_mime_and_extension_are_preserved() {
+            let resolved = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(resolved, "recording.aac");
         }
 
         #[test]
         fn synthesizes_extension_from_mime_when_no_extension_at_all() {
-            let resolved = transcription_safe_filename(
-                "Voice message",
-                Some("audio/ogg"),
-                &MediaCategory::Voice,
-            );
+            let resolved = transcription_safe_filename("Voice message", Some("audio/ogg"));
             assert_eq!(resolved, "attachment.ogg");
         }
 
@@ -4018,11 +3981,7 @@ mod tests {
             };
             let manager = build_transcription_manager(&config).unwrap();
 
-            let file_name = transcription_safe_filename(
-                "Voice message",
-                Some("audio/ogg"),
-                &MediaCategory::Voice,
-            );
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
 
             let err = manager
                 .transcribe(b"not-real-audio", &file_name)
@@ -4048,11 +4007,7 @@ mod tests {
             };
             let manager = build_transcription_manager(&config).unwrap();
 
-            let file_name = transcription_safe_filename(
-                "recording.bin",
-                Some("audio/ogg"),
-                &MediaCategory::Voice,
-            );
+            let file_name = transcription_safe_filename("recording.bin", Some("audio/ogg"));
 
             let err = manager
                 .transcribe(b"not-real-audio", &file_name)
@@ -4067,6 +4022,82 @@ mod tests {
                 !err.to_string().contains("Unsupported audio format"),
                 "expected the unaccepted .bin extension to be replaced with the MIME-derived .ogg, got: {err}"
             );
+        }
+
+        // An unsupported format must be rejected locally by the resolver —
+        // the provider endpoint must see zero requests.
+        #[tokio::test]
+        async fn unsupported_mime_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(file_name, "recording.aac");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("unsupported format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn missing_mime_and_extension_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config).unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", None);
+            assert_eq!(file_name, "Voice message");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("missing format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
         }
 
         // attach_media only inserts non-empty transcripts.
@@ -4095,11 +4126,7 @@ mod tests {
             };
             let manager = build_transcription_manager(&config).unwrap();
 
-            let file_name = transcription_safe_filename(
-                "Voice message",
-                Some("audio/ogg"),
-                &MediaCategory::Voice,
-            );
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
 
             let text = manager.transcribe(b"fake-audio", &file_name).await.unwrap();
             assert_eq!(text, "this is the transcribed voice message");
@@ -4109,13 +4136,277 @@ mod tests {
         #[test]
         fn transcription_only_name_may_diverge_from_the_real_filename() {
             let real_filename = "recording.bin";
-            let transcribe_name = transcription_safe_filename(
-                real_filename,
-                Some("audio/ogg"),
-                &MediaCategory::Audio,
-            );
+            let transcribe_name = transcription_safe_filename(real_filename, Some("audio/ogg"));
             assert_ne!(transcribe_name, real_filename);
             assert_eq!(transcribe_name, "attachment.ogg");
+        }
+    }
+
+    // Route-level hermetic coverage: a real (constructed) WAV file travels
+    // event parsing → media download/save → attach_media → transcript
+    // insertion, with only the homeserver and STT provider mocked at HTTP.
+    mod inbound_route {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{room_id, user_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+
+        use super::super::inbound::{HandlerCtx, handle_message};
+
+        const TRANSCRIPT: &str = "route level transcript of the voice note";
+
+        // 0.1 s of a 440 Hz sine at 16 kHz mono 16-bit PCM: a genuinely
+        // valid, decodable WAV file, generated in-test.
+        fn build_wav() -> Vec<u8> {
+            let sample_rate: u32 = 16_000;
+            let samples: Vec<i16> = (0..(sample_rate / 10))
+                .map(|i| {
+                    let t = i as f32 / sample_rate as f32;
+                    ((t * 440.0 * std::f32::consts::TAU).sin() * f32::from(i16::MAX) * 0.5) as i16
+                })
+                .collect();
+            let data_len = (samples.len() * 2) as u32;
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for s in &samples {
+                wav.extend_from_slice(&s.to_le_bytes());
+            }
+            wav
+        }
+
+        fn handler_ctx(
+            stt_url: &str,
+            workspace: &std::path::Path,
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            HandlerCtx {
+                config: Arc::new(MatrixConfig::default()),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["*".to_string()]),
+                transcription: Some(Arc::new(TranscriptionConfig {
+                    enabled: true,
+                    local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                        url: stt_url.to_string(),
+                        bearer_token: Some("test-token".to_string()),
+                        max_audio_bytes: 10 * 1024 * 1024,
+                        timeout_secs: 30,
+                    }),
+                    ..TranscriptionConfig::default()
+                })),
+                workspace_dir: Some(Arc::new(workspace.to_path_buf())),
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        fn voice_event_json(event_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "url": "mxc://localhost/audioblob",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            })
+        }
+
+        async fn stt_server() -> wiremock::MockServer {
+            let stt = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": TRANSCRIPT })),
+                )
+                .expect(1)
+                .mount(&stt)
+                .await;
+            stt
+        }
+
+        async fn mount_media_download(matrix: &MatrixMockServer, wav: &[u8]) {
+            matrix
+                .mock_media_download()
+                .respond_with(ResponseTemplate::new(200).set_body_raw(wav.to_vec(), "audio/wav"))
+                .mount()
+                .await;
+            matrix
+                .mock_authed_media_download()
+                .ok_bytes(wav.to_vec())
+                .mount()
+                .await;
+        }
+
+        fn assert_stt_received_the_wav(reqs: &[wiremock::Request], wav: &[u8]) {
+            assert_eq!(reqs.len(), 1, "exactly one transcription request");
+            let body = &reqs[0].body;
+            assert!(
+                body.windows(wav.len()).any(|w| w == wav),
+                "request must carry the constructed WAV bytes verbatim"
+            );
+            let text = String::from_utf8_lossy(body);
+            assert!(
+                text.contains("filename=\"voice.wav\""),
+                "part filename: {text}"
+            );
+            assert!(text.contains("audio/wav"), "part content-type: {text}");
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..12], b"WAVE");
+        }
+
+        #[tokio::test]
+        async fn direct_voice_note_inserts_transcript_and_keeps_real_filename() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let json = voice_event_json("$audio1:localhost");
+            let ev: OriginalSyncRoomMessageEvent = serde_json::from_value(json.clone()).unwrap();
+            let raw = RawEvent(Raw::<serde_json::Value>::new(&json).unwrap().into_json());
+
+            handle_message(ctx, ev, room, raw).await.unwrap();
+
+            let msg = rx.recv().await.expect("inbound message must be forwarded");
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted into the inbound content: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            let saved_path = saved[0].path();
+            assert!(
+                saved_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("voice.wav"),
+                "saved file keeps the real-name-derived filename: {saved_path:?}"
+            );
+            assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        #[tokio::test]
+        async fn reply_to_voice_note_inserts_parent_transcript() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
+            // parent m.audio event verbatim.
+            let parent = voice_event_json("$parentaudio:localhost");
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .mount(matrix.server())
+                .await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$reply1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "what does this say?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parentaudio:localhost" }
+                    }
+                }
+            });
+            let ev: OriginalSyncRoomMessageEvent = serde_json::from_value(json.clone()).unwrap();
+            let raw = RawEvent(Raw::<serde_json::Value>::new(&json).unwrap().into_json());
+
+            handle_message(ctx, ev, room, raw).await.unwrap();
+
+            let msg = rx.recv().await.expect("inbound message must be forwarded");
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "parent transcript must be inserted: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the parent's real filename: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
     }
 

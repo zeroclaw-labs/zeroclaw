@@ -288,6 +288,7 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
+matrix-sdk = { version = "0.18", default-features = false, features = ["testing"] }
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
