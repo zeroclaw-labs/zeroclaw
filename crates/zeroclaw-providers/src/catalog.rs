@@ -6,6 +6,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 const NEARAI_CATALOG_URL: &str = "https://cloud-api.near.ai/v1/model/list";
+const ATLASCLOUD_CATALOG_URL: &str = "https://api.atlascloud.ai/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// `(models.dev key, openrouter.ai vendor prefix)` for a family name.
@@ -64,6 +65,9 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "nvidia" => (Some("nvidia"), Some("nvidia")),
         "vercel" => (Some("vercel"), None),
         "cloudflare" => (Some("cloudflare-ai-gateway"), None),
+        // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
+        // `list_models_for_family` handles that path before using this tuple.
+        "atlascloud" => (None, None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
@@ -105,6 +109,30 @@ struct NearaiModelMetadata {
 struct NearaiArchitecture {
     #[serde(default, rename = "outputModalities")]
     output_modalities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelsCatalog {
+    #[serde(default)]
+    data: Vec<OpenAiModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelEntry {
+    id: String,
+}
+
+pub(crate) fn parse_openai_models_catalog(bytes: &[u8]) -> Result<Vec<String>> {
+    let catalog: OpenAiModelsCatalog = serde_json::from_slice(bytes)?;
+    let mut ids: Vec<String> = catalog
+        .data
+        .into_iter()
+        .map(|model| model.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn is_nearai_chat_model(model: &NearaiModel) -> bool {
@@ -149,12 +177,28 @@ async fn list_nearai_models() -> Result<Vec<String>> {
     parse_nearai_catalog(&bytes)
 }
 
+async fn list_atlascloud_models() -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .build()?;
+    let response = client
+        .get(ATLASCLOUD_CATALOG_URL)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    parse_openai_models_catalog(&bytes)
+}
+
 /// Probe the catalog for `family` without constructing a live provider.
 /// Returns the union of every known public catalog source. Errors if
 /// `family` is unknown or has no public catalog source set.
 pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
     if family == "nearai" {
         return list_nearai_models().await;
+    }
+    if family == "atlascloud" {
+        return list_atlascloud_models().await;
     }
 
     let Some((md_key, or_prefix)) = catalog_source_for(family) else {
@@ -294,6 +338,30 @@ mod tests {
         let (md, or) = catalog_source_for("nearai").expect("nearai is canonical");
         assert_eq!(md, None);
         assert_eq!(or, None);
+    }
+
+    #[test]
+    fn atlascloud_family_uses_provider_catalog_source() {
+        let (md, or) = catalog_source_for("atlascloud").expect("atlascloud is canonical");
+        assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn parse_openai_models_catalog_trims_filters_sorts_and_dedups() {
+        let raw = r#"{
+            "data": [
+                {"id": " qwen/qwen3.5-flash "},
+                {"id": ""},
+                {"id": "deepseek-ai/deepseek-v4-pro"},
+                {"id": "qwen/qwen3.5-flash"}
+            ]
+        }"#;
+        let ids = parse_openai_models_catalog(raw.as_bytes()).unwrap();
+        assert_eq!(
+            ids,
+            vec!["deepseek-ai/deepseek-v4-pro", "qwen/qwen3.5-flash"]
+        );
     }
 
     #[test]
