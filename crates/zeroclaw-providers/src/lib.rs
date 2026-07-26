@@ -879,27 +879,18 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
     ))
 }
 
-/// Resolve API key for a model_provider from config and environment variables.
-/// Return the typed-alias `api_key` field, trimmed. Most env-var overrides land
-/// on the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
+/// Resolve API key for a model_provider from the typed alias config/override.
+/// Env-var bridges land on the alias field at config-load via the
+/// `ZEROCLAW_*` schema-mirror grammar; this constructor boundary deliberately
+/// does not read provider-specific global variables.
 fn resolve_model_provider_credential(
-    name: &str,
+    _name: &str,
     credential_override: Option<&str>,
 ) -> Option<String> {
     credential_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .or_else(|| {
-            if name == "atlascloud" {
-                std::env::var("ATLASCLOUD_API_KEY")
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            } else {
-                None
-            }
-        })
 }
 
 /// Single source of truth for `(key_prefix, canonical_model_provider_family)`
@@ -1035,7 +1026,6 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "lambda-ai" => "lambda_ai",
         "github-models" => "github_models",
         "step" => "stepfun",
-        "atlas" | "atlas-cloud" | "atlas_cloud" => "atlascloud",
         // Moonshot / Kimi (regional + code variants fold to one family).
         "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
         | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
@@ -2134,13 +2124,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_atlascloud_credential_falls_back_to_env() {
+    fn resolve_atlascloud_credential_stays_on_typed_alias_boundary() {
         let _env_lock = env_lock();
         let _guard = EnvGuard::set("ATLASCLOUD_API_KEY", Some("  atlas-env-key  "));
-        assert_eq!(
-            resolve_model_provider_credential("atlascloud", None).as_deref(),
-            Some("atlas-env-key")
-        );
+        assert!(resolve_model_provider_credential("atlascloud", None).is_none());
         assert_eq!(
             resolve_model_provider_credential("atlascloud", Some("  explicit-key  ")).as_deref(),
             Some("explicit-key")
@@ -2149,9 +2136,13 @@ mod tests {
     }
 
     #[test]
-    fn atlascloud_aliases_are_canonicalized() {
-        for alias in ["atlas", "atlas-cloud", "atlas_cloud", "atlascloud"] {
-            assert_eq!(canonicalize_v2_model_provider_name(alias), "atlascloud");
+    fn atlascloud_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("atlascloud"),
+            "atlascloud"
+        );
+        for alias in ["atlas", "atlas-cloud", "atlas_cloud"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
         }
     }
 
