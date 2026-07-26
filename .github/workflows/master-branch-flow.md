@@ -69,6 +69,7 @@ tag push.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
+   - `platform-tests`: the same workspace nextest command on `macos-14` and `windows-latest` as advisory, non-blocking checks.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. Maintainer reviews. Once the gate is green and review policy is satisfied,
@@ -129,6 +130,7 @@ flowchart TD
   A["PR opened or updated → master"] --> B["ci.yml"]
   B --> L["lint\nfmt · clippy"]
   L --> T["test\ncargo nextest --workspace"]
+  L --> PT["platform-tests\nmacOS · Windows · advisory"]
   L --> BLD["build\nLinux · macOS · Windows"]
   L --> CHK["check\nall features · no default features"]
   L --> C32["check-32bit\ni686-unknown-linux-gnu"]
