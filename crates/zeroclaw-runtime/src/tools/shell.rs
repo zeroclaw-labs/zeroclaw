@@ -897,10 +897,10 @@ mod tests {
         );
     }
 
-    /// End-to-end regression for issue #9247: driving the REAL wrapped shell
-    /// tool, a write through an in-workspace symlink pointing outside must be
-    /// refused before the command runs, and nothing may be created at the
-    /// target - the same boundary the file tools enforce.
+    /// End-to-end regression for the shell workspace-boundary bypass: driving
+    /// the REAL wrapped shell tool, a write through an in-workspace symlink
+    /// pointing outside must be refused before the command runs, and nothing may
+    /// be created at the target - the same boundary the file tools enforce.
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_blocks_symlink_escape_end_to_end() {
