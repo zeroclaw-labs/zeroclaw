@@ -25,7 +25,7 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.
-- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`, or the newer `sandbox_policy` table below.
+- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`, or the newer `sandbox_policy` table below, enforced today at the application layer only (see the [enforcement matrix](#enforcement-matrix-what-actually-enforces-each-field-today) below); no OS sandbox backend consumes these fields yet.
 
 ## Sandbox policy (`sandbox_policy`)
 
@@ -116,7 +116,7 @@ The Linux-native path. Zero setup, kernel-enforced, very low overhead. Requires 
 Limitations:
 
 - No network confinement: Landlock only controls filesystem access.
-- `forbidden_paths` is enforced via path-based rules, not inode-based, so a clever symlink can sometimes escape (we resolve links before handing to Landlock to mitigate this).
+- `forbidden_paths`/`sandbox_policy` denials are not forwarded to Landlock yet (see the enforcement matrix above). Landlock's own kernel-enforced filesystem confinement is a fixed allowlist independent of those fields: workspace read/write, `/tmp` read/write, `/usr` and `/bin` read-only. Everything else is denied by the kernel regardless of `forbidden_paths`/`sandbox_policy` config.
 
 ### Bubblewrap (`bwrap`)
 

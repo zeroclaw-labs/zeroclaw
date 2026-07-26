@@ -294,13 +294,13 @@ pub fn create_sandbox(
 /// backend constructor (Landlock/Bubblewrap/Seatbelt/Docker/Firejail), so
 /// enforcement against arbitrary shell/script child-process I/O is
 /// application-layer-only (`SecurityPolicy`, `zeroclaw-config`) regardless of
-/// which backend is selected, until per-backend OS sandbox wiring lands (RFC
-/// 6996 Phase 2). Deliberately backend-name-agnostic — a backend that merely
-/// *activates* does not yet *enforce* these fields; once a backend PR wires
-/// `policy` through to its constructor, that backend should gain a real
-/// capability signal here, not before. Pure predicate, split out from
-/// [`warn_if_denials_unenforced`] so it is unit-testable without a logging
-/// harness.
+/// which backend is selected, until per-backend OS sandbox wiring lands (see
+/// the sandbox-policy RFC's Phase 2 rollout). Deliberately backend-name-agnostic
+/// — a backend that merely *activates* does not yet *enforce* these fields;
+/// once a backend PR wires `policy` through to its constructor, that backend
+/// should gain a real capability signal here, not before. Pure predicate,
+/// split out from [`warn_if_denials_unenforced`] so it is unit-testable
+/// without a logging harness.
 #[must_use]
 fn sandbox_denials_unenforced(policy: &SandboxPolicy) -> bool {
     !policy.deny_write.is_empty() || !policy.deny_read.is_empty()

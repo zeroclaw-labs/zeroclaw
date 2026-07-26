@@ -2091,9 +2091,17 @@ impl SecurityPolicy {
             }
         }
 
-        // When workspace_only is disabled the user explicitly opted out of
-        // workspace confinement after forbidden-path checks are applied.
-        if !self.workspace_only {
+        // Legacy behavior: workspace_only = false with an OMITTED allow_write
+        // means "no write confinement" (the pre-sandbox_policy default — the
+        // user explicitly opted out of workspace confinement, and there is no
+        // canonical allowlist to be authoritative over). An EXPLICIT
+        // allow_write (including an explicit empty list) is the canonical
+        // write allowlist and must be authoritative regardless of
+        // workspace_only — see `SandboxPolicyConfig::allow_write` rustdoc
+        // ("All other paths are denied for writes"). Without this check, a
+        // narrow explicit allow_write combined with workspace_only = false
+        // silently degraded into "anything goes" for every unlisted path.
+        if !self.workspace_only && !self.sandbox_inputs.allow_write_is_explicit {
             return true;
         }
 
@@ -5832,12 +5840,37 @@ mod tests {
                 new_policy.is_resolved_path_readable(probe),
                 "old-style and new-style configs must produce identical READ decisions for {probe:?}"
             );
+        }
+
+        // Write parity holds for paths both configs make an explicit
+        // decision about (the denied /secret region, the granted /extra
+        // root). It deliberately does NOT hold for an unlisted path like
+        // /other: old-style's legacy `allowed_roots` + `workspace_only =
+        // false` preserves the historical permissive fallthrough for
+        // compatibility (no canonical field was ever set to be
+        // authoritative), while new-style's explicit `allow_write` is the
+        // canonical allowlist and must deny anything not in it — see
+        // `explicit_allow_write_denies_unlisted_path_when_workspace_only_false`.
+        // Asserting these diverge here (rather than dropping /other from the
+        // loop) is what would have caught this precedence bug in the first
+        // place.
+        for probe in [Path::new("/secret/data.txt"), Path::new("/extra/file.txt")] {
             assert_eq!(
                 old_policy.is_resolved_path_allowed(probe),
                 new_policy.is_resolved_path_allowed(probe),
                 "old-style and new-style configs must produce identical WRITE decisions for {probe:?}"
             );
         }
+        assert!(
+            old_policy.is_resolved_path_allowed(Path::new("/other/file.txt")),
+            "old-style legacy allowed_roots + workspace_only=false preserves the permissive \
+             fallthrough for an unlisted path"
+        );
+        assert!(
+            !new_policy.is_resolved_path_allowed(Path::new("/other/file.txt")),
+            "new-style explicit allow_write must deny an unlisted path even with \
+             workspace_only=false — the canonical allowlist is authoritative"
+        );
     }
 
     /// A path counts as "structurally write-granted" only when it shows up
@@ -5849,12 +5882,15 @@ mod tests {
     /// independently superseded by an explicit `allow_write`). Asserting on
     /// tier membership directly (rather than the end-to-end
     /// `is_resolved_path_allowed` verdict) is deliberate: with
-    /// `workspace_only = false` that method falls through to "allowed unless
-    /// explicitly denied" for ANY path (see the `!self.workspace_only`
-    /// branch), which would make a path look "granted" whether or not it is
-    /// actually present in a write tier — exactly the ambiguity that let the
-    /// original bug (legacy `allowed_roots` leaking into the app-layer write
-    /// grant even when a canonical field superseded it) hide.
+    /// `workspace_only = false` AND an omitted `allow_write`, that method
+    /// falls through to "allowed unless explicitly denied" for ANY path (see
+    /// the `!self.workspace_only && !self.sandbox_inputs.allow_write_is_explicit`
+    /// branch) — a path can look "granted" there whether or not it is
+    /// actually present in a write tier, so tier membership is the precise
+    /// check for whether a canonical field truly superseded a legacy one.
+    /// (When `allow_write` is explicit, that fallthrough no longer applies —
+    /// see `explicit_allow_write_denies_unlisted_path_when_workspace_only_false`
+    /// — so the end-to-end verdict and tier membership agree in that case.)
     fn is_write_granted(policy: &SecurityPolicy, root: &str) -> bool {
         let root = PathBuf::from(root);
         policy.allowed_roots.contains(&root) || policy.allowed_roots_write_only.contains(&root)
@@ -5953,9 +5989,8 @@ mod tests {
 
     #[test]
     fn explicit_tmp_allow_write_is_honored_by_app_path_guard() {
-        // Regression (PR #7821 review, IftekharUddin, 2026-07-23): an
-        // operator-explicit `sandbox_policy.allow_write = ["/tmp"]` was being
-        // silently stripped from `allowed_roots_write_only` by
+        // Regression: an operator-explicit `sandbox_policy.allow_write = ["/tmp"]`
+        // was being silently stripped from `allowed_roots_write_only` by
         // `sandbox_derived_tiers`'s unconditional `DEFAULT_ALLOW_WRITE`
         // exclusion, even though the field's own contract says an explicit
         // `Some(v)` always wins, even when shaped like the prior default.
@@ -6118,6 +6153,72 @@ mod tests {
         assert!(
             policy.is_resolved_path_allowed(Path::new("/data/output.txt")),
             "sandbox_policy.allow_write must grant write access through the app-layer path guard"
+        );
+    }
+
+    #[test]
+    fn explicit_allow_write_denies_unlisted_path_when_workspace_only_false() {
+        // Regression: workspace_only = false used to make is_resolved_path_allowed's
+        // final fallthrough grant EVERY unlisted path, even when an operator had
+        // set an explicit, narrow sandbox_policy.allow_write. That turned an
+        // allow-only canonical field into an allow-additional-roots field
+        // whenever workspace_only was also false. An explicit allow_write must be
+        // authoritative regardless of workspace_only.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/granted".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/unlisted/output.txt")),
+            "explicit allow_write must deny a path not in the allowlist even with \
+             workspace_only=false"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/granted/file.txt")),
+            "the explicitly granted root must still be writable"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_allow_write_denies_every_external_path() {
+        // The "authoritative including []" case: an explicit empty allow_write
+        // must deny every path outside the workspace, not silently fall back to
+        // permissive legacy behavior just because the list happens to be empty.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec![]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/anything/output.txt")),
+            "explicit empty allow_write must deny every external path"
+        );
+    }
+
+    #[test]
+    fn omitted_allow_write_with_workspace_only_false_preserves_legacy_open_behavior() {
+        // Compatibility guarantee: a profile that never touches sandbox_policy at
+        // all must keep the pre-existing "workspace_only=false means no write
+        // confinement" behavior. Only an EXPLICIT allow_write should become
+        // authoritative — the omitted-field case must not regress.
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/anywhere/output.txt")),
+            "omitted allow_write with workspace_only=false must preserve the legacy \
+             unrestricted-write compatibility behavior"
         );
     }
 
