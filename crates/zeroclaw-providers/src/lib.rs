@@ -790,63 +790,53 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
-/// URL query parameters whose value is a secret credential. Google/Gemini send
-/// the API key as `?key=AIza…`, which a transport error's `Display` carries in
-/// the URL; a secret in a query string is not caught by token-prefix matching,
-/// so the whole value is redacted regardless of its shape.
-const SECRET_QUERY_PARAMS: [&str; 3] = ["key", "api_key", "apikey"];
+/// Remove complete query strings from HTTP(S) URLs embedded in error text.
+///
+/// Query-value punctuation cannot safely identify where a credential ends:
+/// commas, apostrophes, and parentheses are all legal query data. Treat the
+/// URL's entire non-whitespace query tail as sensitive instead. This also
+/// covers credential parameter names that the sanitizer does not know about.
+fn scrub_url_queries(input: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let mut scrubbed = String::with_capacity(input.len());
+    let mut cursor = 0;
 
-/// True for characters that may appear in a URL query-parameter value; used to
-/// find where a redacted secret value ends.
-fn is_query_value_char(c: char) -> bool {
-    !(c.is_whitespace() || matches!(c, '&' | ')' | '"' | '\'' | '>' | '}' | ']' | ','))
-}
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        let remaining_lowercase = &lowercase[cursor..];
+        let next_http = remaining_lowercase.find("http://");
+        let next_https = remaining_lowercase.find("https://");
+        let Some(relative_url_start) = (match (next_http, next_https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(http), None) => Some(http),
+            (None, Some(https)) => Some(https),
+            (None, None) => None,
+        }) else {
+            scrubbed.push_str(remaining);
+            break;
+        };
+        let url_start = cursor + relative_url_start;
+        scrubbed.push_str(&input[cursor..url_start]);
 
-/// Redact the values of secret-bearing URL query parameters (see
-/// [`SECRET_QUERY_PARAMS`]). The parameter name is matched case-insensitively
-/// only at a query boundary (preceded by `?`, `&`, `(`, `=`, `/`, whitespace,
-/// or start of string) so an unrelated suffix like `monkey=` is never mistaken
-/// for `key=`.
-fn scrub_query_param_secrets(input: &str) -> String {
-    let mut scrubbed = input.to_string();
-    for param in SECRET_QUERY_PARAMS {
-        let needle = format!("{param}=");
-        let mut from = 0;
-        loop {
-            let lower = scrubbed.to_ascii_lowercase();
-            let Some(rel) = lower[from..].find(&needle) else {
-                break;
-            };
-            let name_start = from + rel;
-            let value_start = name_start + needle.len();
-            let boundary_ok = name_start == 0
-                || matches!(
-                    scrubbed.as_bytes()[name_start - 1],
-                    b'?' | b'&' | b'(' | b'=' | b'/' | b' ' | b'\t'
-                );
-            if !boundary_ok {
-                from = value_start;
-                continue;
-            }
-            let value_end = value_start
-                + scrubbed[value_start..]
-                    .find(|c: char| !is_query_value_char(c))
-                    .unwrap_or(scrubbed.len() - value_start);
-            if value_end == value_start {
-                from = value_start; // empty value — nothing to redact
-                continue;
-            }
-            scrubbed.replace_range(value_start..value_end, "[REDACTED]");
-            from = value_start + "[REDACTED]".len();
+        let url_tail = &input[url_start..];
+        let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
+        let url_token = &input[url_start..url_end];
+        if let Some(query_start) = url_token.find('?') {
+            scrubbed.push_str(&url_token[..query_start]);
+        } else {
+            scrubbed.push_str(url_token);
         }
+        cursor = url_end;
     }
+
     scrubbed
 }
 
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys, and redacts the values
-/// of secret-bearing URL query parameters (e.g. `?key=`).
+/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
+/// are removed from embedded HTTP(S) URLs because query parameters may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
     const PREFIXES: [&str; 8] = [
         "sk-",
@@ -859,9 +849,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "AIza",
     ];
 
-    // Redact secrets carried in URL query strings first (Gemini's `?key=AIza…`),
-    // then token-prefix secrets that can appear anywhere (bodies, JSON, logs).
-    let mut scrubbed = scrub_query_param_secrets(input);
+    let mut scrubbed = scrub_url_queries(input);
 
     for prefix in PREFIXES {
         let mut search_from = 0;
@@ -3604,17 +3592,14 @@ mod tests {
 
     #[test]
     fn sanitize_scrubs_gemini_key_in_reqwest_url() {
-        // The exact reqwest transport-error shape from #9386: a Gemini key rides
-        // in the `?key=` query string and must not reach the chat or the log.
         let key = "AIzaSyDUMMYKEYFORTESTINGONLY1234567890";
         let input = format!(
             "error sending request for url (https://127.0.0.1:1/v1beta/models/x:generateContent?key={key})"
         );
         let result = sanitize_api_error(&input);
         assert!(!result.contains(key), "key leaked: {result}");
-        assert!(result.contains("[REDACTED]"));
-        // The surrounding URL context is preserved so the error is still useful.
-        assert!(result.contains("generateContent?key=[REDACTED]"));
+        assert!(result.contains("generateContent"));
+        assert!(!result.contains("?key="));
     }
 
     #[test]
@@ -3628,20 +3613,28 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_scrubs_generic_key_query_param() {
-        // Any value carried as a `key=`/`api_key=` query param is redacted, even
-        // if it is not an `AIza`-shaped token.
-        let input = "GET https://api.example.com/v1/thing?api_key=hunter2secret&x=1 failed";
+    fn sanitize_removes_complete_url_query_regardless_of_parameter_name() {
+        let input =
+            "GET HTTPS://api.example.com/v1/thing?region=us&access_token=hunter2secret failed";
         let result = sanitize_api_error(input);
         assert!(!result.contains("hunter2secret"), "{result}");
-        assert!(result.contains("api_key=[REDACTED]"));
-        // Non-secret params around it survive.
-        assert!(result.contains("&x=1"));
+        assert!(!result.contains("region=us"), "{result}");
+        assert!(result.contains("HTTPS://api.example.com/v1/thing"));
     }
 
     #[test]
-    fn sanitize_query_scrub_respects_param_boundary() {
-        // `monkey=` must not be treated as `key=`.
+    fn sanitize_removes_query_values_containing_url_punctuation() {
+        let secret = "abc,def'ghi(jkl)";
+        let input = format!("GET https://api.example.com/v1/thing?api_key={secret} failed");
+        let result = sanitize_api_error(&input);
+
+        assert!(!result.contains(secret), "{result}");
+        assert!(!result.contains("def'ghi(jkl)"), "{result}");
+        assert!(result.contains("https://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_leaves_non_url_key_value_text_unchanged() {
         let input = "playing monkey=banana in the query";
         let result = sanitize_api_error(input);
         assert_eq!(result, input);
