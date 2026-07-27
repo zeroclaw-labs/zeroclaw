@@ -22,8 +22,14 @@ use zeroclaw_api::jsonrpc::{
 /// Maximum size of one newline-delimited JSON-RPC frame.
 const MAX_ACP_FRAME_BYTES: usize = 1_048_576;
 
-/// Maximum aggregate stdout consumed during one ACP request.
-const MAX_ACP_STDOUT_BYTES: usize = 4_194_304;
+/// Default aggregate stdout budget consumed during one ACP request.
+pub(super) const DEFAULT_ACP_STDOUT_LIMIT_BYTES: usize = 4_194_304;
+
+/// The aggregate stdout budget must admit at least one valid ACP frame.
+pub(super) const MIN_ACP_STDOUT_LIMIT_BYTES: usize = MAX_ACP_FRAME_BYTES;
+
+/// Keep a configured transport budget bounded even for tool-heavy aliases.
+pub(super) const MAX_ACP_STDOUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum assistant text returned to the channel/runtime.
 const MAX_ACP_ASSISTANT_BYTES: usize = 1_048_576;
@@ -87,12 +93,13 @@ pub(super) async fn run_oneshot_prompt<W, R>(
     prompt: &str,
     cwd: &Path,
     xai_api_key_available: bool,
+    max_stdout_bytes: usize,
 ) -> Result<String, AcpError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let mut reader = AcpReader::new(stdout);
+    let mut reader = AcpReader::new(stdout, max_stdout_bytes);
     let mut next_id = 1_u64;
     let mut assistant = String::new();
 
@@ -172,16 +179,18 @@ where
 struct AcpReader<R> {
     inner: BufReader<R>,
     bytes_read: usize,
+    max_stdout_bytes: usize,
 }
 
 impl<R> AcpReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    fn new(reader: R) -> Self {
+    fn new(reader: R, max_stdout_bytes: usize) -> Self {
         Self {
             inner: BufReader::new(reader),
             bytes_read: 0,
+            max_stdout_bytes,
         }
     }
 
@@ -222,11 +231,11 @@ where
                 .bytes_read
                 .checked_add(take)
                 .ok_or(AcpError::StdoutLimit {
-                    limit: MAX_ACP_STDOUT_BYTES,
+                    limit: self.max_stdout_bytes,
                 })?;
-            if next_total > MAX_ACP_STDOUT_BYTES {
+            if next_total > self.max_stdout_bytes {
                 return Err(AcpError::StdoutLimit {
-                    limit: MAX_ACP_STDOUT_BYTES,
+                    limit: self.max_stdout_bytes,
                 });
             }
             let next_frame = frame.len().checked_add(take).ok_or(AcpError::FrameLimit {
@@ -675,7 +684,7 @@ mod tests {
             .expect("write frame");
         drop(peer);
 
-        let mut reader = AcpReader::new(client);
+        let mut reader = AcpReader::new(client, DEFAULT_ACP_STDOUT_LIMIT_BYTES);
         let error = reader
             .next_message("test")
             .await
@@ -693,12 +702,30 @@ mod tests {
             .expect("write oversized frame");
         drop(peer);
 
-        let mut reader = AcpReader::new(client);
+        let mut reader = AcpReader::new(client, DEFAULT_ACP_STDOUT_LIMIT_BYTES);
         let error = reader
             .next_message("test")
             .await
             .expect_err("oversized frame must fail");
         assert!(matches!(error, AcpError::FrameLimit { .. }));
+    }
+
+    #[tokio::test]
+    async fn aggregate_stdout_limit_is_configurable() {
+        let (mut peer, client) = duplex(16);
+        peer.write_all(b"{}\n{}\n").await.expect("write ACP frames");
+        drop(peer);
+
+        let mut reader = AcpReader::new(client, 5);
+        reader
+            .next_message("test")
+            .await
+            .expect("first frame fits configured aggregate limit");
+        let error = reader
+            .next_message("test")
+            .await
+            .expect_err("second frame must exceed configured aggregate limit");
+        assert!(matches!(error, AcpError::StdoutLimit { limit: 5 }));
     }
 
     #[test]

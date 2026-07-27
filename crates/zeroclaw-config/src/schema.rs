@@ -2695,6 +2695,12 @@ pub struct GrokCliModelProviderConfig {
     /// reserved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+    /// Maximum cumulative stdout bytes accepted from `grok agent stdio` for
+    /// one ACP request. When unset, ZeroClaw uses 4 MiB. Values must be
+    /// between 1 MiB and 64 MiB; the provider rejects invalid values when it
+    /// is constructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_acp_stdout_bytes: Option<usize>,
 }
 
 // ── LMStudio (local default) ──
@@ -24189,6 +24195,7 @@ auto_save = true
                 model = "grok-4.5"
                 working_directory = "/srv/zeroclaw/workspace"
                 env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+                max_acp_stdout_bytes = 8388608
             "#,
         )
         .expect("explicit Grok ACP cwd");
@@ -24197,6 +24204,7 @@ auto_save = true
             parsed.env_passthrough,
             ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
         );
+        assert_eq!(parsed.max_acp_stdout_bytes, Some(8_388_608));
     }
 
     #[test]

@@ -1394,6 +1394,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
                 .working_directory(&self.working_directory)
                 .env_passthrough(self.env_passthrough.clone())
                 .extra_args(self.extra_args.clone())
+                .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
                 .timeout_secs(self.base.timeout_secs)
                 .build()?,
         ))
@@ -1666,6 +1667,26 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("does not accept api_key"));
+    }
+
+    #[test]
+    fn grok_cli_factory_forwards_acp_stdout_limit() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            max_acp_stdout_bytes: Some(0),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            None,
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("invalid ACP stdout limit must not be ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("max_acp_stdout_bytes"));
     }
 
     #[test]

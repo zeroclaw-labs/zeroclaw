@@ -47,11 +47,18 @@ authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
 Small and large prompts both travel on stdin and never appear in argv or a
 prompt file.
 
+`max_acp_stdout_bytes` bounds all stdout read from the Grok ACP child during
+one request, including protocol frames and native-tool updates. It defaults to
+4 MiB; set it per alias when a reviewed tool-enabled workload needs a larger
+bounded budget.
+
 ```toml
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 working_directory = "/srv/zeroclaw/grok-workspace"
 env_passthrough = ["XAI_API_KEY"]
+# Optional: 4 MiB by default; accepted range is 1-64 MiB.
+max_acp_stdout_bytes = 8388608
 ```
 
 Export `XAI_API_KEY` into the daemon environment before starting ZeroClaw. The

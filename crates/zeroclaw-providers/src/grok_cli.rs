@@ -31,7 +31,7 @@
 //! - defaults to `--no-plan`, `--sandbox strict`, `--permission-mode dontAsk`,
 //!   and an empty built-in tool set;
 //! - rejects ACP permission requests without cancelling the complete turn;
-//! - bounds ACP frames, aggregate stdout, assistant output, and stderr;
+//! - bounds ACP frames, configurable aggregate stdout, assistant output, and stderr;
 //! - kills the child process tree on success, failure, timeout, or cancellation;
 //! - never includes child stderr or raw ACP frames in public errors or logs.
 //!
@@ -222,6 +222,8 @@ pub struct GrokCliModelProvider {
     env_passthrough: Vec<String>,
     /// Operator-supplied argv tokens, after provider-owned flag validation.
     extra_args: Vec<String>,
+    /// Aggregate stdout budget for one ACP request.
+    max_acp_stdout_bytes: usize,
     /// Wall-clock timeout for the ACP request.
     timeout: Duration,
 }
@@ -237,6 +239,7 @@ pub struct GrokCliBuilder {
     working_directory: Option<String>,
     env_passthrough: Vec<String>,
     extra_args: Vec<String>,
+    max_acp_stdout_bytes: Option<usize>,
     timeout_secs: Option<u64>,
 }
 
@@ -268,6 +271,12 @@ impl GrokCliBuilder {
         self
     }
 
+    /// Set the aggregate stdout budget for one ACP request.
+    pub fn max_acp_stdout_bytes(mut self, max_acp_stdout_bytes: Option<usize>) -> Self {
+        self.max_acp_stdout_bytes = max_acp_stdout_bytes;
+        self
+    }
+
     /// Set the complete ACP request deadline. Zero uses the provider default.
     pub fn timeout_secs(mut self, timeout_secs: Option<u64>) -> Self {
         self.timeout_secs = timeout_secs;
@@ -285,6 +294,8 @@ impl GrokCliBuilder {
         let env_passthrough =
             GrokCliModelProvider::normalize_and_validate_env_passthrough(self.env_passthrough)?;
         let extra_args = GrokCliModelProvider::normalize_and_validate_extra_args(self.extra_args)?;
+        let max_acp_stdout_bytes =
+            GrokCliModelProvider::validate_acp_stdout_limit(self.max_acp_stdout_bytes)?;
         let timeout = self
             .timeout_secs
             .filter(|seconds| *seconds > 0)
@@ -296,6 +307,7 @@ impl GrokCliBuilder {
             working_directory,
             env_passthrough,
             extra_args,
+            max_acp_stdout_bytes,
             timeout,
         })
     }
@@ -427,6 +439,7 @@ impl GrokCliModelProvider {
             working_directory: None,
             env_passthrough: Vec::new(),
             extra_args: Vec::new(),
+            max_acp_stdout_bytes: None,
             timeout_secs: None,
         }
     }
@@ -449,6 +462,18 @@ impl GrokCliModelProvider {
             anyhow::bail!("grok_cli working_directory must identify a directory");
         }
         Ok(canonical)
+    }
+
+    fn validate_acp_stdout_limit(value: Option<usize>) -> anyhow::Result<usize> {
+        let limit = value.unwrap_or(acp::DEFAULT_ACP_STDOUT_LIMIT_BYTES);
+        if !(acp::MIN_ACP_STDOUT_LIMIT_BYTES..=acp::MAX_ACP_STDOUT_LIMIT_BYTES).contains(&limit) {
+            anyhow::bail!(
+                "grok_cli max_acp_stdout_bytes must be between {} and {} bytes",
+                acp::MIN_ACP_STDOUT_LIMIT_BYTES,
+                acp::MAX_ACP_STDOUT_LIMIT_BYTES
+            );
+        }
+        Ok(limit)
     }
 
     fn normalize_and_validate_env_passthrough(names: Vec<String>) -> anyhow::Result<Vec<String>> {
@@ -676,6 +701,7 @@ impl GrokCliModelProvider {
                 message,
                 &self.working_directory,
                 xai_api_key_available,
+                self.max_acp_stdout_bytes,
             ),
         )
         .await;
@@ -891,7 +917,40 @@ mod tests {
         );
         assert_eq!(model_provider.binary_path, PathBuf::from("grok"));
         assert!(model_provider.env_passthrough.is_empty());
+        assert_eq!(
+            model_provider.max_acp_stdout_bytes,
+            acp::DEFAULT_ACP_STDOUT_LIMIT_BYTES
+        );
         assert_eq!(model_provider.timeout, DEFAULT_GROK_CLI_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_uses_and_validates_acp_stdout_limit() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().to_str().expect("UTF-8 test path");
+        let configured = 8 * 1024 * 1024;
+        let model_provider = GrokCliModelProvider::builder("test")
+            .working_directory(cwd)
+            .max_acp_stdout_bytes(Some(configured))
+            .build()
+            .expect("configured limit");
+        assert_eq!(model_provider.max_acp_stdout_bytes, configured);
+
+        for invalid in [
+            0,
+            acp::MIN_ACP_STDOUT_LIMIT_BYTES - 1,
+            acp::MAX_ACP_STDOUT_LIMIT_BYTES + 1,
+        ] {
+            let result = GrokCliModelProvider::builder("test")
+                .working_directory(cwd)
+                .max_acp_stdout_bytes(Some(invalid))
+                .build();
+            let error = match result {
+                Ok(_) => panic!("invalid stdout limit must fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("max_acp_stdout_bytes"));
+        }
     }
 
     #[test]
@@ -1396,6 +1455,22 @@ while IFS= read -r line; do :; done
             )
         }
 
+        fn fake_provider_with_stdout_limit(
+            temp: &TempDir,
+            body: &str,
+            timeout_secs: u64,
+            max_acp_stdout_bytes: usize,
+        ) -> GrokCliModelProvider {
+            let binary = fake_grok(temp, body);
+            GrokCliModelProvider::builder("test")
+                .binary_path(Some(binary.to_str().expect("UTF-8 fake path")))
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .max_acp_stdout_bytes(Some(max_acp_stdout_bytes))
+                .timeout_secs(Some(timeout_secs))
+                .build()
+                .expect("provider")
+        }
+
         async fn wait_for_pid(path: &Path) -> i32 {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
@@ -1509,6 +1584,32 @@ sleep 30
                 .await
                 .expect_err("oversized frame must fail");
             assert!(error.to_string().contains("stdout frame exceeded"));
+        }
+
+        #[tokio::test]
+        async fn fake_child_honors_configured_stdout_limit() {
+            let temp = TempDir::new().expect("tempdir");
+            let body = r#"
+IFS= read -r line
+printf '%s' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}],"padding":"'
+head -c 600000 /dev/zero | tr '\000' x
+printf '%s\n' '"}}'
+IFS= read -r line
+printf '%s' '{"jsonrpc":"2.0","id":2,"result":{"padding":"'
+head -c 600000 /dev/zero | tr '\000' x
+printf '%s\n' '"}}'
+sleep 30
+"#;
+            let model_provider =
+                fake_provider_with_stdout_limit(&temp, body, 5, acp::MIN_ACP_STDOUT_LIMIT_BYTES);
+            let error = model_provider
+                .invoke_acp("hello", "default")
+                .await
+                .expect_err("configured aggregate stdout limit must fail");
+            assert!(error.to_string().contains(&format!(
+                "stdout exceeded {} bytes",
+                acp::MIN_ACP_STDOUT_LIMIT_BYTES
+            )));
         }
 
         #[tokio::test]
