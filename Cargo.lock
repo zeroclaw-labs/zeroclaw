@@ -13180,6 +13180,8 @@ dependencies = [
  "lru",
  "mail-parser",
  "matrix-sdk",
+ "matrix-sdk-base",
+ "matrix-sdk-test",
  "md5",
  "mime_guess",
  "nanohtml2text",

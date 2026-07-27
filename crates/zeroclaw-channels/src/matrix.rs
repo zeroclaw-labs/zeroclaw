@@ -1467,7 +1467,15 @@ mod inbound {
         pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
     }
 
-    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+    /// Register the inbound event handlers on `client`. The returned guards
+    /// keep the handlers alive; drop them to deregister.
+    pub(super) fn register_event_handlers(
+        client: &Client,
+        ctx: &HandlerCtx,
+    ) -> (
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+    ) {
         let handler_ctx = ctx.clone();
         let message_handler = client.add_event_handler(
             move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
@@ -1488,7 +1496,7 @@ mod inbound {
                 }
             },
         );
-        let _message_handler_guard = client.event_handler_drop_guard(message_handler);
+        let message_guard = client.event_handler_drop_guard(message_handler);
 
         // Surface inbound events the SDK couldn't decrypt by reacting ❓ on
         // the encrypted event so the operator notices a key gap in chat
@@ -1502,7 +1510,14 @@ mod inbound {
                     handle_undecryptable(ctx, ev, room).await;
                 }
             });
-        let _encrypted_handler_guard = client.event_handler_drop_guard(encrypted_handler);
+        let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
+
+        (message_guard, encrypted_guard)
+    }
+
+    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+        let (_message_handler_guard, _encrypted_handler_guard) =
+            register_event_handlers(&client, &ctx);
 
         ::zeroclaw_log::record!(
             INFO,
@@ -1583,7 +1598,7 @@ mod inbound {
         }
     }
 
-    pub(super) async fn handle_message(
+    async fn handle_message(
         ctx: HandlerCtx,
         ev: OriginalSyncRoomMessageEvent,
         room: Room,
@@ -2124,23 +2139,18 @@ mod inbound {
     }
 
     fn default_extension(kind: &MediaCategory, mime: Option<&str>) -> &'static str {
-        // Some Matrix clients append codec params (e.g. "audio/ogg; codecs=opus");
-        // match on the primary type only, mirroring `mime_for_audio` in transcription.rs.
-        let mime = mime.map(|m| m.split(';').next().unwrap_or(m).trim());
         if let Some(m) = mime {
-            match m {
+            // Audio MIMEs resolve through the canonical transcription-side
+            // mapping; non-audio types are display/on-disk naming only.
+            if let Some(ext) = crate::transcription::extension_for_audio_mime(m) {
+                return ext;
+            }
+            match m.split(';').next().unwrap_or(m).trim() {
                 "image/png" => return "png",
                 "image/jpeg" | "image/jpg" => return "jpg",
                 "image/gif" => return "gif",
                 "image/webp" => return "webp",
                 "video/mp4" => return "mp4",
-                "audio/ogg" => return "ogg",
-                "audio/mpeg" | "audio/mp3" => return "mp3",
-                "audio/wav" => return "wav",
-                "audio/flac" => return "flac",
-                "audio/opus" => return "opus",
-                "audio/webm" => return "webm",
-                "audio/mp4" | "audio/x-m4a" => return "m4a",
                 "application/pdf" => return "pdf",
                 _ => {}
             }
@@ -4149,20 +4159,38 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
 
-        use matrix_sdk::event_handler::RawEvent;
-        use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
         use matrix_sdk::ruma::serde::Raw;
-        use matrix_sdk::ruma::{room_id, user_id};
+        use matrix_sdk::ruma::{RoomId, room_id, user_id};
         use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::JoinedRoomBuilder;
         use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
         use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
-        use super::super::inbound::{HandlerCtx, handle_message};
+        use super::super::inbound::{HandlerCtx, register_event_handlers};
 
         const TRANSCRIPT: &str = "route level transcript of the voice note";
+
+        fn test_room() -> &'static RoomId {
+            room_id!("!room:localhost")
+        }
+
+        fn timeline_raw(json: &serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            Raw::new(json).expect("event json").cast_unchecked()
+        }
+
+        async fn recv_forwarded(
+            rx: &mut mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+        ) -> zeroclaw_api::channel::ChannelMessage {
+            tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("inbound message must be forwarded before timeout")
+                .expect("channel must stay open")
+        }
 
         // 0.1 s of a 440 Hz sine at 16 kHz mono 16-bit PCM: a genuinely
         // valid, decodable WAV file, generated in-test.
@@ -4291,9 +4319,7 @@ mod tests {
 
             let matrix = MatrixMockServer::new().await;
             let client = matrix.client_builder().build().await;
-            let room = matrix
-                .sync_joined_room(&client, room_id!("!room:localhost"))
-                .await;
+            matrix.sync_joined_room(&client, test_room()).await;
             mount_media_download(&matrix, &wav).await;
 
             let stt = stt_server().await;
@@ -4305,13 +4331,18 @@ mod tests {
                 tx,
             );
 
+            // The production handlers, registered exactly as `run_sync_loop`
+            // does; the event arrives through the real sync-dispatch pipeline.
+            let _guards = register_event_handlers(&client, &ctx);
             let json = voice_event_json("$audio1:localhost");
-            let ev: OriginalSyncRoomMessageEvent = serde_json::from_value(json.clone()).unwrap();
-            let raw = RawEvent(Raw::<serde_json::Value>::new(&json).unwrap().into_json());
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
 
-            handle_message(ctx, ev, room, raw).await.unwrap();
-
-            let msg = rx.recv().await.expect("inbound message must be forwarded");
+            let msg = recv_forwarded(&mut rx).await;
             assert!(
                 msg.content
                     .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
@@ -4351,9 +4382,7 @@ mod tests {
 
             let matrix = MatrixMockServer::new().await;
             let client = matrix.client_builder().build().await;
-            let room = matrix
-                .sync_joined_room(&client, room_id!("!room:localhost"))
-                .await;
+            matrix.sync_joined_room(&client, test_room()).await;
             mount_media_download(&matrix, &wav).await;
 
             // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
@@ -4376,6 +4405,7 @@ mod tests {
                 tx,
             );
 
+            let _guards = register_event_handlers(&client, &ctx);
             let json = serde_json::json!({
                 "type": "m.room.message",
                 "event_id": "$reply1:localhost",
@@ -4389,12 +4419,14 @@ mod tests {
                     }
                 }
             });
-            let ev: OriginalSyncRoomMessageEvent = serde_json::from_value(json.clone()).unwrap();
-            let raw = RawEvent(Raw::<serde_json::Value>::new(&json).unwrap().into_json());
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
 
-            handle_message(ctx, ev, room, raw).await.unwrap();
-
-            let msg = rx.recv().await.expect("inbound message must be forwarded");
+            let msg = recv_forwarded(&mut rx).await;
             assert!(
                 msg.content
                     .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
@@ -4406,6 +4438,94 @@ mod tests {
                 "marker must keep the parent's real filename: {}",
                 msg.content
             );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        // Encrypted-media variant: the event carries an E2EE `file` source;
+        // the homeserver serves ciphertext and the client decrypts during
+        // download, so the saved copy and the STT request must contain the
+        // original plaintext WAV.
+        #[tokio::test]
+        async fn encrypted_voice_note_decrypts_and_inserts_transcript() {
+            use std::io::Read as _;
+
+            use matrix_sdk::ruma::OwnedMxcUri;
+            use matrix_sdk::ruma::events::room::EncryptedFile;
+            use matrix_sdk_base::crypto::AttachmentEncryptor;
+
+            let wav = build_wav();
+            let mut reader = wav.as_slice();
+            let mut encryptor = AttachmentEncryptor::new(&mut reader);
+            let mut ciphertext = Vec::new();
+            encryptor.read_to_end(&mut ciphertext).unwrap();
+            let keys = encryptor.finish();
+            let file = EncryptedFile::new(
+                OwnedMxcUri::from("mxc://localhost/encryptedaudioblob"),
+                keys.encryption_info,
+                keys.hashes,
+            );
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &ciphertext).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$encaudio1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "file": serde_json::to_value(&file).unwrap(),
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted for encrypted media: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            assert_eq!(
+                std::fs::read(saved[0].path()).unwrap(),
+                wav,
+                "saved copy must be the decrypted plaintext"
+            );
+
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
     }
