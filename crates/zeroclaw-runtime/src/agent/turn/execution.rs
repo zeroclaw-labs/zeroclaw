@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::{ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -29,6 +29,24 @@ impl ResolvedModelAccess<'_> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        // This one-shot seam does NOT run `prepare_messages_for_provider` (the
+        // main iteration path does that upstream), so a tool-result
+        // `[AUDIO:/path]` in the history — e.g. the max-iteration graceful
+        // summary sends the accumulated history verbatim — would otherwise
+        // reach the provider as a raw filesystem path and be hallucinated
+        // over. Strip loadable audio markers here so every direct
+        // `run_model_query` caller is covered. Borrows untouched when clean.
+        let ChatRequest {
+            messages,
+            tools,
+            thinking,
+        } = request;
+        let sanitized = multimodal::sanitize_audio_markers(messages);
+        let request = ChatRequest {
+            messages: &sanitized,
+            tools,
+            thinking,
+        };
         let resp = ProviderDispatch::from_ref(self.model_provider)
             .chat(request, self.model, self.temperature)
             .await?;
@@ -54,6 +72,11 @@ pub struct ResolvedAgentExecution<'a> {
     pub approval: Option<&'a ApprovalManager>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config, for resolving the configured `vision_model_provider`'s
+    /// alias-specific runtime options (the `vision` override, endpoint URI,
+    /// credentials) on the vision route. `None` on configless (test) paths,
+    /// where the route falls back to the legacy factory.
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     /// Agentic loop iteration cap.
     pub max_tool_iterations: usize,
     /// Lifecycle hooks; `None` when unconfigured.
@@ -92,6 +115,9 @@ pub struct ResolvedIo<'a> {
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config for vision-route provider-alias resolution; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::config`].
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     pub hooks: Option<&'a HookRunner>,
     pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,
     pub model_switch_callback: Option<ModelSwitchCallback>,
@@ -126,6 +152,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             silent: io.silent,
             approval: io.approval,
             multimodal_config: io.multimodal_config,
+            config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,
             hooks: io.hooks,
             excluded_tools: runtime.excluded_tools,

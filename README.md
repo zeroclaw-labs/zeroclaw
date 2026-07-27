@@ -45,7 +45,9 @@ cd zeroclaw
 ./install.sh
 ```
 
-The installer asks whether you want a prebuilt binary (fast, ~seconds) or a source build (slower, customisable). Both end the same way: `zeroclaw quickstart` kicks off automatically.
+The piped installer uses a prebuilt binary when one is available and falls back to a source build otherwise. It skips interactive setup and prints `zeroclaw quickstart` as the next step.
+
+When the platform maps to a supported prebuilt target, running `./install.sh` from a clone in an interactive terminal offers prebuilt or source installation; other platforms build from source. The source path also lets you select apps and optional features. For an unconfigured install, the installer then offers CLI or browser-based Quickstart. Use `--skip-quickstart` when you only want to install.
 
 > **Working on the docs?** The translated documentation catalogues live in a
 > git submodule (`docs/book/po`). The Rust build does not need it, but building

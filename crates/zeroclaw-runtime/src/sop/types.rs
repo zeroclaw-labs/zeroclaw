@@ -156,7 +156,7 @@ pub enum SopTrigger {
         /// Request path matched exactly against the event path.
         path: String,
     },
-    /// Time-based firing. Defined and matched, but no scheduler feeds it.
+    /// Time-based firing. Live: dispatched by the SOP maintenance tick (daemon / channel-start paths).
     #[trigger(display = "expression")]
     Cron {
         /// Cron expression evaluated over the run window.
@@ -372,6 +372,23 @@ pub struct SopStep {
     /// Capability arguments, serialized as `with` in TOML/JSON definitions.
     #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
     pub capability_input: Option<serde_json::Value>,
+    /// Approval policy name (a key in `[sop.approval].policies`) the approval broker
+    /// enforces for this step's gate: required approver group + quorum. `None` keeps
+    /// today's behavior (`approval_mode` alone governs, no membership/quorum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Authored gate-notice template for a HITL step (`- prompt:` bullet).
+    /// `{{path.to.field}}` placeholders resolve against the step's piped input
+    /// (the trigger payload at step 1, the previous step's output later) — pure
+    /// lookups, no logic. Rendered into the out-of-band approval notice so the
+    /// approver sees WHAT they are approving; absent = an automatic summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_prompt: Option<String>,
+    /// Editable-field opt-in for a checkpoint step (`- edit: body` bullet): the
+    /// named field of the piped value an approver may amend before the run
+    /// resumes (the gate prompt gains an "Edit" choice). Absent = no editing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<String>,
 }
 
 impl Default for SopStep {
@@ -393,6 +410,9 @@ impl Default for SopStep {
             agent: None,
             capability: None,
             capability_input: None,
+            policy: None,
+            gate_prompt: None,
+            edit: None,
         }
     }
 }
@@ -473,6 +493,15 @@ pub struct Sop {
     /// Steps execute sequentially without LLM round-trips.
     #[serde(default)]
     pub deterministic: bool,
+    /// How to handle a trigger that cannot be admitted immediately because this
+    /// SOP's execution slots are full (A2). Default `parallel`.
+    #[serde(default)]
+    pub admission_policy: SopAdmissionPolicy,
+    /// Upper bound on runs of this SOP parked at a HITL approval at once
+    /// (`0` = unlimited). Once reached, further triggers are deferred (surfaced for
+    /// backpressure/redelivery) rather than silently dropped. Default `0`.
+    #[serde(default = "default_max_pending_approvals")]
+    pub max_pending_approvals: u32,
     /// Parent agent alias that owns this procedure. Every `execute` step runs
     /// as this agent unless the step names its own `agent` override. Required
     /// for headless triggers (mqtt, webhook, cron, amqp), which have no
@@ -487,6 +516,65 @@ fn default_cooldown_secs() -> u64 {
 
 fn default_max_concurrent() -> u32 {
     1
+}
+
+fn default_max_pending_approvals() -> u32 {
+    0
+}
+
+/// How concurrent triggers are handled when a SOP's execution slots are full. A
+/// run parked at a HITL approval releases its slot (A1), so this governs the
+/// remaining case: too many runs actively *executing* at once. No variant ever
+/// silently drops a trigger except `Drop`, which is explicit opt-in.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SopAdmissionPolicy {
+    /// Admit up to `max_concurrent` concurrent runs; a trigger that cannot admit
+    /// now is DEFERRED (surfaced for backpressure/redelivery), never silently
+    /// dropped. Best fit for independent work like PR-request approvals.
+    #[default]
+    Parallel,
+    /// Serialize: admit only when no run of this SOP is active or parked; other
+    /// triggers are deferred. For pipelines whose pre-approval steps must not overlap.
+    Hold,
+    /// Collapse concurrent triggers: when a run is already in flight for this SOP a
+    /// new trigger is coalesced (dropped as redundant - the in-flight run already
+    /// covers the latest state). For "only current state matters" SOPs.
+    Coalesce,
+    /// Legacy fire-and-forget: a trigger that cannot admit now is dropped. Explicit
+    /// opt-in only; never the default.
+    Drop,
+}
+
+impl fmt::Display for SopAdmissionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parallel => write!(f, "parallel"),
+            Self::Hold => write!(f, "hold"),
+            Self::Coalesce => write!(f, "coalesce"),
+            Self::Drop => write!(f, "drop"),
+        }
+    }
+}
+
+/// A2: the outcome of evaluating a matched trigger against a SOP's
+/// `SopAdmissionPolicy`. Advisory - `Admit` still passes through the authoritative
+/// CAS `start_run`; the non-admit variants are surfaced by the dispatch layer
+/// (logged + carried on `DispatchResult`) so a trigger is never silently lost.
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SopAdmission {
+    /// A slot is available - proceed to start the run.
+    Admit,
+    /// Cannot admit now (execution slots or the pending-approval pool are full).
+    /// Apply backpressure / redelivery rather than dropping.
+    Defer { reason: String },
+    /// A run is already in flight for this SOP; collapse this trigger into it.
+    Coalesce { existing_run_id: String },
+    /// Drop this trigger: either the `drop` policy with no free slot, or a cooldown
+    /// / unknown SOP (which drop regardless of policy).
+    Drop { reason: String },
 }
 
 // ── TOML manifest (internal parse target) ───────────────────────
@@ -532,6 +620,12 @@ pub struct SopMeta {
     /// Opt-in deterministic execution (no LLM round-trips between steps).
     #[serde(default)]
     pub deterministic: bool,
+    /// Concurrent-trigger admission policy (`parallel` | `hold` | `coalesce` | `drop`).
+    #[serde(default)]
+    pub admission_policy: SopAdmissionPolicy,
+    /// Max runs parked at a HITL approval at once (`0` = unlimited).
+    #[serde(default = "default_max_pending_approvals")]
+    pub max_pending_approvals: u32,
     /// Parent agent alias that owns the procedure. Steps run as this agent
     /// unless a step overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,6 +644,8 @@ impl SopManifest {
                 cooldown_secs: sop.cooldown_secs,
                 max_concurrent: sop.max_concurrent,
                 deterministic: sop.deterministic,
+                admission_policy: sop.admission_policy,
+                max_pending_approvals: sop.max_pending_approvals,
                 agent: sop.agent.clone(),
             },
             triggers: sop.triggers.clone(),
@@ -672,6 +768,13 @@ pub struct SopStepResult {
     pub output: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// The agent whose policy/tools/provider actually executed this step —
+    /// the acting authority the audit record must name. For a step that
+    /// delegated to a different agent this is the step agent, not the turn's
+    /// outer agent; `None` for deterministic/checkpoint steps, drivers with
+    /// no resolved alias, and legacy records persisted before capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent: Option<String>,
     /// Ordered tool invocations made while executing this step. Empty
     /// for checkpoint steps and legacy records persisted before capture.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -699,6 +802,19 @@ pub struct SopRun {
     /// Number of LLM calls saved by deterministic execution in this run.
     #[serde(default)]
     pub llm_calls_saved: u64,
+    /// Gate-presentation counter: bumped on each `Revise` re-presentation AND on
+    /// each new checkpoint park after the first, so EVERY prompt this run ever
+    /// sends has a unique revision-qualified reference (`<run_id>#<rev>`; bare =
+    /// 0, the run's very first gate). An answer on a superseded prompt — an older
+    /// draft, or an earlier GATE's leftover buttons — can never resolve the
+    /// current one.
+    #[serde(default)]
+    pub revision: u32,
+    /// `revision` as of the CURRENT gate's first presentation. `revision -
+    /// revision_base` = re-drafts spent at this gate (the per-gate revise cap);
+    /// reset when a new checkpoint parks, untouched by revise re-parks.
+    #[serde(default)]
+    pub revision_base: u32,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -785,7 +901,28 @@ pub struct DeterministicSavings {
 pub enum SopRunAction {
     /// Inject this step into the agent for execution. `step.agent` is the
     /// resolved effective agent (step override then parent), not the raw
-    /// persisted override; consumers must not re-resolve it.
+    /// persisted override; consumers must not re-resolve it. Consumers MUST run
+    /// the step AS that effective agent: when it names a different agent than
+    /// the one running the turn, the step's COMPLETE per-agent execution
+    /// contract must be re-assembled for that agent, never inherited from the
+    /// parent turn — its gated tool registry, security policy, MCP scope,
+    /// provider binding (incl. the agent's own temperature), resolved runtime
+    /// controls (iteration/result/context limits, parsing/parallelism, dedup
+    /// exemptions, tool filter groups), and an approval manager built from the
+    /// step agent's risk profile under the parent surface's interactivity mode
+    /// (a live operator approval route survives delegation). The step runs on
+    /// an EXPLICIT child transcript (the step agent's own system prompt plus
+    /// the step context); the parent turn's conversation is never sent to the
+    /// step agent's provider, and only the step's final output flows back.
+    /// Records emitted while the step runs stamp the step agent as the acting
+    /// identity, with the delegating agent preserved as parent correlation.
+    /// A driver path that carries the re-assembly handle (the live runtime and
+    /// channel-orchestrator turn paths) re-assembles the step agent; a path
+    /// that does NOT carry it (e.g. a bounded delegate sub-loop) MUST fail the
+    /// cross-agent step CLOSED rather than run it with the parent's context.
+    /// Either way the invariant holds: a cross-agent step never executes with
+    /// a broader scope than its own agent — it is re-assembled or it is
+    /// refused.
     ExecuteStep {
         run_id: String,
         step: SopStep,
@@ -1284,6 +1421,7 @@ path = "/sop/test"
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "Step 1 done".into(),
@@ -1293,6 +1431,8 @@ path = "/sop/test"
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

@@ -10,6 +10,25 @@ use crate::sop::engine::now_iso8601;
 use crate::sop::engine::{GateState, SopEngine};
 use crate::sop::types::SopRunStatus;
 
+/// True if `approval_mode` rejects this principal outright: the agent cannot
+/// self-satisfy under `OutOfBandRequired`, and an out-of-band principal cannot
+/// satisfy under `AgentTool`. Shared by `resolve_gate` and the approval
+/// broker's quorum vote-recording path (`ApprovalBroker::resolve`), which must
+/// apply this check BEFORE appending a vote - not just at the final
+/// `resolve_gate` call that reaches quorum - so a principal `approval_mode`
+/// would reject can never durably vote at all, even toward a quorum a
+/// different, valid principal later completes.
+pub(crate) fn is_rejected_by_approval_mode(
+    mode: ApprovalMode,
+    principal: &ApprovalPrincipal,
+) -> bool {
+    match mode {
+        ApprovalMode::Both => false,
+        ApprovalMode::OutOfBandRequired => !principal.is_out_of_band(),
+        ApprovalMode::AgentTool => principal.is_out_of_band(),
+    }
+}
+
 /// Resolve a waiting SOP gate. The ONLY place a `WaitingApproval` gate clears.
 pub fn resolve_gate(
     engine: &mut SopEngine,
@@ -28,40 +47,107 @@ pub fn resolve_gate(
     //    OutOfBandRequired; an out-of-band principal cannot satisfy under AgentTool.
     //    Layered ON TOP of execution_mode/priority/requires_confirmation (those
     //    already decided that the gate exists).
-    let mode = engine.config().approval_mode;
-    let rejected = match mode {
-        ApprovalMode::Both => false,
-        ApprovalMode::OutOfBandRequired => !principal.is_out_of_band(),
-        ApprovalMode::AgentTool => principal.is_out_of_band(),
-    };
-    if rejected {
+    if is_rejected_by_approval_mode(engine.config().approval_mode, &principal) {
         return Ok(ResolveOutcome::RejectedSelfApproval);
     }
 
-    if let Err(e) = engine.record_gate_event(GateLedgerEntry {
+    // Amend/Revise are deterministic-checkpoint decisions (resolve_checkpoint
+    // owns them); an approval gate has no draft to edit or re-run. Refuse HERE,
+    // before the claim reacquire and the ledger append, so no side effect records
+    // a decision that was never applied.
+    if matches!(
+        decision,
+        ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. }
+    ) {
+        return Err(anyhow::Error::msg(format!(
+            "run {run_id} is parked at an approval gate; amend/revise apply only to \
+             deterministic checkpoints — approve or deny instead"
+        )));
+    }
+
+    // 2a. Refuse to resolve an approval while the run's parked snapshot has not
+    //     yet been durably persisted (`persist_parked_snapshot_then_release_claim`'s
+    //     fail-closed keep, tracked in `claims_pending_persist`). That claim
+    //     predates this resolve attempt; reacquiring on top of it would give a
+    //     later rollback (on a ledger-append failure) no way to tell "freshly
+    //     reacquired by ME, safe to release on failure" from "pre-existing kept
+    //     claim, must survive" - releasing it would strand the run BOTH
+    //     claimless AND unpersisted. Fail closed here instead: the gate stays
+    //     waiting, re-resolvable once a maintenance tick's retry durably
+    //     persists the park.
+    if matches!(decision, ApprovalDecision::Approve) && engine.is_park_persist_pending(run_id) {
+        return Err(anyhow::Error::msg(format!(
+            "cannot approve run {run_id}: its parked snapshot is not yet durably persisted (retrying)"
+        )));
+    }
+
+    // 2b. Pre-flight the fallible transition lookups BEFORE reacquiring the claim
+    //     or writing the ledger row (approvals only). `clear_waiting_gate` can still
+    //     fail AFTER the audit append if the SOP was removed or its waiting step no
+    //     longer resolves (operator edited/removed the SOP while the run sat parked).
+    //     If that Err surfaced after step 3, a durable `gate_resolved` row would
+    //     exist for a gate that never cleared (metrics counting a phantom approval)
+    //     AND the reacquired exec slot would leak. Validating the same lookups here,
+    //     under the engine mutex, makes the resolution fail closed with the gate
+    //     untouched (still WaitingApproval, re-resolvable) - no claim, no ledger row.
+    if matches!(decision, ApprovalDecision::Approve) {
+        engine.can_clear_waiting_gate(run_id)?;
+    }
+
+    // 2c. Secure the exec claim BEFORE the audit row (approvals only). A run parked
+    //     at the gate released its slot; resuming must re-acquire it. Doing this
+    //     BEFORE the `gate_resolved` append means a claim-store failure aborts the
+    //     resolution WITHOUT writing a false "resolved" audit row (which metrics
+    //     would otherwise count as a real approval) and leaves the gate waiting.
+    //     It also guarantees the run holds its claim before ANY transition out of
+    //     WaitingApproval - including the `Pending` (route-ineligible) branch inside
+    //     clear_waiting_gate - so a live non-terminal run is never claimless.
+    if matches!(decision, ApprovalDecision::Approve)
+        && let Err(e) = engine.reacquire_claim_on_resume(run_id)
+    {
+        if crate::sop::engine::err_is_resume_at_capacity(&e) {
+            // Approved, but every exec slot is full: re-admitting would exceed
+            // the per-SOP or global cap. Leave the gate untouched
+            // (WaitingApproval, re-resolvable) - no ledger row, no claim - and
+            // report backpressure. A later resolve, or the timeout tick's retry,
+            // resumes it once a slot frees. This is what enforces the documented
+            // concurrency caps on resume: an over-cap resume is refused, never
+            // oversubscribed.
+            return Ok(ResolveOutcome::DeferredAtCapacity);
+        }
+        return Err(e);
+    }
+
+    // 3. Build the audit-of-record row, but do not append it independently.
+    //    The row and the run transition below must commit as ONE store outcome:
+    //    an immutable `gate_resolved` row is only true if the corresponding
+    //    `WaitingApproval -> Running/Cancelled` state transition also persisted.
+    let gate_revision = engine
+        .get_run(run_id)
+        .map(|run| run.revision)
+        .unwrap_or_default();
+    let gate_event = GateLedgerEntry {
         run_id: run_id.to_string(),
         step,
+        gate_revision: Some(gate_revision),
+        checkpoint_revision: None,
+        decision_identity: None,
         kind: GateEventKind::Resolved,
         decision: Some(decision.clone()),
         principal: principal.clone(),
         ts: now_iso8601(),
-    }) {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"run_id": run_id, "error": e.to_string()})),
-            "SOP gate resolution aborted: could not persist the audit ledger row (fail-closed)"
-        );
-        return Err(anyhow::Error::msg(format!(
-            "failed to persist approval ledger event: {e}"
-        )));
     }
+    .into_event_record();
 
-    // 4. Apply the decision (only after the audit row is durable).
+    // 4. Apply the decision and persist it atomically with the ledger row.
     let outcome = match decision {
         ApprovalDecision::Approve => {
-            let action = engine.clear_waiting_gate(run_id)?;
+            let action = match engine.clear_waiting_gate_with_event(run_id, &gate_event) {
+                Ok(action) => action,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
             // Meter the approval at the chokepoint (every principal, exactly once):
             // a `system` principal is a timeout auto-approval, any other a human
             // approval. Keeps the live counters in lockstep with the ledger-sourced
@@ -71,8 +157,20 @@ pub fn resolve_gate(
         }
         ApprovalDecision::Deny { reason } => {
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
-            engine.finish_run(run_id, SopRunStatus::Cancelled, Some(why));
+            engine.finish_run_with_gate_event(
+                run_id,
+                SopRunStatus::Cancelled,
+                Some(why),
+                &gate_event,
+            )?;
             ResolveOutcome::Denied
+        }
+        // Rejected at entry (before the claim reacquire and ledger append);
+        // defensive so this match stays exhaustive without a panic path.
+        ApprovalDecision::Amend { .. } | ApprovalDecision::Revise { .. } => {
+            return Err(anyhow::Error::msg(
+                "amend/revise apply only to deterministic checkpoints",
+            ));
         }
     };
 
@@ -112,8 +210,23 @@ mod tests {
         fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
             self.inner.save_run(run)
         }
+        fn save_run_with_event(
+            &self,
+            _run: &PersistedRun,
+            _ev: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
+        }
         fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
             self.inner.finish_run(run_id, terminal)
+        }
+        fn finish_run_with_event(
+            &self,
+            _run_id: &str,
+            _terminal: &PersistedRun,
+            _ev: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            Err(StoreError::Backend("injected append failure".into()))
         }
         fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
             self.inner.load_active_runs()
@@ -220,6 +333,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -273,7 +388,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         )
         .unwrap();
         assert!(out.is_resumed(), "first approve resumes");
@@ -350,7 +465,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         )
         .unwrap();
         let events = e.run_events(&id).unwrap();
@@ -358,7 +473,7 @@ mod tests {
             .iter()
             .find(|ev| ev.kind == "gate_resolved")
             .expect("a gate_resolved ledger row");
-        assert_eq!(resolved.actor.as_deref(), Some("alice"));
+        assert_eq!(resolved.actor.as_deref(), Some("ZeroClawOperator"));
         assert_eq!(resolved.payload["source"], "cli");
     }
 
@@ -385,7 +500,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         )
         .unwrap();
         assert_eq!(
@@ -442,7 +557,7 @@ mod tests {
             &mut e,
             &id,
             ApprovalDecision::Approve,
-            ApprovalPrincipal::cli(Some("alice".into())),
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
         );
         assert!(
             res.is_err(),
@@ -451,6 +566,61 @@ mod tests {
         assert!(
             matches!(e.gate_state(&id), GateState::Waiting { .. }),
             "the gate must remain WaitingApproval when its audit row could not be persisted"
+        );
+    }
+
+    #[test]
+    fn approve_fails_closed_when_sop_removed_while_parked() {
+        // Regression: the transition `clear_waiting_gate` can still fail AFTER the
+        // gate ledger append if the operator removed/shrank the SOP while the run sat
+        // parked. Without the step-2b pre-flight, that would leave a durable
+        // `gate_resolved` row for a gate that never cleared (a phantom approval in the
+        // metrics) AND leak the reacquired exec slot. The pre-flight must make the
+        // whole resolution fail closed BEFORE the claim + ledger.
+        let cfg = SopConfig {
+            approval_mode: ApprovalMode::Both,
+            ..Default::default()
+        };
+        let store = Arc::new(InMemoryRunStore::new());
+        let mut e = SopEngine::new(cfg).with_store(store.clone());
+        e.set_sops_for_test(vec![supervised_sop("deploy")]);
+        let id = start_waiting(&mut e);
+
+        // Operator removes the SOP definition out from under the parked run.
+        e.set_sops_for_test(vec![]);
+
+        let res = resolve_gate(
+            &mut e,
+            &id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(Some("ZeroClawOperator".into())),
+        );
+        assert!(
+            res.is_err(),
+            "resolution must fail closed when the SOP is gone, not half-commit"
+        );
+
+        // No false `gate_resolved` ledger row was written (metrics would otherwise
+        // count a phantom approval): the pre-flight aborts BEFORE the append.
+        let events = store.list_events(&id).unwrap();
+        assert!(
+            !events.iter().any(|ev| ev.kind == "gate_resolved"),
+            "a removed-SOP resolution must not leave a phantom gate_resolved row: {events:?}"
+        );
+
+        // The gate is genuinely still waiting - the approval was not lost.
+        assert!(
+            matches!(e.gate_state(&id), GateState::Waiting { .. }),
+            "the gate must remain WaitingApproval after a failed-closed resolution"
+        );
+
+        // The exec slot was not leaked: restore the SOP and a fresh trigger must admit.
+        // With max_concurrent=1, a claim leaked by the parked run would defer this.
+        e.set_sops_for_test(vec![supervised_sop("deploy")]);
+        let action = e.start_run("deploy", manual()).unwrap();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "a fresh run must admit - no phantom exec slot held by the parked run: {action:?}"
         );
     }
 

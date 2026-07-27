@@ -81,6 +81,7 @@ mod tests {
     fn run_data_ignores_failed_and_skipped_outputs() {
         let results = vec![
             SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Failed,
                 output: r#"{"failed":true}"#.into(),
@@ -89,6 +90,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
             SopStepResult {
+                effective_agent: None,
                 step_number: 2,
                 status: SopStepStatus::Skipped,
                 output: r#"{"skipped":true}"#.into(),
@@ -97,6 +99,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
             SopStepResult {
+                effective_agent: None,
                 step_number: 3,
                 status: SopStepStatus::Completed,
                 output: r#"{"ok":true}"#.into(),

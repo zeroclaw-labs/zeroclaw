@@ -44,6 +44,9 @@ pub struct PropPutBody {
     pub comment: Option<String>,
 }
 
+/// One JSON Patch operation. Supports `add`, `remove`, `replace`, `test`, and
+/// ZeroClaw's `comment` extension. Every operation requires `path`; `add`,
+/// `replace`, and `test` require `value`, while `comment` requires `comment`.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PatchOp {
@@ -80,6 +83,7 @@ pub struct PatchOpResult {
 pub struct PatchResponse {
     pub saved: bool,
     pub results: Vec<PatchOpResult>,
+    /// Non-fatal validation warnings against the saved configuration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
@@ -181,6 +185,7 @@ pub struct SecretResponse {
     pub populated: bool,
 }
 
+/// Single entry in the list response for configuration properties.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ListEntry {
@@ -253,6 +258,7 @@ pub struct ListResponse {
     pub drifted: Vec<DriftEntry>,
 }
 
+/// One drift entry surfaced when in-memory Config diverges from the on-disk file.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DriftEntry {
@@ -884,6 +890,8 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
+    /// Whether any config write has landed since the last admin reload and may
+    /// still require subsystem re-instantiation to take effect.
     pub pending_reload: bool,
 }
 
@@ -2153,8 +2161,9 @@ pub struct InitResponse {
 }
 
 /// POST /api/config/init?section=model_providers — instantiate `None` nested
-/// sections with defaults. Mirrors `zeroclaw config init`. When every
-/// requested section is already configured, returns `{initialized: []}`.
+/// sections with defaults, and only those: dynamic-map aliases are created
+/// through `POST /api/config/map-key`. When every requested section is already
+/// configured, returns `{initialized: []}`.
 pub async fn handle_init(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2572,6 +2581,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -2599,6 +2609,139 @@ mod tests {
             .to_bytes();
         let json = serde_json::from_slice(&body).expect("valid json response");
         (status, json)
+    }
+
+    // Every config in this module must come from `temp_config`: the success-path
+    // tests below fall through into real persistence (`persist_and_swap` ->
+    // `save_dirty`), and a bare `Config::default()` would write the developer's
+    // live `~/.zeroclaw/config.toml`.
+
+    #[tokio::test]
+    async fn prop_put_does_not_materialize_resource_keyed_rate_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(temp_config(&tmp));
+        let (status, json) = response_json(
+            handle_prop_put(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(PropPutBody {
+                    path: "cost.rates.providers.models.openai.gpt-5.input_per_mtok".to_string(),
+                    value: serde_json::json!(1.5),
+                    comment: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], "path_not_found");
+        assert!(
+            state
+                .config
+                .read()
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn prop_put_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .create_map_key("cost.rates.providers.models.openai", "gpt-4.1")
+            .unwrap();
+        let state = test_state(config);
+        let (status, _json) = response_json(
+            handle_prop_put(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(PropPutBody {
+                    path: "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok".to_string(),
+                    value: serde_json::json!(1.5),
+                    comment: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        // In-memory, not the saved TOML: a dotted map key never reaches disk
+        // through the incremental dirty-path write, so a disk assertion would be
+        // vacuous in both directions.
+        assert_eq!(
+            state
+                .config
+                .read()
+                .get_map_keys("cost.rates.providers.models.openai")
+                .expect("known section"),
+            vec!["gpt-4.1".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn prop_put_still_materializes_operator_chosen_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(temp_config(&tmp));
+        // Secret path: the response envelope is `{path, populated}`, not `value`.
+        let (status, _json) = response_json(
+            handle_prop_put(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(PropPutBody {
+                    path: "channels.telegram.newbot.bot_token".to_string(),
+                    value: serde_json::json!("tok"),
+                    comment: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.config.read().channels.telegram.contains_key("newbot"));
+    }
+
+    #[tokio::test]
+    async fn patch_add_does_not_materialize_resource_keyed_rate_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        // `compute_drift` reads the on-disk file, so it has to exist.
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "add",
+                    "path": "/cost/rates/providers/models/openai/gpt-5/input_per_mtok",
+                    "value": 1.5
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], "path_not_found");
+        assert!(
+            state
+                .config
+                .read()
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .is_empty()
+        );
     }
 
     #[tokio::test]

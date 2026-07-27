@@ -1,4 +1,11 @@
 //! Keymap abstraction for zerocode.
+//!
+//! Each leaf action enum carries its own default bindings inline.
+//! Consumers call `ChatTabAction::from_chord(&key)` directly — no
+//! `Keymap` struct, no plumbed argument.
+//!
+//! On darwin, `Chord::matches` translates most `CTRL` modifiers to
+//! `SUPER`; terminal-owned control chords remain literal.
 
 pub mod actions;
 mod chord;
@@ -8,13 +15,23 @@ pub mod overrides;
 pub use actions::*;
 pub use chord::Chord;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn chord_bypasses_text_input(chord: &Chord) -> bool {
+    if !matches!(chord.code, KeyCode::Char(_)) {
+        return true;
+    }
+
+    let mut modifiers = chord.modifiers;
+    modifiers.remove(KeyModifiers::SHIFT);
+    !modifiers.is_empty()
+}
 
 pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
     GlobalAction::Help
         .resolved()
         .iter()
-        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+        .any(|chord| chord_bypasses_text_input(chord) && chord.matches(event))
 }
 
 /// Uniform interface over every `keyactions!`-generated enum so generic
@@ -61,7 +78,7 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
 }
 
 /// Rendered, OS-aware key labels for an action's currently-resolved
-/// chords (e.g. `["Tab"]`, `["⌘K"]`). Help surfaces use this so the keys
+/// chords (e.g. `["Tab"]`, `["⌘x"]`). Help surfaces use this so the keys
 /// they advertise track the live keybinding registry instead of literals.
 pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
     action.resolved().iter().map(Chord::display).collect()
@@ -79,13 +96,51 @@ mod tests {
     }
 
     #[test]
-    fn global_help_resolves_from_question_mark_and_f1() {
+    fn global_help_resolves_from_question_mark_and_control_g() {
         let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
         assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
-        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
-        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
-        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
-        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
+        let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_g), Some(GlobalAction::Help));
+    }
+
+    #[test]
+    fn help_bypass_distinguishes_text_from_command_chords() {
+        let cases = [
+            (
+                Chord::char('?'),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                false,
+            ),
+            (
+                Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                false,
+            ),
+            (
+                Chord::key(KeyCode::F(1)),
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                true,
+            ),
+            (
+                Chord::ctrl('g'),
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                true,
+            ),
+        ];
+
+        for (chord, event, expected) in cases {
+            assert!(chord.matches(&event));
+            assert_eq!(chord_bypasses_text_input(&chord), expected, "{chord:?}");
+        }
+    }
+
+    #[test]
+    fn browse_enter_resolves_from_control_k() {
+        let ev = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(
+            ChatTabAction::from_chord(&ev),
+            Some(ChatTabAction::BrowseEnter)
+        );
     }
 
     #[test]

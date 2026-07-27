@@ -111,7 +111,7 @@ where
         DrainOutcome::ExplicitCancel => {
             match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
                 Ok(joined) => outcome_from_task_result(
-                    joined.map_err(|e| TurnError::Panicked(format!("{e}")))?,
+                    joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
                 Err(_) => {

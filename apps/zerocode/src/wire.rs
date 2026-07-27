@@ -79,7 +79,34 @@ pub struct ModelProviderChoice {
 pub struct ChannelQuickStart {
     pub channel_type: String,
     pub alias: String,
-    pub token: Option<String>,
+    /// Schema-keyed fields from `quickstart/fields`. ZeroCode's initialize
+    /// handshake rejects daemon package-version mismatches before this wire
+    /// shape can be submitted.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fields: HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod quickstart_wire_tests {
+    use super::*;
+
+    #[test]
+    fn channel_quickstart_wire_shape_matches_runtime_contract() {
+        let channel = ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "ops".into(),
+            fields: HashMap::from([("bot_token".into(), "123:ABC".into())]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(channel).expect("serialize channel"),
+            serde_json::json!({
+                "channel_type": "telegram",
+                "alias": "ops",
+                "fields": { "bot_token": "123:ABC" }
+            })
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

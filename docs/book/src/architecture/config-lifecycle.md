@@ -67,6 +67,14 @@ Review config changes with this invariant in mind:
 - Save paths must preserve encrypted secrets and external secret references
   unless the same path was intentionally edited.
 
+## Credential inputs stay typed
+
+Credential-like runtime values are still config values. API keys, OAuth tokens, endpoint URLs, and other provider/channel credentials should flow through the typed config schema, config secret handling, or schema-mirror `ZEROCLAW_*` overrides before a runtime constructor sees them.
+
+Do not add ad-hoc `std::env::var("PROVIDER_API_KEY")` reads inside provider, channel, tool, transcription, TTS, memory, or gateway constructors. That creates a second credential source outside `Config`, bypasses env-override visibility, and can make CLI, gateway, RPC/TUI, quickstart, and reload behavior disagree.
+
+If ZeroClaw intentionally supports a native environment bridge for an integration family, document that bridge at the integration boundary and map it into the same typed config value before construction. Otherwise, ecosystem-default shell names such as `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or `QDRANT_URL` should be bridged by operators into the corresponding `ZEROCLAW_*` schema-mirror variable; see [Environment variables](../reference/env-vars.md#bridging-ecosystem-default-env-vars).
+
 ## Dirty paths and incremental writes
 
 Most editing surfaces use `Config::mark_dirty()` plus `save_dirty()`, not a
@@ -160,6 +168,7 @@ For config-schema, env-var, default, or reload changes, ask:
   prose?
 - Are env overrides load-time only and masked during saves?
 - Do CLI, gateway, RPC/TUI, and quickstart surfaces agree on the dotted path?
+- Are credentials resolved through typed config or documented schema-mirror bridges rather than ad-hoc provider-native env reads?
 - Does a save survive process reload, not just immediate in-memory rendering?
 - Does the PR say whether users need reload, restart, migration, or manual
   rollback?

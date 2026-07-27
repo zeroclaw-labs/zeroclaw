@@ -1,16 +1,8 @@
 # Feature and support matrix
 
-A single-page inventory of what ZeroClaw supports today, compared against
-[OpenClaw](https://github.com/openclaw/openclaw) and
-[Hermes](https://github.com/NousResearch/hermes-agent). It exists so a reader can answer "does ZeroClaw do X?"
-without walking the whole book.
+A high-level inventory of selected ZeroClaw capability sets, compared against [OpenClaw](https://github.com/openclaw/openclaw) and [Hermes](https://github.com/NousResearch/hermes-agent). It provides a quick starting point; feature-gated, non-default, and runtime-only capabilities may require the linked subsystem documentation.
 
-The **ZeroClaw** column is not hand-maintained: it is regenerated on every docs
-build by walking the binary's own registries (the channel inventory, the
-canonical provider slots, and the default tool set), so this page cannot fall
-out of sync with the code. The **OpenClaw** and **Hermes** columns come from
-`docs/book/feature-matrix-parity.toml`, the single reviewable source for parity
-facts the binary has no knowledge of.
+The generated **ZeroClaw** sections below each reflect a specific source: the curated `ChannelsConfig::channels()` metadata list, canonical provider slots, or the minimal default tool set. They stay aligned with those inputs, but they are not exhaustive inventories of every compile-time channel or conditionally registered tool. The **OpenClaw** and **Hermes** columns come from `docs/book/feature-matrix-parity.toml`, the reviewable source for parity facts the binary has no knowledge of.
 
 ## Status legend
 
@@ -37,11 +29,9 @@ facts the binary has no knowledge of.
 | SBC / edge (Raspberry Pi class) | ✅ | [Hardware](../hardware/index.md) |
 | VPS / cloud VM | ✅ | [Network deployment](../ops/network-deployment.md) |
 
-## Channel support
+## Curated channel metadata support
 
-Generated from the channel registry
-([`ChannelsConfig::channels`](../channels/overview.md)). The canonical
-per-channel setup detail lives on each channel's own page.
+Generated from the manually curated [`ChannelsConfig::channels()` metadata list](../channels/overview.md). Compile-only or non-config channel surfaces may be outside this table. The canonical per-channel setup detail lives on each channel's own page.
 
 {{#include ../_snippets/feature-matrix-channels.md}}
 
@@ -53,10 +43,9 @@ Generated from the canonical model-provider slots
 
 {{#include ../_snippets/feature-matrix-providers.md}}
 
-## Tool support
+## Default tool support
 
-Generated from the default tool registry (`default_tools`). The canonical tool
-inventory and gating rules live in the [Tools overview](../tools/overview.md).
+Generated from the minimal default tool registry (`default_tools`). Conditional and full-runtime tools are outside this table; their canonical inventory and gating rules live in the [Tools overview](../tools/overview.md) and [built-in tool inventory](../developing/tool-inventory.md).
 
 {{#include ../_snippets/feature-matrix-tools.md}}
 

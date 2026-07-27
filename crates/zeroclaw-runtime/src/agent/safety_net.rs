@@ -426,6 +426,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
             model_access: crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
@@ -438,6 +440,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             silent: true,
             approval: None,
             multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            config: None,
             max_tool_iterations: 5,
             hooks: None,
             excluded_tools: &[],
@@ -808,6 +811,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {
                     model_access: crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
@@ -820,6 +825,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
                     max_tool_iterations: 5,
                     hooks: None,
                     excluded_tools: &[],

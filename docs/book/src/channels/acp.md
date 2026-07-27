@@ -57,6 +57,18 @@ Open an isolated agent session.
 
 **`agentAlias`** names which configured `[agents.<alias>]` entry to use. It is required when more than one agent is configured; when exactly one agent exists, it is auto-selected and the field may be omitted. The alias accepts the camelCase `agentAlias`, the snake_case `agent_alias`, or the short `agent` form.
 
+When connecting through the **gateway WebSocket** endpoint, the connection URL may also carry a **`?agent=<alias>`** query parameter. That value is a **connection-scoped default**, not a config change. Alias resolution for `session/new` follows this precedence:
+
+1. explicit `agentAlias` / `agent_alias` / `agent` in the `session/new` params
+2. gateway `?agent=<alias>` on the WebSocket URL
+3. `[acp].default_agent`
+4. sole configured `[agents.<alias>]` entry when exactly one exists
+5. error when no alias can be resolved
+
+Every resolved alias, regardless of which step selected it, must name an **enabled, dispatchable** agent. Unknown aliases and configured-but-disabled agents fail `session/new` with `-32602 INVALID_PARAMS`. A blank or whitespace-only `?agent=` is treated as absent and falls through to the next step.
+
+Standalone **`zeroclaw acp`** (stdio subprocess) does not read `?agent=`; use an explicit `agentAlias` or `[acp].default_agent` there instead.
+
 The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary, it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
 
 ```json
@@ -236,6 +248,8 @@ Restore a previously persisted session with **full history replay**. The server 
 
 After `session/load` returns, the session is active and ready to accept `session/prompt` calls.
 
+When restoring a persisted session, the server reuses the stored owner alias only if that agent is still dispatchable. Otherwise it falls back through the operator-controlled `[acp].default_agent` → sole-agent chain, skipping any disabled aliases along the way. Gateway `?agent=` is a `session/new` default only and does not rebind restore.
+
 `session_id` is accepted as a snake_case alias for `sessionId`.
 
 Errors:
@@ -256,7 +270,7 @@ Restore a previously persisted session **without history replay**. The agent is 
 ← {"jsonrpc":"2.0","id":5,"result":{}}
 ```
 
-After `session/resume` returns, the session is active and ready to accept `session/prompt` calls. Same errors as `session/load`.
+After `session/resume` returns, the session is active and ready to accept `session/prompt` calls. Same errors as `session/load`. Restore alias selection follows the same dispatchable-owner fallback rules as `session/load`.
 
 **Load vs. resume:** use `session/load` when reconnecting after an unexpected disconnect and the client needs to rebuild its UI from the stored history. Use `session/resume` when the client already has the history (e.g., it stored it locally) and only needs the server-side agent state restored.
 
@@ -281,7 +295,7 @@ Returns `SESSION_NOT_FOUND` (`-32000`) if the session is not currently active (i
 
 `default_agent` is consulted when `session/new` omits `agentAlias` and more than one agent is configured; if it is absent and exactly one `[agents.<alias>]` entry exists, that agent is auto-selected.
 
-When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required.
+When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required. Gateway clients may append `?agent=<alias>` to that URL so each configured agent can be addressed from a spec-vanilla one-agent-per-endpoint client; authentication (`Authorization`, `Sec-WebSocket-Protocol`, or `?token=`) is enforced before the connection is upgraded, and the query parameter grants no access beyond selecting among already-configured agents.
 
 ## Running
 
@@ -301,7 +315,7 @@ The binary reads stdin, writes stdout, exits on EOF.
 
 **Via the daemon gateway (remote or same-host):**
 
-Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
+Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp`, no extra config flag is required. Clients connect directly: for multi-agent installs, use a URL such as `ws://127.0.0.1:8080/acp?agent=myagent` so `session/new` can omit `agentAlias`, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
 
 <div class="os-tabs-src">
 

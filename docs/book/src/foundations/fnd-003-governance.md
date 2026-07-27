@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 6
+> Starting v0.7.0 · Type: Governance · Rev. 7
 >
-> **Canonical reference** · Ratified by the team · Rev. 6
+> **Canonical reference** · Ratified by the team · Rev. 7
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -24,6 +24,7 @@
 | 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
 | 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
 | 6 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source (#8989) |
+| 7 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions |
 
 ---
 
@@ -544,11 +545,10 @@ The RFC process was established in the documentation RFC and the architecture RF
            ↓
    ┌── Majority APPROVE ──────────────────────────────────────┐
    │  RFC is accepted                                          │
-   │  PR is merged                                            │
-   │  Issue labeled rfc:accepted                              │
-   │  Author writes ADR(s) under docs/book/src/architecture/decisions/ │
-   │  ADR issue(s) linked back to RFC issue                   │
-   │  RFC issue closed                                        │
+   │  Final accepted shape is recorded on the issue           │
+   │  Issue labeled status:accepted                           │
+   │  Durable follow-through is classified and linked        │
+   │  Implementation proceeds within the accepted shape       │
    └──────────────────────────────────────────────────────────┘
            ↓
    ┌── Any REJECT ────────────────────────────────────────────┐
@@ -578,11 +578,20 @@ The RFC process was established in the documentation RFC and the architecture RF
 
 "Active" Core Team members are those who have participated in at least one vote in the past 90 days. Inactive members do not count against majority thresholds but are notified of votes.
 
-### 8.3 The ADR Connection
+### 8.3 Durable Follow-Through and the ADR Connection
 
-Every accepted RFC must produce at least one ADR before the corresponding implementation can begin. The ADR is not a summary of the RFC: it is the permanent record of the specific decision made, in the Nygard format defined in the documentation RFC. The RFC can be long and exploratory. The ADR is short and definitive.
+For newly accepted RFCs, the final shape and durable follow-through must be visible from the RFC issue before implementation proceeds. Acceptance alone does not complete the governance handoff. For accepted RFCs audited after implementation, record the disposition retrospectively without reopening completed work.
 
-RFCs are proposals. ADRs are decisions. Both are necessary. Neither replaces the other.
+Each disposition record identifies the authoritative final shape, the selected disposition and rationale, the durable artifact or delivery tracker, and the owner or next action when follow-through remains.
+
+Use one of four dispositions:
+
+- **ADR:** required when the decision materially constrains future architecture. Indicators include a surprising system boundary, a non-obvious tradeoff, or a choice that materially limits future architecture alternatives.
+- **Standing-document update:** required when the durable result is an operational, reference, workflow, security, or user contract rather than a new architecture decision.
+- **Implementation or tracker follow-up:** required when an existing ADR, FND, or standing document already carries the decision and delivery work remains. Link the delivery tracker and its next action.
+- **No separate artifact:** permitted when an identified existing FND, ADR, standing document, completed implementation, or superseding decision already preserves the result and no additional delivery tracking remains. The issue must record that rationale and link the durable surface.
+
+An RFC is the discussion and acceptance surface. An ADR is the permanent record of a significant architecture decision, not a mandatory summary of every accepted RFC. Standing documents and implementation trackers do not replace an ADR when the accepted decision meets the architecture threshold above.
 
 ### 8.4 Foundational RFCs
 
@@ -703,7 +712,7 @@ An item is **Done** when all of the following are true:
 
 - [ ] All items in the milestone are in `Done` status or explicitly moved to the next milestone with a comment explaining why
 - [ ] The CHANGELOG.md entry for the release is complete
-- [ ] All ADRs spawned by accepted RFCs in this milestone are written and accepted
+- [ ] Every accepted RFC in this milestone has a recorded durable disposition; required ADRs and standing-document updates are merged, and remaining delivery trackers are linked
 - [ ] The release has been tested on at least one platform (Linux x86_64 at minimum)
 - [ ] The release tag follows Semantic Versioning
 
@@ -791,7 +800,7 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 - [ ] Populate the Backlog with deliverables from the microkernel architecture RFC
 - [ ] Populate the Backlog with deliverables from the documentation standards RFC
 - [ ] Conduct the first formal RFC votes on the three existing proposals
-- [ ] Write ADRs for accepted RFCs (ADR-001 through ADR-007 per the docs RFC)
+- [ ] Complete the selected foundational ADR set (ADR-001 through ADR-007 per the docs RFC)
 - [ ] Add the `CONTRIBUTORS.md` file with current team members in their tiers
 - [ ] Implement the auto-label by path Actions workflow
 - [ ] Implement the stale issue management workflow

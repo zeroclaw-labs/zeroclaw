@@ -5,7 +5,11 @@ use heapless::String;
 /// Format: `{"id":"<id>","ok":true,"result":"<result>"}`
 pub fn write_ok<const N: usize>(buf: &mut String<N>, id: &str, result: &str) {
     buf.clear();
-    let _ = write!(buf, "{{\"id\":\"{}\",\"ok\":true,\"result\":\"{}\"}}", id, result);
+    let _ = write!(
+        buf,
+        "{{\"id\":\"{}\",\"ok\":true,\"result\":\"{}\"}}",
+        id, result
+    );
 }
 
 /// Write an error JSON response into `buf`.

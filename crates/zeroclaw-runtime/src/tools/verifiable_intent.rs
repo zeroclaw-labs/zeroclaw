@@ -295,6 +295,123 @@ mod tests {
         assert!(result.success);
     }
 
+    /// The reachable surface for a constraint check is this tool call: caller
+    /// JSON is deserialized into `Fulfillment`, dispatched through
+    /// `check_constraints`, and returned as a `ToolResult`. Every `Fulfillment`
+    /// field is `Option` with `Default` derived, so `"fulfillment": {}`
+    /// deserializes to all-`None`; this asserts the whole path fails closed
+    /// rather than only the constraint helper.
+    #[tokio::test]
+    async fn empty_fulfillment_does_not_satisfy_allowed_merchant() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{
+                "type": "mandate.checkout.allowed_merchant",
+                "allowed_merchants": [
+                    { "name": "Store A", "website": "https://store-a.example.com" }
+                ]
+            }],
+            "fulfillment": {},
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(
+            !result.success,
+            "an empty fulfillment must not satisfy an allowed-merchant constraint"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("one or more constraints violated")
+        );
+
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], false);
+        let entry = &output["results"][0];
+        assert_eq!(
+            entry["constraint_type"],
+            "mandate.checkout.allowed_merchant"
+        );
+        assert_eq!(entry["satisfied"], false);
+        let violation = entry["violations"][0]
+            .as_str()
+            .expect("violation is a string");
+        assert!(
+            violation.starts_with("VI/MerchantNotAllowed:"),
+            "unexpected violation: {violation}"
+        );
+    }
+
+    /// The same for the payee allowlist.
+    #[tokio::test]
+    async fn empty_fulfillment_does_not_satisfy_allowed_payee() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{
+                "type": "payment.allowed_payee",
+                "allowed_payees": [
+                    { "name": "Payee A", "website": "https://payee-a.example.com" }
+                ]
+            }],
+            "fulfillment": {},
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(
+            !result.success,
+            "an empty fulfillment must not satisfy an allowed-payee constraint"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("one or more constraints violated")
+        );
+
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], false);
+        let entry = &output["results"][0];
+        assert_eq!(entry["constraint_type"], "payment.allowed_payee");
+        assert_eq!(entry["satisfied"], false);
+        let violation = entry["violations"][0]
+            .as_str()
+            .expect("violation is a string");
+        assert!(
+            violation.starts_with("VI/PayeeNotAllowed:"),
+            "unexpected violation: {violation}"
+        );
+    }
+
+    /// Positive control for the two above: a disclosed merchant that is on the
+    /// allowlist still satisfies the constraint through the same tool path, so
+    /// the fail-closed arms cannot be satisfied by over-blocking.
+    #[tokio::test]
+    async fn disclosed_merchant_on_allowlist_still_satisfies_constraint() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{
+                "type": "mandate.checkout.allowed_merchant",
+                "allowed_merchants": [
+                    { "name": "Store A", "website": "https://store-a.example.com" }
+                ]
+            }],
+            "fulfillment": {
+                "merchant": { "name": "Store A", "website": "https://store-a.example.com" }
+            },
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], true);
+    }
+
     #[tokio::test]
     async fn unknown_operation_fails() {
         let tool = test_tool();

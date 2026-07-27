@@ -262,6 +262,7 @@ export interface WsMessage {
     | "connected"
     | "cron_result"
     | "approval_request"
+    | "history_trimmed"
     | "aborted";
   content?: string;
   full_response?: string;
@@ -282,6 +283,9 @@ export interface WsMessage {
   tool?: string;
   arguments_summary?: string;
   timeout_secs?: number;
+  dropped_messages?: number;
+  kept_turns?: number;
+  reason?: string;
   // Context window info (present on "done" frames). See #7311.
   max_context_tokens?: number;
   input_tokens?: number;

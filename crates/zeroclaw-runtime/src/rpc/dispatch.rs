@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 method dispatch. Transport-agnostic.
 
-use super::context::RpcContext;
+use super::context::{ConfigWriteGuard, RpcContext};
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -23,6 +24,7 @@ use zeroclaw_api::jsonrpc::{
     SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -31,6 +33,36 @@ mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
 }
+
+struct StatusRuntimeContext {
+    config_dir: String,
+    config_file: String,
+    config_kind: RuntimeConfigKind,
+    local_ipc_endpoint: String,
+}
+
+fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
+    let config_file = config.config_path.display().to_string();
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let local_ipc_endpoint = super::local::socket_path(config).display().to_string();
+
+    StatusRuntimeContext {
+        config_dir,
+        config_file,
+        config_kind,
+        local_ipc_endpoint,
+    }
+}
+
+// ── Method registry ──────────────────────────────────────────────
+//
+// Single source of truth. Every variant maps to exactly one wire
+// string. `from_wire` is a table scan — no hand-written string
+// matching anywhere in this file.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -493,23 +525,72 @@ impl RpcDispatcher {
         }
     }
 
-    /// Flush dirty config paths to disk. Clone the config out of the
-    /// lock (parking_lot guards are !Send), save to disk, then write
-    /// the clone (with cleared dirty set) back.
-    async fn flush_config(&self) -> Result<(), JsonRpcError> {
+    async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
+        if let Some(event) = event
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+        {
+            let _ = self.rpc.send_raw(notification).await;
+        }
+    }
+
+    /// Flush dirty config paths to disk.
+    ///
+    /// `_guard` is never read — it is a witness reminding the caller to
+    /// serialize on `ctx.config_write_lock` for the whole read-mutate-flush
+    /// critical section. It is NOT compile-time proof of holding *that*
+    /// mutex (a guard is not statically tied to a specific instance); the
+    /// `debug_assert!` below catches a caller holding a look-alike guard
+    /// from the wrong mutex. The invariant lives on
+    /// [`RpcContext::config_write_lock`]: every mutation of `ctx.config`
+    /// must hold it, and a bypassing writer that re-dirties a just-saved
+    /// path during a flush loses disk persistence of that write.
+    ///
+    /// Clone the config out of the lock (parking_lot guards are !Send, so
+    /// the clone can't be held across `snapshot.save_dirty().await`), save
+    /// the clone to disk, then remove only the paths that were actually
+    /// saved from the LIVE config's dirty set. This must NOT swap the live
+    /// config wholesale: a write landed on `ctx.config` while this method
+    /// awaits disk I/O would otherwise be overwritten by the stale snapshot
+    /// on write-back, silently erasing an in-memory change that was never
+    /// given a chance to be saved.
+    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "flush_config caller must hold ctx.config_write_lock"
+        );
         let mut snapshot = self.ctx.config.read().clone();
+        let saved_paths = snapshot.dirty_paths.clone();
         snapshot
             .save_dirty()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        *self.ctx.config.write() = snapshot;
+        self.ctx
+            .config
+            .write()
+            .dirty_paths
+            .retain(|path| !saved_paths.contains(path));
         Ok(())
     }
 
+    /// Save `snapshot` to disk, then install it as the live config.
+    ///
+    /// `_guard` is the same serialization witness as in
+    /// [`Self::flush_config`] (a reminder, not compile-time proof — see
+    /// there). Unlike `flush_config`, this deliberately swaps: callers pass
+    /// a clone that was itself mutated beyond just `dirty_paths` (e.g. an
+    /// alias rename), and installing that mutated snapshot wholesale is the
+    /// point. Holding `config_write_lock` is what makes the swap safe — no
+    /// other handler can land a concurrent `config` write while this is in
+    /// flight.
     async fn save_and_swap_config(
         &self,
         mut snapshot: zeroclaw_config::schema::Config,
+        _guard: &ConfigWriteGuard,
     ) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "save_and_swap_config caller must hold ctx.config_write_lock"
+        );
         snapshot
             .save_dirty()
             .await
@@ -841,6 +922,12 @@ impl RpcDispatcher {
 
     async fn handle_status(&self) -> RpcResult {
         let ids = self.ctx.sessions.list_ids().await;
+        let config_path = self.ctx.config.read().config_path.clone();
+        let config_kind = zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await;
+        let runtime_context = {
+            let config = self.ctx.config.read();
+            status_runtime_context(&config, config_kind)
+        };
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
         let persisted_count = self
@@ -855,6 +942,10 @@ impl RpcDispatcher {
             protocol_version: RPC_PROTOCOL_VERSION,
             active_sessions: total,
             session_ids: ids,
+            config_dir: Some(runtime_context.config_dir),
+            config_file: Some(runtime_context.config_file),
+            config_kind: Some(runtime_context.config_kind),
+            local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
         })
     }
 
@@ -998,8 +1089,8 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
             initialize_mcp,
@@ -1137,10 +1228,17 @@ impl RpcDispatcher {
                             ));
                         }
                         message_count = data.messages.len();
-                        self.ctx
+                        let seed_event = self
+                            .ctx
                             .sessions
-                            .seed_conversation_history(&session_id, data.messages)
+                            .seed_conversation_history_with_event(&session_id, data.messages)
                             .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
                         if let Some(ref store) = self.ctx.acp_session_store {
                             let store = store.clone();
                             let sid = session_id.clone();
@@ -1207,7 +1305,12 @@ impl RpcDispatcher {
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
-                        self.ctx.sessions.seed_history(&session_id, &stored).await;
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_history_with_event(&session_id, &stored)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
                         message_count = stored.len();
                     }
                 }
@@ -1438,7 +1541,6 @@ impl RpcDispatcher {
             }
         };
 
-        let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -1447,8 +1549,8 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let agent = crate::agent::agent::Agent::from_config_with_tui_env(
-            &config,
+        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
             false,
@@ -1484,10 +1586,12 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
-        self.ctx
+        let seed_event = self
+            .ctx
             .sessions
-            .seed_conversation_history(sid, data.messages)
+            .seed_conversation_history_with_event(sid, data.messages)
             .await;
+        self.forward_seed_event(sid, seed_event).await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -1599,12 +1703,6 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        let pre_history_len = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            self.ctx.sessions.history_len(sid).await.unwrap_or(0)
-        } else {
-            0
-        };
-
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1780,40 +1878,15 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && matches!(
-                        outcome,
-                        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. })
-                    )
-                    && let Some(new_msgs) = self
-                        .ctx
-                        .sessions
-                        .history_slice_from(sid, pre_history_len)
-                        .await
-                    && !new_msgs.is_empty()
+                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
                 {
-                    let store = store.clone();
-                    let sid_owned = sid.to_string();
-                    let persisted = tokio::task::spawn_blocking(move || {
-                        store.append_turn(&sid_owned, &new_msgs)
-                    })
-                    .await;
-                    let error = match persisted {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(join) => Some(join.to_string()),
-                    };
-                    if let Some(detail) = error {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                            "Failed to persist ACP turn"
-                        );
-                    }
+                        "Failed to persist ACP turn"
+                    );
                 }
             }
             crate::rpc::types::ChatMode::Chat => {
@@ -2613,6 +2686,7 @@ impl RpcDispatcher {
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         {
             let mut config = self.ctx.config.write();
             if config.ensure_map_key_for_path(&req.prop) {
@@ -2661,7 +2735,7 @@ impl RpcDispatcher {
                 .set_prop_persistent(&req.prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
         }
-        self.flush_config().await?;
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -2956,13 +3030,14 @@ impl RpcDispatcher {
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         {
             let mut config = self.ctx.config.write();
             config
                 .set_prop_persistent(&req.prop, "")
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         }
-        self.flush_config().await?;
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -3000,6 +3075,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let created = {
             let mut config = self.ctx.config.write();
             // Shared guarded boundary: enforces the reserved-agent rule (the
@@ -3017,7 +3093,7 @@ impl RpcDispatcher {
             created
         };
         if created {
-            self.flush_config().await?;
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -3028,6 +3104,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let deleted = {
             let mut config = self.ctx.config.write();
             let deleted = config
@@ -3039,7 +3116,7 @@ impl RpcDispatcher {
             deleted
         };
         if deleted {
-            self.flush_config().await?;
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -3053,11 +3130,20 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
-        if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
-            return self.handle_config_alias_rename(req, kind);
-        }
 
         Box::pin(async move {
+            // Acquired once here, not inside `handle_config_alias_rename`:
+            // the alias-kind branch below delegates into it, and the tokio
+            // Mutex is not reentrant. The guard moves by value into the
+            // alias-rename path so it can be released at that handler's
+            // commit point, before its slow post-commit side effects.
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
+                return self
+                    .handle_config_alias_rename(req, kind, config_write_guard)
+                    .await;
+            }
+
             let renamed = {
                 let mut config = self.ctx.config.write();
                 let renamed = config
@@ -3070,7 +3156,7 @@ impl RpcDispatcher {
                 renamed
             };
             if renamed {
-                self.flush_config().await?;
+                self.flush_config(&config_write_guard).await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -3086,6 +3172,7 @@ impl RpcDispatcher {
         &'a self,
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
+        config_write_guard: ConfigWriteGuard,
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
             let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
@@ -3132,8 +3219,15 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                self.save_and_swap_config(working.clone()).await?;
+                self.save_and_swap_config(working.clone(), &config_write_guard)
+                    .await?;
             }
+            // Config is committed (saved + swapped, or already committed by a
+            // prior crashed run). Release before the post-commit side effects
+            // below: workspace moves and the memory/cron/ACP/session-backend
+            // cascade can be slow or wedge, and holding the lock across them
+            // would stall every config-mutating RPC daemon-wide.
+            drop(config_write_guard);
             let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
 
             let mut warnings = Vec::new();
@@ -3769,7 +3863,21 @@ impl RpcDispatcher {
                     biased;
                     _ = rpc.closed() => break,
                     event = rx.recv() => match event {
-                        Ok(event) => {
+                        Ok(mut event) => {
+                            // Pairing secrets (QR payloads, one-shot pair codes)
+                            // ride the shared broadcast bus stamped with the
+                            // ephemeral marker. `logs/subscribe` is NOT the
+                            // bearer-authenticated SSE surface those credentials
+                            // are scoped to — a fresh remote RPC client can
+                            // `initialize` and subscribe over WSS without the
+                            // gateway bearer check — so fail closed: withhold
+                            // marked frames entirely and strip the internal
+                            // marker from everything else (public shape
+                            // unchanged). See `zeroclaw_gateway::sse`.
+                            if zeroclaw_log::frame_carries_ephemeral_credentials(&event) {
+                                continue;
+                            }
+                            zeroclaw_log::strip_ephemeral_broadcast_marker(&mut event);
                             let notification =
                                 JsonRpcNotification::new(notification::LOGS_EVENT, event);
                             if let Ok(json) = serde_json::to_string(&notification)
@@ -4043,6 +4151,16 @@ impl RpcDispatcher {
                 | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
                     return Err(rpc_err(INVALID_PARAMS, reason.clone()));
                 }
+                crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::Coalesced {
+                    existing_run_id, ..
+                } => {
+                    return to_result(SopRunResponse {
+                        run_id: existing_run_id.clone(),
+                    });
+                }
                 crate::sop::dispatch::DispatchResult::NoMatch => {}
             }
         }
@@ -4117,13 +4235,89 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
+        let mut resolved_outcome = None;
         {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-            guard
-                .decide_checkpoint(&req.run_id, decision)
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            let run_sop_name = guard
+                .get_run(&req.run_id)
+                .map(|run| run.sop_name.clone())
+                .ok_or_else(|| {
+                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                })?;
+            if run_sop_name != req.name {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "run '{}' belongs to SOP '{}', not '{}'",
+                        req.run_id, run_sop_name, req.name
+                    ),
+                ));
+            }
+            use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
+            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            match guard
+                .resolve_via_broker(&req.run_id, decision, principal)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
+            {
+                outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
+                    resolved_outcome = Some(outcome);
+                }
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::Denied
+                    | ResolveOutcome::AlreadyResolved
+                    | ResolveOutcome::Revised,
+                )
+                | BrokerOutcome::PendingQuorum { .. } => {}
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
+                )
+                | BrokerOutcome::NotWaiting => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)
+                | BrokerOutcome::NotAuthorized { .. } => {
+                    return Err(rpc_err(
+                        AUTH_REQUIRED,
+                        crate::i18n::get_required_cli_string("sop-rpc-decision-unauthorized"),
+                    ));
+                }
+                BrokerOutcome::PolicyMissing { name } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-missing",
+                            &[("name", name.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::PolicyUnavailable { reason } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-unavailable",
+                            &[("reason", reason.as_str())],
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(outcome) = resolved_outcome {
+            let config = self.ctx.config.read();
+            crate::sop::drive_resumed_broker_action(
+                &config,
+                Arc::clone(&engine),
+                self.ctx.sop_audit.clone(),
+                &outcome,
+            );
         }
 
         let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
@@ -4300,9 +4494,15 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
+        // Serializes with every other config-mutating handler for the whole
+        // clone-apply-save-swap below, so the install on success can't race
+        // a concurrent config write (see `ctx.config_write_lock`).
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         // Clone out of the lock to satisfy `&mut Config`. On success
-        // write the mutated snapshot back, mirroring `flush_config`
-        // and the gateway's `handle_apply`.
+        // install the mutated snapshot, mirroring the gateway's
+        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
+        // the clone, so `save_and_swap_config` performs no second disk
+        // write (empty dirty set short-circuits) — just the guarded swap.
         let mut working = self.ctx.config.read().clone();
         let result = crate::quickstart::apply_with_surface(
             req.submission,
@@ -4312,7 +4512,8 @@ impl RpcDispatcher {
         .await;
         let body = match result {
             Ok(agent) => {
-                *self.ctx.config.write() = working;
+                self.save_and_swap_config(working, &config_write_guard)
+                    .await?;
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
                     agent,
@@ -4420,6 +4621,31 @@ fn truncate_memory_previews(
 /// so the meter freezes at the default even when the profile is set higher.
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
     cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
+/// Persist the exact turn delta captured before structured history trimming.
+/// Empty and failed turns intentionally remain no-ops.
+async fn persist_acp_turn(
+    store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: &str,
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<String> {
+    let messages = match outcome {
+        Ok(TurnOutcome::Completed { messages, .. })
+        | Ok(TurnOutcome::Cancelled { messages, .. })
+            if !messages.is_empty() =>
+        {
+            messages.clone()
+        }
+        _ => return None,
+    };
+    let store = Arc::clone(store);
+    let session_id = session_id.to_string();
+    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join) => Some(join.to_string()),
+    }
 }
 
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
@@ -5124,6 +5350,77 @@ mod tests {
         );
     }
 
+    /// Blocking regression: a fresh remote RPC client that reaches
+    /// `logs/subscribe` (an unauthenticated surface — a new WSS client can
+    /// `initialize` and subscribe without the gateway bearer) must never
+    /// receive a pairing credential off the shared broadcast bus, while
+    /// ordinary log frames still forward with the internal marker stripped.
+    #[tokio::test]
+    async fn logs_subscribe_fails_closed_on_pairing_credentials() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let config = zeroclaw_config::schema::Config::default();
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx.clone());
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
+
+        assert!(
+            d.handle_logs_subscribe().await.is_ok(),
+            "a fresh client should be able to subscribe"
+        );
+
+        // Marker-stamped credential frame (as `record_event` stamps a QR login
+        // event) followed by an ordinary lifecycle frame.
+        let credential = serde_json::json!({
+            "source": "observability",
+            "attributes": { "login": { "state": "qr", "qr_payload": "SECRET-QR-PAYLOAD" } },
+            zeroclaw_log::EPHEMERAL_BROADCAST_MARKER: true,
+        });
+        let plain = serde_json::json!({
+            "source": "observability",
+            "type": "tool_call",
+            "tool": "SENTINEL-LIVE",
+        });
+        event_tx.send(credential).expect("send credential frame");
+        event_tx.send(plain).expect("send plain frame");
+
+        // Collect forwarded notifications until the sentinel arrives or the
+        // budget elapses.
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, writer_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let hit = msg.contains("SENTINEL-LIVE");
+                    seen.push_str(&msg);
+                    if hit {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            seen.contains("SENTINEL-LIVE"),
+            "an ordinary lifecycle frame must still forward over logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains("SECRET-QR-PAYLOAD"),
+            "a remote RPC client must never obtain a pairing credential via logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
+            "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
+        );
+    }
+
     fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -5296,6 +5593,489 @@ mod tests {
             .handle_sops_runs(&serde_json::json!({ "sop": "some-sop" }))
             .expect_err("missing engine must error");
         assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    fn make_checkpoint_rpc_dispatcher(
+        quorum: u32,
+        members: &[&str],
+        tui_id: &str,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{
+            ApprovalGroupConfig, ApprovalPolicyConfig, Config, SopApprovalConfig,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let sops_dir = temp.path().join("sops");
+        let sop = Sop {
+            name: "rpc-checkpoint".into(),
+            description: "checkpoint RPC authorization test".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "authorize".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some("prod".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "continue".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).unwrap();
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: members.iter().map(|member| (*member).to_string()).collect(),
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".into()),
+                quorum,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let mut config = Config::default();
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        config.sop.approval = SopApprovalConfig { groups, policies };
+
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone())
+            .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "rpc-checkpoint",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected checkpoint wait, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
+        (dispatcher, engine, run_id, temp)
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+        use crate::sop::types::SopRunStatus;
+
+        let (unauthorized, engine, run_id, _temp) =
+            make_checkpoint_rpc_dispatcher(1, &["cli:ZeroClawOperator"], "ZeroClawAgent");
+        let error = unauthorized
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("unauthorized RPC principal must be rejected");
+        assert_eq!(error.code, AUTH_REQUIRED);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
+            2,
+            &["cli:ZeroClawOperator", "cli:ZeroClawMaintainer"],
+            "ZeroClawOperator",
+        );
+        pending
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
+            .await
+            .expect("an authorized first vote returns the still-parked overlay");
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_drives_resumed_execute_step() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().expect("temporary SOP directory");
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+        let sop = Sop {
+            name: "rpc-resumed-execute".to_string(),
+            description: "RPC resume driver regression".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute after approval".to_string(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-resumed-execute",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-gated SOP");
+            let SopRunAction::WaitApproval { run_id, .. } = action else {
+                panic!("supervised Execute step must park for approval: {action:?}");
+            };
+            run_id
+        };
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-resumed-execute",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect("RPC approval must accept the parked run");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .expect("engine lock")
+                    .get_run(&run_id)
+                    .map(|run| run.status);
+                if status == Some(SopRunStatus::Failed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC approval must schedule the resumed ExecuteStep");
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_approval_mode_rejection() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ApprovalMode, Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            approval_mode: ApprovalMode::AgentTool,
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        let sop = Sop {
+            name: "rpc-agent-tool-only".to_string(),
+            description: "rpc approval-mode checkpoint".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Policy gate".to_string(),
+                kind: SopStepKind::Checkpoint,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-agent-tool-only",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-mode SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("approval-mode SOP must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-agent-tool-only",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(
+            err.message.contains(&crate::i18n::get_required_cli_string(
+                "sop-rpc-decision-unauthorized",
+            )),
+            "approval_mode rejection must surface, got: {}",
+            err.message
+        );
+        let guard = engine.lock().expect("engine lock");
+        assert_eq!(
+            guard.get_run(&run_id).expect("run still active").status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "rejected RPC decision must not append a gate_resolved row"
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_run_id_from_different_sop_before_broker_resolution() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, SopConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        fn checkpoint_sop(name: &str) -> Sop {
+            Sop {
+                name: name.to_string(),
+                description: format!("{name} checkpoint"),
+                version: "1.0.0".to_string(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Deterministic,
+                triggers: vec![SopTrigger::Manual],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Gate".to_string(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: true,
+                agent: None,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-a")).expect("save rpc-a");
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-b")).expect("save rpc-b");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        assert_eq!(engine.sops().len(), 2, "both temp SOPs should load");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-b",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start rpc-b SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("rpc-b must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-a",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("mismatched name/run_id must be rejected before broker resolution");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("belongs to SOP 'rpc-b', not 'rpc-a'"),
+            "mismatch rejection must name both SOPs, got: {}",
+            err.message
+        );
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("rpc-b run still active");
+        assert_eq!(run.sop_name, "rpc-b");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "mismatched RPC decision must not append a gate_resolved row"
+        );
     }
 
     #[test]
@@ -6005,6 +6785,71 @@ mod tests {
         assert_eq!(val["server_version"], "0.1.0");
     }
 
+    #[test]
+    fn status_runtime_context_reports_config_root_and_local_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let context = status_runtime_context(&config, RuntimeConfigKind::Temporary);
+
+        assert_eq!(context.config_dir, tmp.path().display().to_string());
+        assert_eq!(
+            context.config_file,
+            tmp.path().join("config.toml").display().to_string()
+        );
+        assert_eq!(context.config_kind, RuntimeConfigKind::Temporary);
+        assert_eq!(
+            context.local_ipc_endpoint,
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
+
+        config.config_path = std::path::PathBuf::from("/opt/zeroclaw/config.toml");
+        assert_eq!(
+            status_runtime_context(&config, RuntimeConfigKind::Custom).config_kind,
+            RuntimeConfigKind::Custom
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_status_includes_runtime_context_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher.handle_status().await.expect("status result");
+        let status: StatusResult = serde_json::from_value(value).expect("status shape");
+
+        assert_eq!(
+            status.config_dir.as_deref(),
+            Some(tmp.path().to_str().unwrap())
+        );
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some(tmp.path().join("config.toml").to_str().unwrap())
+        );
+        assert_eq!(status.config_kind, Some(RuntimeConfigKind::Temporary));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some(crate::rpc::local::socket_path(&config).to_str().unwrap())
+        );
+    }
+
+    /// Cover the `initialize` parsing path that caches the TUI's
+    /// `clientCapabilities.elicitation` block so the per-session
+    /// `RpcApprovalChannel` can route `request_choice` over
+    /// `elicitation/create`. Source-of-truth check: the dispatcher
+    /// is the canonical owner; the test reads the field directly.
     #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =
@@ -6396,6 +7241,93 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    #[tokio::test]
+    async fn seed_trim_event_is_forwarded_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 1,
+            reason: "message cap".into(),
+        };
+
+        dispatcher
+            .forward_seed_event("restored-session", Some(event))
+            .await;
+
+        let raw = rx
+            .try_recv()
+            .expect("restored history trim must notify the active client");
+        let notification: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], "restored-session");
+        assert_eq!(notification["params"]["dropped_messages"], 4);
+        assert!(
+            rx.try_recv().is_err(),
+            "one seed trim must emit exactly one notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_appends_complete_pretrim_delta_at_cap() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "trim-at-cap";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let existing = (0..50)
+            .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
+            .collect::<Vec<_>>();
+        store.append_turn(sid, &existing).unwrap();
+
+        let new_messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("new-user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new-assistant")),
+        ];
+        let outcome = Ok(TurnOutcome::Completed {
+            text: "new-assistant".into(),
+            messages: new_messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(restored.messages.len(), 52);
+        assert_eq!(
+            serde_json::to_value(&restored.messages[50..]).unwrap(),
+            serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_skips_empty_and_failed_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "no-turn-delta";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let empty = Ok(TurnOutcome::Cancelled {
+            partial_text: String::new(),
+            messages: Vec::new(),
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+
+        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
     }
 
     fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
@@ -7069,6 +8001,86 @@ mod tests {
         cfg
     }
 
+    // `make_config_set_test_dispatcher` takes the `Config` by value and adds no
+    // isolation of its own, and a successful `config/set` falls through to
+    // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
+    // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[tokio::test]
+    async fn config_set_does_not_materialize_resource_keyed_rate_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-5.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_err(), "unknown rate path must not be auto-created");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("cost.rates.providers.models.openai", "gpt-4.1")
+            .expect("create the dotted resource id");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_ok(), "editing a real dotted rate must work: {res:?}");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .get_map_keys("cost.rates.providers.models.openai")
+                .expect("known section"),
+            vec!["gpt-4.1".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_still_materializes_operator_chosen_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "channels.telegram.newbot.bot_token",
+                "value": "tok"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "operator-chosen alias must still vivify: {res:?}"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .channels
+                .telegram
+                .contains_key("newbot")
+        );
+    }
+
     #[tokio::test]
     async fn config_set_writes_real_secret_through_set_prop() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7659,6 +8671,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_session_uses_reloaded_structured_history_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .max_history_messages = Some(2);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old assistant"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new assistant"),
+        ]);
+
+        assert!(
+            matches!(event, Some(TurnEvent::HistoryTrimmed { .. })),
+            "an existing session must observe the reloaded runtime-profile cap"
+        );
+        assert!(!agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat) if chat.content == "old user"
+        )));
+        assert!(agent.history().iter().any(|message| matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(chat)
+                if chat.content == "new assistant"
+        )));
+    }
+
+    #[tokio::test]
     async fn config_set_provider_model_refreshes_matching_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
@@ -8153,6 +9222,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -8195,6 +9265,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -8294,6 +9365,7 @@ mod tests {
             config: Arc::new(parking_lot::RwLock::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -8321,6 +9393,280 @@ mod tests {
             end_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "session_end must fire when a real session is closed"
+        );
+    }
+
+    // ── config_write_lock races ─────────────────────────────────
+
+    fn make_two_provider_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg
+    }
+
+    fn provider_model(config: &zeroclaw_config::schema::Config, provider: &str) -> Option<String> {
+        match provider {
+            "anthropic" => config
+                .providers
+                .models
+                .anthropic
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            "openai" => config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            other => panic!("unexpected provider {other}"),
+        }
+    }
+
+    /// Regression test: `flush_config` used to clone the live config,
+    /// await `save_dirty()` on the clone, then swap the clone back over the
+    /// live config wholesale. A write landed on `ctx.config` while that save
+    /// was in flight was silently erased by the swap even though it was
+    /// never given a chance to reach disk.
+    ///
+    /// This drives `flush_config` to its first real yield point (inside
+    /// `save_dirty`'s disk I/O) with a single manual poll, proving the
+    /// snapshot has already been cloned out from under the live lock, lands
+    /// a second write directly on the live config, then lets the flush
+    /// finish. Against the old swap-based body this fails: P2 disappears
+    /// from live config when the stale snapshot lands on top of it. It was
+    /// confirmed to fail this way by temporarily reverting `flush_config` to
+    /// the swap-based body and re-running this test.
+    #[tokio::test]
+    async fn flush_config_preserves_write_landed_during_save() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_two_provider_test_config(&tmp);
+        cfg.set_prop_persistent("providers.models.anthropic.default.model", "p1-value")
+            .expect("mark P1 dirty");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let guard = Arc::clone(&dispatcher.ctx.config_write_lock)
+            .lock_owned()
+            .await;
+        let mut flush_fut = Box::pin(dispatcher.flush_config(&guard));
+
+        // Single manual poll: past the synchronous clone-and-capture prefix
+        // of `flush_config`, into `save_dirty`'s disk I/O, which must
+        // suspend rather than resolve synchronously.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first_poll = std::future::Future::poll(flush_fut.as_mut(), &mut cx);
+        assert!(
+            first_poll.is_pending(),
+            "flush must suspend on save_dirty's disk I/O for this test to interleave"
+        );
+
+        // P2: lands directly on the live config while the flush above is
+        // mid-save over its own (now stale) snapshot.
+        {
+            let mut live = dispatcher.ctx.config.write();
+            live.set_prop_persistent("providers.models.openai.default.model", "p2-value")
+                .expect("mark P2 dirty");
+        }
+
+        flush_fut.await.expect("flush of P1 must still succeed");
+        drop(guard);
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("p2-value"),
+            "P2, written while the flush was mid-save, must survive in live config"
+        );
+        assert!(
+            live.dirty_paths
+                .contains("providers.models.openai.default.model"),
+            "P2 must still be dirty -- this flush never saved it"
+        );
+        assert!(
+            !live
+                .dirty_paths
+                .contains("providers.models.anthropic.default.model"),
+            "P1 was actually saved, so it must no longer be dirty"
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("p1-value"),
+            "P1 must have reached disk; on-disk file:\n{on_disk}"
+        );
+    }
+
+    /// Shared blocking scaffold: hold `config_write_lock`, spawn the RPC
+    /// call, assert it stays parked across a bounded sleep-free yield loop,
+    /// release, and return the task's result for caller-specific asserts.
+    async fn assert_rpc_blocks_on_config_write_lock<F>(
+        ctx: Arc<RpcContext>,
+        rpc_call: F,
+        blocked_msg: &'static str,
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+
+        // Bounded, sleep-free: the handler must not race ahead of the
+        // externally held guard no matter how many times it's polled.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "{blocked_msg}");
+        }
+
+        drop(guard);
+        task.await.expect("blocked RPC task must not panic")
+    }
+
+    #[tokio::test]
+    async fn config_set_blocks_while_config_write_lock_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "blocked-value"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move { dispatcher.handle_config_set(&params).await },
+            "config/set must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "config/set must succeed once the guard is released: {result:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("blocked-value"),
+            "config/set must persist once unblocked; on-disk file:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_sets_both_persist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let (dispatcher_a, dispatcher_b, _sessions) = make_two_dispatchers_sharing_context(cfg);
+
+        let params_a = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "concurrent-a"
+        });
+        let params_b = json!({
+            "prop": "providers.models.openai.default.model",
+            "value": "concurrent-b"
+        });
+
+        let (result_a, result_b) = tokio::join!(
+            dispatcher_a.handle_config_set(&params_a),
+            dispatcher_b.handle_config_set(&params_b),
+        );
+        assert!(
+            result_a.is_ok(),
+            "first config/set must succeed: {result_a:?}"
+        );
+        assert!(
+            result_b.is_ok(),
+            "second config/set must succeed: {result_b:?}"
+        );
+
+        let live = dispatcher_a.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "anthropic").as_deref(),
+            Some("concurrent-a")
+        );
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("concurrent-b")
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("concurrent-a"),
+            "provider a's set must have reached disk:\n{on_disk}"
+        );
+        assert_eq!(
+            provider_model(&reparsed, "openai").as_deref(),
+            Some("concurrent-b"),
+            "provider b's set must have reached disk:\n{on_disk}"
+        );
+    }
+
+    /// Same blocking pattern as `config_set_blocks_while_config_write_lock_held`,
+    /// but for the `save_and_swap_config` path used by alias rename: proves
+    /// alias rename and config/set share the same `config_write_lock` and so
+    /// can never interleave their read-mutate-flush critical sections.
+    #[tokio::test]
+    async fn alias_rename_serializes_with_config_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let config_path = config.config_path.clone();
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut rename_dispatcher =
+            RpcDispatcher::new(Arc::clone(&ctx), tx, "test-peer-rename".into());
+        rename_dispatcher.authenticated = true;
+        let params = json!({
+            "path": "agents",
+            "from": "alpha",
+            "to": "beta"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move {
+                rename_dispatcher
+                    .handle_config_map_key_rename(&params)
+                    .await
+            },
+            "alias rename must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "alias rename must succeed once the guard is released: {result:?}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert!(!live.agents.contains_key("alpha"));
+        assert!(live.agents.contains_key("beta"));
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("[agents.beta]"),
+            "renamed alias must persist:\n{on_disk}"
+        );
+        assert!(
+            !on_disk.contains("[agents.alpha]"),
+            "old alias must not survive on disk:\n{on_disk}"
         );
     }
 }

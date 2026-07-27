@@ -228,6 +228,14 @@ fn attachment_kind(mime: &str) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::ffi::OsStr;
+    use std::path::{Component, Path};
+
+    fn path_contains_uploads_component(path: &str) -> bool {
+        Path::new(path)
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if name == OsStr::new("uploads")))
+    }
 
     #[test]
     fn mime_from_filename_common_types() {
@@ -458,13 +466,14 @@ mod tests {
             r.marker
         );
         assert!(
-            r.marker.contains("/uploads/"),
+            path_contains_uploads_component(&r.workspace_path),
             "clipboard image marker should reference workspace uploads path: {}",
             r.marker
         );
+        assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
         assert_eq!(r.size_bytes, png_bytes.len() as u64);
-        assert!(std::path::Path::new(&r.workspace_path).exists());
+        assert!(Path::new(&r.workspace_path).exists());
     }
 
     #[tokio::test]
@@ -494,10 +503,11 @@ mod tests {
             r.marker
         );
         assert!(
-            r.marker.contains("/uploads/"),
+            path_contains_uploads_component(&r.workspace_path),
             "marker should include workspace uploads path: {}",
             r.marker
         );
+        assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
     }
 
@@ -631,11 +641,12 @@ mod tests {
             r.marker
         );
         assert!(
-            r.marker.contains("/uploads/"),
+            path_contains_uploads_component(&r.workspace_path),
             "marker should include workspace path: {}",
             r.marker
         );
+        assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
-        assert!(std::path::Path::new(&r.workspace_path).exists());
+        assert!(Path::new(&r.workspace_path).exists());
     }
 }

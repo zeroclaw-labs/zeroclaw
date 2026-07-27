@@ -769,6 +769,12 @@ impl DelegateTool {
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
+                // Delegate: targets are short-lived independent chat
+                // sessions with no cross-turn reuse contract, so the
+                // per-call `connect_all` is the correct choice. The
+                // daemon heartbeat worker is the only `mcp_registry`
+                // supplier.
+                mcp_registry: None,
             },
         )
         .await;
@@ -801,9 +807,13 @@ impl DelegateTool {
         {
             return (
                 type_key.to_string(),
-                cfg.api_key
-                    .clone()
-                    .or_else(|| self.global_credential.clone()),
+                if cfg.requires_openai_auth {
+                    cfg.api_key.clone()
+                } else {
+                    cfg.api_key
+                        .clone()
+                        .or_else(|| self.global_credential.clone())
+                },
                 cfg.model.clone().unwrap_or_default(),
                 cfg.temperature,
             );
@@ -2614,6 +2624,7 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
@@ -2627,6 +2638,12 @@ impl DelegateTool {
                         silent: true,
                         approval: None,
                         multimodal_config: &self.multimodal_config,
+                        // Full config so the delegated sub-agent's vision route
+                        // resolves the configured `vision_model_provider`'s alias
+                        // options (the `vision` override, endpoint URI, credentials),
+                        // exactly as the parent turn does. `None` only on the
+                        // configless test builder (`root_config` unset).
+                        config: self.root_config.as_deref(),
                         hooks: None,
                         // Thread the target's deferred-MCP activated set so `tool_search`
                         // can activate the target's deferred tools mid-turn (Some only for
@@ -2668,6 +2685,7 @@ impl DelegateTool {
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -8072,6 +8090,100 @@ command = "echo hi"
             !result.output.contains("forbidden_tool_seen"),
             "target policy should have filtered out file_write, but got: {}",
             result.output
+        );
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_returns_none_credential() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: None,
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (provider_type, credential, model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(provider_type, "openai");
+        assert!(
+            credential.is_none(),
+            "OAuth target must not inherit global coordinator credential"
+        );
+        assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_preserves_explicit_alias_key() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: Some("sk-codex-custom-gateway-key".to_string()),
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-codex-custom-gateway-key"),
+            "OAuth target with explicit api_key must preserve the alias key"
+        );
+    }
+
+    #[test]
+    fn resolve_brain_non_oauth_fallback_preserved() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut custom_map = HashMap::new();
+        custom_map.insert(
+            "local".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: false,
+                api_key: None,
+                model: Some("llama3".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("custom".to_string(), custom_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("custom.local");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-ant-global-coordinator-key"),
+            "non-OAuth target without api_key must fall back to global credential"
         );
     }
 }

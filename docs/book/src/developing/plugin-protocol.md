@@ -47,8 +47,10 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and only for
-  a plugin whose manifest grants `http_client`.
+  more. Outbound HTTP is the one network surface that can be opened, and only
+  when the manifest grants `http_client` and that capability adapter explicitly
+  enables its tested HTTP boundary. Tool and channel adapters do; memory does
+  not yet.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -57,19 +59,22 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, config injection, `http_client`, and host-fed inbound are wired.**
-  Of the permissions a manifest can declare, `config_read` injects the plugin's
-  own config section, and `http_client` attaches an outbound `wasi:http` surface
-  so the plugin can make HTTP requests. Filesystem and memory-access permissions
-  are still accepted by the manifest schema but inert: their host functions are
-  not yet registered in the linker. See Permissions and Host imports below.
+- **`logging`, config injection, and host-fed inbound are wired; tool and channel
+  adapters also implement `http_client`.** Of the permissions a manifest can
+  declare, `config_read` injects the plugin's own config section. An
+  `http_client` grant is necessary for outbound `wasi:http`, but the adapter must
+  also opt into the host surface. Memory intentionally remains HTTP-free until
+  its network boundary has component-level coverage. Filesystem and
+  memory-access permissions are still accepted by the manifest schema but
+  inert: their host functions are not yet registered in the linker. See
+  Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
-  through ambient WASI. A `http_client` plugin gets outbound `wasi:http` and
-  nothing else; it cannot listen. Channel plugins that must receive inbound
-  traffic do not open a listener themselves: the host runs the listener and
-  feeds messages through the `inbound` import, which the plugin drains from its
-  `poll-message` export.
+  through ambient WASI. A tool or channel plugin with an `http_client` grant
+  gets outbound `wasi:http` because those adapters opt in; it cannot listen.
+  Channel plugins that must receive inbound traffic do not open a listener
+  themselves: the host runs the listener and feeds messages through the
+  `inbound` import, which the plugin drains from its `poll-message` export.
 - **A 32-bit boundary.** The target is `wasm32-wasip2`. Guest memory is a 32-bit
   address space and the component ABI lowers offsets as 32-bit regardless of
   host word size. Large values (for example a channel attachment's raw bytes)
@@ -239,6 +244,8 @@ skills and between bundles.
 
 ## Manifest format
 
+{{#include ../_snippets/plugin-manifest-fields.md}}
+
 ### Capabilities
 
 `capabilities` is a non-empty list of `PluginCapability` values, defined in
@@ -263,14 +270,15 @@ Be aware of the gap between declared and enforced: in the component host today
 tool plugin's resolved config section into `execute` only when the manifest
 grants `config_read`, and strips any caller-supplied `__config` so the section
 cannot be spoofed; a channel plugin receives the same section through its
-`configure` export under the same rule. `http_client` attaches an outbound
-`wasi:http` context to the plugin's store and links the `wasi:http` interface,
-so a granted plugin can make HTTP requests and one without the permission has no
-network surface at all. The remaining variants (`file_read`, `file_write`,
-`memory_read`, `memory_write`) are accepted by the manifest schema but are not
-yet wired to a host import: declaring them grants nothing on its own. They
-reserve the names for the host functions that will gate them (see Host imports
-below).
+`configure` export under the same rule. `http_client` is a necessary grant, not
+a complete authority decision: the capability adapter must also construct the
+HTTP context and link `wasi:http`. Tool and channel adapters opt in after grant
+validation. The memory adapter deliberately does not, so granting
+`http_client` to a memory scope alone adds no network surface. The remaining
+variants (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted
+by the manifest schema but are not yet wired to a host import: declaring them
+grants nothing on its own. They reserve the names for the host functions that
+will gate them (see Host imports below).
 
 ## WIT interfaces
 
@@ -338,13 +346,13 @@ Host functions are imported by the plugin and provided by the runtime. Every
 world's linker wires `logging` (via the host impl in `component_logging.rs`,
 linked alongside `add_wasi` in `component.rs`). The `channel-plugin` world also
 imports `inbound`, the host-fed message queue a channel drains from
-`poll-message`. Outbound `wasi:http` is linked on top for any plugin whose
-manifest grants `http_client` (`add_wasi_http` in `component.rs`), gated so the
-context and the linked interface always agree. The filesystem and memory-access
-permissions remain inert: the host functions that would gate them are not yet
-wired into the linker. A plugin's ambient authority is the WASI context (no
-preopens, no ambient network) plus exactly the host imports its world and
-permissions wire in.
+`poll-message`. Tool and channel adapters link outbound `wasi:http` only after
+the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
+and `add_wasi_http` in `component.rs`). Memory withholds both the context and
+linker surface. The filesystem and memory-access permissions remain inert: the
+host functions that would gate them are not yet wired into the linker. A
+plugin's ambient authority is the WASI context (no preopens, no ambient network)
+plus exactly the host imports its grants and adapter opt-ins jointly enable.
 
 ### `inbound`
 

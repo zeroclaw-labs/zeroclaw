@@ -603,6 +603,42 @@ mod tests {
         assert!(!spec_str.contains("#/$defs/"));
     }
 
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn config_api_schemas_keep_operator_descriptions() {
+        let spec = build_spec();
+        let cases = [
+            ("/components/schemas/PatchOp/description", "JSON Patch"),
+            (
+                "/components/schemas/PatchResponse/properties/warnings/description",
+                "Non-fatal validation warnings",
+            ),
+            (
+                "/components/schemas/ListEntry/description",
+                "Single entry in the list response",
+            ),
+            (
+                "/components/schemas/DriftEntry/description",
+                "in-memory Config diverges",
+            ),
+            (
+                "/components/schemas/ReloadStatusResponse/properties/pending_reload/description",
+                "subsystem re-instantiation",
+            ),
+        ];
+
+        for (pointer, expected) in cases {
+            let description = spec
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("missing generated description at {pointer}"));
+            assert!(
+                description.contains(expected),
+                "description at {pointer} must retain `{expected}`: {description}",
+            );
+        }
+    }
+
     #[cfg(all(feature = "schema-export", feature = "a2a"))]
     #[test]
     fn spec_registers_a2a_task_schemas() {

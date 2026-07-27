@@ -35,9 +35,16 @@ mod tests {
         .await
         .unwrap();
 
-        let pipeline = RetrievalPipeline::new(Arc::new(mem), RetrievalConfig::default());
+        // This test exercises the hot cache, which is opt-in (off by default).
+        let pipeline = RetrievalPipeline::new(
+            Arc::new(mem),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
 
-        // First call — cache miss, hits FTS
+        // First call: cache miss, hits FTS
         let r1 = pipeline
             .recall("Rust", 10, None, None, None, None)
             .await
@@ -67,7 +74,14 @@ mod tests {
         .unwrap();
 
         let mem = Arc::new(mem);
-        let pipeline = RetrievalPipeline::new(mem.clone(), RetrievalConfig::default());
+        // This test exercises the hot cache, which is opt-in (off by default).
+        let pipeline = RetrievalPipeline::new(
+            mem.clone(),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
 
         let _ = pipeline
             .recall("searchable", 10, None, None, None, None)

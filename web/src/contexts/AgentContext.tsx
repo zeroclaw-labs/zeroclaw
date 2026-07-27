@@ -36,6 +36,8 @@ export interface ChatMessage {
    * as fake assistant replies on reload. See #7137.
    */
   ephemeral?: boolean;
+  /** User-visible lifecycle notice, rendered distinctly from agent output. */
+  notice?: boolean;
 }
 
 interface AgentContextValue {
@@ -373,6 +375,27 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
             },
           ]);
         }
+        break;
+      }
+
+      case 'history_trimmed': {
+        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
+        const content = t('agent.history_trimmed')
+          .replace('{reason}', reason)
+          .replace('{dropped}', String(msg.dropped_messages ?? 0))
+          .replace('{kept}', String(msg.kept_turns ?? 0));
+        localMessageMutationVersionRef.current += 1;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: generateUUID(),
+            role: 'agent' as const,
+            content,
+            timestamp: new Date(),
+            ephemeral: true,
+            notice: true,
+          },
+        ]);
         break;
       }
 

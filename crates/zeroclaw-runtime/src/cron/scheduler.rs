@@ -783,6 +783,11 @@ async fn run_agent_job(
         // `uses_memory = false` job can neither recall/store through a real
         // backend nor reach one via advertised memory tools
         memory_free: !job.uses_memory,
+        // Cron runs are short-lived and one-shot — no cross-turn reuse
+        // contract, so the per-call `connect_all` path inside
+        // `agent::run` is the correct choice. The daemon heartbeat
+        // worker is the only `mcp_registry` supplier.
+        mcp_registry: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {

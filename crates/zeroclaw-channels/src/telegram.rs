@@ -2305,17 +2305,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let is_group = Self::is_group_message(message);
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                // If the user is replying directly to the bot's message, bypass
-                // the mention check — replies are an unambiguous signal of intent.
-                if !Self::contains_bot_mention(text, bot_username) {
-                    let bot_id = *self.bot_id.lock();
-                    if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
-                        return None;
-                    }
+            let bot_username = bot_username.as_ref()?;
+            // If the user is replying directly to the bot's message, bypass
+            // the mention check — replies are an unambiguous signal of intent.
+            if !Self::contains_bot_mention(text, bot_username) {
+                let bot_id = *self.bot_id.lock();
+                if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                    return None;
                 }
-            } else {
-                return None;
             }
         }
 
@@ -7202,13 +7199,12 @@ mod tests {
         use zeroclaw_providers::ModelProvider;
         use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 
-        let groq = OpenAiCompatibleModelProvider::new(
-            "test",
-            "Groq",
-            "https://api.groq.com/openai",
-            Some("fake_key"),
-            AuthStyle::Bearer,
-        );
+        let groq = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Groq")
+            .base_url("https://api.groq.com/openai")
+            .credential(Some("fake_key"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
 
         // Groq must not support vision.
         assert!(

@@ -2267,7 +2267,11 @@ impl Channel for WhatsAppWebChannel {
                                 .await;
                             }
                             Event::Connected(_) => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
+                                crate::login_events::LoginEvent::Connected.emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web connected successfully",
+                                );
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 let device = client
                                     .persistence_manager()
@@ -2310,21 +2314,39 @@ impl Channel for WhatsAppWebChannel {
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "WhatsApp Web was logged out — will clear session and reconnect");
+                                crate::login_events::LoginEvent::LoggedOut.emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web was logged out — will clear session and reconnect",
+                                );
                                 let _ = logout_tx.send(());
                             }
                             Event::StreamError(stream_error) => {
                                 ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("stream error: {:?}", stream_error));
                             }
                             Event::PairingCode { code, .. } => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "pair code received");
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Link your phone by entering this code in WhatsApp > Linked Devices");
+                                crate::login_events::LoginEvent::PairCode { code: code.as_str() }
+                                    .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web pair code received — enter it in WhatsApp > Linked Devices",
+                                );
                                 eprintln!();
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
                             Event::PairingQrCode { code, .. } => {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
+                                crate::login_events::LoginEvent::Qr {
+                                    payload: code.as_str(),
+                                    image_url: None,
+                                    attempt: None,
+                                    max_attempts: None,
+                                }
+                                .emit(
+                                    "whatsapp",
+                                    alias.as_ref(),
+                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+                                );
                                 match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
                                         eprintln!();

@@ -194,38 +194,79 @@ struct NativeResponseMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
-impl OpenRouterModelProvider {
-    pub fn new(alias: &str, credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
-        Self {
-            alias: alias.to_string(),
-            credential: credential.map(ToString::to_string),
-            timeout_secs: timeout_secs
-                .filter(|secs| *secs > 0)
-                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
-            max_tokens: None,
-            extra_body: None,
-        }
-    }
-    /// Override the HTTP request timeout for LLM API calls.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
+/// Typed builder for [`OpenRouterModelProvider`].
+///
+/// Only `alias` is required. `credential` treats whitespace-only inputs
+/// as missing (defensive against stray config values). Timeout,
+/// max_tokens, and extra_body all have sensible defaults.
+#[must_use]
+pub struct OpenRouterBuilder {
+    alias: String,
+    credential: Option<String>,
+    timeout_secs: Option<u64>,
+    max_tokens: Option<u32>,
+    extra_body: Option<serde_json::Value>,
+}
+
+impl OpenRouterBuilder {
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
         self
     }
 
-    /// Set the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default timeout is kept) so a stray `Some(0)`
+    /// from config cannot disable the safety timeout.
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
     /// Set extra JSON parameters to merge into every API request body.
-    /// Keys in `extra` are inserted at the top level of the serialized request,
-    /// overriding any existing keys with the same name.
-    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+    /// Keys in `extra` are inserted at the top level of the serialized
+    /// request, overriding any existing keys with the same name.
+    pub fn extra_body(mut self, extra: serde_json::Value) -> Self {
         self.extra_body = Some(extra);
         self
     }
 
+    pub fn build(self) -> OpenRouterModelProvider {
+        OpenRouterModelProvider {
+            alias: self.alias,
+            credential: self.credential,
+            timeout_secs: self
+                .timeout_secs
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            max_tokens: self.max_tokens,
+            extra_body: self.extra_body,
+        }
+    }
+}
+
+impl OpenRouterModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenRouterBuilder`].
+    pub fn builder(alias: &str) -> OpenRouterBuilder {
+        OpenRouterBuilder {
+            alias: alias.to_string(),
+            credential: None,
+            timeout_secs: None,
+            max_tokens: None,
+            extra_body: None,
+        }
+    }
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
@@ -258,13 +299,19 @@ impl OpenRouterModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content")
@@ -1024,8 +1071,9 @@ mod tests {
 
     #[test]
     fn capabilities_report_vision_support() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         let caps = <OpenRouterModelProvider as ModelProvider>::capabilities(&model_provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -1033,15 +1081,17 @@ mod tests {
 
     #[test]
     fn supports_streaming_returns_true() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         assert!(model_provider.supports_streaming());
     }
 
     #[test]
     fn supports_streaming_tool_events_returns_true() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         assert!(model_provider.supports_streaming_tool_events());
     }
 
@@ -1050,7 +1100,9 @@ mod tests {
         use crate::traits::{ChatMessage, ChatRequest};
         use futures_util::StreamExt as _;
 
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -1089,7 +1141,9 @@ mod tests {
         use crate::traits::{ChatMessage, ChatRequest, StreamEvent};
         use futures_util::StreamExt as _;
 
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -1149,8 +1203,9 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
         assert_eq!(
             model_provider.credential.as_deref(),
             Some("openrouter-test-credential")
@@ -1159,21 +1214,27 @@ mod tests {
 
     #[test]
     fn creates_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         assert!(model_provider.credential.is_none());
     }
 
     #[test]
     fn uses_configured_timeout_when_provided() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), Some(1200));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .timeout_secs(1200)
+            .build();
         assert_eq!(model_provider.timeout_secs, 1200);
     }
 
     #[test]
     fn falls_back_to_default_timeout_for_zero() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), Some(0));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .timeout_secs(0)
+            .build();
         assert_eq!(
             model_provider.timeout_secs,
             zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS
@@ -1182,14 +1243,18 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = model_provider
             .chat_with_system(Some("system"), "hello", "openai/gpt-4o", Some(0.2))
             .await;
@@ -1200,7 +1265,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_fails_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -1335,7 +1402,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
@@ -1799,6 +1868,66 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // A malformed arguments string in the assistant history must be
+        // normalized to "{}" so the outbound chat-completions request doesn't
+        // 400 on strict upstreams. This test pins that the openrouter call site
+        // of `sanitize_tool_arguments` is wired in; the helper contract itself
+        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON object must round-trip byte-for-byte
+        // so the openrouter call site cannot accidentally re-encode or strip
+        // good payloads.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_rejects_non_object_tool_arguments() {
+        // Strict providers (Cohere, OpenRouter auto-exacto) require a JSON
+        // object for tool-call arguments. Null, arrays, strings, numbers, and
+        // booleans are valid JSON but must not reach the upstream.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        for tc in tool_calls {
+            assert_eq!(
+                tc.function.arguments, "{}",
+                "non-object arg for {} must normalize to empty object",
+                tc.function.name
+            );
+        }
+    }
+
+    #[test]
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
@@ -1831,14 +1960,18 @@ mod tests {
 
     #[test]
     fn default_timeout_is_120() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
         assert_eq!(model_provider.timeout_secs, 120);
     }
 
     #[test]
-    fn with_timeout_secs_overrides_default() {
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("key"), None).with_timeout_secs(300);
+    fn timeout_secs_overrides_default() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .timeout_secs(300)
+            .build();
         assert_eq!(model_provider.timeout_secs, 300);
     }
 
@@ -1939,16 +2072,20 @@ mod tests {
     }
 
     #[test]
-    fn with_extra_body_sets_value() {
+    fn extra_body_sets_value() {
         let extra = serde_json::json!({"model_provider": {"only": ["Anthropic"]}});
-        let model_provider =
-            OpenRouterModelProvider::new("test", Some("key"), None).with_extra_body(extra.clone());
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(extra.clone())
+            .build();
         assert_eq!(model_provider.extra_body, Some(extra));
     }
 
     #[test]
     fn extra_body_none_produces_unchanged_request() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1963,8 +2100,10 @@ mod tests {
 
     #[test]
     fn extra_body_empty_object_produces_unchanged_request() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1979,8 +2118,10 @@ mod tests {
 
     #[test]
     fn extra_body_adds_new_top_level_keys() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2000,8 +2141,10 @@ mod tests {
 
     #[test]
     fn extra_body_overrides_existing_keys() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({"temperature": 0.9}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"temperature": 0.9}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2016,8 +2159,10 @@ mod tests {
 
     #[test]
     fn extra_body_merges_at_top_level_not_nested() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
-            .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"transforms": ["middle-out"]}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2036,9 +2181,9 @@ mod tests {
 
     #[test]
     fn extra_body_with_nested_provider_routing() {
-        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None).with_extra_body(
+        let model_provider = OpenRouterModelProvider::builder("test").credential(Some("key")).extra_body(
             serde_json::json!({"model_provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
-        );
+        ).build();
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![],

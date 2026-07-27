@@ -142,9 +142,8 @@ done
 
 # ── Docs book examples + matching i18n catalogs ────────────────────
 # Two surgical patterns, both anchored enough to skip release-runbook
-# history lines like "Last verified: May 2026 (v0.7.4 cycle)" or
-# "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
-# to the version they were written for:
+# release-runbook history lines that intentionally pin an original verification
+# month or scheduled-removal release instead of tracking the current version:
 #   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
 #   - /health response example `"version":"X.Y.Z"` (compact or spaced JSON)
 #   - RPC initialize example   `"serverVersion":"X.Y.Z"` (compact or spaced JSON)

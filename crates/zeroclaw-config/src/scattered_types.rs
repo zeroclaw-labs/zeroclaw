@@ -71,6 +71,7 @@ pub use zeroclaw_api::model_provider::{
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
+    /// Enables provider-native thinking parameters when the selected level has a budget.
     #[serde(default)]
     pub native_thinking: bool,
     #[serde(default)]
@@ -291,8 +292,10 @@ pub struct ContextCompressionConfig {
     pub source_max_chars: usize,
     #[serde(default = "default_cc_timeout_secs")]
     pub timeout_secs: u64,
+    /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
+    /// DEPRECATED bare model id retained as a compatibility fallback.
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
@@ -330,6 +333,7 @@ fn default_precheck_timeout_secs() -> u64 {
     5
 }
 
+/// Per-channel reply-intent precheck configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.precheck"]
@@ -537,6 +541,7 @@ pub struct EmailConfig {
     /// Outlook/Hotmail that have deprecated password auth.
     #[serde(default)]
     pub oauth2: Option<EmailOAuth2Config>,
+    /// When true, the daemon observes new mail but never modifies any IMAP flag.
     #[serde(default)]
     pub observer_mode: bool,
 }

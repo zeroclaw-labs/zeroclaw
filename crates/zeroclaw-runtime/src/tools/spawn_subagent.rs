@@ -184,6 +184,11 @@ impl Tool for SpawnSubagentTool {
             // Subagents keep a live memory backend and the memory tools; only
             // the injected context preamble is suppressed above.
             memory_free: false,
+            // Subagent runs are short-lived; no cross-turn reuse contract,
+            // so the per-call `connect_all` path inside `agent::run` is
+            // the correct choice. The daemon heartbeat worker is the
+            // only `mcp_registry` supplier.
+            mcp_registry: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
