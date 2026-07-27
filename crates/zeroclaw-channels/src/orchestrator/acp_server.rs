@@ -1601,7 +1601,7 @@ impl AcpServer {
         // A failed or cancelled turn still leaves a user-visible transcript: the
         // prompt, completed tool activity, and any partial assistant text are
         // already carried on `StreamedTurnError::new_messages`. Persisting only
-        // successful turns dropped all of it on the next `session/load` (#9333),
+        // successful turns dropped all of it on the next `session/load`,
         // so persist that transcript for every terminal outcome. Provider-facing
         // replay stays valid without a second retention policy — history
         // reconstruction strips orphaned native tool exchanges before the next
@@ -1635,11 +1635,19 @@ impl AcpServer {
                         })),
                     "ACP session/prompt turn failed"
                 );
-                self.persist_turn_messages(
-                    &session_id,
-                    Self::failed_turn_transcript(failure.new_messages),
-                )
-                .await;
+                // A rejected prompt (e.g. empty/whitespace) fails before
+                // producing any transcript, leaving `new_messages` empty. Keep
+                // the old no-write behavior there so repeating an invalid
+                // request doesn't accrete assistant-only `turn-failed` markers
+                // into `session/load`. Only persist — with the marker — when
+                // the turn actually produced visible work.
+                if !failure.new_messages.is_empty() {
+                    self.persist_turn_messages(
+                        &session_id,
+                        Self::failed_turn_transcript(failure.new_messages),
+                    )
+                    .await;
+                }
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Agent turn failed: {}", failure.error),
@@ -1746,7 +1754,7 @@ impl AcpServer {
     /// Best-effort: an empty slice is a no-op, and a store error is logged
     /// while the live session continues in memory. Shared by the successful,
     /// failed, and cancelled turn paths so every terminal outcome preserves
-    /// its user-visible transcript across `session/load` (#9333).
+    /// its user-visible transcript across `session/load`.
     async fn persist_turn_messages(&self, session_id: &str, messages: Vec<ConversationMessage>) {
         let Some(store) = &self.store else {
             return;
@@ -4333,7 +4341,7 @@ mod tests {
         };
 
         // A non-retryable provider failure after visible tool activity used to
-        // discard the whole turn (success-only persistence, #9333). The handler
+        // discard the whole turn (success-only persistence). The handler
         // now routes the failed turn's `new_messages` through the same store
         // path as a success, plus a trailing failure marker. Simulate that
         // failed-turn transcript and confirm it survives `load_session`.
@@ -4417,6 +4425,63 @@ mod tests {
             }
             other => panic!("expected trailing failure marker, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_prompt_leaves_stored_messages_unchanged() {
+        // A blank/whitespace prompt clears `parse_prompt` (it is a non-empty
+        // JSON string) but `turn_streamed_with_steering_state` rejects it
+        // before any provider work, returning `StreamedTurnError` with an empty
+        // `new_messages`. This drives the real failed-turn branch in
+        // `handle_session_prompt` — no mock provider needed — and must NOT
+        // append an assistant-only `turn-failed` marker, otherwise repeating an
+        // invalid request would pollute `session/load`.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        let before = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record must exist after session/new")
+            .messages;
+
+        let err = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id.clone(),
+                    "prompt": "   "
+                }),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("a blank turn must surface an RPC error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+
+        let after = store
+            .load_session(&session_id)
+            .unwrap()
+            .expect("session record must still exist")
+            .messages;
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "a rejected blank turn must not persist any messages: {after:?}"
+        );
     }
 
     #[tokio::test]
