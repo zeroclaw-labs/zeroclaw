@@ -240,7 +240,7 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
 /// the provider sees roughly `bytes * 4 / 3` characters of payload. At the
 /// shared ~4 chars/token heuristic that is `bytes / 3` tokens — orders of
 /// magnitude more than the ~30-character marker string the text heuristic would
-/// otherwise count (#9332).
+/// otherwise count.
 ///
 /// Local files are sized from disk; already-inlined base64 data URIs from their
 /// payload length. References we cannot size here (remote URLs, missing files)
@@ -273,7 +273,7 @@ fn estimate_image_marker_tokens(payload: &str) -> usize {
 /// Estimate the token cost of a single message using the ~4 chars/token
 /// heuristic plus ~4 framing tokens (role, delimiters). `[IMAGE:...]` markers
 /// are additionally charged for the multimodal payload they expand into at
-/// send-time, so image-heavy turns are not reported as nearly free (#9332).
+/// send-time, so image-heavy turns are not reported as nearly free.
 /// Single-sourced so the history and system-floor estimates stay in lock-step.
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
     let text_tokens = message.content.len().div_ceil(4) + 4;
@@ -320,6 +320,19 @@ pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
     crate::i18n::get_required_cli_string_with_args(
         "history-trim-floor-exceeds-budget",
         &[("floor", floor_s.as_str()), ("budget", budget_s.as_str())],
+    )
+}
+
+/// Diagnostic for a single turn whose prepared multimodal payload alone
+/// exceeds the context budget, so no amount of history trimming can make it
+/// fit. Surfaced instead of dispatching a request the provider will reject.
+#[must_use]
+pub fn multimodal_budget_remediation(prepared_tokens: usize, budget: usize) -> String {
+    let tokens_s = prepared_tokens.to_string();
+    let budget_s = budget.to_string();
+    crate::i18n::get_required_cli_string_with_args(
+        "history-trim-multimodal-exceeds-budget",
+        &[("tokens", tokens_s.as_str()), ("budget", budget_s.as_str())],
     )
 }
 
@@ -511,7 +524,7 @@ mod tests {
     fn estimate_charges_image_markers_for_multimodal_payload() {
         // Five image markers in one tool result must not be estimated as a few
         // dozen text tokens — the markers expand to un-downscaled base64 at
-        // send-time, so each ~1.5 MiB image is ~500K tokens (#9332).
+        // send-time, so each ~1.5 MiB image is ~500K tokens.
         let dir = tempfile::tempdir().unwrap();
         let bytes = 1_500_000usize;
         let mut content = String::from("Here are the slides:\n");

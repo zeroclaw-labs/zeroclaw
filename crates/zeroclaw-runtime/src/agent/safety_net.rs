@@ -1995,3 +1995,156 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
         "model-supplied approved=true must be stripped even with no approval gate"
     );
 }
+
+// ── seam: multimodal budget enforced at the post-tool dispatch boundary ──
+// The oversized request in the multimodal-context bug lands on the SECOND
+// provider call — after a tool round returns image markers that expand to
+// un-downscaled base64 during preparation. Enforcement therefore has to run on
+// every dispatch, measured against the prepared payload, and stop the turn
+// before that doomed call rather than trimming based on the raw marker text.
+
+/// Scripted provider that also counts how many times the model was dispatched,
+/// so a test can prove the post-tool call was never made.
+struct CountingScriptedProvider {
+    responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelProvider for CountingScriptedProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok("ok".into())
+    }
+
+    async fn chat(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .responses
+            .lock()
+            .pop_front()
+            .unwrap_or_else(|| text_response("done")))
+    }
+
+    fn capabilities_for_model(
+        &self,
+        _model: &str,
+    ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+        // Vision-capable: the oversized-request bug only occurs when the
+        // provider accepts images, so tool-result markers are kept and expanded
+        // rather than stripped for a text-only route.
+        zeroclaw_api::model_provider::ProviderCapabilities {
+            vision: true,
+            ..Default::default()
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for CountingScriptedProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "CountingScriptedProvider"
+    }
+}
+
+/// Tool whose result carries a fixed `[IMAGE:...]` marker, used to inject an
+/// image into history via a real tool round.
+struct ImageEmittingTool {
+    name: &'static str,
+    marker: String,
+}
+
+zeroclaw_api::tool_attribution!(
+    ImageEmittingTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+
+#[async_trait]
+impl Tool for ImageEmittingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.name
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: self.marker.clone().into(),
+            error: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn safety_net_multimodal_budget_stops_second_dispatch() {
+    // A ~4 MB inline image (decoded < the 5 MB per-image cap so preparation
+    // accepts it) expands to a base64 payload far larger than the context
+    // budget. It is fine as raw marker text but blows the window once prepared.
+    let payload = "A".repeat(5_600_000); // multiple of 4 → valid base64, decodes to 4.2 MB
+    let marker = format!("[IMAGE:data:image/png;base64,{payload}]");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingScriptedProvider {
+        responses: parking_lot::Mutex::new(
+            vec![
+                // Call 1: ask to run the image tool.
+                tool_response(vec![tool_call("img-1", "attach_image")]),
+                // Call 2: would summarize — must never be reached.
+                text_response("here is the image"),
+            ]
+            .into(),
+        ),
+        calls: Arc::clone(&calls),
+    };
+
+    let mut agent = build_agent_with_runtime(
+        Box::new(provider),
+        vec![Box::new(ImageEmittingTool {
+            name: "attach_image",
+            marker,
+        })],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 4,
+            // Comfortably fits the text-only first turn, far below the image.
+            max_context_tokens: 100_000,
+            // Keep the giant marker intact through the tool-result pipeline.
+            max_tool_result_chars: 50_000_000,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+
+    let err = agent
+        .turn("show me the screenshot")
+        .await
+        .expect_err("prepared image payload exceeds the budget; turn must stop, not dispatch");
+
+    assert!(
+        err.to_string().contains("send fewer or smaller images"),
+        "turn must stop with the targeted multimodal-budget diagnostic, got: {err}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the post-tool provider call must be stopped, not dispatched over budget"
+    );
+}

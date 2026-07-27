@@ -247,6 +247,42 @@ fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
 }
 
+/// Public wrapper over the whole-turn count, for callers outside this module
+/// that need the kept-turn figure after a [`drop_oldest_turn`] pass.
+#[must_use]
+pub fn count_turns_pub(history: &[ChatMessage]) -> usize {
+    count_turns(history)
+}
+
+/// Drop the single oldest whole non-system turn in place, keeping leading
+/// system messages and never cutting the most recent turn. Returns the number
+/// of dropped messages, or `None` when there is no older turn left to drop
+/// (only system messages plus one whole turn remain).
+///
+/// Unlike [`trim_to_recent_turns`], this makes no token estimate of its own:
+/// the caller re-measures the *prepared* payload after each drop, so trimming,
+/// dispatch enforcement, and the meter all share one source of truth instead
+/// of trusting a raw-marker estimate that over-counts images the multimodal
+/// preparation will drop.
+pub fn drop_oldest_turn(history: &mut Vec<ChatMessage>) -> Option<usize> {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let boundaries: Vec<usize> = history[leading_system..]
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_turn_boundary(m))
+        .map(|(i, _)| leading_system + i)
+        .collect();
+    if boundaries.len() <= 1 {
+        return None;
+    }
+    // Drop everything from the first turn boundary up to (not including) the
+    // second — i.e. exactly the oldest whole turn.
+    let drop_end = boundaries[1];
+    let dropped = drop_end - boundaries[0];
+    history.drain(boundaries[0]..drop_end);
+    Some(dropped)
+}
+
 /// Front breadcrumb injected after the system messages so the model SEES that
 /// earlier turns were cut and cannot confabulate dropped work as present.
 pub fn breadcrumb() -> ChatMessage {

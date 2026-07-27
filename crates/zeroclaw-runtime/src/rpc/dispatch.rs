@@ -4688,6 +4688,15 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
+            estimated: false,
+        },
+        TurnEvent::UsageEstimate {
+            estimated_input_tokens,
+        } => SessionUpdateEvent::ContextUsage {
+            session_id: session_id.to_string(),
+            input_tokens: *estimated_input_tokens,
+            max_context_tokens,
+            estimated: true,
         },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),

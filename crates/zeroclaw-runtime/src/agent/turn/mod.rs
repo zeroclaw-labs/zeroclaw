@@ -556,13 +556,117 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         refresh_prompt_anchor(history, use_native_tools);
 
-        let prepared_messages = prepare_messages_for_iteration(
-            history,
-            multimodal_config,
-            degrade_strip_images,
-            image_cache.as_deref_mut(),
-        )
-        .await?;
+        // Enforce the context budget against the EFFECTIVE prepared payload on
+        // every dispatch, not just the first iteration. `[IMAGE:...]` markers
+        // expand to un-downscaled base64 only during preparation, so a tool
+        // round that returns screenshots can blow far past the context window
+        // even when the raw history text looked small — and the oversized
+        // request lands *after* a native-tool round, past the iteration==0
+        // pre-trim above. Measure the prepared messages (post image-cap,
+        // provider-ready), drop whole old turns and re-prepare until the
+        // payload fits, and if the current turn alone still exceeds the budget,
+        // stop with a targeted diagnostic rather than dispatching a doomed
+        // multi-million-token request the provider will only reject. The same
+        // prepared figure is emitted to the context meter so it reflects the
+        // real pre-dispatch size instead of the last provider-reported usage.
+        let prepared_messages = {
+            let mut prepared = prepare_messages_for_iteration(
+                history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await?;
+
+            if context_token_budget > 0 {
+                loop {
+                    let prepared_tokens =
+                        crate::agent::history::estimate_history_tokens(&prepared.messages);
+                    if prepared_tokens <= context_token_budget {
+                        break;
+                    }
+                    let Some(dropped_messages) =
+                        crate::agent::history_trim::drop_oldest_turn(history)
+                    else {
+                        // Only system messages plus the current turn remain, and
+                        // that turn's prepared payload alone exceeds the budget.
+                        // Surface the estimate so the meter shows the overflow,
+                        // then fail fast with an actionable message instead of
+                        // dispatching a request the provider cannot accept.
+                        if let Some(tx) = event_tx.as_ref() {
+                            let _ = tx
+                                .send(TurnEvent::UsageEstimate {
+                                    estimated_input_tokens: Some(prepared_tokens as u64),
+                                })
+                                .await;
+                        }
+                        let remediation = crate::agent::history::multimodal_budget_remediation(
+                            prepared_tokens,
+                            context_token_budget,
+                        );
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "prepared_tokens": prepared_tokens,
+                                "budget": context_token_budget,
+                                "error_key": "multimodal_exceeds_budget",
+                            })),
+                            remediation.as_str()
+                        );
+                        return Err(anyhow::Error::msg(remediation));
+                    };
+                    crate::agent::history_trim::insert_breadcrumb_deduped(history);
+                    if let Some(tx) = event_tx.as_ref() {
+                        let _ = tx
+                            .send(TurnEvent::HistoryTrimmed {
+                                dropped_messages,
+                                kept_turns: crate::agent::history_trim::count_turns_pub(history),
+                                reason: crate::i18n::get_required_cli_string(
+                                    "history-trim-reason-multimodal-budget",
+                                ),
+                            })
+                            .await;
+                    }
+                    observer.record_event(
+                        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns: crate::agent::history_trim::count_turns_pub(history),
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-multimodal-budget",
+                            ),
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
+                        },
+                    );
+                    prepared = prepare_messages_for_iteration(
+                        history,
+                        multimodal_config,
+                        degrade_strip_images,
+                        image_cache.as_deref_mut(),
+                    )
+                    .await?;
+                }
+
+                let prepared_tokens =
+                    crate::agent::history::estimate_history_tokens(&prepared.messages);
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::UsageEstimate {
+                            estimated_input_tokens: Some(prepared_tokens as u64),
+                        })
+                        .await;
+                }
+            }
+
+            prepared
+        };
 
         let llm_started_at = announce_llm_request(
             &ctx,

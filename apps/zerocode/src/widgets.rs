@@ -106,6 +106,10 @@ use ratatui::{
 pub struct CtxBar {
     pub input_tokens: Option<u64>,
     pub max_tokens: Option<u64>,
+    /// `input_tokens` is a pre-dispatch estimate, not a provider-reported
+    /// figure. Rendered with a `~` prefix and an `est` tag so it is not
+    /// mistaken for measured usage.
+    pub estimated: bool,
 }
 
 impl CtxBar {
@@ -113,7 +117,14 @@ impl CtxBar {
         Self {
             input_tokens,
             max_tokens,
+            estimated: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_estimated(mut self, estimated: bool) -> Self {
+        self.estimated = estimated;
+        self
     }
 
     /// `true` when there is something worth rendering.
@@ -123,6 +134,9 @@ impl CtxBar {
 
     /// Build a `Paragraph` widget, or `None` if there is nothing to show.
     pub fn widget(&self) -> Option<Paragraph<'static>> {
+        // Marks the used figure as an estimate rather than a measured total.
+        let used_prefix = if self.estimated { "~" } else { "" };
+        let est_tag = if self.estimated { "  est" } else { "" };
         let (text, pct_opt) = match (self.input_tokens, self.max_tokens) {
             (Some(used), Some(max)) if max > 0 => {
                 let pct = (used as f64 / max as f64 * 100.0).min(100.0);
@@ -135,16 +149,23 @@ impl CtxBar {
                     "\u{2591}".repeat(empty)
                 );
                 let label = format!(
-                    " ctx: {:>7} / {:>7}  {}  {:.0}%",
+                    " ctx: {}{:>7} / {:>7}  {}  {:.0}%{}",
+                    used_prefix,
                     fmt_tokens(used),
                     fmt_tokens(max),
                     bar,
                     pct,
+                    est_tag,
                 );
                 (label, Some(pct))
             }
             (Some(used), None) => {
-                let label = format!(" ctx: {} tokens", fmt_tokens(used));
+                let label = format!(
+                    " ctx: {}{} tokens{}",
+                    used_prefix,
+                    fmt_tokens(used),
+                    est_tag
+                );
                 (label, None)
             }
             _ => return None,

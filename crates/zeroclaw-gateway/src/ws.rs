@@ -1163,6 +1163,13 @@ async fn process_chat_message(
                             }
                             continue;
                         }
+                        TurnEvent::UsageEstimate { .. } => {
+                            // Pre-dispatch estimate is surfaced on the RPC/ACP
+                            // context meter; the gateway WS stream reports
+                            // accumulated provider-measured usage at turn end,
+                            // so skip the estimate here without a frame.
+                            continue;
+                        }
                         TurnEvent::Chunk { ref delta } => {
                             accumulated_text.push_str(delta);
                             serde_json::json!({ "type": "chunk", "content": delta })
