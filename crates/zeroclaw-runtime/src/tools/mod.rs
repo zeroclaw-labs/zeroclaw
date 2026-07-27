@@ -1430,16 +1430,17 @@ pub fn all_tools_with_runtime(
         Some(parent_tools)
     };
 
-    // Verifiable Intent tool (opt-in via config)
+    // `vi_verify` is not model-callable while no chain verifier exists: it checked
+    // caller-supplied constraints against a caller-supplied fulfillment with nothing
+    // establishing that either came from a signed credential. Register it again only
+    // behind a verify-and-evaluate path that consumes a verified chain result.
     if root_config.verifiable_intent.enabled {
-        let strictness = match root_config.verifiable_intent.strictness.as_str() {
-            "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
-            _ => crate::verifiable_intent::StrictnessMode::Strict,
-        };
-        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
-            security.clone(),
-            strictness,
-        )));
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+        );
     }
 
     // ── WASM plugin tools (requires plugins-wasm feature) ──
@@ -2984,6 +2985,56 @@ mod tests {
         assert!(
             !names.contains(&"read_skill"),
             "full runtime-profile override should omit read_skill even when global is compact"
+        );
+    }
+
+    /// `vi_verify` checked caller-supplied constraints against a caller-supplied
+    /// fulfillment with nothing establishing that either came from a signed
+    /// credential. Until a chain verifier exists the tool must not reach the model
+    /// even when an operator opts in.
+    #[test]
+    fn vi_verify_is_not_registered_even_when_verifiable_intent_is_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(&tmp);
+        cfg.verifiable_intent.enabled = true;
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !names.contains(&"vi_verify"),
+            "vi_verify must not be model-callable while no chain verifier exists"
+        );
+        assert!(
+            names.contains(&"shell"),
+            "positive control: the registry must still be populated"
         );
     }
 }
