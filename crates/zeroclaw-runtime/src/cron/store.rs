@@ -358,26 +358,27 @@ pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usi
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
-    let lim = i64::try_from(config.scheduler.max_tasks.max(1))
-        .context("Scheduler max_tasks overflows i64")?;
+    let lim = config.scheduler.max_tasks.max(1);
     let Some(jobs) = with_read_connection(config, |conn| {
+        // Fetch all eligible rows without a SQL LIMIT: orphan filtering
+        // happens in Rust, and max_tasks is applied after filtering so
+        // that stale declarative rows cannot consume the live quota.
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                      allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
-             ORDER BY next_run ASC
-             LIMIT ?2",
+             ORDER BY next_run ASC",
         )?;
 
-        let rows = stmt.query_map(params![now.to_rfc3339(), lim], map_cron_job_row)?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], map_cron_job_row)?;
 
         let mut jobs = Vec::new();
         for row in rows {
             match row {
                 Ok(mut job) => {
-                    if job.source == "declarative" && !config.cron.contains_key(&job.id) {
+                    if job.source == "declarative" && !is_valid_declarative_owner(config, &job.id) {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -408,7 +409,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         return Ok(Vec::new());
     };
 
-    Ok(jobs)
+    Ok(jobs.into_iter().take(lim).collect())
 }
 
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
@@ -428,7 +429,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         for row in rows {
             match row {
                 Ok(mut job) => {
-                    if job.source == "declarative" && !config.cron.contains_key(&job.id) {
+                    if job.source == "declarative" && !is_valid_declarative_owner(config, &job.id) {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1071,6 +1072,21 @@ fn resolve_declarative_shell_output_format(config: &Config, job: &mut CronJob) {
     {
         job.shell_output_format = decl.shell_output_format.clone();
     }
+}
+
+/// Returns `true` if a declarative job still has a live config owner.
+/// Covers both `config.cron` entries and derived declarations like
+/// `__builtin_backup` (from `config.backup.schedule_cron`).
+pub(crate) fn is_valid_declarative_owner(config: &Config, job_id: &str) -> bool {
+    if config.cron.contains_key(job_id) {
+        return true;
+    }
+    // __builtin_backup is derived from config.backup.schedule_cron and
+    // synced as source = 'declarative' by the scheduler startup path.
+    if job_id == "__builtin_backup" && config.backup.schedule_cron.is_some() {
+        return true;
+    }
+    false
 }
 
 fn decode_schedule(schedule_raw: Option<&str>, expression: &str) -> Result<Schedule> {

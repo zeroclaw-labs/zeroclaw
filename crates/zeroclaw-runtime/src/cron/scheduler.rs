@@ -499,6 +499,20 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+    // Reject orphaned declarative jobs: a declarative row whose canonical
+    // config declaration has been removed must not execute through any
+    // path (automatic polling or manual trigger).
+    if job.source == "declarative" && !super::store::is_valid_declarative_owner(config, &job.id) {
+        return (
+            false,
+            format!(
+                "cron job {id:?} is an orphaned declarative entry \
+                 (source = \"declarative\" but absent from live config); \
+                 cannot execute",
+                id = job.id
+            ),
+        );
+    }
     use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
         return (
