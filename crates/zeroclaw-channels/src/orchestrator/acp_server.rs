@@ -2420,6 +2420,60 @@ type RpcResult = std::result::Result<Value, RpcError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct RecordingNativeProvider {
+        requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingNativeProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RecordingNativeProvider"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for RecordingNativeProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("recovered".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            self.requests.lock().push(request.messages.to_vec());
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
 
     #[test]
     fn acp_server_config_defaults() {
@@ -4425,6 +4479,94 @@ mod tests {
             }
             other => panic!("expected trailing failure marker, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn restored_failed_turn_repairs_incomplete_tool_call_before_next_prompt() {
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-failed-turn-incomplete-tool";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // This is the durable shape left by a failure after the model emitted
+        // a native tool call but before its result existed.
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("inspect the workspace")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "toolu_incomplete".to_string(),
+                            name: "shell".to_string(),
+                            arguments: "{\"command\":\"pwd\"}".to_string(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                ]),
+            )
+            .unwrap();
+
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("failed transcript must reload");
+
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+
+        let result = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": "continue safely"
+                }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+        assert_eq!(result["stopReason"], "end_turn");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|message| message.content.contains("toolu_incomplete")),
+            "provider request retained an unmatched tool call: {:?}",
+            requests[0]
+        );
+        assert!(
+            requests[0].iter().any(
+                |message| message.role == "user" && message.content.contains("continue safely")
+            ),
+            "provider request must include the post-reload prompt"
+        );
     }
 
     #[tokio::test]
