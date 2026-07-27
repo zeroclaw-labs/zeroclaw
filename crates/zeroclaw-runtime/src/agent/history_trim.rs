@@ -117,7 +117,9 @@ pub(crate) fn trim_conversation_to_recent_turns(
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+    msg.role == "user"
+        && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+        && msg.content != crate::i18n::get_required_cli_string("history-trim-breadcrumb")
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -933,6 +935,30 @@ mod tests {
             trimmed[..system_count].iter().all(|m| m.role == "system"),
             "breadcrumb must sit after every leading system message"
         );
+    }
+
+    #[test]
+    fn repeated_oldest_turn_drops_skip_the_trim_breadcrumb() {
+        let mut history = vec![
+            sys("system"),
+            user("oldest"),
+            asst("answer 1"),
+            user("middle"),
+            asst("answer 2"),
+            user("current"),
+            asst("answer 3"),
+        ];
+
+        assert_eq!(drop_oldest_turn(&mut history), Some(2));
+        insert_breadcrumb_deduped(&mut history);
+        assert_eq!(
+            drop_oldest_turn(&mut history),
+            Some(2),
+            "the synthetic user breadcrumb must not become a turn boundary"
+        );
+        assert!(history.iter().any(|m| m.content == "current"));
+        assert!(!history.iter().any(|m| m.content == "middle"));
+        assert_eq!(drop_oldest_turn(&mut history), None);
     }
 
     #[test]

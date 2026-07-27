@@ -1662,11 +1662,10 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
-        // Capture live attribution fields and max_context_tokens for the turn span.
-        // Zerocode's context meter field is named `max_context_tokens` and must
-        // reflect the runtime-profile budget (`[runtime_profiles.<name>]
-        // max_context_tokens`), not the provider model-window helper (which
-        // falls back to 32_000 when `context_window` is unset).
+        // Capture live attribution fields and the effective context budget for
+        // the turn span. Zerocode's wire field is named `max_context_tokens`,
+        // but its value must match pre-dispatch enforcement after an optional
+        // history-pruning floor, not the provider model-window helper.
         let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
@@ -4545,13 +4544,14 @@ fn truncate_memory_previews(
 /// Resolve the max-token ceiling shown on Zerocode's context usage meter.
 ///
 /// The wire field is named `max_context_tokens` and must track the operator's
-/// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
-/// which is also the preemptive history-trim budget. Using the provider
+/// effective runtime-profile budget (the lower of `max_context_tokens` and an
+/// enabled `history_pruning.max_tokens`), which is also the pre-dispatch
+/// enforcement budget. Using the provider
 /// model-window helper here is wrong: that path ignores the runtime profile
 /// and falls back to 32_000 when `providers.models.*.context_window` is unset,
 /// so the meter freezes at the default even when the profile is set higher.
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
-    cfg.effective_max_context_tokens(agent_alias) as u64
+    cfg.effective_context_budget(agent_alias) as u64
 }
 
 /// Persist the exact turn delta captured before structured history trimming.
@@ -4679,12 +4679,7 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens: _,
-            output_tokens: _,
-            ..
-        } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
@@ -6584,6 +6579,43 @@ mod tests {
             32_000,
             "sanity: model-window helper still defaults to 32k without provider context_window"
         );
+    }
+
+    #[test]
+    fn context_usage_max_tokens_matches_lower_history_pruning_budget() {
+        use std::collections::HashMap;
+        use zeroclaw_config::scattered_types::HistoryPrunerConfig;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                history_pruning: HistoryPrunerConfig {
+                    enabled: true,
+                    max_tokens: 48_000,
+                    ..HistoryPrunerConfig::default()
+                },
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 48_000);
     }
 
     /// Boundary regression: prove the corrected ceiling survives the *wire*

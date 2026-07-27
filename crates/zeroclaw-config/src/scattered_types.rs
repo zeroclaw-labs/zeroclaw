@@ -152,6 +152,17 @@ impl Default for HistoryPrunerConfig {
     }
 }
 
+impl HistoryPrunerConfig {
+    #[must_use]
+    pub fn effective_context_budget(&self, max_context_tokens: usize) -> usize {
+        if self.enabled && self.max_tokens > 0 {
+            max_context_tokens.min(self.max_tokens)
+        } else {
+            max_context_tokens
+        }
+    }
+}
+
 fn default_cost_optimized_hint() -> String {
     "cost-optimized".to_string()
 }

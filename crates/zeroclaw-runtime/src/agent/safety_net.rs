@@ -2008,6 +2008,7 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
 struct CountingScriptedProvider {
     responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
     calls: Arc<AtomicUsize>,
+    requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
 }
 
 #[async_trait]
@@ -2024,11 +2025,12 @@ impl ModelProvider for CountingScriptedProvider {
 
     async fn chat(
         &self,
-        _request: ChatRequest<'_>,
+        request: ChatRequest<'_>,
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().push(request.messages.to_vec());
         Ok(self
             .responses
             .lock()
@@ -2096,11 +2098,11 @@ impl Tool for ImageEmittingTool {
 }
 
 #[tokio::test]
-async fn safety_net_multimodal_budget_stops_second_dispatch() {
-    // A ~4 MB inline image (decoded < the 5 MB per-image cap so preparation
-    // accepts it) expands to a base64 payload far larger than the context
-    // budget. It is fine as raw marker text but blows the window once prepared.
-    let payload = "A".repeat(5_600_000); // multiple of 4 → valid base64, decodes to 4.2 MB
+async fn safety_net_multimodal_budget_stops_second_dispatch_with_multiple_tool_images() {
+    // Two image-returning tools run in one native-tool round. Each image stays
+    // below the per-image cap, but their combined prepared payload exceeds the
+    // context budget before the second provider dispatch.
+    let payload = "A".repeat(2_800_000); // valid base64, decodes to 2.1 MB per image
     let marker = format!("[IMAGE:data:image/png;base64,{payload}]");
 
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2108,21 +2110,31 @@ async fn safety_net_multimodal_budget_stops_second_dispatch() {
         responses: parking_lot::Mutex::new(
             vec![
                 // Call 1: ask to run the image tool.
-                tool_response(vec![tool_call("img-1", "attach_image")]),
+                tool_response(vec![
+                    tool_call("img-1", "attach_image_one"),
+                    tool_call("img-2", "attach_image_two"),
+                ]),
                 // Call 2: would summarize — must never be reached.
                 text_response("here is the image"),
             ]
             .into(),
         ),
         calls: Arc::clone(&calls),
+        requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
 
     let mut agent = build_agent_with_runtime(
         Box::new(provider),
-        vec![Box::new(ImageEmittingTool {
-            name: "attach_image",
-            marker,
-        })],
+        vec![
+            Box::new(ImageEmittingTool {
+                name: "attach_image_one",
+                marker: marker.clone(),
+            }),
+            Box::new(ImageEmittingTool {
+                name: "attach_image_two",
+                marker,
+            }),
+        ],
         zeroclaw_config::schema::ResolvedRuntime {
             max_tool_iterations: 4,
             // Comfortably fits the text-only first turn, far below the image.
@@ -2147,4 +2159,86 @@ async fn safety_net_multimodal_budget_stops_second_dispatch() {
         1,
         "the post-tool provider call must be stopped, not dispatched over budget"
     );
+}
+
+#[tokio::test]
+async fn safety_net_multimodal_budget_drops_two_real_turns_and_dispatches() {
+    let old_payload = "A".repeat(20_000);
+    let tool_payload = "A".repeat(32_000);
+    let old_one = format!("old-one [IMAGE:data:image/png;base64,{old_payload}]");
+    let old_two = format!("old-two [IMAGE:data:image/png;base64,{old_payload}]");
+    let tool_marker = format!("[IMAGE:data:image/png;base64,{tool_payload}]");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let provider = CountingScriptedProvider {
+        responses: parking_lot::Mutex::new(
+            vec![
+                tool_response(vec![
+                    tool_call("img-1", "attach_image_one"),
+                    tool_call("img-2", "attach_image_two"),
+                ]),
+                text_response("images ready"),
+            ]
+            .into(),
+        ),
+        calls: Arc::clone(&calls),
+        requests: Arc::clone(&requests),
+    };
+    let mut agent = build_agent_with_runtime(
+        Box::new(provider),
+        vec![
+            Box::new(ImageEmittingTool {
+                name: "attach_image_one",
+                marker: tool_marker.clone(),
+            }),
+            Box::new(ImageEmittingTool {
+                name: "attach_image_two",
+                marker: tool_marker,
+            }),
+        ],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 4,
+            max_context_tokens: 20_000,
+            max_tool_result_chars: 1_000_000,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+    agent.seed_history(&[
+        ChatMessage::user(old_one),
+        ChatMessage::assistant("old answer one"),
+        ChatMessage::user(old_two),
+        ChatMessage::assistant("old answer two"),
+    ]);
+
+    let answer = agent
+        .turn("attach both current images")
+        .await
+        .expect("two old turns should be dropped until the prepared payload fits");
+    assert_eq!(answer, "images ready");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "trimming must converge and allow the second provider dispatch"
+    );
+
+    let recorded = requests.lock();
+    assert_eq!(recorded.len(), 2);
+    let chat_contents: Vec<&str> = recorded[1]
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    assert!(
+        !chat_contents
+            .iter()
+            .any(|content| content.contains("old-one"))
+    );
+    assert!(
+        !chat_contents
+            .iter()
+            .any(|content| content.contains("old-two"))
+    );
+    assert!(chat_contents.iter().any(|content| {
+        *content == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+    }));
 }

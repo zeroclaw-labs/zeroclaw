@@ -270,39 +270,38 @@ fn estimate_image_marker_tokens(payload: &str) -> usize {
     }
 }
 
-/// Estimate the token cost of a single message using the ~4 chars/token
-/// heuristic plus ~4 framing tokens (role, delimiters). `[IMAGE:...]` markers
-/// are additionally charged for the multimodal payload they expand into at
-/// send-time, so image-heavy turns are not reported as nearly free.
-/// Single-sourced so the history and system-floor estimates stay in lock-step.
+/// Estimate the raw text token cost of a single message using the ~4
+/// chars/token heuristic plus ~4 framing tokens (role, delimiters).
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    let text_tokens = message.content.len().div_ceil(4) + 4;
-    text_tokens + sum_image_marker_tokens(&message.content)
+    let (text, _) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+    text.len().div_ceil(4) + 4
 }
 
-/// Sum the multimodal token estimate over every `[IMAGE:...]` marker in
-/// `content`, counting each occurrence (repeated images each cost payload) so
-/// a batch of identical images is not under-counted.
-fn sum_image_marker_tokens(content: &str) -> usize {
-    const OPEN: &str = "[IMAGE:";
-    let mut total = 0usize;
-    let mut from = 0usize;
-    while let Some(rel) = content[from..].find(OPEN) {
-        let inner_start = from + rel + OPEN.len();
-        let Some(rel_end) = content[inner_start..].find(']') else {
-            break;
-        };
-        let inner_end = inner_start + rel_end;
-        total += estimate_image_marker_tokens(content[inner_start..inner_end].trim());
-        from = inner_end + 1;
-    }
-    total
+/// Estimate one provider-ready message without charging inline image data as
+/// both ordinary text and image payload. This must only be used after
+/// multimodal preparation has removed stale/failed/capped image references.
+fn estimate_prepared_message_tokens(message: &ChatMessage) -> usize {
+    let (text, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+    let text_tokens = text.len().div_ceil(4) + 4;
+    text_tokens
+        + image_refs
+            .iter()
+            .map(|payload| estimate_image_marker_tokens(payload))
+            .sum::<usize>()
 }
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history.iter().map(estimate_message_tokens).sum()
+}
+
+/// Estimate the effective provider-ready history after multimodal preparation.
+///
+/// Image caps, age trimming, failed references, and stale tool-result images
+/// must already have been applied by the caller.
+pub fn estimate_prepared_history_tokens(history: &[ChatMessage]) -> usize {
+    history.iter().map(estimate_prepared_message_tokens).sum()
 }
 
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
@@ -521,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_charges_image_markers_for_multimodal_payload() {
+    fn prepared_estimate_charges_images_without_affecting_raw_preflight() {
         // Five image markers in one tool result must not be estimated as a few
         // dozen text tokens — the markers expand to un-downscaled base64 at
         // send-time, so each ~1.5 MiB image is ~500K tokens.
@@ -535,14 +534,18 @@ mod tests {
         }
         let history = vec![ChatMessage::user(&content)];
 
-        let estimate = estimate_history_tokens(&history);
-        // Text alone (marker strings included) is only a few hundred tokens.
-        let text_only = content.len().div_ceil(4) + 4;
+        let (raw_text, _) = zeroclaw_providers::multimodal::parse_image_markers(&content);
+        let text_only = raw_text.len().div_ceil(4) + 4;
+        assert_eq!(
+            estimate_history_tokens(&history),
+            text_only,
+            "raw-history preflight must not charge images before preparation applies caps"
+        );
         assert!(
             text_only < 1_000,
             "text-only estimate should be small: {text_only}"
         );
-        // Each image contributes ~bytes/3 tokens; five images dominate.
+        let estimate = estimate_prepared_history_tokens(&history);
         let expected_image_floor = 5 * (bytes / 3);
         assert!(
             estimate >= expected_image_floor,
@@ -571,6 +574,53 @@ mod tests {
         let payload = "A".repeat(400);
         let uri = format!("data:image/png;base64,{payload}");
         assert_eq!(estimate_image_marker_tokens(&uri), 100);
+    }
+
+    #[test]
+    fn prepared_estimate_does_not_double_count_inline_image_data_as_text() {
+        let payload = "A".repeat(400);
+        let content = format!("caption [IMAGE:data:image/png;base64,{payload}]");
+        let history = vec![ChatMessage::user(&content)];
+
+        assert_eq!(
+            estimate_prepared_history_tokens(&history),
+            "caption".len().div_ceil(4) + 4 + 100
+        );
+        assert_eq!(
+            estimate_history_tokens(&history),
+            "caption".len().div_ceil(4) + 4,
+            "raw preflight must leave image enforcement to prepared accounting"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_estimate_only_charges_images_that_survive_the_cap() {
+        let payload = "A".repeat(400);
+        let history: Vec<ChatMessage> = (0..3)
+            .map(|index| {
+                ChatMessage::user(format!(
+                    "caption {index} [IMAGE:data:image/png;base64,{payload}]"
+                ))
+            })
+            .collect();
+        let config = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        };
+
+        let prepared =
+            zeroclaw_providers::multimodal::prepare_messages_for_provider(&history, &config)
+                .await
+                .unwrap();
+        assert_eq!(
+            zeroclaw_providers::multimodal::count_image_markers(&prepared.messages),
+            1
+        );
+        let estimate = estimate_prepared_history_tokens(&prepared.messages);
+        assert!(
+            estimate < 200,
+            "capped images must not remain in effective-payload accounting: {estimate}"
+        );
     }
 
     #[test]

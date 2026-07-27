@@ -3379,11 +3379,8 @@ impl ResolvedRuntime {
     /// trims earlier than the hard context ceiling; otherwise the ceiling is
     /// the only trigger. Reuses the existing `history_pruning.*` idents.
     pub fn effective_context_budget(&self) -> usize {
-        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
-            self.max_context_tokens.min(self.history_pruning.max_tokens)
-        } else {
-            self.max_context_tokens
-        }
+        self.history_pruning
+            .effective_context_budget(self.max_context_tokens)
     }
 }
 
@@ -4034,6 +4031,19 @@ impl Config {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
             .unwrap_or(32_000)
+    }
+
+    /// Resolve the actual pre-dispatch context budget after the optional
+    /// history-pruning floor is applied.
+    #[must_use]
+    pub fn effective_context_budget(&self, agent_alias: &str) -> usize {
+        let max_context_tokens = self.effective_max_context_tokens(agent_alias);
+        let Some(profile) = self.runtime_profile_for_agent(agent_alias) else {
+            return max_context_tokens;
+        };
+        profile
+            .history_pruning
+            .effective_context_budget(max_context_tokens)
     }
 
     /// Returns the model's context window size (max input tokens).

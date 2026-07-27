@@ -581,8 +581,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             if context_token_budget > 0 {
                 loop {
                     let prepared_tokens =
-                        crate::agent::history::estimate_history_tokens(&prepared.messages);
-                    if prepared_tokens <= context_token_budget {
+                        crate::agent::history::estimate_prepared_history_tokens(&prepared.messages);
+                    if !prepared.contains_images || prepared_tokens <= context_token_budget {
                         break;
                     }
                     let Some(dropped_messages) =
@@ -655,7 +655,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 }
 
                 let prepared_tokens =
-                    crate::agent::history::estimate_history_tokens(&prepared.messages);
+                    crate::agent::history::estimate_prepared_history_tokens(&prepared.messages);
                 if let Some(tx) = event_tx.as_ref() {
                     let _ = tx
                         .send(TurnEvent::UsageEstimate {
