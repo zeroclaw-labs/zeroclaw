@@ -162,13 +162,13 @@ Parser behavior:
   when a step must require approval in any execution mode.
 - `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
-- `- when:` is a routing guard evaluated against accumulated completed-step
-  outputs after the current step finishes. When it does not match, the run
-  completes instead of dispatching another step.
+- `- when:` guards an explicit `- next:` jump and is evaluated against
+  accumulated completed-step outputs after the current step finishes. A
+  matching guard takes the explicit jump. A false guard advances to the next
+  linear step (`current_step + 1`), or completes when the current step is
+  terminal.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
-- `- when:` guards an explicit `- next:` jump; when the condition is false, the
-  run advances to the next linear step (`current_step + 1`) instead of completing.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
