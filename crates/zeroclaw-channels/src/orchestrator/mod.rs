@@ -14569,6 +14569,18 @@ api_key = "anthropic-key"
                 ProgressEvent::FinalizingResponse,
             ]
         );
+        // Negative control for the cancellation/error regressions below: a
+        // successful turn finalizes and must never cancel its draft. Without
+        // this, a `cancel_draft` called unconditionally would make those two
+        // tests pass vacuously.
+        assert!(
+            channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a successful turn must not cancel its draft"
+        );
+        assert!(
+            !channel_impl.finalized_messages.lock().await.is_empty(),
+            "a successful turn must finalize its draft"
+        );
     }
 
     /// A turn that actually calls a tool must surface `RunningTool` and the
