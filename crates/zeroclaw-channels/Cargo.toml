@@ -71,7 +71,10 @@ matrix-sdk = { version = "0.18", optional = true, default-features = false, feat
   "sqlite",
 ] }
 mime_guess = { version = "2", optional = true }
-nostr-sdk = { version = "0.45.0-alpha.6", default-features = false, optional = true }
+nostr-sdk = { version = "0.44", default-features = false, features = [
+  "nip04",
+  "nip59",
+], optional = true }
 parking_lot = "0.12"
 portable-atomic = "1"
 prost = { version = "0.14", default-features = false, features = [
