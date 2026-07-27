@@ -382,14 +382,14 @@ pub async fn submit_pairing_enhanced(
     // Derive the brute-force lockout key from the real connection peer, only trusting
     // forwarded headers behind a configured proxy. Reading it straight from
     // `X-Forwarded-For` let an unauthenticated client vary the header to dodge the
-    // per-client lockout entirely (#9389). Mirrors the legacy `/pair` handler.
+    // per-client lockout entirely. Mirrors the legacy `/pair` handler.
     let client_id =
         super::client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
 
     // Brute-force protection, mirroring the legacy `/pair` handler: a coarse
     // per-key request cap plus the shared auth rate limiter. Both are keyed on
     // the connection-derived client id (not a spoofable header), so this handler
-    // is no longer the one pairing route without any rate limiting (#9389).
+    // cannot bypass rate limiting by rotating untrusted forwarding headers.
     if !state.rate_limiter.allow_pair(&client_id) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -720,7 +720,9 @@ pub async fn rotate_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GatewayRateLimiter;
     use crate::api::test_state;
+    use crate::auth_rate_limit::{AuthRateLimiter, MAX_ATTEMPTS};
     use axum::Json;
     use http_body_util::BodyExt;
     use std::sync::Arc;
@@ -864,8 +866,8 @@ mod tests {
             );
         }
 
-        // A sixth attempt with yet another spoofed header must be locked out: the key is
-        // the real peer IP, so varying X-Forwarded-For cannot open a fresh bucket (#9389).
+        // A sixth attempt with yet another spoofed header must be locked out:
+        // the real peer IP keeps every spoofed value in the same bucket.
         let mut headers = HeaderMap::new();
         headers.insert("X-Forwarded-For", "198.51.100.9".parse().unwrap());
         let (status, _) = response_json(
@@ -883,6 +885,127 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "lockout must key on the peer IP so X-Forwarded-For spoofing cannot bypass it"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_honors_trusted_forwarded_client_identity() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.trust_forwarded_headers = true;
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(1, 100, 100));
+        let peer: SocketAddr = "10.0.0.2:55555".parse().unwrap();
+
+        for forwarded in ["198.51.100.10", "198.51.100.11"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", forwarded.parse().unwrap());
+            let (status, _) = response_json(
+                submit_pairing_enhanced(
+                    State(state.clone()),
+                    ConnectInfo(peer),
+                    headers,
+                    Json(serde_json::json!({"code": "wrong"})),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "trusted forwarded clients must receive independent rate buckets"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", "198.51.100.10".parse().unwrap());
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                headers,
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body["error"],
+            "Too many pairing requests. Please retry later."
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_enforces_pair_request_limiter_threshold() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(2, 100, 100));
+        let peer: SocketAddr = "203.0.113.20:55555".parse().unwrap();
+
+        for attempt in 0..2 {
+            let (status, _) = response_json(
+                submit_pairing_enhanced(
+                    State(state.clone()),
+                    ConnectInfo(peer),
+                    HeaderMap::new(),
+                    Json(serde_json::json!({"code": "wrong"})),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "attempt {attempt}");
+        }
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body["error"],
+            "Too many pairing requests. Please retry later."
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_enforces_shared_auth_limiter_threshold() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        let peer: SocketAddr = "203.0.113.30:55555".parse().unwrap();
+        let client_id = peer.ip().to_string();
+        for _ in 0..MAX_ATTEMPTS {
+            state.auth_limiter.record_attempt(&client_id);
+        }
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("Too many auth attempts.")),
+            "response must come from the shared authentication limiter: {body}"
         );
     }
 }
