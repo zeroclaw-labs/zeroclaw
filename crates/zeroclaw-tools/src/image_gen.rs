@@ -1067,16 +1067,17 @@ mod tests {
     // private-host check) would surface here.
 
     fn test_tool_with_private_hosts(allowed_private_hosts: Vec<&str>) -> ImageGenTool {
-        ImageGenTool::new_with_config(
+        let allowed = allowed_private_hosts
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        ImageGenTool::new_with_config_resolver(
             test_security(),
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY".into(),
             true,
-            allowed_private_hosts
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            move || allowed.clone(),
         )
         .expect("test tool construction should succeed")
     }
