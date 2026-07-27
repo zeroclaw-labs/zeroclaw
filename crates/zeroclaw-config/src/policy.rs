@@ -412,6 +412,20 @@ pub enum EscalationViolation {
     /// (parent) to `false`, bypassing the human-in-the-loop step the
     /// parent required.
     RequireApprovalDisabledByChild,
+    /// Child is unrestricted (`allowed_tools = None`) while the parent
+    /// has a restricted allowlist. An unrestricted child is the widest
+    /// possible tool set, so it can never be a subset of a restricted
+    /// parent — distinct from naming one disallowed tool below.
+    AllowedToolsUnrestrictedByChild,
+    /// `child.allowed_tools` names a tool the parent's allowlist does
+    /// not permit. Runs the same direction as the root allowlists —
+    /// child ⊆ parent.
+    ToolNotInParent { tool: String },
+    /// Child drops an `excluded_tools` entry the parent enforces.
+    /// Subset semantics on the denylist run the opposite direction from
+    /// allowlists, exactly like `forbidden_paths`: parent ⊆ child, so
+    /// the child can ADD exclusions but never DROP them.
+    ExcludedToolDroppedByChild { tool: String },
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -467,6 +481,18 @@ impl std::fmt::Display for EscalationViolation {
             Self::RequireApprovalDisabledByChild => write!(
                 f,
                 "subagent attempts to set require_approval_for_medium_risk=false but the parent enforces it"
+            ),
+            Self::AllowedToolsUnrestrictedByChild => write!(
+                f,
+                "subagent leaves allowed_tools unrestricted but the parent enforces a tool allowlist"
+            ),
+            Self::ToolNotInParent { tool } => write!(
+                f,
+                "subagent allowed_tools entry {tool:?} is not permitted by the parent's allowed_tools"
+            ),
+            Self::ExcludedToolDroppedByChild { tool } => write!(
+                f,
+                "subagent drops excluded_tools entry {tool:?} that the parent enforces"
             ),
         }
     }
@@ -2112,6 +2138,46 @@ impl SecurityPolicy {
         }
         if parent.require_approval_for_medium_risk && !self.require_approval_for_medium_risk {
             return Err(EscalationViolation::RequireApprovalDisabledByChild);
+        }
+
+        // allowed_tools runs the same direction as the root allowlists:
+        // child ⊆ parent. A parent with no allowlist (`None`) is
+        // unrestricted and imposes no ceiling, so the check only applies
+        // when the parent restricts. Against a restricted parent, an
+        // unrestricted child (`None`) is the widest possible set and is
+        // rejected outright; a restricted child must name only tools the
+        // parent also permits.
+        if let Some(parent_allowed) = &parent.allowed_tools {
+            match &self.allowed_tools {
+                None => return Err(EscalationViolation::AllowedToolsUnrestrictedByChild),
+                Some(child_allowed) => {
+                    for tool in child_allowed {
+                        if !parent_allowed.iter().any(|p| p == tool) {
+                            return Err(EscalationViolation::ToolNotInParent {
+                                tool: tool.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // excluded_tools runs the OPPOSITE direction, exactly like
+        // forbidden_paths: the parent's denylist must be a subset of the
+        // child's, so the child can ADD exclusions but never DROP one the
+        // parent enforces.
+        if let Some(parent_excluded) = &parent.excluded_tools {
+            for tool in parent_excluded {
+                let child_keeps = self
+                    .excluded_tools
+                    .as_ref()
+                    .is_some_and(|c| c.iter().any(|ct| ct == tool));
+                if !child_keeps {
+                    return Err(EscalationViolation::ExcludedToolDroppedByChild {
+                        tool: tool.clone(),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -5120,6 +5186,111 @@ mod tests {
             .ensure_no_escalation_beyond(&parent)
             .expect_err("child flipping require_approval_for_medium_risk off must be rejected");
         assert_eq!(err, EscalationViolation::RequireApprovalDisabledByChild);
+    }
+
+    // ── allowed_tools / excluded_tools escalation checks ───────────────────
+    //
+    // The tool-name dimension closes the delegate confused-deputy path: the
+    // parent's per-agent tool policy is the ceiling, so a child must keep
+    // `allowed_tools` a subset and `excluded_tools` a superset.
+
+    #[test]
+    fn ensure_no_escalation_rejects_child_allowed_tool_not_in_parent() {
+        let parent = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into(), "delegate".into()]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into(), "shell".into()]),
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child allowed_tools entry outside the parent allowlist must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ToolNotInParent { ref tool } if tool == "shell"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_unrestricted_child_under_restricted_parent() {
+        // The delegate escalation this guards: a target sub-agent with no
+        // allowlist (`None`) inherits the parent's full tool set even though
+        // the parent restricts it. An unrestricted child is the widest set,
+        // so it can never sit within a restricted parent.
+        let parent = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_tools: None,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("unrestricted child under a restricted parent must be rejected");
+        assert_eq!(err, EscalationViolation::AllowedToolsUnrestrictedByChild);
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_narrowed_allowed_tools() {
+        let parent = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into(), "shell".into()]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_allows_restricted_child_when_parent_is_unrestricted() {
+        // A parent with no allowlist imposes no tool ceiling, so a child that
+        // restricts itself is a narrowing, not an escalation.
+        let parent = SecurityPolicy {
+            allowed_tools: None,
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_child_dropping_parent_excluded_tool() {
+        let parent = SecurityPolicy {
+            excluded_tools: Some(vec!["shell".into()]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            excluded_tools: None,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("child dropping a parent excluded_tools entry must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ExcludedToolDroppedByChild { ref tool } if tool == "shell"
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_child_adding_excluded_tools() {
+        let parent = SecurityPolicy {
+            excluded_tools: Some(vec!["shell".into()]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            excluded_tools: Some(vec!["shell".into(), "file_write".into()]),
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
     }
 
     #[test]
