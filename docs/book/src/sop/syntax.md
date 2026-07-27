@@ -178,6 +178,42 @@ Parser behavior:
   `[sop.approval].policies` fails closed (the gate stays waiting) rather than
   clearing on a single approval.
 
+### Copyable conditional-routing example
+
+This complete `SOP.md` routes critical alerts through an approved remediation
+step while recording other alerts without remediation:
+
+```md
+# Alert triage
+
+Classify an incoming alert, remediate critical alerts, and notify the operator.
+
+## Steps
+
+1. **Classify alert** - Normalize the incoming alert severity.
+   - output: {"type":"object","required":["severity"],"properties":{"severity":{"type":"string"}}}
+   - when: $.steps.1.severity == "critical"
+   - next: 3
+
+2. **Record routine alert** - Add the non-critical alert to the incident log.
+   - tools: shell
+   - next: 4
+
+3. **Remediate critical alert** - Run the approved remediation command.
+   - tools: shell
+   - requires_confirmation: true
+   - on_failure: retry:2
+   - next: 4
+
+4. **Notify operator** - Send the outcome to the operations channel.
+   - tools: http_request
+```
+
+When step 1 outputs `{"severity":"critical"}`, its guard matches and `next`
+jumps to step 3. Any other severity falls through to step 2, whose explicit
+`next` skips remediation and joins the critical path at step 4. Run
+`zeroclaw sop validate <name>` after copying the example into an SOP directory.
+
 ### `[sop.approval]` policies and route delivery
 
 A policy may also route its approval out of band to a channel, so an approver can
