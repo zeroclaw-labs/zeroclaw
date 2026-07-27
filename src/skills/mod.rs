@@ -234,6 +234,7 @@ pub async fn handle_command(
             agent,
             bundle,
             no_tier_banner,
+            skill,
         } => {
             println!(
                 "{}",
@@ -247,10 +248,26 @@ pub async fn handle_command(
             let skills_path = location.dir().to_path_buf();
             std::fs::create_dir_all(&skills_path)?;
 
-            let (installed_dir, files_scanned) = if is_clawhub_source(&source) {
-                install_clawhub_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                    .await
-                    .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
+            let (installed_dir, files_scanned) = if let Some(skill_name) = skill.as_deref() {
+                if !is_git_source(&source) {
+                    anyhow::bail!(get_required_cli_string_with_args(
+                        "cli-skills-install-skill-requires-git",
+                        &[("source", &source)]
+                    ));
+                }
+                install_git_catalog_skill_source(
+                    &source,
+                    skill_name,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                )
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-catalog-failed",
+                        &[("skill", skill_name), ("source", &source)],
+                    )
+                })?
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| {
@@ -1439,6 +1456,7 @@ mod install_location_tests {
                 agent: None,
                 bundle: None,
                 no_tier_banner: true,
+                skill: None,
             },
             &c,
         )

@@ -324,7 +324,7 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
     (out.into_owned(), stripped)
 }
 
-/// Strip loadable audio markers (see [`strip_unplayable_audio_markers`])
+/// Strip loadable audio markers (see `strip_unplayable_audio_markers`)
 /// across every message in `messages`, logging one degradation warning when
 /// any are removed. Returns the input borrowed when no candidate marker is
 /// present (the common, allocation-free path) or an owned rebuilt vector
@@ -337,7 +337,7 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
 /// - one-shot queries that dispatch history directly without full prep (the
 ///   max-iteration graceful summary and the other `run_model_query` callers).
 ///
-/// Non-audio media markers pass through untouched; see [`AUDIO_MARKER_KINDS`]
+/// Non-audio media markers pass through untouched; see `AUDIO_MARKER_KINDS`
 /// for why the split falls where it does.
 pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
     if !messages

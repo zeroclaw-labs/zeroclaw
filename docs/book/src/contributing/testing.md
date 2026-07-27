@@ -2,6 +2,8 @@
 
 ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost; pick the lowest level that proves what you need to prove.
 
+When a PR claims behavior that a user directly runs, clicks, sends, installs, or observes, use [User-boundary proof](./user-boundary-proof.md) to identify the smallest test or manual check that reaches that boundary.
+
 ## The five levels
 
 | Level | What it tests | Boundary | Where it lives |
@@ -34,6 +36,7 @@ cargo test --test system                    # system only
 cargo test --test live -- --ignored         # live (requires API credentials)
 cargo test --test integration agent         # filter within a level
 cargo nextest run --locked --workspace --exclude zeroclaw-desktop  # what CI runs
+./scripts/ci/parallel_runtime_test_gate.sh  # repeated same-process runtime/channel tests
 ./dev/ci.sh all                             # full CI battery (Docker)
 ./dev/ci.sh firmware-protocol               # standalone firmware protocol host gate (Docker)
 ./dev/ci.sh test-component                  # level-specific CI commands (Docker)
@@ -46,6 +49,13 @@ The `firmware-protocol` command checks the standalone
 workspace. `scripts/ci/firmware_protocol_gate.sh` is the canonical definition
 of its formatting, strict Clippy, and locked-test checks; required CI and the
 pre-push hook invoke the same helper.
+
+The parallel runtime gate repeats the complete `zeroclaw-runtime` and
+`zeroclaw-channels` library test binaries with 16 harness threads. Running the
+whole binaries is intentional: it detects interference between state-mutating
+tests and otherwise unrelated agent turns that filtered test runs cannot expose.
+Override repetitions with `ZEROCLAW_PARALLEL_TEST_RUNS` and harness threads
+with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 
 ## Picking a level for a new test
 

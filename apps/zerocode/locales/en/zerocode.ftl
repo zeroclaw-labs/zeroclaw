@@ -15,8 +15,12 @@ zc-app-help-cycle-mode = Cycle mode
 zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
+zc-app-keybindings-title = Keybindings
+zc-app-help-filter-label = Filter
+zc-app-help-filter-placeholder = type a key or action…
+zc-app-help-no-matches = No matching keybindings
+zc-app-help-controls = { $cancel } clear/close · { $up }/{ $down } scroll · Type to filter
 
-zc-app-press-any-key-to-close = Press any key to close
 zc-app-reload-line-1 = The daemon process stays running (same PID), but every
 zc-app-reload-line-2 = subsystem tears down and re-initializes from the on-disk
 zc-app-reload-line-3 = config:
@@ -30,6 +34,7 @@ zc-app-quit-explainer = The TUI closes. The daemon keeps running; reconnect anyt
 zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
+zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes

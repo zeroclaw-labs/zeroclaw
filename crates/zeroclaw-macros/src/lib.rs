@@ -473,10 +473,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             self.#field_ident.keys().map(String::as_str),
                         ) {
                             let hm_key = hm_key.to_string();
-                            if let Some(inner) = self.#field_ident.get_mut(&hm_key)
-                                && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                            {
-                                return Ok(());
+                            if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                return inner.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -601,6 +599,16 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    // Dotted outer keys make candidate splits ambiguous, so an
+                    // inner "Unknown property" must `continue` to the next
+                    // (shorter) outer-key split — mirroring get_prop's retry
+                    // loop above — while real value errors return (via
+                    // `crate::config::is_unknown_property_error`).
+                    let double_map_set_gate = build_set_prop_delegation_gate(
+                        quote! { inner.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
+                        quote! { continue; },
+                    );
                     nested_set_prop.push(quote! {
                         {
                             let path_prefix = if Self::configurable_prefix().is_empty() {
@@ -636,9 +644,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                     };
                                     if let Some(inner_map) = self.#field_ident.get_mut(&outer_key)
                                         && let Some(inner) = inner_map.get_mut(&inner_key)
-                                        && inner.set_prop(&inner_name, value_str).is_ok()
                                     {
-                                        return Ok(());
+                                        #double_map_set_gate
                                     }
                                 }
                             }
@@ -904,10 +911,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             self.#field_ident.keys().map(String::as_str),
                         ) {
                             let hm_key = hm_key.to_string();
-                            if let Some(inner) = self.#field_ident.get_mut(&hm_key)
-                                && let Ok(()) = inner.set_prop(&inner_name, value_str)
-                            {
-                                return Ok(());
+                            if let Some(inner) = self.#field_ident.get_mut(&hm_key) {
+                                return inner.set_prop(&inner_name, value_str);
                             }
                         }
                     });
@@ -1127,11 +1132,21 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
+                // Option<T> nested fields delegate with the UNSTRIPPED name
+                // (T carries its own configurable_prefix), so the namespace is
+                // shared with sibling fields: an inner "Unknown property"
+                // falls through so siblings still get their chance, while
+                // real value errors propagate — see
+                // `build_set_prop_delegation_gate` /
+                // `crate::config::is_unknown_property_error`.
+                let option_set_gate = build_set_prop_delegation_gate(
+                    quote! { inner.set_prop(name, value_str) },
+                    quote! { name },
+                    quote! {},
+                );
                 nested_set_prop.push(quote! {
                     if let Some(inner) = &mut self.#field_ident {
-                        if let Ok(()) = inner.set_prop(name, value_str) {
-                            return Ok(());
-                        }
+                        #option_set_gate
                     }
                 });
                 nested_prop_is_secret.push(quote! {
@@ -1665,6 +1680,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             }
                         }
                     });
+                    // Flattened fields share this struct's dotted namespace,
+                    // so an inner "Unknown property" falls through — sibling
+                    // own-fields and the generic leaf fallback must still get
+                    // their chance — while real value errors propagate
+                    // — see `build_set_prop_delegation_gate` /
+                    // `crate::config::is_unknown_property_error`.
+                    let flatten_set_gate = build_set_prop_delegation_gate(
+                        quote! { self.#field_ident.set_prop(&inner_name, value_str) },
+                        quote! { &inner_name },
+                        quote! {},
+                    );
                     nested_set_prop.push(quote! {
                         {
                             let outer_prefix = Self::configurable_prefix();
@@ -1680,9 +1706,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 } else {
                                     format!("{inner_prefix}.{leaf}")
                                 };
-                                if let Ok(()) = self.#field_ident.set_prop(&inner_name, value_str) {
-                                    return Ok(());
-                                }
+                                #flatten_set_gate
                             }
                         }
                     });
@@ -2597,6 +2621,35 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
     Ok(quote! {
         Some(crate::config::CredentialSurfaceClass::#variant)
     })
+}
+
+/// Shared `set_prop` delegation gate for nested sites whose dotted namespace
+/// is (or may be) shared with sibling candidates: serde-flatten fields,
+/// `Option<T>` nested fields, and the two-level dotted-key candidate loop.
+/// `Ok` and real value errors return immediately — the path is
+/// confirmed, so a failure is a value problem that must reach the caller.
+/// The generated "Unknown property" marker
+/// (`crate::config::is_unknown_property_error`) instead means "not one of
+/// mine": the site-specific `on_unknown` tokens run so the next candidate —
+/// a sibling field, the generic leaf fallback, or the next dotted-key split —
+/// still gets its chance.
+///
+/// `attempted_name` must be the exact `&str` expression for the property
+/// name passed into `call`'s nested `set_prop` — `is_unknown_property_error`
+/// compares against that exact name so a value error whose message merely
+/// starts with "Unknown property" isn't mistaken for the fall-through
+/// marker.
+fn build_set_prop_delegation_gate(
+    call: proc_macro2::TokenStream,
+    attempted_name: proc_macro2::TokenStream,
+    on_unknown: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        match #call {
+            Err(e) if crate::config::is_unknown_property_error(&e, #attempted_name) => { #on_unknown }
+            other => return other,
+        }
+    }
 }
 
 fn build_integration_descriptor_method(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {

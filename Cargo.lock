@@ -6045,9 +6045,9 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.44.3"
+version = "0.44.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d8f0fe13526800300a36bf3b7c5f752e62e32ab81c74a8e5caa2865708625a"
+checksum = "0112d3433a5550ba13481970d5b6844714510ddcdaca4d9d0aa6e7b83f270271"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -12625,6 +12625,7 @@ version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 dependencies = [
+ "bitflags 2.11.1",
  "wit-bindgen-rust-macro",
 ]
 
@@ -13037,6 +13038,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-channel-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-channels"
 version = "0.8.3"
 dependencies = [
@@ -13236,6 +13244,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.6.3",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -13359,6 +13368,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
@@ -13469,7 +13479,6 @@ dependencies = [
  "directories",
  "encoding_rs",
  "filetime",
- "flate2",
  "fluent",
  "futures-util",
  "glob",
@@ -13537,7 +13546,6 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
- "zip",
 ]
 
 [[package]]

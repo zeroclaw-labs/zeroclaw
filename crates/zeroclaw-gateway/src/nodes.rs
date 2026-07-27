@@ -17,6 +17,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
 
+pub mod mdns;
+
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
 

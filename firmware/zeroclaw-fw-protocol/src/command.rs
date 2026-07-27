@@ -62,6 +62,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_gpio_write_accepts_json_whitespace() {
+        let line = br#"{"id":"1", "cmd": "gpio_write", "args": {"pin":13,"value":1}}"#;
+        assert_eq!(
+            Command::from_line(line),
+            Some(Command::GpioWrite { pin: 13, value: 1 })
+        );
+    }
+
+    #[test]
     fn parse_gpio_write_zero() {
         let line = br#"{"id":"2","cmd":"gpio_write","args":{"pin":13,"value":0}}"#;
         assert_eq!(
