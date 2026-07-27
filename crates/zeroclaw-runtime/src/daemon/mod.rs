@@ -745,7 +745,7 @@ pub async fn run(
         // The "starting" banner appears promptly; "ready" confirms the real bind.
         let config_for_task = config.clone();
         let host_for_task = host.to_string();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             // Wait for both endpoints to report their bind (unbounded)
             let gateway_addr = match gateway_echo_rx {
                 Some(mut rx) => rx
@@ -842,14 +842,13 @@ fn record_daemon_started(config: &Config, host: &str, port: u16) {
 }
 
 /// Bounded wait for the endpoints the foreground banner announces.
-/// Local binds normally complete in well under a second; 15s bounds the
-/// wait so a supervisor retry loop cannot stall the echo — or block the
-/// daemon's shutdown-signal handling behind it — indefinitely.
+#[allow(dead_code)] // Used by tests and the deprecated echo_daemon_started_to_terminal
 const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Outcome of [`await_startup_readiness`]: what the foreground banner is
 /// allowed to claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Used by tests and the deprecated echo_daemon_started_to_terminal
 enum StartupReadiness {
     /// Every supervised endpoint reported its bind. Carries the gateway's
     /// actual bound address when the gateway is supervised in-process, so
@@ -868,6 +867,7 @@ enum StartupReadiness {
 /// Wait until every supervised endpoint the banner announces has reported
 /// its bind, or `timeout` elapses. A `None` receiver means the endpoint is
 /// not supervised in this run — there is nothing to wait for.
+#[allow(dead_code)] // Used by tests
 async fn await_startup_readiness(
     gateway_ready: Option<tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>>,
     socket_ready: Option<tokio::sync::watch::Receiver<bool>>,
