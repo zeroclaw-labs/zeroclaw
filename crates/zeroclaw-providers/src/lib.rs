@@ -790,11 +790,65 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+/// URL query parameters whose value is a secret credential. Google/Gemini send
+/// the API key as `?key=AIza…`, which a transport error's `Display` carries in
+/// the URL; a secret in a query string is not caught by token-prefix matching,
+/// so the whole value is redacted regardless of its shape.
+const SECRET_QUERY_PARAMS: [&str; 3] = ["key", "api_key", "apikey"];
+
+/// True for characters that may appear in a URL query-parameter value; used to
+/// find where a redacted secret value ends.
+fn is_query_value_char(c: char) -> bool {
+    !(c.is_whitespace() || matches!(c, '&' | ')' | '"' | '\'' | '>' | '}' | ']' | ','))
+}
+
+/// Redact the values of secret-bearing URL query parameters (see
+/// [`SECRET_QUERY_PARAMS`]). The parameter name is matched case-insensitively
+/// only at a query boundary (preceded by `?`, `&`, `(`, `=`, `/`, whitespace,
+/// or start of string) so an unrelated suffix like `monkey=` is never mistaken
+/// for `key=`.
+fn scrub_query_param_secrets(input: &str) -> String {
+    let mut scrubbed = input.to_string();
+    for param in SECRET_QUERY_PARAMS {
+        let needle = format!("{param}=");
+        let mut from = 0;
+        loop {
+            let lower = scrubbed.to_ascii_lowercase();
+            let Some(rel) = lower[from..].find(&needle) else {
+                break;
+            };
+            let name_start = from + rel;
+            let value_start = name_start + needle.len();
+            let boundary_ok = name_start == 0
+                || matches!(
+                    scrubbed.as_bytes()[name_start - 1],
+                    b'?' | b'&' | b'(' | b'=' | b'/' | b' ' | b'\t'
+                );
+            if !boundary_ok {
+                from = value_start;
+                continue;
+            }
+            let value_end = value_start
+                + scrubbed[value_start..]
+                    .find(|c: char| !is_query_value_char(c))
+                    .unwrap_or(scrubbed.len() - value_start);
+            if value_end == value_start {
+                from = value_start; // empty value — nothing to redact
+                continue;
+            }
+            scrubbed.replace_range(value_start..value_end, "[REDACTED]");
+            from = value_start + "[REDACTED]".len();
+        }
+    }
+    scrubbed
+}
+
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys, and redacts the values
+/// of secret-bearing URL query parameters (e.g. `?key=`).
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 8] = [
         "sk-",
         "xoxb-",
         "xoxp-",
@@ -802,9 +856,12 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "gho_",
         "ghu_",
         "github_pat_",
+        "AIza",
     ];
 
-    let mut scrubbed = input.to_string();
+    // Redact secrets carried in URL query strings first (Gemini's `?key=AIza…`),
+    // then token-prefix secrets that can appear anywhere (bodies, JSON, logs).
+    let mut scrubbed = scrub_query_param_secrets(input);
 
     for prefix in PREFIXES {
         let mut search_from = 0;
@@ -3543,6 +3600,51 @@ mod tests {
         let result = sanitize_api_error(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         assert!(!result.contains("sk-abcdef123"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_gemini_key_in_reqwest_url() {
+        // The exact reqwest transport-error shape from #9386: a Gemini key rides
+        // in the `?key=` query string and must not reach the chat or the log.
+        let key = "AIzaSyDUMMYKEYFORTESTINGONLY1234567890";
+        let input = format!(
+            "error sending request for url (https://127.0.0.1:1/v1beta/models/x:generateContent?key={key})"
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains(key), "key leaked: {result}");
+        assert!(result.contains("[REDACTED]"));
+        // The surrounding URL context is preserved so the error is still useful.
+        assert!(result.contains("generateContent?key=[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_bare_gemini_key_prefix() {
+        // An `AIza` key that appears outside a query string (e.g. a JSON body)
+        // is still redacted by the prefix rule.
+        let input = r#"{"error":"invalid api key AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_generic_key_query_param() {
+        // Any value carried as a `key=`/`api_key=` query param is redacted, even
+        // if it is not an `AIza`-shaped token.
+        let input = "GET https://api.example.com/v1/thing?api_key=hunter2secret&x=1 failed";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("hunter2secret"), "{result}");
+        assert!(result.contains("api_key=[REDACTED]"));
+        // Non-secret params around it survive.
+        assert!(result.contains("&x=1"));
+    }
+
+    #[test]
+    fn sanitize_query_scrub_respects_param_boundary() {
+        // `monkey=` must not be treated as `key=`.
+        let input = "playing monkey=banana in the query";
+        let result = sanitize_api_error(input);
+        assert_eq!(result, input);
     }
 
     #[test]
