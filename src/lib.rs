@@ -603,6 +603,9 @@ pub enum MigrateCommands {
 /// Flattened into `add`, `add-at`, `add-every`, `once`, and `update` so a job's
 /// output can be routed to a channel. When none of these are set the job keeps
 /// delivery mode `"none"` (output is computed but not announced anywhere).
+///
+/// On `update` these are a patch: only the fields given are changed, and the
+/// rest are carried over from the job's stored delivery config.
 #[derive(clap::Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CronDeliveryArgs {
     /// Announce job output to this channel (e.g. telegram, discord, slack).
@@ -615,8 +618,42 @@ pub struct CronDeliveryArgs {
     #[arg(long = "thread")]
     pub delivery_thread: Option<String>,
     /// Fail the job if delivery fails (default: delivery errors are non-fatal).
-    #[arg(long = "no-best-effort")]
+    #[arg(long = "no-best-effort", conflicts_with = "best_effort")]
     pub no_best_effort: bool,
+    /// Keep the job succeeding when delivery fails. Restores the default after
+    /// a previous `--no-best-effort`.
+    #[arg(long = "best-effort")]
+    pub best_effort: bool,
+}
+
+impl CronDeliveryArgs {
+    /// The requested best-effort setting, or `None` when neither flag is given.
+    ///
+    /// The two flags are mutually exclusive at the clap layer, so at most one
+    /// is ever set.
+    #[must_use]
+    pub fn best_effort_override(&self) -> Option<bool> {
+        if self.no_best_effort {
+            Some(false)
+        } else if self.best_effort {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the user supplied any delivery flag.
+    ///
+    /// This drives the `update` no-field guard and decides whether the stored
+    /// job has to be loaded for a merge, so it must count the boolean flags
+    /// too: `--no-best-effort` on its own is a real request, not an absence.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.delivery_channel.is_some()
+            || self.delivery_to.is_some()
+            || self.delivery_thread.is_some()
+            || self.best_effort_override().is_some()
+    }
 }
 
 /// Cron subcommands
