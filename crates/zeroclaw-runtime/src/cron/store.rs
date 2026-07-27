@@ -377,6 +377,19 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         for row in rows {
             match row {
                 Ok(mut job) => {
+                    if job.source == "declarative" && !config.cron.contains_key(&job.id) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": job.id})),
+                            "Skipping orphaned declarative cron job not present in live config"
+                        );
+                        continue;
+                    }
                     resolve_declarative_shell_output_format(config, &mut job);
                     jobs.push(job);
                 }
@@ -415,6 +428,19 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         for row in rows {
             match row {
                 Ok(mut job) => {
+                    if job.source == "declarative" && !config.cron.contains_key(&job.id) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": job.id})),
+                            "Skipping orphaned declarative cron job not present in live config"
+                        );
+                        continue;
+                    }
                     resolve_declarative_shell_output_format(config, &mut job);
                     jobs.push(job);
                 }
@@ -3428,7 +3454,18 @@ schedule = { kind = "every", every_ms = 300000 }
 
         // Read the raw DB column value before the unrelated update.
         // sync_declarative_jobs does not write shell_output_format, so the
-        // column stays at its DEFAULT ('wrapped').
+        // column stays at its DEFAULT ('wrapped'). Overwrite it with a
+        // distinct sentinel so the test can detect if the unrelated update
+        // writes the column back (which would indicate a snapshot defect).
+        with_read_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET shell_output_format = 'future-format' WHERE id = ?1",
+                params!["raw-decl"],
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+
         let raw_before = with_read_connection(&config, |conn| {
             let val: Option<String> = conn
                 .query_row(
@@ -3443,8 +3480,8 @@ schedule = { kind = "every", every_ms = 300000 }
         .expect("row exists");
         assert_eq!(
             raw_before.as_deref(),
-            Some("wrapped"),
-            "baseline: sync should not write shell_output_format for declarative jobs"
+            Some("future-format"),
+            "baseline: sentinel value must be set before unrelated update"
         );
 
         // Unrelated patch: only toggles `uses_memory`, never touches
@@ -3595,5 +3632,79 @@ schedule = { kind = "every", every_ms = 300000 }
             err.to_string().contains("shell-only"),
             "the core update_job boundary must reject shell_output_format on a non-shell job: {err}"
         );
+    }
+
+    /// Regression: an orphaned declarative row (source = 'declarative' but
+    /// absent from Config.cron) must be excluded from due_jobs and
+    /// all_overdue_jobs. This covers the case where sync_declarative_jobs
+    /// fails before stale-row cleanup (e.g. another invalid declaration
+    /// aborts validation), leaving a removed row in the DB that the
+    /// scheduler would otherwise still execute.
+    #[test]
+    fn due_jobs_excludes_orphaned_declarative_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["orphan-decl"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("orphan-decl".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo orphan".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("orphan-decl".to_string(), decl.clone())]);
+        config.cron.insert("orphan-decl".to_string(), decl.clone());
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Confirm the row is in the DB with source = 'declarative'.
+        let source_in_db = with_read_connection(&config, |conn| {
+            let val: Option<String> = conn
+                .query_row(
+                    "SELECT source FROM cron_jobs WHERE id = ?1",
+                    params!["orphan-decl"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            Ok(val)
+        })
+        .unwrap()
+        .expect("row exists");
+        assert_eq!(source_in_db.as_deref(), Some("declarative"));
+
+        // Remove the declaration from config (simulating operator removal
+        // while sync is broken by a separate invalid declaration).
+        config.cron.remove("orphan-decl");
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        // due_jobs must not return the orphaned row.
+        let due = due_jobs(&config, far_future).unwrap();
+        assert!(
+            due.iter().all(|j| j.id != "orphan-decl"),
+            "due_jobs must exclude orphaned declarative rows not in live config"
+        );
+
+        // all_overdue_jobs must not return it either.
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert!(
+            overdue.iter().all(|j| j.id != "orphan-decl"),
+            "all_overdue_jobs must exclude orphaned declarative rows not in live config"
+        );
+
+        // get_job still returns it (the row exists; the read path surfaces
+        // it for API/admin visibility, but execution won't pick it up).
+        let job = get_job(&config, "orphan-decl").unwrap();
+        assert_eq!(job.source, "declarative");
     }
 }
