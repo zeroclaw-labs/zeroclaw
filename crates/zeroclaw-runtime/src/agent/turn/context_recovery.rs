@@ -179,6 +179,67 @@ mod tests {
         h
     }
 
+    /// The `CompactingContext` lifecycle state is only reachable through this
+    /// recovery path, so it must be exercised with a live draft channel rather
+    /// than the `None` sender the other cases use — otherwise the state is
+    /// never emitted by any test and only appears in the enumeration tables.
+    #[tokio::test]
+    async fn recovery_emits_compacting_context_lifecycle_to_the_draft_channel() {
+        let mut history = overflowing_history();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            Some(&delta_tx),
+            &observer,
+            32_000,
+        )
+        .await;
+
+        assert!(recovered, "an overflowing history must trim and recover");
+        let delta = delta_rx
+            .try_recv()
+            .expect("context recovery must emit a lifecycle delta");
+        assert!(
+            matches!(
+                delta,
+                super::super::events::StreamDelta::Lifecycle(ProgressEvent::CompactingContext)
+            ),
+            "context recovery must emit the typed CompactingContext state, got {delta:?}"
+        );
+    }
+
+    /// A recovery that cannot trim must not announce compaction it did not do.
+    #[tokio::test]
+    async fn unrecoverable_error_emits_no_compacting_context_lifecycle() {
+        let mut history = vec![ChatMessage::system("system")];
+        let err = anyhow::Error::msg("some unrelated provider failure");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            Some(&delta_tx),
+            &observer,
+            32_000,
+        )
+        .await;
+
+        assert!(!recovered, "a non-overflow error must not report recovery");
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "no lifecycle state may be emitted when compaction never ran"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_emits_history_trimmed_event_on_trim() {
         let mut history = overflowing_history();

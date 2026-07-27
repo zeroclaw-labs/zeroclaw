@@ -7041,6 +7041,77 @@ mod tests {
         assert_eq!(body["thread_ts"], "ordinary-thread");
     }
 
+    /// Collect every `assistant.threads.setStatus` call the mock saw, as
+    /// `(thread_ts, status)` pairs in request order. An empty status is the
+    /// clear that terminal paths must issue.
+    async fn assistant_status_calls(server: &wiremock::MockServer) -> Vec<(String, String)> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/assistant.threads.setStatus")
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let field = |key: &str| {
+                    body.get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                (field("thread_ts"), field("status"))
+            })
+            .collect()
+    }
+
+    /// Seed two concurrent Assistant turns in one channel and show a lifecycle
+    /// state on each, so a terminal path has something to clear and a sibling
+    /// that must survive. Returns `(channel, server, first_draft, second_draft)`.
+    async fn two_live_assistant_turns(
+        server: &wiremock::MockServer,
+        data_dir: &std::path::Path,
+    ) -> (SlackChannel, String, String) {
+        let ch = test_slack_channel(server, data_dir).with_streaming(true, 1);
+        for thread_ts in ["thread-one", "thread-two"] {
+            ch.active_assistant_threads
+                .lock()
+                .unwrap()
+                .insert(AssistantTarget {
+                    channel_id: "C123".to_string(),
+                    thread_ts: thread_ts.to_string(),
+                });
+        }
+
+        let mut drafts = Vec::new();
+        for (thread_ts, message_id) in [
+            ("thread-one", "slack_C123_message-one"),
+            ("thread-two", "slack_C123_message-two"),
+        ] {
+            drafts.push(
+                ch.send_draft(
+                    &SendMessage::new("...", "C123")
+                        .in_thread(Some(thread_ts.to_string()))
+                        .in_reply_to(Some(message_id.to_string())),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+        }
+
+        // Both turns are visibly mid-lifecycle before the terminal path runs.
+        ch.update_draft_lifecycle("C123", &drafts[0], ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+        ch.update_draft_lifecycle("C123", &drafts[1], ProgressEvent::WaitingOnModel)
+            .await
+            .unwrap();
+
+        let second = drafts.pop().unwrap();
+        let first = drafts.pop().unwrap();
+        (ch, first, second)
+    }
+
     #[tokio::test]
     async fn finalizing_one_assistant_turn_clears_only_its_status() {
         use wiremock::matchers::{method, path};
@@ -7053,7 +7124,6 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
             })))
-            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -7066,52 +7136,92 @@ mod tests {
             .mount(&server)
             .await;
 
-        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "thread-one".to_string(),
-            });
-        let first = ch
-            .send_draft(
-                &SendMessage::new("...", "C123")
-                    .in_thread(Some("thread-one".to_string()))
-                    .in_reply_to(Some("slack_C123_message-one".to_string())),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        ch.active_assistant_threads
-            .lock()
-            .unwrap()
-            .insert(AssistantTarget {
-                channel_id: "C123".to_string(),
-                thread_ts: "thread-two".to_string(),
-            });
-        let _second = ch
-            .send_draft(
-                &SendMessage::new("...", "C123")
-                    .in_thread(Some("thread-two".to_string()))
-                    .in_reply_to(Some("slack_C123_message-two".to_string())),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+        let (ch, first, _second) = two_live_assistant_turns(&server, tmp.path()).await;
 
         ch.finalize_draft("C123", &first, "done", false)
             .await
             .unwrap();
 
-        let requests = server.received_requests().await.unwrap();
-        let clear = requests
-            .iter()
-            .find(|request| request.url.path() == "/assistant.threads.setStatus")
-            .expect("the finalized turn status must be cleared");
-        let body: serde_json::Value = serde_json::from_slice(&clear.body).unwrap();
-        assert_eq!(body["thread_ts"], "thread-one");
-        assert_eq!(body["status"], "");
+        let calls = assistant_status_calls(&server).await;
+        assert!(
+            calls.contains(&("thread-one".to_string(), "Running tool".to_string())),
+            "the finalized turn must have shown a lifecycle state first: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, status)| status.is_empty())
+                .collect::<Vec<_>>(),
+            vec![&("thread-one".to_string(), String::new())],
+            "finalization must clear exactly the finalized turn's thread: {calls:?}"
+        );
+    }
+
+    /// Cancellation is the terminal owner for interruption, hook suppression,
+    /// timeout, and error exits. It must clear the exact turn-bound Assistant
+    /// status and leave a concurrent sibling turn's status untouched.
+    #[tokio::test]
+    async fn cancelling_one_assistant_turn_clears_only_its_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .mount(&server)
+            .await;
+
+        let (ch, first, _second) = two_live_assistant_turns(&server, tmp.path()).await;
+
+        ch.cancel_draft("C123", &first).await.unwrap();
+
+        let calls = assistant_status_calls(&server).await;
+        assert!(
+            calls.contains(&("thread-two".to_string(), "Waiting on model".to_string())),
+            "the sibling turn must have shown its own lifecycle state: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, status)| status.is_empty())
+                .collect::<Vec<_>>(),
+            vec![&("thread-one".to_string(), String::new())],
+            "cancellation must clear exactly the cancelled turn's thread: {calls:?}"
+        );
+    }
+
+    /// A second terminal call for the same draft must not emit another clear,
+    /// and must never clear a sibling turn.
+    #[tokio::test]
+    async fn repeated_cancellation_does_not_clear_a_sibling_turn() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .mount(&server)
+            .await;
+
+        let (ch, first, _second) = two_live_assistant_turns(&server, tmp.path()).await;
+
+        ch.cancel_draft("C123", &first).await.unwrap();
+        ch.cancel_draft("C123", &first).await.unwrap();
+
+        let calls = assistant_status_calls(&server).await;
+        assert_eq!(
+            calls.iter().filter(|(_, status)| status.is_empty()).count(),
+            1,
+            "the turn's status must be cleared exactly once: {calls:?}"
+        );
     }
 
     #[test]

@@ -13637,6 +13637,7 @@ api_key = "anthropic-key"
         progress_messages: tokio::sync::Mutex<Vec<String>>,
         lifecycle_events: tokio::sync::Mutex<Vec<ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
     }
 
     impl DraftRecordingChannel {
@@ -13649,6 +13650,7 @@ api_key = "anthropic-key"
                 progress_messages: tokio::sync::Mutex::new(Vec::new()),
                 lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
+                cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -13920,6 +13922,14 @@ api_key = "anthropic-key"
                 .push(format!("{recipient}:{message_id}:{text}"));
             Ok(())
         }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push(format!("{recipient}:{message_id}"));
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -14037,6 +14047,39 @@ api_key = "anthropic-key"
         hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
         observer: Arc<dyn Observer>,
     ) -> Arc<ChannelRuntimeContext> {
+        test_runtime_ctx_with_observer_and_tools(
+            channel,
+            model_provider,
+            prompt_config,
+            agent_cfg,
+            model_provider_ref,
+            hooks,
+            observer,
+            vec![],
+        )
+    }
+
+    /// `test_runtime_ctx_with_observer` plus a populated tool registry, so a
+    /// turn can actually execute a tool instead of resolving an unknown name.
+    #[allow(clippy::too_many_arguments)]
+    fn test_runtime_ctx_with_observer_and_tools(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        // Auto-approve the registered tools so the turn actually executes them
+        // instead of short-circuiting on a denial, which would skip the
+        // tool-phase lifecycle emissions entirely.
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            auto_approve: tools.iter().map(|tool| tool.name().to_string()).collect(),
+            ..Default::default()
+        };
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
@@ -14054,7 +14097,7 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(tools),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -14096,9 +14139,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            )),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: None,
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
@@ -14527,6 +14568,118 @@ api_key = "anthropic-key"
                 ProgressEvent::WaitingOnModel,
                 ProgressEvent::FinalizingResponse,
             ]
+        );
+    }
+
+    /// A turn that actually calls a tool must surface `RunningTool` and the
+    /// post-tool `Planning` hand-back at their real emitters, not only in the
+    /// enumeration and locale tables. Without a tool in the loop the six-state
+    /// contract is only half exercised.
+    #[tokio::test]
+    async fn process_channel_message_emits_running_tool_and_post_tool_planning() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        let progress = channel_impl.progress_messages.lock().await.clone();
+        let running_tool = events
+            .iter()
+            .position(|event| *event == ProgressEvent::RunningTool)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a tool-calling turn must emit RunningTool, got lifecycle={events:?} progress={progress:?}"
+                )
+            });
+        assert!(
+            events[..running_tool].contains(&ProgressEvent::WaitingOnModel),
+            "the model wait must precede the tool run, got {events:?}"
+        );
+        assert!(
+            events[running_tool + 1..].contains(&ProgressEvent::Planning),
+            "the post-tool hand-back must re-enter Planning, got {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ProgressEvent::FinalizingResponse),
+            "a completed turn must end on FinalizingResponse, got {events:?}"
+        );
+    }
+
+    /// Cancellation mid-turn must reach the channel's draft cancellation so the
+    /// Slack side can clear its turn-bound Assistant status, and must not
+    /// finalize a draft for a turn that never produced an answer.
+    #[tokio::test]
+    async fn process_channel_message_cancellation_cancels_the_draft() {
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a cancelled turn must cancel its draft so terminal cleanup runs"
+        );
+        assert!(
+            channel_impl.finalized_messages.lock().await.is_empty(),
+            "a cancelled turn must not finalize a draft"
+        );
+    }
+
+    /// A provider/turn error must also reach draft cancellation. This is the
+    /// error-path counterpart of the cancellation regression: both exits are
+    /// what clear a lifecycle state that was already shown to the user.
+    #[tokio::test]
+    async fn process_channel_message_turn_error_cancels_the_draft() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a failed turn must cancel its draft so a shown lifecycle state is cleared"
         );
     }
 
