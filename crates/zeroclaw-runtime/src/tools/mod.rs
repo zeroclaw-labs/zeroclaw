@@ -1141,13 +1141,14 @@ pub fn all_tools_with_runtime(
 
     // Standalone image generation tool (config-gated)
     if root_config.image_gen.enabled {
-        match ImageGenTool::new_with_config(
+        let allowed_hosts = root_config.image_gen.allowed_private_hosts.clone();
+        match ImageGenTool::new_with_config_resolver(
             security.clone(),
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
-            root_config.image_gen.allowed_private_hosts.clone(),
+            move || allowed_hosts.clone(),
         ) {
             Ok(tool) => tool_arcs.push(Arc::new(tool)),
             Err(err) => ::zeroclaw_log::record!(
