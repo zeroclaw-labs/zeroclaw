@@ -14,6 +14,38 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 const FAILED_ATTEMPT_RETENTION_SECS: u64 = 900; // 15 min
 /// Minimum interval between full sweeps of the failed-attempt map.
 const FAILED_ATTEMPT_SWEEP_INTERVAL_SECS: u64 = 300; // 5 min
+/// How long a pending pairing code stays valid before it must be reissued.
+/// Bounds the attack window even if no failed attempt is ever recorded.
+const PAIRING_CODE_TTL_SECS: u64 = 600; // 10 min
+/// Maximum failed guesses against a single pending code across ALL clients
+/// before the code is burned. Unlike the per-client counter this cannot be
+/// reset by rotating the client key (peer address / forwarded header), so a
+/// distributed or IP-rotating brute force still exhausts a bounded budget.
+const MAX_GLOBAL_PAIR_ATTEMPTS: u32 = 50;
+
+/// A pending one-time pairing code plus the metadata that bounds its exposure:
+/// an issue time for TTL expiry and a global failure counter no per-client key
+/// rotation can reset.
+#[derive(Debug, Clone)]
+struct PendingCode {
+    code: String,
+    issued_at: Instant,
+    global_failures: u32,
+}
+
+impl PendingCode {
+    fn new(code: String) -> Self {
+        Self {
+            code,
+            issued_at: Instant::now(),
+            global_failures: 0,
+        }
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.issued_at).as_secs() >= PAIRING_CODE_TTL_SECS
+    }
+}
 
 /// Per-client failed attempt state with optional absolute lockout deadline.
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +69,9 @@ pub enum GeneratePairingCodeError {
 pub struct PairingGuard {
     /// Whether pairing is required at all.
     require_pairing: bool,
-    /// One-time pairing code (generated on startup, consumed on first pair).
-    pairing_code: Arc<Mutex<Option<String>>>,
+    /// One-time pairing code (generated on startup, consumed on first pair),
+    /// carrying its issue time and a global failure counter.
+    pairing_code: Arc<Mutex<Option<PendingCode>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
@@ -64,15 +97,22 @@ impl PairingGuard {
         };
         Self {
             require_pairing,
-            pairing_code: Arc::new(Mutex::new(code)),
+            pairing_code: Arc::new(Mutex::new(code.map(PendingCode::new))),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
         }
     }
 
-    /// The one-time pairing code (generated only on first startup when no tokens exist).
+    /// The one-time pairing code (generated only on first startup when no tokens
+    /// exist). Returns `None` once the code has expired, so callers never
+    /// display or act on a stale code.
     pub fn pairing_code(&self) -> Option<String> {
-        self.pairing_code.lock().clone()
+        let now = Instant::now();
+        self.pairing_code
+            .lock()
+            .as_ref()
+            .filter(|pending| !pending.is_expired(now))
+            .map(|pending| pending.code.clone())
     }
 
     /// Whether pairing is required at all.
@@ -109,23 +149,43 @@ impl PairingGuard {
         }
 
         {
-            let mut pairing_code = self.pairing_code.lock();
-            if let Some(ref expected) = *pairing_code
-                && constant_time_eq(code.trim(), expected.trim())
-            {
+            let mut slot = self.pairing_code.lock();
+            let mut matched = false;
+            let mut expired = false;
+            let mut burn = false;
+            if let Some(pending) = slot.as_mut() {
+                if pending.is_expired(now) {
+                    expired = true;
+                } else if constant_time_eq(code.trim(), pending.code.trim()) {
+                    matched = true;
+                } else {
+                    // Wrong code: bump the global counter (shared across every
+                    // client, so a rotated client key cannot reset it) and burn
+                    // the code once the budget is spent.
+                    pending.global_failures += 1;
+                    burn = pending.global_failures >= MAX_GLOBAL_PAIR_ATTEMPTS;
+                }
+            }
+            // The `pending` borrow ends above, so the slot can be reassigned.
+            if matched {
+                *slot = None; // consume the code so it cannot be reused
+                drop(slot);
                 // Reset failed attempts for this client on success
                 {
                     let mut guard = self.failed_attempts.lock();
                     guard.0.remove(&client_id);
                 }
                 let token = generate_token();
-                let mut tokens = self.paired_tokens.lock();
-                tokens.insert(hash_token(&token));
-
-                // Consume the pairing code so it cannot be reused
-                *pairing_code = None;
-
+                self.paired_tokens.lock().insert(hash_token(&token));
                 return Ok(Some(token));
+            }
+            if expired || burn {
+                *slot = None;
+            }
+            if expired {
+                // An expired code is nobody's failed guess; reject without
+                // charging this client's lockout counter.
+                return Ok(None);
             }
         }
 
@@ -230,7 +290,7 @@ impl PairingGuard {
             return None;
         }
         let new_code = generate_code();
-        *self.pairing_code.lock() = Some(new_code.clone());
+        *self.pairing_code.lock() = Some(PendingCode::new(new_code.clone()));
         Some(new_code)
     }
 
@@ -239,11 +299,15 @@ impl PairingGuard {
             return Err(GeneratePairingCodeError::PairingDisabled);
         }
         let mut slot = self.pairing_code.lock();
-        if slot.is_some() {
+        // An expired code is treated as vacant so a new one can be issued.
+        if slot
+            .as_ref()
+            .is_some_and(|pending| !pending.is_expired(Instant::now()))
+        {
             return Err(GeneratePairingCodeError::Pending);
         }
         let new_code = generate_code();
-        *slot = Some(new_code.clone());
+        *slot = Some(PendingCode::new(new_code.clone()));
         Ok(new_code)
     }
 
@@ -832,5 +896,47 @@ mod tests {
         let guard = PairingGuard::new(false, &[]);
         let err = guard.generate_pairing_code_if_vacant().unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::PairingDisabled);
+    }
+
+    #[test]
+    async fn pending_code_expires_after_ttl() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let pending = PendingCode {
+            code: "123456".to_string(),
+            issued_at: t0,
+            global_failures: 0,
+        };
+        assert!(!pending.is_expired(t0 + Duration::from_secs(PAIRING_CODE_TTL_SECS - 1)));
+        assert!(pending.is_expired(t0 + Duration::from_secs(PAIRING_CODE_TTL_SECS)));
+    }
+
+    #[test]
+    async fn global_counter_burns_code_after_max_attempts_across_clients() {
+        let guard = PairingGuard::new(true, &[]);
+        let real_code = guard.pairing_code().expect("startup code");
+        // A wrong guess guaranteed to differ from the real code.
+        let wrong = if real_code == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+
+        // One wrong guess from each of MAX_GLOBAL distinct clients: no single
+        // client reaches its own 5-attempt lockout, but the shared global
+        // counter still fills — a rotating-IP attacker cannot reset it.
+        for i in 0..MAX_GLOBAL_PAIR_ATTEMPTS {
+            let client = format!("10.0.0.{i}");
+            assert_eq!(
+                guard.try_pair(wrong, &client).await,
+                Ok(None),
+                "attempt {i} should be a plain invalid-code result"
+            );
+        }
+
+        // The code is now burned: even the correct code from a fresh client
+        // no longer pairs, and no code remains pending.
+        assert_eq!(guard.try_pair(&real_code, "203.0.113.9").await, Ok(None));
+        assert!(guard.pairing_code().is_none());
     }
 }

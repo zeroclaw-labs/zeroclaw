@@ -2,7 +2,7 @@
 
 use super::AppState;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Metadata about a paired device.
@@ -370,6 +371,7 @@ pub async fn initiate_pairing(
 /// POST /api/pair — submit pairing code (for new device pairing)
 pub async fn submit_pairing_enhanced(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -377,11 +379,39 @@ pub async fn submit_pairing_enhanced(
     let device_name = body["device_name"].as_str().map(String::from);
     let device_type = body["device_type"].as_str().map(String::from);
 
-    let client_id = headers
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    // Derive the brute-force lockout key from the real connection peer, only trusting
+    // forwarded headers behind a configured proxy. Reading it straight from
+    // `X-Forwarded-For` let an unauthenticated client vary the header to dodge the
+    // per-client lockout entirely (#9389). Mirrors the legacy `/pair` handler.
+    let client_id =
+        super::client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+
+    // Brute-force protection, mirroring the legacy `/pair` handler: a coarse
+    // per-key request cap plus the shared auth rate limiter. Both are keyed on
+    // the connection-derived client id (not a spoofable header), so this handler
+    // is no longer the one pairing route without any rate limiting (#9389).
+    if !state.rate_limiter.allow_pair(&client_id) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "paired": false,
+                "error": "Too many pairing requests. Please retry later.",
+                "retry_after": super::RATE_LIMIT_WINDOW_SECS,
+            })),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.auth_limiter.check_rate_limit(&client_id) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "paired": false,
+                "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+                "retry_after": e.retry_after_secs,
+            })),
+        )
+            .into_response();
+    }
 
     match state.pairing.try_pair(code, &client_id).await {
         Ok(Some(token)) => {
@@ -454,10 +484,26 @@ pub async fn submit_pairing_enhanced(
             }))
             .into_response()
         }
-        Ok(None) => (StatusCode::BAD_REQUEST, "Invalid or expired pairing code").into_response(),
+        Ok(None) => {
+            // Feed the shared auth limiter so repeated invalid codes trip the
+            // cross-request lockout, exactly as the legacy `/pair` handler does.
+            state.auth_limiter.record_attempt(&client_id);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "paired": false,
+                    "error": "Invalid or expired pairing code",
+                })),
+            )
+                .into_response()
+        }
         Err(lockout_secs) => (
             StatusCode::TOO_MANY_REQUESTS,
-            format!("Too many attempts. Locked out for {lockout_secs}s"),
+            Json(serde_json::json!({
+                "paired": false,
+                "error": format!("Too many attempts. Locked out for {lockout_secs}s"),
+                "retry_after": lockout_secs,
+            })),
         )
             .into_response(),
     }
@@ -713,6 +759,7 @@ mod tests {
         let (status, body) = response_json(
             submit_pairing_enhanced(
                 State(state.clone()),
+                ConnectInfo("127.0.0.1:40000".parse().unwrap()),
                 HeaderMap::new(),
                 Json(serde_json::json!({"code": code, "device_name": "test"})),
             )
@@ -760,6 +807,7 @@ mod tests {
         let (status, body) = response_json(
             submit_pairing_enhanced(
                 State(state.clone()),
+                ConnectInfo("127.0.0.1:40001".parse().unwrap()),
                 HeaderMap::new(),
                 Json(serde_json::json!({"code": code})),
             )
@@ -782,6 +830,59 @@ mod tests {
             state.pairing.tokens().is_empty(),
             "PairingGuard::paired_tokens must be empty after a failed persist; have {:?}",
             state.pairing.tokens()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_keys_lockout_on_peer_not_forwarded_header() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        // Default config does not trust forwarded headers.
+        assert!(!state.trust_forwarded_headers);
+
+        let peer: SocketAddr = "203.0.113.7:55555".parse().unwrap();
+
+        // Five wrong codes from one peer, each spoofing a different X-Forwarded-For.
+        for i in 0..5 {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", format!("192.0.2.{i}").parse().unwrap());
+            let (status, _) = response_json(
+                submit_pairing_enhanced(
+                    State(state.clone()),
+                    ConnectInfo(peer),
+                    headers,
+                    Json(serde_json::json!({"code": "wrong"})),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "attempt {i} is an invalid code and must not be locked out yet"
+            );
+        }
+
+        // A sixth attempt with yet another spoofed header must be locked out: the key is
+        // the real peer IP, so varying X-Forwarded-For cannot open a fresh bucket (#9389).
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", "198.51.100.9".parse().unwrap());
+        let (status, _) = response_json(
+            submit_pairing_enhanced(
+                State(state.clone()),
+                ConnectInfo(peer),
+                headers,
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "lockout must key on the peer IP so X-Forwarded-For spoofing cannot bypass it"
         );
     }
 }
