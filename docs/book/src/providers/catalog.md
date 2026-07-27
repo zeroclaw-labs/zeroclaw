@@ -51,6 +51,58 @@ The documented ACP integration and default argument profile are validated
 against Grok Build CLI `0.2.111`. Treat upgrades of the external CLI as a
 compatibility change and revalidate `grok agent stdio` before deploying them.
 
+#### Ubuntu 24.04: keep the Grok sandbox when `bwrap` needs user namespaces
+
+When deploying Grok Build `0.2.112` or later, verify ACP initialization on the
+target host. On Ubuntu 24.04 hosts with
+`kernel.apparmor_restrict_unprivileged_userns=1`, Grok can exit before ACP
+initialization with `bwrap: setting up uid map: Permission denied`. This is a
+host sandbox setup failure, not an ACP, stdout, or authentication failure.
+
+Keep the ZeroClaw default `--sandbox strict` (or an explicit `workspace`
+profile) and grant only the actual Grok executable permission to create a user
+namespace. This is a host-administrator change; it preserves the global user
+namespace restriction and does not turn off Grok's sandbox.
+
+```sh
+readlink -f "$(command -v grok)"
+```
+
+Create `/etc/apparmor.d/grok-build-userns`, replacing the placeholder with that
+absolute path:
+
+```text
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile grok-build-userns /absolute/path/to/grok flags=(unconfined) {
+  userns,
+}
+```
+
+Then load it and verify the profile is active:
+
+```sh
+sudo apparmor_parser -r /etc/apparmor.d/grok-build-userns
+sudo aa-status | grep grok-build-userns
+```
+
+`flags=(unconfined)` is Ubuntu's per-executable AppArmor exception mechanism:
+it grants `userns` to the named Grok binary but does not add AppArmor file
+rules to it. Grok's own requested sandbox remains enabled, and the host-wide
+user-namespace restriction remains enabled. Use a fully confined
+organization-specific profile if Grok also needs AppArmor file restrictions.
+Because self-updates can change the downloaded executable path, resolve the
+path and reload this profile after each Grok update.
+
+Do not use `--sandbox off` merely to avoid this error: it disables Grok's
+sandbox. Do not disable `kernel.apparmor_restrict_unprivileged_userns`
+system-wide. [xAI documents Landlock for normal Linux sandboxing](https://docs.x.ai/build/features/sandbox)
+and documents [`bubblewrap` only for custom read-deny profiles](https://docs.x.ai/build/settings/reference);
+if this occurs without a custom non-empty `deny` list, report the version,
+exact error, sandbox profile, and non-secret host/AppArmor diagnostics to xAI.
+
 `max_acp_stdout_bytes` bounds all stdout read from the Grok ACP child during
 one request, including protocol frames and native-tool updates. It defaults to
 4 MiB; set it per alias when a reviewed tool-enabled workload needs a larger
