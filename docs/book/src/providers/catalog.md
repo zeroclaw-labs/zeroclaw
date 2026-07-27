@@ -47,6 +47,10 @@ authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
 Small and large prompts both travel on stdin and never appear in argv or a
 prompt file.
 
+The documented ACP integration and default argument profile are validated
+against Grok Build CLI `0.2.111`. Treat upgrades of the external CLI as a
+compatibility change and revalidate `grok agent stdio` before deploying them.
+
 `max_acp_stdout_bytes` bounds all stdout read from the Grok ACP child during
 one request, including protocol frames and native-tool updates. It defaults to
 4 MiB; set it per alias when a reviewed tool-enabled workload needs a larger
