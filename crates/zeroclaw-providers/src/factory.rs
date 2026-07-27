@@ -1381,7 +1381,7 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
-        _opts: &ModelProviderRuntimeOptions,
+        opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         if has_api_key(key) {
             anyhow::bail!(
@@ -1396,6 +1396,10 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
                 .extra_args(self.extra_args.clone())
                 .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
                 .timeout_secs(self.base.timeout_secs)
+                // TEMPORARY: Grok Build 0.2.112 advertises ACP image=false
+                // while accepting image blocks. The existing per-alias
+                // `vision = true` override is the sole operator opt-in.
+                .vision_enabled(opts.vision == Some(true))
                 .build()?,
         ))
     }
@@ -1687,6 +1691,28 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("max_acp_stdout_bytes"));
+    }
+
+    #[test]
+    fn grok_cli_factory_enables_explicit_vision_override() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let provider = config
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("vision opt-in must build the Grok CLI provider");
+
+        assert!(provider.capabilities().vision);
     }
 
     #[test]

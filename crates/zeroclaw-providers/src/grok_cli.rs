@@ -50,7 +50,7 @@
 
 mod acp;
 
-use crate::traits::{ChatRequest, ChatResponse, ModelProvider, TokenUsage};
+use crate::traits::{ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -226,6 +226,9 @@ pub struct GrokCliModelProvider {
     max_acp_stdout_bytes: usize,
     /// Wall-clock timeout for the ACP request.
     timeout: Duration,
+    /// Whether this alias explicitly overrides Grok ACP's advertised vision
+    /// capability and serializes normalized image markers as ACP image blocks.
+    vision_enabled: bool,
 }
 
 /// Typed builder for [`GrokCliModelProvider`].
@@ -241,6 +244,7 @@ pub struct GrokCliBuilder {
     extra_args: Vec<String>,
     max_acp_stdout_bytes: Option<usize>,
     timeout_secs: Option<u64>,
+    vision_enabled: bool,
 }
 
 impl GrokCliBuilder {
@@ -283,6 +287,12 @@ impl GrokCliBuilder {
         self
     }
 
+    /// Enable the explicit vision override from the alias configuration.
+    pub fn vision_enabled(mut self, vision_enabled: bool) -> Self {
+        self.vision_enabled = vision_enabled;
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<GrokCliModelProvider> {
         let binary_path = self
             .binary_path
@@ -309,6 +319,7 @@ impl GrokCliBuilder {
             extra_args,
             max_acp_stdout_bytes,
             timeout,
+            vision_enabled: self.vision_enabled,
         })
     }
 }
@@ -441,6 +452,7 @@ impl GrokCliModelProvider {
             extra_args: Vec::new(),
             max_acp_stdout_bytes: None,
             timeout_secs: None,
+            vision_enabled: false,
         }
     }
 
@@ -638,6 +650,7 @@ impl GrokCliModelProvider {
     }
 
     async fn invoke_acp(&self, message: &str, model: &str) -> anyhow::Result<String> {
+        let prompt = self.acp_prompt_content(message);
         let args = Self::build_cli_args(model, &self.extra_args);
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(&args);
@@ -698,7 +711,7 @@ impl GrokCliModelProvider {
             acp::run_oneshot_prompt(
                 &mut stdin,
                 stdout,
-                message,
+                &prompt,
                 &self.working_directory,
                 xai_api_key_available,
                 self.max_acp_stdout_bytes,
@@ -734,6 +747,41 @@ impl GrokCliModelProvider {
                 )))
             }
         }
+    }
+
+    fn acp_prompt_content(&self, message: &str) -> Vec<acp::AcpPromptContent> {
+        if !self.vision_enabled {
+            return vec![acp::AcpPromptContent::Text(message.to_string())];
+        }
+
+        // TEMPORARY: Grok Build CLI 0.2.112 advertises
+        // `promptCapabilities.image = false`, although its ACP
+        // `session/prompt` endpoint accepts image blocks. `vision = true` is
+        // the explicit per-alias opt-in that bypasses that bad advertisement.
+        // Re-evaluate and remove this workaround once Grok advertises the
+        // capability correctly upstream.
+        let (text, image_refs) = crate::multimodal::parse_image_markers(message);
+        if image_refs.is_empty() {
+            return vec![acp::AcpPromptContent::Text(message.to_string())];
+        }
+
+        let Some(images) = image_refs
+            .iter()
+            .map(|image_ref| acp::AcpPromptContent::image_from_data_uri(image_ref))
+            .collect::<Option<Vec<_>>>()
+        else {
+            // The runtime normally normalizes all provider-bound images into
+            // data URIs. Preserve the original text on atypical direct calls
+            // rather than silently dropping an image reference we cannot send.
+            return vec![acp::AcpPromptContent::Text(message.to_string())];
+        };
+
+        let mut prompt = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+        if !text.is_empty() {
+            prompt.push(acp::AcpPromptContent::Text(text));
+        }
+        prompt.extend(images);
+        prompt
     }
 }
 
@@ -819,6 +867,13 @@ fn env_var_allowed(key: &str, env_passthrough: &[String]) -> bool {
 
 #[async_trait]
 impl ModelProvider for GrokCliModelProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            vision: self.vision_enabled,
+            ..ProviderCapabilities::default()
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -922,6 +977,42 @@ mod tests {
             acp::DEFAULT_ACP_STDOUT_LIMIT_BYTES
         );
         assert_eq!(model_provider.timeout, DEFAULT_GROK_CLI_TIMEOUT);
+        assert!(!model_provider.vision_enabled);
+        assert!(!model_provider.capabilities().vision);
+    }
+
+    #[test]
+    fn vision_override_serializes_normalized_images_as_acp_blocks() {
+        let temp = TempDir::new().expect("tempdir");
+        let model_provider = GrokCliModelProvider::builder("test")
+            .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+            .vision_enabled(true)
+            .build()
+            .expect("vision-enabled provider");
+
+        assert!(model_provider.capabilities().vision);
+        assert_eq!(
+            model_provider.acp_prompt_content("Describe [IMAGE:data:image/png;base64,cG5n]"),
+            vec![
+                acp::AcpPromptContent::Text("Describe".to_string()),
+                acp::AcpPromptContent::Image {
+                    data: "cG5n".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_vision_override_keeps_image_marker_as_text() {
+        let temp = TempDir::new().expect("tempdir");
+        let model_provider = provider(None, temp.path(), vec![], None);
+        let message = "Describe [IMAGE:data:image/png;base64,cG5n]";
+
+        assert_eq!(
+            model_provider.acp_prompt_content(message),
+            vec![acp::AcpPromptContent::Text(message.to_string())]
+        );
     }
 
     #[test]
@@ -1471,6 +1562,21 @@ while IFS= read -r line; do :; done
                 .expect("provider")
         }
 
+        fn fake_provider_with_vision(
+            temp: &TempDir,
+            body: &str,
+            timeout_secs: u64,
+        ) -> GrokCliModelProvider {
+            let binary = fake_grok(temp, body);
+            GrokCliModelProvider::builder("test")
+                .binary_path(Some(binary.to_str().expect("UTF-8 fake path")))
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .timeout_secs(Some(timeout_secs))
+                .vision_enabled(true)
+                .build()
+                .expect("vision-enabled provider")
+        }
+
         async fn wait_for_pid(path: &Path) -> i32 {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
@@ -1524,6 +1630,38 @@ while IFS= read -r line; do :; done
                     .expect("captured requests");
                 assert!(requests.contains(&prompt));
             }
+        }
+
+        #[tokio::test]
+        async fn fake_child_sends_images_as_acp_image_blocks_when_vision_is_enabled() {
+            let temp = TempDir::new().expect("tempdir");
+            let model_provider = fake_provider_with_vision(&temp, SUCCESS_BODY, 5);
+            let reply = model_provider
+                .invoke_acp("Describe [IMAGE:data:image/png;base64,cG5n]", "default")
+                .await
+                .expect("fake ACP reply");
+            assert_eq!(reply, "FAKE_ACP_OK");
+
+            let requests = std::fs::read_to_string(temp.path().join("requests.ndjson"))
+                .expect("captured requests");
+            let prompt_request: serde_json::Value = serde_json::from_str(
+                requests
+                    .lines()
+                    .nth(3)
+                    .expect("session/prompt request must be captured"),
+            )
+            .expect("session/prompt request must be JSON");
+            assert_eq!(prompt_request["method"], "session/prompt");
+
+            let blocks = prompt_request["params"]["prompt"]
+                .as_array()
+                .expect("session prompt must contain blocks");
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0]["type"], "text");
+            assert_eq!(blocks[0]["text"], "Describe");
+            assert_eq!(blocks[1]["type"], "image");
+            assert_eq!(blocks[1]["data"], "cG5n");
+            assert_eq!(blocks[1]["mimeType"], "image/png");
         }
 
         #[tokio::test]

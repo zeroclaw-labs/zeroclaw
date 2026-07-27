@@ -39,6 +39,43 @@ const MAX_ACP_ASSISTANT_BYTES: usize = 1_048_576;
 const OUTPUT_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
 const OUTPUT_SETTLE_INTERVALS: usize = 2;
 
+/// One content block sent to Grok Build's ACP `session/prompt` endpoint.
+///
+/// Keep this representation typed until the JSON-RPC boundary so image bytes
+/// cannot accidentally be embedded in a text block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AcpPromptContent {
+    Text(String),
+    Image { data: String, mime_type: String },
+}
+
+impl AcpPromptContent {
+    pub(super) fn image_from_data_uri(data_uri: &str) -> Option<Self> {
+        let (header, data) = data_uri.trim().split_once(',')?;
+        let mime_type = header
+            .strip_prefix("data:")?
+            .strip_suffix(";base64")?
+            .trim();
+        let data = data.trim();
+        if !mime_type.starts_with("image/") || data.is_empty() {
+            return None;
+        }
+        Some(Self::Image {
+            data: data.to_string(),
+            mime_type: mime_type.to_string(),
+        })
+    }
+
+    fn as_json(&self) -> Value {
+        match self {
+            Self::Text(text) => json!({ "type": "text", "text": text }),
+            Self::Image { data, mime_type } => {
+                json!({ "type": "image", "data": data, "mimeType": mime_type })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(super) enum AcpError {
     #[error("Grok ACP transport failed while writing {phase}")]
@@ -90,7 +127,7 @@ impl AcpError {
 pub(super) async fn run_oneshot_prompt<W, R>(
     stdin: &mut W,
     stdout: R,
-    prompt: &str,
+    prompt: &[AcpPromptContent],
     cwd: &Path,
     xai_api_key_available: bool,
     max_stdout_bytes: usize,
@@ -162,7 +199,7 @@ where
         "session/prompt",
         json!({
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": prompt }]
+            "prompt": prompt.iter().map(AcpPromptContent::as_json).collect::<Vec<_>>()
         }),
         &mut assistant,
     )

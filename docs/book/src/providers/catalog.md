@@ -51,6 +51,27 @@ The documented ACP integration and default argument profile are validated
 against Grok Build CLI `0.2.111`. Treat upgrades of the external CLI as a
 compatibility change and revalidate `grok agent stdio` before deploying them.
 
+#### Temporary ACP vision-advertisement workaround for Grok Build 0.2.112
+
+Grok Build CLI `0.2.112` advertises `promptCapabilities.image = false` during
+ACP initialization even though its `session/prompt` endpoint accepts ACP `image`
+blocks. To opt into ZeroClaw's temporary workaround for that upstream
+misadvertisement, set `vision = true` on the specific `grok_cli` alias:
+
+```toml
+[providers.models.grok_cli.default]
+model = "grok-4.5"
+working_directory = "/srv/zeroclaw/grok-workspace"
+# TEMPORARY: bypass Grok Build 0.2.112's incorrect ACP image advertisement.
+vision = true
+```
+
+With this explicit opt-in, ZeroClaw reports vision support for that alias and
+sends normalized image attachments as ACP `image` blocks. It does not override
+other ACP advertisements, such as tool or permission capabilities. Leave the
+setting unset by default; revalidate the upstream behavior and remove this
+temporary setting after Grok advertises image support correctly.
+
 #### Ubuntu 24.04: keep the Grok sandbox when `bwrap` needs user namespaces
 
 When deploying Grok Build `0.2.112` or later, verify ACP initialization on the
