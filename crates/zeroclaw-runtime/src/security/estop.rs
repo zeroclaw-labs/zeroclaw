@@ -59,6 +59,102 @@ impl EstopState {
         self.blocked_domains = dedup_sort(&self.blocked_domains);
         self.frozen_tools = dedup_sort(&self.frozen_tools);
     }
+
+    /// Read the current estop state for a per-tool-call enforcement check
+    /// WITHOUT mutating anything on disk. Unlike [`EstopManager::load`] this
+    /// never persists a fail-closed file, so it is safe to call on every tool
+    /// dispatch. A missing file means "not engaged"; an unreadable or corrupt
+    /// file fails closed (`kill_all`) so a truncated or tampered state cannot
+    /// silently disable the stop.
+    pub fn load_for_enforcement(config: &EstopConfig, config_dir: &Path) -> Self {
+        let path = resolve_state_file_path(config_dir, &config.state_file);
+        if !path.exists() {
+            return Self::default();
+        }
+        match fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
+                Ok(mut parsed) => {
+                    parsed.normalize();
+                    parsed
+                }
+                Err(_) => Self::fail_closed(),
+            },
+            Err(_) => Self::fail_closed(),
+        }
+    }
+
+    /// Whether a specific tool is frozen (case-insensitively, matching the
+    /// normalization applied when the freeze was engaged).
+    pub fn is_tool_frozen(&self, tool_name: &str) -> bool {
+        let normalized = tool_name.trim().to_ascii_lowercase();
+        self.frozen_tools.iter().any(|frozen| frozen == &normalized)
+    }
+
+    /// Whether a domain is blocked by the current estop state. Fails closed
+    /// (blocked) if the stored patterns cannot be compiled.
+    pub fn is_domain_blocked(&self, domain: &str) -> bool {
+        if self.blocked_domains.is_empty() {
+            return false;
+        }
+        DomainMatcher::new(&self.blocked_domains, &[])
+            .map(|matcher| matcher.is_gated(domain))
+            .unwrap_or(true)
+    }
+
+    /// The reason a tool call must be refused right now, or `None` to allow it.
+    /// Covers the whole-agent kill switch and per-tool freezes; domain/network
+    /// gating is evaluated separately at the network layer.
+    pub fn tool_block_reason(&self, tool_name: &str) -> Option<String> {
+        if self.kill_all {
+            Some("emergency stop engaged: all tool calls are halted (kill_all)".to_string())
+        } else if self.is_tool_frozen(tool_name) {
+            Some(format!(
+                "emergency stop engaged: tool '{tool_name}' is frozen"
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Borrowed enforcement context threaded into the tool dispatcher so it can
+/// consult the live estop state before each tool call. Cheap to copy (two
+/// references) and only constructed when estop is enabled.
+#[derive(Debug, Clone, Copy)]
+pub struct EstopEnforcement<'a> {
+    config: &'a EstopConfig,
+    config_dir: &'a Path,
+}
+
+impl<'a> EstopEnforcement<'a> {
+    /// Build enforcement context from the agent config, or `None` when estop is
+    /// disabled or the config directory is unknown. `config_dir` mirrors the
+    /// `zeroclaw estop` CLI (`config_path.parent()`) so both processes resolve
+    /// the same state file.
+    pub fn from_config(config: &'a zeroclaw_config::schema::Config) -> Option<Self> {
+        if !config.security.estop.enabled {
+            return None;
+        }
+        let config_dir = config.config_path.parent()?;
+        Some(Self {
+            config: &config.security.estop,
+            config_dir,
+        })
+    }
+
+    /// Re-read the live state file and return the reason to refuse `tool_name`,
+    /// or `None` to allow it. Reading per call means a `zeroclaw estop` engaged
+    /// from another process takes effect on the next tool call.
+    pub fn block_reason(&self, tool_name: &str) -> Option<String> {
+        EstopState::load_for_enforcement(self.config, self.config_dir).tool_block_reason(tool_name)
+    }
+
+    /// Construct enforcement context directly from parts, for tests that don't
+    /// build a whole `Config`.
+    #[cfg(test)]
+    pub(crate) fn from_parts(config: &'a EstopConfig, config_dir: &'a Path) -> Self {
+        Self { config, config_dir }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +484,70 @@ mod tests {
             .resume(ResumeSelector::KillAll, None, None)
             .expect_err("resume should require OTP");
         assert!(err.to_string().contains("OTP code is required"));
+    }
+
+    #[test]
+    fn load_for_enforcement_reports_engagement_without_persisting() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+
+        // Missing file → not engaged, and nothing is written.
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(!state.is_engaged());
+        assert!(
+            !state_path.exists(),
+            "enforcement read must not create a file"
+        );
+
+        // A `zeroclaw estop` from another process writes the file; the next
+        // enforcement read sees it.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(state.is_tool_frozen("shell"));
+        assert!(state.is_tool_frozen("SHELL"), "match is case-insensitive");
+        assert!(!state.is_tool_frozen("browser"));
+        assert_eq!(state.tool_block_reason("browser"), None);
+        assert!(state.tool_block_reason("shell").unwrap().contains("frozen"));
+    }
+
+    #[test]
+    fn load_for_enforcement_fails_closed_on_corruption_without_persisting() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        fs::write(&state_path, "{ truncated").unwrap();
+        let cfg = estop_config(&state_path);
+
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(state.kill_all, "corrupt state must fail closed");
+        // kill_all blocks every tool by name.
+        assert!(state.tool_block_reason("anything").is_some());
+        // The read did not rewrite the file (still the corrupt bytes).
+        assert_eq!(fs::read_to_string(&state_path).unwrap(), "{ truncated");
+    }
+
+    #[test]
+    fn is_domain_blocked_matches_wildcards() {
+        let mut state = EstopState::default();
+        assert!(!state.is_domain_blocked("chase.com"));
+        state.blocked_domains = vec!["*.chase.com".into()];
+        assert!(state.is_domain_blocked("login.chase.com"));
+        assert!(!state.is_domain_blocked("example.com"));
+    }
+
+    #[test]
+    fn kill_all_blocks_every_tool() {
+        let state = EstopState {
+            kill_all: true,
+            ..EstopState::default()
+        };
+        assert!(state.tool_block_reason("shell").is_some());
+        assert!(state.tool_block_reason("browser").is_some());
     }
 
     #[test]

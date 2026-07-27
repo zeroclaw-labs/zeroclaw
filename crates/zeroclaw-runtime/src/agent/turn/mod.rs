@@ -899,6 +899,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        // Emergency-stop enforcement context, built once per tool batch. `None`
+        // when estop is disabled; otherwise the dispatcher re-reads the live
+        // state file before each tool call.
+        let estop = config.and_then(crate::security::EstopEnforcement::from_config);
+
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -909,6 +914,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        estop,
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -927,6 +933,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        estop,
                     };
                     execute_tools_sequential(
                         &executable_calls,

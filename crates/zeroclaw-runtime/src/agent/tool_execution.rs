@@ -44,6 +44,10 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
+    /// Emergency-stop enforcement, `Some` only when `[security.estop] enabled`.
+    /// Consulted before every tool call so a `zeroclaw estop` engaged from
+    /// another process halts execution on the next call.
+    pub estop: Option<crate::security::EstopEnforcement<'a>>,
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
@@ -62,6 +66,40 @@ fn unavailable_tool_outcome(
     duration: Duration,
 ) -> ToolExecutionOutcome {
     let reason = format!("Tool not available in this turn: {call_name}");
+    observer.record_event(&ObserverEvent::ToolCall {
+        tool: call_name.to_string(),
+        tool_call_id: tool_call_id_owned,
+        duration,
+        success: false,
+        arguments: Some(full_args.to_string()),
+        result: Some(scrub_credentials(&reason)),
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
+    });
+    ToolExecutionOutcome {
+        output: reason.clone(),
+        success: false,
+        error_reason: Some(reason),
+        duration,
+        receipt: None,
+        output_data: None,
+    }
+}
+
+/// Refuse a tool call because emergency stop is engaged. Mirrors
+/// [`unavailable_tool_outcome`] but surfaces the estop reason so the model sees
+/// why the call was blocked and does not silently retry.
+fn estop_blocked_outcome(
+    call_name: &str,
+    tool_call_id_owned: Option<String>,
+    full_args: &str,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    duration: Duration,
+    reason: String,
+) -> ToolExecutionOutcome {
     observer.record_event(&ObserverEvent::ToolCall {
         tool: call_name.to_string(),
         tool_call_id: tool_call_id_owned,
@@ -204,6 +242,34 @@ pub(crate) async fn execute_one_tool(
             meta,
             observer,
             start.elapsed(),
+        ));
+    }
+
+    // Emergency stop: consult the live estop state (re-read from disk) before
+    // running the tool, so `zeroclaw estop` engaged from another process halts
+    // the next tool call instead of being a no-op state file nothing reads.
+    if let Some(estop) = dispatch.estop
+        && let Some(reason) = estop.block_reason(tool.name())
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "tool": call_name,
+                    "reason": reason,
+                })),
+            format!("tool call blocked by emergency stop: {call_name}")
+        );
+        return Ok(estop_blocked_outcome(
+            call_name,
+            tool_call_id_owned,
+            &full_args,
+            meta,
+            observer,
+            start.elapsed(),
+            reason,
         ));
     }
 
@@ -643,6 +709,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                estop: None,
             },
             &meta,
             &NoopObserver,
@@ -667,6 +734,70 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "recovered activated tool should have been invoked exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_blocks_frozen_tool_when_estop_engaged() {
+        use crate::security::{EstopEnforcement, EstopLevel, EstopManager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = zeroclaw_config::schema::EstopConfig {
+            enabled: true,
+            state_file: state_path.display().to_string(),
+            require_otp_to_resume: false,
+        };
+        // A `zeroclaw estop --tool echo` from another process freezes the tool.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["echo".into()]))
+                .unwrap();
+        }
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "echo",
+            Arc::clone(&invocations),
+        ))];
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let outcome = execute_one_tool(
+            "echo",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+                estop: Some(EstopEnforcement::from_parts(&cfg, dir.path())),
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should return a blocked outcome, not error");
+
+        assert!(!outcome.success, "a frozen tool call must not succeed");
+        assert!(
+            outcome.output.contains("emergency stop"),
+            "block reason should name the emergency stop: {}",
+            outcome.output
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "the frozen tool must never execute"
         );
     }
 
@@ -699,6 +830,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
                 model_switch_callback: None,
+                estop: None,
             },
             &meta,
             &NoopObserver,
