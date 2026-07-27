@@ -916,29 +916,25 @@ type HeartbeatMcpRegistryTestHook = std::sync::Arc<
 static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<Option<HeartbeatMcpRegistryTestHook>> =
     std::sync::Mutex::new(None);
 
-/// Serializes the regression tests for the daemon heartbeat MCP
-/// registry hook. The hook itself is process-global, so a
-/// test that installs the hook, runs assertions, and then resets
-/// cannot safely interleave with another test doing the same: a
-/// concurrent `reset_heartbeat_mcp_registry_test_hook` would clear
-/// the hook before the first test observes it, and a concurrent
-/// `set_heartbeat_mcp_registry_test_hook` from another test would
-/// swap in a hook whose counter Arc belongs to the other test. To
-/// keep the regression tests deterministic, every hook-using test
-/// takes this mutex (via [`HeartbeatMcpRegistryTestHookGuard`]) for
-/// the entire duration of its hook-installed work.
+/// Serializes daemon heartbeat MCP registry tests that can observe
+/// the process-global hook. Hook-using tests and tests that need the
+/// real connection path must both hold this mutex; otherwise a
+/// real-path test can consume another test's injected registry.
 #[cfg(test)]
 static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// RAII guard that ties a test-only MCP registry hook installation
-/// to the global serialising lock. Construction takes the global
-/// mutex, installs the supplied hook, and returns a guard whose
-/// `Drop` clears the hook and releases the mutex. Tests that need
-/// the MCP registry hook to be observed by the daemon MUST hold
-/// this guard for the duration of the work that depends on it;
-/// otherwise a parallel test could clobber the hook (or reset it
-/// while the current test is still running) and the assertion would
-/// see a stale or absent hook.
+#[cfg(test)]
+fn lock_unpoisoned_test_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII guard that reserves the process-global heartbeat registry
+/// hook boundary for either an injected-hook test or a real-path
+/// test. Construction takes the global serial lock and sets the hook
+/// to the requested state. `Drop` clears the hook before releasing
+/// the serial lock.
 #[cfg(test)]
 pub(crate) struct HeartbeatMcpRegistryTestHookGuard {
     serial_lock: Option<std::sync::MutexGuard<'static, ()>>,
@@ -946,40 +942,27 @@ pub(crate) struct HeartbeatMcpRegistryTestHookGuard {
 
 #[cfg(test)]
 impl HeartbeatMcpRegistryTestHookGuard {
-    /// Install `hook` under the global serialising lock and return a
-    /// guard whose `Drop` clears the hook and releases the lock.
-    fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
-        // Hold the serial lock before mutating the hook global so a
-        // concurrent test cannot observe a torn state (hook swapped
-        // halfway, or reset between this test's set and use).
-        let serial_lock = HEARTBEAT_MCP_REGISTRY_TEST_LOCK
-            .lock()
-            .expect("heartbeat MCP registry test serial lock should not be poisoned");
-        let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
-            .lock()
-            .expect("heartbeat MCP registry test hook lock should not be poisoned");
-        *guard = Some(hook);
-        // Drop the hook global mutex immediately — the serial lock
-        // is what prevents another test from racing with us now, and
-        // the hook global only needs its inner value read once per
-        // helper invocation.
-        drop(guard);
+    fn reserve(hook: Option<HeartbeatMcpRegistryTestHook>) -> Self {
+        let serial_lock = lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_LOCK);
+        *lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_HOOK) = hook;
         Self {
             serial_lock: Some(serial_lock),
         }
+    }
+
+    fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
+        Self::reserve(Some(hook))
+    }
+
+    fn without_hook() -> Self {
+        Self::reserve(None)
     }
 }
 
 #[cfg(test)]
 impl Drop for HeartbeatMcpRegistryTestHookGuard {
     fn drop(&mut self) {
-        // Clear the hook first (still under the serial lock taken by
-        // `install`) so the next test sees a clean slate.
-        if let Ok(mut guard) = HEARTBEAT_MCP_REGISTRY_TEST_HOOK.lock() {
-            *guard = None;
-        }
-        // Releasing the serial lock last allows the next waiting
-        // test to proceed only after our hook is gone.
+        *lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_HOOK) = None;
         drop(self.serial_lock.take());
     }
 }
@@ -1001,14 +984,22 @@ pub(crate) fn set_heartbeat_mcp_registry_test_hook(
     HeartbeatMcpRegistryTestHookGuard::install(hook)
 }
 
+/// Reserve the heartbeat registry hook boundary with no hook installed.
+///
+/// Real-connection tests must hold this guard while calling
+/// `connect_heartbeat_mcp_registry` so a concurrent injected-hook test
+/// cannot replace their connection path.
+#[cfg(test)]
+fn heartbeat_mcp_registry_without_test_hook() -> HeartbeatMcpRegistryTestHookGuard {
+    HeartbeatMcpRegistryTestHookGuard::without_hook()
+}
+
 /// Snapshot the current test hook (cloned). Returns `None` when no
 /// hook is installed. Used by [`connect_heartbeat_mcp_registry`]
 /// during the registry-construction phase of the heartbeat worker.
 #[cfg(test)]
 fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTestHook> {
-    let guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
-        .lock()
-        .expect("heartbeat MCP registry test hook lock should not be poisoned");
+    let guard = lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_HOOK);
     guard.as_ref().cloned()
 }
 
@@ -2098,6 +2089,32 @@ mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn heartbeat_test_mutex_recovers_after_poisoning() {
+        let mutex = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mutex_for_thread = std::sync::Arc::clone(&mutex);
+
+        let panic_result = std::thread::spawn(move || {
+            let _guard = mutex_for_thread.lock().expect("local mutex starts healthy");
+            panic!("poison the local test mutex");
+        })
+        .join();
+
+        assert!(panic_result.is_err(), "worker thread must panic");
+        let _recovered = lock_unpoisoned_test_mutex(&mutex);
+    }
+
+    #[test]
+    fn heartbeat_no_hook_guard_reserves_shared_test_boundary() {
+        let _guard = heartbeat_mcp_registry_without_test_hook();
+
+        assert!(current_heartbeat_mcp_registry_test_hook().is_none());
+        assert!(matches!(
+            HEARTBEAT_MCP_REGISTRY_TEST_LOCK.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
     }
 
     fn add_agent_with_workspace(config: &mut Config, agent_alias: &str, workspace_dir: PathBuf) {
@@ -3355,6 +3372,7 @@ mod tests {
         use std::sync::Arc;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
 
+        let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
         // `pgrep -f` matches the full command line. The
         // `@modelcontextprotocol/server-filesystem` package runs as
         // a node script whose absolute path contains this literal
@@ -4007,6 +4025,7 @@ mod tests {
     async fn connect_heartbeat_mcp_registry_returns_none_when_all_healthy() {
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
 
+        let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
         let a_handle = make_test_server_handle("server-a");
         let current = std::sync::Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
             vec![("server-a".to_string(), a_handle)],
@@ -4265,6 +4284,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
 
+        let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
         let tmp = TempDir::new().unwrap();
 
         // ── 1. Build a tiny stdio MCP server script ──────────────────────
