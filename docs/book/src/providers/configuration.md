@@ -90,6 +90,14 @@ OpenAI Responses aliases, set `vision = true` for models that accept image
 input; this opt-in keeps text-only Responses models from receiving image
 payloads accidentally.
 
+Setting `vision = true` is an explicit operator assertion that the selected
+alias accepts image input. It changes image routing: ZeroClaw keeps image
+attachments on that alias instead of treating it as text-only or routing them
+to `multimodal.vision_model_provider`. Set it only for a tested provider and
+model combination. The Grok Build CLI `0.2.112` workaround additionally uses
+this opt-in to send ACP `image` blocks; it is temporary and documented in the
+[Grok Build CLI catalog entry](./catalog.md#temporary-acp-vision-advertisement-workaround-for-grok-build-02112).
+
 When `[multimodal] vision_model_provider` names a dotted provider alias, its
 `model` is used automatically. An explicit `[multimodal] vision_model` takes
 precedence over the alias model; if neither is set, the primary turn model is
