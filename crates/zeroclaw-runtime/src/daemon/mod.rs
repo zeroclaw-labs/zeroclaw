@@ -733,20 +733,41 @@ pub async fn run(
 
     record_daemon_started(&config, &host, port);
     if foreground {
-        // Gate the banner on real endpoint readiness: the ready
-        // message must not precede endpoint availability, and a slow or
-        // retrying bind must surface as "starting", never as "started".
-        let readiness =
-            await_startup_readiness(gateway_echo_rx, socket_echo_rx, STARTUP_READINESS_TIMEOUT)
-                .await;
+        // Immediately echo the "starting" banner — the operator sees this
+        // within milliseconds of launching, proving the daemon is running.
         let mut stderr = std::io::stderr().lock();
-        // Stderr write failures at daemon startup are diagnostic-only;
-        // dropping the `Result` keeps startup robust to closed pipes
-        // (e.g. the operator who launched via `&` then quit the shell).
-        let _ = echo_daemon_started_to_terminal(&config, &host, port, &readiness, &mut stderr);
+        let _ = echo_daemon_starting_to_terminal(&config, &host, port, &mut stderr);
+
+        // Spawn an asynchronous wait for the readiness signals. When endpoints
+        // bind, this task echoes the full "ready" banner with the actual bound
+        // addresses. The spawn does not block the daemon's entry into the
+        // shutdown-signal handling path.
+        let config_for_task = config.clone();
+        let host_for_task = host.to_string();
+        tokio::spawn(async move {
+            let readiness =
+                await_startup_readiness(gateway_echo_rx, socket_echo_rx, STARTUP_READINESS_TIMEOUT)
+                    .await;
+
+            // Only echo "ready" if the endpoints actually bound. If the timeout
+            // elapsed or a sender dropped, the "starting" banner remains the
+            // final word (no follow-up).
+            if let StartupReadiness::Ready { gateway_addr } = readiness {
+                let mut stderr = std::io::stderr().lock();
+                let _ = echo_daemon_ready_to_terminal(
+                    &config_for_task,
+                    &host_for_task,
+                    port,
+                    gateway_addr,
+                    &mut stderr,
+                );
+            }
+        });
     }
 
-    // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
+    // Enter the shutdown-signal handling path immediately. The readiness wait
+    // runs independently in the spawned task, so a slow bind (or retry loop)
+    // does not delay SIGINT/SIGTERM handling.
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
     crate::health::mark_component_error(
         "daemon",
@@ -868,16 +889,86 @@ async fn await_startup_readiness(
     }
 }
 
+/// Immediately echo the "starting" banner to the foreground terminal.
+///
+/// Called as soon as the daemon enters the foreground run path, before
+/// waiting for endpoints to bind. Uses the concise "starting" form so
+/// the operator sees immediate feedback that startup has begun.
+///
+/// Accepts any `io::Write` so tests can pass an in-memory buffer.
+/// Production passes `std::io::stderr().lock()`.
+fn echo_daemon_starting_to_terminal<W: std::io::Write>(
+    _config: &Config,
+    host: &str,
+    port: u16,
+    mut out: W,
+) -> std::io::Result<()> {
+    use crate::i18n::get_required_cli_string as cli_t;
+
+    writeln!(out, "{}", cli_t("cli-daemon-starting-title"))?;
+    writeln!(out)?; // blank line
+    writeln!(out, "   Starting on http://{host}:{port}")?;
+    writeln!(out, "   {}", cli_t("cli-daemon-started-stop"))?;
+
+    Ok(())
+}
+
+/// Echo the "ready" banner to the foreground terminal after endpoints bind.
+///
+/// Called asynchronously after `await_startup_readiness` reports that all
+/// supervised endpoints have bound. Prints the full 7-line banner with the
+/// gateway's actual bound address (not the configured guess).
+///
+/// Accepts any `io::Write` so tests can pass an in-memory buffer.
+/// Production passes `std::io::stderr().lock()`.
+fn echo_daemon_ready_to_terminal<W: std::io::Write>(
+    config: &Config,
+    host: &str,
+    port: u16,
+    gateway_addr: Option<std::net::SocketAddr>,
+    mut out: W,
+) -> std::io::Result<()> {
+    use crate::i18n::{
+        get_required_cli_string as cli_t, get_required_cli_string_with_args as cli_ta,
+    };
+
+    writeln!(out, "{}", cli_t("cli-daemon-started-title"))?;
+    writeln!(out)?; // blank line
+
+    // Print the gateway's actual bound address (or fallback to configured)
+    let gateway_url = match gateway_addr {
+        Some(addr) => format!("http://{addr}"),
+        None => format!("http://{host}:{port}"),
+    };
+    writeln!(
+        out,
+        "   {}",
+        cli_ta("cli-daemon-started-gateway", &[("url", &gateway_url)])
+    )?;
+
+    // Print the socket path
+    let socket_path = crate::rpc::local::socket_path(config).display().to_string();
+    writeln!(
+        out,
+        "   {}",
+        cli_ta("cli-daemon-started-socket", &[("path", &socket_path)])
+    )?;
+
+    writeln!(out, "   {}", cli_t("cli-daemon-started-components"))?;
+    if config.gateway.require_pairing {
+        writeln!(out, "   {}", cli_t("cli-daemon-started-pairing"))?;
+    }
+    writeln!(out, "   {}", cli_t("cli-daemon-started-stop"))?;
+
+    Ok(())
+}
+
 /// Foreground echo for the daemon startup banner.
 ///
-/// Kept as a separate helper so the structured call path (always emit)
-/// and the terminal-echo path (foreground only) stay independently
-/// testable. Accepts any `io::Write` so the in-process tests can pass
-/// an in-memory buffer without pulling in `libc` or touching global stderr
-/// state. `run()` passes `std::io::stderr().lock()` — the only call site
-/// for production output. Restores the operator-facing feedback that the
-/// structured `record_daemon_started` event hid behind the `--verbose`
-/// display gate.
+/// **Deprecated**: this function is kept for backward compatibility but
+/// should not be used in new code. Use `echo_daemon_starting_to_terminal`
+/// for the immediate banner and `echo_daemon_ready_to_terminal` for the
+/// follow-up ready banner instead.
 ///
 /// The banner's content is gated on [`StartupReadiness`]. Only the `Ready`
 /// arm prints endpoint addresses — using the gateway's actual bound address
@@ -886,64 +977,24 @@ async fn await_startup_readiness(
 /// endpoints. Every line renders through the Fluent `cli-*` catalogue
 /// (`locales/*/cli.ftl`), the repository's source of truth for
 /// operator-facing CLI/daemon output.
+#[deprecated(
+    since = "0.8.3",
+    note = "Use echo_daemon_starting_to_terminal and echo_daemon_ready_to_terminal instead"
+)]
+#[allow(dead_code)] // Kept for backward compatibility during the deprecation period.
 fn echo_daemon_started_to_terminal<W: std::io::Write>(
     config: &Config,
     host: &str,
     port: u16,
     readiness: &StartupReadiness,
-    mut out: W,
+    out: W,
 ) -> std::io::Result<()> {
-    use crate::i18n::{
-        get_required_cli_string as cli_t, get_required_cli_string_with_args as cli_ta,
-    };
     match readiness {
         StartupReadiness::Ready { gateway_addr } => {
-            // Print the endpoint the listener actually bound (reported via
-            // the readiness signal), falling back to the configured
-            // host:port when no gateway is supervised in-process.
-            let gateway_url = match gateway_addr {
-                Some(addr) => format!("http://{addr}"),
-                None => format!("http://{host}:{port}"),
-            };
-            let socket_path = crate::rpc::local::socket_path(config).display().to_string();
-            writeln!(out, "{}", cli_t("cli-daemon-started-title"))?;
-            writeln!(
-                out,
-                "   {}",
-                cli_ta(
-                    "cli-daemon-started-gateway",
-                    &[("url", gateway_url.as_str())]
-                )
-            )?;
-            writeln!(
-                out,
-                "   {}",
-                cli_ta(
-                    "cli-daemon-started-socket",
-                    &[("path", socket_path.as_str())]
-                )
-            )?;
-            writeln!(out, "   {}", cli_t("cli-daemon-started-components"))?;
-            if config.gateway.require_pairing {
-                writeln!(out, "   {}", cli_t("cli-daemon-started-pairing"))?;
-            }
-            writeln!(out, "   {}", cli_t("cli-daemon-started-stop"))?;
+            echo_daemon_ready_to_terminal(config, host, port, *gateway_addr, out)
         }
-        StartupReadiness::Starting => {
-            let seconds = STARTUP_READINESS_TIMEOUT.as_secs().to_string();
-            writeln!(out, "{}", cli_t("cli-daemon-starting-title"))?;
-            writeln!(
-                out,
-                "   {}",
-                cli_ta(
-                    "cli-daemon-starting-detail",
-                    &[("seconds", seconds.as_str())]
-                )
-            )?;
-            writeln!(out, "   {}", cli_t("cli-daemon-started-stop"))?;
-        }
+        StartupReadiness::Starting => echo_daemon_starting_to_terminal(config, host, port, out),
     }
-    Ok(())
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
@@ -2595,16 +2646,17 @@ mod tests {
         .expect("foreground echo writes succeed");
         let captured = String::from_utf8(buf).expect("echo output is utf-8");
 
-        let en = crate::i18n::get_english_cli_string_with_args;
         assert!(
-            captured.contains(en("cli-daemon-starting-title", &[]).as_str()),
+            captured.contains(
+                crate::i18n::get_required_cli_string("cli-daemon-starting-title").as_str()
+            ),
             "starting state must say starting, got: {captured:?}"
         );
         // Endpoint availability is not confirmed: the starting banner must
         // not announce the gateway/socket endpoints as ready.
         assert!(
             !captured.contains(
-                en(
+                crate::i18n::get_required_cli_string_with_args(
                     "cli-daemon-started-gateway",
                     &[("url", "http://127.0.0.1:42617")]
                 )
@@ -2616,7 +2668,227 @@ mod tests {
             !captured.contains("Socket:"),
             "starting state must not announce the socket endpoint, got: {captured:?}"
         );
-        assert!(captured.contains(en("cli-daemon-started-stop", &[]).as_str()));
+        assert!(
+            captured
+                .contains(crate::i18n::get_required_cli_string("cli-daemon-started-stop").as_str())
+        );
+    }
+
+    #[test]
+    fn starting_banner_is_immediate_and_concise() {
+        // Proves the immediate "starting" banner that the operator sees
+        // within milliseconds of launching, before any endpoint binds.
+        // Use get_required_cli_string to match the actual locale used by
+        // echo_daemon_starting_to_terminal.
+        crate::i18n::init("en");
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let mut buf: Vec<u8> = Vec::new();
+        echo_daemon_starting_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            &mut buf,
+        )
+        .expect("foreground echo writes succeed");
+        let captured = String::from_utf8(buf).expect("echo output is utf-8");
+
+        // The starting banner is concise: title, blank line, configured
+        // host:port detail, and stop hint.
+        assert!(
+            captured.contains(
+                crate::i18n::get_required_cli_string("cli-daemon-starting-title").as_str()
+            ),
+            "starting banner must contain the title"
+        );
+        assert!(
+            captured.contains(&format!(
+                "http://{}:{}",
+                FOREGROUND_ECHO_HOST, FOREGROUND_ECHO_PORT
+            )),
+            "starting banner must announce the configured host:port"
+        );
+        assert!(
+            captured
+                .contains(crate::i18n::get_required_cli_string("cli-daemon-started-stop").as_str()),
+            "starting banner must include the stop hint"
+        );
+        // The starting banner is 4 lines: title, blank, detail, stop
+        let line_count = captured.lines().count();
+        assert_eq!(
+            line_count, 4,
+            "starting banner must be exactly 4 lines (title, blank, detail, stop), got {} lines: {:?}",
+            line_count, captured
+        );
+    }
+
+    #[test]
+    fn ready_banner_is_full_and_shows_actual_bound_address() {
+        // Proves the follow-up "ready" banner that appears asynchronously
+        // after both endpoints bind.
+        crate::i18n::init("en");
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let bound: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        echo_daemon_ready_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            Some(bound),
+            &mut buf,
+        )
+        .expect("foreground echo writes succeed");
+        let captured = String::from_utf8(buf).expect("echo output is utf-8");
+
+        // The ready banner is the full 7-line form with actual bound address.
+        let expected = crate::i18n::get_english_cli_string_with_args(
+            "cli-daemon-started-gateway",
+            &[("url", "http://127.0.0.1:42617")],
+        );
+        assert!(
+            captured.contains(&expected),
+            "ready banner must show the actual bound gateway address, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("http://127.0.0.1:0\n"),
+            "configured ephemeral port must not appear, got: {captured:?}"
+        );
+        // The ready banner is 7 lines: title, blank, gateway, socket,
+        // components, pairing (if enabled), stop
+        let line_count = captured.lines().count();
+        assert!(
+            line_count >= 6 && line_count <= 7,
+            "ready banner must be 6-7 lines (pairing optional), got {} lines: {:?}",
+            line_count,
+            captured
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_lifecycle_emits_starting_then_ready() {
+        // Proves the complete ordered lifecycle: immediate "starting"
+        // followed by asynchronous "ready" after both endpoints bind.
+        crate::i18n::init("en");
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (gateway_tx, gateway_rx) =
+            tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+        let (socket_tx, socket_rx) = tokio::sync::watch::channel::<bool>(false);
+        let bound: std::net::SocketAddr = "127.0.0.1:42617".parse().unwrap();
+
+        // Simulate delayed bind: socket at 40ms, gateway at 80ms
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = socket_tx.send(true);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = gateway_tx.send(Some(bound));
+        });
+
+        // Capture the immediate "starting" banner
+        let mut starting_buf: Vec<u8> = Vec::new();
+        echo_daemon_starting_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            &mut starting_buf,
+        )
+        .unwrap();
+        let starting = String::from_utf8_lossy(&starting_buf);
+
+        // Wait for readiness
+        let readiness =
+            await_startup_readiness(Some(gateway_rx), Some(socket_rx), Duration::from_secs(5))
+                .await;
+
+        // Capture the "ready" banner only if ready
+        let mut ready_buf: Vec<u8> = Vec::new();
+        if let StartupReadiness::Ready { gateway_addr } = readiness {
+            echo_daemon_ready_to_terminal(
+                &config,
+                FOREGROUND_ECHO_HOST,
+                FOREGROUND_ECHO_PORT,
+                gateway_addr,
+                &mut ready_buf,
+            )
+            .unwrap();
+        }
+        let ready = String::from_utf8_lossy(&ready_buf);
+
+        // Assert ordered lifecycle
+        assert!(
+            starting.contains(
+                crate::i18n::get_required_cli_string("cli-daemon-starting-title").as_str()
+            ),
+            "starting banner must be emitted first"
+        );
+        assert!(
+            ready.contains(
+                crate::i18n::get_required_cli_string("cli-daemon-started-title").as_str()
+            ),
+            "ready banner must be emitted second"
+        );
+        assert!(
+            ready.contains("http://127.0.0.1:42617"),
+            "ready banner must show the actual bound address"
+        );
+
+        // The starting banner appears immediately (within a few ms)
+        // The ready banner appears after ~80ms (both endpoints reported)
+    }
+
+    #[tokio::test]
+    async fn starting_without_ready_on_timeout() {
+        // Proves that if the timeout elapses, only the "starting" banner
+        // is emitted — no follow-up "ready" ever appears.
+        crate::i18n::init("en");
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (_gateway_tx, gateway_rx) =
+            tokio::sync::watch::channel::<Option<std::net::SocketAddr>>(None);
+        let (_socket_tx, socket_rx) = tokio::sync::watch::channel::<bool>(false);
+
+        // Capture the immediate "starting" banner
+        let mut starting_buf: Vec<u8> = Vec::new();
+        echo_daemon_starting_to_terminal(
+            &config,
+            FOREGROUND_ECHO_HOST,
+            FOREGROUND_ECHO_PORT,
+            &mut starting_buf,
+        )
+        .unwrap();
+        let starting = String::from_utf8_lossy(&starting_buf);
+
+        // Wait for readiness (will timeout)
+        let readiness = await_startup_readiness(
+            Some(gateway_rx),
+            Some(socket_rx),
+            Duration::from_millis(50), // Short timeout for the test
+        )
+        .await;
+
+        // No ready banner — readiness is Starting
+        assert_eq!(readiness, StartupReadiness::Starting);
+        let mut ready_buf: Vec<u8> = Vec::new();
+        if let StartupReadiness::Ready { .. } = readiness {
+            panic!("should not emit ready on timeout");
+        }
+
+        // The starting banner is the final word
+        assert!(
+            starting.contains(
+                crate::i18n::get_required_cli_string("cli-daemon-starting-title").as_str()
+            ),
+            "starting banner must be emitted"
+        );
+        assert!(
+            ready_buf.is_empty(),
+            "ready banner must never be emitted on timeout"
+        );
     }
 
     #[tokio::test]

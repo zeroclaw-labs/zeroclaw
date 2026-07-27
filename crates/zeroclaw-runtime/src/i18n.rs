@@ -104,13 +104,18 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
 }
 
 #[cfg(test)]
-pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+pub(crate) fn get_english_cli_string(key: &str, args: &[(&str, &str)]) -> String {
     let english = CliFtlSources {
         locale: "en".to_string(),
         disk: None,
         builtin: None,
     };
     format_cli_string_with_args(&english, key, args).unwrap_or_else(|| missing_cli_string(key))
+}
+
+#[cfg(test)]
+pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    get_english_cli_string(key, args)
 }
 
 fn missing_cli_string(key: &str) -> String {
