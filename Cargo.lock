@@ -1203,8 +1203,8 @@ version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5528f85b1e134ae811704e41ef80930f56e795923f866813255bc342cc20654"
 dependencies = [
- "cap-primitives",
- "cap-std",
+ "cap-primitives 3.4.5",
+ "cap-std 3.4.5",
  "io-lifetimes 2.0.4",
  "windows-sys 0.59.0",
 ]
@@ -1215,8 +1215,8 @@ version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20a158160765c6a7d0d8c072a53d772e4cb243f38b04bfcf6b4939cfbe7482e7"
 dependencies = [
- "cap-primitives",
- "cap-std",
+ "cap-primitives 3.4.5",
+ "cap-std 3.4.5",
  "rustix 1.1.4",
  "smallvec",
 ]
@@ -1229,7 +1229,7 @@ checksum = "b6cf3aea8a5081171859ef57bc1606b1df6999df4f1110f8eef68b30098d1d3a"
 dependencies = [
  "ambient-authority",
  "fs-set-times",
- "io-extras",
+ "io-extras 0.18.4",
  "io-lifetimes 2.0.4",
  "ipnet",
  "maybe-owned",
@@ -1240,14 +1240,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-primitives"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdadbd7c002d3a484b35243669abdae85a0ebaded5a61117169dc3400f9a7ff0"
+dependencies = [
+ "ambient-authority",
+ "fs-set-times",
+ "io-extras 0.19.0",
+ "io-lifetimes 3.0.1",
+ "ipnet",
+ "maybe-owned",
+ "rustix 1.1.4",
+ "rustix-linux-procfs",
+ "windows-sys 0.61.2",
+ "winx",
+]
+
+[[package]]
 name = "cap-std"
 version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6dc3090992a735d23219de5c204927163d922f42f575a0189b005c62d37549a"
 dependencies = [
- "cap-primitives",
- "io-extras",
+ "cap-primitives 3.4.5",
+ "io-extras 0.18.4",
  "io-lifetimes 2.0.4",
+ "rustix 1.1.4",
+]
+
+[[package]]
+name = "cap-std"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
+dependencies = [
+ "cap-primitives 4.0.2",
+ "io-extras 0.19.0",
+ "io-lifetimes 3.0.1",
  "rustix 1.1.4",
 ]
 
@@ -1258,7 +1288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "def102506ce40c11710a9b16e614af0cde8e76ae51b1f48c04b8d79f4b671a80"
 dependencies = [
  "ambient-authority",
- "cap-primitives",
+ "cap-primitives 3.4.5",
  "iana-time-zone",
  "once_cell",
  "rustix 1.1.4",
@@ -4807,6 +4837,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-extras"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
+dependencies = [
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "io-kit-sys"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4842,6 +4882,12 @@ name = "io-lifetimes"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
+
+[[package]]
+name = "io-lifetimes"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
 
 [[package]]
 name = "ipnet"
@@ -11762,12 +11808,12 @@ dependencies = [
  "bytes",
  "cap-fs-ext",
  "cap-net-ext",
- "cap-std",
+ "cap-std 3.4.5",
  "cap-time-ext",
  "cfg-if",
  "fs-set-times",
  "futures",
- "io-extras",
+ "io-extras 0.18.4",
  "io-lifetimes 2.0.4",
  "rand 0.10.1",
  "rustix 1.1.4",
@@ -12994,6 +13040,7 @@ dependencies = [
  "cargo_metadata 0.18.1",
  "clap",
  "fluent-syntax",
+ "pulldown-cmark",
  "reqwest 0.12.28",
  "schemars 1.2.1",
  "serde",
@@ -13586,6 +13633,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "cap-std 4.0.2",
  "chacha20poly1305",
  "chrono",
  "chrono-tz",
@@ -13704,6 +13752,7 @@ dependencies = [
  "async-imap",
  "async-trait",
  "base64 0.22.1",
+ "cap-std 4.0.2",
  "chrono",
  "directories",
  "fantoccini",

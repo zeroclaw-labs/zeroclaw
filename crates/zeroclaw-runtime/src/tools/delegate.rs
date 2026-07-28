@@ -767,6 +767,7 @@ impl DelegateTool {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
                 // Delegate: targets are short-lived independent chat
