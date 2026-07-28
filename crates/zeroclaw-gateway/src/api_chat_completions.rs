@@ -27,8 +27,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatCompletionMessage>,
     #[serde(default)]
     pub stream: bool,
-    #[serde(default = "default_temperature")]
-    pub temperature: f64,
+    #[serde(default)]
+    pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
     pub top_p: Option<f64>,
     pub stop: Option<serde_json::Value>,
@@ -45,10 +45,17 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
     pub logit_bias: Option<serde_json::Value>,
     pub max_completion_tokens: Option<u32>,
-}
-
-fn default_temperature() -> f64 {
-    0.7
+    // Behavior-changing controls ZeroClaw does not honor. Modeled so they can
+    // be rejected explicitly rather than silently dropped by serde.
+    pub parallel_tool_calls: Option<bool>,
+    pub service_tier: Option<String>,
+    pub functions: Option<serde_json::Value>,
+    pub function_call: Option<serde_json::Value>,
+    pub reasoning_effort: Option<String>,
+    pub modalities: Option<serde_json::Value>,
+    pub audio: Option<serde_json::Value>,
+    pub prediction: Option<serde_json::Value>,
+    pub web_search_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -238,19 +245,14 @@ fn agent_alias_from_model(
         }
     }
 
-    // Silently route unrecognized model names (e.g. "gpt-4") to default
-    // agent for standard-client compatibility.
-    ::zeroclaw_log::record!(
-        DEBUG,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-            ::serde_json::json!({
-                "request_model": model,
-                "resolved_alias": default,
-            })
-        ),
-        "chat completions: unrecognized model resolved to default agent"
-    );
-    Ok(default)
+    // `model` selects a ZeroClaw agent, not a provider model. Reject anything
+    // that is neither the default shorthand nor an explicit agent-routing form,
+    // so a caller can never appear to select a provider model that was ignored.
+    Err(format!(
+        "Unrecognized model `{model}`: this endpoint routes to ZeroClaw agents only. \
+         Use `zeroclaw/<agent-alias>`, or omit `model` (or send `zeroclaw`) for the \
+         default agent. Provider and model are ZeroClaw configuration, not per-request."
+    ))
 }
 
 fn extract_session_key(headers: &HeaderMap) -> Option<String> {
@@ -259,6 +261,19 @@ fn extract_session_key(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Stricter than `is_canonical_session_key`: restricts to ASCII `[a-z0-9_-]`.
+/// The chat-completions endpoint is new, so no pre-existing HTTP sessions can
+/// break — narrowing here is migration-free and closes both the
+/// case-insensitive-filesystem collision (`gw_Alpha` vs `gw_alpha`) and the
+/// Unicode case-variant collision at this entry point. WebSocket and RPC keep
+/// the broader check because they have pre-existing mixed-case sessions.
+fn is_http_canonical_session_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 fn normalize_role(role: &str) -> String {
@@ -433,10 +448,24 @@ pub(crate) fn try_claim_session_ownership(
             error_type: "invalid_request_error".to_string(),
             message: format!("Session belongs to agent '{stored_alias}', not '{agent_alias}'"),
         }),
-        // Backend lacks ownership tracking: accept (empty non-owned sessions
-        // were already allowed; non-empty ones were rejected by the guard
-        // above for the resume path).
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        // Backend lacks ownership tracking. Reject any non-empty session
+        // regardless of the legacy getter result: the pre-claim guard only
+        // covers the Ok(None)|Err getter cases, so a backend that reports an
+        // owner via get_session_agent_alias yet cannot claim atomically would
+        // otherwise leak a foreign transcript here. Empty sessions stay safe.
+        // Matches the WebSocket and RPC paths.
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            if backend.load(session_key).is_empty() {
+                Ok(())
+            } else {
+                Err(OwnershipError {
+                    status: StatusCode::BAD_REQUEST,
+                    error_type: "invalid_request_error".to_string(),
+                    message: "Cannot resume session: backend does not track agent ownership"
+                        .to_string(),
+                })
+            }
+        }
         Err(e) => Err(OwnershipError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             error_type: "server_error".to_string(),
@@ -553,21 +582,20 @@ pub async fn handle_chat_completions(
     let session_id_from_header = extract_session_key(&headers);
 
     // Reject noncanonical client-supplied session keys before deriving the
-    // persistence key. `sanitize_session_key` folds every disallowed
-    // character to `_`, so distinct raw keys (e.g. `alpha.beta` and
-    // `alpha/beta`) would otherwise collapse to the same `gw_` key while the
-    // client sees two different session IDs — sharing one transcript,
-    // ownership record, and memory scope. Auto-generated UUIDs are always
-    // canonical, so this only affects explicit `x-session-key` headers.
+    // persistence key. The key becomes a `gw_`-prefixed storage id and an
+    // in-memory map key; restricting it to ASCII `[a-z0-9_-]` keeps that
+    // mapping injective on every filesystem (no punctuation folding, no
+    // case-insensitive collision). Auto-generated UUIDs are always canonical,
+    // so this only affects explicit `x-session-key` headers.
     if let Some(ref supplied) = session_id_from_header
-        && !zeroclaw_api::session_keys::is_canonical_session_key(supplied)
+        && !is_http_canonical_session_key(supplied)
     {
         return add_session_key_header(
             add_request_id_header(
                 error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
-                    "Session key must contain only [A-Za-z0-9_-] and be non-empty",
+                    "Session key must contain only [a-z0-9_-] and be non-empty",
                     None,
                     None,
                 ),
@@ -893,7 +921,6 @@ pub async fn handle_chat_completions(
         agent.seed_history(&request_history);
     }
 
-    agent.set_temperature(Some(request.temperature));
     let tool_choice_mode = parse_tool_choice(&request.tool_choice);
     // Authoritative specs from the tool registry, keyed by name. A client's
     // `tools` list acts only as a name whitelist; the schema/description sent
@@ -1856,6 +1883,76 @@ fn validate_unsupported_params(req: &ChatCompletionRequest) -> Result<(), Respon
             Some("max_completion_tokens"),
         ));
     }
+    // Generation setting owned by ZeroClaw config, not per-request.
+    if req.temperature.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "temperature is not supported per-request; set `temperature` on the \
+             routed agent's provider model in ZeroClaw config",
+            None,
+            Some("temperature"),
+        ));
+    }
+    // Behavior-changing controls ZeroClaw does not honor. Benign annotation
+    // fields (metadata, store) stay tolerated for forward compatibility.
+    for (present, param, message) in [
+        (
+            req.parallel_tool_calls.is_some(),
+            "parallel_tool_calls",
+            "parallel_tool_calls is not supported; ZeroClaw executes tools transparently",
+        ),
+        (
+            req.service_tier.is_some(),
+            "service_tier",
+            "service_tier is not applicable; generation routing is ZeroClaw config",
+        ),
+        (
+            req.functions.is_some(),
+            "functions",
+            "legacy function-calling is not supported; use `tools`",
+        ),
+        (
+            req.function_call.is_some(),
+            "function_call",
+            "legacy function_call is not supported; use `tool_choice`",
+        ),
+        (
+            req.reasoning_effort.is_some(),
+            "reasoning_effort",
+            "reasoning_effort is not supported per-request; configure the model in provider settings",
+        ),
+        (
+            req.modalities.is_some(),
+            "modalities",
+            "only text output is supported",
+        ),
+        (
+            req.audio.is_some(),
+            "audio",
+            "audio output is not supported",
+        ),
+        (
+            req.prediction.is_some(),
+            "prediction",
+            "predicted outputs are not supported",
+        ),
+        (
+            req.web_search_options.is_some(),
+            "web_search_options",
+            "web search is not supported per-request",
+        ),
+    ] {
+        if present {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "unsupported_parameter",
+                message,
+                None,
+                Some(param),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1993,7 +2090,18 @@ mod tests {
             agent_alias_from_model("zeroclaw/default", &config).unwrap(),
             "default"
         );
-        assert_eq!(agent_alias_from_model("gpt-4", &config).unwrap(), "default");
+        assert!(agent_alias_from_model("gpt-4", &config).is_err());
+    }
+
+    #[test]
+    fn test_agent_alias_from_model_rejects_provider_model_names() {
+        let config = zeroclaw_config::schema::Config::default();
+        for m in ["gpt-4o", "claude-3-opus", "llama-3", "text-davinci-003"] {
+            assert!(
+                agent_alias_from_model(m, &config).is_err(),
+                "{m} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2042,7 +2150,7 @@ mod tests {
         assert_eq!(current, "hello");
     }
 
-    // ── F1: session key canonical gate (noncanonical keys rejected) ──
+    // ── Session key canonical gate (noncanonical keys rejected) ──
     fn header_map_with_session_key(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2053,41 +2161,56 @@ mod tests {
     }
 
     #[test]
-    fn is_canonical_session_key_rejects_noncanonical_ids_from_header() {
-        // These are exactly the collision examples from the review: distinct
-        // raw keys that sanitize_session_key would fold to the same gw_ key.
+    fn http_session_key_gate_rejects_noncanonical_ids_from_header() {
+        // Punctuation folds to `_` (collision); uppercase collides on
+        // case-insensitive filesystems — all rejected at the HTTP entry.
         for bad in [
             "alpha.beta",
             "alpha/beta",
             "alpha beta",
             "alpha:beta",
             "alpha@beta",
+            "Alpha",
+            "abc-DEF_123",
         ] {
             let headers = header_map_with_session_key(bad);
             let supplied = extract_session_key(&headers).expect("header present");
             assert!(
-                !zeroclaw_api::session_keys::is_canonical_session_key(&supplied),
-                "expected {bad:?} to be rejected as noncanonical"
+                !is_http_canonical_session_key(&supplied),
+                "expected {bad:?} to be rejected"
             );
         }
+        // Non-ASCII cannot even reach a header value, and is rejected directly.
+        assert!(!is_http_canonical_session_key("user_Алиса"));
     }
 
     #[test]
-    fn canonical_session_key_header_passes_gate_and_is_injective() {
-        // Canonical keys pass and map 1:1 to their gw_ persistence key.
-        for good in ["alpha_beta", "abc-DEF_123", "550e8400-e29b-41d4"] {
+    fn http_session_key_gate_accepts_canonical_and_is_injective() {
+        for good in ["alpha_beta", "abc-def-123", "550e8400-e29b-41d4"] {
             let headers = header_map_with_session_key(good);
             let supplied = extract_session_key(&headers).expect("header present");
-            assert!(zeroclaw_api::session_keys::is_canonical_session_key(
-                &supplied
-            ));
-            // gw_ key preserves the (already canonical) id verbatim.
+            assert!(is_http_canonical_session_key(&supplied));
             let key = format!(
                 "gw_{}",
                 zeroclaw_api::session_keys::sanitize_session_key(&supplied)
             );
             assert_eq!(key, format!("gw_{good}"));
         }
+    }
+
+    #[test]
+    fn ws_rpc_canonical_still_accepts_uppercase_and_unicode() {
+        // Guard: the shared check keeps its broader alphabet so WebSocket and
+        // RPC do not reject their pre-existing mixed-case sessions.
+        assert!(zeroclaw_api::session_keys::is_canonical_session_key(
+            "Alpha"
+        ));
+        assert!(zeroclaw_api::session_keys::is_canonical_session_key(
+            "abc-DEF_123"
+        ));
+        assert!(zeroclaw_api::session_keys::is_canonical_session_key(
+            "user_Алиса"
+        ));
     }
 
     #[test]
@@ -2190,23 +2313,7 @@ mod tests {
             model: "test".into(),
             messages: vec![chat_message("user", "hi")],
             stream: false,
-            temperature: 0.7,
-            max_tokens: None,
-            top_p: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            tools: None,
-            tool_choice: None,
-            stream_options: None,
-            n: None,
-            response_format: None,
-            seed: None,
-            logprobs: None,
-            top_logprobs: None,
-            user: None,
-            logit_bias: None,
-            max_completion_tokens: None,
+            ..Default::default()
         };
         assert!(!request_has_authoritative_history(&single));
 
@@ -2290,7 +2397,6 @@ mod tests {
             model: "test".into(),
             messages: vec![],
             stream: false,
-            temperature: 0.7,
             max_tokens: None,
             top_p: None,
             stop: None,
@@ -2317,7 +2423,6 @@ mod tests {
                 tool_call_id: None,
             }],
             stream: false,
-            temperature: 0.7,
             max_tokens: None,
             top_p: None,
             stop: None,
@@ -2351,7 +2456,6 @@ mod tests {
                 tool_call_id: None,
             }],
             stream: false,
-            temperature: 0.7,
             max_tokens: None,
             top_p: None,
             stop: None,
@@ -2378,7 +2482,6 @@ mod tests {
                 tool_call_id: None,
             }],
             stream: false,
-            temperature: 0.7,
             max_tokens: None,
             top_p: None,
             stop: None,
@@ -2406,7 +2509,6 @@ mod tests {
             model: "test".into(),
             messages: vec![chat_message("user", "hi")],
             stream: false,
-            temperature: 0.7,
             max_tokens: Some(100),
             top_p: None,
             stop: None,
@@ -2427,7 +2529,6 @@ mod tests {
             model: "test".into(),
             messages: vec![chat_message("user", "hi")],
             stream: false,
-            temperature: 0.7,
             max_tokens: None,
             top_p: Some(0.9),
             stop: None,
@@ -2448,7 +2549,6 @@ mod tests {
             model: "test".into(),
             messages: vec![chat_message("user", "hi")],
             stream: false,
-            temperature: 0.7,
             max_tokens: Some(100),
             top_p: Some(0.9),
             stop: Some(serde_json::json!("stop")),
@@ -2469,7 +2569,6 @@ mod tests {
             model: "test".into(),
             messages: vec![chat_message("user", "hi")],
             stream: false,
-            temperature: 0.7,
             max_tokens: None,
             top_p: None,
             stop: None,
@@ -2482,6 +2581,68 @@ mod tests {
         };
         let result = validate_unsupported_params(&req);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_rejects_explicit_temperature() {
+        let mut req = ChatCompletionRequest {
+            model: "test".into(),
+            messages: vec![chat_message("user", "hi")],
+            ..Default::default()
+        };
+        assert!(
+            validate_unsupported_params(&req).is_ok(),
+            "omitted temperature is accepted"
+        );
+        req.temperature = Some(0.2);
+        assert!(
+            validate_unsupported_params(&req).is_err(),
+            "explicit temperature is rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_rejects_behavior_controls() {
+        for field in [
+            "parallel_tool_calls",
+            "service_tier",
+            "functions",
+            "function_call",
+            "reasoning_effort",
+            "modalities",
+            "audio",
+            "prediction",
+            "web_search_options",
+        ] {
+            let mut body = serde_json::json!({
+                "model": "zeroclaw/default",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            body[field] = if field == "parallel_tool_calls" {
+                serde_json::json!(false)
+            } else {
+                serde_json::json!("x")
+            };
+            let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+            assert!(
+                validate_unsupported_params(&req).is_err(),
+                "{field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_unsupported_params_tolerates_benign_metadata() {
+        // Annotation-only fields do not change generation/tool behavior and
+        // stay accepted for forward compatibility.
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "zeroclaw/default",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"trace": "abc"},
+            "store": true,
+        }))
+        .unwrap();
+        assert!(validate_unsupported_params(&req).is_ok());
     }
 
     #[test]
@@ -2958,8 +3119,8 @@ mod tests {
 
     #[test]
     fn sse_timeout_emits_event_error_and_timeout_type() {
-        // Reconstruct the exact error body the streaming timeout path emits
-        // (TurnStatus::TimedOut branch, line 1180).
+        // Invariant: a streaming timeout terminates the SSE stream with an
+        // `error` event whose body carries type=timeout and status=408.
         let error_body = serde_json::json!({
             "error": {
                 "message": "gateway turn timed out",
@@ -3002,8 +3163,8 @@ mod tests {
 
     #[test]
     fn sse_server_error_emits_event_error_and_internal_error_type() {
-        // Reconstruct the exact error body the streaming server-error path
-        // emits (TurnStatus::Error / catch-all branch, line 1200).
+        // Invariant: a streaming server error terminates the SSE stream with an
+        // `error` event whose body carries type=internal_error and status=500.
         let error_body = serde_json::json!({
             "error": {
                 "message": "agent task terminated unexpectedly",
@@ -3079,7 +3240,6 @@ mod tests {
             self
         }
 
-        #[allow(dead_code)]
         fn claim_result(
             mut self,
             result: std::io::Result<zeroclaw_infra::session_backend::ClaimOutcome>,
@@ -3434,6 +3594,45 @@ mod tests {
             err.message.contains("does not track agent ownership"),
             "error must mention ownership tracking; got: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn ownership_resume_getter_owner_but_claim_unsupported_non_empty_returns_400() {
+        // Partially-implemented backend: reports an owner via the getter (so
+        // the pre-claim guard does not fire) yet cannot claim atomically. The
+        // non-empty session must still be rejected, not seeded into the caller.
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Ok(Some("alice".to_string())))
+            .claim_result(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not supported",
+            )))
+            .load_data(vec![user_msg("alice's private transcript")])
+            .build();
+        let result =
+            try_claim_session_ownership(&backend, "gw_test", "bob", Some("existing-session-id"));
+        let err = result.expect_err("Unsupported claim + non-empty session must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert!(err.message.contains("does not track agent ownership"));
+    }
+
+    #[test]
+    fn ownership_resume_getter_owner_but_claim_unsupported_empty_is_ok() {
+        let backend = MockBackendBuilder::new()
+            .get_alias_result(Ok(Some("alice".to_string())))
+            .claim_result(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not supported",
+            )))
+            .load_data(vec![])
+            .build();
+        let result =
+            try_claim_session_ownership(&backend, "gw_test", "bob", Some("existing-session-id"));
+        assert!(
+            result.is_ok(),
+            "empty session stays valid under graceful degradation"
         );
     }
 

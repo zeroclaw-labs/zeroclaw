@@ -190,6 +190,24 @@ async fn rewrite_payload_too_large(response: Response) -> Response {
     });
     (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
 }
+
+/// Build the `/v1/chat/completions` router. When `enabled` is false the route
+/// is absent (requests 404); the body-size limit and 413 rewrite always apply.
+/// Shared by production wiring and tests so neither drifts from the other.
+fn build_chat_completions_router(state: AppState, enabled: bool) -> Router {
+    let router: Router<AppState> = if enabled {
+        Router::new().route(
+            "/v1/chat/completions",
+            post(api_chat_completions::handle_chat_completions),
+        )
+    } else {
+        Router::new()
+    };
+    router
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(axum::middleware::map_response(rewrite_payload_too_large))
+}
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -2148,18 +2166,8 @@ pub async fn run_gateway(
     // limit middleware are rewritten into ChatError JSON by the
     // map_response layer.
     // Disabled by default; set gateway.chat_completions_enabled = true to expose.
-    let chat_completions_router: Router<AppState> = if config.gateway.chat_completions_enabled {
-        Router::new().route(
-            "/v1/chat/completions",
-            post(api_chat_completions::handle_chat_completions),
-        )
-    } else {
-        Router::new()
-    };
-    let chat_completions_router: Router = chat_completions_router
-        .with_state(state)
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
-        .layer(axum::middleware::map_response(rewrite_payload_too_large));
+    let chat_completions_router =
+        build_chat_completions_router(state, config.gateway.chat_completions_enabled);
 
     let inner = inner
         .merge(long_running_router)
@@ -4497,11 +4505,14 @@ mod tests {
         );
     }
 
-    /// Verify the body-size threshold: bodies within the limit are accepted,
-    /// bodies one byte over the limit are rejected with a 413. Because
+    /// Verify the body-size layer in isolation: bodies within the limit pass
+    /// through, bodies one byte over trigger the 413 rewrite. Because
     /// `RequestBodyLimitLayer` uses `data.len() > remaining` (not `>=`),
-    /// exactly `MAX_BODY_SIZE` bytes are allowed; `MAX_BODY_SIZE + 1` bytes
-    /// trigger the limit.
+    /// exactly `MAX_BODY_SIZE` bytes are allowed; `MAX_BODY_SIZE + 1` reject.
+    /// A minimal echo handler isolates the layer: the real handler consumes an
+    /// over-limit body as a `JsonRejection` (400), so it cannot observe the
+    /// layer's raw 413 — that path is covered by the `rewrite_payload_too_large`
+    /// unit tests above.
     #[tokio::test]
     async fn chat_413_threshold_boundary() {
         use axum::body::Body;
@@ -4555,6 +4566,32 @@ mod tests {
             response_over.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "body one byte over the limit must produce a 413"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_route_absent_when_disabled() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        let app = build_chat_completions_router(state, false);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"zeroclaw/default","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "route must be absent when chat_completions_enabled is false"
         );
     }
 
@@ -8521,13 +8558,10 @@ mod tests {
         );
     }
 
-    /// Handler integration: the canonical-session-key gate must reject a
-    /// noncanonical `x-session-key` header before the handler reaches any
-    /// state field. The gate fires directly in `handle_chat_completions` (not
-    /// in middleware or in an extractor), so the old predicate-only test
-    /// (`is_canonical_session_key_rejects_noncanonical_ids_from_header`) was
-    /// not sufficient — it never called the handler. This test calls the real
-    /// handler; disabling the gate's `if` branch would keep it green.
+    /// The canonical-session-key gate fires inside `handle_chat_completions`
+    /// (not in middleware or an extractor), so it must be exercised through the
+    /// real handler: a noncanonical `x-session-key` header is rejected before
+    /// the handler touches any state.
     #[tokio::test]
     async fn handler_rejects_noncanonical_session_key_header() {
         use crate::api_chat_completions;

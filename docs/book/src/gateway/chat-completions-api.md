@@ -24,15 +24,16 @@
 
 | Parameter | Type | Required | Default | Range/Enum | Description |
 |-----------|------|----------|---------|------------|-------------|
-| **`model`** | string | ❌ | default agent | `zeroclaw/<alias>` or plain label | **Agent routing target** (not provider model name). `"zeroclaw"` / `""` / plain label → default agent |
+| **`model`** | string | ❌ | default agent | `zeroclaw/<alias>` or `zeroclaw` | **Agent routing target** (not provider model name). `"zeroclaw"` / `"zeroclaw/default"` / `""` → default agent; `zeroclaw/<alias>` → that agent. Any other label returns 400 |
 | **`messages`** | array | ✅ | - | ≥ 1 message | Message list. Multi-turn supported (history messages are split into conversation context) |
 | `stream` | boolean | ❌ | `false` | `true`/`false` | SSE streaming response |
-| `temperature` | float | ❌ | `0.7` | `0.0`~`2.0` | Sampling temperature |
+| ~~`temperature`~~ | - | ❌ | - | - | ⛔ **Not supported** -- returns 400 if provided. Configure on the routed agent's provider model instead |
 | ~~`max_tokens`~~ | - | ❌ | - | - | ⛔ **Not supported** -- returns 400 if provided. Configure in provider settings instead |
 | ~~`top_p`~~ | - | ❌ | - | - | ⛔ **Not supported** -- returns 400 if provided |
 | ~~`stop`~~ | - | ❌ | - | - | ⛔ **Not supported** -- returns 400 if provided |
 | ~~`presence_penalty`~~ | - | ❌ | - | - | ⛔ **Not supported** -- returns 400 if provided |
 | ~~`frequency_penalty`~~ | - | ❌ | - | - | ⛔ **Not supported** -- returns 400 if provided |
+| ~~`parallel_tool_calls`~~ / ~~`service_tier`~~ / ~~`reasoning_effort`~~ / ~~`functions`~~ / ~~`function_call`~~ / ~~`modalities`~~ / ~~`audio`~~ / ~~`prediction`~~ / ~~`web_search_options`~~ | - | ❌ | - | - | ⛔ **Not supported** -- behavior-changing controls return 400 if provided |
 | `tools` | array | ❌ | - | Tool object list | Available tool definitions for this request (filtered against agent's configured tools) |
 | `tool_choice` | string/object | ❌ | `auto` | `"auto"` / `"none"` | Tool selection strategy. `"none"` disables all tools. `"required"` and `{"type":"function",...}` are **not yet supported** -- they return 400 |
 | `stream_options` | object | ❌ | - | `{"include_usage": true}` | Stream options (controls usage reporting) |
@@ -209,11 +210,11 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
     ]
   }'
 
-# Any model name works (compatible with standard clients, routes to default agent)
+# Explicit agent routing via the model field
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "gpt-4",
+    "model": "zeroclaw/coding",
     "messages": [
       {"role": "user", "content": "Hello!"}
     ]
@@ -293,7 +294,7 @@ x-session-key: <session-id>
   - **Client-provided**: Uses the client-supplied session_id
   - **Client omitted**: Server generates a UUID, returned in `x-session-key` response header
 - **Persistence**: Session history stored in session backend (auto-prefixed with `gw_`)
-- **Format constraint**: Client-supplied `x-session-key` values must contain only `[A-Za-z0-9_-]` characters (non-empty). Characters such as `.`, `/`, spaces, or `@` are rejected with 400. Auto-generated UUIDs are canonical by construction.
+- **Format constraint**: Client-supplied `x-session-key` values must contain only `[a-z0-9_-]` characters (non-empty). Uppercase, non-ASCII letters, and characters such as `.`, `/`, spaces, or `@` are rejected with 400 (a lowercase key maps to one transcript on every filesystem). Auto-generated UUIDs are canonical by construction.
 - **Single vs multi-turn behavior**:
   - `messages` has only 1 entry: auto-loads backend session history (if `x-session-key` present)
   - `messages` has > 1 entry: request messages are authoritative context, **does not** load backend history
@@ -341,7 +342,7 @@ session_id=$(cat /proc/sys/kernel/random/uuid)
 | `"zeroclaw:<alias>"` | `<alias>` | Compatible alias format |
 | `"agent:<alias>"` | `<alias>` | Compatible alias format |
 | `"zeroclaw/"` / `"zeroclaw:"` / `"agent:"` | 400 error | Empty alias, malformed |
-| Plain label (e.g. `"gpt-4"`) | Default agent | **Standard client compatibility fallback** |
+| Plain label (e.g. `"gpt-4"`) | 400 error | Not a ZeroClaw agent target; provider/model are config-owned |
 
 **Error handling**:
 
@@ -397,36 +398,28 @@ session_id=$(cat /proc/sys/kernel/random/uuid)
 
 ---
 
-#### 3.2.4 temperature (Sampling Temperature)
+#### 3.2.4 Unsupported Parameters
 
-**Type**: `float`
-**Default**: `0.7`
-**Required**: ❌ No
+The following parameters are **not supported** per-request and will return a **400 error** (`error.type: "unsupported_parameter"`) if provided:
 
-- Controls output randomness; higher values = more random
-- Range: `0.0` (deterministic) ~ `2.0` (highly random)
+| Parameter | Error Message |
+|-----------|---------------|
+| `temperature` | `temperature is not supported per-request; set 'temperature' on the routed agent's provider model in ZeroClaw config` |
+| `max_tokens` | `max_tokens is not supported per-request; configure it in provider settings` |
+| `top_p` | `top_p is not supported per-request` |
+| `stop` | `stop is not supported per-request` |
+| `presence_penalty` | `presence_penalty is not supported per-request` |
+| `frequency_penalty` | `frequency_penalty is not supported per-request` |
+| `n`, `response_format`, `seed`, `logprobs`, `top_logprobs`, `user`, `logit_bias`, `max_completion_tokens` | Explicit 400 per field |
+| `parallel_tool_calls`, `service_tier`, `reasoning_effort`, `functions`, `function_call`, `modalities`, `audio`, `prediction`, `web_search_options` | Behavior-changing controls -- explicit 400 per field |
 
----
+**Why are these rejected?** Generation settings and behavior controls are owned by ZeroClaw configuration, not selectable per-request. Rather than silently ignoring them (which could mislead callers into thinking they take effect), the endpoint returns an explicit 400. Benign annotation fields (`metadata`, `store`) are tolerated and ignored for forward compatibility.
 
-#### 3.2.5 Unsupported Parameters
-
-The following parameters are **not supported** per-request and will return a **400 error** if provided:
-
-| Parameter | Type | Error Message |
-|-----------|------|---------------|
-| `max_tokens` | integer | `max_tokens is not supported per-request; configure it in provider settings` |
-| `top_p` | float | `top_p is not supported per-request` |
-| `stop` | string/array | `stop is not supported per-request` |
-| `presence_penalty` | float | `presence_penalty is not supported per-request` |
-| `frequency_penalty` | float | `frequency_penalty is not supported per-request` |
-
-**Why are these rejected?** These parameters are parsed from the request but the ZeroClaw runtime does not forward them to the underlying LLM provider. Rather than silently ignoring them (which could mislead callers into thinking they take effect), the endpoint returns an explicit 400 error with `error.type: "unsupported_parameter"`.
-
-**Alternative**: To configure `max_tokens` for your agent, set it in the ZeroClaw provider configuration (e.g. `[providers.<type>.<alias>]` section).
+**Alternative**: Configure generation settings on the routed agent's provider model in the ZeroClaw provider configuration.
 
 ---
 
-#### 3.2.6 stream_options (Streaming Options)
+#### 3.2.5 stream_options (Streaming Options)
 
 **Type**: `object`
 **Required**: ❌ No
@@ -795,11 +788,11 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Write a quicksort"}]
   }'
 
-# Standard client compatibility: any model name routes to default agent
+# Omit model (or send "zeroclaw") to route to the default agent
 curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "gpt-4",
+    "model": "zeroclaw",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
@@ -898,8 +891,9 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ```
 model = "zeroclaw/<alias>"  → Routes to specified agent
-model = "" / "zeroclaw" / plain label (e.g. "gpt-4") → Routes to default agent
+model = "" / "zeroclaw" / "zeroclaw/default" → Routes to default agent
 model = "zeroclaw/" (empty alias) → 400 error
+model = other label (e.g. "gpt-4") → 400 error (not a ZeroClaw agent target)
 ```
 
 ---
@@ -1074,7 +1068,7 @@ bails with a clear error and no side effects.
 ### 2. Agent and Model Usage
 
 - **Route via model**: Use `"zeroclaw/<alias>"` format to specify target agent
-- **Standard client compatibility**: Front-ends like Open WebUI / LobeChat can pass any model name (auto-routes to default agent)
+- **Default agent**: Omit `model` or send `"zeroclaw"` / `"zeroclaw/default"`; other labels return 400
 - **No need to know provider model names**: Clients only need agent aliases
 
 ### 3. Streaming vs Non-streaming
@@ -1100,7 +1094,7 @@ bails with a clear error and no side effects.
 ### 6. Performance Optimization
 
 - **Limit tool count**: Only provide necessary tools per request (reduces token consumption)
-- **Set temperature appropriately**: `0.7` for general chat, `1.0` for creative writing, `0.2` for code generation
+- **Configure temperature in provider settings**: it is owned by the routed agent's config, not per-request
 - **Respect rate limits**: Control request frequency per `chat_rate_limit_per_minute`
 
 ### 7. Security
