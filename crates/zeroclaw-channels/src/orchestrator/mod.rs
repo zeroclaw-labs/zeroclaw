@@ -8089,6 +8089,14 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
+    if channel_id.contains('.') {
+        deliver_announcement(config, channel_id, recipient, None, message)
+            .await
+            .with_context(|| format!("Failed to send message via {channel_id}"))?;
+        println!("Message sent via {channel_id}.");
+        return Ok(());
+    }
+
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
     let config_arc = Arc::new(RwLock::new(config.clone()));
@@ -27555,6 +27563,21 @@ Done."#;
         assert!(
             !preamble.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {preamble}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-discord")]
+    async fn one_off_send_resolves_dotted_discord_alias() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "discord.governance", "123456789", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.discord.governance] not configured"),
+            "dotted alias should reach named channel resolution; got: {message}"
         );
     }
 
