@@ -14665,6 +14665,18 @@ api_key = "anthropic-key"
             channel_impl.finalized_messages.lock().await.is_empty(),
             "a cancelled turn must not finalize a draft"
         );
+        // A turn that never produced an answer must not claim it is finalizing
+        // one, and the states it did show must be the real pre-model ones.
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&ProgressEvent::FinalizingResponse),
+            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&ProgressEvent::Received),
+            "the turn must still have announced receipt, got {events:?}"
+        );
     }
 
     /// A provider/turn error must also reach draft cancellation. This is the
@@ -14692,6 +14704,15 @@ api_key = "anthropic-key"
         assert!(
             !channel_impl.cancelled_drafts.lock().await.is_empty(),
             "a failed turn must cancel its draft so a shown lifecycle state is cleared"
+        );
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&ProgressEvent::FinalizingResponse),
+            "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert!(
+            events.contains(&ProgressEvent::WaitingOnModel),
+            "the failure happened at the provider, so the model wait must have been shown: {events:?}"
         );
     }
 

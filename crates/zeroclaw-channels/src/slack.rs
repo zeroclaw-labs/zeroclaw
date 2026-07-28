@@ -45,6 +45,12 @@ pub struct SlackChannel {
     active_assistant_threads: Mutex<HashSet<AssistantTarget>>,
     /// Per-turn draft routing, keyed by the exact draft ID returned to the orchestrator.
     draft_turns: AsyncMutex<HashMap<String, SlackDraftTurn>>,
+    /// In-flight progress `chat.update` tasks per draft. Progress updates are
+    /// dispatched detached so the draft updater never back-pressures the tool
+    /// loop, which means a slow update can still be in flight when the turn
+    /// ends. Terminal paths drain these first so a late progress edit can
+    /// never land after — and overwrite — the final answer.
+    pending_draft_updates: AsyncMutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
     /// Threads (`thread_ts`) for which we have already prepended a
     /// `[Thread context]` backfill block. In-memory only — after a
     /// process restart the set is empty and each active thread sees one
@@ -281,6 +287,7 @@ impl SlackChannel {
             workspace_dir: None,
             active_assistant_threads: Mutex::new(HashSet::new()),
             draft_turns: AsyncMutex::new(HashMap::new()),
+            pending_draft_updates: AsyncMutex::new(HashMap::new()),
             seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
             proxy_url: None,
@@ -561,6 +568,21 @@ impl SlackChannel {
             .lock()
             .expect("last_draft_edit lock")
             .insert(message_id.to_string(), Instant::now());
+    }
+
+    /// Drain in-flight progress updates for `message_id` so nothing this draft
+    /// already dispatched can land after the caller's own Slack write. Must be
+    /// awaited by every terminal path before it edits or deletes the draft.
+    async fn settle_draft_updates(&self, message_id: &str) {
+        let handles = self
+            .pending_draft_updates
+            .lock()
+            .await
+            .remove(message_id)
+            .unwrap_or_default();
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     fn is_assistant_target(&self, target: &AssistantTarget) -> bool {
@@ -4539,7 +4561,7 @@ impl Channel for SlackChannel {
         let token = self.bot_token.clone();
         let channel = recipient.to_string();
         let update_url = self.slack_api_url("chat.update");
-        zeroclaw_spawn::spawn!(async move {
+        let update_task = zeroclaw_spawn::spawn!(async move {
             let mut body = serde_json::json!({
                 "channel": channel,
                 "ts": real_ts,
@@ -4587,6 +4609,16 @@ impl Channel for SlackChannel {
                 }
             }
         });
+
+        // Track the detached update so a terminal path can wait for it.
+        // Completed handles are pruned here so a long turn cannot accumulate
+        // them without bound.
+        {
+            let mut pending = self.pending_draft_updates.lock().await;
+            let entry = pending.entry(message_id.to_string()).or_default();
+            entry.retain(|handle| !handle.is_finished());
+            entry.push(update_task);
+        }
 
         Ok(())
     }
@@ -4636,6 +4668,11 @@ impl Channel for SlackChannel {
         text: &str,
         _suppress_voice: bool,
     ) -> anyhow::Result<()> {
+        // Let any in-flight progress edit finish first, so the final answer is
+        // the last write to this message rather than being overwritten by a
+        // delayed lifecycle update.
+        self.settle_draft_updates(message_id).await;
+
         // Clean up only this turn's pacing and Assistant status.
         self.last_draft_edit
             .lock()
@@ -4716,6 +4753,10 @@ impl Channel for SlackChannel {
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        // Same ordering guarantee as finalization: a delayed progress edit must
+        // not resurrect stale lifecycle text after the draft is cleaned up.
+        self.settle_draft_updates(message_id).await;
+
         self.last_draft_edit
             .lock()
             .expect("last_draft_edit lock")
@@ -7154,6 +7195,182 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&("thread-one".to_string(), String::new())],
             "finalization must clear exactly the finalized turn's thread: {calls:?}"
+        );
+    }
+
+    /// A progress `chat.update` is dispatched detached, so a slow one can still
+    /// be in flight when the turn ends. Finalization must wait for it: if the
+    /// delayed lifecycle edit were allowed to land afterwards it would replace
+    /// the final answer with stale progress text.
+    ///
+    /// The mock delays the first `chat.update` (the lifecycle edit) well past
+    /// the finalize call, then records order of arrival. The final answer must
+    /// be the last write Slack sees.
+    #[tokio::test]
+    async fn a_delayed_progress_update_cannot_overwrite_the_final_answer() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "draft-ts",
+            })))
+            .mount(&server)
+            .await;
+        // The lifecycle edit is held for 2s; finalization is invoked ~immediately
+        // after it is dispatched.
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .and(body_string_contains("Running tool"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({"ok": true})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .and(body_string_contains("the final answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
+        let draft = ch
+            .send_draft(
+                &SendMessage::new("...", "C123")
+                    .in_thread(Some("thread-one".to_string()))
+                    .in_reply_to(Some("slack_C123_message-one".to_string())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Materialize the draft, then dispatch the slow lifecycle edit. Step
+        // clear of the pacing window first so the lifecycle edit is genuinely
+        // dispatched rather than rate-limited away — otherwise this test could
+        // pass for the wrong reason.
+        ch.update_draft("C123", &draft, "Received").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ch.update_draft_lifecycle("C123", &draft, ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+
+        ch.finalize_draft("C123", &draft, "the final answer", false)
+            .await
+            .unwrap();
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/chat.update")
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect();
+
+        assert!(
+            bodies.iter().any(|body| body.contains("Running tool")),
+            "the delayed lifecycle edit must still have been dispatched: {bodies:?}"
+        );
+        assert!(
+            bodies
+                .last()
+                .is_some_and(|body| body.contains("the final answer")),
+            "the final answer must be the last write to the draft: {bodies:?}"
+        );
+    }
+
+    /// Production-shaped pacing: lifecycle updates and streamed response text
+    /// share one draft and one rate limiter. With a realistic interval, an
+    /// intermediate state dispatched after the interval has elapsed must
+    /// actually reach Slack rather than being swallowed by interleaved text,
+    /// and the final answer must still land last.
+    ///
+    /// This is the interaction the live exercise could not settle: emission and
+    /// rendering were covered separately, but not together under pacing.
+    #[tokio::test]
+    async fn intermediate_lifecycle_survives_pacing_shared_with_streamed_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "draft-ts",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        // 50ms interval: long enough to be a real rate limit, short enough to
+        // step over deterministically.
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 50);
+        let draft = ch
+            .send_draft(
+                &SendMessage::new("...", "C123")
+                    .in_thread(Some("thread-one".to_string()))
+                    .in_reply_to(Some("slack_C123_message-one".to_string())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Materializes the draft and starts the pacing clock.
+        ch.update_draft_lifecycle("C123", &draft, ProgressEvent::Received)
+            .await
+            .unwrap();
+
+        // Partial response text arrives, then the tool phase begins. Both are
+        // dispatched after the interval, so neither may be dropped.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ch.update_draft("C123", &draft, "partial answer so far")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        ch.update_draft_lifecycle("C123", &draft, ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+
+        ch.finalize_draft("C123", &draft, "the final answer", false)
+            .await
+            .unwrap();
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request.url.path(), "/chat.update" | "/chat.postMessage"))
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect();
+
+        assert!(
+            bodies.iter().any(|body| body.contains("Received")),
+            "the first lifecycle state must materialize the draft: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("Running tool")),
+            "an intermediate state dispatched outside the pacing window must reach Slack, \
+             not be swallowed by the interleaved text update: {bodies:?}"
+        );
+        assert!(
+            bodies
+                .last()
+                .is_some_and(|body| body.contains("the final answer")),
+            "the final answer must still be the last write: {bodies:?}"
         );
     }
 

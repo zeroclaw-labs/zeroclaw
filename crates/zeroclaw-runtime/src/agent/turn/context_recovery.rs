@@ -65,7 +65,6 @@ pub(crate) async fn try_recover_context_overflow(
     context_token_budget: usize,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
-        send_progress(on_delta, ProgressEvent::CompactingContext).await;
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
@@ -88,6 +87,11 @@ pub(crate) async fn try_recover_context_overflow(
         let tokens_after = result.tokens_after;
         let mut recovered_history = result.history;
         if trimmed {
+            // Announce compaction only once the trim has actually succeeded.
+            // Recognizing the overflow is not enough: a single oversized turn
+            // cannot be trimmed, and announcing on recognition would claim
+            // work that never happens.
+            send_progress(on_delta, ProgressEvent::CompactingContext).await;
             // Insert the same model-visible breadcrumb the turn-boundary path
             // uses, after the leading system messages, so the retried provider
             // call tells the model earlier turns were dropped (never silent to
@@ -214,7 +218,7 @@ mod tests {
         );
     }
 
-    /// A recovery that cannot trim must not announce compaction it did not do.
+    /// An unrelated provider error is not a compaction trigger at all.
     #[tokio::test]
     async fn unrecoverable_error_emits_no_compacting_context_lifecycle() {
         let mut history = vec![ChatMessage::system("system")];
@@ -237,6 +241,49 @@ mod tests {
         assert!(
             delta_rx.try_recv().is_err(),
             "no lifecycle state may be emitted when compaction never ran"
+        );
+    }
+
+    /// The case that matters for state accuracy: a genuine context overflow
+    /// that cannot be trimmed, because a single oversized turn leaves nothing
+    /// to drop. Recognizing the overflow must not announce compaction, or the
+    /// user is told the agent is compacting when it provably cannot.
+    #[tokio::test]
+    async fn overflow_that_cannot_trim_emits_no_compacting_context_lifecycle() {
+        // One system message plus a single user turn: `trim_to_recent_turns`
+        // always keeps the current turn, so there is no whole turn to drop.
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("only turn {}", "x".repeat(40_000)).as_str()),
+        ];
+        let before = history.clone();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            Some(&delta_tx),
+            &observer,
+            32_000,
+        )
+        .await;
+
+        assert!(
+            !recovered,
+            "an overflow with a single turn cannot be recovered"
+        );
+        assert_eq!(
+            history.len(),
+            before.len(),
+            "nothing was trimmable, so history must be unchanged"
+        );
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "recognizing an overflow must not announce compaction that cannot happen"
         );
     }
 

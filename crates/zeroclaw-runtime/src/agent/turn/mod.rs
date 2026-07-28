@@ -571,6 +571,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        // Fail closed on the local budget BEFORE announcing the request.
+        // `announce_llm_request` emits the user-visible `WaitingOnModel`
+        // state, and a rejected turn never reaches the provider — announcing
+        // first would claim the agent is waiting on a model that is never
+        // called.
+        enforce_tool_loop_budget()?;
+
         let llm_started_at = announce_llm_request(
             &ctx,
             history,
@@ -580,8 +587,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             iteration,
         )
         .await;
-
-        enforce_tool_loop_budget()?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
