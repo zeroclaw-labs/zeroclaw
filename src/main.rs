@@ -4214,6 +4214,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
                 let sop_maintenance = spawn_sop_maintenance(
+                    &current_config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
@@ -4986,6 +4987,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
                 let sop_maintenance = spawn_sop_maintenance(
+                    &config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
@@ -7883,6 +7885,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
 /// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
+    config: &Config,
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
@@ -7892,6 +7895,7 @@ fn spawn_sop_maintenance(
     }
     let engine = sop_engine.cloned()?;
     let audit = sop_audit.cloned();
+    let config = config.clone();
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
@@ -7902,6 +7906,7 @@ fn spawn_sop_maintenance(
         loop {
             ticker.tick().await;
             let Some(report) = run_sop_maintenance_tick(
+                &config,
                 &engine,
                 audit.as_ref(),
                 cron_cache.as_ref(),
@@ -7953,6 +7958,7 @@ impl SopMaintenanceTickReport {
 
 #[cfg(feature = "agent-runtime")]
 async fn run_sop_maintenance_tick(
+    config: &Config,
     engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
     audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
@@ -7986,8 +7992,20 @@ async fn run_sop_maintenance_tick(
         .await;
         for result in &results {
             match result {
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. } => {
                     report.cron_started += 1;
+                    if matches!(
+                        action.as_ref(),
+                        zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                            | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                    ) {
+                        zeroclaw_runtime::sop::spawn_headless_run_driver(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        );
+                    }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
                 | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
@@ -8005,7 +8023,22 @@ async fn run_sop_maintenance_tick(
                 }
             }
         }
-        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+        let unhandled = results
+            .iter()
+            .filter(|result| {
+                !matches!(
+                    result,
+                    zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. }
+                        if matches!(
+                            action.as_ref(),
+                            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                                | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                        )
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&unhandled);
     }
 
     Some(report)
@@ -9669,7 +9702,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "agent-runtime")]
-    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
         use std::sync::{Arc, Mutex};
         use zeroclaw_config::schema::{MemoryConfig, SopConfig};
         use zeroclaw_memory::traits::Memory;
@@ -9682,7 +9715,7 @@ mod tests {
             name: "cron-sop".into(),
             description: "cron regression".into(),
             version: "0.1.0".into(),
-            execution_mode: SopExecutionMode::Supervised,
+            execution_mode: SopExecutionMode::Auto,
             priority: SopPriority::Normal,
             triggers: vec![SopTrigger::Cron {
                 expression: "* * * * *".into(),
@@ -9718,13 +9751,27 @@ mod tests {
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
         let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let report =
-            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
-                .await
-                .expect("maintenance tick should complete");
+        let report = run_sop_maintenance_tick(
+            &Config::default(),
+            &engine,
+            Some(&audit),
+            Some(&cache),
+            &mut last_cron_check,
+        )
+        .await
+        .expect("maintenance tick should complete");
 
         assert_eq!(report.cron_started, 1);
-        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if engine.lock().unwrap().active_runs().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cron-started SOP should be driven to a terminal state");
     }
 
     #[test]
