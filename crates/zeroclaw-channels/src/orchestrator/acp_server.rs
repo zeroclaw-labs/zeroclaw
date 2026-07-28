@@ -2369,6 +2369,20 @@ type RpcResult = std::result::Result<Value, RpcError>;
 mod tests {
     use super::*;
 
+    /// Upper bound for "this must not deadlock" waits in these tests.
+    ///
+    /// These guards exist to fail a genuine hang, not to assert how fast
+    /// `session/new` is. `scripts/ci/parallel_runtime_test_gate.sh` runs the
+    /// suite at 16 threads, where the previous 2s budget stopped being a
+    /// deadlock guard and became a scheduling assertion: a loaded runner blew
+    /// it while the behaviour under test was correct.
+    ///
+    /// The operations guarded here are sub-second when they are not hung, so
+    /// 30s cannot be reached by ordinary contention. It also stays well under
+    /// the 60s sleep that `session_new_does_not_wait_for_configured_mcp_servers`
+    /// relies on, so that regression is still caught.
+    const DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
     #[test]
     fn acp_server_config_defaults() {
         let cfg = AcpServerConfig::default();
@@ -2555,6 +2569,11 @@ mod tests {
     #[tokio::test]
     async fn session_new_does_not_wait_for_configured_mcp_servers() {
         let cwd = tempfile::tempdir().unwrap();
+        // The configured server touches this before sleeping, so its absence
+        // is direct evidence the child was never launched. Without it the test
+        // can only infer "did not wait" from elapsed time, which says nothing
+        // about a server that is spawned but not awaited.
+        let spawn_marker = cwd.path().join("mcp-server-was-spawned");
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
             providers: {
@@ -2576,7 +2595,10 @@ mod tests {
                     name: "slow".to_string(),
                     transport: zeroclaw_config::schema::McpTransport::Stdio,
                     command: "/bin/sh".to_string(),
-                    args: vec!["-c".to_string(), "sleep 60".to_string()],
+                    args: vec![
+                        "-c".to_string(),
+                        format!("touch {}; sleep 60", spawn_marker.display()),
+                    ],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2591,14 +2613,25 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig::default(),
         );
-        config.agents.insert(
-            "test-agent".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+        // Grant the slow server to the agent. Without a bundle grant,
+        // `mcp_servers_for_agent` returns nothing and the assertions below hold
+        // no matter what `session/new` does, which would make this test
+        // vacuous. With the grant, flipping `acp_enable_mcp` on is enough to
+        // spawn the child and block on its 60s sleep.
+        config.mcp_bundles.insert(
+            "slow-bundle".to_string(),
+            zeroclaw_config::schema::McpBundleConfig {
+                servers: vec!["slow".to_string()],
+                exclude: Vec::new(),
+            },
         );
+        let mut agent = dispatchable_test_agent("openrouter.default");
+        agent.mcp_bundles = vec!["slow-bundle".to_string()];
+        config.agents.insert("test-agent".to_string(), agent);
         let server = AcpServer::new(config, AcpServerConfig::default());
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            DEADLOCK_GUARD,
             server.handle_session_new(&serde_json::json!({
                 "cwd": cwd.path().to_string_lossy(),
                 "agentAlias": "test-agent",
@@ -2606,10 +2639,14 @@ mod tests {
             })),
         )
         .await
-        .expect("session/new should not block on configured MCP startup")
+        .expect("session/new must not hang on configured MCP startup")
         .expect("session/new should create a session");
 
         assert!(result["sessionId"].as_str().is_some());
+        assert!(
+            !spawn_marker.exists(),
+            "session/new must not launch configured MCP servers (acp_enable_mcp is off)"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -2670,7 +2707,7 @@ mod tests {
             error.message
         );
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + DEADLOCK_GUARD;
         let event = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(
@@ -2910,7 +2947,7 @@ mod tests {
         let server = AcpServer::new(config, AcpServerConfig::default());
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            DEADLOCK_GUARD,
             server.handle_session_new(&serde_json::json!({
                 "cwd": cwd.path().to_string_lossy(),
                 "mcpServers": []
@@ -2990,7 +3027,7 @@ mod tests {
         let server = AcpServer::new(config, AcpServerConfig::default());
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            DEADLOCK_GUARD,
             server.handle_session_new(&serde_json::json!({
                 "cwd": cwd.path().to_string_lossy(),
                 "mcpServers": []
@@ -3045,7 +3082,7 @@ mod tests {
 
         // Explicit alias should win over config default
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            DEADLOCK_GUARD,
             server.handle_session_new(&serde_json::json!({
                 "agentAlias": "agent-beta",
                 "cwd": cwd.path().to_string_lossy(),

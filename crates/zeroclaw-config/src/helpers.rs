@@ -62,6 +62,30 @@ pub fn route_double_hashmap_path<'a>(
     Some((outer_key, inner_key, inner_name))
 }
 
+/// True when `e` is exactly the "Unknown property" marker produced by the
+/// `Configurable` derive's `set_prop`/`get_prop` fallback (and by
+/// `prop_name_to_serde_field` in this module) for the specific property
+/// `name` the caller just tried. Namespace-sharing nested delegation sites
+/// (serde-flatten, `Option<T>`, dotted-key candidate loops) use it to tell
+/// "not one of mine — keep trying siblings" apart from a real value error
+/// on a confirmed path.
+///
+/// Both constructors build the error as exactly `Unknown property
+/// '{name}'` via `anyhow::Error::msg(String)`, so the downcast is the
+/// common zero-alloc path; `to_string()` is only a fallback for
+/// wrapped/contextualized errors. The comparison is against the full
+/// message, not just a prefix: a genuine nested value error whose text
+/// happens to start with "Unknown property" (a custom validator message,
+/// say) must not be mistaken for this fall-through marker and silently
+/// swallowed as a retry.
+pub fn is_unknown_property_error(e: &anyhow::Error, name: &str) -> bool {
+    let expected = format!("Unknown property '{name}'");
+    if let Some(msg) = e.downcast_ref::<String>() {
+        return *msg == expected;
+    }
+    e.to_string() == expected
+}
+
 pub fn route_vec_path<'a, 'k, I>(
     name: &'a str,
     my_prefix: &str,
@@ -1069,5 +1093,42 @@ mod tests {
         assert_eq!(kebab_to_snake("uri"), "uri");
         assert_eq!(kebab_to_snake("model"), "model");
         assert_eq!(kebab_to_snake(""), "");
+    }
+
+    // ── is_unknown_property_error ───────────────────────────────────────
+
+    #[test]
+    fn is_unknown_property_error_matches_the_exact_generated_sentinel() {
+        // Same construction the two real fallbacks use.
+        let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"));
+        assert!(is_unknown_property_error(&marker, "gateway.port"));
+    }
+
+    #[test]
+    fn is_unknown_property_error_rejects_a_value_error_that_merely_shares_the_prefix() {
+        // A genuine value error (e.g. a future or custom nested
+        // validator/deserializer failure) can happen to start with the same
+        // "Unknown property" text as the generated fall-through marker
+        // without being that marker. Built the same way the real
+        // constructors build their errors (`anyhow::Error::msg(String)`),
+        // so this exercises the exact downcast path the classifier prefers.
+        let value_error = anyhow::Error::msg(
+            "Unknown property value rejected by a custom field validator".to_string(),
+        );
+        assert!(
+            !is_unknown_property_error(&value_error, "gateway.port"),
+            "a value error sharing the marker's prefix must not be classified as \
+             'not mine' just because it starts with the same text — doing so would \
+             have it silently retried/masked instead of propagated"
+        );
+    }
+
+    #[test]
+    fn is_unknown_property_error_rejects_sentinel_for_a_different_name() {
+        // The sentinel for one property must not be mistaken for the
+        // sentinel of another — exact-name matching, not just exact-text
+        // matching against some fixed literal.
+        let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"));
+        assert!(!is_unknown_property_error(&marker, "gateway.host"));
     }
 }

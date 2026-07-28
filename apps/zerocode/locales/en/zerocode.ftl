@@ -15,8 +15,12 @@ zc-app-help-cycle-mode = Cycle mode
 zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
 zc-app-help-quit = Quit
+zc-app-keybindings-title = Keybindings
+zc-app-help-filter-label = Filter
+zc-app-help-filter-placeholder = type a key or action…
+zc-app-help-no-matches = No matching keybindings
+zc-app-help-controls = { $cancel } clear/close · { $up }/{ $down } scroll · Type to filter
 
-zc-app-press-any-key-to-close = Press any key to close
 zc-app-reload-line-1 = The daemon process stays running (same PID), but every
 zc-app-reload-line-2 = subsystem tears down and re-initializes from the on-disk
 zc-app-reload-line-3 = config:
