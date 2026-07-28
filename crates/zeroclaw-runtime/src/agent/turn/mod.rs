@@ -3421,7 +3421,9 @@ mod sop_step_reassembly_tests {
                 provider_name: "child-original-provider".into(),
                 model: "child-original-model".into(),
                 temperature: None,
-                tools_registry: vec![Box::new(ChildModelSwitchTool)],
+                tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(ChildModelSwitchTool),
+                ]),
                 approval: crate::approval::ApprovalManager::for_non_interactive(
                     &stepper_risk_profile,
                 ),
@@ -3440,7 +3442,7 @@ mod sop_step_reassembly_tests {
         let parent_switch_state: ModelSwitchCallback = Arc::new(std::sync::Mutex::new(None));
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
