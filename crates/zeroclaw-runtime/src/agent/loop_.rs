@@ -927,28 +927,21 @@ async fn agent_turn_with_sop_reassembly(
         turn_id: &turn_id,
     })
     .await;
-    // Snapshot token usage from the task-local cost context when the caller
-    // scoped one around this call (the gateway scopes both
+    // Snapshot token usage and cost from the task-local cost context when
+    // the caller scoped one around this call (the gateway scopes both
     // `TOOL_LOOP_TURN_USAGE` and `TOOL_LOOP_COST_TRACKING_CONTEXT` around
     // `process_message`); unscoped callers report `None`. When this runs
     // nested inside a parent turn's scoped context (peer-message-as-tool),
     // `snapshot_turn_usage` prefers the caller-scoped task-local and may
     // report the parent turn's cumulative usage — pre-existing cost
     // attribution semantics, kept as-is.
-    let tokens_used = TOOL_LOOP_COST_TRACKING_CONTEXT
+    let usage = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(std::clone::Clone::clone)
         .ok()
         .flatten()
-        .and_then(|ctx| {
-            let usage = ctx.snapshot_turn_usage();
-            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            )
-        });
-    turn_guard.set_usage(tokens_used, None);
+        .map(|ctx| ctx.observer_turn_usage())
+        .unwrap_or_default();
+    turn_guard.set_usage(usage.tokens_used, usage.cost_usd);
     turn_guard.finish();
     result
 }
@@ -2756,21 +2749,16 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
-        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
-            let usage = ctx.snapshot_turn_usage();
-            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            )
-        });
+        let usage = cost_tracking_context
+            .as_ref()
+            .map(|ctx| ctx.observer_turn_usage())
+            .unwrap_or_default();
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
             duration,
-            tokens_used,
-            cost_usd: None,
+            tokens_used: usage.tokens_used,
+            cost_usd: usage.cost_usd,
             channel: Some(channel_name.to_string()),
             agent_alias: Some(agent_alias.to_string()),
             turn_id: Some(turn_id),
@@ -4222,6 +4210,13 @@ mod tests {
                 .collect();
             Self {
                 responses: Arc::new(Mutex::new(scripted)),
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+
+        fn from_responses(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
                 capabilities: ProviderCapabilities::default(),
             }
         }
@@ -15717,6 +15712,103 @@ Let me check the result."#;
         // the full (channel, agent_alias, turn_id) triple — the same
         // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `agent_turn` reads the task-local cost context for token usage but
+    /// must also surface the priced `cost_usd` on its `AgentEnd` bracket,
+    /// matching the `Agent::turn`/`turn_streamed` entry points.
+    #[tokio::test]
+    async fn agent_turn_reports_cost_usd_in_agent_end() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+
+        let model_provider = ScriptedModelProvider::from_responses(vec![ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(1_000),
+                cached_input_tokens: None,
+                output_tokens: Some(200),
+            }),
+            reasoning_content: None,
+        }]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("mock-model.input".to_string(), 3.0),
+                ("mock-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(tracker, pricing);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_context),
+                agent_turn(
+                    None, // config: configless test
+                    &model_provider,
+                    &mut history,
+                    &tools_registry,
+                    capturing.as_ref(),
+                    "mock-provider",
+                    "mock-model",
+                    Some(0.0),
+                    true,
+                    "daemon",
+                    None,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    4,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    false,
+                    false, // parallel_tools
+                    0,     // max_tool_result_chars: disabled for test
+                    0,     // context_token_budget: disabled for test
+                    None,  // channel
+                    TurnOrigin::SubTurn,
+                    None,
+                    Some("test-agent"),
+                    None, // turn_id: self-minted
+                ),
+            )
+            .await
+            .expect("turn should succeed");
+        assert_eq!(result, "done");
+
+        let events = capturing.events.lock();
+        let cost = events
+            .iter()
+            .find_map(|event| match event {
+                ObserverEvent::AgentEnd { cost_usd, .. } => Some(*cost_usd),
+                _ => None,
+            })
+            .expect("AgentEnd must be recorded");
+        let cost =
+            cost.expect("AgentEnd must carry Some(cost_usd) when a priced context is scoped");
+        let expected = (1_000.0 * 3.0 + 200.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "AgentEnd cost_usd must equal the priced turn cost: got {cost}, want {expected}"
+        );
     }
 
     /// When the caller pre-mints a turn id (`process_message` does, so its

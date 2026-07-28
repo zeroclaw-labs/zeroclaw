@@ -1094,6 +1094,98 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
     );
 }
 
+/// Usage was tracked but no pricing matched (builder falls back to a
+/// usage-only cost context): `AgentEnd.cost_usd` must be `Some(0.0)` —
+/// "tracked but unpriced or free" — never `None`, which is reserved for
+/// turns with no recorded usage at all.
+#[tokio::test]
+async fn safety_net_agent_end_cost_is_some_zero_when_unpriced() {
+    let mut final_round = text_response("done");
+    final_round.usage = Some(token_usage(11, 5));
+
+    let capture = Arc::new(EventCapture::default());
+    let mut agent = Agent::builder()
+        .model_provider(Box::new(ScriptedProvider::new(vec![final_round])))
+        .tools(Vec::new())
+        .memory(mem_none())
+        .observer(Arc::clone(&capture) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .build()
+        .expect("agent builder should succeed");
+
+    agent.turn("hello").await.expect("turn should succeed");
+
+    let events = capture.events.lock();
+    let cost = events
+        .iter()
+        .find_map(|event| match event {
+            ObserverEvent::AgentEnd { cost_usd, .. } => Some(*cost_usd),
+            _ => None,
+        })
+        .expect("AgentEnd must be recorded");
+    assert_eq!(
+        cost,
+        Some(0.0),
+        "tracked-but-unpriced turns must report Some(0.0), not None"
+    );
+}
+
+/// An LLM failure mid-turn must not lose the usage already recorded by the
+/// rounds that succeeded: the error-path `AgentEnd` still carries token
+/// totals and the tracked cost.
+#[tokio::test]
+async fn safety_net_agent_end_reports_cost_on_error_after_partial_usage() {
+    let mut tool_round = tool_response(vec![tool_call("tc1", "echo")]);
+    tool_round.usage = Some(token_usage(7, 3));
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capture = Arc::new(EventCapture::default());
+    let mut agent = Agent::builder()
+        .model_provider(Box::new(ErrAfterScriptProvider {
+            responses: parking_lot::Mutex::new(vec![tool_round].into()),
+        }))
+        .tools(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })])
+        .memory(mem_none())
+        .observer(Arc::clone(&capture) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .build()
+        .expect("agent builder should succeed");
+
+    let result = agent.turn("hello").await;
+    assert!(result.is_err(), "second provider call must fail the turn");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the tool round must have executed before the failure"
+    );
+
+    let events = capture.events.lock();
+    let (tokens_used, cost_usd) = events
+        .iter()
+        .find_map(|event| match event {
+            ObserverEvent::AgentEnd {
+                tokens_used,
+                cost_usd,
+                ..
+            } => Some((tokens_used.clone(), *cost_usd)),
+            _ => None,
+        })
+        .expect("AgentEnd must be recorded on the error path");
+    let tokens = tokens_used.expect("error-path AgentEnd must keep partial token totals");
+    assert_eq!(tokens.input_tokens, 7);
+    assert_eq!(tokens.output_tokens, 3);
+    assert_eq!(
+        cost_usd,
+        Some(0.0),
+        "error-path AgentEnd must keep the tracked (unpriced) cost"
+    );
+}
+
 #[tokio::test]
 async fn safety_net_turn_survives_in_loop_history_pruning() {
     let filler = "x".repeat(400);

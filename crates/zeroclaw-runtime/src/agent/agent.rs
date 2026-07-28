@@ -2398,19 +2398,13 @@ impl Agent {
             )
             .await;
 
+        // Raw snapshot retained: output_tokens feeds the response-cache put below.
+        let usage = cost_context.snapshot_turn_usage();
         // Feed the accumulated per-call usage into the AgentEnd guard before
         // any return below drops it — including the error path, which must
         // still report usage from calls that succeeded earlier in the turn.
-        let usage = cost_context.snapshot_turn_usage();
-        if usage.input_tokens > 0 || usage.output_tokens > 0 {
-            guard.set_usage(
-                Some(zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                }),
-                None,
-            );
-        }
+        let observer_usage = cost_context.observer_turn_usage();
+        guard.set_usage(observer_usage.tokens_used, observer_usage.cost_usd);
         for replayed in Self::replay_loop_messages(&loop_new_messages) {
             self.history.push(replayed);
         }
@@ -2795,19 +2789,13 @@ impl Agent {
                 turn_model_fallback = round_fallback;
             }
 
+            // Raw snapshot retained: output_tokens feeds the response-cache put below.
+            let usage = cost_context.snapshot_turn_usage();
             // Feed cumulative usage into the AgentEnd guard before any return
             // below drops it — the error paths must still report usage from
             // calls that succeeded earlier in the turn.
-            let usage = cost_context.snapshot_turn_usage();
-            if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                guard.set_usage(
-                    Some(zeroclaw_api::observability_traits::TurnTokenUsage {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                    }),
-                    None,
-                );
-            }
+            let observer_usage = cost_context.observer_turn_usage();
+            guard.set_usage(observer_usage.tokens_used, observer_usage.cost_usd);
 
             // Replay everything the loop appended this round into the
             // conversation history and the persistence capture.
@@ -8709,6 +8697,7 @@ mod tests {
         let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
             .with_agent_alias("agent-turn");
         let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let observer = Arc::new(CapturingObserver::default());
 
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
@@ -8725,7 +8714,7 @@ mod tests {
             }))
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
-            .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
+            .observer(Arc::clone(&observer) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_name("test-model".into())
@@ -8766,6 +8755,21 @@ mod tests {
         assert!(
             agent_summary.session_cost_usd > 0.0,
             "agent alias should flow through persisted turn usage"
+        );
+
+        let events = observer.events.lock();
+        let cost = events
+            .iter()
+            .find_map(|event| match event {
+                ObserverEvent::AgentEnd { cost_usd, .. } => Some(*cost_usd),
+                _ => None,
+            })
+            .expect("AgentEnd must be recorded");
+        let cost = cost.expect("AgentEnd must carry Some(cost_usd) when usage was tracked");
+        let expected = (1_000.0 * 3.0 + 200.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "AgentEnd cost_usd must equal the priced turn cost: got {cost}, want {expected}"
         );
     }
 
@@ -8808,6 +8812,7 @@ mod tests {
         let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
             .with_agent_alias("streamed-agent");
         let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let observer = Arc::new(CapturingObserver::default());
 
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
@@ -8824,7 +8829,7 @@ mod tests {
             }))
             .tools(vec![Box::new(MockTool)])
             .memory(mem)
-            .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
+            .observer(Arc::clone(&observer) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_name("test-model".into())
@@ -8870,6 +8875,21 @@ mod tests {
         assert!(
             agent_summary.session_cost_usd > 0.0,
             "agent alias should flow through persisted streamed-turn usage"
+        );
+
+        let events = observer.events.lock();
+        let cost = events
+            .iter()
+            .find_map(|event| match event {
+                ObserverEvent::AgentEnd { cost_usd, .. } => Some(*cost_usd),
+                _ => None,
+            })
+            .expect("AgentEnd must be recorded");
+        let cost = cost.expect("AgentEnd must carry Some(cost_usd) when usage was tracked");
+        let expected = (1_000.0 * 3.0 + 200.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "AgentEnd cost_usd must equal the priced turn cost: got {cost}, want {expected}"
         );
     }
 

@@ -5551,17 +5551,12 @@ async fn process_channel_message_body(
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
     // `Drop` path supplies the same matched end on panic or early unwind.
-    let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
-        let usage = ctx.snapshot_turn_usage();
-        (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-            zeroclaw_api::observability_traits::TurnTokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            },
-        )
-    });
+    let turn_usage = cost_tracking_context
+        .as_ref()
+        .map(|ctx| ctx.observer_turn_usage())
+        .unwrap_or_default();
     turn_guard.set_model_route(route.model_provider.clone(), route.model.clone());
-    turn_guard.set_usage(turn_tokens_used, None);
+    turn_guard.set_usage(turn_usage.tokens_used, turn_usage.cost_usd);
     turn_guard.finish();
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
@@ -13536,6 +13531,53 @@ api_key = "anthropic-key"
         }
     }
 
+    /// Provider double that reports token usage from chat, so a scoped
+    /// cost-tracking context accumulates usage the way real providers do.
+    struct UsageReportingModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for UsageReportingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    cached_input_tokens: None,
+                    output_tokens: Some(200),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for UsageReportingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "UsageReportingModelProvider"
+        }
+    }
+
     struct FormatErrorModelProvider;
 
     #[async_trait::async_trait]
@@ -13980,6 +14022,29 @@ api_key = "anthropic-key"
         hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
         observer: Arc<dyn Observer>,
     ) -> Arc<ChannelRuntimeContext> {
+        test_runtime_ctx_with_observer_and_cost_tracking(
+            channel,
+            model_provider,
+            prompt_config,
+            agent_cfg,
+            model_provider_ref,
+            hooks,
+            observer,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_runtime_ctx_with_observer_and_cost_tracking(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+        cost_tracking: Option<ChannelCostTrackingState>,
+    ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
@@ -14043,7 +14108,7 @@ api_key = "anthropic-key"
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
             activated_tools: None,
-            cost_tracking: None,
+            cost_tracking,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
@@ -14190,6 +14255,29 @@ api_key = "anthropic-key"
         }
     }
 
+    /// Send hook that cancels every outgoing message, counting invocations
+    /// so tests can assert the hook actually ran.
+    struct CancellingSendHook {
+        fired: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for CancellingSendHook {
+        fn name(&self) -> &str {
+            "cancelling-send"
+        }
+
+        async fn on_message_sending(
+            &self,
+            _channel: String,
+            _recipient: String,
+            _content: String,
+        ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+            self.fired.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_runtime::hooks::HookResult::Cancel("suppressed".to_string())
+        }
+    }
+
     /// (start bracket entries, end bracket entries) — each entry is
     /// `(channel, agent_alias, turn_id)`. Aliased to keep the return type
     /// readable (clippy::type_complexity).
@@ -14297,6 +14385,94 @@ api_key = "anthropic-key"
         );
     }
 
+    /// With cost tracking configured, the channel turn's closing AgentEnd
+    /// must carry the priced per-turn cost alongside token totals, and the
+    /// cost change must not break the shared turn-id contract between the
+    /// lifecycle brackets.
+    #[tokio::test]
+    async fn process_channel_message_reports_cost_usd_in_agent_end() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            zeroclaw_runtime::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "test-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_tracking = ChannelCostTrackingState {
+            tracker,
+            model_provider_pricing: pricing,
+            agent_alias: Arc::new("test-agent".to_string()),
+        };
+
+        let runtime_ctx = test_runtime_ctx_with_observer_and_cost_tracking(
+            channel,
+            Arc::new(UsageReportingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+            Some(cost_tracking),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = observer.events.lock().unwrap();
+        let (tokens_used, cost_usd, end_turn_id) = events
+            .iter()
+            .find_map(|e| match e {
+                ObserverEvent::AgentEnd {
+                    tokens_used,
+                    cost_usd,
+                    turn_id,
+                    ..
+                } => Some((tokens_used.clone(), *cost_usd, turn_id.clone())),
+                _ => None,
+            })
+            .expect("channel turn must emit AgentEnd");
+
+        let tokens = tokens_used.expect("AgentEnd must carry tokens_used");
+        assert_eq!(tokens.input_tokens, 1_000);
+        assert_eq!(tokens.output_tokens, 200);
+
+        let cost =
+            cost_usd.expect("AgentEnd must carry Some(cost_usd) when tracking is configured");
+        let expected = (1_000.0 * 3.0 + 200.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "AgentEnd cost_usd must equal the priced turn cost: got {cost}, want {expected}"
+        );
+
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(starts.len(), 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends.len(), 1, "exactly one AgentEnd, got {events:?}");
+        assert!(end_turn_id.is_some(), "AgentEnd must carry a turn_id");
+        assert_eq!(
+            starts[0].2, end_turn_id,
+            "AgentEnd must share the AgentStart turn_id"
+        );
+    }
+
     /// An erroring LLM turn must still close its bracket: one `AgentStart`
     /// and one `AgentEnd`, same `turn_id`.
     #[tokio::test]
@@ -14372,6 +14548,69 @@ api_key = "anthropic-key"
             "brackets must share a turn_id even when cancelled"
         );
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
+    }
+
+    /// A successful turn whose outgoing message is suppressed by an
+    /// on_message_sending Cancel hook must still close its lifecycle
+    /// bracket: AgentEnd closes before the send hook runs, so
+    /// cancellation cannot orphan the bracket.
+    #[tokio::test]
+    async fn process_channel_message_emits_agent_end_when_send_hook_cancels() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(CancellingSendHook {
+            fired: Arc::clone(&fired),
+        }));
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(Arc::new(hook_runner)),
+            observer.clone(),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Snapshot the channel before taking the events guard: sent_messages
+        // is an async mutex, and awaiting while holding the std-mutex events
+        // guard would hold a sync lock across an await point.
+        let sent = channel_impl.sent_messages.lock().await.clone();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the on_message_sending hook must run exactly once"
+        );
+        assert!(
+            sent.is_empty(),
+            "the outgoing message must be suppressed by the Cancel hook, got {sent:?}"
+        );
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(starts.len(), 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(
+            ends.len(),
+            1,
+            "hook-cancelled turn must still emit AgentEnd, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "AgentEnd must be the last event: {events:?}"
+        );
+        assert!(starts[0].2.is_some(), "AgentStart must carry a turn_id");
+        assert_eq!(starts[0].2, ends[0].2, "brackets must share a turn_id");
     }
 
     #[tokio::test]

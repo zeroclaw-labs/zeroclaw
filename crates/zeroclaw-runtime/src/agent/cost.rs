@@ -20,6 +20,18 @@ pub struct TurnUsage {
     pub last_input_tokens: u64,
 }
 
+/// Observer-facing view of the usage accumulated this turn, in the shape
+/// `AgentEnd` consumers take. `cost_usd` is `Some` whenever token usage was
+/// recorded — including `Some(0.0)` when no pricing entry matched — so
+/// observers can tell "tracked but unpriced or free" apart from "not
+/// tracked" (`None`). When a cost tracker is attached, missing pricing
+/// already warns once per (model_provider, model) pair at record time.
+#[derive(Default, Clone, Debug)]
+pub struct ObserverTurnUsage {
+    pub tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
+    pub cost_usd: Option<f64>,
+}
+
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 
@@ -177,6 +189,22 @@ impl ToolLoopCostTrackingContext {
         TOOL_LOOP_TURN_USAGE
             .try_with(|turn_usage| turn_usage.as_ref().map(|u| *u.lock()).unwrap_or_default())
             .unwrap_or_else(|_| *self.turn_usage.lock())
+    }
+
+    /// Snapshot the per-scope usage for `AgentEnd` emission. Both fields are
+    /// `None` when nothing was recorded this turn.
+    pub fn observer_turn_usage(&self) -> ObserverTurnUsage {
+        let usage = self.snapshot_turn_usage();
+        if usage.input_tokens == 0 && usage.output_tokens == 0 {
+            return ObserverTurnUsage::default();
+        }
+        ObserverTurnUsage {
+            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            cost_usd: Some(usage.cost_usd),
+        }
     }
 }
 
@@ -801,5 +829,66 @@ mod tests {
         assert_eq!(recorded.input_tokens, 5_000);
         assert_eq!(recorded.output_tokens, 200);
         assert!((recorded.cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn observer_turn_usage_empty_context_yields_none_pair() {
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let usage = ctx.observer_turn_usage();
+        assert!(
+            usage.tokens_used.is_none(),
+            "no usage recorded → tokens None"
+        );
+        assert!(usage.cost_usd.is_none(), "no usage recorded → cost None");
+    }
+
+    #[test]
+    fn observer_turn_usage_reports_tracked_cost() {
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        *ctx.turn_usage.lock() = TurnUsage {
+            input_tokens: 500,
+            output_tokens: 100,
+            cost_usd: 0.0030,
+            ..TurnUsage::default()
+        };
+        let usage = ctx.observer_turn_usage();
+        let tokens = usage.tokens_used.expect("usage recorded → tokens Some");
+        assert_eq!(tokens.input_tokens, 500);
+        assert_eq!(tokens.output_tokens, 100);
+        assert_eq!(usage.cost_usd, Some(0.0030));
+    }
+
+    #[test]
+    fn observer_turn_usage_tracked_but_unpriced_is_some_zero() {
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        *ctx.turn_usage.lock() = TurnUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            cost_usd: 0.0,
+            ..TurnUsage::default()
+        };
+        let usage = ctx.observer_turn_usage();
+        assert!(usage.tokens_used.is_some());
+        assert_eq!(
+            usage.cost_usd,
+            Some(0.0),
+            "tracked-but-unpriced must be Some(0.0); None is reserved for not-tracked"
+        );
+    }
+
+    #[test]
+    fn observer_turn_usage_one_sided_tokens_still_tracked() {
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        *ctx.turn_usage.lock() = TurnUsage {
+            input_tokens: 42,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            ..TurnUsage::default()
+        };
+        let usage = ctx.observer_turn_usage();
+        let tokens = usage.tokens_used.expect("one-sided usage is still tracked");
+        assert_eq!(tokens.input_tokens, 42);
+        assert_eq!(tokens.output_tokens, 0);
+        assert_eq!(usage.cost_usd, Some(0.0));
     }
 }
