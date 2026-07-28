@@ -1332,6 +1332,7 @@ pub async fn run(
             // cannot read or write memory even though the registry is otherwise
             // built identically.
             exclude_memory: memory_free,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
             // Honor the daemon worker's pre-built shared registry so stdio
@@ -2940,6 +2941,7 @@ pub async fn process_message(
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
             // `process_message` is the channel/orchestrator live-chat path;
@@ -15361,6 +15363,7 @@ Let me check the result."#;
                 connect_mcp: false,   // exercise the filter without MCP fixtures
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
                 mcp_registry: None,

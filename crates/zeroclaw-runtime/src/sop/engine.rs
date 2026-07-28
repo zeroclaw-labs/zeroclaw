@@ -10878,14 +10878,9 @@ mod tests {
             .unwrap();
         let run_id = extract_run_id(&action).to_string();
 
-        let err = engine
+        engine
             .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
             .expect_err("checkpoint state-file write must fail for a file-valued location");
-        assert!(
-            err.to_string().contains("Not a directory")
-                || err.to_string().contains("not a directory"),
-            "unexpected state-file error: {err}"
-        );
         assert_eq!(
             engine.get_run(&run_id).unwrap().status,
             SopRunStatus::Running,

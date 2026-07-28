@@ -5,6 +5,7 @@ pub mod hardware;
 pub mod keymap;
 pub mod linkcheck;
 pub mod peer_groups;
+pub mod placeholders;
 pub mod plugins;
 pub mod protected;
 pub mod refs;
