@@ -545,8 +545,10 @@ fn expand_user_path(path: &str) -> PathBuf {
 /// would still land outside, so it must be resolved and blocked, exactly as
 /// `file_write` blocks writing through a symlink leaf). Lexical `.`/`..` are
 /// applied without touching the filesystem. Symlink chains are bounded to guard
-/// against cycles; on the bound or an unreadable link we stop expanding and keep
-/// the path resolved so far, which stays conservative for the boundary check.
+/// against cycles: exhausting the hop budget returns `None` ("could not
+/// resolve"), and callers fail closed by BLOCKING the path - a crafted cycle
+/// never falls back to the literal input. An unreadable link is kept as a
+/// literal component while resolution continues on its ancestors.
 fn resolve_symlinked_path(path: &Path) -> Option<PathBuf> {
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     let mut current = path.to_path_buf();
@@ -1816,8 +1818,12 @@ impl SecurityPolicy {
     /// CREATE the leaf (e.g. `touch dir/new.txt`), symlinks are resolved on the
     /// deepest existing ancestor and any non-existent trailing components are
     /// re-appended, so an in-workspace symlink pointing outside is followed to
-    /// its real target. Returns `None` only for inputs that cannot form a path
-    /// (null bytes); callers treat `None` as "no resolved target to re-check".
+    /// its real target. Relative arguments are joined onto the workspace
+    /// directory BEFORE resolving. Returns `None` when no trustworthy target
+    /// exists: a null byte in the input, or an unresolvable path (a symlink
+    /// cycle exhausting the resolver's hop budget). Callers MUST treat `None`
+    /// as a block (fail closed), never as "nothing to re-check" - see
+    /// `forbidden_path_argument_impl`.
     fn resolve_command_path_argument(&self, candidate: &str) -> Option<PathBuf> {
         if candidate.contains('\0') {
             return None;
