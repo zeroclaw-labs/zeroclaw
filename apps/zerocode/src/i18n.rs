@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_initialize_timeout_formats_in_all_builtin_catalogues() {
+    fn argument_messages_format_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL),
             ("es", include_str!("../locales/es/zerocode.ftl")),
@@ -248,6 +248,17 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("timeout message must format for {locale}"));
             assert!(timeout.contains("10"));
+
+            let controls = format_ftl_message(
+                source,
+                locale,
+                "zc-app-help-controls",
+                &[("up", "↑"), ("down", "↓"), ("cancel", "Esc")],
+            )
+            .unwrap_or_else(|| panic!("help controls must format for {locale}"));
+            assert!(controls.contains('↑'));
+            assert!(controls.contains('↓'));
+            assert!(controls.contains("Esc"));
         }
     }
 
