@@ -557,7 +557,7 @@ jobs:
         run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
       - name: Run tests
         shell: bash
-        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
+        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes

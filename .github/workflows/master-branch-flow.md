@@ -69,7 +69,7 @@ tag push.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
-   - `platform-tests`: the same workspace nextest command on `macos-14` and `windows-latest` as advisory, non-blocking checks.
+   - `platform-tests`: the same workspace nextest selection on `macos-14` and `windows-latest` as advisory, non-blocking checks, with `--no-fail-fast` so each run inventories all platform failures.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. Maintainer reviews. Once the gate is green and review policy is satisfied,

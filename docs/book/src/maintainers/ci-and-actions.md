@@ -16,7 +16,7 @@ Composite job with multiple matrix legs:
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
-- **platform-tests**: advisory `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` matrix on macOS and Windows; failures remain visible but do not feed `CI Required Gate`
+- **platform-tests**: advisory `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` matrix on macOS and Windows; each run inventories all platform failures, which remain visible but do not feed `CI Required Gate`
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
