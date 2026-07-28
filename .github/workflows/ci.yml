@@ -390,7 +390,7 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$'; then
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -413,6 +413,9 @@ jobs:
       - name: Run channel plugin component test
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+      - name: Run plugins lib unit tests
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
 
   check-32bit:
     name: Check (32-bit)
