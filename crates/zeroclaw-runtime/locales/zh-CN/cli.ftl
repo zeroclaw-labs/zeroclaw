@@ -147,6 +147,27 @@ cli-sop-list-about = 列出已加载的 SOP
 cli-sop-validate-about = 验证 SOP 定义
 cli-sop-show-about = 显示 SOP 的详细信息
 cli-migrate-openclaw-about = 将 OpenClaw 工作区中的记忆导入到此 ZeroClaw 工作区
+
+# migrate session-ownership（运维管理命令）
+cli-migrate-session-ownership-err-open-backend = 打开会话后端
+cli-migrate-session-ownership-confirm-claim = 将会话 "{$key}" 认领给代理 "{$alias}"？[y/N]
+cli-migrate-session-ownership-aborted = 已中止。
+cli-migrate-session-ownership-claimed-one = 会话 "{$key}" 现由代理 "{$alias}" 拥有。
+cli-migrate-session-ownership-err-already-owned = 会话 "{$key}" 已由代理 "{$existing}" 拥有；请使用 --agent-alias "{$existing}" 或先清除所有权
+cli-migrate-session-ownership-err-write = 为会话 "{$key}" 写入所有权
+cli-migrate-session-ownership-err-unknown-agent = 未知的代理别名 "{$alias}"；它不是已配置的代理——拒绝写入将导致永久无法访问的所有权
+cli-migrate-session-ownership-err-unknown-session = 会话 "{$key}" 不存在；拒绝创建幽灵会话
+cli-migrate-session-ownership-none-found = 未找到无主的非空会话。
+cli-migrate-session-ownership-found-count = 找到 {$count} 个无主的非空会话：
+cli-migrate-session-ownership-list-header = 无主的非空会话：
+cli-migrate-session-ownership-list-item = {$key}  （{$count} 条消息）
+cli-migrate-session-ownership-prompt-alias = 要指定为拥有者的代理别名：
+cli-migrate-session-ownership-no-alias = 未提供别名；正在中止。
+cli-migrate-session-ownership-skip-owned = 跳过 "{$key}"：已由 "{$existing}" 拥有
+cli-migrate-session-ownership-skip-error = 跳过 "{$key}"：{$error}
+cli-migrate-session-ownership-summary = 完成：已认领 {$claimed}，已跳过 {$skipped}，失败 {$failed}。
+cli-migrate-session-ownership-err-partial = {$failed} 个会话认领失败
+
 cli-agent-long-about =
     启动 AI 代理循环。
 

@@ -18,6 +18,33 @@ impl IterationToolSpecs {
         self.use_native_tools =
             model_provider.supports_native_tools() && !self.tool_specs.is_empty();
     }
+
+    /// Construct iteration tool specs from a per-request override, bypassing
+    /// the normal `tools_registry` → `tool.spec()` rebuild.
+    ///
+    /// Applies `excluded_tools` filtering to honour security policy — tools
+    /// excluded by policy are removed even if present in the override.
+    pub(crate) fn from_override(
+        model_provider: &dyn ModelProvider,
+        override_specs: &[ToolSpec],
+        excluded_tools: &[String],
+    ) -> Self {
+        let tool_specs: Vec<ToolSpec> = override_specs
+            .iter()
+            .filter(|s| !excluded_tools.iter().any(|ex| ex == &s.name))
+            .cloned()
+            .collect();
+        let known_tool_names: HashSet<String> = tool_specs
+            .iter()
+            .map(|s| s.name.to_ascii_lowercase())
+            .collect();
+        let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
+        IterationToolSpecs {
+            tool_specs,
+            known_tool_names,
+            use_native_tools,
+        }
+    }
 }
 
 pub(crate) fn build_iteration_tool_specs(
@@ -67,9 +94,10 @@ pub(crate) fn build_iteration_tool_specs(
 
 #[cfg(test)]
 mod tests {
-    use super::build_iteration_tool_specs;
-    use crate::tools::ActivatedToolSet;
+    use super::{IterationToolSpecs, build_iteration_tool_specs};
+    use crate::tools::{ActivatedToolSet, ToolSpec};
     use async_trait::async_trait;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use zeroclaw_api::attribution::Role;
@@ -239,6 +267,68 @@ mod tests {
         assert!(
             !specs.use_native_tools,
             "active provider must decide whether this turn uses native tool transport"
+        );
+    }
+
+    // ── Regression: default rebuild path includes activated tools ──────
+
+    #[test]
+    fn build_specs_includes_activated_tools_with_mcp_suffixes() {
+        // When no TOOL_SPECS_OVERRIDE is set, the per-iteration rebuild must
+        // surface tools activated at runtime — including those with MCP-style
+        // prefixed names (docker-mcp__extract_text). The `from_override()`
+        // snapshot path must NOT be used here; it would miss these tools.
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let specs = build_iteration_tool_specs(&NativeToolsProvider, &[], &[], Some(&activated))
+            .expect("build should succeed with activated tools");
+
+        assert!(
+            specs.known_tool_names.contains("docker-mcp__extract_text"),
+            "default rebuild must include MCP-suffix activated tools"
+        );
+        assert!(
+            specs
+                .tool_specs
+                .iter()
+                .any(|s| s.name == "docker-mcp__extract_text"),
+            "default rebuild tool_specs must list the activated MCP tool"
+        );
+    }
+
+    // ── Regression: override path is a snapshot, not a live rebuild ─────
+
+    #[test]
+    fn from_override_does_not_include_activated_tools() {
+        // `from_override` takes a pre-built Vec<ToolSpec> — it must NOT
+        // consult the activated-tool set. The override is a snapshot frozen
+        // at request time (chat-completions tools parameter).
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated_tool: Arc<dyn Tool> =
+            Arc::new(CountingTool::new("extra_tool", Arc::clone(&invocations)));
+        activated
+            .lock()
+            .unwrap()
+            .activate("extra_tool".into(), activated_tool);
+
+        let override_specs = vec![ToolSpec::new("weather_query", "Query weather", json!({}))];
+        let specs = IterationToolSpecs::from_override(&NativeToolsProvider, &override_specs, &[]);
+
+        assert_eq!(specs.tool_specs.len(), 1);
+        assert_eq!(specs.tool_specs[0].name, "weather_query");
+        assert!(
+            !specs.known_tool_names.contains("extra_tool"),
+            "override must not include activated tools — it is a snapshot"
         );
     }
 }

@@ -22,7 +22,7 @@ struct SessionSlot {
     pending: AtomicUsize,
 }
 
-/// RAII guard that releases the session permit on drop.
+/// RAII guard that releases the session permit and pending count on drop.
 pub struct SessionGuard {
     slot: Arc<SessionSlot>,
     _permit: OwnedSemaphorePermit,
@@ -31,6 +31,29 @@ pub struct SessionGuard {
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.slot.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Cancel-safe guard for the pending-count increment during `acquire`.
+///
+/// On successful acquisition, `into_guard()` transfers the +1 to
+/// `SessionGuard`. On error or cancellation, `Drop` decrements.
+struct PendingGuard {
+    slot: Arc<SessionSlot>,
+    consumed: bool,
+}
+
+impl PendingGuard {
+    fn into_guard(mut self) {
+        self.consumed = true;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.slot.pending.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -72,8 +95,8 @@ impl SessionActorQueue {
         }
     }
 
-    /// Acquire exclusive access to a session. Blocks until the session is free
-    /// or the timeout expires. Returns a guard that releases on drop.
+    /// Acquire exclusive access to a session. Cancel-safe: `PendingGuard`
+    /// ensures the pending count is decremented even if this future is dropped.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
         let slot = {
             let mut slots = self.slots.lock().await;
@@ -89,32 +112,31 @@ impl SessionActorQueue {
                 .clone()
         };
 
-        // Check queue depth before waiting
         let current = slot.pending.fetch_add(1, Ordering::Relaxed);
+        let pending_guard = PendingGuard {
+            slot: slot.clone(),
+            consumed: false,
+        };
         if current >= self.max_queue_depth {
-            slot.pending.fetch_sub(1, Ordering::Relaxed);
             return Err(SessionQueueError::QueueFull {
                 session_id: session_id.to_string(),
                 depth: current,
             });
         }
 
-        // Acquire owned permit with timeout
         let sem = slot.semaphore.clone();
         match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
             Ok(Ok(permit)) => {
                 *slot.last_active.lock().await = Instant::now();
+                pending_guard.into_guard();
                 Ok(SessionGuard {
                     slot,
                     _permit: permit,
                 })
             }
-            Ok(Err(_)) | Err(_) => {
-                slot.pending.fetch_sub(1, Ordering::Relaxed);
-                Err(SessionQueueError::Timeout {
-                    session_id: session_id.to_string(),
-                })
-            }
+            Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
+                session_id: session_id.to_string(),
+            }),
         }
     }
 

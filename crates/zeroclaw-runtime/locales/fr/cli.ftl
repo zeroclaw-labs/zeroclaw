@@ -148,6 +148,27 @@ cli-sop-list-about = Lister les SOP (Procédures Opérationnelles Standard) char
 cli-sop-validate-about = Valider les définitions des SOP
 cli-sop-show-about = Afficher les détails d'une SOP
 cli-migrate-openclaw-about = Importer la mémoire d'un espace de travail OpenClaw vers cet espace de travail ZeroClaw
+
+# migrate session-ownership (commande d'administration opérateur)
+cli-migrate-session-ownership-err-open-backend = ouvrir le backend de sessions
+cli-migrate-session-ownership-confirm-claim = Revendiquer la session « {$key} » pour l'agent « {$alias} » ? [y/N]
+cli-migrate-session-ownership-aborted = Annulé.
+cli-migrate-session-ownership-claimed-one = La session « {$key} » appartient désormais à l'agent « {$alias} ».
+cli-migrate-session-ownership-err-already-owned = la session « {$key} » appartient déjà à l'agent « {$existing} » ; utilisez --agent-alias « {$existing} » ou effacez d'abord la propriété
+cli-migrate-session-ownership-err-write = écrire la propriété de la session « {$key} »
+cli-migrate-session-ownership-err-unknown-agent = alias d'agent inconnu « {$alias} » ; ce n'est pas un agent configuré — refus d'écrire une propriété qui serait définitivement inaccessible
+cli-migrate-session-ownership-err-unknown-session = la session « {$key} » n'existe pas ; refus de créer une session fantôme
+cli-migrate-session-ownership-none-found = Aucune session non vide sans propriétaire trouvée.
+cli-migrate-session-ownership-found-count = {$count} session(s) non vide(s) sans propriétaire trouvée(s) :
+cli-migrate-session-ownership-list-header = Sessions non vides sans propriétaire :
+cli-migrate-session-ownership-list-item = {$key}  ({$count} messages)
+cli-migrate-session-ownership-prompt-alias = Alias d'agent à assigner comme propriétaire :
+cli-migrate-session-ownership-no-alias = Aucun alias fourni ; annulation.
+cli-migrate-session-ownership-skip-owned = Ignore « {$key} » : appartient déjà à « {$existing} »
+cli-migrate-session-ownership-skip-error = Ignore « {$key} » : {$error}
+cli-migrate-session-ownership-summary = Terminé : {$claimed} revendiquée(s), {$skipped} ignorée(s), {$failed} échec(s).
+cli-migrate-session-ownership-err-partial = {$failed} session(s) n'ont pas pu être revendiquées
+
 cli-agent-long-about =
     Démarrer la boucle de l'agent IA.
 

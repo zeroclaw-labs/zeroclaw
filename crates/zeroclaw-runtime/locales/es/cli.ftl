@@ -148,6 +148,27 @@ cli-sop-list-about = Lista los SOP cargados
 cli-sop-validate-about = Valida las definiciones de SOP
 cli-sop-show-about = Muestra los detalles de un SOP
 cli-migrate-openclaw-about = Importa memoria de un espacio de trabajo OpenClaw a este espacio de trabajo ZeroClaw
+
+# migrate session-ownership (comando de administración del operador)
+cli-migrate-session-ownership-err-open-backend = abrir el backend de sesiones
+cli-migrate-session-ownership-confirm-claim = ¿Reclamar la sesión "{$key}" para el agente "{$alias}"? [y/N]
+cli-migrate-session-ownership-aborted = Abortado.
+cli-migrate-session-ownership-claimed-one = La sesión "{$key}" ahora pertenece al agente "{$alias}".
+cli-migrate-session-ownership-err-already-owned = la sesión "{$key}" ya pertenece al agente "{$existing}"; usa --agent-alias "{$existing}" o borra primero la propiedad
+cli-migrate-session-ownership-err-write = escribir la propiedad de la sesión "{$key}"
+cli-migrate-session-ownership-err-unknown-agent = alias de agente desconocido "{$alias}"; no es un agente configurado — se rechaza escribir una propiedad que quedaría permanentemente inaccesible
+cli-migrate-session-ownership-err-unknown-session = la sesión "{$key}" no existe; se rechaza crear una sesión fantasma
+cli-migrate-session-ownership-none-found = No se encontraron sesiones no vacías sin propietario.
+cli-migrate-session-ownership-found-count = Se encontraron {$count} sesión(es) no vacía(s) sin propietario:
+cli-migrate-session-ownership-list-header = Sesiones no vacías sin propietario:
+cli-migrate-session-ownership-list-item = {$key}  ({$count} mensajes)
+cli-migrate-session-ownership-prompt-alias = Alias de agente para asignar como propietario:
+cli-migrate-session-ownership-no-alias = No se proporcionó ningún alias; abortando.
+cli-migrate-session-ownership-skip-owned = Omitiendo "{$key}": ya pertenece a "{$existing}"
+cli-migrate-session-ownership-skip-error = Omitiendo "{$key}": {$error}
+cli-migrate-session-ownership-summary = Listo: reclamadas {$claimed}, omitidas {$skipped}, fallidas {$failed}.
+cli-migrate-session-ownership-err-partial = {$failed} sesión(es) no se pudieron reclamar
+
 cli-agent-long-about =
     Inicia el bucle del agente de IA.
 

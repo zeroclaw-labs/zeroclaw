@@ -25,6 +25,37 @@ pub fn sanitize_session_key(key: &str) -> String {
         .collect()
 }
 
+/// Return `true` if `key` is already in canonical form: non-empty and
+/// containing only `[A-Za-z0-9_-]` (plus Unicode alphanumerics, matching
+/// `sanitize_session_key`). Equivalent to `sanitize_session_key(key) == key`
+/// but allocation-free.
+///
+/// Client-facing entry points (the chat-completions endpoint and the
+/// WebSocket handshake) reject noncanonical keys instead of silently
+/// folding them: because `sanitize_session_key` maps every disallowed
+/// character to `_`, distinct raw keys such as `alpha.beta` and `alpha/beta`
+/// would otherwise collapse to the same persistence key (`gw_alpha_beta`)
+/// while the client sees two different session IDs — sharing one transcript,
+/// ownership record, and memory scope. Restricting inputs to canonical keys
+/// makes the `gw_`-prefixed persistence key injective.
+pub fn is_canonical_session_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Canonical memory-session identifier shared by WS and HTTP paths.
+///
+/// Both transports must pass the same identifier to
+/// `Agent::set_memory_session_id` so the memory backend sees a single
+/// scope regardless of transport. This is the sanitized form of the
+/// client-supplied session ID, matching the on-disk JSONL filename and
+/// the `session_id` column in SQLite backends.
+pub fn canonical_memory_id(session_id: &str) -> String {
+    sanitize_session_key(session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +90,60 @@ mod tests {
     fn preserves_unicode_alphanumeric() {
         // is_alphanumeric() treats unicode letters/digits as alphanumeric.
         assert_eq!(sanitize_session_key("user_Алиса"), "user_Алиса");
+    }
+
+    #[test]
+    fn canonical_memory_id_preserves_punctuation_key() {
+        // WS and HTTP must produce identical memory-scope identifiers for
+        // the same client session ID, including keys with punctuation.
+        assert_eq!(canonical_memory_id("alpha.beta"), "alpha_beta");
+        assert_eq!(canonical_memory_id("test.alpha"), "test_alpha");
+        // UUID-based IDs are unaffected.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(canonical_memory_id(uuid), uuid);
+    }
+
+    #[test]
+    fn is_canonical_accepts_canonical_keys() {
+        assert!(is_canonical_session_key("abc-DEF_123"));
+        assert!(is_canonical_session_key(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(is_canonical_session_key("user_Алиса"));
+    }
+
+    #[test]
+    fn is_canonical_rejects_noncanonical_keys() {
+        // Distinct raw keys that would collapse under sanitize_session_key.
+        assert!(!is_canonical_session_key("alpha.beta"));
+        assert!(!is_canonical_session_key("alpha/beta"));
+        assert!(!is_canonical_session_key("alpha beta"));
+        assert!(!is_canonical_session_key("alpha:beta"));
+        assert!(!is_canonical_session_key("alpha@beta"));
+    }
+
+    #[test]
+    fn is_canonical_rejects_empty() {
+        assert!(!is_canonical_session_key(""));
+    }
+
+    #[test]
+    fn is_canonical_agrees_with_sanitize_fixpoint() {
+        // is_canonical_session_key(x) must equal (sanitize_session_key(x) == x)
+        // for non-empty inputs.
+        for k in [
+            "abc-DEF_123",
+            "alpha.beta",
+            "alpha/beta",
+            "user_Алиса",
+            "550e8400-e29b-41d4",
+            "has space",
+        ] {
+            assert_eq!(
+                is_canonical_session_key(k),
+                sanitize_session_key(k) == k,
+                "mismatch for {k:?}"
+            );
+        }
     }
 }

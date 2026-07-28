@@ -596,6 +596,27 @@ pub enum MigrateCommands {
         #[arg(long)]
         reindex: bool,
     },
+
+    /// Backfill session ownership metadata for pre-migration sessions
+    #[command(name = "session-ownership")]
+    #[cfg(feature = "agent-runtime")]
+    SessionOwnership {
+        /// List unowned sessions (non-empty, no recorded owner)
+        #[arg(long, conflicts_with_all = ["claim", "agent_alias", "yes"])]
+        list: bool,
+
+        /// Session key to claim
+        #[arg(long, requires = "agent_alias")]
+        claim: Option<String>,
+
+        /// Agent alias to assign as owner
+        #[arg(long, requires = "claim")]
+        agent_alias: Option<String>,
+
+        /// Skip confirmation prompt
+        #[arg(long, requires = "agent_alias")]
+        yes: bool,
+    },
 }
 
 /// Cron subcommands

@@ -148,6 +148,27 @@ cli-sop-list-about = ロードされた SOP を一覧表示
 cli-sop-validate-about = SOP 定義を検証
 cli-sop-show-about = SOP の詳細を表示
 cli-migrate-openclaw-about = OpenClaw ワークスペースからこの ZeroClaw ワークスペースにメモリをインポート
+
+# migrate session-ownership（オペレーター管理コマンド）
+cli-migrate-session-ownership-err-open-backend = セッションバックエンドを開く
+cli-migrate-session-ownership-confirm-claim = セッション "{$key}" をエージェント "{$alias}" に割り当てますか？[y/N]
+cli-migrate-session-ownership-aborted = 中止しました。
+cli-migrate-session-ownership-claimed-one = セッション "{$key}" はエージェント "{$alias}" が所有するようになりました。
+cli-migrate-session-ownership-err-already-owned = セッション "{$key}" はすでにエージェント "{$existing}" が所有しています。--agent-alias "{$existing}" を使用するか、先に所有権を解除してください
+cli-migrate-session-ownership-err-write = セッション "{$key}" の所有権を書き込む
+cli-migrate-session-ownership-err-unknown-agent = 不明なエージェントエイリアス "{$alias}"。設定されたエージェントではありません — 永久にアクセス不能になる所有権の書き込みを拒否します
+cli-migrate-session-ownership-err-unknown-session = セッション "{$key}" は存在しません。ゴーストセッションの作成を拒否します
+cli-migrate-session-ownership-none-found = 所有者のいない空でないセッションは見つかりませんでした。
+cli-migrate-session-ownership-found-count = 所有者のいない空でないセッションが {$count} 件見つかりました：
+cli-migrate-session-ownership-list-header = 所有者のいない空でないセッション：
+cli-migrate-session-ownership-list-item = {$key}  （{$count} 件のメッセージ）
+cli-migrate-session-ownership-prompt-alias = 所有者として割り当てるエージェントエイリアス：
+cli-migrate-session-ownership-no-alias = エイリアスが指定されていません。中止します。
+cli-migrate-session-ownership-skip-owned = "{$key}" をスキップ：すでに "{$existing}" が所有しています
+cli-migrate-session-ownership-skip-error = "{$key}" をスキップ：{$error}
+cli-migrate-session-ownership-summary = 完了：割り当て {$claimed} 件、スキップ {$skipped} 件、失敗 {$failed} 件。
+cli-migrate-session-ownership-err-partial = {$failed} 件のセッションの割り当てに失敗しました
+
 cli-agent-long-about =
     AI エージェントループを起動します。
 

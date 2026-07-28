@@ -180,6 +180,26 @@ cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
 
+# migrate session-ownership (operator admin command)
+cli-migrate-session-ownership-err-open-backend = open session backend
+cli-migrate-session-ownership-confirm-claim = Claim session "{$key}" for agent "{$alias}"? [y/N]
+cli-migrate-session-ownership-aborted = Aborted.
+cli-migrate-session-ownership-claimed-one = Session "{$key}" now owned by agent "{$alias}".
+cli-migrate-session-ownership-err-already-owned = session "{$key}" already owned by agent "{$existing}"; use --agent-alias "{$existing}" or clear ownership first
+cli-migrate-session-ownership-err-write = write ownership for session "{$key}"
+cli-migrate-session-ownership-err-unknown-agent = unknown agent alias "{$alias}"; it is not a configured agent — refusing to write ownership that would be permanently inaccessible
+cli-migrate-session-ownership-err-unknown-session = session "{$key}" does not exist; refusing to create a ghost session
+cli-migrate-session-ownership-none-found = No unowned non-empty sessions found.
+cli-migrate-session-ownership-found-count = Found {$count} unowned non-empty session(s):
+cli-migrate-session-ownership-list-header = Unowned non-empty sessions:
+cli-migrate-session-ownership-list-item = {$key}  ({$count} messages)
+cli-migrate-session-ownership-prompt-alias = Agent alias to assign as owner:
+cli-migrate-session-ownership-no-alias = No alias provided; aborting.
+cli-migrate-session-ownership-skip-owned = Skipping "{$key}": already owned by "{$existing}"
+cli-migrate-session-ownership-skip-error = Skipping "{$key}": {$error}
+cli-migrate-session-ownership-summary = Done: claimed {$claimed}, skipped {$skipped}, failed {$failed}.
+cli-migrate-session-ownership-err-partial = {$failed} session(s) failed to claim
+
 cli-agent-long-about =
     Start the AI agent loop.
 

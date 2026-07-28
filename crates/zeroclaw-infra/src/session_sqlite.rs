@@ -875,6 +875,47 @@ impl SessionBackend for SqliteSessionBackend {
         })
     }
 
+    fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<crate::session_backend::ClaimOutcome> {
+        use crate::session_backend::ClaimOutcome;
+        // Hold the single connection lock across read + conditional write so
+        // the compare-and-set is atomic against concurrent claims.
+        let conn = self.conn.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(std::io::Error::other(other)),
+            })?;
+        match existing {
+            Some(ref owner) if owner != agent_alias => Ok(ClaimOutcome::Conflict(owner.clone())),
+            Some(_) => Ok(ClaimOutcome::Claimed),
+            None => {
+                // No owner recorded yet (row may or may not exist). Insert the
+                // row if missing, and set the owner only when still NULL — the
+                // WHERE guard makes a lost update impossible even though we
+                // already hold the lock.
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                     VALUES (?1, ?2, ?3, 0, ?4)
+                     ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
+                     WHERE session_metadata.agent_alias IS NULL",
+                    params![session_key, now, now, agent_alias],
+                )
+                .map_err(std::io::Error::other)?;
+                Ok(ClaimOutcome::Claimed)
+            }
+        }
+    }
+
     fn set_session_context(
         &self,
         session_key: &str,
@@ -1533,5 +1574,81 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+
+    #[test]
+    fn claim_ownership_first_caller_wins_then_conflict() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "claim_race";
+
+        assert_eq!(
+            backend.claim_session_agent_alias(key, "alice").unwrap(),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            backend.claim_session_agent_alias(key, "alice").unwrap(),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            backend.claim_session_agent_alias(key, "bob").unwrap(),
+            ClaimOutcome::Conflict("alice".to_string())
+        );
+        assert_eq!(
+            backend.get_session_agent_alias(key).unwrap(),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn claim_ownership_does_not_overwrite_existing_owner() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "owned";
+
+        // Pre-existing owner recorded via the plain setter.
+        backend.set_session_agent_alias(key, "alice").unwrap();
+        // A different alias claiming must conflict, not overwrite.
+        assert_eq!(
+            backend.claim_session_agent_alias(key, "mallory").unwrap(),
+            ClaimOutcome::Conflict("alice".to_string())
+        );
+        assert_eq!(
+            backend.get_session_agent_alias(key).unwrap(),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn claim_ownership_concurrent_only_one_wins() {
+        use crate::session_backend::ClaimOutcome;
+        use std::sync::Arc;
+        // Mirror of the JSONL concurrent single-winner test: 8 threads race to
+        // claim the same unowned session through the shared connection lock;
+        // exactly one must win (Claimed) and the rest must Conflict.
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let key = "concurrent_claim";
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let backend = Arc::clone(&backend);
+            let alias = format!("agent{i}");
+            handles.push(std::thread::spawn(move || {
+                backend.claim_session_agent_alias(key, &alias).unwrap()
+            }));
+        }
+        let outcomes: Vec<ClaimOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes
+            .iter()
+            .filter(|o| matches!(o, ClaimOutcome::Claimed))
+            .count();
+        assert_eq!(claimed, 1, "exactly one concurrent claim must win");
+        assert_eq!(outcomes.len(), 8);
+        // The stored owner must be one of the racing aliases, and stable.
+        let owner = backend.get_session_agent_alias(key).unwrap();
+        assert!(owner.is_some(), "a winner must have recorded ownership");
     }
 }
