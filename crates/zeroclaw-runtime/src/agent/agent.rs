@@ -541,6 +541,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the agent's sealed tool set. Production callers obtain the
+    /// [`crate::tools::scoped::ScopedToolRegistry`] from
+    /// `ScopedToolRegistry::assemble(...)` (the `.registry` field of its
+    /// output); raw `Vec<Box<dyn Tool>>` fixtures use
+    /// `ScopedToolRegistry::from_raw_for_test`, available to this crate's unit
+    /// tests and, via the dev-only `test-util` feature, to other crates' test
+    /// builds. [`Self::build`] applies the `allowed_tools` and ACP
+    /// memory-strip filters on top of the sealed set.
     pub fn tools(mut self, tools: crate::tools::scoped::ScopedToolRegistry) -> Self {
         self.tools = Some(tools);
         self
