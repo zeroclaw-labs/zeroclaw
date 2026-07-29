@@ -4323,6 +4323,7 @@ done
             args: vec![pid_path.display().to_string()],
             env: std::collections::HashMap::new(),
             tool_timeout_secs: None,
+            danger_accept_invalid_certs: false,
             transport: zeroclaw_config::schema::McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::new(),

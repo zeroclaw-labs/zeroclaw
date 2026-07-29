@@ -4973,6 +4973,11 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Skip TLS certificate verification (insecure, use only for self-signed
+    /// or internal CA certificates). The `danger_` prefix follows reqwest's
+    /// naming convention to signal that this is a security-relevant option.
+    #[serde(default)]
+    pub danger_accept_invalid_certs: bool,
     /// Resource URIs to read once at agent startup and inject into the system
     /// prompt as untrusted, server-origin context. Each is read via
     /// `resources/read` on this server; pins on a server that does not advertise
@@ -31545,6 +31550,37 @@ high_entropy_tokens = false
                 Some(transport.required_leaf()),
             );
         }
+    }
+
+    #[test]
+    async fn mcp_server_config_danger_accept_invalid_certs_roundtrip() {
+        let toml_str = r#"
+            name = "internal-gateway"
+            transport = "http"
+            url = "https://mcp.internal.example.com/mcp"
+            danger_accept_invalid_certs = true
+        "#;
+
+        let parsed: McpServerConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(parsed.name, "internal-gateway");
+        assert_eq!(parsed.transport, McpTransport::Http);
+        assert_eq!(
+            parsed.url.as_deref(),
+            Some("https://mcp.internal.example.com/mcp")
+        );
+        assert!(parsed.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    async fn mcp_server_config_danger_accept_invalid_certs_defaults_to_false() {
+        let toml_str = r#"
+            name = "official"
+            transport = "http"
+            url = "https://mcp.example.com/mcp"
+        "#;
+
+        let parsed: McpServerConfig = toml::from_str(toml_str).expect("deserialize");
+        assert!(!parsed.danger_accept_invalid_certs);
     }
 
     #[test]

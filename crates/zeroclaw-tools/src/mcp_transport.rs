@@ -905,6 +905,33 @@ pub struct HttpTransport {
     session_id: ParkingMutex<Option<String>>,
 }
 
+/// Compute the reqwest client-wide timeout so it never undercuts the configured
+/// tool budget. The client timeout must be at least as large as `tool_timeout_secs`
+/// so it does not fire before the per-call SSE read wrapper.
+fn http_client_timeout_secs(tool_timeout_secs: Option<u64>) -> u64 {
+    tool_timeout_secs.unwrap_or(120).max(120)
+}
+
+fn build_mcp_http_client(
+    config: &McpServerConfig,
+    transport: &'static str,
+    timeout_secs: Option<u64>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if config.danger_accept_invalid_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(timeout_secs) = timeout_secs {
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    }
+    builder.build().with_context(|| {
+        format!(
+            "failed to build MCP {transport} client for server `{}` (danger_accept_invalid_certs={})",
+            config.name, config.danger_accept_invalid_certs
+        )
+    })
+}
+
 impl HttpTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
         let url = config
@@ -925,9 +952,11 @@ impl HttpTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        let client = build_mcp_http_client(
+            config,
+            "HTTP",
+            Some(http_client_timeout_secs(config.tool_timeout_secs)),
+        )?;
 
         Ok(Self {
             url,
@@ -1137,9 +1166,7 @@ impl SseTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        let client = build_mcp_http_client(config, "SSE", None)?;
 
         Ok(Self {
             sse_url,
@@ -2272,6 +2299,67 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("session-xyz")
         );
+    }
+
+    // ── http_client_timeout_secs tests ───────────────────────────────────────
+
+    #[test]
+    fn http_client_timeout_defaults_to_120_when_tool_timeout_unset() {
+        assert_eq!(http_client_timeout_secs(None), 120);
+    }
+
+    #[test]
+    fn http_client_timeout_uses_tool_timeout_when_above_120() {
+        assert_eq!(http_client_timeout_secs(Some(300)), 300);
+        assert_eq!(http_client_timeout_secs(Some(600)), 600);
+    }
+
+    #[test]
+    fn http_client_timeout_keeps_120_floor_when_tool_timeout_below_120() {
+        assert_eq!(http_client_timeout_secs(Some(30)), 120);
+        assert_eq!(http_client_timeout_secs(Some(1)), 120);
+    }
+
+    #[test]
+    fn mcp_transport_danger_accept_invalid_certs_defaults_to_false() {
+        let config = McpServerConfig::default();
+        assert!(!config.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn http_transport_builds_successfully_with_high_tool_timeout() {
+        let config = McpServerConfig {
+            name: "test-http-slow".into(),
+            transport: McpTransport::Http,
+            url: Some("http://localhost/mcp".into()),
+            tool_timeout_secs: Some(300),
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(&config).is_ok());
+    }
+
+    #[test]
+    fn http_transport_builds_with_danger_accept_invalid_certs_enabled() {
+        let config = McpServerConfig {
+            name: "test-http-insecure".into(),
+            transport: McpTransport::Http,
+            url: Some("https://mcp.internal.example.com/mcp".into()),
+            danger_accept_invalid_certs: true,
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(&config).is_ok());
+    }
+
+    #[test]
+    fn sse_transport_builds_with_danger_accept_invalid_certs_enabled() {
+        let config = McpServerConfig {
+            name: "test-sse-insecure".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://mcp.internal.example.com/sse".into()),
+            danger_accept_invalid_certs: true,
+            ..Default::default()
+        };
+        assert!(SseTransport::new(&config).is_ok());
     }
 
     // ── derive_message_url tests ──────────────────────────────────────────────
