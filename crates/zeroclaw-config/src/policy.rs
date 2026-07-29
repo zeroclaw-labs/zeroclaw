@@ -1146,6 +1146,12 @@ fn strip_windows_exe_suffix(name: &str) -> &str {
     }
 }
 
+/// Returns true if `allowed` contains any glob metacharacter
+/// (`*`, `?`, `[`, `]`).
+fn contains_glob_metacharacters(s: &str) -> bool {
+    s.chars().any(|c| matches!(c, '*' | '?' | '[' | ']'))
+}
+
 fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
@@ -1158,11 +1164,27 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     }
 
     // Path-like allowlist entries must match the executable token exactly
-    // after "~" expansion.
+    // after "~" expansion, or via glob pattern.
     if looks_like_path(allowed) {
         let allowed_path = expand_user_path(allowed);
         let executable_path = expand_user_path(executable);
-        return executable_path == allowed_path;
+
+        // Exact match first.
+        if executable_path == allowed_path {
+            return true;
+        }
+
+        // Glob pattern match (e.g. `/Plugin/.zeroclaw/workspace/scripts/**/*.sh`).
+        let allowed_str = allowed_path.to_string_lossy();
+        let executable_str = executable_path.to_string_lossy();
+        if contains_glob_metacharacters(&allowed_str)
+            && let Ok(pattern) = glob::Pattern::new(&allowed_str)
+            && pattern.matches(&executable_str)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     // Command-name entries continue to match by basename.
