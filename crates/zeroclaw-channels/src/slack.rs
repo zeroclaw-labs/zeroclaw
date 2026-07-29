@@ -59,7 +59,7 @@ pub struct SlackChannel {
     /// write a lifecycle state or issue the terminal clear. Without this an
     /// older turn's completion would blank a newer turn's status, and its late
     /// lifecycle write would overwrite it.
-    assistant_status_owners: AsyncMutex<HashMap<AssistantTarget, String>>,
+    assistant_status_owners: AsyncMutex<HashMap<AssistantTarget, AssistantStatusOwner>>,
     /// In-flight progress `chat.update` tasks per draft. Progress updates are
     /// dispatched detached so the draft updater never back-pressures the tool
     /// loop, which means a slow update can still be in flight when the turn
@@ -117,6 +117,26 @@ struct SlackDraftTurn {
     thread_ts: Option<String>,
     assistant_target: Option<AssistantTarget>,
 }
+
+/// Which draft holds the current generation for one Assistant status surface.
+#[derive(Debug, Clone)]
+struct AssistantStatusOwner {
+    draft_id: String,
+    claimed_at: Instant,
+}
+
+/// Upper bound on tracked Assistant status surfaces, mirroring
+/// `PACING_RECIPIENT_CAP`. One entry per Assistant thread; the oldest claim is
+/// evicted past this point so a long-lived daemon cannot grow the map forever.
+const ASSISTANT_STATUS_OWNER_CAP: usize = 1024;
+
+/// Bounded attempts for the terminal Assistant status clear, so a transient
+/// Slack failure does not immediately strand stale lifecycle text.
+const ASSISTANT_STATUS_CLEAR_ATTEMPTS: usize = 3;
+
+/// Delay between terminal-clear attempts. Kept short: this runs on the path
+/// that delivers the final answer.
+const ASSISTANT_STATUS_CLEAR_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
@@ -588,66 +608,106 @@ impl SlackChannel {
 
     /// Hand `message_id` the current generation for `target`, displacing any
     /// older draft. Called when a draft is created for an Assistant thread.
+    ///
+    /// Claiming also repairs a target whose previous clear failed: the retained
+    /// generation is replaced, and this turn's own terminal path clears the
+    /// surface. That is the recovery path for a stranded status.
     async fn claim_assistant_status(&self, target: &AssistantTarget, message_id: &str) {
-        self.assistant_status_owners
-            .lock()
-            .await
-            .insert(target.clone(), message_id.to_string());
+        let mut owners = self.assistant_status_owners.lock().await;
+        owners.insert(
+            target.clone(),
+            AssistantStatusOwner {
+                draft_id: message_id.to_string(),
+                claimed_at: Instant::now(),
+            },
+        );
+        // One entry per Assistant thread, so this grows with distinct threads
+        // rather than turns — but a long-lived daemon would still accumulate
+        // them without a bound. Evict the oldest claim, matching the
+        // `PACING_RECIPIENT_CAP` idiom used for the pacing map.
+        if owners.len() > ASSISTANT_STATUS_OWNER_CAP
+            && let Some(victim) = owners
+                .iter()
+                .min_by_key(|(_, owner)| owner.claimed_at)
+                .map(|(target, _)| target.clone())
+        {
+            owners.remove(&victim);
+        }
     }
 
     /// Whether `message_id` still owns `target`'s status surface. A superseded
     /// draft answers `false` and must not write or clear.
+    ///
+    /// A missing entry also answers `false`. That is deliberate: after an
+    /// eviction we cannot prove this draft is still the live turn, and guessing
+    /// wrong would blank a working turn's status. The surface then self-heals
+    /// when the next turn in that thread claims and completes.
     async fn owns_assistant_status(&self, target: &AssistantTarget, message_id: &str) -> bool {
         self.assistant_status_owners
             .lock()
             .await
             .get(target)
-            .is_some_and(|owner| owner == message_id)
+            .is_some_and(|owner| owner.draft_id == message_id)
     }
 
     /// Release `target` only if `message_id` still owns it, so a late terminal
-    /// path cannot strip a newer turn's ownership. Returns whether it released.
-    async fn release_assistant_status(&self, target: &AssistantTarget, message_id: &str) -> bool {
+    /// path cannot strip a newer turn's ownership.
+    async fn release_assistant_status(&self, target: &AssistantTarget, message_id: &str) {
         let mut owners = self.assistant_status_owners.lock().await;
-        if owners.get(target).is_some_and(|owner| owner == message_id) {
+        if owners
+            .get(target)
+            .is_some_and(|owner| owner.draft_id == message_id)
+        {
             owners.remove(target);
-            true
-        } else {
-            false
         }
     }
 
     /// Issue the terminal empty-status clear for a turn that still owns its
     /// Assistant surface.
     ///
-    /// Ownership is released only after Slack accepts the clear. A failed clear
-    /// keeps the generation, so the surface still has an identified owner and a
-    /// later terminal path can retry it rather than leaving stale lifecycle text
-    /// behind an erased record.
+    /// A transient Slack failure must not strand stale lifecycle text, so the
+    /// clear is retried a bounded number of times. Ownership is released only
+    /// once Slack accepts it; if every attempt fails the generation is retained,
+    /// which both keeps the failure attributable and leaves the recovery path
+    /// open — the next turn in that thread reclaims the target and its own
+    /// terminal path clears the surface.
     async fn clear_owned_assistant_status(&self, turn: &SlackDraftTurn, message_id: &str) {
         let Some(target) = turn.assistant_target.as_ref() else {
             return;
         };
-        if !self.owns_assistant_status(target, message_id).await {
-            // A newer turn owns the surface; blanking it would erase live state.
-            return;
-        }
-        match self.set_assistant_status(target, "").await {
-            Ok(()) => {
-                self.release_assistant_status(target, message_id).await;
+
+        for attempt in 0..ASSISTANT_STATUS_CLEAR_ATTEMPTS {
+            // Re-checked every attempt: a newer turn may claim the surface while
+            // we are retrying, and blanking it would erase live state.
+            if !self.owns_assistant_status(target, message_id).await {
+                return;
             }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "channel_id": target.channel_id,
-                            "thread_ts": target.thread_ts,
-                            "error": format!("{e}"),
-                        })),
-                    "Slack assistant status clear failed; ownership retained for retry"
-                );
+            match self.set_assistant_status(target, "").await {
+                Ok(()) => {
+                    self.release_assistant_status(target, message_id).await;
+                    return;
+                }
+                Err(e) => {
+                    let last = attempt + 1 == ASSISTANT_STATUS_CLEAR_ATTEMPTS;
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_id": target.channel_id,
+                                "thread_ts": target.thread_ts,
+                                "attempt": attempt + 1,
+                                "attempts": ASSISTANT_STATUS_CLEAR_ATTEMPTS,
+                                "exhausted": last,
+                                "error": format!("{e}"),
+                            })),
+                        "Slack assistant status clear failed"
+                    );
+                    if last {
+                        return;
+                    }
+                    tokio::time::sleep(ASSISTANT_STATUS_CLEAR_RETRY_DELAY).await;
+                }
             }
         }
     }
@@ -7555,10 +7615,10 @@ mod tests {
         );
     }
 
-    /// A transient Slack failure on the terminal clear must not silently strand
-    /// stale lifecycle text. The generation is retained so the surface still has
-    /// an identified owner and a later terminal path can retry the clear,
-    /// instead of the only target record being erased on a failed request.
+    /// When every bounded attempt fails, the generation is retained rather than
+    /// erased. That keeps the failure attributable and leaves the recovery path
+    /// open: the next turn in the thread reclaims the target and its own
+    /// terminal path clears the surface.
     #[tokio::test]
     async fn a_failed_assistant_clear_retains_ownership_so_it_can_be_retried() {
         use wiremock::matchers::{method, path};
@@ -7566,19 +7626,10 @@ mod tests {
 
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
-        // First clear attempt fails, the retry succeeds.
+        // Every attempt fails, so the in-path retry cannot rescue this turn.
         Mock::given(method("POST"))
             .and(path("/assistant.threads.setStatus"))
             .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/assistant.threads.setStatus"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ok": true,
-            })))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -7609,31 +7660,140 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Finalization attempts the clear; Slack rejects it.
+        // Finalization exhausts its bounded attempts; Slack rejects every one.
         ch.finalize_draft("C123", &draft, "done", false)
             .await
             .unwrap();
         assert!(
             ch.owns_assistant_status(&target, &draft).await,
-            "a failed clear must keep the generation so it stays retryable"
-        );
-
-        // The retained ownership makes a retry effective.
-        let turn = SlackDraftTurn {
-            recipient: "C123".to_string(),
-            thread_ts: Some("thread-one".to_string()),
-            assistant_target: Some(target.clone()),
-        };
-        ch.clear_owned_assistant_status(&turn, &draft).await;
-        assert!(
-            !ch.owns_assistant_status(&target, &draft).await,
-            "a successful clear must release the generation"
+            "an exhausted clear must keep the generation rather than erase the \
+             only record of the target"
         );
         let calls = assistant_status_calls(&server).await;
         assert_eq!(
             calls.iter().filter(|(_, status)| status.is_empty()).count(),
-            2,
-            "the clear must have been attempted twice: {calls:?}"
+            ASSISTANT_STATUS_CLEAR_ATTEMPTS,
+            "every bounded attempt must have been made: {calls:?}"
+        );
+
+        // Recovery path: the next turn in this thread reclaims the target, and
+        // its own terminal path clears the surface.
+        let next_draft = ch
+            .send_draft(
+                &SendMessage::new("...", "C123")
+                    .in_thread(Some("thread-one".to_string()))
+                    .in_reply_to(Some("slack_C123_message-two".to_string())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ch.owns_assistant_status(&target, &next_draft).await,
+            "the newer turn must take the generation from the stranded one"
+        );
+        assert!(
+            !ch.owns_assistant_status(&target, &draft).await,
+            "the stranded turn must no longer own the surface"
+        );
+    }
+
+    /// A transient failure is retried within one terminal path rather than
+    /// waiting for a later turn, so an ordinary blip does not leave the surface
+    /// showing stale lifecycle text.
+    #[tokio::test]
+    async fn a_transient_assistant_clear_failure_is_retried_within_one_terminal_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "final-ts",
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
+        let target = AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "thread-one".to_string(),
+        };
+        ch.active_assistant_threads
+            .lock()
+            .unwrap()
+            .insert(target.clone());
+        let draft = ch
+            .send_draft(
+                &SendMessage::new("...", "C123")
+                    .in_thread(Some("thread-one".to_string()))
+                    .in_reply_to(Some("slack_C123_message-one".to_string())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        ch.finalize_draft("C123", &draft, "done", false)
+            .await
+            .unwrap();
+
+        assert!(
+            !ch.owns_assistant_status(&target, &draft).await,
+            "the in-path retry must succeed and release the generation"
+        );
+        server.verify().await;
+    }
+
+    /// One entry per Assistant thread still grows without bound in a long-lived
+    /// daemon, so the owner map is capped and evicts the oldest claim.
+    #[tokio::test]
+    async fn the_assistant_status_owner_map_is_bounded() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
+
+        for i in 0..(ASSISTANT_STATUS_OWNER_CAP + 32) {
+            ch.claim_assistant_status(
+                &AssistantTarget {
+                    channel_id: "C123".to_string(),
+                    thread_ts: format!("thread-{i}"),
+                },
+                &format!("draft-{i}"),
+            )
+            .await;
+        }
+
+        let owners = ch.assistant_status_owners.lock().await;
+        assert!(
+            owners.len() <= ASSISTANT_STATUS_OWNER_CAP,
+            "the owner map must stay bounded, got {}",
+            owners.len()
+        );
+        assert!(
+            owners.contains_key(&AssistantTarget {
+                channel_id: "C123".to_string(),
+                thread_ts: format!("thread-{}", ASSISTANT_STATUS_OWNER_CAP + 31),
+            }),
+            "the newest claim must survive eviction"
         );
     }
 
