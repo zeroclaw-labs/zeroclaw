@@ -1639,21 +1639,26 @@ impl SecurityPolicy {
     /// Like [`SecurityPolicy::forbidden_path_argument`] but for a command that
     /// runs IN the workspace: each workspace-relative path argument is also
     /// resolved (following symlinks, including dangling ones) and re-checked
-    /// against the workspace boundary, so an in-workspace symlink pointing
-    /// outside cannot be used to escape - the same protection the file tools
-    /// enforce.
+    /// against the workspace boundary, catching an in-workspace symlink that
+    /// points outside for the argument forms this static scan can see.
     ///
-    /// Scope and known limitations. This is a best-effort static guard over a
-    /// token-scanned command line; it closes the reported bypass (a *path-shaped*
-    /// argument - one containing a separator, e.g. `link/x`, or a redirect target,
-    /// or an absolute / `..` form - that reaches outside via an in-workspace
-    /// symlink) and matches the file tools' boundary for those. It does NOT, and
-    /// cannot from a static parse, cover: a *bare* argument with no separator
-    /// (`cat somelink`) that is itself a symlink, values produced by shell
-    /// variable expansion or command substitution (`$VAR`, `$(...)`), or `eval`.
-    /// A shell command is Turing-complete; the only complete containment is an OS
-    /// sandbox (see the sandbox / firejail work). This guard raises the bar to
-    /// parity with the file tools for the argument forms it can see.
+    /// This is best-effort, defense-in-depth hardening over a token-scanned
+    /// command line - NOT a complete workspace boundary, and NOT equivalent to
+    /// the file tools, which resolve an operation-aware target at the call site.
+    /// It flags a *path-shaped* argument (one with a separator, e.g. `link/x`, a
+    /// redirect target, or an absolute / `..` form) that escapes via an
+    /// in-workspace symlink. It does NOT, and cannot from a static parse, cover:
+    /// a *bare* argument with no separator (`cat somelink`) that is a symlink; a
+    /// path computed at run time via variable expansion or command substitution
+    /// (`$VAR`, `$(...)`), `eval`, or a write done inside an executed script
+    /// (`sh ./x.sh`, where only the script path is scanned); a quoted path
+    /// holding whitespace (`"link dir/out"`), which the whitespace tokenizer
+    /// fragments; read-vs-write direction (an argument may be read or written, so
+    /// a resolved target allowed for EITHER passes, unlike the operation-aware
+    /// file tools); or non-Unix relative forms (a `link\file` path on Windows). A
+    /// shell command is Turing-complete; complete containment is the execution
+    /// boundary (the OS sandbox and the broader granular sandbox-policy work),
+    /// not this preflight.
     pub fn forbidden_workspace_path_argument(&self, command: &str) -> Option<String> {
         self.forbidden_path_argument_impl(command, true)
     }
@@ -1680,11 +1685,12 @@ impl SecurityPolicy {
             // symlink whose target is outside the workspace: the string check
             // above passes because the literal path has no `..` and is not
             // absolute, yet the real target is elsewhere. The file tools already
-            // block this by canonicalizing before checking; mirror that here so a
-            // shell command cannot bypass the workspace boundary that file_write
-            // enforces. Resolve the deepest existing ancestor (the leaf may be
-            // about to be created, e.g. `touch link/new.txt`) and re-check the
-            // resolved target with the symlink-aware policy.
+            // block this by canonicalizing before checking; mirror that here for
+            // the path-shaped argument forms this static scan can see (a full
+            // boundary needs the execution-time sandbox). Resolve the deepest
+            // existing ancestor (the leaf may be about to be created, e.g.
+            // `touch link/new.txt`) and re-check the resolved target with the
+            // symlink-aware policy.
             // For a command that runs IN the workspace, also resolve symlinks and
             // re-check: a workspace-relative arg can point outside via an
             // in-workspace symlink, which the string check above misses. A
