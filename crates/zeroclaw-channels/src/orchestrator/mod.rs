@@ -7276,6 +7276,28 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+/// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
+///
+/// One-off callers match on this sentinel instead of the error text so the
+/// builder stays the single source of truth for which ids it resolves; a family
+/// added or removed there changes the fallback automatically.
+#[derive(Debug)]
+struct UnknownChannelId(String);
+
+impl std::fmt::Display for UnknownChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(channel_id) = self;
+        write!(
+            f,
+            "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
+            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
+            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+        )
+    }
+}
+
+impl std::error::Error for UnknownChannelId {}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -8074,11 +8096,7 @@ fn build_channel_by_id(
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
-        other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
-        ),
+        other => Err(anyhow::Error::new(UnknownChannelId(other.to_string()))),
     }
 }
 
@@ -8089,18 +8107,27 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
-    if channel_id.contains('.') {
-        deliver_announcement(config, channel_id, recipient, None, message)
-            .await
-            .with_context(|| format!("Failed to send message via {channel_id}"))?;
-        println!("Message sent via {channel_id}.");
-        return Ok(());
-    }
-
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let channel = build_channel_by_id(&config_arc, channel_id)?;
+    // The builder gets first refusal so families it already resolves natively
+    // (notably `linq.<alias>`) keep their established route and their own
+    // configuration errors. Only a dotted id the builder does not claim at all
+    // falls through to the announcement dispatcher, which resolves any
+    // `<type>.<alias>` it supports.
+    let channel = match build_channel_by_id(&config_arc, channel_id) {
+        Ok(channel) => channel,
+        Err(err)
+            if channel_id.contains('.') && err.downcast_ref::<UnknownChannelId>().is_some() =>
+        {
+            deliver_announcement(config, channel_id, recipient, None, message)
+                .await
+                .with_context(|| format!("Failed to send message via {channel_id}"))?;
+            println!("Message sent via {channel_id}.");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let msg = SendMessage::new(message, recipient);
     channel
         .send(&msg)
@@ -27578,6 +27605,29 @@ Done."#;
         assert!(
             message.contains("[channels.discord.governance] not configured"),
             "dotted alias should reach named channel resolution; got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-linq")]
+    async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
+        // `linq.<alias>` predates the announcement delegation and is resolved by
+        // the one-off builder itself. Delegating every dotted id would route it
+        // to an arm that does not exist, so assert it still lands on the
+        // builder's own alias lookup rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "linq.governance", "+15550100", "test message")
+            .await
+            .expect_err("unconfigured alias should fail at the builder's linq arm");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Linq alias 'governance' not configured"),
+            "dotted linq id should stay on the one-off builder; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted linq id must not be delegated to deliver_announcement; got: {message}"
         );
     }
 
