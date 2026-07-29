@@ -903,15 +903,34 @@ impl SessionBackend for SqliteSessionBackend {
                 // WHERE guard makes a lost update impossible even though we
                 // already hold the lock.
                 let now = Utc::now().to_rfc3339();
-                conn.execute(
-                    "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
-                     VALUES (?1, ?2, ?3, 0, ?4)
-                     ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
-                     WHERE session_metadata.agent_alias IS NULL",
-                    params![session_key, now, now, agent_alias],
-                )
-                .map_err(std::io::Error::other)?;
-                Ok(ClaimOutcome::Claimed)
+                let affected = conn
+                    .execute(
+                        "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                         VALUES (?1, ?2, ?3, 0, ?4)
+                         ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
+                         WHERE session_metadata.agent_alias IS NULL",
+                        params![session_key, now, now, agent_alias],
+                    )
+                    .map_err(std::io::Error::other)?;
+                if affected == 0 {
+                    // WHERE clause blocked the UPDATE — another connection already set the owner.
+                    // Re-read to get the winner.
+                    match conn.query_row(
+                        "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
+                        params![session_key],
+                        |row| row.get(0),
+                    ) {
+                        Ok(winner) => Ok(ClaimOutcome::Conflict(winner)),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            // Extreme edge case: session was deleted between UPSERT and SELECT.
+                            // Session no longer exists → Claimed.
+                            Ok(ClaimOutcome::Claimed)
+                        }
+                        Err(e) => Err(std::io::Error::other(e)),
+                    }
+                } else {
+                    Ok(ClaimOutcome::Claimed)
+                }
             }
         }
     }
@@ -1650,5 +1669,41 @@ mod tests {
         // The stored owner must be one of the racing aliases, and stable.
         let owner = backend.get_session_agent_alias(key).unwrap();
         assert!(owner.is_some(), "a winner must have recorded ownership");
+    }
+
+    #[test]
+    fn claim_cross_connection_only_one_wins() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = TempDir::new().unwrap();
+
+        let backend_a = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let backend_b = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Pre-create the session.
+        backend_a
+            .append("gw_test", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let jh_a = std::thread::spawn(move || {
+            b1.wait();
+            backend_a
+                .claim_session_agent_alias("gw_test", "alice")
+                .unwrap()
+        });
+        let jh_b = std::thread::spawn(move || {
+            barrier.wait();
+            backend_b
+                .claim_session_agent_alias("gw_test", "bob")
+                .unwrap()
+        });
+
+        let ra = jh_a.join().unwrap();
+        let rb = jh_b.join().unwrap();
+
+        let claimed =
+            matches!(ra, ClaimOutcome::Claimed) as u8 + matches!(rb, ClaimOutcome::Claimed) as u8;
+        assert_eq!(claimed, 1, "only one caller should win");
     }
 }

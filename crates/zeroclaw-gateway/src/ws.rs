@@ -41,12 +41,13 @@ impl WsConnectionGuard {
         session_key: String,
         ws_connections: Arc<Mutex<std::collections::HashMap<String, usize>>>,
     ) -> Self {
+        let guard_key = zeroclaw_api::session_keys::guard_key(&session_key);
         {
             let mut map = ws_connections.lock();
-            *map.entry(session_key.clone()).or_insert(0) += 1;
+            *map.entry(guard_key.clone()).or_insert(0) += 1;
         }
         Self {
-            session_key,
+            session_key: guard_key,
             ws_connections,
         }
     }
@@ -484,21 +485,22 @@ async fn handle_socket(
                     return;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                    // Backend doesn't track ownership. Reject non-empty
-                    // sessions to prevent cross-agent contamination; accept
-                    // empty ones (graceful degradation).
-                    if !backend.load(&session_key).is_empty() {
-                        let err_frame = serde_json::json!({
-                            "type": "error",
-                            "code": "SESSION_OWNERSHIP_UNSUPPORTED",
-                            "message": "Cannot resume session: backend does not track agent ownership"
-                        });
-                        let _ = sender
-                            .send(Message::Text(err_frame.to_string().into()))
-                            .await;
-                        let _ = sender.close().await;
-                        return;
-                    }
+                    // Connection-scoped transports require deterministic
+                    // ownership recording.  A backend that cannot record
+                    // ownership exposes every empty session to multi-agent
+                    // admission for the lifetime of the connection — reject
+                    // unconditionally.
+                    let err_frame = serde_json::json!({
+                        "type": "error",
+                        "code": "SESSION_OWNERSHIP_UNSUPPORTED",
+                        "message": "WebSocket sessions require ownership tracking. \
+                                    The configured backend does not support it."
+                    });
+                    let _ = sender
+                        .send(Message::Text(err_frame.to_string().into()))
+                        .await;
+                    let _ = sender.close().await;
+                    return;
                 }
                 Err(e) => {
                     let err_frame = serde_json::json!({

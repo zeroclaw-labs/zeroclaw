@@ -2,7 +2,6 @@
 
 > **Document Version**: v1.0
 > **Created**: 2026-05-15
-> **Updated**: 2026-06-30
 > **Project**: ZeroClaw
 > **Endpoint**: `POST /v1/chat/completions`
 > **Compatibility**: OpenAI Chat Completions API compatible
@@ -42,11 +41,11 @@
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `role` | string | ✅ | `system` / `developer` / `user` / `assistant` / `tool` / `function` |
+| `role` | string | ✅ | `system` / `developer` / `user` / `assistant` / `tool` / `function`. Other roles return 400 `invalid_request_error`. |
 | `content` | string | ✅ | Message content (string only) |
-| `name` | string | ❌ | Optional name |
-| `tool_calls` | array | ❌ | Tool calls for assistant role |
-| `tool_call_id` | string | ❌ | Tool call ID for tool role |
+| `name` | - | - | ⛔ **Not supported**, returns 400 `unsupported_parameter` |
+| `tool_calls` | - | - | ⛔ **Not supported**, returns 400 `unsupported_parameter` (transparent execution) |
+| `tool_call_id` | - | - | ⛔ **Not supported**, returns 400 `unsupported_parameter` |
 
 ---
 
@@ -191,7 +190,7 @@ SSE error events carry an explicit event name and vary the `type` field:
 
 ```bash
 # Simplest non-streaming call (no model = default agent)
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
@@ -201,7 +200,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 
 # Specify agent (zeroclaw/<alias> format)
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "zeroclaw/coding",
@@ -211,7 +210,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 
 # Explicit agent routing via the model field
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "zeroclaw/coding",
@@ -225,7 +224,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ```bash
 # Streaming call (real-time output, recommended with x-session-key)
-curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -N -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'x-session-key: my-session-123' \
   -d '{
@@ -368,7 +367,7 @@ session_id=$(cat /proc/sys/kernel/random/uuid)
 | `developer` | Developer instruction (same as system) | `"You are a code assistant"` |
 | `user` | User message | `"Hello!"` |
 | `assistant` | Assistant response | `"Hi, how can I help?"` |
-| `tool` | Tool call result | `{"role": "tool", "tool_call_id": "call_123", "content": "Sunny"}` |
+| `tool` | Tool call result | `{"role": "tool", "content": "Sunny"}` |
 | `function` | Function call result (auto-normalized to `tool`) | `{"role": "function", "content": "..."}` |
 
 **Multi-turn message processing**:
@@ -429,7 +428,7 @@ The following parameters are **not supported** per-request and will return a **4
 
 ---
 
-#### 3.2.7 tools (Dynamic Tool Definitions)
+#### 3.2.6 tools (Dynamic Tool Definitions)
 
 **Type**: `array[object]`
 **Required**: ❌ No
@@ -460,7 +459,7 @@ The following parameters are **not supported** per-request and will return a **4
 
 ---
 
-#### 3.2.8 tool_choice (Tool Selection Strategy)
+#### 3.2.7 tool_choice (Tool Selection Strategy)
 
 **Type**: `string` or `object`
 **Default**: `auto`
@@ -683,7 +682,7 @@ The following parameters are **not supported** per-request and will return a **4
 ### Scenario 1: Single-turn Conversation (Non-streaming)
 
 ```bash
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
@@ -705,7 +704,7 @@ echo "Session ID: $SESSION_ID"
 
 # Turn 1: User introduces themselves
 echo "=== Turn 1 ==="
-curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -sS -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-session-key: $SESSION_ID" \
   -d '{
@@ -717,7 +716,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 # Turn 2: Ask about stored state (single message auto-loads backend history)
 echo "=== Turn 2 ==="
-curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -sS -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-session-key: $SESSION_ID" \
   -d '{
@@ -734,7 +733,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
 ### Scenario 3: Multi-turn with Full History (Request messages as authoritative context)
 
 ```bash
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
@@ -758,7 +757,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 SESSION_ID=$(cat /proc/sys/kernel/random/uuid)
 
-curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -N -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H "x-session-key: $SESSION_ID" \
   -d '{
@@ -781,7 +780,7 @@ curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ```bash
 # Use model field to specify agent (zeroclaw/<alias> format)
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "zeroclaw/coding",
@@ -789,7 +788,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 
 # Omit model (or send "zeroclaw") to route to the default agent
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "zeroclaw",
@@ -802,7 +801,7 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 ### Scenario 6: Streaming + Usage Statistics
 
 ```bash
-curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -N -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
@@ -816,12 +815,12 @@ curl -N -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ---
 
-### Scenario 8: Disable All Tools
+### Scenario 7: Disable All Tools
 
 ```bash
 # tool_choice: "none" disables all tools for this request
 # The LLM receives no tool definitions and no tool protocol in the system prompt
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
@@ -832,11 +831,11 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ---
 
-### Scenario 9: Restrict to Specific Tools
+### Scenario 8: Restrict to Specific Tools
 
 ```bash
 # Only expose a subset of tools for this request
-curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+curl -X POST http://127.0.0.1:42617/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "",
@@ -862,9 +861,9 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ---
 
-### Scenario 10: Force a Specific Tool
+### Scenario 9: Force a Specific Tool (Not Yet Supported)
 
-`tool_choice` with a specific function object is **not yet supported** -- it returns a 400 error. Use `"auto"` with a `tools` list to restrict available tools instead (see Scenario 9).
+`tool_choice` with a specific function object is **not yet supported** -- it returns a 400 error. Use `"auto"` with a `tools` list to restrict available tools instead (see Scenario 8).
 
 ---
 
@@ -875,17 +874,28 @@ curl -X POST http://127.0.0.1:3000/v1/chat/completions \
 **Answer**: ZeroClaw uses **transparent tool execution** -- tool calls are executed automatically by the backend, and the client only receives the final text response. In non-streaming mode, `tool_calls` is always `null` and `finish_reason` is always `"stop"`.
 
 - **Non-streaming**: `finish_reason` is always `"stop"`, `tool_calls` is always `null`
-- **Streaming**: Tool execution is transparent; no client-actionable `tool_calls` chunks are emitted (see Q2)
+- **Streaming**: Tool execution is transparent; no client-actionable `tool_calls` chunks are emitted (see Q3)
 
 ---
 
-### Q2: Why doesn't finish_reason return "tool_calls"?
+### Q2: Why are `tool_calls` rejected in request messages?
+
+**Answer**: ZeroClaw uses **transparent tool execution**: tools are called
+server-side and the client only receives the final text answer.  Including
+`tool_calls` in conversation history is unnecessary because the agent
+executes tools internally.  Sending `tool_calls` in a request message
+returns 400 `unsupported_parameter`; remove the `tool_calls` field from
+your message objects when using ZeroClaw's endpoint.
+
+---
+
+### Q3: Why doesn't finish_reason return "tool_calls"?
 
 **Answer**: ZeroClaw tools are transparently executed server-side. Unlike the OpenAI API -- where `finish_reason: "tool_calls"` means the *client* must execute the tool and call back -- ZeroClaw has already completed the tool loop before returning. The client always receives the final text answer with `finish_reason: "stop"`.
 
 ---
 
-### Q3: What is the model parameter routing logic?
+### Q4: What is the model parameter routing logic?
 
 **Answer**: The `model` field is an **agent routing target**, not a provider model name:
 
@@ -898,13 +908,13 @@ model = other label (e.g. "gpt-4") → 400 error (not a ZeroClaw agent target)
 
 ---
 
-### Q4: Are system prompts persisted in multi-turn conversations?
+### Q5: Are system prompts persisted in multi-turn conversations?
 
 **Answer**: No. `system` and `developer` messages are extracted as a prefix for the current turn (prepended to the user message), but are **not persisted to the session backend**. This prevents subsequent turns from being polluted by repeated system prompts.
 
 ---
 
-### Q5: What is the difference between providing multiple messages vs using x-session-key?
+### Q6: What is the difference between providing multiple messages vs using x-session-key?
 
 **Answer**:
 
@@ -917,7 +927,7 @@ Both approaches can be mixed depending on the use case.
 
 ---
 
-### Q6: Why are usage stats sometimes all zeros?
+### Q7: Why are usage stats sometimes all zeros?
 
 **Answer**: Token usage is collected via **cost tracking**. If:
 - No cost tracker is configured (`cost_tracker` is empty)
@@ -927,7 +937,7 @@ Then all `usage` fields will be 0. This does not affect conversation functionali
 
 ---
 
-### Q7: Why do max_tokens, top_p, stop, presence_penalty, frequency_penalty return 400?
+### Q8: Why do max_tokens, top_p, stop, presence_penalty, frequency_penalty return 400?
 
 **Answer**: These parameters are not supported per-request by the ZeroClaw runtime. Rather than silently ignoring them (which would mislead callers into thinking they take effect), the endpoint returns an explicit 400 error with `error.type: "unsupported_parameter"`.
 
@@ -935,7 +945,7 @@ Then all `usage` fields will be 0. This does not affect conversation functionali
 
 ---
 
-### Q8: How does tool_choice: "none" work?
+### Q9: How does tool_choice: "none" work?
 
 **Answer**: `tool_choice: "none"` disables tools entirely:
 1. **System prompt**: Tool protocol descriptions are excluded from the system prompt
@@ -946,7 +956,7 @@ This ensures the LLM behaves as a pure text model with no tool capability for th
 
 ---
 
-### Q9: How does the tools parameter filter work?
+### Q10: How does the tools parameter filter work?
 
 **Answer**: The `tools` parameter filters against the agent's currently configured tools:
 - Only tool names present in `agent.get_configured_tool_names()` are activated
@@ -958,7 +968,7 @@ This ensures the LLM behaves as a pure text model with no tool capability for th
 
 ---
 
-### Q10: Where is the rate limit configured?
+### Q11: Where is the rate limit configured?
 
 **Answer**: In the ZeroClaw config file:
 
@@ -971,7 +981,7 @@ Exceeding the limit returns 429 with a `Retry-After` header indicating the real 
 
 ---
 
-### Q11: Does the tools parameter scope the system prompt tool descriptions?
+### Q12: Does the tools parameter scope the system prompt tool descriptions?
 
 **Answer**: It depends on the model type:
 - **Native-tool models** (recommended): Yes -- only the requested tool specs are sent as structured API parameters, and the system prompt tool catalog is suppressed
@@ -979,12 +989,12 @@ Exceeding the limit returns 429 with a `Retry-After` header indicating the real 
 
 ---
 
-### Q12: What is the overall tool control strategy?
+### Q13: What is the overall tool control strategy?
 
 **Answer**: Tool control is enforced at three layers that work together:
 
 1. **Request validation** -- The handler validates `tool_choice` and `tools` combinations before the turn starts. Invalid or unavailable tool configurations return a 400 error (fail-closed), never silently falling back to the full tool set.
-2. **Provider-visible specs** -- Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all. For native-tool models, this is the primary lever: only the requested tools are sent as structured API parameters. For text-protocol models, the system prompt may still include descriptions of all agent-configured tools; see the model-compatibility notes in §3.2.7.
+2. **Provider-visible specs** -- Only the requested tool specs are sent to the LLM as structured API parameters. For `tool_choice: "none"`, no tool definitions are sent at all. For native-tool models, this is the primary lever: only the requested tools are sent as structured API parameters. For text-protocol models, the system prompt may still include descriptions of all agent-configured tools; see the model-compatibility notes in §3.2.6.
 3. **Execution enforcement** -- If the model still returns a call for a tool outside the requested subset, that call is rejected and never executes. The model receives a failure result ("Unknown tool" / "Tool not available") it can use to self-correct on the next turn.
 
 This ensures a tool outside the requested subset can never run, regardless of what the model returns. Only the requested tools can actually execute.
@@ -1000,32 +1010,29 @@ by cross-agent session isolation:
 
 | Method | Default behavior | Impact if not implemented |
 |--------|-----------------|--------------------------|
-| `set_session_agent_alias` | `Err(Unsupported)` | **Non-empty sessions:** HTTP 400 (`"Cannot resume session: backend does not track agent ownership"`). **Empty sessions:** Turn proceeds without ownership tracking -- cross-agent isolation is absent. |
-| `get_session_agent_alias` | `Err(Unsupported)` | Same as above -- the handler calls this at history-load time and rejects non-empty sessions if unsupported. |
+| `claim_session_agent_alias` | `Err(Unsupported)` | Atomic compare-and-set for ownership. Returns `ClaimOutcome::Claimed` or `Conflict(existing_alias)`. Required for multi-agent session isolation. **Non-empty sessions:** rejected on all transports. **Empty sessions:** HTTP/RPC accept (request-scoped); WebSocket rejects (connection-scoped requires deterministic ownership). |
+| `set_session_agent_alias` (legacy) | `Err(Unsupported)` | Deprecated for ownership tracking. Use `claim_session_agent_alias`. |
+| `get_session_agent_alias` (legacy) | `Err(Unsupported)` | Deprecated for ownership tracking. Use `claim_session_agent_alias`. |
 
-**To support multi-agent deployments**, implement both methods to persist
-and retrieve the agent alias associated with each session key. The JSONL
-backend (`SessionStore`) uses a `.meta.json` sidecar file for this purpose
-as a reference implementation.
+**To support multi-agent deployments**, implement `claim_session_agent_alias`
+with an atomic compare-and-set (e.g. file-locked JSONL sidecar, or
+`INSERT ... ON CONFLICT ... WHERE agent_alias IS NULL` in SQLite).
+The method must return `ClaimOutcome::Claimed` on success and
+`ClaimOutcome::Conflict(existing_alias)` when another agent owns the session.
 
-**For single-agent deployments** that don't need ownership enforcement,
-implement both methods as no-ops, but return a fixed alias so non-empty
-sessions are not rejected:
+**For single-agent deployments** that don't need cross-agent isolation,
+implement `claim_session_agent_alias` to always return `Claimed`:
 
 ```rust
-fn set_session_agent_alias(&self, _key: &str, _alias: &str) -> std::io::Result<()> {
-    Ok(())
-}
-fn get_session_agent_alias(&self, _key: &str) -> std::io::Result<Option<String>> {
-    Ok(Some("default".into()))
+fn claim_session_agent_alias(
+    &self, _key: &str, _alias: &str,
+) -> std::io::Result<ClaimOutcome> {
+    Ok(ClaimOutcome::Claimed)
 }
 ```
 
-Returning `Ok(None)` from `get_session_agent_alias` tells the handler the
-session has no recorded owner, which is accepted for **empty** sessions
-but rejected for **non-empty** sessions (to prevent cross-agent history
-leakage). See the `SessionBackend` trait documentation in
-the `SessionBackend` trait interface for the full contract.
+WebSocket rejects `Unsupported` unconditionally (connection-scoped transport);
+HTTP and RPC accept empty sessions on `Unsupported`.
 
 ### Migrating Pre-Existing Sessions
 
@@ -1113,11 +1120,11 @@ bails with a clear error and no side effects.
 **Core features**:
 - ✅ OpenAI Chat Completions API compatible endpoint (`POST /v1/chat/completions`)
 - ✅ `model` field as **agent routing target** (`"zeroclaw/<alias>"`), not provider model name
-- ✅ Plain label model names auto-route to default agent (standard client compatibility)
+- ✅ Plain label model names rejected with 400; explicit agent routing required
 - ✅ Multi-turn message splitting (system/developer prefix, history injection, active turn extraction)
 - ✅ Session management via `x-session-key` with auto-load for single-message requests
 - ✅ Streaming (SSE) and non-streaming (JSON) response modes
-- ✅ `temperature` parameter supported per-request
+- ✅ `temperature` rejected per-request (400); owned by agent config
 
 **Tool control** (newly effective in v1.0):
 - ✅ `tool_choice: "none"` -- Fully disables tools: system prompt excludes tool protocol, LLM request omits tool definitions, model tool calls discarded

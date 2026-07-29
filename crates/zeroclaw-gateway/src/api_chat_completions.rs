@@ -790,6 +790,7 @@ pub async fn handle_chat_completions(
             None,
             true,
             false,
+            false,
             None,
             None,
             None,
@@ -862,7 +863,7 @@ pub async fn handle_chat_completions(
     // against ws_connections (connection-scoped).
     {
         let ws = state.ws_connections.lock();
-        if ws.contains_key(&session_key) {
+        if ws.contains_key(&zeroclaw_api::session_keys::guard_key(&session_key)) {
             return add_rate_limit_headers(
                 add_session_key_header(
                     add_request_id_header(
@@ -1598,6 +1599,41 @@ fn validate_request(req: &ChatCompletionRequest) -> Result<(), Response> {
                 "unsupported_parameter",
                 &format!(
                     "messages[{i}].tool_call_id is not supported; tool results are transparently executed"
+                ),
+                None,
+                Some("messages"),
+            ));
+        }
+        // Role allow-list: only the 6 documented roles are accepted.
+        // Unsupported roles (e.g. "admin") are rejected instead of being
+        // silently converted to prompt text.
+        if !matches!(
+            msg.role.as_str(),
+            "system" | "developer" | "user" | "assistant" | "tool" | "function"
+        ) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!(
+                    "messages[{i}].role '{}' is not supported; \
+                     allowed: system, developer, user, assistant, tool, function",
+                    msg.role
+                ),
+                None,
+                Some("messages"),
+            ));
+        }
+        // tool_calls in message history is not supported under transparent
+        // execution — the agent executes tools internally, and client-side
+        // tool-call records have no meaning in this model.
+        if msg.tool_calls.is_some() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "unsupported_parameter",
+                &format!(
+                    "messages[{i}].tool_calls is not supported; \
+                     tool execution is transparent — the agent executes tools internally. \
+                     Do not include tool_calls in conversation history."
                 ),
                 None,
                 Some("messages"),

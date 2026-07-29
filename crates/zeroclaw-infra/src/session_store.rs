@@ -297,12 +297,26 @@ impl SessionBackend for SessionStore {
         agent_alias: &str,
     ) -> std::io::Result<crate::session_backend::ClaimOutcome> {
         use crate::session_backend::ClaimOutcome;
-        // Serialize the read-modify-write so two concurrent claims cannot both
-        // observe "no owner" and both write.
+        use std::fs::OpenOptions;
+
+        // Per-instance mutex as fast path for same-process threads.
         let _guard = self
             .claim_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Per-session lock file for cross-process serialization.
+        let lock_path = self
+            .sessions_dir
+            .join(format!("{}.claim.lock", sanitize_session_key(session_key)));
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&lock_file)?;
+
         let mut meta = self.read_meta(session_key)?;
         match meta.agent_alias {
             Some(ref existing) if existing != agent_alias => {
@@ -315,6 +329,7 @@ impl SessionBackend for SessionStore {
                 Ok(ClaimOutcome::Claimed)
             }
         }
+        // lock_file drops here → OS releases advisory lock
     }
 
     fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
@@ -866,5 +881,39 @@ mod tests {
         // Exactly one alias may claim an unowned session; the rest conflict.
         assert_eq!(claimed, 1, "exactly one concurrent claim must win");
         assert_eq!(outcomes.len(), 8);
+    }
+
+    #[test]
+    fn claim_cross_instance_only_one_wins() {
+        use crate::session_backend::ClaimOutcome;
+        let tmp = TempDir::new().unwrap();
+        let store_a = SessionStore::new(tmp.path()).unwrap();
+        let store_b = SessionStore::new(tmp.path()).unwrap();
+
+        // Pre-create the session with a message so it's non-empty.
+        store_a
+            .append("gw_test", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let jh_a = std::thread::spawn(move || {
+            b1.wait();
+            store_a
+                .claim_session_agent_alias("gw_test", "alice")
+                .unwrap()
+        });
+        let jh_b = std::thread::spawn(move || {
+            barrier.wait();
+            store_b.claim_session_agent_alias("gw_test", "bob").unwrap()
+        });
+
+        let ra = jh_a.join().unwrap();
+        let rb = jh_b.join().unwrap();
+
+        // Exactly one must be Claimed, the other Conflict.
+        let claimed =
+            matches!(ra, ClaimOutcome::Claimed) as u8 + matches!(rb, ClaimOutcome::Claimed) as u8;
+        assert_eq!(claimed, 1, "only one caller should win");
     }
 }

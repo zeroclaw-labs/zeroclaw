@@ -56,6 +56,18 @@ pub fn canonical_memory_id(session_id: &str) -> String {
     sanitize_session_key(session_id)
 }
 
+/// Normalize a session key for use as an in-memory guard identifier.
+///
+/// ASCII-lowercases the key so that `gw_Alpha` and `gw_alpha` map to the
+/// same guard entry (lease, queue slot, cancel token), preventing the
+/// cross-transport case-collision on case-insensitive filesystems.
+///
+/// Storage identifiers (filenames, SQLite TEXT columns) continue to use
+/// the un-lowered form so existing mixed-case sessions are not broken.
+pub fn guard_key(session_key: &str) -> String {
+    session_key.to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +157,23 @@ mod tests {
                 "mismatch for {k:?}"
             );
         }
+    }
+
+    #[test]
+    fn guard_key_normalizes_ascii_case() {
+        assert_eq!(guard_key("gw_Alpha"), "gw_alpha");
+        assert_eq!(guard_key("gw_ALPHA"), "gw_alpha");
+        assert_eq!(guard_key("gw_alpha"), "gw_alpha");
+    }
+
+    #[test]
+    fn guard_key_preserves_non_ascii() {
+        // to_ascii_lowercase only affects A-Z, not Unicode
+        assert_eq!(guard_key("gw_用户"), "gw_用户");
+    }
+
+    #[test]
+    fn guard_key_idempotent() {
+        assert_eq!(guard_key(&guard_key("gw_Alpha")), "gw_alpha");
     }
 }

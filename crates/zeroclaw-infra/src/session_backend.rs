@@ -267,9 +267,11 @@ pub trait SessionBackend: Send + Sync {
     /// SQLite: INSERT … ON CONFLICT DO UPDATE … WHERE agent_alias IS NULL).
     ///
     /// Returning `Unsupported` tells the handler the backend cannot enforce
-    /// ownership. All three transport handlers (HTTP, WebSocket, RPC) reject
-    /// **non-empty** sessions when `Unsupported` is returned, and accept
-    /// empty ones as graceful degradation.
+    /// ownership. HTTP and RPC handlers accept empty sessions when `Unsupported` is
+    /// returned as graceful degradation (request-scoped transports can
+    /// safely admit one empty turn).  WebSocket rejects `Unsupported`
+    /// unconditionally because connection-scoped transports require
+    /// deterministic ownership recording to prevent multi-agent admission.
     fn claim_session_agent_alias(
         &self,
         _session_key: &str,

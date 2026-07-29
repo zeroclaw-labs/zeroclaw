@@ -98,10 +98,10 @@ impl SessionActorQueue {
     /// Acquire exclusive access to a session. Cancel-safe: `PendingGuard`
     /// ensures the pending count is decremented even if this future is dropped.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
-        let slot = {
+        let (slot, current) = {
             let mut slots = self.slots.lock().await;
-            slots
-                .entry(session_id.to_string())
+            let s = slots
+                .entry(session_id.to_ascii_lowercase())
                 .or_insert_with(|| {
                     Arc::new(SessionSlot {
                         semaphore: Arc::new(Semaphore::new(1)),
@@ -109,10 +109,10 @@ impl SessionActorQueue {
                         pending: AtomicUsize::new(0),
                     })
                 })
-                .clone()
+                .clone();
+            let current = s.pending.fetch_add(1, Ordering::Relaxed);
+            (s, current)
         };
-
-        let current = slot.pending.fetch_add(1, Ordering::Relaxed);
         let pending_guard = PendingGuard {
             slot: slot.clone(),
             consumed: false,
@@ -142,9 +142,10 @@ impl SessionActorQueue {
 
     /// Get the number of pending requests for a session.
     pub async fn queue_depth(&self, session_id: &str) -> usize {
+        let guard_key = session_id.to_ascii_lowercase();
         let slots = self.slots.lock().await;
         slots
-            .get(session_id)
+            .get(&guard_key)
             .map(|s| s.pending.load(Ordering::Relaxed))
             .unwrap_or(0)
     }

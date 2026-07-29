@@ -178,14 +178,15 @@ where
     }
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
+    let guard_key = zeroclaw_api::session_keys::guard_key(session_key);
     let _cancel_guard = {
         state
             .cancel_tokens
             .lock()
-            .insert(session_key.to_string(), cancel_token.clone());
+            .insert(guard_key.clone(), cancel_token.clone());
         CancelTokenGuard {
             tokens: Arc::clone(&state.cancel_tokens),
-            session_key: session_key.to_string(),
+            session_key: guard_key,
         }
     };
 
@@ -1785,6 +1786,7 @@ mod tests {
             id: "call_1".into(),
             name: "shell".into(),
             output: "file.txt".into(),
+            artifact: None,
         };
         assert_eq!(
             crate::ws::turn_event_to_ws_frame(&tool_result).unwrap(),

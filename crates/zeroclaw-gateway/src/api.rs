@@ -1935,7 +1935,11 @@ pub async fn handle_api_session_delete(
     // (ws_connections contains the key → 409) or will block at
     // ws.rs:411 until we release the queue (session deleted by then).
     // A rejected DELETE at this stage has performed NO side effects.
-    if state.ws_connections.lock().contains_key(&session_key) {
+    if state
+        .ws_connections
+        .lock()
+        .contains_key(&zeroclaw_api::session_keys::guard_key(&session_key))
+    {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1950,7 +1954,10 @@ pub async fn handle_api_session_delete(
     // We hold the session queue, so no new turn can start. Any
     // token present belongs to an in-flight turn that will be
     // cancelled. This is now safe because we will not return 409.
-    let token = state.cancel_tokens.lock().remove(&session_key);
+    let token = state
+        .cancel_tokens
+        .lock()
+        .remove(&zeroclaw_api::session_keys::guard_key(&session_key));
     if let Some(token) = token {
         token.cancel();
         ::zeroclaw_log::record!(
@@ -2167,7 +2174,11 @@ pub async fn handle_api_session_abort(
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
-    let token = state.cancel_tokens.lock().get(&session_key).cloned();
+    let token = state
+        .cancel_tokens
+        .lock()
+        .get(&zeroclaw_api::session_keys::guard_key(&session_key))
+        .cloned();
 
     if let Some(token) = token {
         token.cancel();
