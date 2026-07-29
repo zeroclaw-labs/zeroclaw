@@ -45,6 +45,21 @@ pub struct SlackChannel {
     active_assistant_threads: Mutex<HashSet<AssistantTarget>>,
     /// Per-turn draft routing, keyed by the exact draft ID returned to the orchestrator.
     draft_turns: AsyncMutex<HashMap<String, SlackDraftTurn>>,
+    /// Which draft currently owns each Assistant status surface.
+    ///
+    /// `assistant.threads.setStatus` addresses a status only by
+    /// `(channel_id, thread_ts)`, so unlike a draft it is a *shared* external
+    /// resource: two overlapping turns in one Assistant thread get distinct
+    /// draft IDs that both resolve to it. That overlap is reachable whenever
+    /// `interrupt_on_new_message` is false — the default — because the
+    /// dispatcher lets the older worker run on while starting the newer one.
+    ///
+    /// Ownership is latest-live-turn-wins, matching the single surface: claiming
+    /// a target hands the newer draft the generation, and only the owner may
+    /// write a lifecycle state or issue the terminal clear. Without this an
+    /// older turn's completion would blank a newer turn's status, and its late
+    /// lifecycle write would overwrite it.
+    assistant_status_owners: AsyncMutex<HashMap<AssistantTarget, String>>,
     /// In-flight progress `chat.update` tasks per draft. Progress updates are
     /// dispatched detached so the draft updater never back-pressures the tool
     /// loop, which means a slow update can still be in flight when the turn
@@ -287,6 +302,7 @@ impl SlackChannel {
             workspace_dir: None,
             active_assistant_threads: Mutex::new(HashSet::new()),
             draft_turns: AsyncMutex::new(HashMap::new()),
+            assistant_status_owners: AsyncMutex::new(HashMap::new()),
             pending_draft_updates: AsyncMutex::new(HashMap::new()),
             seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
@@ -568,6 +584,72 @@ impl SlackChannel {
             .lock()
             .expect("last_draft_edit lock")
             .insert(message_id.to_string(), Instant::now());
+    }
+
+    /// Hand `message_id` the current generation for `target`, displacing any
+    /// older draft. Called when a draft is created for an Assistant thread.
+    async fn claim_assistant_status(&self, target: &AssistantTarget, message_id: &str) {
+        self.assistant_status_owners
+            .lock()
+            .await
+            .insert(target.clone(), message_id.to_string());
+    }
+
+    /// Whether `message_id` still owns `target`'s status surface. A superseded
+    /// draft answers `false` and must not write or clear.
+    async fn owns_assistant_status(&self, target: &AssistantTarget, message_id: &str) -> bool {
+        self.assistant_status_owners
+            .lock()
+            .await
+            .get(target)
+            .is_some_and(|owner| owner == message_id)
+    }
+
+    /// Release `target` only if `message_id` still owns it, so a late terminal
+    /// path cannot strip a newer turn's ownership. Returns whether it released.
+    async fn release_assistant_status(&self, target: &AssistantTarget, message_id: &str) -> bool {
+        let mut owners = self.assistant_status_owners.lock().await;
+        if owners.get(target).is_some_and(|owner| owner == message_id) {
+            owners.remove(target);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Issue the terminal empty-status clear for a turn that still owns its
+    /// Assistant surface.
+    ///
+    /// Ownership is released only after Slack accepts the clear. A failed clear
+    /// keeps the generation, so the surface still has an identified owner and a
+    /// later terminal path can retry it rather than leaving stale lifecycle text
+    /// behind an erased record.
+    async fn clear_owned_assistant_status(&self, turn: &SlackDraftTurn, message_id: &str) {
+        let Some(target) = turn.assistant_target.as_ref() else {
+            return;
+        };
+        if !self.owns_assistant_status(target, message_id).await {
+            // A newer turn owns the surface; blanking it would erase live state.
+            return;
+        }
+        match self.set_assistant_status(target, "").await {
+            Ok(()) => {
+                self.release_assistant_status(target, message_id).await;
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel_id": target.channel_id,
+                            "thread_ts": target.thread_ts,
+                            "error": format!("{e}"),
+                        })),
+                    "Slack assistant status clear failed; ownership retained for retry"
+                );
+            }
+        }
     }
 
     /// Drain in-flight progress updates for `message_id` so nothing this draft
@@ -4501,6 +4583,11 @@ impl Channel for SlackChannel {
             };
             self.is_assistant_target(&target).then_some(target)
         });
+        // This draft is the newest turn for the thread, so it takes the
+        // generation for the shared Assistant status surface.
+        if let Some(target) = assistant_target.as_ref() {
+            self.claim_assistant_status(target, &lazy_id).await;
+        }
         self.draft_turns.lock().await.insert(
             lazy_id.clone(),
             SlackDraftTurn {
@@ -4651,6 +4738,11 @@ impl Channel for SlackChannel {
             .get(message_id)
             .and_then(|turn| turn.assistant_target.clone());
         if let Some(target) = assistant_target {
+            // A superseded turn must not write to the shared status surface: the
+            // newer turn's state is what the single display should show.
+            if !self.owns_assistant_status(&target, message_id).await {
+                return Ok(());
+            }
             if self.progress_rate_limited(message_id) {
                 return Ok(());
             }
@@ -4680,11 +4772,8 @@ impl Channel for SlackChannel {
             .remove(message_id);
 
         let draft_turn = self.draft_turns.lock().await.remove(message_id);
-        if let Some(target) = draft_turn
-            .as_ref()
-            .and_then(|turn| turn.assistant_target.as_ref())
-        {
-            let _ = self.set_assistant_status(target, "").await;
+        if let Some(turn) = draft_turn.as_ref() {
+            self.clear_owned_assistant_status(turn, message_id).await;
         }
 
         let draft_thread_ts = draft_turn.and_then(|turn| turn.thread_ts);
@@ -4762,8 +4851,8 @@ impl Channel for SlackChannel {
             .expect("last_draft_edit lock")
             .remove(message_id);
         let draft_turn = self.draft_turns.lock().await.remove(message_id);
-        if let Some(target) = draft_turn.and_then(|turn| turn.assistant_target) {
-            let _ = self.set_assistant_status(&target, "").await;
+        if let Some(turn) = draft_turn.as_ref() {
+            self.clear_owned_assistant_status(turn, message_id).await;
         }
         let real_ts = self.resolve_draft_ts(message_id).await;
         self.lazy_draft_ts.lock().await.remove(message_id);
@@ -7371,6 +7460,180 @@ mod tests {
                 .last()
                 .is_some_and(|body| body.contains("the final answer")),
             "the final answer must still be the last write: {bodies:?}"
+        );
+    }
+
+    /// `assistant.threads.setStatus` addresses a status only by
+    /// `(channel_id, thread_ts)`, so two overlapping turns in ONE Assistant
+    /// thread share that surface even though each holds its own draft ID. This
+    /// is reachable with `interrupt_on_new_message = false`, the default, where
+    /// the dispatcher lets the older worker continue.
+    ///
+    /// Latest-live-turn-wins: once turn B claims the thread, turn A may neither
+    /// overwrite B's status with a late lifecycle write nor blank it when A
+    /// finishes.
+    #[tokio::test]
+    async fn an_older_turn_cannot_overwrite_or_clear_a_newer_turn_in_one_assistant_thread() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "final-ts",
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
+        ch.active_assistant_threads
+            .lock()
+            .unwrap()
+            .insert(AssistantTarget {
+                channel_id: "C123".to_string(),
+                thread_ts: "shared-thread".to_string(),
+            });
+
+        // Two turns, same Assistant thread, distinct draft IDs.
+        let draft = |message_id: &'static str| {
+            SendMessage::new("...", "C123")
+                .in_thread(Some("shared-thread".to_string()))
+                .in_reply_to(Some(message_id.to_string()))
+        };
+        let turn_a = ch
+            .send_draft(&draft("slack_C123_msg-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let turn_b = ch
+            .send_draft(&draft("slack_C123_msg-b"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(turn_a, turn_b, "each turn must hold its own draft ID");
+
+        // B is the live turn and shows its state.
+        ch.update_draft_lifecycle("C123", &turn_b, ProgressEvent::WaitingOnModel)
+            .await
+            .unwrap();
+        // A is superseded: neither a late lifecycle write nor its terminal clear
+        // may touch the surface B now owns.
+        ch.update_draft_lifecycle("C123", &turn_a, ProgressEvent::RunningTool)
+            .await
+            .unwrap();
+        ch.finalize_draft("C123", &turn_a, "A's answer", false)
+            .await
+            .unwrap();
+
+        let calls = assistant_status_calls(&server).await;
+        assert_eq!(
+            calls,
+            vec![("shared-thread".to_string(), "Waiting on model".to_string())],
+            "only the live turn may write the shared surface, and a superseded \
+             turn must not clear it: {calls:?}"
+        );
+
+        // B still owns it, so B's own completion does clear it.
+        ch.finalize_draft("C123", &turn_b, "B's answer", false)
+            .await
+            .unwrap();
+        let calls = assistant_status_calls(&server).await;
+        assert_eq!(
+            calls.last(),
+            Some(&("shared-thread".to_string(), String::new())),
+            "the owning turn's completion must clear the surface: {calls:?}"
+        );
+    }
+
+    /// A transient Slack failure on the terminal clear must not silently strand
+    /// stale lifecycle text. The generation is retained so the surface still has
+    /// an identified owner and a later terminal path can retry the clear,
+    /// instead of the only target record being erased on a failed request.
+    #[tokio::test]
+    async fn a_failed_assistant_clear_retains_ownership_so_it_can_be_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        // First clear attempt fails, the retry succeeds.
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "final-ts",
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path()).with_streaming(true, 1);
+        let target = AssistantTarget {
+            channel_id: "C123".to_string(),
+            thread_ts: "thread-one".to_string(),
+        };
+        ch.active_assistant_threads
+            .lock()
+            .unwrap()
+            .insert(target.clone());
+        let draft = ch
+            .send_draft(
+                &SendMessage::new("...", "C123")
+                    .in_thread(Some("thread-one".to_string()))
+                    .in_reply_to(Some("slack_C123_message-one".to_string())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Finalization attempts the clear; Slack rejects it.
+        ch.finalize_draft("C123", &draft, "done", false)
+            .await
+            .unwrap();
+        assert!(
+            ch.owns_assistant_status(&target, &draft).await,
+            "a failed clear must keep the generation so it stays retryable"
+        );
+
+        // The retained ownership makes a retry effective.
+        let turn = SlackDraftTurn {
+            recipient: "C123".to_string(),
+            thread_ts: Some("thread-one".to_string()),
+            assistant_target: Some(target.clone()),
+        };
+        ch.clear_owned_assistant_status(&turn, &draft).await;
+        assert!(
+            !ch.owns_assistant_status(&target, &draft).await,
+            "a successful clear must release the generation"
+        );
+        let calls = assistant_status_calls(&server).await;
+        assert_eq!(
+            calls.iter().filter(|(_, status)| status.is_empty()).count(),
+            2,
+            "the clear must have been attempted twice: {calls:?}"
         );
     }
 
