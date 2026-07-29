@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -63,6 +63,35 @@ impl Drop for ThreadBackfillReservationGuard<'_> {
     }
 }
 
+/// Server-issued cooldown deadlines per Slack Web API method, shared by every
+/// handle that addresses one Slack installation.
+type MethodCooldowns = Arc<AsyncMutex<HashMap<&'static str, Instant>>>;
+
+/// Cooldowns for every Slack installation this process talks to, keyed by a
+/// digest of the bot token.
+///
+/// Slack evaluates Web API rate limits per method, per workspace, per app, and a
+/// 429 instructs the app to stop calling that method for the workspace until
+/// `Retry-After` elapses. Several `[channels.slack.<alias>]` handles may be
+/// configured against the same token, so the deadline cannot live on one handle:
+/// a second alias would otherwise construct its own map and call straight
+/// through an active cooldown.
+static INSTALLATION_METHOD_COOLDOWNS: LazyLock<Mutex<HashMap<String, MethodCooldowns>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve the shared cooldown state for the installation `bot_token` addresses.
+///
+/// The registry is keyed by a SHA-256 digest rather than the token itself, so a
+/// process-lifetime map never holds a raw credential.
+fn installation_method_cooldowns(bot_token: &str) -> MethodCooldowns {
+    use sha2::Digest as _;
+    let key = hex::encode(sha2::Sha256::digest(bot_token.as_bytes()));
+    let mut registry = INSTALLATION_METHOD_COOLDOWNS
+        .lock()
+        .expect("installation cooldown registry lock");
+    Arc::clone(registry.entry(key).or_default())
+}
+
 /// Slack channel — polls conversations.history via Web API
 #[allow(clippy::struct_excessive_bools)]
 pub struct SlackChannel {
@@ -92,10 +121,13 @@ pub struct SlackChannel {
     /// re-backfill on the next inbound message, which is the accepted
     /// tradeoff (matches `matrix.rs::context`).
     seen_threads: Mutex<HashSet<SlackThreadKey>>,
-    /// Authoritative server-issued cooldown deadline for each Slack API method
-    /// in this workspace handle. Unlike a hydration-local retry budget, this
-    /// survives the failed call so subsequent work cannot bypass Retry-After.
-    api_method_cooldowns: AsyncMutex<HashMap<&'static str, Instant>>,
+    /// Authoritative server-issued cooldown deadline for each Slack API method.
+    /// Unlike a hydration-local retry budget this survives the failed call, and
+    /// it is shared by every handle addressing the same Slack installation:
+    /// Slack applies Web API limits per method, per workspace, per app, so a
+    /// handle-local map would let a second configured alias using the same bot
+    /// token bypass a server-issued `Retry-After`.
+    api_method_cooldowns: MethodCooldowns,
     /// Resolves the current canonical Slack config value on demand. This is a
     /// resolver, not a cached copy, so config reload remains the source of truth.
     thread_context_max_messages_resolver: Arc<dyn Fn() -> usize + Send + Sync>,
@@ -306,6 +338,9 @@ impl SlackChannel {
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
+        // Resolved before the token moves into the struct: every handle for one
+        // installation must share the same cooldown state.
+        let api_method_cooldowns = installation_method_cooldowns(&bot_token);
         Self {
             bot_token,
             app_token,
@@ -320,7 +355,7 @@ impl SlackChannel {
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
             seen_threads: Mutex::new(HashSet::new()),
-            api_method_cooldowns: AsyncMutex::new(HashMap::new()),
+            api_method_cooldowns,
             thread_context_max_messages_resolver: Arc::new(|| {
                 zeroclaw_config::schema::DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES
             }),
@@ -6355,9 +6390,23 @@ mod tests {
             .await;
     }
 
+    /// Every handle gets a distinct bot token so each test resolves its own
+    /// entry in the process-wide installation cooldown registry. Sharing one
+    /// token here would leak a `Retry-After` deadline set by a rate-limit test
+    /// into unrelated tests running in the same process. Tests that need the
+    /// shared-installation behaviour construct handles with an explicit common
+    /// token instead.
+    fn unique_test_bot_token() -> String {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        format!(
+            "xoxb-fake-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
     fn test_slack_channel(server: &wiremock::MockServer, workspace: &Path) -> SlackChannel {
         SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -7548,6 +7597,106 @@ mod tests {
             .expect("hydration task must not panic")
             .expect("the triggering message must be forwarded");
         assert!(content.contains("prior context"), "{content}");
+        server.verify().await;
+    }
+
+    /// Slack applies Web API limits per method, per workspace, per app, so a
+    /// terminal `Retry-After` must bind every configured handle addressing the
+    /// same installation — not just the alias that received the 429.
+    ///
+    /// Two `[channels.slack.<alias>]` handles are built with one shared bot
+    /// token. Alias A exhausts its three-request hydration budget on a terminal
+    /// 429 carrying `Retry-After: 1`; alias B must then be unable to call
+    /// `conversations.replies` until that deadline expires.
+    #[tokio::test]
+    async fn terminal_cooldown_binds_every_alias_of_one_slack_installation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [],
+                "response_metadata": {"next_cursor": ""},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // One installation, two configured aliases.
+        let shared_token = "xoxb-one-installation-two-aliases";
+        let build = |alias: &'static str| {
+            Arc::new(
+                SlackChannel::new(
+                    shared_token.into(),
+                    None,
+                    vec!["C_ONE".into()],
+                    alias,
+                    Arc::new(|| vec!["U_USER".to_string()]),
+                )
+                .with_thread_context_max_messages_resolver(Arc::new(|| 2))
+                .with_api_base_url(server.uri()),
+            )
+        };
+        let alias_a = build("slack_alias_a");
+        let alias_b = build("slack_alias_b");
+
+        // Alias A burns the whole hydration budget and ends on a terminal 429.
+        let first = serde_json::json!({
+            "ts": "T_FIRST",
+            "thread_ts": "T_PARENT_ONE",
+            "user": "U_USER",
+            "text": "<@U_BOT> first",
+        });
+        alias_a
+            .build_incoming_content(&first, "C_ONE", true, "U_BOT")
+            .await
+            .expect("a rate-limited hydration must not drop the message");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+        // Alias B is a different handle, so before this fix it had its own empty
+        // cooldown map and called straight through the active deadline.
+        let second = serde_json::json!({
+            "ts": "T_SECOND",
+            "thread_ts": "T_PARENT_TWO",
+            "user": "U_USER",
+            "text": "<@U_BOT> second",
+        });
+        let task_b = Arc::clone(&alias_b);
+        let task = zeroclaw_spawn::spawn!(async move {
+            task_b
+                .build_incoming_content(&second, "C_ONE", true, "U_BOT")
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "a second alias of the same installation must honor the method cooldown"
+        );
+        tokio::time::timeout(Duration::from_secs(7), task)
+            .await
+            .expect("the second alias must resume once Retry-After expires")
+            .expect("hydration task must not panic")
+            .expect("the second alias's message must still be forwarded");
+
         server.verify().await;
     }
 
