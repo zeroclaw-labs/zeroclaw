@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -76,20 +76,41 @@ type MethodCooldowns = Arc<AsyncMutex<HashMap<&'static str, Instant>>>;
 /// configured against the same token, so the deadline cannot live on one handle:
 /// a second alias would otherwise construct its own map and call straight
 /// through an active cooldown.
-static INSTALLATION_METHOD_COOLDOWNS: LazyLock<Mutex<HashMap<String, MethodCooldowns>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Entries are `Weak` so the registry does not itself keep cooldown state alive:
+/// once every handle for a token is dropped the state can be reclaimed, and the
+/// dead entry is pruned on the next lookup. A strong map would otherwise
+/// accumulate one permanent entry per token ever constructed, which token
+/// rotation or repeated channel construction turns into a real leak.
+static INSTALLATION_METHOD_COOLDOWNS: LazyLock<
+    Mutex<HashMap<String, Weak<AsyncMutex<HashMap<&'static str, Instant>>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve the shared cooldown state for the installation `bot_token` addresses.
 ///
 /// The registry is keyed by a SHA-256 digest rather than the token itself, so a
-/// process-lifetime map never holds a raw credential.
+/// process-lifetime map never holds a raw credential. The digest is a stable
+/// secret-derived pseudonym: it is never logged or persisted.
+///
+/// Note the identity is token equality, so a rotated token is treated as a new
+/// installation until every handle is rebuilt. That is a deliberate tradeoff —
+/// Slack does not expose a workspace/app identifier on this path, and the
+/// alternative would be inventing one.
 fn installation_method_cooldowns(bot_token: &str) -> MethodCooldowns {
     use sha2::Digest as _;
     let key = hex::encode(sha2::Sha256::digest(bot_token.as_bytes()));
+    // Advisory cooldown state: a poisoned registry must not permanently break
+    // every later channel construction, so recover the guard rather than panic.
     let mut registry = INSTALLATION_METHOD_COOLDOWNS
         .lock()
-        .expect("installation cooldown registry lock");
-    Arc::clone(registry.entry(key).or_default())
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    // Reclaim entries whose handles have all been dropped before inserting.
+    registry.retain(|_, state| state.strong_count() > 0);
+    let created: MethodCooldowns = Arc::new(AsyncMutex::new(HashMap::new()));
+    registry.insert(key, Arc::downgrade(&created));
+    created
 }
 
 /// Slack channel — polls conversations.history via Web API
@@ -5669,7 +5690,7 @@ mod tests {
     #[test]
     fn slack_channel_name() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5681,7 +5702,7 @@ mod tests {
     #[test]
     fn slack_channel_with_channel_ids() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C12345".into()],
             "slack_test_alias",
@@ -5693,7 +5714,7 @@ mod tests {
     #[test]
     fn slack_group_reply_policy_defaults_to_all_messages() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5707,7 +5728,7 @@ mod tests {
     #[test]
     fn with_thread_replies_sets_flag() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5720,7 +5741,7 @@ mod tests {
     #[test]
     fn with_strict_mention_in_thread_sets_flag() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5738,7 +5759,7 @@ mod tests {
         let configured = Arc::new(AtomicUsize::new(3));
         let resolver_value = Arc::clone(&configured);
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5756,7 +5777,7 @@ mod tests {
     #[test]
     fn strict_active_thread_reply_requires_mention() {
         let strict = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5767,7 +5788,7 @@ mod tests {
         assert!(strict.requires_mention("C_ONE", "U_USER", true));
 
         let non_strict = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5806,7 +5827,7 @@ mod tests {
         let msg = SendMessage::new("hello", "C123").in_thread(Some("1741234567.100001".into()));
 
         let threaded = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5815,7 +5836,7 @@ mod tests {
         assert_eq!(threaded.outbound_thread_ts(&msg), Some("1741234567.100001"));
 
         let channel_root = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5828,7 +5849,7 @@ mod tests {
     #[test]
     fn with_workspace_dir_sets_field() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5844,7 +5865,7 @@ mod tests {
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5877,7 +5898,7 @@ mod tests {
     #[test]
     fn configured_app_token_ignores_blank_values() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             Some("   ".into()),
             vec![],
             "slack_test_alias",
@@ -5889,7 +5910,7 @@ mod tests {
     #[test]
     fn configured_app_token_trims_value() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             Some(" xapp-123 ".into()),
             vec![],
             "slack_test_alias",
@@ -5901,7 +5922,7 @@ mod tests {
     #[test]
     fn scoped_channel_ids_uses_explicit_list() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_LIST1".into(), "D_DM1".into()],
             "slack_test_alias",
@@ -5916,7 +5937,7 @@ mod tests {
     #[test]
     fn scoped_channel_ids_with_single_entry() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_SINGLE".into()],
             "slack_test_alias",
@@ -5928,7 +5949,7 @@ mod tests {
     #[test]
     fn scoped_channel_ids_returns_none_for_wildcard_mode() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5948,7 +5969,7 @@ mod tests {
     #[test]
     fn is_direct_message_true_for_im_reply_target() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5985,7 +6006,7 @@ mod tests {
     #[test]
     fn empty_allowlist_denies_everyone() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -5998,7 +6019,7 @@ mod tests {
     #[test]
     fn wildcard_allows_everyone() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6010,7 +6031,7 @@ mod tests {
     #[test]
     fn explicit_user_peer_is_allowed() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6061,7 +6082,7 @@ mod tests {
     #[test]
     fn cached_sender_display_name_returns_none_when_expired() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6086,7 +6107,7 @@ mod tests {
     #[test]
     fn cached_sender_display_name_returns_cached_value_when_valid() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6304,7 +6325,7 @@ mod tests {
         let path = workspace.path().join("chart.png");
         tokio::fs::write(&path, b"\x89PNG\r\n\x1a\n").await.unwrap();
         let channel = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6333,7 +6354,7 @@ mod tests {
         let path = outside.path().join("secret.png");
         tokio::fs::write(&path, b"\x89PNG\r\n\x1a\n").await.unwrap();
         let channel = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6664,7 +6685,7 @@ mod tests {
     async fn persist_image_attachment_writes_bytes_without_part_leftovers() {
         let workspace = tempfile::tempdir().unwrap();
         let channel = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6723,7 +6744,7 @@ mod tests {
     #[test]
     fn specific_allowlist_filters() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6737,7 +6758,7 @@ mod tests {
     #[test]
     fn allowlist_exact_match_not_substring() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6750,7 +6771,7 @@ mod tests {
     #[test]
     fn allowlist_empty_user_id() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6762,7 +6783,7 @@ mod tests {
     #[test]
     fn allowlist_case_sensitive() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6775,7 +6796,7 @@ mod tests {
     #[test]
     fn allowlist_wildcard_and_specific() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -6939,7 +6960,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -7196,7 +7217,7 @@ mod tests {
     fn slack_send_uses_markdown_blocks() {
         let msg = SendMessage::new("**bold** and _italic_", "C123");
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -7253,7 +7274,7 @@ mod tests {
     #[tokio::test]
     async fn start_typing_requires_thread_context() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -7270,7 +7291,7 @@ mod tests {
     #[test]
     fn assistant_thread_tracking() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec![],
             "slack_test_alias",
@@ -7466,7 +7487,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -7559,7 +7580,7 @@ mod tests {
 
         let ch = Arc::new(
             SlackChannel::new(
-                "xoxb-fake".into(),
+                unique_test_bot_token(),
                 None,
                 vec!["C_ONE".into()],
                 "slack_test_alias",
@@ -7598,6 +7619,63 @@ mod tests {
             .expect("the triggering message must be forwarded");
         assert!(content.contains("prior context"), "{content}");
         server.verify().await;
+    }
+
+    /// Handles for one installation must resolve to the same cooldown state,
+    /// and distinct installations must stay isolated.
+    #[test]
+    fn installation_cooldowns_are_shared_per_token_and_isolated_across_tokens() {
+        let a1 = installation_method_cooldowns("xoxb-installation-a");
+        let a2 = installation_method_cooldowns("xoxb-installation-a");
+        let b = installation_method_cooldowns("xoxb-installation-b");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "two handles for one token must share cooldown state"
+        );
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different installations must not share cooldown state"
+        );
+    }
+
+    /// The registry holds `Weak` refs, so state for an installation with no live
+    /// handles is reclaimed instead of accumulating one permanent entry per
+    /// token ever constructed.
+    #[test]
+    fn installation_cooldown_registry_reclaims_dropped_installations() {
+        let key = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(b"xoxb-transient-installation"))
+        };
+        {
+            let _live = installation_method_cooldowns("xoxb-transient-installation");
+            let registry = INSTALLATION_METHOD_COOLDOWNS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                registry.get(&key).and_then(Weak::upgrade).is_some(),
+                "a live handle must keep its cooldown state resolvable"
+            );
+        }
+        // The handle is gone, so the entry must no longer resolve...
+        {
+            let registry = INSTALLATION_METHOD_COOLDOWNS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                registry.get(&key).and_then(Weak::upgrade).is_none(),
+                "dropped installations must not keep cooldown state alive"
+            );
+        }
+        // ...and the dead key is pruned by the next resolution.
+        let _other = installation_method_cooldowns("xoxb-some-other-installation");
+        let registry = INSTALLATION_METHOD_COOLDOWNS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !registry.contains_key(&key),
+            "a later lookup must prune the dead entry"
+        );
     }
 
     /// Slack applies Web API limits per method, per workspace, per app, so a
@@ -7733,7 +7811,7 @@ mod tests {
 
         let ch = Arc::new(
             SlackChannel::new(
-                "xoxb-fake".into(),
+                unique_test_bot_token(),
                 None,
                 vec!["C_ONE".into()],
                 "slack_test_alias",
@@ -7828,7 +7906,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -7907,7 +7985,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -7956,7 +8034,7 @@ mod tests {
 
         let server = MockServer::start().await;
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -7985,7 +8063,7 @@ mod tests {
 
         let server = MockServer::start().await;
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8026,7 +8104,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8069,7 +8147,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8112,7 +8190,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8155,7 +8233,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8199,7 +8277,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8250,7 +8328,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8309,7 +8387,7 @@ mod tests {
             .await;
 
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C_ONE".into()],
             "slack_test_alias",
@@ -8470,7 +8548,7 @@ mod tests {
     #[test]
     fn thread_backfill_first_reply_backfills_then_subsequent_replies_do_not() {
         let ch = SlackChannel::new(
-            "xoxb-fake".into(),
+            unique_test_bot_token(),
             None,
             vec!["C1".into()],
             "slack_test_alias",
