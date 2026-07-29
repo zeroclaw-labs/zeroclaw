@@ -472,15 +472,21 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_path_outside_workspace() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
         let tool = ClaudeCodeRunnerTool::new(
-            test_security(AutonomyLevel::Full),
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
             test_config(),
             "http://localhost:3000".into(),
         );
         let result = tool
             .execute(json!({
                 "prompt": "hello",
-                "working_directory": "/etc"
+                "working_directory": outside.path()
             }))
             .await
             .expect("should return a result for path validation");

@@ -808,4 +808,109 @@ mod tests {
         let after = tokio::fs::read(store.path()).await.unwrap();
         assert_eq!(before, after, "list_profile_ids must not rewrite the store");
     }
+
+    #[tokio::test]
+    async fn legacy_oauth_store_loads_with_flat_tokens_reconstructed() {
+        // A store written by a release before the `provider` -> `model_provider`
+        // rename: it carries the legacy `provider` key and flat OAuth token fields
+        // rather than a nested `token_set`. Loading through the real store path must
+        // map the alias and rebuild the token set, not silently yield `token_set:
+        // None` (an authenticated profile that holds no credentials).
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let legacy = r#"{
+            "schema_version": 1,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "active_profiles": {
+                "openai-codex": "openai-codex:default"
+            },
+            "profiles": {
+                "openai-codex:default": {
+                    "provider": "openai-codex",
+                    "profile_name": "default",
+                    "kind": "oauth",
+                    "account_id": "acct_legacy",
+                    "workspace_id": "ws_legacy",
+                    "access_token": "legacy-access",
+                    "refresh_token": "legacy-refresh",
+                    "id_token": "legacy-id",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "token_type": "Bearer",
+                    "scope": "openid offline_access"
+                }
+            }
+        }"#;
+        tokio::fs::write(store.path(), legacy).await.unwrap();
+
+        let data = store.load().await.unwrap();
+        let profile = data
+            .profiles
+            .get("openai-codex:default")
+            .expect("legacy profile loads");
+
+        // Legacy `provider` key resolves to the canonical field.
+        assert_eq!(profile.model_provider, "openai-codex");
+        assert_eq!(profile.kind, AuthProfileKind::OAuth);
+        assert_eq!(profile.account_id.as_deref(), Some("acct_legacy"));
+        assert_eq!(profile.workspace_id.as_deref(), Some("ws_legacy"));
+
+        // Flat token fields are reassembled into the token set.
+        let token_set = profile.token_set.as_ref().expect("flat tokens rebuilt");
+        assert_eq!(token_set.access_token, "legacy-access");
+        assert_eq!(token_set.refresh_token.as_deref(), Some("legacy-refresh"));
+        assert_eq!(token_set.id_token.as_deref(), Some("legacy-id"));
+        assert_eq!(token_set.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(token_set.scope.as_deref(), Some("openid offline_access"));
+        assert_eq!(
+            token_set.expires_at,
+            Some(
+                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+
+        // The active-profile pointer survives the load unchanged.
+        assert_eq!(
+            data.active_profiles.get("openai-codex").map(String::as_str),
+            Some("openai-codex:default")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_token_store_loads_flat_token_field() {
+        // Token-kind sibling of the OAuth case: a legacy `provider` key with a flat
+        // `token` field (no OAuth token set) must load with the token preserved.
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let legacy = r#"{
+            "schema_version": 1,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "active_profiles": {
+                "anthropic": "anthropic:default"
+            },
+            "profiles": {
+                "anthropic:default": {
+                    "provider": "anthropic",
+                    "profile_name": "default",
+                    "kind": "token",
+                    "token": "legacy-api-key"
+                }
+            }
+        }"#;
+        tokio::fs::write(store.path(), legacy).await.unwrap();
+
+        let data = store.load().await.unwrap();
+        let profile = data
+            .profiles
+            .get("anthropic:default")
+            .expect("legacy token profile loads");
+
+        assert_eq!(profile.model_provider, "anthropic");
+        assert_eq!(profile.kind, AuthProfileKind::Token);
+        assert!(profile.token_set.is_none());
+        assert_eq!(profile.token.as_deref(), Some("legacy-api-key"));
+    }
 }
