@@ -3684,6 +3684,21 @@ impl LarkChannel {
     }
 }
 
+/// Verify an incoming URL-verification challenge token against the configured
+/// token. Fail-closed: missing, null, non-string, or empty incoming tokens are
+/// rejected; a configured empty verification_token (i.e. no token configured)
+/// also rejects all challenges. Uses constant-time comparison to prevent
+/// timing side-channel leakage.
+fn verify_challenge_token(incoming: Option<&serde_json::Value>, configured: &str) -> bool {
+    incoming
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| {
+            !t.is_empty()
+                && !configured.is_empty()
+                && constant_time_eq(t, configured)
+        })
+}
+
 impl LarkChannel {
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
@@ -3710,11 +3725,13 @@ impl LarkChannel {
 
             // URL verification challenge
             if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
-                // Verify token if present
-                let token_ok = payload
-                    .get("token")
-                    .and_then(|t| t.as_str())
-                    .is_none_or(|t| constant_time_eq(t, &state.verification_token));
+                // Fail-closed: reject missing, null, non-string, or empty
+                // tokens. A configured empty verification_token is treated as
+                // "no token configured" and rejects all challenges.
+                let token_ok = verify_challenge_token(
+                    payload.get("token"),
+                    &state.verification_token,
+                );
 
                 if !token_ok {
                     return (StatusCode::FORBIDDEN, "invalid token").into_response();
@@ -4198,11 +4215,52 @@ mod tests {
     }
 
     #[test]
-    fn lark_verification_token_comparison_is_constant_time() {
-        let token = "test_verification_token";
-        assert!(constant_time_eq(token, token));
-        assert!(!constant_time_eq("wrong_token", token));
-        assert!(!constant_time_eq("", token));
+    fn lark_url_verification_accepts_valid_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": configured });
+        assert!(verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_wrong_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": "wrong_token" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_missing_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "challenge": "abc" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_null_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": null });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_non_string_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": 12345 });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_empty_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": "" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_when_configured_token_empty() {
+        let configured = "";
+        let payload = serde_json::json!({ "token": "" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
     }
 
     #[test]
