@@ -162,23 +162,46 @@ rejected. Grok's discovered user and project configuration, together with alias
 `extra_args`, owns Grok tool policy.
 
 The default argv adds `--no-auto-update`, `--no-plan`, `--sandbox strict`,
-`--permission-mode dontAsk`, and `--tools ""`. The ACP client never approves a
-permission request. When the request supplies a `reject_once` option, the
-client selects that option instead of cancelling the complete agent turn;
-otherwise it cancels the request. The requested tool still fails closed,
-while Grok can consume the rejection and produce a final answer or retry with
-an operation its policy allows. Grok evaluates permission rules discovered from
-its user and project configuration before asking the ACP client. Those files
-are therefore trusted operator policy: an `allow` rule may pre-authorize a tool,
-and project MCP servers, plugins, or hooks may add capabilities. Use a dedicated,
-reviewed `working_directory` for channel agents. Operators can also grant tools
-or relax sandbox/permission policy with alias `extra_args`; both surfaces are
-explicit opt-ins to a wider subprocess boundary. Transport, prompt, model,
-session, cwd, and update flags remain provider-owned and are rejected in
-`extra_args`. Positional and short arguments are also rejected. Known
-value-taking options accept either `["--flag", "value"]` or `--flag=value`;
-unknown option shapes require the inline form so they cannot consume the
-trailing ACP command.
+`--permission-mode dontAsk`, and `--tools ""`. By default, the ACP client fails
+permission requests closed. When the request supplies a `reject_once` option,
+the client selects it instead of cancelling the complete agent turn; otherwise
+it cancels the request. The requested tool still fails closed, while Grok can
+consume the rejection and produce a final answer or retry with an operation its
+policy allows.
+
+An alias explicitly configured with `--always-approve`,
+`--dangerously-skip-permissions`, `--yolo`, or
+`--permission-mode=bypassPermissions` changes the headless ACP response policy:
+the client selects the request's `allow_once` option. It never substitutes
+`allow_always`, and cancels when the requested `allow_once` option is absent.
+This approval applies only to the current permission request; Grok's permission
+rules and active OS sandbox can still reject or confine the operation.
+
+```toml
+[providers.models.grok_cli.ops]
+working_directory = "/path/to/agents/ops/workspace"
+extra_args = [
+  "--tools=run_terminal_cmd",
+  "--permission-mode=bypassPermissions",
+]
+```
+
+Treat these bypass flags as authorization for Grok to execute every
+request-supported tool on that alias without a human approval round trip. Other
+permission modes, including `acceptEdits`, do not enable ACP auto-approval.
+Grok evaluates permission rules discovered from its user and project
+configuration before asking the ACP client. Those files are therefore trusted
+operator policy: an `allow` rule may pre-authorize a tool, and project MCP
+servers, plugins, or hooks may add capabilities. Use a dedicated, reviewed
+`working_directory` for channel agents.
+
+Operators can also grant tools or relax sandbox/permission policy with alias
+`extra_args`; both surfaces are explicit opt-ins to a wider subprocess boundary.
+Transport, prompt, model, session, cwd, and update flags remain provider-owned
+and are rejected in `extra_args`. Positional and short arguments are also
+rejected. Known value-taking options accept either `["--flag", "value"]` or
+`--flag=value`; unknown option shapes require the inline form so they cannot
+consume the trailing ACP command.
 
 Grok may emit progress as an `agent_message_chunk` before a plan, tool call, or
 permission request. The provider discards the preceding message segment at
@@ -246,7 +269,7 @@ model_provider = "grok_cli.ops"
 | Reply precheck | `classifier_provider` → API alias (e.g. `xai.default`) | REPLY / `NO_REPLY[*]` only; avoids CLI thinking text as the message body |
 | Full answer | `model_provider` → `grok_cli.default` | Grok Build ACP; prompt only on stdin |
 | OS sandbox | Default `--sandbox strict` (or `extra_args` override) | Read CWD + system paths only (not `~/.ssh` / home); write CWD + `~/.grok` + tmp; child network blocked on Linux |
-| App permissions | Empty built-in tool set + ACP permission rejection | Discovered Grok permission rules remain operator-owned and may pre-authorize configured tools |
+| App permissions | Empty built-in tool set + fail-closed ACP default | Explicit bypass flags select `allow_once`; discovered Grok rules may also pre-authorize configured tools |
 | Channel delivery | ZeroClaw `thread_replies` / channel config | Single in-thread reply path |
 | Optional gate | Slack `mention_only` + `strict_mention_in_thread` | Drop unmentioned group/thread traffic before the agent (see [Slack](../channels/slack.md)); independent of the classifier |
 

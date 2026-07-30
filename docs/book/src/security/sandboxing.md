@@ -9,8 +9,10 @@ ZeroClaw's native tool-approval path. Risk-profile sandboxing above does not
 confine it. The `grok_cli` ACP provider therefore injects `--sandbox strict`,
 `--permission-mode dontAsk`, and an empty built-in tool set by default, and it
 rejects ACP permission requests (selecting `reject_once` when the CLI offers
-it, otherwise cancelling the request). A corresponding `extra_args` flag is an
-explicit per-alias opt-in to relax those defaults. See
+it, otherwise cancelling the request). Explicit bypass flags in alias
+`extra_args` instead select the request's `allow_once` option; this does not
+disable Grok's active OS sandbox or override its deny rules. Other permission
+modes remain fail closed. See
 [Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli).
 
 `sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.

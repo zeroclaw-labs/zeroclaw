@@ -4,8 +4,8 @@
 //! initialize → authenticate → session/new → session/prompt. Assistant text
 //! arrives in `session/update` notifications. Every input frame and aggregate
 //! byte count is bounded before allocation grows. Server permission requests
-//! select reject-once when offered so the tool fails closed without cancelling
-//! the complete agent turn.
+//! follow the explicit per-alias policy supplied by the provider and otherwise
+//! select reject-once so the tool fails closed.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,6 +30,22 @@ pub(super) const MIN_ACP_STDOUT_LIMIT_BYTES: usize = MAX_ACP_FRAME_BYTES;
 
 /// Keep a configured transport budget bounded even for tool-heavy aliases.
 pub(super) const MAX_ACP_STDOUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// How the headless ACP client answers interactive permission requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AcpPermissionPolicy {
+    RejectOnce,
+    AllowOnce,
+}
+
+impl AcpPermissionPolicy {
+    fn option_kind(self) -> &'static str {
+        match self {
+            Self::RejectOnce => "reject_once",
+            Self::AllowOnce => "allow_once",
+        }
+    }
+}
 
 /// Maximum assistant text returned to the channel/runtime.
 const MAX_ACP_ASSISTANT_BYTES: usize = 1_048_576;
@@ -130,6 +146,7 @@ pub(super) async fn run_oneshot_prompt<W, R>(
     prompt: &[AcpPromptContent],
     cwd: &Path,
     xai_api_key_available: bool,
+    permission_policy: AcpPermissionPolicy,
     max_stdout_bytes: usize,
 ) -> Result<String, AcpError>
 where
@@ -153,6 +170,7 @@ where
             }
         }),
         &mut assistant,
+        permission_policy,
     )
     .await?;
 
@@ -167,6 +185,7 @@ where
             "_meta": { "headless": true }
         }),
         &mut assistant,
+        permission_policy,
     )
     .await?;
 
@@ -180,6 +199,7 @@ where
             "mcpServers": []
         }),
         &mut assistant,
+        permission_policy,
     )
     .await?;
     let session_id = new_session
@@ -202,10 +222,11 @@ where
             "prompt": prompt.iter().map(AcpPromptContent::as_json).collect::<Vec<_>>()
         }),
         &mut assistant,
+        permission_policy,
     )
     .await?;
 
-    settle_trailing_output(stdin, &mut reader, &mut assistant).await?;
+    settle_trailing_output(stdin, &mut reader, &mut assistant, permission_policy).await?;
     let trimmed = assistant.trim();
     if trimmed.is_empty() {
         return Err(AcpError::EmptyOutput);
@@ -311,6 +332,7 @@ async fn rpc_request<W, R>(
     method: &'static str,
     params: Value,
     assistant: &mut String,
+    permission_policy: AcpPermissionPolicy,
 ) -> Result<Value, AcpError>
 where
     W: AsyncWrite + Unpin,
@@ -328,7 +350,7 @@ where
 
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
             discard_non_final_output(&message, assistant);
-            handle_server_request(stdin, &message).await?;
+            handle_server_request(stdin, &message, permission_policy).await?;
             continue;
         }
         if message.get(field::METHOD).is_some() && message.get(field::ID).is_none() {
@@ -360,7 +382,11 @@ where
     stdin.flush().await.map_err(|_| AcpError::Write { phase })
 }
 
-async fn handle_server_request<W>(stdin: &mut W, message: &Value) -> Result<(), AcpError>
+async fn handle_server_request<W>(
+    stdin: &mut W,
+    message: &Value,
+    permission_policy: AcpPermissionPolicy,
+) -> Result<(), AcpError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -371,7 +397,7 @@ where
         .unwrap_or_default();
 
     if method == "session/request_permission" || method.ends_with("/session/request_permission") {
-        let outcome = permission_rejection_outcome(message);
+        let outcome = permission_outcome(message, permission_policy);
         let response = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
             result: Some(json!({ "outcome": outcome })),
@@ -394,13 +420,15 @@ where
     write_line(stdin, &response, "unsupported server request response").await
 }
 
-fn permission_rejection_outcome(message: &Value) -> Value {
+fn permission_outcome(message: &Value, permission_policy: AcpPermissionPolicy) -> Value {
     if let Some(option_id) = message
         .pointer("/params/options")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find(|option| option.get("kind").and_then(Value::as_str) == Some("reject_once"))
+        .find(|option| {
+            option.get("kind").and_then(Value::as_str) == Some(permission_policy.option_kind())
+        })
         .and_then(|option| option.get("optionId"))
         .and_then(Value::as_str)
     {
@@ -413,6 +441,7 @@ async fn settle_trailing_output<W, R>(
     stdin: &mut W,
     reader: &mut AcpReader<R>,
     assistant: &mut String,
+    permission_policy: AcpPermissionPolicy,
 ) -> Result<(), AcpError>
 where
     W: AsyncWrite + Unpin,
@@ -428,7 +457,7 @@ where
                 quiet_intervals = 0;
                 if message.get(field::METHOD).is_some() && message.get(field::ID).is_some() {
                     discard_non_final_output(&message, assistant);
-                    handle_server_request(stdin, &message).await?;
+                    handle_server_request(stdin, &message, permission_policy).await?;
                 } else if message.get(field::METHOD).is_some() {
                     discard_non_final_output(&message, assistant);
                     append_agent_message_chunk(&message, assistant)?;
@@ -674,7 +703,7 @@ mod tests {
                 ]
             }
         });
-        handle_server_request(&mut client, &request)
+        handle_server_request(&mut client, &request, AcpPermissionPolicy::RejectOnce)
             .await
             .expect("permission response");
         drop(client);
@@ -695,8 +724,42 @@ mod tests {
         assert!(!encoded.contains("allow"));
     }
 
+    #[tokio::test]
+    async fn permission_requests_select_the_request_allow_once_option() {
+        let (mut client, mut peer) = duplex(4096);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    { "optionId": "allow", "kind": "allow_once" },
+                    { "optionId": "deny", "kind": "reject_once" }
+                ]
+            }
+        });
+        handle_server_request(&mut client, &request, AcpPermissionPolicy::AllowOnce)
+            .await
+            .expect("permission response");
+        drop(client);
+
+        let mut encoded = String::new();
+        peer.read_to_string(&mut encoded)
+            .await
+            .expect("read response");
+        let response: Value = serde_json::from_str(encoded.trim()).expect("valid response");
+        assert_eq!(
+            response.pointer("/result/outcome/outcome"),
+            Some(&Value::String("selected".to_string()))
+        );
+        assert_eq!(
+            response.pointer("/result/outcome/optionId"),
+            Some(&Value::String("allow".to_string()))
+        );
+    }
+
     #[test]
-    fn permission_requests_cancel_without_a_reject_once_option() {
+    fn permission_requests_cancel_without_the_policy_option() {
         let request = json!({
             "params": {
                 "options": [
@@ -706,7 +769,21 @@ mod tests {
             }
         });
         assert_eq!(
-            permission_rejection_outcome(&request),
+            permission_outcome(&request, AcpPermissionPolicy::RejectOnce),
+            json!({ "outcome": "cancelled" })
+        );
+        assert_eq!(
+            permission_outcome(
+                &json!({
+                    "params": {
+                        "options": [
+                            { "optionId": "deny", "kind": "reject_once" },
+                            { "optionId": "always", "kind": "allow_always" }
+                        ]
+                    }
+                }),
+                AcpPermissionPolicy::AllowOnce
+            ),
             json!({ "outcome": "cancelled" })
         );
     }

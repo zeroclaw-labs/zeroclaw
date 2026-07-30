@@ -30,7 +30,8 @@
 //!   plus explicit per-alias `env_passthrough` names;
 //! - defaults to `--no-plan`, `--sandbox strict`, `--permission-mode dontAsk`,
 //!   and an empty built-in tool set;
-//! - rejects ACP permission requests without cancelling the complete turn;
+//! - rejects ACP permission requests unless the alias explicitly enables a
+//!   bypass mode, in which case it selects the request's allow-once option;
 //! - bounds ACP frames, configurable aggregate stdout, assistant output, and stderr;
 //! - kills the child process tree on success, failure, timeout, or cancellation;
 //! - never includes child stderr or raw ACP frames in public errors or logs.
@@ -38,7 +39,8 @@
 //! Operators can deliberately relax the CLI policy through `extra_args` (for
 //! example, `--tools=Read,Grep`, `--permission-mode=acceptEdits`, or
 //! `--sandbox=workspace`). Such overrides are explicit per-provider-alias
-//! opt-ins.
+//! opt-ins. Bypass flags also authorize the headless ACP client to approve
+//! interactive permission requests for that alias.
 //!
 //! # Limitations
 //!
@@ -564,6 +566,34 @@ impl GrokCliModelProvider {
         })
     }
 
+    fn acp_permission_policy(extra_args: &[String]) -> acp::AcpPermissionPolicy {
+        let mut index = 0;
+        while index < extra_args.len() {
+            let arg = &extra_args[index];
+            if matches!(
+                arg.as_str(),
+                "--always-approve" | "--dangerously-skip-permissions" | "--yolo"
+            ) || arg
+                .strip_prefix("--permission-mode=")
+                .is_some_and(|mode| mode == "bypassPermissions")
+            {
+                return acp::AcpPermissionPolicy::AllowOnce;
+            }
+            if arg == "--permission-mode" {
+                if extra_args
+                    .get(index + 1)
+                    .is_some_and(|mode| mode == "bypassPermissions")
+                {
+                    return acp::AcpPermissionPolicy::AllowOnce;
+                }
+                index += 2;
+                continue;
+            }
+            index += 1;
+        }
+        acp::AcpPermissionPolicy::RejectOnce
+    }
+
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
         !trimmed.is_empty() && trimmed != DEFAULT_MODEL_MARKER
@@ -652,6 +682,7 @@ impl GrokCliModelProvider {
     async fn invoke_acp(&self, message: &str, model: &str) -> anyhow::Result<String> {
         let prompt = self.acp_prompt_content(message);
         let args = Self::build_cli_args(model, &self.extra_args);
+        let permission_policy = Self::acp_permission_policy(&self.extra_args);
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(&args);
         cmd.current_dir(&self.working_directory);
@@ -714,6 +745,7 @@ impl GrokCliModelProvider {
                 &prompt,
                 &self.working_directory,
                 xai_api_key_available,
+                permission_policy,
                 self.max_acp_stdout_bytes,
             ),
         )
@@ -1195,6 +1227,41 @@ mod tests {
     }
 
     #[test]
+    fn acp_permission_policy_requires_explicit_bypass() {
+        for extra in [
+            vec![],
+            vec!["--permission-mode=dontAsk".to_string()],
+            vec!["--permission-mode".to_string(), "acceptEdits".to_string()],
+            vec!["--always-approve=false".to_string()],
+        ] {
+            assert_eq!(
+                GrokCliModelProvider::acp_permission_policy(&extra),
+                acp::AcpPermissionPolicy::RejectOnce
+            );
+        }
+
+        for extra in [
+            vec!["--always-approve".to_string()],
+            vec!["--dangerously-skip-permissions".to_string()],
+            vec!["--yolo".to_string()],
+            vec!["--permission-mode=bypassPermissions".to_string()],
+            vec![
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ],
+            vec![
+                "--permission-mode=acceptEdits".to_string(),
+                "--always-approve".to_string(),
+            ],
+        ] {
+            assert_eq!(
+                GrokCliModelProvider::acp_permission_policy(&extra),
+                acp::AcpPermissionPolicy::AllowOnce
+            );
+        }
+    }
+
+    #[test]
     fn validate_temperature_allows_only_cli_baselines() {
         assert!(GrokCliModelProvider::validate_temperature(0.7).is_ok());
         assert!(GrokCliModelProvider::validate_temperature(1.0).is_ok());
@@ -1422,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an installed and authenticated Grok Build CLI"]
-    async fn live_grok_acp_recovers_after_rejecting_prompted_complex_shell() {
+    async fn live_grok_acp_allows_prompted_complex_shell_in_bypass_mode() {
         let temp = TempDir::new().expect("live Grok cwd");
         let marker = temp.path().join("permission-marker");
         let model_provider = provider(
@@ -1438,11 +1505,11 @@ mod tests {
         );
         let reply = model_provider
             .invoke_acp(
-                "First use the shell tool to run exactly `for value in ACP_PERMISSION_EXEC_OK; do printf '%s' \"$value\" > permission-marker; done`. If that tool call is rejected, retry with the simple command `printf ACP_PERMISSION_EXEC_OK > permission-marker`. After the marker is written, output the token ACP_PERMISSION_FINAL_OK.",
+                "Use the shell tool to run exactly this multiline command:\n```\n# OpenClaw style memory in agent home\nprintf ACP_PERMISSION_EXEC_OK > permission-marker\n```\nAfter the marker is written, output the token ACP_PERMISSION_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
             .await
-            .expect("live Grok ACP rejection recovery response");
+            .expect("live Grok ACP permission response");
         eprintln!("permission: {reply}");
         assert!(reply.contains("ACP_PERMISSION_FINAL_OK"), "reply: {reply}");
         assert_eq!(
@@ -1453,34 +1520,31 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an installed and authenticated Grok Build CLI"]
-    async fn live_grok_acp_rejects_denied_tool_without_cancelling_turn() {
+    async fn live_grok_acp_rejects_unapproved_tool() {
         let temp = TempDir::new().expect("live Grok cwd");
         let marker = temp.path().join("denied-marker");
-        let grok_config_dir = temp.path().join(".grok");
-        std::fs::create_dir(&grok_config_dir).expect("Grok config directory");
-        std::fs::write(
-            grok_config_dir.join("config.toml"),
-            "[permission]\ndeny = [\"Bash(printf *)\"]\n",
-        )
-        .expect("Grok deny config");
         let model_provider = provider(
             None,
             temp.path(),
             vec![
                 "--tools=run_terminal_cmd".to_string(),
-                "--permission-mode=bypassPermissions".to_string(),
+                "--permission-mode=dontAsk".to_string(),
             ],
             Some(120),
         );
-        let reply = model_provider
+        let error = model_provider
             .invoke_acp(
                 "Attempt to use the shell tool to run exactly `printf ACP_DENY_EXEC_BAD > denied-marker`. Whether the tool is denied or succeeds, output the token ACP_DENY_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
             .await
-            .expect("live Grok ACP rejected-tool response");
-        eprintln!("deny: {reply}");
-        assert!(reply.contains("ACP_DENY_FINAL_OK"), "reply: {reply}");
+            .expect_err("unapproved shell must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("completed without agent message text"),
+            "error: {error}"
+        );
         assert!(!marker.exists(), "deny rule must prevent the tool write");
     }
 
@@ -1525,6 +1589,22 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
 while IFS= read -r line; do :; done
 "#;
 
+        const PERMISSION_REQUEST_BODY: &str = r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fake-session"}}'
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":91,"method":"session/request_permission","params":{"sessionId":"fake-session","options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]}}'
+IFS= read -r line
+printf '%s\n' "$line" > permission-response.json
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FAKE_PERMISSION_OK"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+while IFS= read -r line; do :; done
+"#;
+
         fn fake_grok(temp: &TempDir, body: &str) -> PathBuf {
             let path = temp.path().join("fake-grok");
             std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).expect("write fake Grok");
@@ -1537,11 +1617,20 @@ while IFS= read -r line; do :; done
         }
 
         fn fake_provider(temp: &TempDir, body: &str, timeout_secs: u64) -> GrokCliModelProvider {
+            fake_provider_with_extra_args(temp, body, timeout_secs, vec![])
+        }
+
+        fn fake_provider_with_extra_args(
+            temp: &TempDir,
+            body: &str,
+            timeout_secs: u64,
+            extra_args: Vec<String>,
+        ) -> GrokCliModelProvider {
             let binary = fake_grok(temp, body);
             provider(
                 Some(binary.to_str().expect("UTF-8 fake path")),
                 temp.path(),
-                vec![],
+                extra_args,
                 Some(timeout_secs),
             )
         }
@@ -1674,6 +1763,40 @@ while IFS= read -r line; do :; done
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_PROGRESS_BOUNDARY_OK");
             assert!(!reply.contains("PROGRESS_MUST_NOT_ESCAPE"));
+        }
+
+        #[tokio::test]
+        async fn fake_child_permission_response_follows_explicit_bypass_policy() {
+            for (extra_args, expected_option_id) in [
+                (vec![], "deny"),
+                (
+                    vec!["--permission-mode=bypassPermissions".to_string()],
+                    "allow",
+                ),
+            ] {
+                let temp = TempDir::new().expect("tempdir");
+                let model_provider =
+                    fake_provider_with_extra_args(&temp, PERMISSION_REQUEST_BODY, 5, extra_args);
+                let reply = model_provider
+                    .invoke_acp("hello", "default")
+                    .await
+                    .expect("fake ACP reply");
+                assert_eq!(reply, "FAKE_PERMISSION_OK");
+
+                let encoded = std::fs::read_to_string(temp.path().join("permission-response.json"))
+                    .expect("captured permission response");
+                let response: serde_json::Value =
+                    serde_json::from_str(encoded.trim()).expect("valid permission response");
+                assert_eq!(response["id"], 91);
+                assert_eq!(
+                    response.pointer("/result/outcome/outcome"),
+                    Some(&serde_json::Value::String("selected".to_string()))
+                );
+                assert_eq!(
+                    response.pointer("/result/outcome/optionId"),
+                    Some(&serde_json::Value::String(expected_option_id.to_string()))
+                );
+            }
         }
 
         #[tokio::test]
