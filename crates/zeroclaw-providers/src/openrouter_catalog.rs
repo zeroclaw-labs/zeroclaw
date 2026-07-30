@@ -105,6 +105,9 @@ fn filter_by_vendor_with_pricing(
             e.id.strip_prefix(&needle).map(|slug| ModelInfo {
                 id: slug.to_string(),
                 pricing: e.pricing.clone(),
+                // OpenRouter publishes `context_length`; wiring it is a
+                // follow-up. `None` means "unknown", never a stub value.
+                context_window: None,
             })
         })
         .collect();
@@ -145,6 +148,9 @@ fn all_models_with_pricing(
         .map(|e| ModelInfo {
             id: e.id.clone(),
             pricing: e.pricing.clone(),
+            // OpenRouter publishes `context_length`; wiring it is a follow-up.
+            // `None` means "unknown", never a stub value.
+            context_window: None,
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
