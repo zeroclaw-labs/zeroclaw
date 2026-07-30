@@ -1099,12 +1099,11 @@ fn build_channel_turn_context_preamble(
 
     let mut preamble = format!(
         "[turn-context] time={time} date={date} tz={tz} \
-         channel={channel} reply_target={reply_target} sender={sender} \
-         message_id={message_id}. The sender field is the platform-specific \
+         channel={channel} reply_target={reply_target} sender={sender}. \
+         The sender field is the platform-specific \
          user ID of the person who sent this message. Use it to distinguish \
-         between different users. The message_id field identifies this \
-         incoming message; pass it as the `message_id` argument when calling \
-         the `reaction` tool. When scheduling delayed messages or reminders \
+         between different users. \
+         When scheduling delayed messages or reminders \
          via cron_add for this conversation, use {delivery_hint} so the \
          message reaches the user.\n\n",
         time = now.format("%H:%M:%S"),
@@ -1113,7 +1112,6 @@ fn build_channel_turn_context_preamble(
         channel = channel_name,
         reply_target = reply_target,
         sender = sender,
-        message_id = message_id,
         delivery_hint = delivery_hint,
     );
 
@@ -27487,8 +27485,8 @@ Done."#;
             "preamble must carry sender (for disambiguation): {preamble}"
         );
         assert!(
-            preamble.contains("message_id=msg-xyz789"),
-            "preamble must carry message_id (for the reaction tool): {preamble}"
+            !preamble.contains("message_id="),
+            "preamble must NOT carry message_id (per-turn IDs degrade cross-turn cache hit rates): {preamble}"
         );
         assert!(
             preamble.contains("\"to\":\"chat:42\""),
