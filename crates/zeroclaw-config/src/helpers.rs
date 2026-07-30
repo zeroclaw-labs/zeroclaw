@@ -72,18 +72,14 @@ pub fn route_double_hashmap_path<'a>(
 ///
 /// Both constructors build the error as exactly `Unknown property
 /// '{name}'` via `anyhow::Error::msg(String)`, so the downcast is the
-/// common zero-alloc path; `to_string()` is only a fallback for
-/// wrapped/contextualized errors. The comparison is against the full
-/// message, not just a prefix: a genuine nested value error whose text
-/// happens to start with "Unknown property" (a custom validator message,
-/// say) must not be mistaken for this fall-through marker and silently
-/// swallowed as a retry.
+/// typed identity check and still works through `anyhow` context layers.
+/// Display text alone is not sufficient: a different error type can render
+/// the same message but must not be mistaken for this fall-through marker and
+/// silently swallowed as a retry.
 pub fn is_unknown_property_error(e: &anyhow::Error, name: &str) -> bool {
     let expected = format!("Unknown property '{name}'");
-    if let Some(msg) = e.downcast_ref::<String>() {
-        return *msg == expected;
-    }
-    e.to_string() == expected
+    e.downcast_ref::<String>()
+        .is_some_and(|msg| *msg == expected)
 }
 
 pub fn route_vec_path<'a, 'k, I>(
@@ -1102,6 +1098,21 @@ mod tests {
         // Same construction the two real fallbacks use.
         let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"));
         assert!(is_unknown_property_error(&marker, "gateway.port"));
+    }
+
+    #[test]
+    fn is_unknown_property_error_matches_a_context_wrapped_typed_sentinel() {
+        let marker = anyhow::Error::msg(format!("Unknown property '{}'", "gateway.port"))
+            .context("while routing a nested property");
+        assert!(is_unknown_property_error(&marker, "gateway.port"));
+    }
+
+    #[test]
+    fn is_unknown_property_error_rejects_an_exact_text_non_string_error() {
+        let lookalike =
+            anyhow::Error::new(std::io::Error::other("Unknown property 'gateway.port'"));
+        assert_eq!(lookalike.to_string(), "Unknown property 'gateway.port'");
+        assert!(!is_unknown_property_error(&lookalike, "gateway.port"));
     }
 
     #[test]

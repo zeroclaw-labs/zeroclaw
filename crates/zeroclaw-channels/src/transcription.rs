@@ -35,6 +35,7 @@ pub(crate) fn mime_for_audio(extension: &str) -> Option<&'static str> {
 /// `mime_for_audio`. `None` when the MIME does not map to a format
 /// `resolve_audio_format` accepts. Codec parameters (e.g.
 /// "audio/ogg; codecs=opus") are stripped before matching.
+#[cfg(any(feature = "channel-matrix", test))]
 pub(crate) fn extension_for_audio_mime(mime: &str) -> Option<&'static str> {
     let mime = mime.split(';').next().unwrap_or(mime).trim();
     match mime.to_ascii_lowercase().as_str() {

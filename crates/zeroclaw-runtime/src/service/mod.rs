@@ -1910,8 +1910,8 @@ mod linux_service_tests {
     }
 }
 
-#[cfg(all(test, zeroclaw_root_crate))]
-mod tests {
+#[cfg(test)]
+mod service_helper_tests {
     use super::*;
 
     #[test]
@@ -2067,53 +2067,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn systemd_unit_contains_home_and_pass_environment() {
-        let unit = "[Unit]\n\
-             Description=ZeroClaw daemon\n\
-             After=network.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart=/usr/local/bin/zeroclaw daemon\n\
-             Restart=always\n\
-             RestartSec=3\n\
-             # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
-             Environment=HOME=%h\n\
-             # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
-             # so graphical/headless browsers can function correctly.\n\
-             PassEnvironment=DISPLAY XDG_RUNTIME_DIR\n\
-             \n\
-             [Install]\n\
-             WantedBy=default.target\n"
-            .to_string();
-
-        assert!(
-            unit.contains("Environment=HOME=%h"),
-            "systemd unit must set HOME for headless browser support"
-        );
-        assert!(
-            unit.contains("PassEnvironment=DISPLAY XDG_RUNTIME_DIR"),
-            "systemd unit must pass through display/runtime env vars"
-        );
-    }
-
-    #[test]
-    fn warn_if_binary_in_home_detects_home_path() {
-        use std::path::PathBuf;
-
-        let home_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        assert!(home_path.to_string_lossy().contains("/home/"));
-        assert!(home_path.to_string_lossy().contains(".cargo/bin"));
-
-        let cargo_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        assert!(cargo_path.to_string_lossy().contains(".cargo/bin"));
-
-        let system_path = PathBuf::from("/usr/local/bin/zeroclaw");
-        assert!(!system_path.to_string_lossy().contains("/home/"));
-        assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn shell_single_quote_escapes_single_quotes() {
@@ -2177,21 +2130,5 @@ mod tests {
         // tail should succeed on existing file
         let result = tail_file(&log, 3, false);
         assert!(result.is_ok(), "tail on existing file should succeed");
-    }
-
-    #[test]
-    fn logs_variant_is_recognized() {
-        // Ensure the Logs variant can be constructed and matched
-        let cmd = crate::ServiceCommands::Logs {
-            lines: 25,
-            follow: true,
-        };
-        match &cmd {
-            crate::ServiceCommands::Logs { lines, follow } => {
-                assert_eq!(*lines, 25);
-                assert!(*follow);
-            }
-            _ => panic!("Expected Logs variant"),
-        }
     }
 }

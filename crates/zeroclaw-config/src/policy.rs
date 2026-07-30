@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -29,6 +29,14 @@ pub struct ActionTracker {
     actions: Mutex<Vec<Instant>>,
 }
 
+const ACTION_WINDOW: Duration = Duration::from_secs(3600);
+
+fn retain_actions_after(actions: &mut Vec<Instant>, cutoff: Option<Instant>) {
+    if let Some(cutoff) = cutoff {
+        actions.retain(|timestamp| *timestamp > cutoff);
+    }
+}
+
 impl Default for ActionTracker {
     fn default() -> Self {
         Self::new()
@@ -45,21 +53,16 @@ impl ActionTracker {
     /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
-        actions.push(Instant::now());
+        let now = Instant::now();
+        retain_actions_after(&mut actions, now.checked_sub(ACTION_WINDOW));
+        actions.push(now);
         actions.len()
     }
 
     /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
+        retain_actions_after(&mut actions, Instant::now().checked_sub(ACTION_WINDOW));
         actions.len()
     }
 }
@@ -3315,6 +3318,15 @@ mod tests {
         assert_eq!(tracker.record(), 2);
         assert_eq!(tracker.record(), 3);
         assert_eq!(tracker.count(), 3);
+    }
+
+    #[test]
+    fn action_tracker_retains_actions_when_cutoff_is_unavailable() {
+        let mut actions = vec![Instant::now(), Instant::now()];
+
+        retain_actions_after(&mut actions, None);
+
+        assert_eq!(actions.len(), 2);
     }
 
     #[test]

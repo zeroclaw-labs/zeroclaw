@@ -62,17 +62,25 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
         );
     }
 
-    // Coarse check: reject only when no execute bit is set at all. A precise
-    // "can *we* execute it" test (uid/gid vs. the file owner) buys little —
-    // the kernel's spawn is the real authority (ACLs, caps, mount flags) — and
-    // this is a fail-fast sanity check, not a security gate.
-    let mode = match resolved.metadata() {
-        Ok(meta) => meta.permissions().mode(),
+    let metadata = match resolved.metadata() {
+        Ok(metadata) => metadata,
         Err(e) => anyhow::bail!(
             "runtime.shell {shell:?} (resolved to {}) could not be inspected: {e}",
             resolved.display()
         ),
     };
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "runtime.shell {shell:?} (resolved to {}) is not a regular file",
+            resolved.display()
+        );
+    }
+
+    // Coarse check: reject only when no execute bit is set at all. A precise
+    // "can *we* execute it" test (uid/gid vs. the file owner) buys little —
+    // the kernel's spawn is the real authority (ACLs, caps, mount flags) — and
+    // this is a fail-fast sanity check, not a security gate.
+    let mode = metadata.permissions().mode();
     if mode & 0o111 == 0 {
         anyhow::bail!(
             "runtime.shell {shell:?} (resolved to {}) is not executable",
@@ -186,6 +194,17 @@ mod tests {
         assert!(
             err.to_string().contains("does not exist"),
             "error should name the missing path, got: {err}"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn validate_shell_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = validate_shell(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "error should identify the non-file shell target, got: {err}"
         );
     }
 
