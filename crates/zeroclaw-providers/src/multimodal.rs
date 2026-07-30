@@ -390,7 +390,7 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
+pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
     message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
 }
 

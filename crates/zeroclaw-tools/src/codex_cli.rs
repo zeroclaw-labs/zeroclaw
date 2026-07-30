@@ -328,11 +328,16 @@ mod tests {
 
     #[tokio::test]
     async fn codex_cli_rejects_path_outside_workspace() {
-        let tool = CodexCliTool::new(test_security(AutonomyLevel::Full), test_config());
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
+        let tool = CodexCliTool::new(
+            test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
+            test_config(),
+        );
         let result = tool
             .execute(json!({
                 "prompt": "hello",
-                "working_directory": "/etc"
+                "working_directory": outside.path()
             }))
             .await
             .expect("should return a result for path validation");

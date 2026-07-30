@@ -178,7 +178,14 @@ pub(crate) async fn consume_provider_streaming_response(
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
                 if let Some(tx) = event_tx {
                     visible_event_output = true;
-                    let _ = tx.send(TurnEvent::ToolResult { id, name, output }).await;
+                    let _ = tx
+                        .send(TurnEvent::ToolResult {
+                            id,
+                            name,
+                            output,
+                            artifact: None,
+                        })
+                        .await;
                 }
             }
             StreamEvent::TextDelta(chunk) => {

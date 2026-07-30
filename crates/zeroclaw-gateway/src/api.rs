@@ -2045,7 +2045,17 @@ pub(crate) mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::RwLock;
-    #[cfg(feature = "channel-linq")]
+    // Gated on every channel feature whose `AppState` fields below are built
+    // with `HashMap::new()`, not just `channel-linq`. With only one of the
+    // others enabled the import vanished while its uses remained, so
+    // `--features channel-nextcloud` alone failed to compile. `--all-features`
+    // hid it, because `channel-linq` was always along for the ride.
+    #[cfg(any(
+        feature = "channel-linq",
+        feature = "channel-nextcloud",
+        feature = "channel-wati",
+        feature = "channel-whatsapp-cloud"
+    ))]
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2604,7 +2614,7 @@ pub(crate) mod tests {
             zeroclaw_config::schema::NextcloudTalkConfig {
                 enabled: true,
                 base_url: "https://cloud.example.com".to_string(),
-                app_token: "test-token".to_string(),
+                app_token: None,
                 ..Default::default()
             },
         );

@@ -4720,7 +4720,14 @@ fn notification_for_turn_event(
             name: name.clone(),
             raw_input: args.clone(),
         },
-        TurnEvent::ToolResult { id, name, output } => SessionUpdateEvent::ToolResult {
+        // The RPC/SessionUpdateEvent surface forwards the text output only; file
+        // attachment happens on the direct ACP path, so `artifact` is not needed here.
+        TurnEvent::ToolResult {
+            id,
+            name,
+            output,
+            artifact: _,
+        } => SessionUpdateEvent::ToolResult {
             session_id: session_id.to_string(),
             tool_call_id: id.clone(),
             name: name.clone(),
@@ -4748,12 +4755,7 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens: _,
-            output_tokens: _,
-            ..
-        } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
@@ -6399,6 +6401,7 @@ mod tests {
             id: "tc_1".into(),
             name: "bash".into(),
             output: "file.txt".into(),
+            artifact: None,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);

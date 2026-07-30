@@ -33,6 +33,16 @@ enum Cmd {
         #[arg(value_name = "RENDERER")]
         renderer: Option<String>,
     },
+    /// mdBook preprocessor: code-format placeholder-shaped tags after translation.
+    /// Invoked by mdBook via book.toml; not run directly.
+    Placeholders {
+        /// `supports <renderer>` probe from mdBook (exit 0 = supported).
+        #[arg(value_name = "ARG")]
+        arg: Option<String>,
+        /// The renderer name mdBook passes after `supports`.
+        #[arg(value_name = "RENDERER")]
+        renderer: Option<String>,
+    },
     /// Sync .po files and AI-fill translation delta
     Sync {
         #[arg(long)]
@@ -99,6 +109,12 @@ fn main() -> anyhow::Result<()> {
             cmd::mdbook::hardware::run(&root)?;
             cmd::mdbook::feature_matrix::run(&root)?;
             cmd::mdbook::peer_groups::run()
+        }
+        Cmd::Placeholders { arg, .. } => {
+            if arg.as_deref() == Some("supports") {
+                cmd::mdbook::placeholders::supports();
+            }
+            cmd::mdbook::placeholders::run()
         }
         Cmd::Sync {
             locale,

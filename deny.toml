@@ -276,6 +276,24 @@ version = "=0.6.26"
 name = "wit-bindgen"
 version = "=0.51.0"
 
+# cap-std (workspace-confined, no-follow file delivery) pulls an older slice of
+# its own transitive tree; the canonical newest versions are kept unskipped.
+[[bans.skip]]
+name = "io-lifetimes"
+version = "=2.0.4"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.59.0"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.60.2"
+
+[[bans.skip]]
+name = "windows_i686_gnullvm"
+version = "=0.52.6"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
