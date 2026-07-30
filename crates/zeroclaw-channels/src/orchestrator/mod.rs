@@ -4790,6 +4790,15 @@ async fn process_channel_message_body(
         msg.content = thinking.effective_content.clone();
     }
 
+    // ── Typed image-presence signal ──
+    // Captured from the attachment envelope, not from message text, so skill
+    // auto-activation cannot be spoofed by a literal "[IMAGE:" string and a
+    // real image is still detected when the media pipeline is disabled or
+    // emits no marker. `looks_like_image()` (MIME, extension, or magic bytes)
+    // rather than `kind() == Image` so a sender-spoofed MIME or a stripped
+    // extension cannot dodge image-turn restrictions.
+    let msg_has_image_attachment = msg.attachments.iter().any(|a| a.looks_like_image());
+
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision =
@@ -4859,6 +4868,148 @@ async fn process_channel_message_body(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+
+    // ── Skill auto-activation: provider switch + image-turn tool blocking ──
+    // Skills can declare in SKILL.toml:
+    //   - `triggers = [...]` natural-language phrases (word-boundary matched)
+    //   - `provider = "..."` to auto-switch the session's provider on match
+    //   - `blocked_tools_with_image = [...]` to forbid the listed tools when
+    //     the current message carries an image attachment (typed envelope,
+    //     see `msg_has_image_attachment` above), enforcing two-turn
+    //     protocols architecturally instead of via prompt text
+    // Matching lives in `zeroclaw_runtime::skills::match_skill_activation`.
+    let mut skill_blocked_tools: Vec<String> = Vec::new();
+    // Resolved from the canonical skill loader on every message. The
+    // image-turn entry below removes a tool capability, so the decision of
+    // whether any skill declares one must reflect the current on-disk state:
+    // a separately-cached verdict could report "none" for a skill installed
+    // out-of-process and leave the declared tool callable on the exact image
+    // turn it is meant to block. The loader's content-digest cache
+    // keeps the repeat cost to a directory digest rather than a re-audit.
+    let activation_candidates = zeroclaw_runtime::skills::load_activation_candidates(
+        ctx.workspace_dir.as_ref(),
+        ctx.prompt_config.as_ref(),
+        ctx.agent_alias.as_ref(),
+    );
+    if !activation_candidates.is_empty() {
+        // Image presence comes from the typed attachment envelope captured
+        // before media enrichment, never from message-text matching.
+        let has_image = msg_has_image_attachment;
+        if let Some(skill) = zeroclaw_runtime::skills::match_skill_activation(
+            &activation_candidates,
+            &msg.content,
+            has_image,
+        ) {
+            // 1. Switch the session provider if the skill declares one.
+            //    Mirrors the model-switch contract: resolve the manifest's
+            //    provider ref to a configured `<type>.<alias>` profile and
+            //    construct the provider FIRST; persist the route only after
+            //    a successful build, so an unknown, ambiguous, or
+            //    unbuildable manifest value leaves the sender's existing
+            //    route untouched.
+            if let Some(ref provider_name) = skill.provider {
+                match resolve_provider_ref_for_runtime_switch(
+                    runtime_defaults.config.as_ref(),
+                    provider_name,
+                ) {
+                    Ok(resolved_provider) => {
+                        let current = get_route_selection(
+                            ctx.as_ref(),
+                            &msg,
+                            &history_key,
+                            &runtime_defaults,
+                        );
+                        if current.model_provider != resolved_provider {
+                            match get_or_create_provider(
+                                ctx.as_ref(),
+                                &resolved_provider,
+                                None,
+                                &runtime_defaults,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "skill": skill.name.as_str(),
+                                                "provider": resolved_provider.as_str(),
+                                            })
+                                        ),
+                                        "Skill auto-activated: switching session provider"
+                                    );
+                                    set_route_selection(
+                                        ctx.as_ref(),
+                                        &history_key,
+                                        ChannelRouteSelection {
+                                            model_provider: resolved_provider,
+                                            model: "default".to_string(),
+                                            api_key: None,
+                                        },
+                                        &runtime_defaults,
+                                    );
+                                }
+                                Err(err) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "skill": skill.name.as_str(),
+                                                "provider": resolved_provider.as_str(),
+                                                "err": err.to_string(),
+                                            })
+                                        ),
+                                        "Skill auto-activation: provider build failed; keeping current route"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "skill": skill.name.as_str(),
+                                "provider": provider_name.as_str(),
+                                "err": err.to_string(),
+                            })),
+                            "Skill auto-activation: provider ref did not resolve; keeping current route"
+                        );
+                    }
+                }
+            }
+
+            // 2. Collect blocked_tools_with_image when the message has an image.
+            if has_image && !skill.blocked_tools_with_image.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "skill": skill.name.as_str(),
+                            "blocked": &skill.blocked_tools_with_image,
+                        })),
+                    "Skill image-turn tool block engaged"
+                );
+                skill_blocked_tools.extend(skill.blocked_tools_with_image.iter().cloned());
+            }
+        }
+    }
+
     let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
 
     if let Some(hint) =
@@ -5576,12 +5727,19 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
+            // Combine base channel exclusions with skill-driven image-turn blocks.
+            let mut effective_excluded_tools: Vec<String> =
                 if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
+                    Vec::new()
                 } else {
-                    ctx.non_cli_excluded_tools.as_ref()
+                    ctx.non_cli_excluded_tools.as_ref().clone()
                 };
+            for t in &skill_blocked_tools {
+                if !effective_excluded_tools.iter().any(|e| e == t) {
+                    effective_excluded_tools.push(t.clone());
+                }
+            }
+            let excluded_tools: &[String] = &effective_excluded_tools;
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -16802,6 +16960,12 @@ BTC is currently around $65,000 based on latest tool output."#
             slash_options: Vec::new(),
             always: false,
             location: None,
+            // Auto-activation is irrelevant to this test (it pins runtime
+            // threading), so declare nothing: no provider switch, no
+            // triggers, no image-turn tool blocks.
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
         let assembled = assemble_channel_agent_tools(
             &config,
@@ -18474,6 +18638,634 @@ BTC is currently around $65,000 based on latest tool output."#
                 assert_eq!(start, end, "each logical turn must keep one matched pair");
             }
         }
+    }
+
+    /// Writes a workspace skill that declares auto-activation on the
+    /// `__image__` sentinel with the given provider ref.
+    fn write_image_activation_skill(workspace: &Path, provider: &str) {
+        let dir = workspace.join("skills").join("image-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.toml"),
+            format!(
+                r#"[skill]
+name = "image-skill"
+description = "auto-activation regression skill"
+provider = "{provider}"
+triggers = ["__image__"]
+blocked_tools_with_image = ["test_blocked_tool"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Minimal runtime context for the skill auto-activation regressions:
+    /// telegram recording channel, capture mock as the default provider, and
+    /// a caller-supplied workspace dir + prompt config + provider cache seed.
+    fn skill_activation_test_ctx(
+        prompt_config: Arc<zeroclaw_config::schema::Config>,
+        workspace_dir: std::path::PathBuf,
+        provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        skill_activation_test_ctx_with_tooling(
+            prompt_config,
+            workspace_dir,
+            provider_cache_seed,
+            Arc::new(ModelCaptureModelProvider::default()),
+            Arc::new(vec![]),
+            AutonomyLevel::default(),
+            Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+        )
+        .0
+    }
+
+    /// Core of [`skill_activation_test_ctx`] with the model provider, tool
+    /// registry, autonomy level, and approval manager parameterized, so the
+    /// image-turn tool-block e2e can wire a tool-calling provider plus an
+    /// executable tool through the SAME context shape as the route tests.
+    /// Returns the concrete channel handle alongside the context so tests can
+    /// inspect what was sent.
+    #[allow(clippy::type_complexity)]
+    fn skill_activation_test_ctx_with_tooling(
+        prompt_config: Arc<zeroclaw_config::schema::Config>,
+        workspace_dir: std::path::PathBuf,
+        provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>>,
+        default_model_provider: Arc<dyn ModelProvider>,
+        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+        autonomy_level: AutonomyLevel,
+        approval_manager: Arc<ApprovalManager>,
+    ) -> (Arc<ChannelRuntimeContext>, Arc<TelegramRecordingChannel>) {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: default_model_provider,
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry,
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir),
+            prompt_config,
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level,
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager,
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+        (ctx, channel_impl)
+    }
+
+    fn skill_activation_message(
+        content: &str,
+        attachments: Vec<zeroclaw_api::media::MediaAttachment>,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "msg-skill-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: content.to_string(),
+            subject: None,
+            channel: "telegram".to_string(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments,
+            ..Default::default()
+        }
+    }
+
+    fn jpeg_attachment() -> zeroclaw_api::media::MediaAttachment {
+        zeroclaw_api::media::MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some("image/jpeg".to_string()),
+        }
+    }
+
+    /// `mock_price` twin that counts executions, so the image-turn tool-block
+    /// e2e can assert whether the tool actually RAN. The reply text alone is
+    /// ambiguous: [`ToolCallingModelProvider`] answers with the price after
+    /// ANY `[Tool results]` message, including a block/denial payload.
+    struct CountingPriceTool {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingPriceTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as ::zeroclaw_api::tool::Tool>::name(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingPriceTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+
+        fn description(&self) -> &str {
+            "Return a mocked BTC price"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string" }
+                },
+                "required": ["symbol"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Writes a workspace skill that declares ONLY an image-turn tool block
+    /// (no provider switch), isolating the `blocked_tools_with_image` half of
+    /// auto-activation.
+    fn write_image_toolblock_skill(workspace: &Path) {
+        let dir = workspace.join("skills").join("image-block-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.toml"),
+            r#"[skill]
+name = "image-block-skill"
+description = "image-turn tool block regression skill"
+triggers = ["__image__"]
+blocked_tools_with_image = ["mock_price"]
+"#,
+        )
+        .unwrap();
+    }
+
+    /// Typed image source of truth: literal `[IMAGE:` text with
+    /// no attachment must NOT fire the `__image__` skill activation, so a user
+    /// cannot impersonate an image turn and hijack the session provider.
+    #[tokio::test]
+    async fn skill_activation_literal_image_text_does_not_impersonate_attachment() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_image_activation_skill(workspace.path(), "openrouter");
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+        let ctx = skill_activation_test_ctx(
+            Arc::new(config),
+            workspace.path().to_path_buf(),
+            HashMap::new(),
+        );
+
+        process_channel_message(
+            ctx.clone(),
+            skill_activation_message("[IMAGE:photo.jpg] log my dinner", vec![]),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            ctx.route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "literal [IMAGE: text without an attachment must not activate the \
+             __image__ skill or persist a provider switch"
+        );
+    }
+
+    /// Typed image source of truth plus build-before-persist,
+    /// happy path): a real image attachment with NO text marker and the media
+    /// pipeline disabled must activate the `__image__` skill, resolve the
+    /// manifest's bare provider to the configured dotted ref, build it, and
+    /// persist the resolved route for the sender.
+    #[tokio::test]
+    async fn skill_activation_typed_attachment_switches_provider_and_persists_resolved_route() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_image_activation_skill(workspace.path(), "openrouter");
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        // Seed the switched provider so `get_or_create_provider` returns the
+        // mock instead of constructing a real openrouter client.
+        let switched: Arc<dyn ModelProvider> = Arc::new(ModelCaptureModelProvider::default());
+        let mut seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        seed.insert(provider_cache_key("openrouter.default", None, 0), switched);
+
+        let ctx = skill_activation_test_ctx(Arc::new(config), workspace.path().to_path_buf(), seed);
+
+        process_channel_message(
+            ctx.clone(),
+            skill_activation_message("here is my dinner", vec![jpeg_attachment()]),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let persisted = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("telegram_chat-1_alice")
+            .cloned()
+            .expect(
+                "a real image attachment must activate the skill even without \
+                 [IMAGE: marker enrichment (media pipeline disabled) and persist \
+                 the provider switch",
+            );
+        assert_eq!(
+            persisted.model_provider, "openrouter.default",
+            "the persisted route must carry the RESOLVED dotted ref, not the \
+             manifest's bare provider string"
+        );
+        assert_eq!(persisted.model, "default");
+        assert_eq!(persisted.api_key, None);
+    }
+
+    /// Build-before-persist, failure paths: unknown, ambiguous,
+    /// and unbuildable manifest provider values must all leave the sender's
+    /// route untouched instead of poisoning the session override. Each case
+    /// seeds a PRE-EXISTING route override for the sender and asserts it
+    /// survives byte-for-byte, so the regression also catches a failure path
+    /// that clears or partially rewrites the prior route rather than merely
+    /// declining to add one.
+    #[tokio::test]
+    async fn skill_activation_unresolvable_provider_leaves_route_untouched() {
+        // (provider ref in SKILL.toml, config setup, failure mode)
+        type ConfigMutator = Box<dyn Fn(&mut zeroclaw_config::schema::Config)>;
+        let cases: Vec<(&str, ConfigMutator)> = vec![
+            (
+                "definitely-not-a-provider",
+                Box::new(|_cfg| {}), // unknown family
+            ),
+            (
+                "openrouter",
+                Box::new(|cfg| {
+                    // Two aliases -> bare ref is ambiguous.
+                    cfg.providers
+                        .models
+                        .ensure("openrouter", "default")
+                        .unwrap();
+                    cfg.providers
+                        .models
+                        .ensure("openrouter", "secondary")
+                        .unwrap();
+                }),
+            ),
+            (
+                "azure",
+                Box::new(|cfg| {
+                    // Resolves to azure.default but construction fails:
+                    // the azure factory requires `resource`/`deployment`.
+                    cfg.providers.models.ensure("azure", "default").unwrap();
+                }),
+            ),
+        ];
+
+        for (provider_ref, configure) in cases {
+            let workspace = tempfile::TempDir::new().unwrap();
+            write_image_activation_skill(workspace.path(), provider_ref);
+
+            let mut config = zeroclaw_config::schema::Config::default();
+            configure(&mut config);
+            let ctx = skill_activation_test_ctx(
+                Arc::new(config),
+                workspace.path().to_path_buf(),
+                HashMap::new(),
+            );
+
+            // Seed a prior session route for the sender; every failure mode
+            // must leave it exactly as found.
+            let prior = ChannelRouteSelection {
+                model_provider: "test-provider".to_string(),
+                model: "prior-model".to_string(),
+                api_key: Some("prior-key".to_string()),
+            };
+            ctx.route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert("telegram_chat-1_alice".to_string(), prior.clone());
+
+            process_channel_message(
+                ctx.clone(),
+                skill_activation_message("what is in this photo", vec![jpeg_attachment()]),
+                CancellationToken::new(),
+            )
+            .await;
+
+            let overrides = ctx
+                .route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            assert_eq!(
+                overrides.len(),
+                1,
+                "provider ref `{provider_ref}` must not add or drop route overrides"
+            );
+            assert_eq!(
+                overrides.get("telegram_chat-1_alice"),
+                Some(&prior),
+                "provider ref `{provider_ref}` must leave the sender's prior route \
+                 untouched (resolve/build failures must not rewrite any field)"
+            );
+        }
+    }
+
+    /// End-to-end boundary proof: on a real image turn, the
+    /// tool named in `blocked_tools_with_image` must be unable to execute
+    /// even under Full autonomy with the tool auto-approved (the skill block
+    /// is appended AFTER the cli/Full-autonomy exclusion bypass), while the
+    /// identical wiring WITHOUT an image runs the tool normally. Asserts on
+    /// the tool's execution counter rather than reply text, because the mock
+    /// provider replies with the price after any `[Tool results]` message,
+    /// including a denial.
+    #[tokio::test]
+    async fn skill_activation_image_turn_blocks_declared_tool_end_to_end() {
+        let cases = [
+            (
+                vec![jpeg_attachment()],
+                0usize,
+                "image turn: blocked tool must not execute",
+            ),
+            (vec![], 1usize, "text turn: tool must execute normally"),
+        ];
+        for (attachments, expected_executions, case) in cases {
+            let workspace = tempfile::TempDir::new().unwrap();
+            write_image_toolblock_skill(workspace.path());
+
+            let executions = Arc::new(AtomicUsize::new(0));
+            let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
+                executions: Arc::clone(&executions),
+            })]);
+            let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                workspace.path().to_path_buf(),
+                HashMap::new(),
+                Arc::new(ToolCallingModelProvider),
+                tools,
+                AutonomyLevel::Full,
+                Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                        auto_approve: vec!["mock_price".to_string()],
+                        ..Default::default()
+                    },
+                )),
+            );
+
+            process_channel_message(
+                ctx,
+                skill_activation_message("What is the BTC price now?", attachments),
+                CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                expected_executions,
+                "{case}"
+            );
+        }
+    }
+
+    /// Freshness of the safety decision: a skill installed by
+    /// another process must be enforced on the very NEXT message — no
+    /// invalidate hook, no expiry to wait out.
+    ///
+    /// The first turn deliberately primes the skill-load cache with a
+    /// workspace that declares no activation skills, so the second turn can
+    /// only pass if the cached negative was re-derived from disk. The earlier
+    /// design memoized that negative verdict behind its own TTL, which left
+    /// `blocked_tools_with_image` unenforced for up to a minute after an
+    /// out-of-process `skills install` — the exact image turn it exists to
+    /// protect. Freshness now rides on the loader's content digest, so the
+    /// write below takes effect immediately.
+    #[tokio::test]
+    async fn out_of_band_skill_install_blocks_declared_tool_on_next_message() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        // Turn 1: no activation skill on disk — the tool runs, and the load
+        // cache now holds a "no activation candidates" answer for this
+        // workspace.
+        let executions = Arc::new(AtomicUsize::new(0));
+        let make_ctx = || {
+            let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
+                executions: Arc::clone(&executions),
+            })]);
+            skill_activation_test_ctx_with_tooling(
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                workspace.path().to_path_buf(),
+                HashMap::new(),
+                Arc::new(ToolCallingModelProvider),
+                tools,
+                AutonomyLevel::Full,
+                Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                        auto_approve: vec!["mock_price".to_string()],
+                        ..Default::default()
+                    },
+                )),
+            )
+        };
+
+        let (ctx, _channel) = make_ctx();
+        process_channel_message(
+            ctx,
+            skill_activation_message("What is the BTC price now?", vec![jpeg_attachment()]),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "baseline: with no activation skill declared the tool must run, \
+             which also primes the load cache with that negative answer"
+        );
+
+        // Out-of-process writer: drop the skill on disk and call NO
+        // invalidate hook (the CLI `skills install` runs in a separate
+        // process and cannot reach this process's hook).
+        write_image_toolblock_skill(workspace.path());
+
+        // Turn 2: same image turn, same workspace. The declared block must
+        // already be in force.
+        let (ctx, _channel) = make_ctx();
+        process_channel_message(
+            ctx,
+            skill_activation_message("What is the BTC price now?", vec![jpeg_attachment()]),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "an out-of-band skill install must block the declared tool on the \
+             next message; a further execution means a stale negative verdict \
+             was served"
+        );
+    }
+
+    /// Live-smoke regression: a REAL Telegram photo update, parsed by
+    /// the actual channel code (wiremock Bot API), must block the declared
+    /// tool when driven through `process_channel_message`. The first live
+    /// smoke failed because the hand-constructed e2e above proved the
+    /// orchestrator gate while Telegram ingress never populated the typed
+    /// attachment envelope the gate reads.
+    #[tokio::test]
+    async fn telegram_parsed_photo_update_blocks_declared_tool_end_to_end() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_9.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_9\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        write_image_toolblock_skill(workspace.path());
+
+        let telegram = crate::telegram::TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 7,
+                "chat": { "id": 555 },
+                "from": { "username": "alice", "id": 99 },
+                "photo": [ { "file_id": "best", "file_size": 4 } ],
+                "caption": "What is the BTC price now? Log it automatically."
+            }
+        });
+        let msg = telegram
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("photo update should parse");
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
+            executions: Arc::clone(&executions),
+        })]);
+        let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            workspace.path().to_path_buf(),
+            HashMap::new(),
+            Arc::new(ToolCallingModelProvider),
+            tools,
+            AutonomyLevel::Full,
+            Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                    auto_approve: vec!["mock_price".to_string()],
+                    ..Default::default()
+                },
+            )),
+        );
+
+        process_channel_message(ctx, msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "a real parsed Telegram photo turn must not execute the blocked tool, \
+             even when the caption demands it"
+        );
     }
 
     #[tokio::test]
@@ -21554,6 +22346,9 @@ BTC is currently around $65,000 based on latest tool output."#
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -21597,6 +22392,9 @@ BTC is currently around $65,000 based on latest tool output."#
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let prompt = build_system_prompt_with_mode(
@@ -21651,6 +22449,9 @@ BTC is currently around $65,000 based on latest tool output."#
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
