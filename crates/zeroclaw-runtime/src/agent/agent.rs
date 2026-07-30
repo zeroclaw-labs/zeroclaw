@@ -10311,6 +10311,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }
     }
 
@@ -10440,6 +10443,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         };
         tools::register_skill_tools_with_context(
             &mut tools,
