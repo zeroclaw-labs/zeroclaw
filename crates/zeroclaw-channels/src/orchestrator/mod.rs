@@ -27424,6 +27424,140 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    /// An image uploaded "as file" through Telegram, with the media pipeline
+    /// ENABLED and a vision-capable provider, must not pick up a second,
+    /// base64-inlined `[IMAGE:data:` copy in the outgoing prompt or in stored
+    /// history. The channel emits the same re-loadable `[IMAGE:<path>]` marker
+    /// for image documents as for photos, and the pipeline recognizes it as
+    /// already marked instead of describing it again.
+    #[tokio::test]
+    async fn telegram_image_document_with_enabled_pipeline_never_inlines_base64() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_11" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_11$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let telegram = crate::telegram::TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // An extensionless image document is the historic double-describe
+        // path: it used to render as `[Document:]` while `kind()` classified
+        // it as an image, so the pipeline saw an undescribed image.
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 8,
+                "chat": { "id": 556 },
+                "from": { "username": "alice", "id": 99 },
+                "document": {
+                    "file_id": "doc11",
+                    "file_name": "upload",
+                    "mime_type": "image/jpeg",
+                    "file_size": 4
+                },
+                "caption": "please describe"
+            }
+        });
+        let msg = telegram
+            .try_parse_attachment_message(&update)
+            .await
+            .expect("image document update should parse");
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "channel must emit the path marker for image documents: {}",
+            msg.content
+        );
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            vision: true,
+        });
+        let base_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            Arc::new(vec![]),
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+
+        // Marker resolution legitimately inlines ONE base64 copy of the
+        // `[IMAGE:<path>]` marker at provider-call time; the double-describe
+        // bug added a SECOND copy via the pipeline's own annotation. Assert
+        // the annotation is absent and no message carries more than one copy.
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!calls.is_empty(), "provider must have been called");
+        for call in calls.iter() {
+            for (role, content) in call {
+                assert!(
+                    !content.contains("will be processed by vision model"),
+                    "media pipeline must not re-describe a channel-marked image \
+                     ({role}): {content}"
+                );
+                assert!(
+                    content.matches("[IMAGE:data:").count() <= 1,
+                    "outgoing {role} message must not inline the image twice: {content}"
+                );
+            }
+        }
+        drop(calls);
+
+        // The persisted user turn is the enriched content verbatim, so it must
+        // carry the path marker but never base64.
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stored_turns = 0usize;
+        for (_, history) in histories.iter() {
+            for msg in history.iter() {
+                stored_turns += 1;
+                assert!(
+                    !msg.content.contains("IMAGE:data:"),
+                    "stored history must not persist base64: {}",
+                    msg.content
+                );
+            }
+        }
+        assert!(stored_turns > 0, "history must have stored the turn");
+    }
+
     #[tokio::test]
     async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
