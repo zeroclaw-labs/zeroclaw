@@ -486,6 +486,29 @@ pub(crate) fn compute_excluded_mcp_tools(
         .collect()
 }
 
+/// Merge a headless SOP step's scope exclusions into one turn's exclusion set.
+///
+/// Re-resolved per turn rather than once at registry assembly: `tool_search`
+/// can activate MCP tools mid-run, and an `allow`-scoped step must narrow those
+/// too. No-op for ordinary agent runs, which carry no step scope.
+fn merge_sop_step_exclusions(
+    excluded: &mut Vec<String>,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    sop_step_scope: Option<&crate::sop::active_scope::HeadlessStepScope>,
+) {
+    let Some(scope) = sop_step_scope else {
+        return;
+    };
+    let registry_names =
+        crate::agent::turn::collect_callable_tool_names(tools_registry, activated_tools);
+    for tool in scope.excluded(&registry_names) {
+        if !excluded.iter().any(|e| e.eq_ignore_ascii_case(&tool)) {
+            excluded.push(tool);
+        }
+    }
+}
+
 pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
     tools_registry: &[Box<dyn Tool>],
@@ -1067,6 +1090,12 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// Tool-scope contract for a SOP step executed headlessly (cron and the
+    /// other non-agent-loop trigger surfaces). `Some` narrows every turn of
+    /// this run to the step's active scope and removes the SOP control tools,
+    /// matching what the live nested-step driver enforces inside an enclosing
+    /// turn. `None` for every ordinary agent run.
+    pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
 }
 
 fn agent_provider_composite(
@@ -1217,6 +1246,7 @@ pub async fn run(
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
+        let sop_step_scope = overrides.sop_step_scope.clone();
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -1623,17 +1653,26 @@ pub async fn run(
         } else {
             None
         };
-        let prompt_excluded_tools = message
-            .as_deref()
-            .map(|msg| {
-                compute_excluded_mcp_tools(
-                    &tools_registry,
-                    &agent.resolved.tool_filter_groups,
-                    msg,
-                    &mcp_tool_names,
-                )
-            })
-            .unwrap_or_default();
+        let prompt_excluded_tools = {
+            let mut excluded = message
+                .as_deref()
+                .map(|msg| {
+                    compute_excluded_mcp_tools(
+                        &tools_registry,
+                        &agent.resolved.tool_filter_groups,
+                        msg,
+                        &mcp_tool_names,
+                    )
+                })
+                .unwrap_or_default();
+            merge_sop_step_exclusions(
+                &mut excluded,
+                &tools_registry,
+                activated_handle.as_ref(),
+                sop_step_scope.as_ref(),
+            );
+            excluded
+        };
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut system_prompt = build_system_prompt_for_turn(
             &agent_workspace,
@@ -1723,12 +1762,21 @@ pub async fn run(
             // Compute per-turn excluded MCP tools from tool_filter_groups before
             // building the turn prompt so tool availability matches the specs
             // sent to the provider.
-            let excluded_tools = compute_excluded_mcp_tools(
-                &tools_registry,
-                &agent.resolved.tool_filter_groups,
-                &effective_msg,
-                &mcp_tool_names,
-            );
+            let excluded_tools = {
+                let mut excluded = compute_excluded_mcp_tools(
+                    &tools_registry,
+                    &agent.resolved.tool_filter_groups,
+                    &effective_msg,
+                    &mcp_tool_names,
+                );
+                merge_sop_step_exclusions(
+                    &mut excluded,
+                    &tools_registry,
+                    activated_handle.as_ref(),
+                    sop_step_scope.as_ref(),
+                );
+                excluded
+            };
             system_prompt = build_system_prompt_for_turn(
                 &agent_workspace,
                 &model_name,
@@ -1837,12 +1885,21 @@ pub async fn run(
             ];
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
-            let excluded_tools = compute_excluded_mcp_tools(
-                &tools_registry,
-                &agent.resolved.tool_filter_groups,
-                &effective_msg,
-                &mcp_tool_names,
-            );
+            let excluded_tools = {
+                let mut excluded = compute_excluded_mcp_tools(
+                    &tools_registry,
+                    &agent.resolved.tool_filter_groups,
+                    &effective_msg,
+                    &mcp_tool_names,
+                );
+                merge_sop_step_exclusions(
+                    &mut excluded,
+                    &tools_registry,
+                    activated_handle.as_ref(),
+                    sop_step_scope.as_ref(),
+                );
+                excluded
+            };
 
             #[allow(unused_assignments)]
             let mut response = String::new();
@@ -2249,12 +2306,21 @@ pub async fn run(
                 // Compute per-turn excluded MCP tools from tool_filter_groups
                 // before the provider call; the system prompt is rebuilt from
                 // this same set immediately before each attempt.
-                let excluded_tools = compute_excluded_mcp_tools(
-                    &tools_registry,
-                    &agent.resolved.tool_filter_groups,
-                    &effective_input,
-                    &mcp_tool_names,
-                );
+                let excluded_tools = {
+                    let mut excluded = compute_excluded_mcp_tools(
+                        &tools_registry,
+                        &agent.resolved.tool_filter_groups,
+                        &effective_input,
+                        &mcp_tool_names,
+                    );
+                    merge_sop_step_exclusions(
+                        &mut excluded,
+                        &tools_registry,
+                        activated_handle.as_ref(),
+                        sop_step_scope.as_ref(),
+                    );
+                    excluded
+                };
 
                 let excluded_tool_names: HashSet<&str> =
                     excluded_tools.iter().map(String::as_str).collect();

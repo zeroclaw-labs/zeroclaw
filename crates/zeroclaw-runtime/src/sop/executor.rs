@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use super::approval::{BrokerOutcome, ResolveOutcome};
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
-use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
+use super::types::{SopRun, SopRunAction, SopStep, SopStepResult, StepToolCall};
 
 use crate::agent::history::truncate_tool_result;
 use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
@@ -156,15 +156,21 @@ const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
 /// `ExecuteStep` runs through a fresh agent loop under the step's resolved
 /// agent, `DeterministicStep` routes through the engine's headless
 /// deterministic driver, and every other action is already parked or terminal.
+///
+/// Returns the driver's task handle. A caller whose `config` and engine belong
+/// to a bounded lifetime (the daemon's SOP maintenance tick, which is rebuilt on
+/// reload) must keep it and drain or cancel the driver when that lifetime ends;
+/// otherwise the driver keeps running against superseded configuration. Callers
+/// with no such boundary `drop` it to detach.
 pub fn spawn_headless_run_driver(
     config: zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
-) {
+) -> tokio::task::JoinHandle<()> {
     zeroclaw_spawn::spawn!(async move {
         drive_headless_run(config, engine, audit, first_action).await;
-    });
+    })
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -183,7 +189,71 @@ pub fn drive_resumed_broker_action(
         return;
     };
 
-    spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
+    // Detached: an approval resolved over HTTP/WS has no caller lifetime to
+    // drain against, so the driver outlives the transport that released it.
+    drop(spawn_headless_run_driver(
+        config.clone(),
+        engine,
+        audit,
+        action.as_ref().clone(),
+    ));
+}
+
+/// Resolve the agent a headless `ExecuteStep` runs as, failing closed.
+///
+/// `step.agent` is already the resolved step-override-then-parent alias by the
+/// time an `ExecuteStep` exists, so `None` here means the SOP declares no
+/// owning agent at all. Headless triggers have no ambient agent turn to borrow
+/// an identity from, and borrowing an arbitrary configured agent would run an
+/// unattended procedure under that agent's provider, workspace, tool surface,
+/// and risk profile. An alias naming an unconfigured agent fails the same way,
+/// with a message that names the SOP's own declaration rather than the generic
+/// turn-assembly error.
+fn headless_step_agent<'a>(
+    config: &zeroclaw_config::schema::Config,
+    step: &'a SopStep,
+) -> Result<&'a str> {
+    let alias = step
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SOP step {} has no owning agent: headless execution requires `agent` on the SOP \
+                 (or on the step). Refusing to run an unattended step as an unrelated agent.",
+                step.number
+            ))
+        })?;
+    if !config.agents.contains_key(alias) {
+        anyhow::bail!(
+            "SOP step {} names agent '{alias}', which is not a configured agent",
+            step.number
+        );
+    }
+    Ok(alias)
+}
+
+/// Build the step's tool-scope contract for the fresh `agent::run` that
+/// executes it. The engine owns the canonical `SopConfig`, so the enforcement
+/// flag and mandatory-tool list are read from it rather than re-derived.
+fn headless_step_scope(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+    step: &SopStep,
+) -> crate::sop::active_scope::HeadlessStepScope {
+    let config = {
+        let guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.config().clone()
+    };
+    crate::sop::active_scope::HeadlessStepScope {
+        run_id: run_id.to_string(),
+        step: step.clone(),
+        config,
+    }
 }
 
 async fn drive_headless_run(
@@ -202,31 +272,40 @@ async fn drive_headless_run(
                 step,
                 context,
             } => {
-                let agent_alias = step
-                    .agent
-                    .clone()
-                    .or_else(|| config.agents.keys().min().cloned())
-                    .unwrap_or_default();
                 let started_at = crate::sop::engine::now_iso8601();
-                let session_path =
-                    std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
-                let run_result = Box::pin(crate::agent::run(
-                    config.clone(),
-                    &agent_alias,
-                    Some(context),
-                    None,
-                    None,
-                    config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path),
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
-                ))
-                .await;
+                let resolved_agent = headless_step_agent(&config, &step);
+                // Attribution follows execution: a step that never ran — no
+                // owner, or an owner naming an unconfigured agent — is recorded
+                // against no agent at all, so a refusal can never read as an
+                // agent having done the work.
+                let effective_agent = resolved_agent.as_ref().ok().map(|a| (*a).to_string());
+                let run_result = match resolved_agent {
+                    Ok(agent_alias) => {
+                        let session_path =
+                            std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
+                        Box::pin(crate::agent::run(
+                            config.clone(),
+                            agent_alias,
+                            Some(context),
+                            None,
+                            None,
+                            config
+                                .model_provider_for_agent(agent_alias)
+                                .and_then(|e| e.temperature),
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::Daemon,
+                            crate::agent::loop_::AgentRunOverrides {
+                                sop_step_scope: Some(headless_step_scope(&engine, &run_id, &step)),
+                                ..Default::default()
+                            },
+                        ))
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
                 let completed_at = crate::sop::engine::now_iso8601();
                 let step_result = match run_result {
                     Ok(output) => SopStepResult {
@@ -235,7 +314,7 @@ async fn drive_headless_run(
                         output,
                         started_at,
                         completed_at: Some(completed_at),
-                        effective_agent: Some(agent_alias.clone()),
+                        effective_agent,
                         tool_calls: Vec::new(),
                     },
                     Err(e) => SopStepResult {
@@ -244,7 +323,7 @@ async fn drive_headless_run(
                         output: e.to_string(),
                         started_at,
                         completed_at: Some(completed_at),
-                        effective_agent: Some(agent_alias.clone()),
+                        effective_agent,
                         tool_calls: Vec::new(),
                     },
                 };

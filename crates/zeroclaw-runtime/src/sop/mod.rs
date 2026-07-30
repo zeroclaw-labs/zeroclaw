@@ -1067,6 +1067,49 @@ fn validate_planned_call_bindings(
     }
 }
 
+/// Every `execute` step reachable by a headless trigger must resolve an owning
+/// agent, from the step's own `agent` or the procedure's.
+///
+/// Blocking rather than advisory: a headless trigger has no ambient agent turn
+/// to borrow an identity from, so the headless driver refuses an unowned step
+/// outright. Saving such a SOP produces a procedure that fires on schedule and
+/// then fails every run at dispatch. `checkpoint` and `capability` steps are
+/// exempt — they park for approval and run through the deterministic capability
+/// registry respectively, neither of which assumes an agent.
+fn validate_headless_ownership(sop: &Sop, blocking: &mut Vec<String>) {
+    let has_owner = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|alias| !alias.trim().is_empty())
+    };
+    if has_owner(&sop.agent) {
+        return;
+    }
+    let mut sources: Vec<String> = sop
+        .triggers
+        .iter()
+        .filter(|trigger| trigger.is_headless())
+        .map(|trigger| trigger.source().to_string())
+        .collect();
+    if sources.is_empty() {
+        return;
+    }
+    sources.sort();
+    sources.dedup();
+
+    for step in &sop.steps {
+        if step.kind != SopStepKind::Execute || has_owner(&step.agent) {
+            continue;
+        }
+        blocking.push(format!(
+            "Step {}: no owning agent for headless trigger(s) [{}]. Set `agent` on the SOP or on \
+             the step; a headless run has no agent turn to inherit one from.",
+            step.number,
+            sources.join(", ")
+        ));
+    }
+}
+
 /// Result of `validate_sop_strict`: `blocking` problems reject a save,
 /// `warnings` surface in editors but do not block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1101,6 +1144,8 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
             blocking.push(format!("Duplicate step number {}", step.number));
         }
     }
+
+    validate_headless_ownership(sop, &mut blocking);
 
     let mut warnings = Vec::new();
     validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
@@ -1384,6 +1429,79 @@ mod tests {
 
         let ok = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
         assert!(ok.is_ok());
+    }
+
+    fn cron_sop(steps: Vec<SopStep>, agent: Option<&str>) -> Sop {
+        Sop {
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            agent: agent.map(str::to_string),
+            ..authoring_sop(steps)
+        }
+    }
+
+    /// A headless trigger has no agent turn to inherit an owner from, so the
+    /// authoring gate must reject an unowned procedure rather than let it fire
+    /// on schedule and fail every run at dispatch.
+    #[test]
+    fn validate_sop_strict_blocks_unowned_headless_sop() {
+        let validation = validate_sop_strict(&cron_sop(vec![titled_step(1, "a")], None));
+
+        assert!(!validation.is_ok());
+        let blocking = validation
+            .blocking
+            .iter()
+            .find(|b| b.contains("no owning agent"))
+            .expect("missing owner should block, got {validation:?}");
+        assert!(
+            blocking.contains("cron"),
+            "the message should name the headless trigger, got {blocking:?}"
+        );
+    }
+
+    /// The owner may come from either level: the procedure's `agent`, or the
+    /// step's own override.
+    #[test]
+    fn validate_sop_strict_accepts_owned_headless_sop() {
+        let by_sop = validate_sop_strict(&cron_sop(vec![titled_step(1, "a")], Some("ops")));
+        assert!(by_sop.is_ok(), "{:?}", by_sop.blocking);
+
+        let mut step = titled_step(1, "a");
+        step.agent = Some("ops".into());
+        let by_step = validate_sop_strict(&cron_sop(vec![step], None));
+        assert!(by_step.is_ok(), "{:?}", by_step.blocking);
+    }
+
+    /// `Manual` is agent-initiated through `sop_execute`, so the calling turn
+    /// owns the run and no declared `agent` is required. Guards the rule
+    /// against over-blocking every ordinary procedure.
+    #[test]
+    fn validate_sop_strict_allows_unowned_manual_sop() {
+        let validation = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
+
+        assert!(validation.is_ok(), "{:?}", validation.blocking);
+    }
+
+    /// Only `execute` steps need an agent: checkpoints park for human approval
+    /// and capability steps run through the deterministic registry.
+    #[test]
+    fn validate_sop_strict_exempts_non_execute_steps_from_ownership() {
+        let mut checkpoint = titled_step(1, "approve");
+        checkpoint.kind = SopStepKind::Checkpoint;
+        let mut capability = titled_step(2, "compute");
+        capability.kind = SopStepKind::Capability;
+
+        let validation = validate_sop_strict(&cron_sop(vec![checkpoint, capability], None));
+
+        assert!(
+            !validation
+                .blocking
+                .iter()
+                .any(|b| b.contains("owning agent")),
+            "non-execute steps should not require an owner, got {:?}",
+            validation.blocking
+        );
     }
 
     #[test]

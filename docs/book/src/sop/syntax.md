@@ -25,8 +25,19 @@ the runtime schema, and `condition` expressions. Before running a generated or
 checked-in SOP, validate it with `zeroclaw sop validate <name>`.
 
 `SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
-`triggers`, and its execution knobs. The concurrency-admission fields govern what
-happens when a trigger arrives while this SOP's execution slots are full:
+`triggers`, its owning `agent`, and its execution knobs.
+
+`agent` names the configured agent alias that `execute` steps run as; an
+individual step's own `agent` overrides it. **A SOP with any headless trigger
+(cron, mqtt, webhook, amqp, filesystem, calendar, peripheral, channel) must
+resolve an owner for every `execute` step**, from one level or the other:
+validation blocks the save otherwise. Those triggers fire with no agent turn to
+inherit an identity from, and an unowned step is refused at dispatch rather than
+run as an unrelated agent. `manual` triggers are exempt: `sop_execute` runs
+inside an agent turn, which owns the run.
+
+The concurrency-admission fields govern what happens when a trigger arrives
+while this SOP's execution slots are full:
 
 | Field | Default | Effect |
 |---|---:|---|

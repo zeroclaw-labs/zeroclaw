@@ -221,12 +221,15 @@ pub async fn handle_sop_run(
                 );
                 if needs_driver {
                     let config = state.config.read().clone();
-                    zeroclaw_runtime::sop::spawn_headless_run_driver(
+                    // Detached: a dashboard-initiated run outlives the request
+                    // that started it, so there is no caller lifetime to drain
+                    // against.
+                    drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
                         config,
                         std::sync::Arc::clone(engine),
                         Some(std::sync::Arc::clone(audit)),
                         action.as_ref().clone(),
-                    );
+                    ));
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
             }
