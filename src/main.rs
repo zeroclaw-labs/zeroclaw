@@ -4349,8 +4349,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     startup_feedback_enabled,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // Before the loop re-reads config and builds a fresh SOP
+                // engine: in-flight cron drivers hold this generation's config
+                // and engine, so they must not straddle the rebuild.
+                if let Some(maintenance) = sop_maintenance {
+                    maintenance.shutdown().await;
                 }
                 let exit = exit?;
                 match exit {
@@ -4996,8 +4999,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     config, None, cancel, sop_engine, sop_audit,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // `channel start` runs one configuration generation and exits,
+                // but drivers still hold the engine; drain them before the
+                // process tears the subsystem down.
+                if let Some(maintenance) = sop_maintenance {
+                    maintenance.shutdown().await;
                 }
                 result
             }
@@ -7880,8 +7886,8 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
 /// prunes terminal runs past the retention policy, and dispatches cached cron
 /// SOP triggers. Returns `None` (no task) when the tick is disabled
 /// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
-/// returned handle and aborts it when the foreground daemon/channel run exits.
-/// The tick itself self-approves nothing - timeout handling follows
+/// returned handle and shuts it down when the foreground daemon/channel run
+/// exits. The tick itself self-approves nothing - timeout handling follows
 /// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
@@ -7889,7 +7895,7 @@ fn spawn_sop_maintenance(
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<SopMaintenance> {
     if interval_secs == 0 {
         return None;
     }
@@ -7899,7 +7905,9 @@ fn spawn_sop_maintenance(
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
-    Some(::zeroclaw_spawn::spawn!(async move {
+    let drivers = SopDriverSet::default();
+    let tick_drivers = drivers.clone();
+    let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_cron_check = chrono::Utc::now();
@@ -7911,6 +7919,7 @@ fn spawn_sop_maintenance(
                 audit.as_ref(),
                 cron_cache.as_ref(),
                 &mut last_cron_check,
+                &tick_drivers,
             )
             .await
             else {
@@ -7932,7 +7941,90 @@ fn spawn_sop_maintenance(
                 );
             }
         }
-    }))
+    });
+    Some(SopMaintenance { ticker, drivers })
+}
+
+/// In-flight cron-started headless drivers for one daemon generation.
+///
+/// Shared between the maintenance tick (which pushes each driver it launches
+/// and prunes finished ones) and the daemon loop (which drains them before
+/// rebuilding the SOP subsystem).
+#[cfg(feature = "agent-runtime")]
+type SopDriverSet = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// How long a daemon generation waits for its in-flight cron drivers to finish
+/// before aborting the stragglers. Long enough for a step already in a provider
+/// call to land, short enough that a reload is not held hostage by one.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One daemon generation's SOP maintenance: the tick task plus every cron
+/// driver it started.
+///
+/// A cron driver captures this generation's `Config` and `SopEngine`. Reload
+/// re-reads config and builds a fresh engine, so a driver that outlives the
+/// generation would keep doing model and tool work under superseded policy.
+/// The whole set is therefore torn down before the daemon loop rebuilds.
+#[cfg(feature = "agent-runtime")]
+struct SopMaintenance {
+    ticker: tokio::task::JoinHandle<()>,
+    drivers: SopDriverSet,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenance {
+    /// Stop the tick, then let in-flight drivers finish under the configuration
+    /// they started with, aborting any that overrun
+    /// [`SOP_DRIVER_DRAIN_TIMEOUT`].
+    ///
+    /// The tick is aborted first so no new driver can join the set while the
+    /// drain is running.
+    async fn shutdown(self) {
+        self.ticker.abort();
+        // Joined, not just aborted: `abort` requests cancellation, so a tick
+        // already inside `check_sop_cron_triggers` can still spawn and register
+        // a driver. Awaiting the aborted handle (it resolves `Err(Cancelled)`
+        // at the task's next await point) is what guarantees the set below is
+        // final — otherwise a late driver would be detached and outlive this
+        // generation, which is the leak this whole type exists to prevent.
+        let _ = self.ticker.await;
+        let pending = match self.drivers.lock() {
+            Ok(mut drivers) => std::mem::take(&mut *drivers),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        if pending.is_empty() {
+            return;
+        }
+        // Taken before the drain: dropping a `JoinHandle` detaches its task
+        // rather than stopping it, so the timeout arm below would leave
+        // stragglers running unless it holds abort handles of its own.
+        let aborts: Vec<tokio::task::AbortHandle> = pending
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let drained = tokio::time::timeout(SOP_DRIVER_DRAIN_TIMEOUT, async {
+            for driver in pending {
+                let _ = driver.await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            for abort in &aborts {
+                abort.abort();
+            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "drain_timeout_secs": SOP_DRIVER_DRAIN_TIMEOUT.as_secs(),
+                    })),
+                "SOP cron drivers did not finish before the drain deadline; aborting them so the \
+                 next daemon generation does not overlap superseded configuration"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -7963,6 +8055,7 @@ async fn run_sop_maintenance_tick(
     audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
     last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+    drivers: &SopDriverSet,
 ) -> Option<SopMaintenanceTickReport> {
     let maintenance = match engine.lock() {
         Ok(mut e) => e.run_maintenance_tick(),
@@ -7999,12 +8092,27 @@ async fn run_sop_maintenance_tick(
                         zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
                             | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
                     ) {
-                        zeroclaw_runtime::sop::spawn_headless_run_driver(
+                        let driver = zeroclaw_runtime::sop::spawn_headless_run_driver(
                             config.clone(),
                             std::sync::Arc::clone(engine),
                             Some(std::sync::Arc::clone(audit)),
                             action.as_ref().clone(),
                         );
+                        // Retained so this daemon generation can drain the
+                        // driver before a reload swaps the config and engine it
+                        // captured. Finished handles are dropped on the way in
+                        // so a long-lived daemon does not accumulate them.
+                        match drivers.lock() {
+                            Ok(mut drivers) => {
+                                drivers.retain(|driver| !driver.is_finished());
+                                drivers.push(driver);
+                            }
+                            Err(poisoned) => {
+                                let mut drivers = poisoned.into_inner();
+                                drivers.retain(|driver| !driver.is_finished());
+                                drivers.push(driver);
+                            }
+                        }
                     }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
@@ -9700,15 +9808,58 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Fixture for the cron-dispatch regressions: a one-step SOP on a
+    /// once-a-minute cron trigger, a mock OpenAI-compatible provider so the
+    /// step's agent turn actually completes, and the engine/audit/cache trio
+    /// the maintenance tick consumes.
+    ///
+    /// `owner` is the SOP's `agent`. `Some("sop-runner")` names the one
+    /// configured agent; `None` leaves the procedure unowned, which the
+    /// headless driver must refuse rather than borrow an identity for.
     #[cfg(feature = "agent-runtime")]
-    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
+    struct CronSopHarness {
+        _tmp: tempfile::TempDir,
+        _server: wiremock::MockServer,
+        config: Config,
+        engine: std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        audit: std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>,
+        cache: zeroclaw_runtime::sop::dispatch::SopCronCache,
+        drivers: SopDriverSet,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    const CRON_SOP_AGENT: &str = "sop-runner";
+
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness(owner: Option<&str>) -> CronSopHarness {
         use std::sync::{Arc, Mutex};
-        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SopConfig,
+        };
         use zeroclaw_memory::traits::Memory;
         use zeroclaw_runtime::sop::{
             Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
         };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "step one done"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })),
+            )
+            .mount(&server)
+            .await;
 
         let mut engine = SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![Sop {
@@ -9736,7 +9887,7 @@ mod tests {
             deterministic: false,
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
-            agent: None,
+            agent: owner.map(str::to_string),
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -9750,28 +9901,173 @@ mod tests {
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
-        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let report = run_sop_maintenance_tick(
-            &Config::default(),
-            &engine,
-            Some(&audit),
-            Some(&cache),
-            &mut last_cron_check,
-        )
-        .await
-        .expect("maintenance tick should complete");
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("custom", "default")
+                .expect("`custom` slot must exist on ModelProviders");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some(server.uri());
+        }
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            CRON_SOP_AGENT.to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        let mut risk_profiles = std::collections::HashMap::new();
+        risk_profiles.insert("default".to_string(), RiskProfileConfig::default());
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            agents,
+            risk_profiles,
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.scheduler_retries = 0;
 
-        assert_eq!(report.cron_started, 1);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        CronSopHarness {
+            _tmp: tmp,
+            _server: server,
+            config,
+            engine,
+            audit,
+            cache,
+            drivers: SopDriverSet::default(),
+        }
+    }
+
+    /// Wait for the cron-started run to leave the active set, then return the
+    /// retained terminal run.
+    #[cfg(feature = "agent-runtime")]
+    async fn await_terminal_cron_run(
+        harness: &CronSopHarness,
+    ) -> zeroclaw_runtime::sop::types::SopRun {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                if engine.lock().unwrap().active_runs().is_empty() {
-                    break;
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("cron-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("cron-started SOP should be driven to a terminal state");
+        .expect("cron-started SOP should be driven to a retained terminal run")
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+
+        assert_eq!(report.cron_started, 1);
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the tick must retain its driver so the daemon generation can drain it"
+        );
+
+        let run = await_terminal_cron_run(&harness).await;
+        // The point of the regression: the cron path must run the step through
+        // the resolved agent and SUCCEED, not merely stop being stranded.
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "cron-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// A cron SOP with no owning agent must fail closed. Before this, the
+    /// headless driver fell back to the alphabetically first configured agent,
+    /// running an unattended procedure under an unrelated agent's provider,
+    /// workspace, tools, and risk profile.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_unowned_cron_sop() {
+        let harness = cron_sop_harness(None).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "an unowned headless SOP must fail, not borrow another agent"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("no owning agent"),
+            "the failure should name the missing owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains(CRON_SOP_AGENT),
+            "the refusal must not fall back to the one configured agent, got {:?}",
+            step.output
+        );
     }
 
     #[test]

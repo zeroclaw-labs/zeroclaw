@@ -803,6 +803,9 @@ async fn run_agent_job(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        // A `[[cron]]` job runs a prompt, not a SOP step. SOP cron triggers
+        // are a separate surface driven by the SOP maintenance tick.
+        sop_step_scope: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {

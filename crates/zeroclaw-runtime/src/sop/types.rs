@@ -232,6 +232,17 @@ impl SopTrigger {
     pub fn source(&self) -> SopTriggerSource {
         SopTriggerSource::from(self)
     }
+
+    /// True when this trigger starts a run with no ambient agent turn.
+    ///
+    /// Every fan-in source except `Manual` fires from a listener, poller, or
+    /// the maintenance tick, none of which carry an agent identity a step could
+    /// borrow. `Manual` is agent-initiated through the `sop_execute` tool, so
+    /// the calling turn's agent owns the run. A procedure reachable by a
+    /// headless trigger must declare its own owning agent (see [`Sop::agent`]).
+    pub fn is_headless(&self) -> bool {
+        !matches!(self, Self::Manual)
+    }
 }
 
 // ── Step kind ────────────────────────────────────────────────────

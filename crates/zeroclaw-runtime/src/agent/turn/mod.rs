@@ -1235,7 +1235,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     .await
 }
 
-fn collect_callable_tool_names(
+pub(crate) fn collect_callable_tool_names(
     tools_registry: &[Box<dyn crate::tools::Tool>],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Vec<String> {
@@ -1283,7 +1283,7 @@ fn sop_step_excluded_tools(
     excluded_tools: &[String],
 ) -> Vec<String> {
     let mut scoped = excluded_tools.to_vec();
-    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+    for tool in crate::sop::active_scope::SOP_CONTROL_TOOLS {
         push_excluded_tool(&mut scoped, tool);
     }
 

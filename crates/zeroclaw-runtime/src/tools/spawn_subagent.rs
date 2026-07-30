@@ -189,6 +189,10 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            // A subagent is spawned from a tool call, not from a SOP step
+            // driver; any enclosing step's scope is already enforced on the
+            // parent turn that reached this tool.
+            sop_step_scope: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
