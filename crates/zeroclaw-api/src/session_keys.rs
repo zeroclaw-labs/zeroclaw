@@ -58,14 +58,18 @@ pub fn canonical_memory_id(session_id: &str) -> String {
 
 /// Normalize a session key for use as an in-memory guard identifier.
 ///
-/// ASCII-lowercases the key so that `gw_Alpha` and `gw_alpha` map to the
-/// same guard entry (lease, queue slot, cancel token), preventing the
-/// cross-transport case-collision on case-insensitive filesystems.
+/// Unicode-lowercases the key so that case variants that collide on
+/// case-insensitive filesystems (macOS APFS/HFS+, Windows NTFS) map to the
+/// same guard entry — lease, queue slot, cancel token — preventing
+/// cross-transport and cross-connection case-collision.  This covers
+/// ASCII (`gw_Alpha` / `gw_alpha`) through Cyrillic and Greek.
+///
+/// Characters without a lowercase mapping (CJK, digits) are unchanged.
 ///
 /// Storage identifiers (filenames, SQLite TEXT columns) continue to use
-/// the un-lowered form so existing mixed-case sessions are not broken.
+/// the un-lowered form so existing sessions are not broken.
 pub fn guard_key(session_key: &str) -> String {
-    session_key.to_ascii_lowercase()
+    session_key.to_lowercase()
 }
 
 #[cfg(test)]
@@ -168,12 +172,30 @@ mod tests {
 
     #[test]
     fn guard_key_preserves_non_ascii() {
-        // to_ascii_lowercase only affects A-Z, not Unicode
+        // Characters without a lowercase mapping (CJK, digits) are unchanged.
         assert_eq!(guard_key("gw_用户"), "gw_用户");
+    }
+
+    #[test]
+    fn guard_key_folds_unicode_case() {
+        // Cyrillic case variants must map to the same guard identifier
+        // because they collide on case-insensitive filesystems (APFS).
+        let cap = guard_key("gw_Алиса"); // Cyrillic capital А
+        let small = guard_key("gw_алиса"); // Cyrillic small а
+        assert_eq!(cap, small, "Unicode case variants must share a guard");
+        assert_eq!(cap, "gw_алиса");
+
+        // Greek case variants same treatment.
+        assert_eq!(guard_key("gw_Αλφα"), guard_key("gw_αλφα"));
+
+        // ASCII is still folded (existing behavior).
+        assert_eq!(guard_key("gw_Alpha"), guard_key("gw_alpha"));
     }
 
     #[test]
     fn guard_key_idempotent() {
         assert_eq!(guard_key(&guard_key("gw_Alpha")), "gw_alpha");
+        // Unicode folding is also idempotent.
+        assert_eq!(guard_key(&guard_key("gw_Алиса")), "gw_алиса");
     }
 }

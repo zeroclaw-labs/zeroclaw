@@ -101,7 +101,7 @@ impl SessionActorQueue {
         let (slot, current) = {
             let mut slots = self.slots.lock().await;
             let s = slots
-                .entry(session_id.to_ascii_lowercase())
+                .entry(zeroclaw_api::session_keys::guard_key(session_id))
                 .or_insert_with(|| {
                     Arc::new(SessionSlot {
                         semaphore: Arc::new(Semaphore::new(1)),
@@ -142,7 +142,7 @@ impl SessionActorQueue {
 
     /// Get the number of pending requests for a session.
     pub async fn queue_depth(&self, session_id: &str) -> usize {
-        let guard_key = session_id.to_ascii_lowercase();
+        let guard_key = zeroclaw_api::session_keys::guard_key(session_id);
         let slots = self.slots.lock().await;
         slots
             .get(&guard_key)
