@@ -69,7 +69,6 @@ impl PersonalityProfile {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for file in &self.files {
-            let _ = writeln!(out, "### {}\n", file.name);
             out.push_str(&file.content);
             if file.truncated {
                 let _ = writeln!(
@@ -227,10 +226,10 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("### SOUL.md"));
         assert!(rendered.contains("Be kind."));
-        assert!(rendered.contains("### IDENTITY.md"));
         assert!(rendered.contains("Name: Nova"));
+        assert!(!rendered.contains("SOUL.md"));
+        assert!(!rendered.contains("IDENTITY.md"));
 
         let _ = std::fs::remove_dir_all(ws);
     }
