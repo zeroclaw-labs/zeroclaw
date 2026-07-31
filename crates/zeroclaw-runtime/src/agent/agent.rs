@@ -272,9 +272,29 @@ async fn forward_history_trim_notice(
     }
 }
 
+/// The agent's effective provider/model/temperature for post-turn memory
+/// consolidation, produced by [`Agent::consolidation_context`]. Cheap to move
+/// into a spawned task (the provider is an `Arc` clone).
+pub struct ConsolidationContext {
+    pub model_provider: Arc<dyn ModelProvider>,
+    pub model: String,
+    pub temperature: Option<f64>,
+}
+
 pub struct Agent {
-    model_provider: Box<dyn ModelProvider>,
+    /// `Arc` (not `Box`) so the gateway turn runner can cheaply clone the
+    /// agent's effective provider into the fire-and-forget memory
+    /// consolidation task (see `consolidation_context`).
+    model_provider: Arc<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
+    /// Tool specs sent to the LLM. Populated from `tools` at build time;
+    /// may be overridden per-request (e.g. by the OpenAI chat completions
+    /// endpoint to honour `tools` / `tool_choice` request parameters).
+    tool_specs: Vec<zeroclaw_api::tool::ToolSpec>,
+    /// When true, the agent's tools are disabled for this request
+    /// (tool_choice: "none"). Set by `disable_tools()`, cleared by
+    /// `set_tool_specs()`.
+    tools_disabled: bool,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -803,7 +823,7 @@ impl AgentBuilder {
         let config = self.config.unwrap_or_default();
 
         Ok(Agent {
-            model_provider: self.model_provider.ok_or_else(|| {
+            model_provider: self.model_provider.map(Arc::from).ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -813,6 +833,8 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("model_provider is required")
             })?,
+            tool_specs: Vec::new(),
+            tools_disabled: false,
             tools,
             memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
@@ -983,6 +1005,19 @@ impl Agent {
         )
     }
 
+    /// The agent's effective provider/model/temperature for post-turn memory
+    /// consolidation. Returns the *routed agent's* values (including any
+    /// mid-turn `model_switch`), not gateway defaults, so consolidation stays
+    /// within the same provider/privacy boundary the turn executed under.
+    /// The provider is an `Arc` clone, cheap to move into a spawned task.
+    pub fn consolidation_context(&self) -> ConsolidationContext {
+        ConsolidationContext {
+            model_provider: Arc::clone(&self.model_provider),
+            model: self.model_name.clone(),
+            temperature: self.temperature,
+        }
+    }
+
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history_has_trim_breadcrumb = false;
@@ -1120,11 +1155,41 @@ impl Agent {
     }
 
     pub fn set_model_provider(&mut self, model_provider: Box<dyn ModelProvider>) {
-        self.model_provider = model_provider;
+        self.model_provider = Arc::from(model_provider);
     }
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Replace the tool specs sent to the LLM with the given set.
+    /// Used by the OpenAI-compatible HTTP endpoint to honour the `tools`
+    /// and `tool_choice` request parameters.
+    pub fn set_tool_specs(&mut self, specs: Vec<zeroclaw_api::tool::ToolSpec>) {
+        self.tool_specs = specs;
+        self.tools_disabled = false;
+    }
+
+    /// Clear all tool specs so the LLM sees no available tools.
+    /// Corresponds to `tool_choice: "none"`.
+    pub fn disable_tools(&mut self) {
+        self.tool_specs.clear();
+        self.tools_disabled = true;
+    }
+
+    /// Return the names of all registered tools.
+    pub fn get_configured_tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Return the authoritative [`ToolSpec`] for every registered tool, taken
+    /// from each tool's own `spec()`. This is the single source of truth for
+    /// the schema/description sent to the LLM — callers restricting tools by a
+    /// client-supplied name list must resolve back to these specs rather than
+    /// trusting client-provided schemas (see the gateway chat-completions
+    /// tool-resolution path).
+    pub fn get_configured_tool_specs(&self) -> Vec<zeroclaw_api::tool::ToolSpec> {
+        self.tools.iter().map(|t| t.spec()).collect()
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
@@ -1877,7 +1942,9 @@ impl Agent {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
-        let prompt_tools = if expose_text_tool_protocol {
+        let prompt_tools = if self.tools_disabled {
+            &no_tools
+        } else if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
@@ -1892,7 +1959,8 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: dispatcher.should_send_tool_specs()
+            sends_native_tool_specs: !self.tools_disabled
+                && dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
@@ -2006,7 +2074,7 @@ impl Agent {
             Ok(new_prov) => {
                 // Commit state only after the provider was built
                 // successfully.
-                self.model_provider = new_prov;
+                self.model_provider = Arc::from(new_prov);
                 self.model_provider_name = new_model_provider;
                 self.model_name = new_model.clone();
                 Some(new_model)
@@ -2309,91 +2377,109 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
-        let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+
+        let tool_specs_override = if self.tools_disabled {
+            Some(Vec::new())
+        } else if !self.tool_specs.is_empty() {
+            Some(self.tool_specs.clone())
+        } else {
+            None
+        };
+
+        let loop_result = zeroclaw_api::TOOL_SPECS_OVERRIDE
             .scope(
-                Some(cost_context.clone()),
-                crate::agent::tool_receipts::scope_receipts(
-                    receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                            crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            crate::agent::loop_::ResolvedIo {
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: false,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
-                                hooks: self.hook_runner.as_deref(),
-                                activated_tools: self.activated_tools.as_ref(),
-                                model_switch_callback: None,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            },
-                            crate::agent::loop_::ResolvedRuntimeKnobs {
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
-                                knobs: &knobs,
-                            },
-                        ),
-                        history: &mut loop_history,
-                        channel_name: &self.channel_name,
-                        channel_reply_target: None,
-                        cancellation_token: None,
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: None,
-                        collected_receipts: receipt_scope
-                            .as_ref()
-                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: None,
-                        steering: None,
-                        new_messages_out: Some(&mut loop_new_messages),
-                        image_cache: Some(&mut self.image_cache),
-                        // Direct embedded Agent::turn call; source/transport/
-                        // trust stay placeholders, not yet stamped at the edge.
-                        memory: Some(crate::agent::memory_inject::TurnMemory {
-                            handle: self.memory.as_ref(),
-                            query: user_message.to_string(),
-                            sessions: vec![self.memory_session_id.clone()],
-                            suppress: false,
-                            cfg: self.memory_inject_cfg,
+                tool_specs_override,
+                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context.clone()),
+                    crate::agent::tool_receipts::scope_receipts(
+                        receipt_scope.clone(),
+                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
+                                    model_provider: self.model_provider.as_ref(),
+                                    provider_name: &self.model_provider_name,
+                                    model: &effective_model,
+                                    temperature: self.temperature,
+                                },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: false,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    // Inlined `full_config()` (per-field borrow) so it coexists with
+                                    // the `&mut self.image_cache` in this same ToolLoop expression.
+                                    config: self
+                                        .provider_switch_config
+                                        .as_ref()
+                                        .and_then(|c| c.config.as_deref()),
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    context_token_budget: self
+                                        .config
+                                        .resolved
+                                        .effective_context_budget(),
+                                    knobs: &knobs,
+                                },
+                            ),
+                            history: &mut loop_history,
+                            channel_name: &self.channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: None,
+                            on_delta: None,
+                            shared_budget: None,
+                            channel: None,
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: None,
+                            steering: None,
+                            new_messages_out: Some(&mut loop_new_messages),
+                            image_cache: Some(&mut self.image_cache),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay placeholders, not yet stamped at the edge.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            parent_agent_alias: None,
+                            turn_id: &turn_id,
+                            // Live-daemon SOP path: re-assemble a nested step's agent
+                            // when it delegates elsewhere. Config survives only via
+                            // `provider_switch_config`; with `None` (test builder) a
+                            // cross-agent step FAILS CLOSED rather than inheriting
+                            // this turn's context.
+                            sop_reassembly: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|c| c.config.as_deref())
+                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
                         }),
-                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                        agent_alias: agent_alias_for_loop.as_deref(),
-                        parent_agent_alias: None,
-                        turn_id: &turn_id,
-                        // Live-daemon SOP path: re-assemble a nested step's agent
-                        // when it delegates elsewhere. Config survives only via
-                        // `provider_switch_config`; with `None` (test builder) a
-                        // cross-agent step FAILS CLOSED rather than inheriting
-                        // this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                    }),
+                    ),
                 ),
             )
             .await;
@@ -2641,6 +2727,14 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
 
+        let tool_specs_override = if self.tools_disabled {
+            Some(Vec::new())
+        } else if !self.tool_specs.is_empty() {
+            Some(self.tool_specs.clone())
+        } else {
+            None
+        };
+
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
@@ -2682,96 +2776,105 @@ impl Agent {
             // error exits — never derived from history indices, which the
             // loop's own preflight pruning can invalidate.
             let mut round_added: Vec<ChatMessage> = Vec::new();
-            let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                Some(cost_context.clone()),
-                crate::agent::tool_receipts::scope_receipts(
-                    receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                            crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            crate::agent::loop_::ResolvedIo {
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: true,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
-                                hooks: self.hook_runner.as_deref(),
-                                activated_tools: self.activated_tools.as_ref(),
-                                // `None` here (rather than a shared global) is
-                                // deliberate: `run_tool_call_loop` mints a fresh,
-                                // task-local switch state for this round when it
-                                // sees `None`, so a `model_switch` requested this
-                                // round can never leak into a sibling round or a
-                                // concurrently running turn/agent.
-                                model_switch_callback: None,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            },
-                            crate::agent::loop_::ResolvedRuntimeKnobs {
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
-                                knobs: &knobs,
-                            },
-                        ),
-                        history: &mut loop_history,
-                        channel_name: &self.channel_name,
-                        channel_reply_target: None,
-                        cancellation_token: cancel_token.clone(),
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: approval_bridge.as_deref(),
-                        collected_receipts: receipt_scope
-                            .as_ref()
-                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: Some(event_tx.clone()),
-                        steering: None,
-                        new_messages_out: Some(&mut round_added),
-                        image_cache: Some(&mut self.image_cache),
-                        // Direct embedded Agent::turn call; source/transport/
-                        // trust stay placeholders, not yet stamped at the edge.
-                        memory: Some(crate::agent::memory_inject::TurnMemory {
-                            handle: self.memory.as_ref(),
-                            query: user_message.to_string(),
-                            sessions: vec![self.memory_session_id.clone()],
-                            suppress: false,
-                            cfg: self.memory_inject_cfg,
+            let round_loop = zeroclaw_api::TOOL_SPECS_OVERRIDE.scope(
+                tool_specs_override.clone(),
+                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context.clone()),
+                    crate::agent::tool_receipts::scope_receipts(
+                        receipt_scope.clone(),
+                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
+                                    model_provider: self.model_provider.as_ref(),
+                                    provider_name: &self.model_provider_name,
+                                    model: &effective_model,
+                                    temperature: self.temperature,
+                                },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: true,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    // Inlined `full_config()` (per-field borrow) so it coexists with
+                                    // the `&mut self.image_cache` in this same ToolLoop expression.
+                                    config: self
+                                        .provider_switch_config
+                                        .as_ref()
+                                        .and_then(|c| c.config.as_deref()),
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    // `None` here (rather than a shared global) is
+                                    // deliberate: `run_tool_call_loop` mints a fresh,
+                                    // task-local switch state for this round when it
+                                    // sees `None`, so a `model_switch` requested this
+                                    // round can never leak into a sibling round or a
+                                    // concurrently running turn/agent.
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    context_token_budget: self
+                                        .config
+                                        .resolved
+                                        .effective_context_budget(),
+                                    knobs: &knobs,
+                                },
+                            ),
+                            history: &mut loop_history,
+                            channel_name: &self.channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: cancel_token.clone(),
+                            on_delta: None,
+                            shared_budget: None,
+                            channel: approval_bridge.as_deref(),
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: Some(event_tx.clone()),
+                            steering: None,
+                            new_messages_out: Some(&mut round_added),
+                            image_cache: Some(&mut self.image_cache),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay placeholders, not yet stamped at the edge.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            parent_agent_alias: None,
+                            turn_id: &turn_id,
+                            // Live-daemon SOP path: re-assemble a nested step's
+                            // agent when it delegates elsewhere. Config survives
+                            // only via `provider_switch_config`; with `None`
+                            // (test builder) a cross-agent step FAILS CLOSED
+                            // rather than inheriting this turn's context.
+                            sop_reassembly: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|c| c.config.as_deref())
+                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
                         }),
-                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                        agent_alias: agent_alias_for_loop.as_deref(),
-                        parent_agent_alias: None,
-                        turn_id: &turn_id,
-                        // Live-daemon SOP path: re-assemble a nested step's
-                        // agent when it delegates elsewhere. Config survives
-                        // only via `provider_switch_config`; with `None`
-                        // (test builder) a cross-agent step FAILS CLOSED
-                        // rather than inheriting this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                    }),
+                    ),
                 ),
             );
             // Scope the provider-fallback task-local around the round so the
@@ -3168,6 +3271,177 @@ mod tests {
         let mut agent = blank_input_agent(model_provider);
         let err = agent.turn("").await.expect_err("blank turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[test]
+    fn consolidation_context_reflects_agent_model_and_temperature() {
+        // The gateway turn runner uses consolidation_context() to route
+        // post-turn memory consolidation through the agent's OWN provider,
+        // not the gateway default — this guards against consolidation
+        // crossing a configured provider boundary.
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .model_provider(provider)
+            .model_name("agent-model-x".to_string())
+            .model_provider_name("agent-provider-x".to_string())
+            .temperature(Some(0.42))
+            .tools(Vec::new())
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        let ctx = agent.consolidation_context();
+        assert_eq!(ctx.model, "agent-model-x");
+        assert_eq!(ctx.temperature, Some(0.42));
+        // The provider Arc must be the agent's own (identifiable by alias).
+        assert_eq!(
+            ::zeroclaw_api::attribution::Attributable::alias(ctx.model_provider.as_ref()),
+            "MockModelProvider"
+        );
+    }
+
+    #[test]
+    fn consolidation_context_differs_across_two_agents() {
+        // Two agents with different provider/model/temperature fields must
+        // each report their OWN values through consolidation_context().
+        // This is the regression guard the reviewer asked for: a routing
+        // change or gateway-default fallback in the consolidation path would
+        // cause both agents to return the same values rather than their own.
+        struct ProviderAlpha;
+        #[async_trait]
+        impl ModelProvider for ProviderAlpha {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("alpha".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("alpha".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ProviderAlpha {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "ProviderAlpha"
+            }
+        }
+
+        struct ProviderBeta;
+        #[async_trait]
+        impl ModelProvider for ProviderBeta {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("beta".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("beta".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ProviderBeta {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "ProviderBeta"
+            }
+        }
+
+        let builder = |provider: Box<dyn ModelProvider>,
+                       model_name: &str,
+                       temperature: Option<f64>|
+         -> Agent {
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            Agent::builder()
+                .model_provider(provider)
+                .model_name(model_name.to_string())
+                .model_provider_name(model_name.to_string())
+                .temperature(temperature)
+                .tools(Vec::new())
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(std::path::PathBuf::from("/tmp"))
+                .build()
+                .expect("agent builder should succeed")
+        };
+
+        let agent_a = builder(Box::new(ProviderAlpha), "agent-alpha", Some(0.1));
+        let agent_b = builder(Box::new(ProviderBeta), "agent-beta", Some(0.9));
+
+        let ctx_a = agent_a.consolidation_context();
+        let ctx_b = agent_b.consolidation_context();
+
+        // Different provider identity.
+        assert_ne!(
+            ::zeroclaw_api::attribution::Attributable::alias(ctx_a.model_provider.as_ref()),
+            ::zeroclaw_api::attribution::Attributable::alias(ctx_b.model_provider.as_ref()),
+            "two agents with different providers must report different provider identities"
+        );
+        // Different model name.
+        assert_ne!(ctx_a.model, ctx_b.model);
+        // Different temperature.
+        assert_ne!(ctx_a.temperature, ctx_b.temperature);
     }
 
     #[tokio::test]
@@ -5593,6 +5867,140 @@ mod tests {
             "Generated ID should be a valid UUID: got '{}'",
             call_id
         );
+    }
+
+    /// Provider that captures the FULL ToolSpec list it receives (not just a
+    /// presence flag), so a test can assert the provider-visible schema.
+    struct FullToolSpecCaptureProvider {
+        captured: Arc<Mutex<Vec<zeroclaw_api::tool::ToolSpec>>>,
+    }
+    #[async_trait]
+    impl ModelProvider for FullToolSpecCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            if let Some(tools) = request.tools {
+                *self.captured.lock() = tools.to_vec();
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            if let Some(tools) = request.tools {
+                *self.captured.lock() = tools.to_vec();
+            }
+            let chunk = zeroclaw_providers::traits::StreamEvent::TextDelta(
+                zeroclaw_providers::traits::StreamChunk {
+                    delta: "done".into(),
+                    is_final: false,
+                    reasoning: None,
+                    token_count: 0,
+                },
+            );
+            stream::iter(vec![
+                Ok(chunk),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FullToolSpecCaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FullToolSpecCaptureProvider"
+        }
+    }
+
+    /// F2 provider-visible-schema guard: the gateway resolves a request's tool
+    /// names back to authoritative `Tool::spec()`s and installs them via
+    /// `set_tool_specs`. This test proves the specs the PROVIDER actually
+    /// receives carry the authoritative description/parameters — a forged
+    /// client schema installed here would be visible on the wire, so asserting
+    /// the provider-visible value (not just resolve_tool_specs' return) closes
+    /// the reviewer's gap.
+    #[tokio::test]
+    async fn provider_receives_authoritative_tool_spec_not_forged() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(FullToolSpecCaptureProvider {
+            captured: captured.clone(),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        // Authoritative spec from the registry — this is what
+        // get_configured_tool_specs()/authoritative_specs_for() produce and
+        // what the gateway installs. A forged client schema would look nothing
+        // like this.
+        let authoritative = agent.get_configured_tool_specs();
+        assert_eq!(authoritative.len(), 1);
+        assert_eq!(authoritative[0].name, "echo");
+        agent.set_tool_specs(authoritative.clone());
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed("hello", event_tx, None)
+            .await
+            .expect("turn should succeed");
+
+        let seen = captured.lock();
+        assert_eq!(seen.len(), 1, "provider must receive exactly the one spec");
+        assert_eq!(seen[0].name, "echo");
+        // The provider-visible description/parameters are the authoritative
+        // ones from Tool::spec(), NOT any client-supplied override.
+        assert_eq!(seen[0].description, authoritative[0].description);
+        assert_eq!(*seen[0].parameters, *authoritative[0].parameters);
     }
 
     fn tool_receipts_enabled_config(enabled: bool) -> zeroclaw_config::schema::AliasedAgentConfig {

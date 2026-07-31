@@ -25,6 +25,53 @@ pub fn sanitize_session_key(key: &str) -> String {
         .collect()
 }
 
+/// Return `true` if `key` is already in canonical form: non-empty and
+/// containing only `[A-Za-z0-9_-]` (plus Unicode alphanumerics, matching
+/// `sanitize_session_key`). Equivalent to `sanitize_session_key(key) == key`
+/// but allocation-free.
+///
+/// Client-facing entry points (the chat-completions endpoint and the
+/// WebSocket handshake) reject noncanonical keys instead of silently
+/// folding them: because `sanitize_session_key` maps every disallowed
+/// character to `_`, distinct raw keys such as `alpha.beta` and `alpha/beta`
+/// would otherwise collapse to the same persistence key (`gw_alpha_beta`)
+/// while the client sees two different session IDs — sharing one transcript,
+/// ownership record, and memory scope. Restricting inputs to canonical keys
+/// makes the `gw_`-prefixed persistence key injective.
+pub fn is_canonical_session_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Canonical memory-session identifier shared by WS and HTTP paths.
+///
+/// Both transports must pass the same identifier to
+/// `Agent::set_memory_session_id` so the memory backend sees a single
+/// scope regardless of transport. This is the sanitized form of the
+/// client-supplied session ID, matching the on-disk JSONL filename and
+/// the `session_id` column in SQLite backends.
+pub fn canonical_memory_id(session_id: &str) -> String {
+    sanitize_session_key(session_id)
+}
+
+/// Normalize a session key for use as an in-memory guard identifier.
+///
+/// Unicode-lowercases the key so that case variants that collide on
+/// case-insensitive filesystems (macOS APFS/HFS+, Windows NTFS) map to the
+/// same guard entry — lease, queue slot, cancel token — preventing
+/// cross-transport and cross-connection case-collision.  This covers
+/// ASCII (`gw_Alpha` / `gw_alpha`) through Cyrillic and Greek.
+///
+/// Characters without a lowercase mapping (CJK, digits) are unchanged.
+///
+/// Storage identifiers (filenames, SQLite TEXT columns) continue to use
+/// the un-lowered form so existing sessions are not broken.
+pub fn guard_key(session_key: &str) -> String {
+    session_key.to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +106,96 @@ mod tests {
     fn preserves_unicode_alphanumeric() {
         // is_alphanumeric() treats unicode letters/digits as alphanumeric.
         assert_eq!(sanitize_session_key("user_Алиса"), "user_Алиса");
+    }
+
+    #[test]
+    fn canonical_memory_id_preserves_punctuation_key() {
+        // WS and HTTP must produce identical memory-scope identifiers for
+        // the same client session ID, including keys with punctuation.
+        assert_eq!(canonical_memory_id("alpha.beta"), "alpha_beta");
+        assert_eq!(canonical_memory_id("test.alpha"), "test_alpha");
+        // UUID-based IDs are unaffected.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(canonical_memory_id(uuid), uuid);
+    }
+
+    #[test]
+    fn is_canonical_accepts_canonical_keys() {
+        assert!(is_canonical_session_key("abc-DEF_123"));
+        assert!(is_canonical_session_key(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(is_canonical_session_key("user_Алиса"));
+    }
+
+    #[test]
+    fn is_canonical_rejects_noncanonical_keys() {
+        // Distinct raw keys that would collapse under sanitize_session_key.
+        assert!(!is_canonical_session_key("alpha.beta"));
+        assert!(!is_canonical_session_key("alpha/beta"));
+        assert!(!is_canonical_session_key("alpha beta"));
+        assert!(!is_canonical_session_key("alpha:beta"));
+        assert!(!is_canonical_session_key("alpha@beta"));
+    }
+
+    #[test]
+    fn is_canonical_rejects_empty() {
+        assert!(!is_canonical_session_key(""));
+    }
+
+    #[test]
+    fn is_canonical_agrees_with_sanitize_fixpoint() {
+        // is_canonical_session_key(x) must equal (sanitize_session_key(x) == x)
+        // for non-empty inputs.
+        for k in [
+            "abc-DEF_123",
+            "alpha.beta",
+            "alpha/beta",
+            "user_Алиса",
+            "550e8400-e29b-41d4",
+            "has space",
+        ] {
+            assert_eq!(
+                is_canonical_session_key(k),
+                sanitize_session_key(k) == k,
+                "mismatch for {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_key_normalizes_ascii_case() {
+        assert_eq!(guard_key("gw_Alpha"), "gw_alpha");
+        assert_eq!(guard_key("gw_ALPHA"), "gw_alpha");
+        assert_eq!(guard_key("gw_alpha"), "gw_alpha");
+    }
+
+    #[test]
+    fn guard_key_preserves_non_ascii() {
+        // Characters without a lowercase mapping (CJK, digits) are unchanged.
+        assert_eq!(guard_key("gw_用户"), "gw_用户");
+    }
+
+    #[test]
+    fn guard_key_folds_unicode_case() {
+        // Cyrillic case variants must map to the same guard identifier
+        // because they collide on case-insensitive filesystems (APFS).
+        let cap = guard_key("gw_Алиса"); // Cyrillic capital А
+        let small = guard_key("gw_алиса"); // Cyrillic small а
+        assert_eq!(cap, small, "Unicode case variants must share a guard");
+        assert_eq!(cap, "gw_алиса");
+
+        // Greek case variants same treatment.
+        assert_eq!(guard_key("gw_Αλφα"), guard_key("gw_αλφα"));
+
+        // ASCII is still folded (existing behavior).
+        assert_eq!(guard_key("gw_Alpha"), guard_key("gw_alpha"));
+    }
+
+    #[test]
+    fn guard_key_idempotent() {
+        assert_eq!(guard_key(&guard_key("gw_Alpha")), "gw_alpha");
+        // Unicode folding is also idempotent.
+        assert_eq!(guard_key(&guard_key("gw_Алиса")), "gw_алиса");
     }
 }

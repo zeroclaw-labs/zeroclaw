@@ -71,8 +71,15 @@ pub fn build_spec() -> serde_json::Value {
         serde_json::to_value(schema_for!(T)).unwrap_or(serde_json::Value::Null)
     }
 
+    use crate::api_chat_completions::{
+        ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
+    };
+
     let components = serde_json::json!({
         "schemas": {
+            "ChatRequest":     schema_value::<ChatCompletionRequest>(),
+            "ChatResponse":    schema_value::<ChatCompletionResponse>(),
+            "ChatError":       schema_value::<ErrorResponse>(),
             "ConfigApiError":   schema_value::<ConfigApiError>(),
             "PropPutBody":      schema_value::<PropPutBody>(),
             "PropResponse":     schema_value::<PropResponse>(),
@@ -340,7 +347,7 @@ pub fn build_spec() -> serde_json::Value {
                 }
             }
         },
-        "/api/version/check": {
+         "/api/version/check": {
             "get": {
                 "tags": ["version"],
                 "summary": "Check for a newer release",
@@ -386,6 +393,119 @@ pub fn build_spec() -> serde_json::Value {
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpgradeStatusResponse" } } }
                     },
                     "404": version_error("Unknown `handoff_id`."),
+                }
+            }
+        },
+        "/v1/chat/completions": {
+            "post": {
+                "tags": ["chat"],
+                "summary": "OpenAI-compatible chat completions",
+                "description": "Route to a ZeroClaw agent via `model: zeroclaw/<alias>`. Supports streaming (SSE) and non-streaming (JSON) modes. `tools` and `tool_choice` restrict the available tool set per request. Session continuity via `x-session-key` header. Disabled by default (`chat_completions_enabled`). Rate-limited independently (`chat_rate_limit_per_minute`).",
+                "security": [{ "bearerAuth": [] }],
+                "parameters": [
+                    {
+                        "name": "x-session-key",
+                        "in": "header",
+                        "required": false,
+                        "schema": { "type": "string" },
+                        "description": "Session ID for multi-turn continuity. If omitted, a new UUID is generated and returned in the response header."
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/ChatRequest" }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful completion.",
+                        "headers": {
+                            "X-Request-ID": {
+                                "description": "Server-generated unique request identifier (UUID). Present on all handler-processed responses (including errors), absent on 413 (body-size guard fires before the handler).",
+                                "schema": { "type": "string" }
+                            },
+                            "x-session-key": {
+                                "description": "Session ID (without gw_ prefix). Echoed from the request header when supplied, generated as a UUID when omitted. Present on all handler-processed responses.",
+                                "schema": { "type": "string" }
+                            },
+                            "X-RateLimit-Limit": {
+                                "description": "Configured requests-per-minute ceiling (chat_rate_limit_per_minute).",
+                                "schema": { "type": "integer" }
+                            },
+                            "X-RateLimit-Remaining": {
+                                "description": "Requests still allowed in the current sliding window (real count from the limiter, decreases as the window is spent).",
+                                "schema": { "type": "integer" }
+                            },
+                            "X-RateLimit-Reset": {
+                                "description": "Unix timestamp when the window frees a slot, derived from the oldest in-window request.",
+                                "schema": { "type": "integer" }
+                            }
+                        },
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ChatResponse" }
+                            },
+                            "text/event-stream": {
+                                "schema": {
+                                    "type": "string",
+                                    "description": "SSE stream; each chunk is a chat.completion.chunk JSON object terminated by data: [DONE]. On failure or cancellation, an in-band error object is emitted, optionally followed by usage data (if stream_options.include_usage was requested), then [DONE]."
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request, unsupported parameter, unknown agent, or unavailable tool.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "408": {
+                        "description": "Request exceeded the configured timeout (default 600s).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "409": {
+                        "description": "Session currently owned by an active WebSocket connection.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "413": {
+                        "description": "Request body exceeds the maximum allowed size (64 KB).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "401": {
+                        "description": "Authentication required (when `require_pairing` is enabled).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "429": {
+                        "description": "Rate limit exceeded (`chat_rate_limit_per_minute`), or the per-session queue is busy.",
+                        "headers": {
+                            "X-RateLimit-Limit": {
+                                "description": "Configured requests-per-minute ceiling.",
+                                "schema": { "type": "integer" }
+                            },
+                            "X-RateLimit-Remaining": {
+                                "description": "Requests still allowed in the current sliding window (0 when the window is full).",
+                                "schema": { "type": "integer" }
+                            },
+                            "X-RateLimit-Reset": {
+                                "description": "Unix timestamp when the window frees a slot.",
+                                "schema": { "type": "integer" }
+                            },
+                            "Retry-After": {
+                                "description": "Seconds until the window frees a slot (real value from the limiter, not a fixed window).",
+                                "schema": { "type": "integer" }
+                            }
+                        },
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "500": {
+                        "description": "Internal server or provider error.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    },
+                    "503": {
+                        "description": "Agent not configured (complete onboarding).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } }
+                    }
                 }
             }
         }
@@ -583,6 +703,36 @@ mod tests {
         assert!(paths.get("/api/skills/slash-option-kinds").is_some());
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn chat_completions_declares_rate_limit_headers() {
+        // The endpoint emits real sliding-window rate-limit metadata (F7), so
+        // the spec must declare those headers on the 200 and 429 responses.
+        let spec = build_spec();
+        let responses = spec["paths"]["/v1/chat/completions"]["post"]["responses"].clone();
+
+        for status in ["200", "429"] {
+            let headers = responses[status]
+                .get("headers")
+                .unwrap_or_else(|| panic!("{status} response must declare headers"));
+            for header in [
+                "X-RateLimit-Limit",
+                "X-RateLimit-Remaining",
+                "X-RateLimit-Reset",
+            ] {
+                assert!(
+                    headers.get(header).is_some(),
+                    "{status} response must declare {header}"
+                );
+            }
+        }
+        // Retry-After is specific to the 429 path.
+        assert!(
+            responses["429"]["headers"].get("Retry-After").is_some(),
+            "429 response must declare Retry-After"
+        );
     }
 
     #[cfg(feature = "schema-export")]

@@ -294,6 +294,18 @@ version = "=0.60.2"
 name = "windows_i686_gnullvm"
 version = "=0.52.6"
 
+# fs4 (introduced by zeroclaw-infra for JSONL cross-process claim locks)
+# depends on an older rustix/linux-raw-sys.  Remove these skips once
+# fs4 upgrades to rustix 1.x or zeroclaw-infra switches to a
+# compatible file-locking crate.
+[[bans.skip]]
+name = "linux-raw-sys"
+version = "=0.4.15"
+
+[[bans.skip]]
+name = "rustix"
+version = "=0.38.44"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

@@ -4481,6 +4481,11 @@ async fn process_channel_message_body(
     cancellation_token: CancellationToken,
     channel_composite: String,
 ) {
+    // This function is ~1750 lines; in debug builds the compiler generates
+    // a state machine large enough to overflow the default tokio worker
+    // stack (2 MB).  Box::pin moves it to the heap — same pattern as the
+    // gateway's turn runner async-join block.
+    Box::pin(async move {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -6228,6 +6233,7 @@ async fn process_channel_message_body(
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
     }
+    }).await;
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path

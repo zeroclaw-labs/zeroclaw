@@ -22,7 +22,7 @@ struct SessionSlot {
     pending: AtomicUsize,
 }
 
-/// RAII guard that releases the session permit on drop.
+/// RAII guard that releases the session permit and pending count on drop.
 pub struct SessionGuard {
     slot: Arc<SessionSlot>,
     _permit: OwnedSemaphorePermit,
@@ -31,6 +31,29 @@ pub struct SessionGuard {
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.slot.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Cancel-safe guard for the pending-count increment during `acquire`.
+///
+/// On successful acquisition, `into_guard()` transfers the +1 to
+/// `SessionGuard`. On error or cancellation, `Drop` decrements.
+struct PendingGuard {
+    slot: Arc<SessionSlot>,
+    consumed: bool,
+}
+
+impl PendingGuard {
+    fn into_guard(mut self) {
+        self.consumed = true;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.slot.pending.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -72,13 +95,13 @@ impl SessionActorQueue {
         }
     }
 
-    /// Acquire exclusive access to a session. Blocks until the session is free
-    /// or the timeout expires. Returns a guard that releases on drop.
+    /// Acquire exclusive access to a session. Cancel-safe: `PendingGuard`
+    /// ensures the pending count is decremented even if this future is dropped.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
-        let slot = {
+        let (slot, current) = {
             let mut slots = self.slots.lock().await;
-            slots
-                .entry(session_id.to_string())
+            let s = slots
+                .entry(zeroclaw_api::session_keys::guard_key(session_id))
                 .or_insert_with(|| {
                     Arc::new(SessionSlot {
                         semaphore: Arc::new(Semaphore::new(1)),
@@ -86,43 +109,43 @@ impl SessionActorQueue {
                         pending: AtomicUsize::new(0),
                     })
                 })
-                .clone()
+                .clone();
+            let current = s.pending.fetch_add(1, Ordering::Relaxed);
+            (s, current)
         };
-
-        // Check queue depth before waiting
-        let current = slot.pending.fetch_add(1, Ordering::Relaxed);
+        let pending_guard = PendingGuard {
+            slot: slot.clone(),
+            consumed: false,
+        };
         if current >= self.max_queue_depth {
-            slot.pending.fetch_sub(1, Ordering::Relaxed);
             return Err(SessionQueueError::QueueFull {
                 session_id: session_id.to_string(),
                 depth: current,
             });
         }
 
-        // Acquire owned permit with timeout
         let sem = slot.semaphore.clone();
         match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
             Ok(Ok(permit)) => {
                 *slot.last_active.lock().await = Instant::now();
+                pending_guard.into_guard();
                 Ok(SessionGuard {
                     slot,
                     _permit: permit,
                 })
             }
-            Ok(Err(_)) | Err(_) => {
-                slot.pending.fetch_sub(1, Ordering::Relaxed);
-                Err(SessionQueueError::Timeout {
-                    session_id: session_id.to_string(),
-                })
-            }
+            Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
+                session_id: session_id.to_string(),
+            }),
         }
     }
 
     /// Get the number of pending requests for a session.
     pub async fn queue_depth(&self, session_id: &str) -> usize {
+        let guard_key = zeroclaw_api::session_keys::guard_key(session_id);
         let slots = self.slots.lock().await;
         slots
-            .get(session_id)
+            .get(&guard_key)
             .map(|s| s.pending.load(Ordering::Relaxed))
             .unwrap_or(0)
     }

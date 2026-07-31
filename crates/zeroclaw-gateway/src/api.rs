@@ -1591,6 +1591,54 @@ pub async fn handle_api_health(
 
 // ── Helpers ─────────────────────────────────────────────────────
 
+/// Error returned when a session key cannot be resolved unambiguously
+/// because both `gw_{id}` and `{id}` exist in the backend.
+#[derive(Debug)]
+struct SessionKeyResolutionError {
+    id: String,
+    gw_candidate: String,
+    ch_candidate: String,
+}
+
+/// Resolve a session key from a caller-supplied ID by consulting the backend.
+///
+/// Strategy (in order):
+/// 1. `gw_` prefix → full gateway key (identity after sanitize).
+/// 2. `ch:` prefix → channel key (identity — strip prefix, lookup bare).
+/// 3. Probe both `gw_{sanitize(id)}` and `{sanitize(id)}` bare.
+///    - Both exist → `Err(SessionKeyResolutionError)` — ambiguous.
+///    - Only `gw_` exists → return `gw_` form.
+///    - Only bare exists → return bare form (channel key).
+///    - Neither exists → default to `gw_{sanitize(id)}`.
+fn resolve_session_key(
+    id: &str,
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+) -> Result<String, SessionKeyResolutionError> {
+    // Step 1: gw_ prefix → full gateway key (identity after sanitize).
+    if id.starts_with("gw_") {
+        return Ok(zeroclaw_api::session_keys::sanitize_session_key(id));
+    }
+    // Step 2: ch: prefix → channel key (identity — strip, lookup bare).
+    if let Some(bare) = id.strip_prefix("ch:") {
+        return Ok(zeroclaw_api::session_keys::sanitize_session_key(bare));
+    }
+    // Step 3: probe both gw_{sanitize(id)} and {sanitize(id)}.
+    let bare = zeroclaw_api::session_keys::sanitize_session_key(id);
+    let gw_key = format!("gw_{}", bare);
+    let gw_exists = backend.session_exists(&gw_key);
+    let bare_exists = backend.session_exists(&bare);
+    match (gw_exists, bare_exists) {
+        (true, true) => Err(SessionKeyResolutionError {
+            id: id.to_string(),
+            gw_candidate: gw_key,
+            ch_candidate: format!("ch:{}", bare),
+        }),
+        (true, false) => Ok(gw_key),
+        (false, true) => Ok(bare),
+        (false, false) => Ok(gw_key),
+    }
+}
+
 // ── Session API handlers ─────────────────────────────────────────
 
 /// GET /api/sessions — list gateway sessions
@@ -1628,19 +1676,25 @@ pub async fn handle_api_sessions_list(
                     .and_then(|c| config.agent_for_channel(c))
                     .map(str::to_string)
             });
-            // Drop the gw_ prefix for display; channel keys stay as-is so
-            // the frontend can show the channel context inline.
+            // Drop the gw_ / ch: prefix for display.
             let session_id = meta
                 .key
                 .strip_prefix("gw_")
+                .or_else(|| meta.key.strip_prefix("ch:"))
                 .map(str::to_string)
                 .unwrap_or_else(|| meta.key.clone());
+            // Ensure every key has an addressable prefix: gw_ for gateway,
+            // ch: for channel-driven sessions.
+            let session_key = if meta.key.starts_with("gw_") {
+                meta.key.clone()
+            } else {
+                format!("ch:{}", meta.key)
+            };
             let mut entry = serde_json::json!({
-                // Display form: `gw_` stripped for gateway sessions, full
-                // composite for channel-driven sessions.
+                // Display form: prefix stripped for all session types.
                 "session_id": session_id,
-                // Full DB key for API operations (delete, messages, abort).
-                "session_key": meta.key.clone(),
+                // Full key with namespace prefix for API operations.
+                "session_key": session_key,
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
@@ -1679,10 +1733,19 @@ pub async fn handle_api_session_messages(
     // Accept either the full DB key (channel-driven sessions like
     // `discord.clamps_…`) or the stripped form (legacy callers that pass
     // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
+                })),
+            ).into_response();
+        }
     };
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
@@ -1731,7 +1794,20 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
+                })),
+            ).into_response();
+        }
+    };
     if !backend
         .list_sessions()
         .iter()
@@ -1813,17 +1889,75 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
+                })),
+            ).into_response();
+        }
     };
 
+    // ── Step 1: Acquire session queue FIRST ──────────────────────
+    // This creates the linearized boundary with WebSocket admission:
+    // the WS inserts into ws_connections (ws.rs:380) before it acquires
+    // the queue (ws.rs:411), so by the time we hold the queue,
+    // ws_connections reflects all admitted WS connections.
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Session is busy, retry after current turn completes"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // ── Step 2: Check WebSocket lease UNDER queue guard ─────────
+    // No TOCTOU gap: any WS that inserted into ws_connections at
+    // ws.rs:380 has either already acquired the queue before us
+    // (ws_connections contains the key → 409) or will block at
+    // ws.rs:411 until we release the queue (session deleted by then).
+    // A rejected DELETE at this stage has performed NO side effects.
+    if state
+        .ws_connections
+        .lock()
+        .contains_key(&zeroclaw_api::session_keys::guard_key(&session_key))
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "session_in_use_by_websocket",
+                "error_description": "Cannot delete a session that is currently owned by an active WebSocket connection. Disconnect the WebSocket first."
+            })),
+        )
+            .into_response();
+    }
+
+    // ── Step 3: Cancel turn token ONLY after committing ─────────
+    // We hold the session queue, so no new turn can start. Any
+    // token present belongs to an in-flight turn that will be
+    // cancelled. This is now safe because we will not return 409.
     let token = state
         .cancel_tokens
         .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
+        .remove(&zeroclaw_api::session_keys::guard_key(&session_key));
     if let Some(token) = token {
         token.cancel();
         ::zeroclaw_log::record!(
@@ -1834,6 +1968,7 @@ pub async fn handle_api_session_delete(
         );
     }
 
+    // ── Step 4: Delete from backend ─────────────────────────────
     match backend.delete_session(&session_key) {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
         Ok(false) => (
@@ -1877,7 +2012,20 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
+                })),
+            ).into_response();
+        }
+    };
 
     // Verify the session exists before renaming
     let sessions = backend.list_sessions();
@@ -1951,7 +2099,20 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = match resolve_session_key(&id, backend.as_ref()) {
+        Ok(key) => key,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "ambiguous_session_key",
+                    "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                    "candidates": [e.gw_candidate, e.ch_candidate],
+                    "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
+                })),
+            ).into_response();
+        }
+    };
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -1990,15 +2151,33 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = match state.session_backend.as_ref() {
+        Some(backend) => match resolve_session_key(&id, backend.as_ref()) {
+            Ok(key) => key,
+            Err(e) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "ambiguous_session_key",
+                        "error_description": format!("The session identifier '{}' matches both a gateway session and a channel session. Use 'gw_' prefix to select the gateway session or 'ch:' to select the channel session.", e.id),
+                        "candidates": [e.gw_candidate, e.ch_candidate],
+                        "hint": "Use the 'session_key' field from GET /api/sessions responses — it includes the correct prefix ('gw_' or 'ch:')."
+                    })),
+                ).into_response();
+            }
+        },
+        None => format!(
+            "gw_{}",
+            zeroclaw_api::session_keys::sanitize_session_key(&id)
+        ),
+    };
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
     let token = state
         .cancel_tokens
         .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
+        .get(&zeroclaw_api::session_keys::guard_key(&session_key))
         .cloned();
 
     if let Some(token) = token {
@@ -2044,7 +2223,7 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
+    use parking_lot::{Mutex, RwLock};
     // Gated on every channel feature whose `AppState` fields below are built
     // with `HashMap::new()`, not just `channel-linq`. With only one of the
     // others enabled the import vanished while its uses remained, so
@@ -2062,7 +2241,7 @@ pub(crate) mod tests {
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
-    use zeroclaw_providers::ModelProvider;
+    use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     #[derive(Default)]
@@ -2234,7 +2413,7 @@ pub(crate) mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -2264,12 +2443,14 @@ pub(crate) mod tests {
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -4721,5 +4902,489 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+    }
+
+    // ── resolve_session_key ───────────────────────────────────
+
+    #[test]
+    fn resolve_session_key_preserves_gw_prefixed_key() {
+        // Step 1: gw_ prefix → identity (sanitized).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        assert_eq!(resolve_session_key("gw_foo", backend).unwrap(), "gw_foo");
+        assert_eq!(
+            resolve_session_key("gw_test-session", backend).unwrap(),
+            "gw_test-session"
+        );
+        assert_eq!(
+            resolve_session_key("gw_foo.bar", backend).unwrap(),
+            "gw_foo_bar"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_backend_based_disambiguation() {
+        // Steps 2-4: consult backend to disambiguate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        // No sessions exist: bare ID → gw_ prefix (step 4).
+        assert_eq!(
+            resolve_session_key("my-session", backend).unwrap(),
+            "gw_my-session"
+        );
+        assert_eq!(
+            resolve_session_key("550e8400-e29b-41d4-a716-446655440000", backend).unwrap(),
+            "gw_550e8400-e29b-41d4-a716-446655440000"
+        );
+
+        // Create a gw_ session: gw_{id} lookup should find it (step 2).
+        store
+            .append("gw_my-session", &ChatMessage::user("hello"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("my-session", backend).unwrap(),
+            "gw_my-session"
+        );
+
+        // Create a channel key: bare lookup should find it (step 3).
+        store
+            .append("discord_clamps_user123", &ChatMessage::user("hi"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("discord_clamps_user123", backend).unwrap(),
+            "discord_clamps_user123"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_sanitizes_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Spaces and dots are sanitized; no session exists → gw_ prefix (step 4).
+        assert_eq!(
+            resolve_session_key("my session", backend).unwrap(),
+            "gw_my_session"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_ch_prefix_selects_channel_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // ch: prefix → identity path → strip prefix, return bare key.
+        store
+            .append("discord_clamps_user123", &ChatMessage::user("hi"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("ch:discord_clamps_user123", backend).unwrap(),
+            "discord_clamps_user123"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_ch_prefix_selects_channel_even_when_gw_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Both gw_X and X exist — ch:X must select X, not fall into ambiguity.
+        store
+            .append("gw_discord_clamps_user123", &ChatMessage::user("gw"))
+            .unwrap();
+        store
+            .append("discord_clamps_user123", &ChatMessage::user("ch"))
+            .unwrap();
+        assert_eq!(
+            resolve_session_key("ch:discord_clamps_user123", backend).unwrap(),
+            "discord_clamps_user123"
+        );
+        // gw_ prefix still selects the gateway record.
+        assert_eq!(
+            resolve_session_key("gw_discord_clamps_user123", backend).unwrap(),
+            "gw_discord_clamps_user123"
+        );
+        // Bare key is still ambiguous.
+        assert!(resolve_session_key("discord_clamps_user123", backend).is_err());
+    }
+
+    #[test]
+    fn resolve_session_key_ambiguous_error_includes_ch_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        store.append("gw_test", &ChatMessage::user("gw")).unwrap();
+        store.append("test", &ChatMessage::user("ch")).unwrap();
+        let err = resolve_session_key("test", backend).unwrap_err();
+        assert_eq!(err.gw_candidate, "gw_test");
+        assert_eq!(err.ch_candidate, "ch:test");
+    }
+
+    // ── DELETE handler session_queue serialization tests ─────────────
+
+    #[tokio::test]
+    async fn delete_waits_for_session_queue_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_del_block",
+                &zeroclaw_providers::ChatMessage::user("hello"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_del_block").await.unwrap();
+
+        let response_fut = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("del_block".to_string()),
+        );
+        tokio::pin!(response_fut);
+
+        // DELETE must block behind the active guard
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "DELETE should block behind active session queue guard"
+        );
+        // Session still exists while guard is held
+        assert!(backend.session_exists("gw_del_block"));
+
+        drop(session_guard);
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("DELETE should complete after guard released")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // Session is now deleted
+        assert!(!backend.session_exists("gw_del_block"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_429_when_queue_full() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let mut state = test_state_with_session_backend(config, backend.clone());
+        // max_queue_depth=1: acquire the single slot, DELETE gets QueueFull
+        state.session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(1, 30, 600),
+        );
+        backend
+            .append("gw_del_full", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        // Fill the only slot — second acquire will be QueueFull
+        let _guard = state.session_queue.acquire("gw_del_full").await.unwrap();
+
+        let response =
+            handle_api_session_delete(State(state), HeaderMap::new(), Path("del_full".to_string()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Session was NOT deleted (queue guard not acquired)
+        assert!(backend.session_exists("gw_del_full"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_409_when_active_websocket_holds_session() {
+        // An idle WebSocket holds the cross-transport lease (ws_connections).
+        // DELETE must refuse with 409 rather than deleting a session the socket
+        // could re-append to afterward, recreating a de facto unowned session.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let state = test_state_with_session_backend(config, backend.clone());
+        backend
+            .append("gw_del_ws", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        // Simulate an active WebSocket lease on this session key.
+        state
+            .ws_connections
+            .lock()
+            .insert("gw_del_ws".to_string(), 1);
+
+        let response =
+            handle_api_session_delete(State(state), HeaderMap::new(), Path("del_ws".to_string()))
+                .await
+                .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "DELETE must be refused while an active WebSocket holds the session lease"
+        );
+        assert!(
+            backend.session_exists("gw_del_ws"),
+            "the session must survive a refused DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_returns_409_when_queue_times_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let mut state = test_state_with_session_backend(config, backend.clone());
+        // lock_timeout_secs=0: acquire times out immediately
+        state.session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(8, 0, 600),
+        );
+        backend
+            .append(
+                "gw_del_timeout",
+                &zeroclaw_providers::ChatMessage::user("hi"),
+            )
+            .unwrap();
+        // Hold the guard so the DELETE's acquire will time out
+        let _guard = state.session_queue.acquire("gw_del_timeout").await.unwrap();
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("del_timeout".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // Session was NOT deleted (timeout → fail-closed)
+        assert!(backend.session_exists("gw_del_timeout"));
+    }
+
+    #[tokio::test]
+    async fn resolve_session_key_ambiguous_returns_409_on_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_discord_clamps_user123",
+                &ChatMessage::user("gateway-msg"),
+            )
+            .unwrap();
+        backend
+            .append("discord_clamps_user123", &ChatMessage::user("channel-msg"))
+            .unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        // DELETE with ambiguous key → 409
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("discord_clamps_user123".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Both sessions still exist (nothing was deleted)
+        assert!(backend.session_exists("gw_discord_clamps_user123"));
+        assert!(backend.session_exists("discord_clamps_user123"));
+
+        // Using the full gw_ key (identity escape hatch) succeeds
+        let state2 = test_state_with_session_backend(
+            zeroclaw_config::schema::Config {
+                data_dir: tmp.path().join("workspace"),
+                config_path: tmp.path().join("config.toml"),
+                ..Default::default()
+            },
+            backend.clone(),
+        );
+        let response2 = handle_api_session_delete(
+            State(state2),
+            HeaderMap::new(),
+            Path("gw_discord_clamps_user123".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response2.status(), StatusCode::OK);
+        assert!(!backend.session_exists("gw_discord_clamps_user123"));
+        assert!(backend.session_exists("discord_clamps_user123"));
+    }
+
+    // ── DELETE handler cancel_token tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn delete_success_removes_cancel_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append("gw_del_ok", &zeroclaw_providers::ChatMessage::user("hello"))
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        // Insert a cancel token that the DELETE handler should remove after
+        // acquiring the session queue and confirming no WebSocket lease.
+        state.cancel_tokens.lock().insert(
+            "gw_del_ok".to_string(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        // No ws_connections entry — the session is not held by a WebSocket.
+
+        let response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("del_ok".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state.cancel_tokens.lock().contains_key("gw_del_ok"),
+            "cancel token should be removed on successful DELETE"
+        );
+        assert!(!backend.session_exists("gw_del_ok"));
+    }
+
+    #[tokio::test]
+    async fn delete_blocks_behind_active_turn_then_returns_409() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_del_busy",
+                &zeroclaw_providers::ChatMessage::user("hello"),
+            )
+            .unwrap();
+        let mut state = test_state_with_session_backend(config, backend.clone());
+        // Short queue timeout so the concurrent DELETE fails fast.
+        state.session_queue = std::sync::Arc::new(
+            zeroclaw_infra::session_queue::SessionActorQueue::new(8, 1, 600),
+        );
+        // Pre-insert a cancel token to verify it survives the timeout.
+        state.cancel_tokens.lock().insert(
+            "gw_del_busy".to_string(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        // Simulate an active WebSocket lease.
+        state
+            .ws_connections
+            .lock()
+            .insert("gw_del_busy".to_string(), 1);
+
+        // Pre-acquire the session queue guard to simulate an active turn.
+        let guard = state.session_queue.acquire("gw_del_busy").await.unwrap();
+
+        // Spawn a concurrent DELETE — it will block on the queue and then time out.
+        let state_for_handler = state.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            handle_api_session_delete(
+                State(state_for_handler),
+                HeaderMap::new(),
+                Path("del_busy".to_string()),
+            )
+            .await
+            .into_response()
+        });
+
+        let response = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("spawned task should complete within timeout")
+            .expect("DELETE should not panic");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "DELETE should return 409 when queue timeout occurs"
+        );
+        assert!(
+            state.cancel_tokens.lock().contains_key("gw_del_busy"),
+            "cancel token must be preserved when DELETE times out — zero side effects"
+        );
+
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn delete_409_preserves_cancel_token_when_ws_holds_lease() {
+        // DELETE must return 409 and preserve ALL state — including the cancel
+        // token — when a WebSocket holds the cross-transport lease. The handler
+        // must never reach the token-removal step (Step 3) because it rejects
+        // at the WebSocket check (Step 2) with zero side effects.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let state = test_state_with_session_backend(config, backend.clone());
+        backend
+            .append("gw_del_ws2", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        // Pre-insert a cancel token that must survive the rejected DELETE.
+        state.cancel_tokens.lock().insert(
+            "gw_del_ws2".to_string(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        // Simulate an active WebSocket lease on this session key.
+        state
+            .ws_connections
+            .lock()
+            .insert("gw_del_ws2".to_string(), 1);
+
+        let response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("del_ws2".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            state.cancel_tokens.lock().contains_key("gw_del_ws2"),
+            "cancel token must be preserved — zero side effects on 409"
+        );
+        assert!(
+            backend.session_exists("gw_del_ws2"),
+            "session must survive a refused DELETE"
+        );
     }
 }

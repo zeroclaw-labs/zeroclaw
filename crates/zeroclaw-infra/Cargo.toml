@@ -11,6 +11,7 @@ zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 anyhow = "1.0"
+fs4 = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
 portable-atomic = "1"

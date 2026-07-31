@@ -16,5 +16,18 @@ pub async fn handle_command(command: crate::MigrateCommands, config: &Config) ->
             dry_run,
             reindex,
         } => migrate_openclaw_memory(config, source, dry_run, reindex).await,
+        #[cfg(feature = "agent-runtime")]
+        crate::MigrateCommands::SessionOwnership {
+            list,
+            claim,
+            agent_alias,
+            yes,
+        } => crate::commands::migrate_session_ownership::handle(
+            list,
+            claim,
+            agent_alias,
+            yes,
+            config,
+        ),
     }
 }

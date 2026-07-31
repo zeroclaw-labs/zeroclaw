@@ -6,6 +6,8 @@ mod config_schema;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
+#[cfg(feature = "agent-runtime")]
+mod migrate_session_ownership_cli;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;

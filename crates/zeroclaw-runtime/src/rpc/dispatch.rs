@@ -325,6 +325,27 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
+/// Reject a caller-supplied session id that is not canonical.
+///
+/// Every RPC method that keys the chat backend derives `rpc_{session_id}`, and
+/// the JSONL store sanitizes that into a filename — so `alpha.beta` and
+/// `alpha/beta` would collapse onto the same transcript/ownership record while
+/// the caller sees two distinct ids. Enforcing canonicality on *every* entry
+/// point that accepts a caller id keeps the persistence key injective (matching
+/// the HTTP/WS gates) and keeps the read/state/delete probes from ever
+/// addressing a collided key. Auto-generated UUIDs are always canonical, so
+/// only explicit ids are affected.
+fn ensure_canonical_session_id(session_id: &str) -> Result<(), JsonRpcError> {
+    if zeroclaw_api::session_keys::is_canonical_session_key(session_id) {
+        Ok(())
+    } else {
+        Err(rpc_err(
+            INVALID_PARAMS,
+            "session_id must contain only [A-Za-z0-9_-] and be non-empty",
+        ))
+    }
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -1012,6 +1033,13 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        // Reject noncanonical caller-supplied session ids before any backend
+        // keying (see ensure_canonical_session_id). Auto-generated UUIDs are
+        // always canonical, so this only affects explicit ids.
+        if resuming {
+            ensure_canonical_session_id(&session_id)?;
+        }
+
         let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
@@ -1302,8 +1330,57 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let session_key = format!("rpc_{session_id}");
-                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    let stored = backend.load(&session_key);
+                    // Atomically claim ownership before loading history. A
+                    // caller-controlled session id must not be able to
+                    // reassign an existing session's owner and then read
+                    // another agent's transcript.
+                    let mut stored: Option<Vec<ChatMessage>> = None;
+
+                    match backend.claim_session_agent_alias(&session_key, &req.agent_alias) {
+                        Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed) => {}
+                        Ok(zeroclaw_infra::session_backend::ClaimOutcome::Conflict(owner)) => {
+                            if let Some(ref hooks) = self.ctx.hooks {
+                                hooks.fire_session_end(&session_id, "rpc").await;
+                            }
+                            self.ctx.sessions.remove(&session_id).await;
+                            return Err(rpc_err(
+                                INVALID_PARAMS,
+                                format!(
+                                    "Session belongs to agent '{owner}', not '{}'",
+                                    req.agent_alias
+                                ),
+                            ));
+                        }
+                        // Backend without ownership tracking: reject non-empty
+                        // sessions to prevent cross-agent transcript exposure;
+                        // accept empty ones (graceful degradation, same as
+                        // HTTP and WebSocket paths).
+                        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                            let msgs = backend.load(&session_key);
+                            if !msgs.is_empty() {
+                                if let Some(ref hooks) = self.ctx.hooks {
+                                    hooks.fire_session_end(&session_id, "rpc").await;
+                                }
+                                self.ctx.sessions.remove(&session_id).await;
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    "Cannot resume session: backend does not track agent ownership",
+                                ));
+                            }
+                            stored = Some(msgs);
+                        }
+                        Err(e) => {
+                            if let Some(ref hooks) = self.ctx.hooks {
+                                hooks.fire_session_end(&session_id, "rpc").await;
+                            }
+                            self.ctx.sessions.remove(&session_id).await;
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Failed to claim session ownership: {e}"),
+                            ));
+                        }
+                    }
+                    let stored = stored.unwrap_or_else(|| backend.load(&session_key));
                     if !stored.is_empty() {
                         let seed_event = self
                             .ctx
@@ -1612,6 +1689,7 @@ impl RpcDispatcher {
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let sid = &req.session_id;
 
         if req.prompt.trim().is_empty() && req.attachments.is_empty() {
@@ -2276,6 +2354,7 @@ impl RpcDispatcher {
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let backend = self
             .ctx
             .session_backend
@@ -2357,6 +2436,7 @@ impl RpcDispatcher {
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let backend = self
             .ctx
             .session_backend
@@ -2391,6 +2471,7 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -7978,6 +8059,272 @@ mod tests {
             "Chat session must stamp its agent_alias in session_backend (got: {:?})",
             entry.agent_alias
         );
+    }
+
+    /// A caller-controlled RPC session id must not reassign an existing chat
+    /// session's owner. Pre-own `rpc_{sid}` for one agent, then resume with a
+    /// different alias: the atomic claim must Conflict → INVALID_PARAMS, and
+    /// the prior transcript must NOT be loaded into a live session for the
+    /// second agent.
+    #[tokio::test]
+    async fn chat_session_new_resume_rejects_agent_alias_mismatch() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // The Chat resume path constructs the agent BEFORE the ownership claim,
+        // so the second alias must be a real, constructible agent — otherwise
+        // the test would fail at agent construction (INTERNAL_ERROR) instead of
+        // the claim conflict (INVALID_PARAMS) we mean to exercise.
+        let second = zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            model_provider: "openai.test-provider".into(),
+            risk_profile: "test-profile".into(),
+            ..Default::default()
+        };
+        config.agents.insert("other-agent".to_string(), second);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "chat-alias-mismatch-001";
+        let key = format!("rpc_{sid}");
+        // Pre-existing owner + transcript recorded by the first agent.
+        chat_backend
+            .set_session_agent_alias(&key, "test-agent")
+            .expect("seed owner");
+        chat_backend
+            .append(
+                &key,
+                &zeroclaw_providers::ChatMessage::user("secret history"),
+            )
+            .expect("seed history");
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "other-agent",
+                "session_id": sid,
+            }))
+            .await;
+
+        let err = resumed.expect_err("chat session/new must reject a cross-agent resume");
+        assert_eq!(
+            err.code, INVALID_PARAMS,
+            "cross-agent resume must be rejected at the ownership claim, not elsewhere"
+        );
+        // Ownership is unchanged and the transcript is preserved for the owner.
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            Some("test-agent".to_string()),
+            "a rejected resume must not reassign ownership"
+        );
+        assert!(
+            !chat_backend.load(&key).is_empty(),
+            "the original transcript must be preserved"
+        );
+        // The rejected resume must not leave a live session bound to the
+        // second agent (the claim fires before history is seeded).
+        assert!(
+            sessions.get_agent(sid).await.is_none()
+                || sessions.get_agent_alias(sid).await.as_deref() != Some("other-agent"),
+            "a rejected mismatched resume must not expose the transcript to the second agent"
+        );
+    }
+
+    /// A `session/new` for a non-empty session must be rejected when the
+    /// backend returns `Unsupported` for `claim_session_agent_alias`,
+    /// because without ownership tracking a caller-controlled session id
+    /// could access another agent's transcript.
+    #[tokio::test]
+    async fn rpc_rejects_nonempty_session_when_claim_unsupported() {
+        use std::sync::Arc;
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        struct MockBackend {
+            messages: Vec<ChatMessage>,
+        }
+
+        impl SessionBackend for MockBackend {
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                self.messages.clone()
+            }
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn claim_session_agent_alias(
+                &self,
+                _session_key: &str,
+                _agent_alias: &str,
+            ) -> std::io::Result<ClaimOutcome> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "claim not supported by mock",
+                ))
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mock = Arc::new(MockBackend {
+            messages: vec![ChatMessage::user("hi")],
+        });
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(mock as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "test-session",
+                "chat_mode": "chat",
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "session/new must reject non-empty session when backend does not track ownership",
+        );
+        assert_eq!(
+            err.code, INVALID_PARAMS,
+            "rejection code must be INVALID_PARAMS"
+        );
+        assert!(
+            err.message.contains("does not track agent ownership"),
+            "error message must mention ownership tracking: {}",
+            err.message
+        );
+    }
+
+    /// A `session/new` for an empty session must be accepted even when the
+    /// backend returns `Unsupported` for `claim_session_agent_alias`,
+    /// as graceful degradation (no cross-agent exposure risk for empty
+    /// sessions).
+    #[tokio::test]
+    async fn rpc_accepts_empty_session_when_claim_unsupported() {
+        use std::sync::Arc;
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        struct MockBackend {
+            messages: Vec<ChatMessage>,
+        }
+
+        impl SessionBackend for MockBackend {
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                self.messages.clone()
+            }
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn claim_session_agent_alias(
+                &self,
+                _session_key: &str,
+                _agent_alias: &str,
+            ) -> std::io::Result<ClaimOutcome> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "claim not supported by mock",
+                ))
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mock = Arc::new(MockBackend {
+            messages: Vec::new(),
+        });
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(mock as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "test-session",
+                "chat_mode": "chat",
+            }))
+            .await;
+
+        let value = result
+            .expect("session/new must accept empty session when backend does not track ownership");
+        let message_count = value["message_count"].as_u64().unwrap();
+        assert_eq!(
+            message_count, 0,
+            "empty session must report message_count 0"
+        );
+    }
+
+    /// Noncanonical caller-supplied session ids must be rejected before any
+    /// backend keying, mirroring the HTTP/WS canonical gate — otherwise
+    /// `alpha.beta` and `alpha/beta` would collapse to the same `rpc_*`
+    /// transcript once the JSONL store sanitizes the filename.
+    #[tokio::test]
+    async fn chat_session_new_rejects_noncanonical_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        for bad in ["alpha.beta", "alpha/beta", "has space", ""] {
+            let result = dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": bad,
+                }))
+                .await;
+            let err = result.expect_err(&format!(
+                "noncanonical session_id {bad:?} must be rejected, not accepted"
+            ));
+            assert_eq!(
+                err.code, INVALID_PARAMS,
+                "noncanonical session_id {bad:?} must be rejected"
+            );
+        }
+        // No ghost transcripts were created for the rejected ids.
+        assert!(
+            chat_backend.list_sessions().is_empty(),
+            "rejected noncanonical ids must not create any session rows"
+        );
+
+        // The read path (session/messages) must reject the same ids, so a
+        // caller cannot probe a collided key even though no such session can
+        // be created — closing the injectivity surface on both sides.
+        for bad in ["alpha.beta", "alpha/beta"] {
+            let result = dispatcher
+                .handle_session_messages_for_test(&json!({ "session_id": bad }))
+                .await;
+            let err = result.expect_err(&format!(
+                "session/messages must reject noncanonical id {bad:?}"
+            ));
+            assert_eq!(err.code, INVALID_PARAMS);
+        }
     }
 
     // ── config/set secret-routing ────────────────────────────────

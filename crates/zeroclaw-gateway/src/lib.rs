@@ -3,6 +3,15 @@
     clippy::useless_format,
     clippy::collapsible_if
 )]
+#![recursion_limit = "256"]
+//! Axum-based HTTP gateway with proper HTTP/1.1 compliance, body limits, and timeouts.
+//!
+//! This module replaces the raw TCP implementation with axum for:
+//! - Proper HTTP/1.1 parsing and compliance
+//! - Content-Length validation (handled by hyper)
+//! - Request body size limits (64KB max)
+//! - Request timeouts (30s) to prevent slow-loris attacks
+//! - Header sanitization (handled by axum/hyper)
 
 #[cfg(feature = "a2a")]
 pub mod a2a;
@@ -10,6 +19,7 @@ pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
+pub mod api_chat_completions;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_pairing;
@@ -41,6 +51,7 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+pub mod turn_runner;
 pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
@@ -64,12 +75,6 @@ use axum::body::Bytes;
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
-#[cfg(any(
-    feature = "channel-linq",
-    feature = "channel-nextcloud",
-    feature = "channel-wati",
-    feature = "channel-whatsapp-cloud"
-))]
 use axum::response::Response;
 use axum::{
     Router,
@@ -166,6 +171,43 @@ pub fn gateway_long_running_request_timeout_secs(
 ) -> u64 {
     cfg.long_running_request_timeout_secs
 }
+
+/// Rewrites a 413 Payload Too Large response from `RequestBodyLimitLayer`
+/// into a `ChatError` JSON body, matching the format of all other error
+/// responses from the chat completions endpoint.
+async fn rewrite_payload_too_large(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    let body = Json(crate::api_chat_completions::ErrorResponse {
+        error: crate::api_chat_completions::ErrorDetail {
+            message: format!("Request body exceeds the {} byte limit", MAX_BODY_SIZE),
+            error_type: "payload_too_large".to_string(),
+            code: None,
+            param: None,
+            status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        },
+    });
+    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
+}
+
+/// Build the `/v1/chat/completions` router. When `enabled` is false the route
+/// is absent (requests 404); the body-size limit and 413 rewrite always apply.
+/// Shared by production wiring and tests so neither drifts from the other.
+fn build_chat_completions_router(state: AppState, enabled: bool) -> Router {
+    let router: Router<AppState> = if enabled {
+        Router::new().route(
+            "/v1/chat/completions",
+            post(api_chat_completions::handle_chat_completions),
+        )
+    } else {
+        Router::new()
+    };
+    router
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(axum::middleware::map_response(rewrite_payload_too_large))
+}
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -244,6 +286,26 @@ struct SlidingWindowRateLimiter {
     requests: Mutex<(HashMap<String, Vec<Instant>>, Instant)>,
 }
 
+/// Real rate-limit state for one `decide()` call, computed under the limiter
+/// lock so response headers reflect the actual sliding window rather than
+/// fabricated values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    /// Whether this request is permitted.
+    pub allowed: bool,
+    /// Configured requests-per-window ceiling.
+    pub limit: u32,
+    /// Requests still permitted in the current window *after* accounting for
+    /// this one (0 when the window is full / this request was blocked).
+    pub remaining: u32,
+    /// Seconds until the window frees at least one slot, measured from the
+    /// oldest in-window request. Callers convert to an absolute reset time
+    /// with `Utc::now() + reset_after_secs` (the monotonic `Instant` clock
+    /// cannot be turned into a Unix timestamp directly). Falls back to the
+    /// full window when there are no tracked requests.
+    pub reset_after_secs: u64,
+}
+
 impl SlidingWindowRateLimiter {
     fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
         Self {
@@ -262,12 +324,26 @@ impl SlidingWindowRateLimiter {
     }
 
     fn allow(&self, key: &str) -> bool {
+        self.decide(key).allowed
+    }
+
+    /// Evaluate the sliding window for `key` and return the real decision.
+    /// When allowed, records this request. Computed entirely under the lock so
+    /// `remaining`/`reset_after_secs` are consistent with the recorded state.
+    fn decide(&self, key: &str) -> RateLimitDecision {
         if self.limit_per_window == 0 {
-            return true;
+            // Unlimited: always allowed, no meaningful window.
+            return RateLimitDecision {
+                allowed: true,
+                limit: 0,
+                remaining: 0,
+                reset_after_secs: 0,
+            };
         }
 
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
+        let window_secs = self.window.as_secs();
 
         let mut guard = self.requests.lock();
         let (requests, last_sweep) = &mut *guard;
@@ -297,12 +373,35 @@ impl SlidingWindowRateLimiter {
         let entry = requests.entry(key.to_owned()).or_default();
         entry.retain(|instant| *instant > cutoff);
 
-        if entry.len() >= self.limit_per_window as usize {
-            return false;
+        // reset_after: when the oldest in-window request ages out, a slot frees.
+        let reset_after_secs = entry
+            .first()
+            .map(|oldest| {
+                let elapsed = now.saturating_duration_since(*oldest);
+                self.window.saturating_sub(elapsed).as_secs_f64().ceil() as u64
+            })
+            .unwrap_or(window_secs);
+
+        let limit = self.limit_per_window;
+        if entry.len() >= limit as usize {
+            // Blocked: no slot available; remaining stays 0.
+            return RateLimitDecision {
+                allowed: false,
+                limit,
+                remaining: 0,
+                reset_after_secs,
+            };
         }
 
         entry.push(now);
-        true
+        // `entry.len()` now includes this request; remaining is what's left.
+        let remaining = limit.saturating_sub(entry.len() as u32);
+        RateLimitDecision {
+            allowed: true,
+            limit,
+            remaining,
+            reset_after_secs,
+        }
     }
 }
 
@@ -310,14 +409,21 @@ impl SlidingWindowRateLimiter {
 pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
+    chat: SlidingWindowRateLimiter,
 }
 
 impl GatewayRateLimiter {
-    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(
+        pair_per_minute: u32,
+        webhook_per_minute: u32,
+        chat_per_minute: u32,
+        max_keys: usize,
+    ) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            chat: SlidingWindowRateLimiter::new(chat_per_minute, window, max_keys),
         }
     }
 
@@ -327,6 +433,14 @@ impl GatewayRateLimiter {
 
     fn allow_webhook(&self, key: &str) -> bool {
         self.webhook.allow(key)
+    }
+
+    fn allow_chat(&self, key: &str) -> bool {
+        self.chat.allow(key)
+    }
+
+    fn decide_chat(&self, key: &str) -> RateLimitDecision {
+        self.chat.decide(key)
     }
 }
 
@@ -523,6 +637,10 @@ pub struct AppState {
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
+    /// Semaphore bounding concurrent memory consolidation tasks across all
+    /// sessions. Each permit represents one in-flight `consolidate_turn` call
+    /// (LLM inference + memory-backend writes). Default 4 permits.
+    pub consolidation_semaphore: Arc<tokio::sync::Semaphore>,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
@@ -536,9 +654,14 @@ pub struct AppState {
     /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
     /// current turn. Entries are inserted before each turn and removed after
     /// completion (normal or cancelled).
-    pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
-    >,
+    pub cancel_tokens:
+        Arc<Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Set of session_keys (e.g. `gw_<session_id>`) that currently have an
+    /// open WebSocket connection. Used by the cross-transport guard in
+    /// `/v1/chat/completions` to reject HTTP requests when a WebSocket
+    /// owns the session. Inserted on WS accept, removed on disconnect --
+    /// this is connection-scoped, unlike `cancel_tokens` which is turn-scoped.
+    pub ws_connections: Arc<Mutex<std::collections::HashMap<String, usize>>>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -548,6 +671,31 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+}
+
+impl AppState {
+    /// Extract client key from the request and check the chat completions
+    /// rate limit. Returns `true` if the request is allowed.
+    pub fn check_chat_rate_limit(
+        &self,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> bool {
+        let key = client_key_from_request(peer_addr, headers, self.trust_forwarded_headers);
+        self.rate_limiter.allow_chat(&key)
+    }
+
+    /// Like [`check_chat_rate_limit`], but returns the full
+    /// [`RateLimitDecision`] so the handler can emit real
+    /// `x-ratelimit-remaining` / reset headers instead of fabricated ones.
+    pub fn decide_chat_rate_limit(
+        &self,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> RateLimitDecision {
+        let key = client_key_from_request(peer_addr, headers, self.trust_forwarded_headers);
+        self.rate_limiter.decide_chat(&key)
+    }
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -696,9 +844,6 @@ pub async fn run_gateway(
             },
         }
     };
-    // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
-    // here would clobber the "let the provider decide" intent for models
-    // (e.g. claude-opus-4-7) that reject `temperature`.
     let temperature: Option<f64> = fallback.and_then(|e| e.temperature);
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
@@ -1263,6 +1408,7 @@ pub async fn run_gateway(
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
+        config.gateway.chat_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
     let idempotency_max_keys = normalize_max_keys(
@@ -1589,13 +1735,39 @@ pub async fn run_gateway(
         node_registry,
         mdns_peer_registry,
         session_backend,
-        session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
+        session_queue: {
+            let q = Arc::new(session_queue::SessionActorQueue::new(8, 30, 600));
+            // Evict idle session slots every 60 s to bound memory growth.
+            let reaper_q = Arc::clone(&q);
+            zeroclaw_spawn::spawn!(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // skip immediate fire
+                loop {
+                    interval.tick().await;
+                    let evicted = reaper_q.evict_idle().await;
+                    if evicted > 0 {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"evicted": evicted})),
+                            "session queue idle eviction"
+                        );
+                    }
+                }
+            });
+            q
+        },
+        consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -1981,14 +2153,25 @@ pub async fn run_gateway(
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    // Chat completions route: timeout is handled at the handler level
+    // (tokio::time::timeout produces a ChatError JSON 408) instead of a
+    // middleware-level TimeoutLayer.  413 responses from the body-size
+    // limit middleware are rewritten into ChatError JSON by the
+    // map_response layer.
+    // Disabled by default; set gateway.chat_completions_enabled = true to expose.
+    let chat_completions_router =
+        build_chat_completions_router(state, config.gateway.chat_completions_enabled);
+
+    let inner = inner
+        .merge(long_running_router)
+        .merge(chat_completions_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -4257,6 +4440,161 @@ mod tests {
         assert_eq!(MAX_BODY_SIZE, 65_536);
     }
 
+    // ── 413 Payload Too Large wire-regression tests ────────────────────────────
+
+    /// 413 Payload Too Large rewrites must return the correct status and
+    /// `error.type` of `"payload_too_large"`.
+    #[tokio::test]
+    async fn chat_413_returns_correct_status_and_error_type() {
+        let response = (StatusCode::PAYLOAD_TOO_LARGE, "original body").into_response();
+        let rewritten = rewrite_payload_too_large(response).await;
+        assert_eq!(rewritten.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body_bytes = axum::body::to_bytes(rewritten.into_body(), 1024)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(err["error"]["type"], "payload_too_large");
+    }
+
+    /// The 413 JSON body must contain all fields of a chat completions error:
+    /// non-empty message, type `"payload_too_large"`, null code and param,
+    /// status 413.
+    #[tokio::test]
+    async fn chat_413_body_matches_chat_error_schema() {
+        let response = (StatusCode::PAYLOAD_TOO_LARGE, "original body").into_response();
+        let rewritten = rewrite_payload_too_large(response).await;
+        let body_bytes = axum::body::to_bytes(rewritten.into_body(), 10240)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let error = &err["error"];
+        assert!(
+            error["message"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "error.message must be a non-empty string"
+        );
+        assert_eq!(error["type"], "payload_too_large");
+        assert!(error["code"].is_null(), "error.code must be null");
+        assert!(error["param"].is_null(), "error.param must be null");
+        assert_eq!(error["status"], 413);
+    }
+
+    /// 413 responses must not leak request-id or session-key headers, and
+    /// must set `content-type: application/json`.
+    #[tokio::test]
+    async fn chat_413_omits_request_id_and_session_key_headers() {
+        let response = (StatusCode::PAYLOAD_TOO_LARGE, "original body").into_response();
+        let rewritten = rewrite_payload_too_large(response).await;
+        assert!(
+            !rewritten.headers().contains_key("x-request-id"),
+            "413 response must not contain x-request-id header"
+        );
+        assert!(
+            !rewritten.headers().contains_key("x-session-key"),
+            "413 response must not contain x-session-key header"
+        );
+        assert_eq!(
+            rewritten
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "413 response must have content-type: application/json"
+        );
+    }
+
+    /// Verify the body-size layer in isolation: bodies within the limit pass
+    /// through, bodies one byte over trigger the 413 rewrite. Because
+    /// `RequestBodyLimitLayer` uses `data.len() > remaining` (not `>=`),
+    /// exactly `MAX_BODY_SIZE` bytes are allowed; `MAX_BODY_SIZE + 1` reject.
+    /// A minimal echo handler isolates the layer: the real handler consumes an
+    /// over-limit body as a `JsonRejection` (400), so it cannot observe the
+    /// layer's raw 413 — that path is covered by the `rewrite_payload_too_large`
+    /// unit tests above.
+    #[tokio::test]
+    async fn chat_413_threshold_boundary() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|Json(_body): Json<serde_json::Value>| async { "ok" }),
+            )
+            .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+            .layer(axum::middleware::map_response(rewrite_payload_too_large));
+
+        // Build a valid JSON body of exactly `target_len` bytes by padding the
+        // content string. The JSON wrapper (keys + structure) is 52 bytes.
+        fn json_body(target_len: usize) -> String {
+            let overhead = 52;
+            let pad = target_len.saturating_sub(overhead);
+            format!(
+                r#"{{"model":"t","messages":[{{"role":"u","content":"{}"}}]}}"#,
+                "A".repeat(pad),
+            )
+        }
+
+        // 65535 bytes: within the limit, must NOT be a 413.
+        let body_under = json_body(65535);
+        let request_under = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body_under))
+            .unwrap();
+        let response_under = app.clone().oneshot(request_under).await.unwrap();
+        assert_ne!(
+            response_under.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body under the limit must not produce a 413",
+        );
+
+        // 65537 bytes: one byte over MAX_BODY_SIZE, must trigger 413.
+        let body_over = json_body(65537);
+        let request_over = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body_over))
+            .unwrap();
+        let response_over = app.oneshot(request_over).await.unwrap();
+        assert_eq!(
+            response_over.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body one byte over the limit must produce a 413"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_route_absent_when_disabled() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        let app = build_chat_completions_router(state, false);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"zeroclaw/default","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "route must be absent when chat_completions_enabled is false"
+        );
+    }
+
     #[test]
     fn security_timeout_default_is_30_seconds() {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
@@ -4428,7 +4766,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -4463,10 +4801,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: registry,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5057,7 +5397,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5092,10 +5432,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5145,7 +5487,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5180,10 +5522,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5202,7 +5546,7 @@ mod tests {
 
     #[test]
     fn gateway_rate_limiter_blocks_after_limit() {
-        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        let limiter = GatewayRateLimiter::new(2, 2, 2, 100);
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
@@ -5740,7 +6084,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5775,10 +6119,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5846,7 +6192,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -5881,10 +6227,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5967,7 +6315,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6002,10 +6350,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6068,7 +6418,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6103,10 +6453,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6188,7 +6540,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6223,10 +6575,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6274,7 +6628,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6309,10 +6663,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6365,7 +6721,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6400,10 +6756,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6463,7 +6821,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6498,10 +6856,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6559,7 +6919,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6592,10 +6952,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6711,7 +7073,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -6755,10 +7117,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
@@ -7110,7 +7474,7 @@ mod tests {
 
     #[test]
     fn gateway_rate_limiter_pair_and_webhook_are_independent() {
-        let limiter = GatewayRateLimiter::new(2, 3, 100);
+        let limiter = GatewayRateLimiter::new(2, 3, 2, 100);
 
         // Exhaust pair limit
         assert!(limiter.allow_pair("ip-1"));
@@ -7166,6 +7530,65 @@ mod tests {
     }
 
     #[test]
+    fn decide_reports_monotonically_decreasing_remaining() {
+        let limiter = SlidingWindowRateLimiter::new(3, Duration::from_secs(60), 100);
+        let d1 = limiter.decide("ip-1");
+        assert!(d1.allowed);
+        assert_eq!(d1.limit, 3);
+        assert_eq!(d1.remaining, 2, "after first request, two slots remain");
+
+        let d2 = limiter.decide("ip-1");
+        assert!(d2.allowed);
+        assert_eq!(d2.remaining, 1);
+
+        let d3 = limiter.decide("ip-1");
+        assert!(d3.allowed);
+        assert_eq!(d3.remaining, 0, "third request consumes the last slot");
+    }
+
+    #[test]
+    fn decide_reports_zero_remaining_and_reset_when_blocked() {
+        let limiter = SlidingWindowRateLimiter::new(2, Duration::from_secs(60), 100);
+        assert!(limiter.decide("ip-1").allowed);
+        assert!(limiter.decide("ip-1").allowed);
+
+        let blocked = limiter.decide("ip-1");
+        assert!(
+            !blocked.allowed,
+            "third request over a limit of two is blocked"
+        );
+        assert_eq!(blocked.remaining, 0);
+        // Reset is measured from the oldest in-window request, so it is at most
+        // the full window and strictly positive right after filling the window.
+        assert!(blocked.reset_after_secs > 0);
+        assert!(blocked.reset_after_secs <= 60);
+    }
+
+    #[test]
+    fn decide_reset_is_based_on_oldest_request_not_reset_each_call() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 100);
+        let first = limiter.decide("ip-1");
+        // A later call must not push the reset back to a full window; it should
+        // track the SAME oldest request, so reset_after is <= the first's.
+        let second = limiter.decide("ip-1");
+        assert!(
+            second.reset_after_secs <= first.reset_after_secs,
+            "reset must not be reset to a full window on every request \
+             (first={}, second={})",
+            first.reset_after_secs,
+            second.reset_after_secs
+        );
+    }
+
+    #[test]
+    fn decide_unlimited_when_limit_zero() {
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60), 100);
+        let d = limiter.decide("ip-1");
+        assert!(d.allowed);
+        assert_eq!(d.limit, 0);
+    }
+
+    #[test]
     fn idempotency_store_concurrent_access_safe() {
         use std::sync::Arc;
 
@@ -7204,6 +7627,29 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn reset_after_secs_rounds_up_for_subsecond_remainder() {
+        let limiter = SlidingWindowRateLimiter::new(2, Duration::from_secs(2), 100);
+        // Fill the first slot.
+        assert!(limiter.decide("test").allowed);
+
+        // Wait just over 1 second.
+        std::thread::sleep(Duration::from_millis(1001));
+
+        // Fill the second slot — window is now full.
+        assert!(limiter.decide("test").allowed);
+
+        // Third request is blocked; ~0.999 s remain, which must round up to 1.
+        let blocked = limiter.decide("test");
+        assert!(!blocked.allowed);
+        assert_eq!(blocked.remaining, 0);
+        assert!(
+            blocked.reset_after_secs >= 1,
+            "reset_after_secs must round up fractional seconds (got {})",
+            blocked.reset_after_secs
+        );
     }
 
     #[test]
@@ -7554,7 +8000,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -7589,10 +8035,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7641,7 +8089,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -7676,10 +8124,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7802,7 +8252,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
@@ -7837,10 +8287,12 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            consolidation_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            ws_connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8104,6 +8556,251 @@ mod tests {
              persist; have {:?}",
             state.pairing.tokens()
         );
+    }
+
+    /// The canonical-session-key gate fires inside `handle_chat_completions`
+    /// (not in middleware or an extractor), so it must be exercised through the
+    /// real handler: a noncanonical `x-session-key` header is rejected before
+    /// the handler touches any state.
+    #[tokio::test]
+    async fn handler_rejects_noncanonical_session_key_header() {
+        use crate::api_chat_completions;
+        use axum::Json;
+        use axum::extract::{ConnectInfo, State};
+        use axum::http::HeaderMap;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        for bad in ["alpha.beta", "alpha/beta"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-key", bad.parse().unwrap());
+            let body = serde_json::json!({
+                "model": "zeroclaw/default",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false,
+            });
+            let request: api_chat_completions::ChatCompletionRequest =
+                serde_json::from_value(body).unwrap();
+
+            let resp = api_chat_completions::handle_chat_completions(
+                State(state.clone()),
+                ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))),
+                headers,
+                Ok(Json(request)),
+            )
+            .await;
+
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "noncanonical session key {bad:?} must be rejected by the handler gate"
+            );
+            let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let err: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(err["error"]["type"], "invalid_request_error");
+            assert!(
+                err["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Session key must contain only"),
+                "the gate message must mention session key validity, got {:?}",
+                err["error"]["message"]
+            );
+        }
+    }
+
+    /// Handler integration: inject a failing session backend and assert the
+    /// handler returns 500 `server_error` from the ownership-claim leg, that
+    /// it actually reached the claim (`set_alias_calls == 1`), and — via a
+    /// mock provider server that counts requests — that it never called the
+    /// model provider or appended any message. This is the real trust
+    /// boundary: ownership must be claimed before any provider call or
+    /// persistence. Previously `#[ignore]`d (so required CI skipped it); the
+    /// agent-construction plumbing (provider uri/key + bare-alias profile
+    /// refs) is now wired so construction succeeds and the turn reaches the
+    /// ownership leg.
+    #[tokio::test]
+    async fn handler_rejects_request_when_ownership_write_fails() {
+        use crate::api_chat_completions;
+        use axum::extract::{ConnectInfo, State};
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_api::model_provider::ChatMessage;
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        struct FailingBackend {
+            set_alias_calls: AtomicUsize,
+            append_calls: AtomicUsize,
+        }
+        impl SessionBackend for FailingBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                vec![]
+            }
+            fn append(&self, _key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
+                self.append_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                vec![]
+            }
+            fn set_session_agent_alias(&self, _key: &str, _alias: &str) -> std::io::Result<()> {
+                self.set_alias_calls.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "ownership persist failure (test injection)",
+                ))
+            }
+            fn get_session_agent_alias(&self, _key: &str) -> std::io::Result<Option<String>> {
+                Ok(None)
+            }
+            fn claim_session_agent_alias(
+                &self,
+                _session_key: &str,
+                agent_alias: &str,
+            ) -> std::io::Result<zeroclaw_infra::session_backend::ClaimOutcome> {
+                match self.get_session_agent_alias(_session_key)? {
+                    Some(existing) if existing != agent_alias => Ok(
+                        zeroclaw_infra::session_backend::ClaimOutcome::Conflict(existing),
+                    ),
+                    Some(_) => Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed),
+                    None => {
+                        self.set_session_agent_alias(_session_key, agent_alias)?;
+                        Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed)
+                    }
+                }
+            }
+        }
+
+        // Mock provider server that counts inbound requests. The ownership
+        // claim must fail BEFORE any provider call, so this stays at 0.
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls_srv = provider_calls.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let provider_calls = provider_calls_srv.clone();
+                async move {
+                    provider_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "choices": [{ "message": { "content": "should never be reached" } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let backend = Arc::new(FailingBackend {
+            set_alias_calls: AtomicUsize::new(0),
+            append_calls: AtomicUsize::new(0),
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = admin_paircode_state(&tmp, false, false);
+        state.session_backend = Some(backend.clone() as Arc<dyn SessionBackend>);
+
+        let agent_cfg = AliasedAgentConfig {
+            memory: AgentMemoryConfig {
+                backend: MemoryBackendKind::None,
+            },
+            // model_provider uses the dotted `<type>.<alias>` form; risk/runtime
+            // profiles are keyed by BARE alias (see risk_profile_for_agent /
+            // runtime_profile_for_agent) — the earlier `risk_profiles.mock`
+            // prefix never resolved, failing agent construction.
+            model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.mock"),
+            risk_profile: zeroclaw_config::providers::RiskProfileRef::new("mock"),
+            runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("mock"),
+            ..AliasedAgentConfig::default()
+        };
+        {
+            let mut cfg = state.config.write();
+            cfg.agents.insert("default".to_string(), agent_cfg);
+            cfg.providers.models.custom.insert(
+                "mock".into(),
+                zeroclaw_config::schema::CustomModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        model: Some("test-model".into()),
+                        // The custom slot has no family-default endpoint, so a
+                        // uri (and key) are required for construction.
+                        api_key: Some("test-key".into()),
+                        uri: Some(format!("http://{mock_addr}")),
+                        ..Default::default()
+                    },
+                },
+            );
+            cfg.risk_profiles.insert(
+                "mock".into(),
+                zeroclaw_config::schema::RiskProfileConfig::default(),
+            );
+            cfg.runtime_profiles.insert(
+                "mock".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig::default(),
+            );
+        }
+
+        let body = serde_json::json!({
+            "model": "zeroclaw/default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+        });
+        let request: api_chat_completions::ChatCompletionRequest =
+            serde_json::from_value(body).unwrap();
+
+        let resp = api_chat_completions::handle_chat_completions(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))),
+            HeaderMap::new(),
+            Ok(Json(request)),
+        )
+        .await;
+
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "expected 500, got {status}, body: {}",
+            std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>")
+        );
+        assert_eq!(
+            err["error"]["type"], "server_error",
+            "ownership-claim failure maps to server_error (see try_claim_session_ownership)"
+        );
+
+        assert_eq!(
+            backend.set_alias_calls.load(Ordering::SeqCst),
+            1,
+            "expected handler to reach the ownership claim (0 means agent construction or a prereq failed)"
+        );
+        assert_eq!(
+            backend.append_calls.load(Ordering::SeqCst),
+            0,
+            "no messages must be persisted when the ownership claim fails"
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "the model provider must never be called when the ownership claim fails"
+        );
+
+        server_handle.abort();
     }
 }
 

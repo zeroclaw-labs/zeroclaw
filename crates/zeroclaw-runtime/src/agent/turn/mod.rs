@@ -75,6 +75,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::TOOL_SPECS_OVERRIDE;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -525,12 +526,29 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let mut iteration_tool_specs = build_iteration_tool_specs(
-            model_provider,
-            tools_registry,
-            excluded_tools,
-            activated_tools,
-        )?;
+        // When TOOL_SPECS_OVERRIDE is Some, the turn is request-scoped
+        // (chat-completions `tools` parameter). On default paths the override
+        // is absent — the full agent tool set is available, and the per-iteration
+        // rebuild (including activated/deferred tools) runs normally.
+        let is_request_scoped = TOOL_SPECS_OVERRIDE
+            .try_with(|ov| ov.is_some())
+            .ok()
+            .unwrap_or(false);
+
+        let mut iteration_tool_specs =
+            match TOOL_SPECS_OVERRIDE.try_with(Clone::clone).ok().flatten() {
+                Some(override_specs) => IterationToolSpecs::from_override(
+                    model_provider,
+                    &override_specs,
+                    excluded_tools,
+                ),
+                None => build_iteration_tool_specs(
+                    model_provider,
+                    tools_registry,
+                    excluded_tools,
+                    activated_tools,
+                )?,
+            };
 
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
             config,
@@ -558,6 +576,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let IterationToolSpecs {
             ref tool_specs,
             use_native_tools,
+            ref known_tool_names,
             ..
         } = iteration_tool_specs;
 
@@ -899,6 +918,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        // Gate: only active on request-scoped (chat-completions) paths.
+        // Default paths keep the full agent tool set available.
+        let request_tool_names: Option<&std::collections::HashSet<String>> = if is_request_scoped {
+            Some(known_tool_names)
+        } else {
+            None
+        };
+
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -909,6 +936,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        request_tool_names,
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -927,6 +955,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        request_tool_names,
                     };
                     execute_tools_sequential(
                         &executable_calls,
