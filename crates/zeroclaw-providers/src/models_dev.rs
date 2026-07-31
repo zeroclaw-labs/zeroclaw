@@ -29,7 +29,7 @@ struct ModelEntry {
     /// models.dev `modalities` block. Carries the per-model `input` and
     /// `output` modality lists (e.g. `input: ["text", "image"]`). Previously
     /// dropped during deserialization; per-model vision support is now
-    /// resolved through this field. See #8733.
+    /// resolved through this field.
     #[serde(default)]
     modalities: Option<Modalities>,
 }
