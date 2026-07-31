@@ -11694,8 +11694,9 @@ mod tests {
         // directly, rather than exercising each in isolation: the actual
         // `zeroclaw-runtime::doctor::persist_model_cache` writer (what
         // `zeroclaw models refresh` calls), then this crate's actual
-        // `load_cached_model_preview` reader (what `/model` calls) — for a
-        // dotted provider ref and a custom, non-default agent workspace.
+        // `load_cached_model_preview` reader (what `/model` calls) — for an
+        // undotted provider ref (canonicalized to `openrouter.default` on both
+        // sides) and a custom, non-default agent workspace.
         let data_root = TempDir::new().unwrap();
         let custom_agent_workspace = TempDir::new().unwrap();
 
@@ -11707,7 +11708,7 @@ mod tests {
 
         zeroclaw_runtime::doctor::persist_model_cache(
             &config,
-            "custom.local",
+            "openrouter",
             &["model-a".to_string(), "model-b".to_string()],
         )
         .unwrap();
@@ -11715,7 +11716,7 @@ mod tests {
         let found = load_cached_model_preview(
             data_root.path(),
             custom_agent_workspace.path(),
-            "custom.local",
+            "openrouter",
         );
 
         assert_eq!(
