@@ -704,6 +704,7 @@ async fn build_lark_file_upload_form(
 /// the card after the click so the buttons disappear.
 struct PendingApproval {
     sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    destination: String,
     /// `data.message_id` returned by the send-card POST. Empty string is a
     /// sentinel meaning "card was sent but message_id was missing from the
     /// response" — handler will skip the post-click PATCH in that case.
@@ -2919,6 +2920,7 @@ impl Channel for LarkChannel {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                destination: recipient.to_string(),
                 message_id,
                 tool_name: request.tool_name.clone(),
                 arguments_summary: request.arguments_summary.clone(),
@@ -3453,7 +3455,18 @@ impl LarkChannel {
             }
         };
 
-        let pending = self.pending_approvals.lock().await.remove(approval_id);
+        let responder = event_payload
+            .pointer("/operator/open_id")
+            .or_else(|| event_payload.pointer("/operator/operator_id/open_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let destination = event_payload
+            .pointer("/context/open_chat_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let pending = self
+            .take_pending_approval(approval_id, responder, destination)
+            .await;
         let Some(pending) = pending else {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3494,6 +3507,26 @@ impl LarkChannel {
         }
 
         Ok(())
+    }
+
+    async fn take_pending_approval(
+        &self,
+        approval_id: &str,
+        responder: &str,
+        destination: &str,
+    ) -> Option<PendingApproval> {
+        if responder.is_empty() || destination.is_empty() || !self.is_user_allowed(responder) {
+            return None;
+        }
+
+        let mut pending_approvals = self.pending_approvals.lock().await;
+        let destination_matches = pending_approvals
+            .get(approval_id)
+            .is_some_and(|pending| pending.destination == destination);
+        if !destination_matches {
+            return None;
+        }
+        pending_approvals.remove(approval_id)
     }
 }
 
@@ -3995,7 +4028,7 @@ mod tests {
         Arc::new(move || peers.clone())
     }
 
-    fn make_channel() -> LarkChannel {
+    fn make_channel_with_peers(peers: Vec<String>) -> LarkChannel {
         with_bot_open_id(
             LarkChannel::new(
                 "cli_test_app_id".into(),
@@ -4003,11 +4036,15 @@ mod tests {
                 "test_verification_token".into(),
                 None,
                 "lark_test_alias",
-                resolver_from(vec!["ou_testuser123".into()]),
+                resolver_from(peers),
                 true,
             ),
             "ou_bot",
         )
+    }
+
+    fn make_channel() -> LarkChannel {
+        make_channel_with_peers(vec!["ou_testuser123".into()])
     }
 
     #[test]
@@ -5752,9 +5789,13 @@ mod tests {
         ];
 
         for (name, raw, expected) in fixtures {
-            let ch = make_channel();
             let event: serde_json::Value =
                 serde_json::from_str(raw).unwrap_or_else(|e| panic!("parse {name} fixture: {e}"));
+            let responder = event
+                .pointer("/operator/open_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name} fixture must contain an operator open_id"));
+            let ch = make_channel_with_peers(vec![responder.to_string()]);
             let approval_id = event
                 .pointer("/action/value/approval_id")
                 .and_then(|value| value.as_str())
@@ -5768,6 +5809,11 @@ mod tests {
                 approval_id.to_string(),
                 PendingApproval {
                     sender: tx,
+                    destination: event
+                        .pointer("/context/open_chat_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     message_id: String::new(),
                     tool_name: String::new(),
                     arguments_summary: String::new(),
@@ -5777,8 +5823,9 @@ mod tests {
             ch.handle_card_action_event(&event)
                 .await
                 .unwrap_or_else(|e| panic!("route {name} fixture: {e}"));
-            let result = rx
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
                 .await
+                .unwrap_or_else(|_| panic!("receive {name} decision timed out"))
                 .unwrap_or_else(|e| panic!("receive {name} decision: {e}"));
             assert_eq!(result, expected, "fixture {name}");
         }
@@ -5798,6 +5845,7 @@ mod tests {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                destination: "oc_test_chat".to_string(),
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
@@ -5811,7 +5859,9 @@ mod tests {
                     "type": "callback",
                     "value": { "approval_id": approval_id, "decision": "always" }
                 }]
-            }
+            },
+            "context": { "open_chat_id": "oc_test_chat" },
+            "operator": { "open_id": "ou_testuser123" }
         });
         ch.handle_card_action_event(&event)
             .await
@@ -5884,6 +5934,51 @@ mod tests {
         ch.handle_card_action_event(&event)
             .await
             .expect("unknown approval id should not error");
+    }
+    #[tokio::test]
+    async fn pending_approval_requires_allowed_user_and_origin_chat() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = make_channel();
+        let approval_id = "approval-test".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                destination: "oc_origin".to_string(),
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        for decision in ["approve", "deny", "always"] {
+            let event = serde_json::json!({
+                "action": { "value": { "approval_id": approval_id, "decision": decision } },
+                "context": { "open_chat_id": "oc_origin" },
+                "operator": { "open_id": "ou_other" }
+            });
+            ch.handle_card_action_event(&event).await.unwrap();
+            assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+        }
+
+        let wrong_chat = serde_json::json!({
+            "action": { "value": { "approval_id": approval_id, "decision": "approve" } },
+            "context": { "open_chat_id": "oc_other" },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        ch.handle_card_action_event(&wrong_chat).await.unwrap();
+        assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+
+        let authorized = serde_json::json!({
+            "action": { "value": { "approval_id": approval_id, "decision": "always" } },
+            "context": { "open_chat_id": "oc_origin" },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        ch.handle_card_action_event(&authorized).await.unwrap();
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert!(ch.pending_approvals.lock().await.is_empty());
     }
     async fn mount_lark_token_and_send_mocks(
         mock_server: &wiremock::MockServer,

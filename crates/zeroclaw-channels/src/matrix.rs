@@ -1435,14 +1435,11 @@ mod inbound {
         },
     };
     use serde_json::Value as JsonValue;
-    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
     use crate::transcription::TranscriptionManager;
-    use zeroclaw_api::{
-        channel::{ChannelApprovalResponse, ChannelMessage},
-        media::MediaAttachment,
-    };
+    use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
     use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
     pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1459,8 +1456,7 @@ mod inbound {
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals:
-            Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -1618,19 +1614,25 @@ mod inbound {
         let body = ctx_mod::body_for(&ev.content.msgtype);
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
+        let allowed_peers = (ctx.peer_resolver)();
+        let sender_allowed = allowlist::user_allowed(&allowed_peers, sender);
+        let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
 
-        // Approval reply has highest priority — operator answer must work even
-        // if the room/user filters would otherwise drop the message.
-        if let Some((token, response)) = approval::parse_reply(&body) {
-            let waiter = ctx.pending_approvals.lock().await.remove(&token);
-            if let Some(tx) = waiter {
-                let _ = tx.send(response);
-                return Ok(());
-            }
+        if let Some((token, response)) = approval::parse_reply(&body)
+            && crate::util::resolve_pending_approval(
+                &ctx.pending_approvals,
+                &token,
+                response,
+                sender_allowed && room_allowed,
+                room_id,
+            )
+            .await
+            .suppresses_message()
+        {
+            return Ok(());
         }
 
-        let allowed_peers = (ctx.peer_resolver)();
-        if !allowlist::user_allowed(&allowed_peers, sender) {
+        if !sender_allowed {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1639,7 +1641,7 @@ mod inbound {
             );
             return Ok(());
         }
-        if !allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id) {
+        if !room_allowed {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3211,7 +3213,7 @@ pub struct MatrixChannel {
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<Arc<TranscriptionConfig>>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -3810,6 +3812,10 @@ impl Channel for MatrixChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        let client = self.ensure_client().await?;
+        let destination = client::resolve_room(client, &self.alias_cache, recipient)
+            .await?
+            .to_string();
         let token = approval::generate_token_default();
         let prompt = crate::util::build_approve_deny_approval_prompt(
             &token,
@@ -3818,10 +3824,13 @@ impl Channel for MatrixChannel {
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination,
+            },
+        );
 
         let send_msg = SendMessage::new(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
@@ -4642,6 +4651,97 @@ mod tests {
         use rand::rngs::StdRng;
         use std::collections::HashSet;
         use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        #[tokio::test]
+        async fn pending_approval_requires_allowed_user_and_origin_room() {
+            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVAL".to_string(),
+                crate::util::PendingApproval {
+                    sender: tx,
+                    destination: "!origin:example.invalid".to_string(),
+                },
+            );
+
+            for response in [
+                ChannelApprovalResponse::Approve,
+                ChannelApprovalResponse::Deny,
+                ChannelApprovalResponse::AlwaysApprove,
+            ] {
+                assert_eq!(
+                    crate::util::resolve_pending_approval(
+                        &pending,
+                        "APPROVAL",
+                        response,
+                        super::super::allowlist::user_allowed(
+                            &["@operator:example.invalid".to_string()],
+                            "@other:example.invalid",
+                        ),
+                        "!origin:example.invalid",
+                    )
+                    .await,
+                    crate::util::PendingApprovalResolution::Rejected,
+                );
+                assert!(pending.lock().await.contains_key("APPROVAL"));
+            }
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!other:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(pending.lock().await.contains_key("APPROVAL"));
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::AlwaysApprove,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+            let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVE2".to_string(),
+                crate::util::PendingApproval {
+                    sender: approve_tx,
+                    destination: "!origin:example.invalid".to_string(),
+                },
+            );
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVE2",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        }
 
         #[test]
         fn token_length_and_alphabet() {

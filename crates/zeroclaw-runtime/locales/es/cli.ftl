@@ -970,6 +970,7 @@ channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_comma
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
+channel-telegram-approval-ack-not-accepted = Aprobación no aceptada
 channel-telegram-approval-ack-unknown = Acción desconocida
 channel-discord-approval-btn-allow-once = Permitir una vez
 channel-discord-approval-btn-allow-session = Permitir esta sesión

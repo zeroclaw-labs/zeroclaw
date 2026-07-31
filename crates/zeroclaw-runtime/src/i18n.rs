@@ -1224,6 +1224,7 @@ mod tests {
         "channel-telegram-approval-ack-approved",
         "channel-telegram-approval-ack-always-approved",
         "channel-telegram-approval-ack-denied",
+        "channel-telegram-approval-ack-not-accepted",
         "channel-telegram-approval-ack-unknown",
         "channel-discord-approval-btn-allow-once",
         "channel-discord-approval-btn-allow-session",
@@ -1358,6 +1359,11 @@ mod tests {
                 "Always approved",
             ),
             ("channel-telegram-approval-ack-denied", &[], "Denied"),
+            (
+                "channel-telegram-approval-ack-not-accepted",
+                &[],
+                "Approval not accepted",
+            ),
             (
                 "channel-telegram-approval-ack-unknown",
                 &[],
