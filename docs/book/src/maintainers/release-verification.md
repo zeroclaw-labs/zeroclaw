@@ -1,161 +1,135 @@
 # Release Artifact Verification
 
-ZeroClaw signs all release artifacts using [Sigstore](https://sigstore.dev) keyless signing.
-Signatures are recorded in the [Rekor](https://rekor.sigstore.dev) public transparency log, so no
-private key material is stored anywhere.
+ZeroClaw uses GitHub artifact attestations as the canonical provenance mechanism
+for downloadable release assets. Each successful attestation records the asset
+digest, source commit, and release workflow identity as SLSA v1.0 Build Level 2
+provenance.
 
-## Prerequisites
+Attestation proves where and how an artifact was built. It does not prove that a
+human reviewed the source, that dependencies are safe, or that a maintainer
+account, GitHub-hosted runner, or GitHub control plane was not compromised. See
+[SLSA provenance attestation](../../../security/slsa-provenance.md) for the full
+threat model.
 
-```bash
-# Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/)
-go install github.com/sigstore/cosign/v2/cmd/cosign@latest
-# or via Homebrew
-brew install cosign
-```
+The release workflow currently treats attestations as best-effort Phase A
+output. Check the release notes before relying on verification material; they
+state whether online provenance and the offline archive were produced.
 
----
+## Online verification
 
-## Binary Release Assets
-
-Every `.tar.gz`, `.zip`, and `.dmg` in a ZeroClaw GitHub Release is accompanied by a
-`.bundle` file containing the certificate chain and signature.
-
-### Verify a binary release asset
+Install the [GitHub CLI](https://cli.github.com/), download an asset, and verify
+it against the release workflow and source commit:
 
 ```bash
-# Replace VERSION and TARGET with the appropriate values, e.g.:
-#   VERSION=v1.5.0
-#   TARGET=x86_64-unknown-linux-gnu
+VERSION=vX.Y.Z
+SOURCE_DIGEST=<40-character-release-commit>
+ASSET=zeroclaw-x86_64-unknown-linux-gnu.tar.gz
 
-VERSION=v1.5.0
-TARGET=x86_64-unknown-linux-gnu
-ASSET="zeroclaw-${TARGET}.tar.gz"
-
-# Download the asset and its bundle
 gh release download "$VERSION" --repo zeroclaw-labs/zeroclaw \
-  --pattern "${ASSET}" \
-  --pattern "${ASSET}.bundle"
-
-# Verify (cosign checks the Rekor log automatically)
-cosign verify-blob \
-  --bundle "${ASSET}.bundle" \
-  "${ASSET}"
+  --pattern "$ASSET"
+gh attestation verify "$ASSET" \
+  --repo zeroclaw-labs/zeroclaw \
+  --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+  --source-digest "$SOURCE_DIGEST"
 ```
 
-A successful verification prints:
+Use the full commit shown for the release tag. A successful command prints the
+verified attestation and subject digest. The same command applies to
+`install.sh`, `SHA256SUMS`, both SBOM files, and the verification archive.
 
-```
-Verified OK
-```
+## Offline verification
 
-### Expected certificate identity
+A release produced by the consolidated workflow with complete Phase A output
+publishes one archive named
+`zeroclaw-vX.Y.Z-verification.tar.gz`. It contains:
 
-The signing certificate is issued via GitHub Actions OIDC:
+- one `<artifact>.attestation.jsonl` bundle for each release payload;
+- `trusted_root.jsonl`, the GitHub and Sigstore trusted-root material;
+- `ATTESTATION-BUNDLES.md`, an index of artifact names, SHA-256 digests, and
+  bundle names.
 
-- **OIDC issuer:** `https://token.actions.githubusercontent.com`
-- **Subject:** matches `https://github.com/zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml@refs/tags/vX.Y.Z`
+The archive cannot contain its own attestation without creating a circular
+digest. Bootstrap trust while connected by verifying the archive and final
+checksum file online. Then transfer the artifact, archive, and checksum file to
+the offline environment.
 
-To verify explicitly:
+### Connected staging step
 
 ```bash
-cosign verify-blob \
-  --bundle "${ASSET}.bundle" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "^https://github.com/zeroclaw-labs/zeroclaw/" \
-  "${ASSET}"
+VERSION=vX.Y.Z
+SOURCE_DIGEST=<40-character-release-commit>
+ASSET=zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+VERIFY_ARCHIVE="zeroclaw-${VERSION}-verification.tar.gz"
+
+gh release download "$VERSION" --repo zeroclaw-labs/zeroclaw \
+  --pattern "$ASSET" \
+  --pattern SHA256SUMS \
+  --pattern "$VERIFY_ARCHIVE"
+
+gh attestation verify "$VERIFY_ARCHIVE" \
+  --repo zeroclaw-labs/zeroclaw \
+  --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+  --source-digest "$SOURCE_DIGEST"
+gh attestation verify SHA256SUMS \
+  --repo zeroclaw-labs/zeroclaw \
+  --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+  --source-digest "$SOURCE_DIGEST"
+
+awk -v file="$VERIFY_ARCHIVE" '$2 == file { print }' SHA256SUMS | sha256sum -c -
+mkdir verification
+tar -xzf "$VERIFY_ARCHIVE" -C verification
 ```
 
----
-
-## Container Images
-
-ZeroClaw container images on GHCR are signed by digest using the same keyless model.
-
-### Verify a container image
+Also compare the artifact digest with its row in `SHA256SUMS` before transfer:
 
 ```bash
-IMAGE="ghcr.io/zeroclaw-labs/zeroclaw"
-TAG="v1.5.0"
+awk -v file="$ASSET" '$2 == file { print }' SHA256SUMS | sha256sum -c -
+```
+
+### Disconnected verification step
+
+No network request is required when both `--bundle` and
+`--custom-trusted-root` point to the staged verification material:
+
+```bash
+gh attestation verify "$ASSET" \
+  --repo zeroclaw-labs/zeroclaw \
+  --signer-workflow zeroclaw-labs/zeroclaw/.github/workflows/release-stable-manual.yml \
+  --source-digest "$SOURCE_DIGEST" \
+  --bundle "verification/${ASSET}.attestation.jsonl" \
+  --custom-trusted-root verification/trusted_root.jsonl
+```
+
+`SHA256SUMS` and the verification archive are online-bootstrap metadata and do
+not have bundles inside the archive. All payloads present before the archive is
+built, including `install.sh` and both SBOMs, do.
+
+## SBOMs
+
+Two checksummed and attested SBOM files are published with each release:
+
+| File | Format |
+|---|---|
+| `zeroclaw-vX.Y.Z-sbom.spdx.json` | SPDX JSON |
+| `zeroclaw-vX.Y.Z-sbom.cdx.json` | CycloneDX JSON |
+
+Verify either SBOM with the same online or offline attestation command used for
+a binary asset. Tools such as Syft or Grype can then inspect the verified file.
+
+## Container images
+
+GHCR container images remain signed by digest with cosign. This is independent
+of the GitHub-attestation path for downloadable release assets.
+
+```bash
+IMAGE=ghcr.io/zeroclaw-labs/zeroclaw
+TAG=vX.Y.Z
 
 cosign verify \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp "^https://github.com/zeroclaw-labs/zeroclaw/" \
   "${IMAGE}:${TAG}"
 ```
 
-### Verify by digest (recommended for air-gapped or pinned deployments)
-
-```bash
-# Resolve the digest first
-DIGEST=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" \
-  --format '{{json .Manifest}}' | jq -r '.digest')
-
-cosign verify \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "^https://github.com/zeroclaw-labs/zeroclaw/" \
-  "${IMAGE}@${DIGEST}"
-```
-
----
-
-## SBOM
-
-Two SBOM files are published alongside each release:
-
-| File | Format |
-|------|--------|
-| `zeroclaw-vX.Y.Z-sbom.spdx.json` | SPDX 2.3 (JSON) |
-| `zeroclaw-vX.Y.Z-sbom.cdx.json` | CycloneDX 1.5 (JSON) |
-
-### Download and inspect
-
-```bash
-VERSION=v1.5.0
-
-gh release download "$VERSION" --repo zeroclaw-labs/zeroclaw \
-  --pattern "*-sbom.spdx.json" \
-  --pattern "*-sbom.cdx.json"
-
-# Inspect with syft (https://github.com/anchore/syft)
-syft convert "zeroclaw-${VERSION}-sbom.spdx.json" -o table
-
-# Or with grype for vulnerability scanning
-grype "zeroclaw-${VERSION}-sbom.spdx.json"
-```
-
----
-
-## SLSA Provenance
-
-Starting from the version where SLSA provenance generation became blocking, a
-`.intoto.jsonl` provenance file is published alongside each release. Earlier releases
-may have provenance files generated non-blocking (present but not required for the build
-to succeed).
-
-```bash
-VERSION=v1.5.0
-
-gh release download "$VERSION" --repo zeroclaw-labs/zeroclaw \
-  --pattern "*.intoto.jsonl"
-
-# Verify with slsa-verifier (https://github.com/slsa-framework/slsa-verifier)
-slsa-verifier verify-artifact \
-  --provenance-path "multiple.intoto.jsonl" \
-  --source-uri "github.com/zeroclaw-labs/zeroclaw" \
-  --source-tag "$VERSION" \
-  zeroclaw-x86_64-unknown-linux-gnu.tar.gz
-```
-
----
-
-## Transparency Log Lookup
-
-All signatures are permanently recorded in Rekor. To look up a signature:
-
-```bash
-# By artifact hash
-HASH=$(sha256sum zeroclaw-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
-rekor-cli search --sha "sha256:${HASH}" --rekor_server https://rekor.sigstore.dev
-```
-
-Or browse the Rekor log at: <https://search.sigstore.dev/>
+For pinned deployments, resolve the digest and verify `${IMAGE}@${DIGEST}`
+instead of a mutable tag.
