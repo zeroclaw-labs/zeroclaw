@@ -89,7 +89,7 @@ enum WriterJob {
     Write(Value),
     /// Block until the worker has drained all previously-queued jobs and
     /// completed a `sync_all`. Acks via a rendezvous channel.
-    Flush(SyncSender<()>),
+    Flush(SyncSender<Result<()>>),
 }
 
 /// Set when the worker thread has exited (panic or normal). Used by
@@ -238,7 +238,8 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
                     }
                 }
                 WriterJob::Flush(ack) => {
-                    if let Err(err) = sync_active_file(&state) {
+                    let result = sync_active_file(&state);
+                    if let Err(err) = &result {
                         tracing::warn!(
                             target: "zeroclaw_log_internal",
                             error = ?err,
@@ -247,7 +248,7 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
                     }
                     writes_since_sync = 0;
                     last_sync = Instant::now();
-                    let _ = ack.send(());
+                    let _ = ack.send(result);
                 }
             }
         }
@@ -299,15 +300,12 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Open the active file just long enough to call `sync_all`. Used for
-/// Flush and the periodic sync cadence. Returns Ok(()) when the file
-/// does not exist yet (no writes have happened this run).
+/// Open or create the active file, then call `sync_all`. Used by explicit
+/// flush, periodic sync after successful writes, and best-effort shutdown sync.
 fn sync_active_file(state: &Arc<WorkerState>) -> Result<()> {
-    let file = match open_active_file(state) {
-        Ok(f) => f,
-        Err(_) => return Ok(()),
-    };
-    file.sync_all().context("sync_all log file")?;
+    let file = open_active_file(state)?;
+    file.sync_all()
+        .with_context(|| format!("syncing log file {}", state.policy.path.display()))?;
     Ok(())
 }
 
@@ -348,18 +346,20 @@ pub fn flush_for_test() -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
     };
-    if state.worker_dead.load(Ordering::Acquire) {
-        return Ok(());
-    }
     if !state.policy.storage.is_enabled() {
         return Ok(());
     }
-    let (ack_tx, ack_rx) = sync_channel(0);
-    if state.tx.send(WriterJob::Flush(ack_tx)).is_err() {
-        return Ok(());
+    if state.worker_dead.load(Ordering::Acquire) {
+        anyhow::bail!("log writer worker is not running");
     }
-    let _ = ack_rx.recv();
-    Ok(())
+    let (ack_tx, ack_rx) = sync_channel(0);
+    state
+        .tx
+        .send(WriterJob::Flush(ack_tx))
+        .map_err(|_| anyhow::anyhow!("log writer worker disconnected before flush request"))?;
+    ack_rx
+        .recv()
+        .context("log writer worker disconnected before reporting flush result")?
 }
 
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the
@@ -844,6 +844,126 @@ mod tests {
             ..LogConfig::default()
         };
         init_from_config(&cfg, dir);
+    }
+
+    fn detached_enabled_policy(dir: &Path) -> ResolvedPolicy {
+        install_writer(dir, 10);
+        let policy = current_state().unwrap().policy.clone();
+        shutdown_current_writer();
+        policy
+    }
+
+    fn install_test_state(
+        policy: ResolvedPolicy,
+        tx: SyncSender<WriterJob>,
+        worker_dead: WorkerDead,
+    ) {
+        *slot().write() = Some(Arc::new(WriterState {
+            policy,
+            tx,
+            worker_dead,
+        }));
+    }
+
+    #[test]
+    fn flush_without_writer_is_noop() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        shutdown_current_writer();
+
+        flush_for_test().unwrap();
+    }
+
+    #[test]
+    fn flush_with_disabled_storage_is_noop() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+
+        flush_for_test().unwrap();
+    }
+
+    #[test]
+    fn flush_before_first_write_creates_empty_active_file() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        flush_for_test().unwrap();
+
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "");
+    }
+
+    #[test]
+    fn flush_reports_active_file_open_failure() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        let path = runtime_trace_path().unwrap();
+        fs::create_dir_all(&path).unwrap();
+
+        let err = flush_for_test().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("opening log file"),
+            "flush should report the active-file open failure: {err:#}"
+        );
+    }
+
+    #[test]
+    fn flush_reports_dead_worker() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = detached_enabled_policy(tmp.path());
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        install_test_state(policy, tx, Arc::new(AtomicBool::new(true)));
+
+        let err = flush_for_test().unwrap_err();
+        slot().write().take();
+        assert_eq!(err.to_string(), "log writer worker is not running");
+    }
+
+    #[test]
+    fn flush_reports_request_channel_disconnect() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = detached_enabled_policy(tmp.path());
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        install_test_state(policy, tx, Arc::new(AtomicBool::new(false)));
+
+        let err = flush_for_test().unwrap_err();
+        slot().write().take();
+        assert_eq!(
+            err.to_string(),
+            "log writer worker disconnected before flush request"
+        );
+    }
+
+    #[test]
+    fn flush_reports_result_channel_disconnect() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = detached_enabled_policy(tmp.path());
+        let (tx, rx) = sync_channel(1);
+        install_test_state(policy, tx, Arc::new(AtomicBool::new(false)));
+        let worker = thread::spawn(move || match rx.recv().unwrap() {
+            WriterJob::Flush(ack) => drop(ack),
+            WriterJob::Write(_) => panic!("expected flush job"),
+        });
+
+        let err = flush_for_test().unwrap_err();
+        worker.join().unwrap();
+        slot().write().take();
+        assert_eq!(
+            err.to_string(),
+            "log writer worker disconnected before reporting flush result"
+        );
     }
 
     #[test]
