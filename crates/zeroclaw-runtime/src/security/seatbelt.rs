@@ -92,12 +92,21 @@ impl Sandbox for SeatbeltSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
+        // Preserve the working directory across the rebuild below: replacing
+        // `*cmd` with a fresh `Command::new("sandbox-exec")` would otherwise
+        // silently drop it, so a workspace-relative command (the common case
+        // for tool calls) would resolve against the daemon's actual cwd
+        // instead of the intended per-case workspace.
+        let cwd = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         let mut sandbox_cmd = Command::new("sandbox-exec");
         sandbox_cmd.arg("-f");
         sandbox_cmd.arg(&self.policy_path);
         sandbox_cmd.arg(&program);
         sandbox_cmd.args(&args);
+        if let Some(dir) = cwd {
+            sandbox_cmd.current_dir(dir);
+        }
 
         *cmd = sandbox_cmd;
         Ok(())

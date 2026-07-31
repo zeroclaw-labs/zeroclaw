@@ -119,6 +119,14 @@ impl FirejailSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
+        // Preserve the working directory across the rebuild below: replacing
+        // `*cmd` with a fresh `Command::new("firejail")` would otherwise
+        // silently drop it, so a workspace-relative command (the common case
+        // for tool calls) would resolve against the daemon's actual cwd
+        // instead of the intended per-case workspace. Firejail itself forwards
+        // the launching process's cwd into the sandbox unless overridden, so
+        // setting it on the outer `firejail` command carries through.
+        let cwd = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         // Build firejail wrapper with security flags
         let mut firejail_cmd = Command::new("firejail");
@@ -138,6 +146,9 @@ impl FirejailSandbox {
         // Add the original command
         firejail_cmd.arg(&program);
         firejail_cmd.args(&args);
+        if let Some(dir) = cwd {
+            firejail_cmd.current_dir(dir);
+        }
 
         // Replace the command
         *cmd = firejail_cmd;

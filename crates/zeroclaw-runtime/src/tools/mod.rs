@@ -158,7 +158,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
-use crate::security::{SecurityPolicy, create_sandbox};
+use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
@@ -262,16 +262,44 @@ pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
 }
 
-/// Create the default tool registry with explicit runtime adapter.
+/// Create the default tool registry with explicit runtime adapter. The shell
+/// tool is unsandboxed (`NoopSandbox`); this is the historical, still-default
+/// behavior for existing callers (SOP execution, subagent authoring, tests).
 pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+) -> Vec<Box<dyn Tool>> {
+    default_tools_impl(security, runtime, Arc::new(crate::security::NoopSandbox))
+}
+
+/// Create the default tool registry with the native runtime adapter and an
+/// explicit OS-level sandbox wrapping the shell tool. For callers (like the
+/// eval harness's live mode) that need `default_tools`' registry shape but
+/// with the shell tool actually confined by a real sandbox backend, rather
+/// than the unsandboxed default.
+pub fn default_tools_with_sandbox(
+    security: Arc<SecurityPolicy>,
+    sandbox: Arc<dyn Sandbox>,
+) -> Vec<Box<dyn Tool>> {
+    default_tools_impl(security, Arc::new(NativeRuntime::new()), sandbox)
+}
+
+/// Shared body for `default_tools_with_runtime` and `default_tools_with_sandbox`:
+/// builds the same registry shape (shell, file_read, deliver_file, file_write,
+/// file_edit, glob_search, content_search) behind the same `RateLimitedTool` /
+/// `PathGuardedTool` wrappers, differing only in the sandbox wrapping the shell
+/// tool.
+fn default_tools_impl(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    sandbox: Arc<dyn Sandbox>,
 ) -> Vec<Box<dyn Tool>> {
     let persistent_writes = runtime.has_filesystem_access();
     vec![
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
+                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                    .with_persistent_writes(persistent_writes),
                 security.clone(),
             ),
             security.clone(),

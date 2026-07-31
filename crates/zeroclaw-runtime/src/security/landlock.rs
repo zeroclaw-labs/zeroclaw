@@ -62,6 +62,21 @@ impl LandlockSandbox {
     /// child process via `pre_exec` (see `wrap_command`), so only the
     /// child is restricted — the daemon (parent) process is never affected.
     fn build_ruleset(&self) -> std::io::Result<RulesetCreated> {
+        // Rights granted within the workspace and `/tmp` below: read/write an
+        // existing file, list a directory, create/remove a regular file,
+        // create/remove a directory, and create a symlink. All of these are
+        // in the *handled* set (below), so any of them attempted outside the
+        // explicit `PathBeneath` grants further down (workspace, `/tmp`) is
+        // denied by Landlock, not merely unrestricted.
+        let workspace_write_rights = AccessFs::ReadFile
+            | AccessFs::WriteFile
+            | AccessFs::ReadDir
+            | AccessFs::MakeReg
+            | AccessFs::MakeDir
+            | AccessFs::RemoveFile
+            | AccessFs::RemoveDir
+            | AccessFs::MakeSym;
+
         let mut ruleset = Ruleset::default()
             .handle_access(
                 AccessFs::ReadFile
@@ -74,33 +89,32 @@ impl LandlockSandbox {
                     | AccessFs::MakeFifo
                     | AccessFs::MakeBlock
                     | AccessFs::MakeReg
-                    | AccessFs::MakeSym,
+                    | AccessFs::MakeSym
+                    | AccessFs::MakeDir,
             )
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Allow workspace directory (read/write)
+        // Allow workspace directory: read, write, list, and create/remove
+        // files, directories, and symlinks within it (but not device nodes,
+        // sockets, or FIFOs -- those stay denied everywhere, workspace
+        // included, since no rule below grants them).
         if let Some(ref workspace) = self.workspace_dir
             && workspace.exists()
         {
             let workspace_fd =
                 PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
             ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    workspace_fd,
-                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
-                ))
+                .add_rule(PathBeneath::new(workspace_fd, workspace_write_rights))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
-        // Allow /tmp for general operations
+        // Allow /tmp the same create/remove rights as the workspace (general
+        // scratch-file operations; e.g. `mkstemp`-style temp files).
         let tmp_fd =
             PathFd::new(Path::new("/tmp")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                tmp_fd,
-                AccessFs::ReadFile | AccessFs::WriteFile,
-            ))
+            .add_rule(PathBeneath::new(tmp_fd, workspace_write_rights))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Allow /usr and /bin for executing commands
