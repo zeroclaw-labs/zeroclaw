@@ -70,6 +70,8 @@ pub enum ChannelKind {
     Filesystem,
     Git,
     GmailPush,
+    #[strum(serialize = "ict")]
+    Ict,
     #[strum(serialize = "imessage")]
     IMessage,
     Irc,
