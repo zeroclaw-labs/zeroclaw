@@ -103,6 +103,7 @@
     - [Creating a GitHub App](./channels/git-github-app.md)
     - [Creating a Gitea / Forgejo token (Codeberg)](./channels/git-gitea-forgejo.md)
   - [ACP (Agent Client Protocol)](./channels/acp.md)
+  - [ZEGA AI (Solana Pay)](./integrations/zega-ai.md)
 - [Tools & Extensibility](./tools/overview.md)
   - [MCP (Model Context Protocol)](./tools/mcp.md)
   - [Browser automation](./tools/browser.md)
