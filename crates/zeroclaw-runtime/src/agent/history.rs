@@ -2,14 +2,53 @@ use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
 
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
+/// Default complete-turn retention limit. Prefer passing the config-driven
+/// value via `run_tool_call_loop`; this constant is only used when callers omit
+/// the parameter. The name is retained for config compatibility.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+
+const PROMPT_TOOL_RESULTS_ROLE: &str = "zeroclaw_prompt_tool_results";
+
+pub(crate) fn prompt_tool_results_message(content: impl Into<String>) -> ChatMessage {
+    ChatMessage {
+        role: PROMPT_TOOL_RESULTS_ROLE.to_string(),
+        content: content.into(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn is_prompt_tool_results_message(message: &ChatMessage) -> bool {
+    message.role == PROMPT_TOOL_RESULTS_ROLE
+}
+
+pub(crate) fn normalize_prompt_tool_results_for_provider(
+    messages: &[ChatMessage],
+) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|message| message.role == PROMPT_TOOL_RESULTS_ROLE)
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    Cow::Owned(
+        messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                if message.role == PROMPT_TOOL_RESULTS_ROLE {
+                    message.role = "user".to_string();
+                }
+                message
+            })
+            .collect(),
+    )
+}
 
 static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -307,63 +346,28 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    let has_system = history.first().is_some_and(|m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return;
-    }
-
-    let system_offset = usize::from(has_system);
-
-    // Find the first user message (the framing anchor). If `max_history` is
-    // too small to fit both the anchor and any recent context, fall back to
-    // the old tail-only behaviour rather than producing a degenerate window.
-    let anchor_idx = history
-        .iter()
-        .enumerate()
-        .skip(system_offset)
-        .find(|(_, m)| m.role == "user")
-        .map(|(i, _)| i);
-
-    let messages_before = history.len();
-
-    let dropped_range = match anchor_idx {
-        Some(anchor) if max_history >= 2 => {
-            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
-            let tail_keep = max_history - 1;
-            let tail_start = history.len().saturating_sub(tail_keep);
-            // Middle range to drop: (anchor + 1) .. tail_start.
-            let drop_start = anchor + 1;
-            if tail_start <= drop_start {
-                // Anchor is already inside the tail window — nothing in the
-                // middle to drop. Fall through to plain head-drop below.
-                None
-            } else {
-                Some(drop_start..tail_start)
-            }
-        }
-        _ => None,
-    };
-
-    if let Some(range) = dropped_range {
-        history.drain(range);
-    } else {
-        // No anchor, or `max_history < 2`: original head-drop behaviour.
-        let to_remove = non_system_count - max_history;
-        history.drain(system_offset..system_offset + to_remove);
-    }
-
-    remove_orphaned_tool_messages(history);
-    normalize_system_messages(history);
-
-    let dropped = messages_before.saturating_sub(history.len());
-    if dropped > 0 {
+pub fn trim_history(
+    history: &mut Vec<ChatMessage>,
+    max_history_turns: usize,
+    history_has_trim_breadcrumb: &mut bool,
+) {
+    let result = crate::agent::history_trim::trim_to_recent_turn_count(
+        std::mem::take(history),
+        max_history_turns,
+        *history_has_trim_breadcrumb,
+    );
+    let crate::agent::history_trim::TurnCountTrimResult {
+        history: trimmed_history,
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        trimmed,
+    } = result;
+    let messages_before = trimmed_history.len().saturating_add(dropped_messages);
+    *history = trimmed_history;
+    if trimmed {
+        remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -371,13 +375,12 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
                 .with_attrs(::serde_json::json!({
                     "messages_before": messages_before,
                     "messages_after": history.len(),
-                    "dropped": dropped,
-                    "max_history": max_history,
-                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                    "dropped_messages": dropped_messages,
+                    "dropped_turns": dropped_turns,
+                    "kept_turns": kept_turns,
+                    "max_history_turns": max_history_turns,
                 })),
-            "trim_history fired: middle of conversation dropped. Raise \
-             [runtime_profiles.<name>] max_history_messages or enable \
-             compact_context to avoid silent context loss."
+            "trim_history: dropped oldest whole turns"
         );
     }
 }
@@ -386,13 +389,16 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 pub struct InteractiveSessionState {
     pub version: u32,
     pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub history_has_trim_breadcrumb: bool,
 }
 
 impl InteractiveSessionState {
-    fn from_history(history: &[ChatMessage]) -> Self {
+    fn from_history(history: &[ChatMessage], history_has_trim_breadcrumb: bool) -> Self {
         Self {
             version: 1,
             history: history.to_vec(),
+            history_has_trim_breadcrumb,
         }
     }
 }
@@ -401,8 +407,16 @@ pub fn load_interactive_session_history(
     path: &Path,
     system_prompt: &str,
 ) -> Result<Vec<ChatMessage>> {
+    load_interactive_session_history_with_provenance(path, system_prompt)
+        .map(|(history, _)| history)
+}
+
+pub fn load_interactive_session_history_with_provenance(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
     if !path.exists() {
-        return Ok(vec![ChatMessage::system(system_prompt)]);
+        return Ok((vec![ChatMessage::system(system_prompt)], false));
     }
 
     let raw = std::fs::read_to_string(path)?;
@@ -419,15 +433,26 @@ pub fn load_interactive_session_history(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    Ok(state.history)
+    Ok((state.history, state.history_has_trim_breadcrumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    save_interactive_session_history_with_provenance(path, history, false)
+}
+
+pub fn save_interactive_session_history_with_provenance(
+    path: &Path,
+    history: &[ChatMessage],
+    history_has_trim_breadcrumb: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(
+        history,
+        history_has_trim_breadcrumb,
+    ))?;
     std::fs::write(path, payload)?;
     Ok(())
 }
@@ -435,6 +460,20 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_trim_prompt_tool_results_normalize_only_at_provider_boundary() {
+        let internal = prompt_tool_results_message("[Tool results]\noutput");
+        let messages = vec![internal.clone(), ChatMessage::user("real user")];
+
+        let normalized = normalize_prompt_tool_results_for_provider(&messages);
+
+        assert!(is_prompt_tool_results_message(&internal));
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[0].content, internal.content);
+        assert_eq!(normalized[1].role, "user");
+        assert!(is_prompt_tool_results_message(&messages[0]));
+    }
 
     #[test]
     fn estimate_system_floor_counts_only_system_messages() {

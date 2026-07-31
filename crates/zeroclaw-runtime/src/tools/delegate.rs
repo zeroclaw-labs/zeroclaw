@@ -2669,6 +2669,7 @@ impl DelegateTool {
                     },
                 ),
                 history: &mut history,
+                history_has_trim_breadcrumb: None,
                 channel_name: "delegate",
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),

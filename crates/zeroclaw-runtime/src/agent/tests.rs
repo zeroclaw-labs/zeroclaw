@@ -712,7 +712,7 @@ async fn turn_propagates_provider_error() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn history_trims_after_max_messages() {
+async fn history_trims_after_max_turns() {
     let max_history = 6;
     let mut responses = vec![];
     for _ in 0..max_history + 5 {
@@ -744,16 +744,16 @@ async fn history_trims_after_max_messages() {
         })
         .collect();
 
-    assert!(
-        retained_messages.len() <= max_history,
-        "Retained history length {} exceeds max {}",
-        retained_messages.len(),
-        max_history,
-    );
     let mut turns = retained_messages.chunks_exact(2);
     assert!(
         turns.remainder().is_empty(),
         "history must retain whole turns"
+    );
+    assert!(
+        turns.len() <= max_history,
+        "Retained turn count {} exceeds max {}",
+        turns.len(),
+        max_history,
     );
     assert!(turns.all(|turn| matches!(
         turn,

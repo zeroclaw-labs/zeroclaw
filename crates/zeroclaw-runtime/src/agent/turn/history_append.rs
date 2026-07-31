@@ -1,6 +1,6 @@
 //! History append for one tool round: the assistant message plus per-call
-//! `role=tool` messages (native) or a `[Tool results]` user message (prompt
-//! mode).
+//! `role=tool` messages (native) or an internally tagged `[Tool results]`
+//! message that becomes `role=user` only at the provider boundary (prompt mode).
 
 use zeroclaw_providers::{ChatMessage, ToolCall};
 
@@ -28,7 +28,9 @@ pub(crate) fn append_tool_round_to_history(
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
         } else {
-            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+            history.push(crate::agent::history::prompt_tool_results_message(format!(
+                "[Tool results]\n{tool_results}"
+            )));
         }
     } else {
         // `zip` would drop trailing results on any length divergence,

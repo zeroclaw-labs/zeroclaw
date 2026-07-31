@@ -150,8 +150,10 @@ pub use super::cost::{
 // History management moved to `super::history`.
 pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
-    save_interactive_session_history, trim_history, truncate_tool_result,
+    estimate_history_tokens, load_interactive_session_history,
+    load_interactive_session_history_with_provenance, normalize_system_messages,
+    save_interactive_session_history, save_interactive_session_history_with_provenance,
+    trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -872,6 +874,7 @@ async fn agent_turn_with_sop_reassembly(
         Some(turn_id.clone()),
     );
     let result = run_tool_call_loop(ToolLoop {
+        history_has_trim_breadcrumb: None,
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -1187,7 +1190,7 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_max_history_messages = agent.resolved.max_history_messages;
+        let eff_max_history_turns = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_model_context_window = agent.resolved.model_context_window;
@@ -1878,6 +1881,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
+                                history_has_trim_breadcrumb: None,
                                 exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
@@ -2120,11 +2124,12 @@ pub async fn run(
             )();
 
             // Persistent conversation history across turns
-            let mut history = if let Some(path) = session_state_file.as_deref() {
-                load_interactive_session_history(path, &system_prompt)?
-            } else {
-                vec![ChatMessage::system(&system_prompt)]
-            };
+            let (mut history, mut history_has_trim_breadcrumb) =
+                if let Some(path) = session_state_file.as_deref() {
+                    load_interactive_session_history_with_provenance(path, &system_prompt)?
+                } else {
+                    (vec![ChatMessage::system(&system_prompt)], false)
+                };
 
             loop {
                 print!("> ");
@@ -2190,6 +2195,7 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        history_has_trim_breadcrumb = false;
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2206,7 +2212,11 @@ pub async fn run(
                             println!("Conversation cleared.\n");
                         }
                         if let Some(path) = session_state_file.as_deref() {
-                            save_interactive_session_history(path, &history)?;
+                            save_interactive_session_history_with_provenance(
+                                path,
+                                &history,
+                                history_has_trim_breadcrumb,
+                            )?;
                         }
                         continue;
                     }
@@ -2422,6 +2432,9 @@ pub async fn run(
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
+                                    history_has_trim_breadcrumb: Some(
+                                        &mut history_has_trim_breadcrumb,
+                                    ),
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
@@ -2567,14 +2580,13 @@ pub async fn run(
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
                                     recovery_budget,
+                                    history_has_trim_breadcrumb,
                                 );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
-                                    let system_count =
-                                        trimmed.iter().take_while(|m| m.role == "system").count();
-                                    trimmed.insert(
-                                        system_count,
-                                        crate::agent::history_trim::breadcrumb(),
+                                    crate::agent::history_trim::insert_breadcrumb_deduped(
+                                        &mut trimmed,
+                                        &mut history_has_trim_breadcrumb,
                                     );
                                     history = trimmed;
                                     {
@@ -2725,8 +2737,12 @@ pub async fn run(
                     }
                 }
 
-                // Hard cap as a safety net.
-                trim_history(&mut history, eff_max_history_messages);
+                // Whole-turn retention limit as a safety net.
+                trim_history(
+                    &mut history,
+                    eff_max_history_turns,
+                    &mut history_has_trim_breadcrumb,
+                );
 
                 // Restore base system prompt after the per-turn tool framing
                 // and optional thinking prefix have been applied.
@@ -2737,7 +2753,11 @@ pub async fn run(
                 }
 
                 if let Some(path) = session_state_file.as_deref() {
-                    save_interactive_session_history(path, &history)?;
+                    save_interactive_session_history_with_provenance(
+                        path,
+                        &history,
+                        history_has_trim_breadcrumb,
+                    )?;
                 }
             }
         }
@@ -3693,6 +3713,7 @@ mod tests {
         let path = dir.path().join("session.json");
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
+            history_has_trim_breadcrumb: false,
             history: vec![ChatMessage::user("orphan")],
         })
         .unwrap();
@@ -3711,6 +3732,7 @@ mod tests {
         let path = dir.path().join("session.json");
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
+            history_has_trim_breadcrumb: false,
             history: vec![
                 ChatMessage::system("base system"),
                 ChatMessage::user("first question"),
@@ -3754,6 +3776,7 @@ mod tests {
         let path = dir.path().join("session.json");
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
+            history_has_trim_breadcrumb: false,
             history: vec![
                 ChatMessage::system(""),
                 ChatMessage::user("follow-up"),
@@ -3783,6 +3806,7 @@ mod tests {
         );
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
+            history_has_trim_breadcrumb: false,
             history: vec![
                 ChatMessage::system("sys"),
                 orphan_tool,
@@ -5034,6 +5058,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5111,6 +5136,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5195,6 +5221,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5284,6 +5311,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5358,6 +5386,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5435,6 +5464,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5513,6 +5543,7 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5578,6 +5609,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                history_has_trim_breadcrumb: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -5764,6 +5796,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                history_has_trim_breadcrumb: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -5889,6 +5922,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5966,6 +6000,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6042,6 +6077,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6204,6 +6240,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6266,7 +6303,7 @@ mod tests {
 
         let tool_results_message = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| crate::agent::history::is_prompt_tool_results_message(msg))
             .expect("tool results message should be present");
         let idx_a = tool_results_message
             .content
@@ -6345,6 +6382,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6506,6 +6544,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6624,6 +6663,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6797,6 +6837,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6906,6 +6947,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6999,6 +7041,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7084,6 +7127,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7177,6 +7221,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7273,6 +7318,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7336,7 +7382,7 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| crate::agent::history::is_prompt_tool_results_message(msg))
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
@@ -7374,6 +7420,7 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7432,7 +7479,7 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| crate::agent::history::is_prompt_tool_results_message(msg))
             .expect("tool results message should be present");
         assert!(tool_results.content.contains("hello"));
         assert!(!tool_results.content.contains("Denied by user."));
@@ -7472,6 +7519,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7570,6 +7618,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7636,7 +7685,7 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| crate::agent::history::is_prompt_tool_results_message(msg))
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
@@ -7673,6 +7722,7 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7766,6 +7816,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7829,7 +7880,7 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| crate::agent::history::is_prompt_tool_results_message(msg))
             .expect("prompt-mode tool result payload should be present");
         assert!(
             !tool_results.content.contains("Skipped duplicate tool call"),
@@ -7863,6 +7914,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7962,6 +8014,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8047,6 +8100,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8112,7 +8166,7 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
+                .all(|msg| !crate::agent::history::is_prompt_tool_results_message(msg)),
             "native mode should use role=tool history instead of prompt fallback wrapper"
         );
     }
@@ -8136,6 +8190,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8220,6 +8275,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8302,6 +8358,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8387,6 +8444,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8469,6 +8527,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8550,6 +8609,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8623,6 +8683,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8697,6 +8758,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8771,6 +8833,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8847,6 +8910,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8928,6 +8992,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9021,6 +9086,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9097,6 +9163,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9176,6 +9243,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9253,6 +9321,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9331,6 +9400,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9466,6 +9536,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9552,6 +9623,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9642,6 +9714,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9755,6 +9828,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9873,6 +9947,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9965,6 +10040,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10068,6 +10144,7 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10951,6 +11028,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11056,6 +11134,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11160,6 +11239,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11264,6 +11344,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11423,6 +11504,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11965,7 +12047,7 @@ This is an example, not an invocation."#;
         let original_len = history.len();
         assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
 
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
 
         // System prompt preserved
         assert_eq!(history[0].role, "system");
@@ -11987,7 +12069,7 @@ This is an example, not an invocation."#;
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
         ];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), 3);
     }
 
@@ -12304,7 +12386,7 @@ This is an example, not an invocation."#;
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
     }
 
@@ -12316,7 +12398,7 @@ This is an example, not an invocation."#;
             history.push(ChatMessage::user(format!("user {i}")));
             history.push(ChatMessage::assistant(format!("assistant {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
@@ -12325,7 +12407,7 @@ This is an example, not an invocation."#;
     fn trim_history_with_only_system_prompt() {
         // Recovery: Only system prompt should not be trimmed
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), 1);
     }
 
@@ -12533,14 +12615,14 @@ Let me check the result."#;
     #[test]
     fn trim_history_empty_history() {
         let mut history: Vec<ChatMessage> = vec![];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, &mut false);
         assert!(history.is_empty());
     }
 
     #[test]
     fn trim_history_system_only() {
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, &mut false);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, "system");
     }
@@ -12552,49 +12634,67 @@ Let me check the result."#;
             ChatMessage::user("msg 1"),
             ChatMessage::assistant("reply 1"),
         ];
-        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        trim_history(&mut history, 1, &mut false);
         assert_eq!(history.len(), 3, "should not trim when exactly at limit");
     }
 
     #[test]
-    fn trim_history_keeps_first_user_anchor_and_recent_tail() {
-        // The framing anchor (first user message) must survive trim so the
-        // model doesn't start a turn thinking "Continue" is the first thing
-        // it ever saw. Middle messages are the ones that get dropped.
+    fn trim_history_keeps_latest_complete_turns() {
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user("anchor: what's the task"),
-            ChatMessage::assistant("middle reply 1"),
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old reply"),
             ChatMessage::user("middle user 1"),
             ChatMessage::assistant("middle reply 2"),
             ChatMessage::user("recent user"),
             ChatMessage::assistant("recent reply"),
         ];
-        // max_history = 3 → keep anchor + 2 most recent (=3 non-system).
-        trim_history(&mut history, 3);
+        trim_history(&mut history, 2, &mut false);
         assert_eq!(history[0].role, "system");
-        assert_eq!(
-            history[1].content, "anchor: what's the task",
-            "first user message (framing anchor) must survive"
-        );
+        assert_eq!(history[1].content, "middle user 1");
         let last = history.last().expect("history not empty");
         assert_eq!(last.content, "recent reply", "tail must be preserved");
     }
 
     #[test]
-    fn trim_history_falls_back_to_tail_when_max_history_is_one() {
-        // With max_history=1 there's no room for both anchor and tail; fall
-        // back to plain head-drop so we don't produce a degenerate window.
+    fn trim_history_keeps_newest_incomplete_turn_when_limit_is_one() {
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("anchor"),
             ChatMessage::assistant("middle"),
             ChatMessage::user("recent"),
         ];
-        trim_history(&mut history, 1);
+        trim_history(&mut history, 1, &mut false);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "recent");
+    }
+
+    #[test]
+    fn trim_history_does_not_count_tool_rows_as_turns() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run tools"),
+        ];
+        for index in 0..60 {
+            history.push(ChatMessage::assistant(format!("tool call {index}")));
+            history.push(crate::agent::history::prompt_tool_results_message(format!(
+                "[Tool results]\nresult {index}"
+            )));
+        }
+        history.push(ChatMessage::assistant("done"));
+        let original: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+
+        trim_history(&mut history, 1, &mut false);
+
+        let retained: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(retained, original, "tool rows must remain part of one turn");
     }
 
     #[test]
@@ -13706,7 +13806,7 @@ Let me check the result."#;
             "fixture must overflow the window: got {tokens_before}"
         );
 
-        let result = trim_to_recent_turns(history, recovery_budget);
+        let result = trim_to_recent_turns(history, recovery_budget, false);
         assert!(
             result.trimmed,
             "recovery must trim when the estimate exceeds the 90% budget"
@@ -13750,6 +13850,7 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -13928,6 +14029,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_has_trim_breadcrumb: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14005,6 +14107,7 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14121,6 +14224,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_has_trim_breadcrumb: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -14203,6 +14307,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -14292,6 +14397,7 @@ Let me check the result."#;
         ];
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -15509,6 +15615,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_has_trim_breadcrumb: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {

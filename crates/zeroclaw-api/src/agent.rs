@@ -97,10 +97,11 @@ pub enum TurnEvent {
         timeout_secs: u64,
     },
     /// Older whole turns were dropped to fit either the context token budget or
-    /// the configured message limit. Surfaces a user-visible "context was cut
+    /// the configured turn limit. Surfaces a user-visible "context was cut
     /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
     HistoryTrimmed {
         dropped_messages: usize,
+        dropped_turns: usize,
         kept_turns: usize,
         reason: String,
     },

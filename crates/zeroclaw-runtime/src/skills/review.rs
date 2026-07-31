@@ -116,6 +116,7 @@ pub async fn maybe_run_skill_review(
                     },
                 ),
                 history: &mut review_history,
+                history_has_trim_breadcrumb: None,
                 // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,

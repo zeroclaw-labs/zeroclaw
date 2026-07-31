@@ -3350,6 +3350,8 @@ impl Default for DelegateToolConfig {
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    /// History retention limit. Structured Agent and legacy loop sessions
+    /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
     /// Token budget for preemptive context/history trimming (from runtime profile).
     /// NOT the provider `max_tokens` output limit.
@@ -4007,24 +4009,12 @@ impl Config {
 
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
-    /// An explicit runtime-profile cap remains authoritative. When omitted, the
-    /// cap scales with the profile's tool-iteration limit while preserving the
-    /// legacy floor of 50 messages.
+    /// The legacy config key is named `max_history_messages`, but structured
+    /// Agent sessions enforce it at complete user-turn boundaries. Tool-call
+    /// and tool-result rows therefore do not consume independent slots there.
     #[must_use]
     pub fn effective_structured_max_history_messages(&self, agent_alias: &str) -> usize {
-        if let Some(max_history_messages) = self
-            .runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.max_history_messages)
-        {
-            return max_history_messages;
-        }
-
-        // Each tool iteration adds two structural messages; user/final assistant
-        // add two more, while the floor preserves the structured default cap of 50.
-        self.effective_max_tool_iterations(agent_alias)
-            .saturating_mul(2)
-            .saturating_add(2)
-            .max(50)
+        self.effective_max_history_messages(agent_alias)
     }
 
     #[must_use]
@@ -11795,7 +11785,9 @@ pub struct RuntimeProfileConfig {
     /// Agentic delegate run timeout in seconds. `None` inherits global.
     pub agentic_timeout_secs: Option<u64>,
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
-    /// Maximum conversation history messages retained per session. `None` inherits.
+    /// History retention limit per session. Structured Agent and legacy loop
+    /// sessions count complete turns; channel caches count message rows. `None`
+    /// inherits the default of 50.
     pub max_history_messages: Option<usize>,
     /// Maximum estimated tokens for context before compaction. `None` inherits.
     pub max_context_tokens: Option<usize>,
@@ -25744,7 +25736,7 @@ runtime_profile = "fast"
     }
 
     #[test]
-    async fn runtime_profile_structured_history_cap_scales_when_omitted() {
+    async fn runtime_profile_structured_history_cap_counts_turns_when_omitted() {
         let raw = r#"
 [runtime_profiles.long_turn]
 max_tool_iterations = 100
@@ -25756,7 +25748,7 @@ runtime_profile = "long_turn"
         assert_eq!(parsed.effective_max_history_messages("default"), 50);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            202
+            50
         );
         let agent = parsed.resolved_agent_config("default").unwrap();
         assert_eq!(agent.resolved.max_history_messages, 50);
@@ -25803,7 +25795,7 @@ runtime_profile = "long_turn"
     }
 
     #[test]
-    async fn runtime_profile_history_cap_saturates_at_usize_max() {
+    async fn runtime_profile_tool_iterations_do_not_change_history_turn_limit() {
         let mut config = Config::default();
         config.runtime_profiles.insert(
             "long_turn".to_string(),
@@ -25822,7 +25814,7 @@ runtime_profile = "long_turn"
 
         assert_eq!(
             config.effective_structured_max_history_messages("default"),
-            usize::MAX
+            50
         );
         assert_eq!(config.effective_max_history_messages("default"), 50);
     }

@@ -94,6 +94,9 @@ pub struct ToolLoop<'a> {
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
+    /// Explicit owner-provided provenance for a synthetic leading trim
+    /// breadcrumb. User text is never classified as synthetic by content.
+    pub history_has_trim_breadcrumb: Option<&'a mut bool>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -134,6 +137,7 @@ pub struct ToolLoop<'a> {
 
 async fn enforce_reported_budget(
     history: &mut Vec<ChatMessage>,
+    history_has_trim_breadcrumb: &mut bool,
     reported_input_tokens: usize,
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -147,15 +151,20 @@ async fn enforce_reported_budget(
         taken,
         context_token_budget,
         reported_input_tokens,
+        *history_has_trim_breadcrumb,
     );
     if result.trimmed {
         let mut trimmed = result.history;
-        crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+        crate::agent::history_trim::insert_breadcrumb_deduped(
+            &mut trimmed,
+            history_has_trim_breadcrumb,
+        );
         *history = trimmed;
         if let Some(tx) = event_tx {
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
                     dropped_messages: result.dropped_messages,
+                    dropped_turns: result.dropped_turns,
                     kept_turns: result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 })
@@ -186,6 +195,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
         exec,
         history,
+        history_has_trim_breadcrumb,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -204,6 +214,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         sop_reassembly,
     } = p;
+    let mut local_history_has_trim_breadcrumb = false;
+    let history_has_trim_breadcrumb =
+        history_has_trim_breadcrumb.unwrap_or(&mut local_history_has_trim_breadcrumb);
     let ResolvedAgentExecution {
         model_access:
             ResolvedModelAccess {
@@ -438,11 +451,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 );
             }
             let taken = std::mem::take(history);
-            let result =
-                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            let result = crate::agent::history_trim::trim_to_recent_turns(
+                taken,
+                context_token_budget,
+                *history_has_trim_breadcrumb,
+            );
             if result.trimmed {
                 let mut trimmed = result.history;
-                crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+                crate::agent::history_trim::insert_breadcrumb_deduped(
+                    &mut trimmed,
+                    history_has_trim_breadcrumb,
+                );
                 *history = trimmed;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -481,6 +500,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     let _ = tx
                         .send(TurnEvent::HistoryTrimmed {
                             dropped_messages: result.dropped_messages,
+                            dropped_turns: result.dropped_turns,
                             kept_turns: result.kept_turns,
                             reason: crate::i18n::get_required_cli_string(
                                 "history-trim-reason-budget",
@@ -675,6 +695,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 record_llm_failure(&ctx, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     history,
+                    history_has_trim_breadcrumb,
                     &e,
                     iteration,
                     event_tx.as_ref(),
@@ -847,6 +868,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if let Some(reported) = reported_input_tokens {
                 enforce_reported_budget(
                     history,
+                    history_has_trim_breadcrumb,
                     reported as usize,
                     context_token_budget,
                     event_tx.as_ref(),
@@ -1121,6 +1143,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         if let Some(reported) = reported_input_tokens {
             enforce_reported_budget(
                 history,
+                history_has_trim_breadcrumb,
                 reported as usize,
                 context_token_budget,
                 event_tx.as_ref(),
@@ -1805,6 +1828,7 @@ async fn drive_live_sop_actions(
                             crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
+                                    history_has_trim_breadcrumb: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -2168,7 +2192,16 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let reported = estimated * 4;
         let budget = reported / 2;
-        enforce_reported_budget(&mut history, reported, budget, None, &NoopObserver).await;
+        let mut has_breadcrumb = false;
+        enforce_reported_budget(
+            &mut history,
+            &mut has_breadcrumb,
+            reported,
+            budget,
+            None,
+            &NoopObserver,
+        )
+        .await;
         assert!(
             history.len() < before,
             "over-budget no-tool history must be trimmed before it is persisted"
@@ -2189,7 +2222,16 @@ mod reported_budget_tests {
         ];
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
-        enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
+        let mut has_breadcrumb = false;
+        enforce_reported_budget(
+            &mut history,
+            &mut has_breadcrumb,
+            estimated,
+            estimated * 4,
+            None,
+            &NoopObserver,
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "within-budget history is untouched");
     }
@@ -2198,7 +2240,16 @@ mod reported_budget_tests {
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
-        enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
+        let mut has_breadcrumb = false;
+        enforce_reported_budget(
+            &mut history,
+            &mut has_breadcrumb,
+            usize::MAX,
+            0,
+            None,
+            &NoopObserver,
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
     }

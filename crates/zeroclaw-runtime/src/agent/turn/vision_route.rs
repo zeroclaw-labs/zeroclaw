@@ -124,7 +124,8 @@ pub(crate) async fn prepare_messages_for_iteration(
     // Enforce the universal leading-turn-order invariant before any provider
     // sees the history: strict providers reject a first non-system turn that is
     // not `user`, which context trims and session restores can produce.
-    let mut sanitized = history.to_vec();
+    let mut sanitized =
+        crate::agent::history::normalize_prompt_tool_results_for_provider(history).into_owned();
     ChatMessage::sanitize_leading_turn_order(&mut sanitized);
     if !sanitized.iter().any(ChatMessage::is_user) {
         anyhow::bail!(

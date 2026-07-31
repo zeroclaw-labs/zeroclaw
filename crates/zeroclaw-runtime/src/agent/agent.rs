@@ -249,6 +249,7 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
+    dropped_turns: usize,
     kept_turns: usize,
     reason: String,
 }
@@ -257,6 +258,7 @@ impl HistoryTrimNotice {
     fn into_turn_event(self) -> TurnEvent {
         TurnEvent::HistoryTrimmed {
             dropped_messages: self.dropped_messages,
+            dropped_turns: self.dropped_turns,
             kept_turns: self.kept_turns,
             reason: self.reason,
         }
@@ -284,10 +286,10 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history cap from canonical config at use time.
+    /// Resolves the structured-history turn limit from canonical config at use time.
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -449,7 +451,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -499,7 +501,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_cap_resolver: None,
+            structured_history_turn_limit_resolver: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -579,17 +581,17 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_cap_resolver(
+    fn structured_history_turn_limit_resolver(
         mut self,
         resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Self {
-        self.structured_history_cap_resolver = Some(resolver);
+        self.structured_history_turn_limit_resolver = Some(resolver);
         self
     }
 
     #[cfg(test)]
-    fn structured_max_history_messages(self, max: usize) -> Self {
-        self.structured_history_cap_resolver(Arc::new(move || max))
+    fn structured_max_history_turns(self, max: usize) -> Self {
+        self.structured_history_turn_limit_resolver(Arc::new(move || max))
     }
 
     pub fn multimodal_config(
@@ -845,7 +847,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_cap_resolver: self.structured_history_cap_resolver,
+            structured_history_turn_limit_resolver: self.structured_history_turn_limit_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -1169,7 +1171,7 @@ impl Agent {
     }
 
     /// Hydrate prior chat messages and return a transport event when restoring
-    /// the history enforces the structured message cap.
+    /// the history enforces the structured whole-turn limit.
     pub fn seed_history_with_event(&mut self, messages: &[ChatMessage]) -> Option<TurnEvent> {
         if self.history.is_empty()
             && let Ok(sys) = self.build_system_prompt()
@@ -1195,7 +1197,7 @@ impl Agent {
     }
 
     /// Hydrate structured conversation history and return a transport event
-    /// when restoring the history enforces the structured message cap.
+    /// when restoring the history enforces the structured whole-turn limit.
     pub fn seed_conversation_history_with_event(
         &mut self,
         messages: Vec<ConversationMessage>,
@@ -1637,7 +1639,7 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
-        let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
+        let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
@@ -1669,7 +1671,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_cap_resolver(structured_history_cap_resolver)
+            .structured_history_turn_limit_resolver(structured_history_turn_limit_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
@@ -1718,18 +1720,15 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self
-            .structured_history_cap_resolver
+        let max_turns = self
+            .structured_history_turn_limit_resolver
             .as_ref()
             .map_or(self.config.resolved.max_history_messages, |resolve| {
                 resolve()
             });
-        if self.history.len() <= max {
-            return None;
-        }
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
-            max,
+            max_turns,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
@@ -1765,7 +1764,7 @@ impl Agent {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "max_history_messages": max,
+                        "max_history_turns": max_turns,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -1786,6 +1785,7 @@ impl Agent {
 
         Some(HistoryTrimNotice {
             dropped_messages: result.dropped_messages,
+            dropped_turns: result.dropped_turns,
             kept_turns: result.kept_turns,
             reason,
         })
@@ -2287,6 +2287,7 @@ impl Agent {
 
         let mut loop_history = provider_messages;
         let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+        let mut loop_history_has_trim_breadcrumb = self.history_has_trim_breadcrumb;
 
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2315,6 +2316,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: Some(&mut loop_history_has_trim_breadcrumb),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -2640,6 +2642,7 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let mut loop_history_has_trim_breadcrumb = self.history_has_trim_breadcrumb;
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
@@ -2687,6 +2690,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: Some(&mut loop_history_has_trim_breadcrumb),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -5165,7 +5169,7 @@ mod tests {
     fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
 
         let event = agent.seed_history_with_event(&[
             ChatMessage::user("old request"),
@@ -5205,7 +5209,7 @@ mod tests {
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(4, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         let event = agent.seed_conversation_history_with_event(vec![
             ConversationMessage::Chat(ChatMessage::user("old request")),
             ConversationMessage::Chat(ChatMessage::assistant("old answer")),
@@ -5257,7 +5261,7 @@ mod tests {
     #[test]
     fn clear_history_resets_trim_breadcrumb_provenance_before_reuse() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -5305,7 +5309,7 @@ mod tests {
     #[test]
     fn append_seed_history_preserves_existing_trim_breadcrumb_provenance() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.seed_history(&[
             ChatMessage::user("old user"),
             ChatMessage::assistant("old assistant"),
@@ -5342,7 +5346,7 @@ mod tests {
     #[test]
     fn append_conversation_seed_preserves_existing_trim_breadcrumb_provenance() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.seed_conversation_history(vec![
             ConversationMessage::Chat(ChatMessage::user("old user")),
             ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
@@ -6188,7 +6192,7 @@ mod tests {
         );
     }
 
-    fn trim_history_test_agent(max_history_messages: usize, observer: Arc<dyn Observer>) -> Agent {
+    fn trim_history_test_agent(max_history_turns: usize, observer: Arc<dyn Observer>) -> Agent {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -6212,7 +6216,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .config(agent_config)
-            .structured_max_history_messages(max_history_messages)
+            .structured_max_history_turns(max_history_turns)
             .build()
             .expect("agent builder should succeed with valid config")
     }
@@ -6268,7 +6272,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_history_preserves_single_tool_heavy_turn_over_message_cap() {
+    fn trim_history_does_not_count_tool_rows_as_turns() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_history_test_agent(50, observer);
         agent
@@ -6286,7 +6290,7 @@ mod tests {
         assert_eq!(
             agent.history.len(),
             64,
-            "the newest complete turn must survive even when it exceeds the message cap"
+            "tool rows within one turn must not consume the turn limit"
         );
         assert!(matches!(
             agent.history.first(),
@@ -6319,7 +6323,7 @@ mod tests {
     fn trim_history_drops_old_turn_with_breadcrumb_and_observer_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -6419,7 +6423,7 @@ mod tests {
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_name("test-model".into())
             .config(config)
-            .structured_max_history_messages(2)
+            .structured_max_history_turns(1)
             .build()
             .expect("agent builder should succeed with valid config");
         agent.history = vec![
@@ -6472,7 +6476,7 @@ mod tests {
     async fn trim_history_runs_after_direct_vision_resolution_error() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
 
         let error = agent
@@ -6497,7 +6501,7 @@ mod tests {
     async fn trim_history_runs_after_streamed_vision_resolution_error() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
@@ -6518,7 +6522,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_runs_after_direct_system_prompt_rebuild_error() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
         agent.prompt_builder =
             SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
@@ -6539,7 +6543,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_runs_after_streamed_system_prompt_rebuild_error() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
         agent.prompt_builder =
             SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
@@ -6562,7 +6566,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_runs_before_streamed_round_loop_exhaustion_error() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.config.resolved.max_tool_iterations = 0;
         seed_old_trim_test_turn(&mut agent);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
@@ -6590,7 +6594,7 @@ mod tests {
         while log_rx.try_recv().is_ok() {}
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.agent_alias = "trim-test-agent".into();
         agent.channel_name = "trim-test-channel".into();
         agent.history = vec![
@@ -6649,7 +6653,7 @@ mod tests {
     async fn trim_history_streamed_turn_forwards_single_hard_cap_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -6666,18 +6670,20 @@ mod tests {
         while let Ok(event) = event_rx.try_recv() {
             if let TurnEvent::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
             } = event
             {
-                trim_events.push((dropped_messages, kept_turns, reason));
+                trim_events.push((dropped_messages, dropped_turns, kept_turns, reason));
             }
         }
         assert_eq!(trim_events.len(), 1, "one streamed trim event is required");
         assert_eq!(trim_events[0].0, 2);
         assert_eq!(trim_events[0].1, 1);
+        assert_eq!(trim_events[0].2, 1);
         assert_eq!(
-            trim_events[0].2,
+            trim_events[0].3,
             crate::i18n::get_required_cli_string("history-trim-reason-message-cap")
         );
         assert!(capturing.events.lock().iter().any(|event| matches!(
@@ -6692,7 +6698,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_cancel_before_output_retains_synthesized_newest_turn() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -8254,14 +8260,12 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .config(agent_config)
-            .structured_max_history_messages(4)
+            .structured_max_history_turns(2)
             .build()
             .expect("agent builder should succeed with valid config");
 
-        // Pre-fill the history to exactly max_history_messages non-system
-        // messages so that adding a new user+assistant pair triggers trim.
-        // (system message is added by turn_streamed on first call, so we
-        // push user+assistant pairs to simulate a history-at-limit state.)
+        // Pre-fill history to exactly two complete turns so adding a third
+        // turn triggers the configured whole-turn limit.
         agent
             .history
             .push(ConversationMessage::Chat(ChatMessage::system("sys")));
@@ -8277,9 +8281,7 @@ mod tests {
                     "old reply {i}"
                 ))));
         }
-        // History is now: [system, user0, assistant0, user1, assistant1] = 5
-        // entries. The structured message limit of 4 means trim fires after
-        // adding the new turn.
+        // History is now at the two-turn limit; trim fires after the new turn.
 
         let (event_tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
         let (_, new_msgs) = agent

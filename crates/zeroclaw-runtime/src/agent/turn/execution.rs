@@ -41,7 +41,9 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         } = request;
-        let sanitized = multimodal::sanitize_audio_markers(messages);
+        let normalized =
+            crate::agent::history::normalize_prompt_tool_results_for_provider(messages);
+        let sanitized = multimodal::sanitize_audio_markers(&normalized);
         let request = ChatRequest {
             messages: &sanitized,
             tools,

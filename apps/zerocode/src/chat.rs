@@ -6141,16 +6141,33 @@ impl ChatState {
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
                 ..
             } => {
-                let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
-                let notice = crate::i18n::t_args(
-                    "zc-chat-history-trimmed",
-                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
-                );
+                let notice = if let Some(dropped_turns) = dropped_turns {
+                    let dropped = dropped_turns.to_string();
+                    let dropped_kind = if dropped_turns == 1 { "one" } else { "other" };
+                    let kept_kind = if kept_turns == 1 { "one" } else { "other" };
+                    crate::i18n::t_args(
+                        "zc-chat-history-trimmed",
+                        &[
+                            ("reason", &reason),
+                            ("dropped", &dropped),
+                            ("dropped-kind", dropped_kind),
+                            ("kept", &kept),
+                            ("kept-kind", kept_kind),
+                        ],
+                    )
+                } else {
+                    let dropped = dropped_messages.to_string();
+                    crate::i18n::t_args(
+                        "zc-chat-history-trimmed-legacy",
+                        &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                    )
+                };
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
@@ -8841,6 +8858,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 12,
+            dropped_turns: Some(4),
             kept_turns: 3,
             reason: "history message limit exceeded".to_string(),
         });
@@ -8849,8 +8867,44 @@ mod tests {
             s.entries().last(),
             Some(ChatEntry::SystemMessage(text))
                 if text.contains("history message limit exceeded")
-                    && text.contains("12")
+                    && text.contains("4 older turns dropped")
                     && text.contains("3")
+        ));
+    }
+
+    #[test]
+    fn legacy_history_trimmed_update_reports_message_count() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            dropped_turns: None,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("12 messages dropped") && text.contains("3 turns kept")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_update_uses_singular_turn_copy() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history turn limit exceeded".to_string(),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("1 older turn dropped; 1 turn kept")
         ));
     }
 

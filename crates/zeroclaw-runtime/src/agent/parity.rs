@@ -180,6 +180,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
             },
         ),
         history: &mut history,
+        history_has_trim_breadcrumb: None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,

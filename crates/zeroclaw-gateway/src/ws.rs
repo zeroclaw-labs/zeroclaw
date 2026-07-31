@@ -526,11 +526,12 @@ async fn handle_socket(
     // notifications cannot race setup or be emitted twice.
     if let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
         dropped_messages,
+        dropped_turns,
         kept_turns,
         reason,
     }) = restore_trim_event
     {
-        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let frame = history_trimmed_ws_frame(dropped_messages, dropped_turns, kept_turns, &reason);
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 
@@ -860,12 +861,14 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
 
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
+    dropped_turns: usize,
     kept_turns: usize,
     reason: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "history_trimmed",
         "dropped_messages": dropped_messages,
+        "dropped_turns": dropped_turns,
         "kept_turns": kept_turns,
         "reason": reason,
     })
@@ -1194,9 +1197,15 @@ async fn process_chat_message(
                         }),
                         TurnEvent::HistoryTrimmed {
                             dropped_messages,
+                            dropped_turns,
                             kept_turns,
                             reason,
-                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                        } => history_trimmed_ws_frame(
+                            dropped_messages,
+                            dropped_turns,
+                            kept_turns,
+                            &reason,
+                        ),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
@@ -1493,13 +1502,14 @@ mod tests {
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
-        let frame = history_trimmed_ws_frame(12, 3, "message limit");
+        let frame = history_trimmed_ws_frame(12, 4, 3, "message limit");
 
         assert_eq!(
             frame,
             serde_json::json!({
                 "type": "history_trimmed",
                 "dropped_messages": 12,
+                "dropped_turns": 4,
                 "kept_turns": 3,
                 "reason": "message limit",
             })

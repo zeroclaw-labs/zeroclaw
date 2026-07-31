@@ -7,6 +7,7 @@ import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSessio
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
+import { formatHistoryTrimmedNotice } from '@/lib/historyTrimNotice';
 import {
   initialTurnStreamState,
   reduceTurnFrame,
@@ -409,11 +410,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'history_trimmed': {
-        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-        const content = t('agent.history_trimmed')
-          .replace('{reason}', reason)
-          .replace('{dropped}', String(msg.dropped_messages ?? 0))
-          .replace('{kept}', String(msg.kept_turns ?? 0));
+        const content = formatHistoryTrimmedNotice(msg, t);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,

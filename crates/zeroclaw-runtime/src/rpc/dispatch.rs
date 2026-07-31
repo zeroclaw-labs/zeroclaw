@@ -4747,11 +4747,13 @@ fn notification_for_turn_event(
         },
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
+            dropped_turns: *dropped_turns,
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
@@ -6568,6 +6570,7 @@ mod tests {
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
+            dropped_turns: 4,
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
         };
@@ -6577,6 +6580,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "history_trimmed");
         assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["dropped_turns"], 4);
         assert_eq!(v["params"]["kept_turns"], 1);
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
     }
@@ -7253,6 +7257,7 @@ mod tests {
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 2,
             kept_turns: 1,
             reason: "message cap".into(),
         };
@@ -8699,7 +8704,7 @@ mod tests {
             .runtime_profiles
             .get_mut("reloadable")
             .expect("runtime profile exists")
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
 
         let agent = dispatcher
             .ctx
