@@ -895,6 +895,15 @@ impl EmailChannel {
             .from(self.config.from_address.parse()?)
             .to(message.recipient.parse()?)
             .subject(subject);
+        // Cc/Bcc are email-only and stay empty for every other channel. Each
+        // address is parsed through `lettre`, so a malformed entry fails the
+        // whole send instead of being silently dropped from the envelope.
+        for addr in &message.cc {
+            builder = builder.cc(addr.parse()?);
+        }
+        for addr in &message.bcc {
+            builder = builder.bcc(addr.parse()?);
+        }
         if let Some(ref reply_id) = message.in_reply_to
             && !is_synthetic_email_message_id(reply_id)
         {
@@ -1037,12 +1046,17 @@ impl Channel for EmailChannel {
         let email = self.build_email_message(message)?;
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
+        // Only the primary recipient is named, as before. Cc addresses are
+        // reported as a count so a wider envelope does not turn this INFO line
+        // into a disclosure of the whole participant list, and Bcc is not
+        // described at all.
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Email sent to {} ({} attachments)",
+                "Email sent to {} ({} cc, {} attachments)",
                 message.recipient,
+                message.cc.len(),
                 message.attachments.len()
             )
         );
@@ -1717,6 +1731,103 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.reply_target, "sender@example.invalid");
         assert!(msg.references.is_empty());
+    }
+
+    #[test]
+    fn build_email_message_carries_every_participant_in_one_message() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let message = SendMessage::new("body", "alice@example.invalid").cc(vec![
+            "bob@example.invalid".to_string(),
+            "dave@example.invalid".to_string(),
+        ]);
+
+        let email = channel.build_email_message(&message).unwrap();
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+
+        // The whole point of the change: one MIME message carrying every
+        // participant, not one message per participant.
+        assert!(
+            wire.contains("To: alice@example.invalid"),
+            "primary recipient must stay in To:\n{wire}"
+        );
+        assert!(
+            wire.contains("Cc: bob@example.invalid, dave@example.invalid"),
+            "both Cc recipients must share one Cc header:\n{wire}"
+        );
+    }
+
+    #[test]
+    fn build_email_message_omits_recipient_headers_when_envelope_is_empty() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let message = SendMessage::new("body", "alice@example.invalid");
+
+        let email = channel.build_email_message(&message).unwrap();
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+
+        assert!(wire.contains("To: alice@example.invalid"));
+        assert!(
+            !wire.contains("Cc:"),
+            "a single-recipient send must not gain a Cc header:\n{wire}"
+        );
+        assert!(
+            !wire.contains("Bcc:"),
+            "a single-recipient send must not gain a Bcc header:\n{wire}"
+        );
+    }
+
+    #[test]
+    fn build_email_message_never_discloses_bcc_on_the_wire() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let message = SendMessage::new("body", "alice@example.invalid")
+            .cc(vec!["bob@example.invalid".to_string()])
+            .bcc(vec!["audit@example.invalid".to_string()]);
+
+        let email = channel.build_email_message(&message).unwrap();
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+
+        // `lettre` keeps Bcc out of the serialized headers and carries it only
+        // in the SMTP envelope. If that ever regressed, every To/Cc recipient
+        // would learn the blind-copied address.
+        assert!(
+            !wire.contains("audit@example.invalid"),
+            "Bcc address must not appear in the serialized message:\n{wire}"
+        );
+        assert!(wire.contains("Cc: bob@example.invalid"));
+        assert!(
+            email
+                .envelope()
+                .to()
+                .iter()
+                .any(|addr| addr.to_string().contains("audit@example.invalid")),
+            "Bcc address must still be an SMTP envelope recipient"
+        );
+    }
+
+    #[test]
+    fn build_email_message_rejects_a_malformed_cc_recipient() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let message = SendMessage::new("body", "alice@example.invalid")
+            .cc(vec!["not-an-address".to_string()]);
+
+        // Failing the send is the safe outcome: silently dropping the address
+        // would report success while a participant never received the mail.
+        assert!(channel.build_email_message(&message).is_err());
     }
 
     #[test]

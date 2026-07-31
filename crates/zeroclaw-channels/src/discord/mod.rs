@@ -4409,6 +4409,8 @@ mod tests {
             attachments: Vec::new(),
             in_reply_to: None,
             references: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
             force_voice: false,
             suppress_voice: false,
         };

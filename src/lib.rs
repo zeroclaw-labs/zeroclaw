@@ -312,16 +312,27 @@ platform-specific destination (e.g. a Telegram chat ID).
 
 Examples:
   zeroclaw channel send 'Someone is near your device.' --channel-id telegram --recipient 123456789
-  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321")]
+  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321
+  zeroclaw channel send 'Looping Bob in.' --channel-id email --recipient alice@example.com --cc bob@example.com --subject 'Re: Partnership'")]
     Send {
         /// Message text to send
         message: String,
         /// Channel config name (e.g. telegram, discord, slack)
         #[arg(long)]
         channel_id: String,
-        /// Recipient identifier (platform-specific, e.g. Telegram chat ID)
+        /// Recipient identifier (platform-specific, e.g. Telegram chat ID).
+        /// For email this is the To address.
         #[arg(long)]
         recipient: String,
+        /// Cc recipients (email only). Repeatable or comma-separated.
+        #[arg(long = "cc", value_delimiter = ',')]
+        cc: Vec<String>,
+        /// Bcc recipients (email only). Repeatable or comma-separated.
+        #[arg(long = "bcc", value_delimiter = ',')]
+        bcc: Vec<String>,
+        /// Subject line, overriding the channel default.
+        #[arg(long)]
+        subject: Option<String>,
     },
 }
 

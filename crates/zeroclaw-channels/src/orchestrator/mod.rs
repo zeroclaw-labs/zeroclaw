@@ -8082,18 +8082,59 @@ fn build_channel_by_id(
     }
 }
 
+/// Optional envelope fields for a one-off `channel send`. `cc` and `bcc` are
+/// email-only and rejected for any other channel rather than silently dropped;
+/// `subject` is a pre-existing cross-channel field.
+#[derive(Debug, Default, Clone)]
+pub struct ChannelSendEnvelope {
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: Option<String>,
+}
+
+impl ChannelSendEnvelope {
+    /// Whether any email-only recipient field was supplied.
+    fn has_email_recipients(&self) -> bool {
+        !self.cc.is_empty() || !self.bcc.is_empty()
+    }
+}
+
+/// Reject email-only recipient fields aimed at a channel that addresses a
+/// single peer. Failing loudly matters here: a silently ignored `--cc` is
+/// indistinguishable from a delivered one, so the operator would believe a
+/// participant was included when they were never addressed.
+fn check_envelope_supported(
+    channel_name: &str,
+    channel_id: &str,
+    envelope: &ChannelSendEnvelope,
+) -> Result<()> {
+    if envelope.has_email_recipients() && channel_name != "email" {
+        anyhow::bail!(
+            "--cc/--bcc are email-only; channel '{channel_id}' addresses a single recipient"
+        );
+    }
+    Ok(())
+}
+
 /// Send a one-off message to a configured channel.
 pub async fn send_channel_message(
     config: &Config,
     channel_id: &str,
     recipient: &str,
     message: &str,
+    envelope: ChannelSendEnvelope,
 ) -> Result<()> {
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let channel = build_channel_by_id(&config_arc, channel_id)?;
-    let msg = SendMessage::new(message, recipient);
+    check_envelope_supported(channel.name(), channel_id, &envelope)?;
+    let mut msg = SendMessage::new(message, recipient)
+        .cc(envelope.cc)
+        .bcc(envelope.bcc);
+    if let Some(subject) = envelope.subject {
+        msg = msg.subject(subject);
+    }
     channel
         .send(&msg)
         .await
@@ -25165,6 +25206,38 @@ This is an example JSON object for profile settings."#;
                 .all(|turn| turn.content != "trigger format error"),
             "failed non-retryable turn must not persist in history"
         );
+    }
+
+    #[test]
+    fn email_only_envelope_fields_are_rejected_for_single_recipient_channels() {
+        let envelope = ChannelSendEnvelope {
+            cc: vec!["bob@example.invalid".to_string()],
+            ..Default::default()
+        };
+
+        let err = check_envelope_supported("telegram", "telegram", &envelope)
+            .expect_err("a Cc aimed at Telegram must not be silently dropped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("email-only") && msg.contains("telegram"),
+            "error must name the unsupported flag and channel, got: {msg}"
+        );
+
+        check_envelope_supported("email", "email.work", &envelope)
+            .expect("email accepts Cc recipients");
+    }
+
+    #[test]
+    fn subject_only_envelope_stays_allowed_on_every_channel() {
+        // `subject` predates this change and is a cross-channel field, so it
+        // must not start failing for non-email channels.
+        let envelope = ChannelSendEnvelope {
+            subject: Some("Status".to_string()),
+            ..Default::default()
+        };
+
+        check_envelope_supported("telegram", "telegram", &envelope)
+            .expect("subject alone must not trip the email-only guard");
     }
 
     #[test]

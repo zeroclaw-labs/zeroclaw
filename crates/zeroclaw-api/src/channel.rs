@@ -288,6 +288,12 @@ pub struct SendMessage {
     pub in_reply_to: Option<String>,
     /// RFC 5322 References chain for email replies; ignored by non-email channels.
     pub references: Vec<String>,
+    /// `Cc` recipients. Email-only; ignored by channels with no carbon-copy
+    /// concept.
+    pub cc: Vec<String>,
+    /// `Bcc` recipients. Email-only. These are never disclosed to the `To` or
+    /// `Cc` recipients, so they must not be copied into any other field.
+    pub bcc: Vec<String>,
     /// When `true`, channels that support TTS must not synthesise this
     /// message as a voice note. Use for error notices, system alerts, and
     /// other non-conversational content that should never be voiced.
@@ -360,6 +366,8 @@ impl SendMessage {
             attachments: vec![],
             in_reply_to: None,
             references: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
             suppress_voice: false,
             force_voice: false,
         }
@@ -392,9 +400,24 @@ impl SendMessage {
             attachments: vec![],
             in_reply_to: None,
             references: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
             suppress_voice: false,
             force_voice: false,
         }
+    }
+
+    /// Set the `Cc` recipients (email).
+    pub fn cc(mut self, recipients: impl IntoIterator<Item = String>) -> Self {
+        self.cc = recipients.into_iter().collect();
+        self
+    }
+
+    /// Set the `Bcc` recipients (email). These stay hidden from every other
+    /// recipient.
+    pub fn bcc(mut self, recipients: impl IntoIterator<Item = String>) -> Self {
+        self.bcc = recipients.into_iter().collect();
+        self
     }
 
     /// Set the In-Reply-To header for email threading.
