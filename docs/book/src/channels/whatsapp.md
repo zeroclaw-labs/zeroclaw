@@ -37,7 +37,9 @@ The shared `interrupt_on_new_message` option applies to both Cloud API mode and 
 
 ## Personal and business behavior
 
-For Web mode, `mode = "personal"` applies separate DM, group, and self-chat policies:
+For Web mode, these fields control which chats the bot answers. `dm_policy` and
+`group_policy` apply under **both** `mode = "business"` and `mode = "personal"`.
+`self_chat_mode` is personal-only, because a business account has no self-chat:
 
 | Field | Values | Effect |
 |---|---|---|
@@ -47,13 +49,40 @@ For Web mode, `mode = "personal"` applies separate DM, group, and self-chat poli
 | `mention_only` | `true`, `false` | Requires group messages to mention the bot |
 | `passive_group_context` | `true`, `false` | Records allowed unaddressed group messages as context only |
 
-The default `mode = "business"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = "personal"` with `dm_policy = "allowlist"` and `group_policy = "allowlist"`.
+### Compatibility: business mode now honors these policies
+
+Before this change, `mode = "business"` accepted `dm_policy` and `group_policy`
+and then never read them, so a business-mode bot answered every DM and every
+group regardless of what those keys said. They are now enforced under both
+modes, and the default for both is `allowlist`.
+
+If you run business mode and relied on that permissive behavior, set the openness
+you actually want, explicitly:
+
+```toml
+[channels.whatsapp.myaccount]
+mode = "business"
+dm_policy = "all"      # answer any sender, as before
+group_policy = "all"   # answer any group, as before
+```
+
+To keep a bot restricted instead, leave both at the `allowlist` default and list
+the senders in `allowed_numbers` and the groups in `allowed_groups`. An empty
+`allowed_groups` under `allowlist` or `ignore` now admits no group rather than
+all of them, so open group access has to be requested by name with
+`group_policy = "all"`.
 
 `passive_group_context = true` is opt-in and applies only to WhatsApp Web group chats. Allowed unaddressed group messages are stored in the room-scoped conversation history without starting an agent turn, sending reactions, downloading media, or calling the model. Later addressed messages in the same group can use that passive context.
 
 ## Restricting which groups (`allowed_groups`)
 
-`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+
+An empty list (the default) is not permission. A list that admits everything cannot be told apart from a list nobody configured, so what an empty list means is decided by `group_policy`: under `allowlist` (the default) or `ignore` it admits **no** group, and under `all` it admits every group. Open group access is therefore something a config asks for by name.
+
+A non-empty list keeps its exact-JID filtering under **every** policy, including `all`. `all` widens what an *empty* list means; it does not override a list you wrote.
+
+Because this change can make a channel stop answering groups without erroring, the channel emits a startup warning only when the configuration newly loses group access: business mode with `allowlist` or `ignore`, and personal mode with `allowlist`. Personal mode with `ignore` was already closed, while `all` explicitly preserves open access, so both stay quiet.
 
 Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part - the segment before `@` (`123456789012345`) - compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
 
