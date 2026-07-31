@@ -70,16 +70,20 @@ struct ToolCallRecord {
 
 /// Produce a deterministic hash for a JSON value that is invariant under
 /// object-key reordering.  Implemented as a streaming walker that feeds
-/// structural tags + sorted keys + leaves directly to a [`Hasher`], so no
-/// intermediate owned `serde_json::Value` or canonical `String` is allocated.
+/// structural tags + sorted keys + leaves directly to a [`Hasher`], so the
+/// only allocations along the path are the per-vector key slices plus a
+/// short owned `String` per numeric leaf for the canonical-text form.
 ///
 /// The hot path is `record()` in `collect_tool_results`, called once per
 /// successful tool call inside the agent loop.  The previous implementation
 /// (`canonicalise` + `serde_json::to_string`) deep-cloned the entire args
 /// tree and then serialised it, so on long tool-heavy turns each call added
-/// two transient allocations proportional to the input size; on glibc those
-/// freed chunks stayed in the per-thread arena and RSS grew monotonically
-/// (same family as MCP tool-spec cloning).
+/// one tree-sized `Value` clone plus one proportional owned `String`.
+/// This streaming form avoids both: code review of the walker establishes
+/// the changed allocation shape; the regression suite in this module
+/// (see `streaming_hash_matches_legacy_canonicalise_equivalence`) pins the
+/// resulting equality classes and confirms the walker does not panic on
+/// large inputs. RSS / monotonic-arena behavior is not measured here.
 fn hash_value(value: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
     hash_value_into(value, &mut hasher);
@@ -102,11 +106,16 @@ fn hash_value_into<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
         }
         serde_json::Value::Number(n) => {
             "num".hash(hasher);
-            // serde_json::Number's `Hash` impl covers both integral and float
-            // variants; numbers written in the JSON as `1` and `1.0` are
-            // distinct tokens and therefore distinct under this hasher, which
-            // matches the previous serde_json::to_string behaviour.
-            n.hash(hasher);
+            // Hash the canonical serialized text instead of `Number::hash`.
+            // `serde_json::Number`'s `Hash` impl routes integer `0` and float
+            // `0.0` through `0.0f64.to_bits()` and they collide, and it
+            // normalizes `+0.0` / `-0.0`. The legacy `canonicalise` +
+            // `serde_json::to_string` path produced `"0"`, `"0.0"`, and
+            // `"-0.0"` as distinct tokens; this preserves that equality
+            // classification per the reference oracle.
+            let text = n.to_string();
+            text.len().hash(hasher);
+            text.hash(hasher);
         }
         serde_json::Value::String(s) => {
             "str".hash(hasher);
@@ -879,12 +888,7 @@ mod tests {
                 false,
             ),
             // Different number → not equal
-            (
-                "different-number",
-                json!({"x": 1}),
-                json!({"x": 2}),
-                false,
-            ),
+            ("different-number", json!({"x": 1}), json!({"x": 2}), false),
             // Different boolean → not equal
             (
                 "different-bool",
@@ -907,12 +911,7 @@ mod tests {
                 false,
             ),
             // Array ordering matters → not equal
-            (
-                "array-ordering",
-                json!([1, 2, 3]),
-                json!([3, 2, 1]),
-                false,
-            ),
+            ("array-ordering", json!([1, 2, 3]), json!([3, 2, 1]), false),
             // Large escaped string
             (
                 "large-string",
@@ -925,6 +924,61 @@ mod tests {
                 "large-string-diff",
                 json!({"data": "x".repeat(10000) + "a"}),
                 json!({"data": "x".repeat(10000) + "b"}),
+                false,
+            ),
+            // Numeric equivalence battery. The legacy path serialised
+            // numbers via serde_json, so `0`, `0.0`, and `-0.0` produced
+            // distinct tokens `0`, `0.0`, `-0.0`. The previous
+            // `Number::hash` impl routed integer 0 and float 0.0 through
+            // `0.0f64.to_bits()` (colliding) and normalized `+0.0` /
+            // `-0.0`. After the number-text fix above these cases
+            // reclassify in line with legacy equality.
+            (
+                "int-zero-vs-float-zero",
+                json!({"x": 0}),
+                json!({"x": 0.0}),
+                false,
+            ),
+            (
+                "positive-zero-vs-negative-zero",
+                json!({"x": 0.0}),
+                json!({"x": -0.0}),
+                false,
+            ),
+            (
+                "int-zero-vs-negative-zero",
+                json!({"x": 0}),
+                json!({"x": -0.0}),
+                false,
+            ),
+            (
+                "same-float-text",
+                json!({"x": 1.5}),
+                json!({"x": 1.5}),
+                true,
+            ),
+            (
+                "different-float-text",
+                json!({"x": 1.5}),
+                json!({"x": 2.5}),
+                false,
+            ),
+            (
+                "int-vs-float-one",
+                json!({"x": 1}),
+                json!({"x": 1.0}),
+                false,
+            ),
+            (
+                "int-vs-negative-float",
+                json!({"x": -1}),
+                json!({"x": -1.0}),
+                false,
+            ),
+            (
+                "large-int-vs-large-float",
+                json!({"x": 123456789012345_i64}),
+                json!({"x": 123456789012345.0}),
                 false,
             ),
         ];
