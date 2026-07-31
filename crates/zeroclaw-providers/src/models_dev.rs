@@ -19,7 +19,7 @@ pub(crate) struct ProviderEntry {
 }
 
 #[derive(Debug, Deserialize)]
-#[cfg_attr(not(test), allow(dead_code))] // `modalities` is parsed and exposed via `model_supports_vision`, which only has test callers until #8733 capability-routing lands.
+#[cfg_attr(not(test), allow(dead_code))] // `modalities` is parsed and exposed via `model_supports_vision`, which only has test callers until the capability-routing follow-up lands.
 struct ModelEntry {
     id: String,
     #[serde(default)]
@@ -70,7 +70,7 @@ impl Modalities {
     /// an explicit `"image"` token in `input` flips it on. Malformed
     /// catalog entries (missing `modalities` or empty `input`) yield
     /// `false`; callers fall back to the family default in that case.
-    #[cfg_attr(not(test), allow(dead_code))] // only test callers until #8733 capability-routing lands
+    #[cfg_attr(not(test), allow(dead_code))] // only test callers until the capability-routing follow-up lands
     fn supports_image_input(&self) -> bool {
         self.input.iter().any(|m| m == "image")
     }
@@ -166,10 +166,10 @@ pub async fn list_models_with_context_for(
 /// catalog entry has no `modalities` block at all — callers should fall
 /// back to the family default in that case.
 ///
-/// Pure / sync / no network. This is the parser half of #8733; wiring the
-/// result into `provider.capabilities()` and the orchestrator
-/// `supports_vision()` call site is a separate change tracked on #8733.
-#[cfg_attr(not(test), allow(dead_code))] // only test callers until #8733 capability-routing lands
+/// Pure / sync / no network. This is the parser half of the modalities work;
+/// wiring the result into `provider.capabilities()` and the orchestrator
+/// `supports_vision()` call site is a separate follow-up change.
+#[cfg_attr(not(test), allow(dead_code))] // only test callers until the capability-routing follow-up lands
 pub(crate) fn model_supports_vision(
     catalog: &Catalog,
     provider_key: &str,
