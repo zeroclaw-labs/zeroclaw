@@ -264,8 +264,8 @@ impl Doctor {
 
             // Always show the partial-results banner when a phase timed
             // out, even if the user has selected a specific diagnostic row.
-            // This ensures the incomplete-run state from 8647 stays
-            // persistently visible alongside any selected-row detail.
+            // This ensures the incomplete-run state stays persistently visible
+            // alongside any selected-row detail.
             let is_partial = self
                 .result
                 .as_ref()
@@ -674,12 +674,12 @@ mod tests {
     }
 
     /// Pairs with `doctor_timeout_error_is_generic_not_model_probing_specific`
-    /// above to pin the whole-RPC-vs-structured-probe discrimination from
-    /// review 8647: the "model probing" hint must only surface on the
-    /// structured-partial banner path, never on the error path. A future
-    /// refactor that swaps the discriminator (e.g. on freeform substring
-    /// matching) will be caught here even though `format_doctor_error`'s own
-    /// test would still pass in isolation.
+    /// above to pin the whole-RPC-vs-structured-probe discrimination.
+    /// The "model probing" hint must only surface on the structured-partial
+    /// banner path, never on the error path. A future refactor that swaps
+    /// the discriminator (e.g. on freeform substring matching) will be caught
+    /// here even though `format_doctor_error`'s own test would still pass
+    /// in isolation.
     #[test]
     fn doctor_timeout_discriminator_pins_each_path_to_its_own_text() {
         // Error path — generic daemon-side timeout text only.
@@ -811,8 +811,8 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Tests from 8650 (log_path) — kept verbatim with `timed_out_phase: None`
-    // to match the merged DoctorRunResult shape.
+    // Tests for log_path feature with `timed_out_phase: None` to match the
+    // merged DoctorRunResult shape.
     // ─────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -949,7 +949,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Test from 8647 (partial-results banner) — kept verbatim.
+    // Test for partial-results banner feature.
     // ─────────────────────────────────────────────────────────
 
     /// Render Doctor when `probe_models` has timed out: the partial-results
@@ -982,7 +982,7 @@ mod tests {
 
         let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
 
-        // The banner from 8647 must be discoverable in the detail panel,
+        // The partial-results banner must be discoverable in the detail panel,
         // above the selected entry's `detail_lines` content.
         assert!(
             rendered.contains("⚠ Partial results"),

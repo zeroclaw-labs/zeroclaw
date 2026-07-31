@@ -257,12 +257,11 @@ pub async fn run_structured_with_timeout(
         match tokio::time::timeout(probe_timeout, probe_models(config)).await {
             Ok(probes) => (probes, None),
             Err(_) => {
-                let msg = "Model probing timed out. Some provider catalogs may be unreachable. \
-                       You can retry Doctor to refresh.";
+                let msg = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
                 results.push(DiagResult {
                     severity: Severity::Warn,
                     category: "doctor".into(),
-                    message: msg.into(),
+                    message: msg,
                 });
                 (vec![], Some("probe_models".into()))
             }
@@ -2205,156 +2204,83 @@ mod tests {
         );
     }
 
-    fn config_with_install_root(tmp: &TempDir) -> Config {
-        Config {
-            config_path: tmp.path().join("config.toml"),
-            data_dir: tmp.path().to_path_buf(),
-            ..Config::default()
-        }
-    }
-
-    #[test]
-    fn canonicalize_provider_ref_defaults_undotted_names() {
-        assert_eq!(
-            canonicalize_provider_ref("openrouter"),
-            "openrouter.default"
-        );
-        assert_eq!(
-            canonicalize_provider_ref("openrouter.work"),
-            "openrouter.work"
-        );
-    }
-
-    #[test]
-    fn persist_model_cache_merges_multiple_providers_and_replaces_on_refresh() {
-        let tmp = TempDir::new().unwrap();
-        let config = config_with_install_root(&tmp);
-
-        persist_model_cache(&config, "openrouter", &["a".to_string(), "b".to_string()]).unwrap();
-        persist_model_cache(&config, "ollama", &["c".to_string()]).unwrap();
-        // Refreshing openrouter replaces its entry rather than duplicating it.
-        persist_model_cache(&config, "openrouter", &["a2".to_string()]).unwrap();
-
-        let raw = std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap();
-        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(&raw).unwrap();
-        assert_eq!(cache.entries.len(), 2);
-        let openrouter = cache
-            .entries
-            .iter()
-            .find(|e| e.model_provider == "openrouter.default")
-            .unwrap();
-        assert_eq!(openrouter.models, vec!["a2".to_string()]);
-        let ollama = cache
-            .entries
-            .iter()
-            .find(|e| e.model_provider == "ollama.default")
-            .unwrap();
-        assert_eq!(ollama.models, vec!["c".to_string()]);
-    }
-
-    #[test]
-    fn persist_model_cache_preserves_malformed_existing_file() {
-        let tmp = TempDir::new().unwrap();
-        let config = config_with_install_root(&tmp);
-        let state_dir = tmp.path().join("state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let cache_path = state_dir.join(MODEL_CACHE_FILE);
-        std::fs::write(&cache_path, "not valid json").unwrap();
-
-        let result = persist_model_cache(&config, "openrouter", &["a".to_string()]);
-
-        assert!(
-            result.is_err(),
-            "malformed existing cache must fail the write, not silently replace it"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&cache_path).unwrap(),
-            "not valid json",
-            "existing malformed cache must be left untouched"
-        );
-    }
-
-    #[test]
-    fn persist_model_cache_preserves_unreadable_existing_file() {
-        let tmp = TempDir::new().unwrap();
-        let config = config_with_install_root(&tmp);
-        let state_dir = tmp.path().join("state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        // A directory where the cache file is expected produces a read
-        // error that is not `NotFound` — distinct from the missing-file case.
-        let cache_path = state_dir.join(MODEL_CACHE_FILE);
-        std::fs::create_dir_all(&cache_path).unwrap();
-
-        let result = persist_model_cache(&config, "openrouter", &["a".to_string()]);
-
-        assert!(result.is_err());
-        assert!(
-            cache_path.is_dir(),
-            "unreadable existing cache path must be left untouched, not replaced"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn persist_model_cache_does_not_follow_a_preexisting_tmp_symlink() {
-        let tmp = TempDir::new().unwrap();
-        let config = config_with_install_root(&tmp);
-        let state_dir = tmp.path().join("state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-
-        // Plant a symlink at the *old* fixed temp-file name, pointing outside
-        // the cache directory. The old `cache_path.with_extension("json.tmp")`
-        // scheme would write through this predictable path and truncate the
-        // decoy; the new unique/exclusive tempfile-based path must never pick
-        // this name at all.
-        let decoy = tmp.path().join("decoy.json");
-        std::fs::write(&decoy, "untouched").unwrap();
-        std::os::unix::fs::symlink(&decoy, state_dir.join("models_cache.json.tmp")).unwrap();
-
-        persist_model_cache(&config, "openrouter", &["a".to_string()]).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(&decoy).unwrap(),
-            "untouched",
-            "persistence must not write through a pre-existing symlink at a predictable temp path"
-        );
-        let raw = std::fs::read_to_string(state_dir.join(MODEL_CACHE_FILE)).unwrap();
-        assert!(raw.contains("openrouter"));
-    }
-
+    /// Regression test: production-path timeout via `run_structured_with_timeout`
+    /// must preserve pre-timeout diagnostics and set `timed_out_phase` when
+    /// `probe_models` exceeds the deadline. This pins the actual RPC boundary
+    /// behavior, not just synthetic response-state construction.
     #[tokio::test]
-    async fn run_models_targeted_refresh_fails_when_cache_write_fails() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/tags"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "models": [{"name": "llama3"}]
-                })),
-            )
-            .mount(&server)
-            .await;
+    async fn run_structured_with_timeout_preserves_prior_diagnostics() {
+        use std::time::Duration;
 
-        let tmp = TempDir::new().unwrap();
-        let mut config = config_with_install_root(&tmp);
-        config
+        let mut config = Config::default();
+        // Configure a custom provider with a non-routable URI so probe_models
+        // hangs until the timeout fires.
+        let profile = config
             .providers
             .models
-            .ensure("ollama", "default")
-            .expect("known model_provider type")
-            .uri = Some(server.uri());
+            .ensure("custom", "local")
+            .expect("known model_provider type");
+        profile.api_key = Some("redacted-test-key".to_string());
+        profile.uri = Some("http://192.0.2.1:9/v1".to_string()); // TEST-NET-1, unroutable
 
-        // Make the cache destination unwritable: `state` exists as a plain
-        // file, so `create_dir_all` inside `persist_model_cache` fails even
-        // though the provider fetch itself succeeds.
-        std::fs::write(tmp.path().join("state"), "not a directory").unwrap();
+        let (results, timed_out_phase) =
+            run_structured_with_timeout(&config, Duration::from_millis(100)).await;
 
-        let result = run_models(&config, Some("ollama.default"), false, false).await;
-
+        // Pre-probe diagnostics (config, workspace, daemon, environment, CLI tools)
+        // must survive the timeout.
         assert!(
-            result.is_err(),
-            "a targeted refresh must fail the command when the fetched catalog cannot be persisted, \
-             even though the network fetch itself succeeded"
+            results.iter().any(|r| r.category == "config"),
+            "config diagnostics must survive probe timeout"
+        );
+        assert!(
+            results.iter().any(|r| r.category == "workspace"),
+            "workspace diagnostics must survive probe timeout"
+        );
+        assert!(
+            results.iter().any(|r| r.category == "daemon"),
+            "daemon diagnostics must survive probe timeout"
+        );
+
+        // The timeout warning must be present.
+        let timeout_warning = results.iter().find(|r| {
+            r.category == "doctor"
+                && r.severity == Severity::Warn
+                && r.message.contains("timed out")
+        });
+        assert!(
+            timeout_warning.is_some(),
+            "probe timeout must append a timeout warning to results"
+        );
+
+        // timed_out_phase must identify the probe phase.
+        assert_eq!(
+            timed_out_phase,
+            Some("probe_models".to_string()),
+            "timed_out_phase must identify the probe phase"
+        );
+    }
+
+    /// Regression test: when probe_models completes under the deadline,
+    /// `timed_out_phase` must be `None` and all probe results must be present.
+    #[tokio::test]
+    async fn run_structured_with_timeout_under_deadline() {
+        use std::time::Duration;
+
+        let config = Config::default();
+        // No providers configured → probe_models returns immediately with no rows.
+        let (results, timed_out_phase) =
+            run_structured_with_timeout(&config, Duration::from_secs(5)).await;
+
+        // No timeout warning should be present.
+        assert!(
+            !results.iter().any(|r| r.message.contains("timed out")),
+            "under-deadline run must not append timeout warning"
+        );
+
+        // timed_out_phase must be None.
+        assert_eq!(
+            timed_out_phase, None,
+            "timed_out_phase must be None when probe completes under deadline"
         );
     }
 

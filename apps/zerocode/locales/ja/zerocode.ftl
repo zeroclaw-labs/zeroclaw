@@ -496,3 +496,6 @@ zc-config-footer-action-back-to-skills = スキルに戻る
 zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
 zc-config-field-edit-hint = { $keys } → 押して編集
+
+# Doctor probe timeout warning — shown when model probing times out
+zc-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.

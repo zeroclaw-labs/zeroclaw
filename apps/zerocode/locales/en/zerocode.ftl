@@ -178,6 +178,7 @@ zc-doctor-error-timeout-hint = Model probing against live provider APIs can be s
 zc-doctor-error-daemon-timeout = The doctor check timed out. The daemon may be busy, unreachable, or processing a long-running request. Try again or check daemon connectivity.
 zc-doctor-partial-banner = ⚠ Partial results — model probing timed out
 zc-doctor-partial-hint = Some provider catalogs could not be reached. Results from config, workspace, and daemon checks are shown below. Press the refresh key to retry.
+zc-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.
 
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions
