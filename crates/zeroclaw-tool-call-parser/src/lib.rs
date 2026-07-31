@@ -1629,15 +1629,14 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             .trim_end_matches('/')
             .trim();
         (tool, attrs)
-    } else if let Some(gt_pos) = body.find('>') {
+    } else {
+        let gt_pos = body.find('>')?;
         // GLM shortened: `tool_name>value`
         let tool = body[..gt_pos].trim();
         let value = body[gt_pos + 1..].trim();
         // Strip trailing self-close markers that some models emit
         let value = value.trim_end_matches("/>").trim_end_matches('/').trim();
         (tool, value)
-    } else {
-        return None;
     };
 
     // Validate tool name: must be alphanumeric + underscore only

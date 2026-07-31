@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
     MemoryBackendKind, backend_kind_from_dotted, classify_memory_backend,
-    create_memory_for_migration, create_memory_with_storage_and_routes,
+    create_memory_for_migration, create_memory_from_config,
 };
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -60,14 +60,7 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         bail!("Memory backend is 'none' (disabled). No entries to manage.");
     }
-    create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.embedding_routes,
-        config.resolve_active_storage(),
-        &config.data_dir,
-        None,
-        Some(&config.providers.models),
-    )
+    create_memory_from_config(config, None)
 }
 
 async fn handle_reindex(config: &Config) -> Result<()> {
@@ -100,7 +93,7 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
         MemoryBackendKind::None => {
             bail!("Memory backend is 'none' (disabled). No entries to manage.");
         }
-        _ => create_memory_for_migration(&backend, &config.data_dir),
+        _ => create_memory_for_migration(config),
     }
 }
 

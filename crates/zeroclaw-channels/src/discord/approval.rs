@@ -10,6 +10,37 @@ use super::custom_id::CustomId;
 
 pub(crate) const APPROVAL_KIND: &str = "apv";
 
+/// `custom_id` kind for STATELESS SOP-gate buttons (`ChannelGatePrompt`
+/// deliveries). Unlike [`APPROVAL_KIND`] there is no server-side registration:
+/// the arg carries `<choice_id>:<reference>` directly, so the buttons survive
+/// daemon restarts and can answer a gate parked hours earlier. A click becomes
+/// an inbound message stamped with the internal `sop.gate:` marker (set only by
+/// the interaction producer, never derivable from message text), which the
+/// orchestrator resolves against the parked gate. Decision-in-wire is safe here
+/// because a SOP gate's choices are operator-privilege-equivalent
+/// (approve/deny), unlike the tool-approval escalation ladder above.
+pub(crate) const SOP_GATE_KIND: &str = "sopgate";
+
+/// `custom_id` kind for a SOP-gate button whose choice COLLECTS TEXT (Edit /
+/// Revise): the click's interaction response is opening a modal (type 9), not
+/// emitting a marker. Same stateless `<choice_id>:<reference>` arg as
+/// [`SOP_GATE_KIND`]; the modal pre-fill comes from the in-memory prompt
+/// registry when the process that sent the prompt is still alive (best-effort —
+/// after a restart the modal opens blank, the draft is still in the embed).
+pub(crate) const SOP_GATE_MODAL_KIND: &str = "sopgatem";
+
+/// `custom_id` kind for the MODAL itself (echoed back on its type-5 submit):
+/// the submit parses statelessly and becomes the inbound marker message, with
+/// the typed text as the message content.
+pub(crate) const SOP_GATE_SUBMIT_KIND: &str = "sopgates";
+
+/// True for any of the stateless SOP-gate custom_id kinds — used by the
+/// shared-token foreign-alias silent pass (every alias receives every click;
+/// only the alias that owns the channel may answer, the rest stay quiet).
+pub(crate) fn is_sop_gate_kind(kind: &str) -> bool {
+    kind == SOP_GATE_KIND || kind == SOP_GATE_MODAL_KIND || kind == SOP_GATE_SUBMIT_KIND
+}
+
 /// The four operator choices, as a fixed server-side enum. A click resolves to
 /// exactly one of these because the *emitter* registered it — never because the
 /// wire said so. This is the "no privilege escalation via custom_id" guarantee:

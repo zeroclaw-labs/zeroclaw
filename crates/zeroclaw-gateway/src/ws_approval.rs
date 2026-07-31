@@ -71,6 +71,14 @@ impl Channel for WsApprovalChannel {
         Ok(())
     }
 
+    /// `send` above is a deliberate no-op (see comment). Surfaces that must
+    /// genuinely deliver — `poll`'s formatted-text fallback and
+    /// `escalate_to_human` — check this so they fail honestly instead of
+    /// claiming success for a message that was never rendered.
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // The gateway WS path does not act as a message source for the
         // channel orchestrator; turns are driven directly by the WS

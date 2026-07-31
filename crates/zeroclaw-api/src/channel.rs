@@ -99,6 +99,120 @@ pub struct AttributedApprovalResponse {
     pub decided_by: Option<String>,
 }
 
+/// A long-lived, channel-agnostic gate prompt (e.g. a parked SOP approval):
+/// rendered natively per channel (Discord embed + buttons, Telegram inline
+/// keyboard, ...), answered through the channel's normal inbound path — a
+/// component click or a `<choice> <reference>` text reply — NOT a blocking wait.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGatePrompt {
+    /// Short heading, e.g. "SOP approval needed: gitea-triage-pipeline".
+    pub title: String,
+    /// Body: what is waiting and how to answer (includes the text-reply form
+    /// for humans on channels that render it as plain text).
+    pub description: String,
+    /// Correlation key the answer must carry (e.g. the SOP run id). Encoded in
+    /// component custom_ids and expected in text replies.
+    pub reference: String,
+    /// The presented choices, in order.
+    pub choices: Vec<GateChoice>,
+    /// Body a RESOLVED prompt should keep showing (the context, without the
+    /// how-to-answer instructions): on finalize the channel appends the outcome
+    /// line under it, so the record of WHAT was approved survives in place.
+    /// `None` = the outcome replaces the body entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_description: Option<String>,
+}
+
+/// The fixed vocabulary of gate-answer tokens, and the single source of truth
+/// for their wire spelling. A gate answer crosses two stringly-typed transports
+/// — a Discord `custom_id` and a `<choice> <reference>` text reply — so the
+/// token must be a string on the wire; this enum keeps producer (the route
+/// adapter that mints [`GateChoice::id`]) and consumer (the orchestrator that
+/// maps an answer to an approval decision) matching on ONE definition instead of
+/// re-typing the literal at each site, so adding a choice is a compile error at
+/// every place that must handle it rather than a silent drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateChoiceKind {
+    /// Approve the gate as presented.
+    Approve,
+    /// Deny the gate (cancels / fails the run per the step's policy).
+    Deny,
+    /// Approve with an operator amendment to the declared editable field.
+    Edit,
+    /// Ask for a re-draft with guidance (checkpoint with an llm predecessor).
+    Revise,
+}
+
+impl GateChoiceKind {
+    /// The wire token — the string carried in a `custom_id` and a text reply.
+    pub fn id(self) -> &'static str {
+        match self {
+            GateChoiceKind::Approve => "approve",
+            GateChoiceKind::Deny => "deny",
+            GateChoiceKind::Edit => "edit",
+            GateChoiceKind::Revise => "revise",
+        }
+    }
+
+    /// Parse a wire token back to its kind (case-insensitive). `None` for any
+    /// unknown token, so an unrecognized answer is dropped, never coerced.
+    pub fn from_id(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "approve" => Some(GateChoiceKind::Approve),
+            "deny" => Some(GateChoiceKind::Deny),
+            "edit" => Some(GateChoiceKind::Edit),
+            "revise" => Some(GateChoiceKind::Revise),
+            _ => None,
+        }
+    }
+
+    /// True when answering this choice collects free text (the amended draft or
+    /// the re-draft guidance) — the channels that can, render a form for it.
+    pub fn collects_text(self) -> bool {
+        matches!(self, GateChoiceKind::Edit | GateChoiceKind::Revise)
+    }
+}
+
+/// One selectable choice on a [`ChannelGatePrompt`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateChoice {
+    /// Stable machine id carried back in the answer (e.g. "approve"). Mint it
+    /// from [`GateChoiceKind::id`] so it stays in lockstep with the parser.
+    pub id: String,
+    /// Human label for the button / keyboard entry.
+    pub label: String,
+    /// Visual emphasis hint for channels that support it.
+    pub emphasis: GateChoiceEmphasis,
+    /// When set, this choice collects free text from the operator before it is
+    /// answered (e.g. "Edit" amends a draft, "Revise" sends guidance). Channels
+    /// with a native form (Discord modal) render one; channels without simply
+    /// omit the choice — plain approve/deny stays universally answerable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<GateChoiceInput>,
+}
+
+/// The text-collection spec of an input-bearing [`GateChoice`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateChoiceInput {
+    /// Field label shown on the form (e.g. "Edited draft").
+    pub label: String,
+    /// Pre-filled text (e.g. the current draft an Edit starts from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+}
+
+/// Rendering hint for a [`GateChoice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateChoiceEmphasis {
+    /// The affirmative action (e.g. a green/primary button).
+    Positive,
+    /// The destructive/refusing action (e.g. a red button).
+    Negative,
+    /// No particular emphasis.
+    Neutral,
+}
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -665,6 +779,52 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             }))
     }
 
+    /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
+    /// approval) on this channel, rendered natively — an embed with one button
+    /// per choice on Discord, an inline keyboard on Telegram, and so on.
+    ///
+    /// UNLIKE [`Channel::request_approval`] this does NOT wait for the answer:
+    /// the prompt outlives the call (and daemon restarts). The choice comes
+    /// back through the channel's normal INBOUND path — a component click
+    /// (stamped with an internal `sop.gate:` marker by the channel's own
+    /// interaction producer, never derivable from message text) or a plain
+    /// `<choice> <reference>` text reply — which the orchestrator resolves
+    /// against the parked gate.
+    ///
+    /// Default `Ok(false)` = "no native prompt on this channel"; the caller
+    /// then falls back to a plain text notice carrying the reply instructions.
+    async fn send_gate_prompt(
+        &self,
+        _recipient: &str,
+        _prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Mark a previously sent gate prompt as resolved: strip its interactive
+    /// controls and replace the body with `outcome` (e.g. "Approved by @user —
+    /// run resumed"), so a decided gate cannot be clicked again and the
+    /// decision is visible in place. `reference` is the same correlation key
+    /// the prompt was sent with. Best-effort: `Ok(false)` when this channel
+    /// has nothing to finalize (no native prompt, or the mapping was lost to a
+    /// restart) — the gate state itself is never affected.
+    async fn finalize_gate_prompt(&self, _reference: &str, _outcome: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Ask the user a multiple-choice question and return the chosen option's text.
+    ///
+    /// Returns `Ok(Some(answer))` if the channel handled the question natively
+    /// (e.g. ACP `elicitation/create` with a single-select enum schema, or
+    /// the legacy `session/request_permission` fallback for older ACP clients;
+    /// Telegram inline keyboard; etc.). Returns `Ok(None)` to signal the
+    /// caller should fall back to the generic `send` + `listen` flow.
+    /// Default impl returns `None`.
+    ///
+    /// Free-form (no-choices) questions are not modeled by this method.
+    /// Multiple-choice support landed via ACP `elicitation/create` (see
+    /// the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>);
+    /// free-form text is tracked under that spec's Phase 2.
     async fn request_choice(
         &self,
         _question: &str,
@@ -697,6 +857,30 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_choice_kind_ids_round_trip_and_reject_unknown() {
+        for kind in [
+            GateChoiceKind::Approve,
+            GateChoiceKind::Deny,
+            GateChoiceKind::Edit,
+            GateChoiceKind::Revise,
+        ] {
+            assert_eq!(GateChoiceKind::from_id(kind.id()), Some(kind));
+        }
+        // Case-insensitive parse; unknown tokens are None (dropped, never coerced).
+        assert_eq!(
+            GateChoiceKind::from_id("APPROVE"),
+            Some(GateChoiceKind::Approve)
+        );
+        assert_eq!(GateChoiceKind::from_id("escalate"), None);
+        assert_eq!(GateChoiceKind::from_id(""), None);
+        // Only the text-collecting choices report collects_text.
+        assert!(GateChoiceKind::Edit.collects_text());
+        assert!(GateChoiceKind::Revise.collects_text());
+        assert!(!GateChoiceKind::Approve.collects_text());
+        assert!(!GateChoiceKind::Deny.collects_text());
+    }
 
     #[test]
     fn channel_sop_topic_build_parse_roundtrip() {

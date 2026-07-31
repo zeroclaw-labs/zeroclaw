@@ -1,6 +1,8 @@
 //! Channel subsystem for messaging platform integrations.
 
 #[cfg(feature = "channel-acp-server")]
+pub mod acp_embedded;
+#[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
@@ -96,7 +98,7 @@ use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
-use serde::Deserialize;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::ops::Range;
@@ -120,9 +122,8 @@ use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -325,16 +326,8 @@ enum ChannelRuntimeCommand {
     InvalidThinking(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheState {
-    entries: Vec<ModelCacheEntry>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheEntry {
-    model_provider: String,
-    models: Vec<String>,
-}
+// ModelCacheState / ModelCacheEntry are defined in zeroclaw-config::schema
+// as the single source of truth for the on-disk cache contract.
 
 #[derive(Debug, Clone)]
 struct ChannelRuntimeDefaults {
@@ -2222,27 +2215,44 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
-fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
-    let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
-    let Ok(raw) = std::fs::read_to_string(cache_path) else {
-        return Vec::new();
-    };
-    let Ok(state) = serde_json::from_str::<ModelCacheState>(&raw) else {
-        return Vec::new();
+fn load_cached_model_preview(
+    data_dir: &Path,
+    agent_workspace_dir: &Path,
+    provider_name: &str,
+) -> Vec<String> {
+    // Canonicalize undotted names so lookup matches the cache key.
+    let canonical = if provider_name.contains('.') {
+        provider_name.to_string()
+    } else {
+        format!("{provider_name}.default")
     };
 
-    state
-        .entries
-        .into_iter()
-        .find(|entry| entry.model_provider == provider_name)
-        .map(|entry| {
-            entry
+    // Check the shared cache location first (written by `zeroclaw models refresh`),
+    // then fall back to the agent workspace for backward compatibility.
+    let shared_path = data_dir.join("state").join(MODEL_CACHE_FILE);
+    let agent_path = agent_workspace_dir.join("state").join(MODEL_CACHE_FILE);
+
+    for cache_path in [&shared_path, &agent_path] {
+        let Ok(raw) = std::fs::read_to_string(cache_path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<zeroclaw_config::schema::ModelCacheState>(&raw)
+        else {
+            continue;
+        };
+        if let Some(entry) = state
+            .entries
+            .into_iter()
+            .find(|e| e.model_provider == canonical)
+        {
+            return entry
                 .models
                 .into_iter()
                 .take(MODEL_CACHE_PREVIEW_LIMIT)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// Build a cache key that includes the runtime-defaults generation, the
@@ -2378,7 +2388,8 @@ async fn create_resilient_model_provider_nonblocking(
 
 fn build_models_help_response(
     current: &ChannelRouteSelection,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
@@ -2410,7 +2421,8 @@ fn build_models_help_response(
         }
     }
 
-    let cached_models = load_cached_model_preview(workspace_dir, &current.model_provider);
+    let cached_models =
+        load_cached_model_preview(data_dir, agent_workspace_dir, &current.model_provider);
     if cached_models.is_empty() {
         response.push('\n');
         response.push_str(&channel_runtime_cli_string_with_args(
@@ -2508,7 +2520,8 @@ fn build_config_text_response(
 /// Build a Slack Block Kit JSON payload for the `/config` interactive UI.
 fn build_config_block_kit(
     current: &ChannelRouteSelection,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let provider_options: Vec<serde_json::Value> = zeroclaw_providers::list_model_providers()
@@ -2537,7 +2550,7 @@ fn build_config_block_kit(
         })
         .collect();
 
-    let cached = load_cached_model_preview(workspace_dir, &current.model_provider);
+    let cached = load_cached_model_preview(data_dir, agent_workspace_dir, &current.model_provider);
     for model_id in cached {
         if !model_options.iter().any(|o| {
             o.get("value")
@@ -2778,6 +2791,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowModel => {
             let mut resp = build_models_help_response(
                 &current,
+                ctx.prompt_config.data_dir.as_path(),
                 ctx.workspace_dir.as_path(),
                 &ctx.model_routes,
             );
@@ -2887,6 +2901,7 @@ async fn handle_runtime_command_if_needed(
             if msg.channel == "slack" {
                 let blocks_json = build_config_block_kit(
                     &current,
+                    ctx.prompt_config.data_dir.as_path(),
                     ctx.workspace_dir.as_path(),
                     &ctx.model_routes,
                 );
@@ -4540,26 +4555,23 @@ async fn process_channel_message_body(
         }
     }
 
-    if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
-        let wants = engine
-            .lock()
-            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
-            .unwrap_or(false);
-        if wants {
-            let topic = match &msg.channel_alias {
-                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
-                _ => msg.channel.clone(),
-            };
-            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
-                engine,
-                audit,
-                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-                Some(&topic),
-                Some(&msg.content),
-                None,
-            )
-            .await;
-        }
+    if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
+        let topic = match &msg.channel_alias {
+            Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+            _ => msg.channel.clone(),
+        };
+        zeroclaw_runtime::sop::dispatch::SopIngress::new(
+            ctx.sop_engine.as_ref(),
+            ctx.sop_audit.as_deref(),
+        )
+        .dispatch(
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some(&topic),
+            Some(&msg.content),
+            None,
+            None,
+        )
+        .await;
     }
 
     let history_key = conversation_history_key(&msg);
@@ -5245,7 +5257,14 @@ async fn process_channel_message_body(
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = followup_thread_id(&msg);
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
+    // Tool-call notifications go out as SEPARATE messages below, which is right
+    // for chat channels (Discord/Telegram threads) but wrong for partial-draft
+    // channels like the git forge, where every message is a PERMANENT comment on
+    // a third-party issue/PR: each tool call became its own comment (issue spam),
+    // duplicating the progress the draft stream already folds into the single
+    // edited comment. Partial-draft channels drain-and-drop here; their draft
+    // stream remains the (single-message) tool-activity surface.
+    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
         Some(zeroclaw_spawn::spawn!(async move {
             while notify_rx.recv().await.is_some() {}
         }))
@@ -5270,7 +5289,6 @@ async fn process_channel_message_body(
         Cancelled,
     }
 
-    let model_switch_callback = get_model_switch_state();
     let scale_cap = ctx
         .pacing
         .message_timeout_scale_max
@@ -5341,7 +5359,7 @@ async fn process_channel_message_body(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 };
-            let tool_loop = run_tool_call_loop(ToolLoop {
+            let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -5362,7 +5380,7 @@ async fn process_channel_message_body(
                         config: Some(ctx.prompt_config.as_ref()),
                         hooks: ctx.hooks.as_deref(),
                         activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: Some(model_switch_callback.clone()),
+                        model_switch_callback: None,
                         receipt_generator: ctx.receipt_generator.as_ref(),
                     },
                     ResolvedRuntimeKnobs {
@@ -5423,7 +5441,7 @@ async fn process_channel_message_body(
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                 }),
-            });
+            }));
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
@@ -5472,7 +5490,6 @@ async fn process_channel_message_body(
                             .with_attrs(::serde_json::json!({"err": err.to_string()})),
                             "Failed to resolve model_provider after model switch"
                         );
-                        clear_model_switch_request();
                         break loop_result;
                     }
                 };
@@ -5504,8 +5521,6 @@ async fn process_channel_message_body(
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
                         route.api_key = resolved_api_key;
-                        clear_model_switch_request();
-
                         // Persist the route override so subsequent messages
                         // from this sender continue using the switched model.
                         set_route_selection(
@@ -5532,7 +5547,6 @@ async fn process_channel_message_body(
                             .with_attrs(::serde_json::json!({"err": err.to_string()})),
                             "Failed to create model_provider after model switch"
                         );
-                        clear_model_switch_request();
                         // Fall through with the original error
                     }
                 }
@@ -6335,11 +6349,13 @@ impl AgentRouter {
         }
         if let Some(alias) = msg.channel_alias.as_deref().filter(|s| !s.is_empty()) {
             let composite = format!("{}.{alias}", msg.channel);
-            if let Some(agent) = self.owner_by_channel_key.get(&composite)
-                && let Some(ctx) = self.by_agent.get(agent)
-            {
-                return Some(Arc::clone(ctx));
-            }
+            // An explicit alias identifies a distinct configured channel. It
+            // must not fall back to another alias's bare platform owner.
+            return self
+                .owner_by_channel_key
+                .get(&composite)
+                .and_then(|agent| self.by_agent.get(agent))
+                .cloned();
         }
         if let Some(agent) = self.owner_by_channel_key.get(&msg.channel)
             && let Some(ctx) = self.by_agent.get(agent)
@@ -6348,6 +6364,395 @@ impl AgentRouter {
         }
         None
     }
+}
+
+/// Split an inbound gate reference into its run part and revision. A reference
+/// may be revision-qualified (`<run_id>#<rev>`); a bare reference means
+/// revision 0 (the ORIGINAL presentation) — NOT "whatever is current" — so a
+/// click on a superseded prompt can never resolve a newer draft it wasn't
+/// looking at. A malformed suffix leaves the whole string as the run part.
+fn parse_gate_reference(reference: &str) -> (String, u32) {
+    match reference.rsplit_once('#') {
+        Some((run_part, rev_part)) if !run_part.is_empty() => match rev_part.parse::<u32>() {
+            Ok(rev) => (run_part.to_string(), rev),
+            Err(_) => (reference.to_string(), 0),
+        },
+        _ => (reference.to_string(), 0),
+    }
+}
+
+fn channel_key_for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    match msg.channel_alias.as_deref() {
+        Some(alias) => format!("{}.{alias}", msg.channel),
+        None => msg.channel.clone(),
+    }
+}
+
+fn unique_channel_handles(
+    channels_by_name: &HashMap<String, Arc<dyn Channel>>,
+) -> Vec<Arc<dyn Channel>> {
+    let mut unique = Vec::new();
+    for channel in channels_by_name.values() {
+        if !unique.iter().any(|existing| Arc::ptr_eq(existing, channel)) {
+            unique.push(Arc::clone(channel));
+        }
+    }
+    unique
+}
+
+async fn finalize_gate_prompts(channels: &[Arc<dyn Channel>], reference: &str, outcome: &str) {
+    for channel in channels {
+        if let Err(e) = channel.finalize_gate_prompt(reference, outcome).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "reference": reference,
+                        "channel": channel.name(),
+                        "error": e.to_string(),
+                    })),
+                "gate-prompt finalize failed (decision unaffected)"
+            );
+        }
+    }
+}
+
+fn text_gate_reply_matches_approval_route(
+    engine: &zeroclaw_runtime::sop::SopEngine,
+    run_id: &str,
+    channel_route_keys: &[String],
+    reply_target: &str,
+) -> bool {
+    let Some(policy_name) = engine.current_step_policy_name(run_id) else {
+        return false;
+    };
+    let broker = engine.approval_broker();
+    broker
+        .reply_routes(engine.approval_config(), &policy_name)
+        .iter()
+        .any(|route| {
+            let Some((route_channel_key, route_recipient)) =
+                zeroclaw_runtime::sop::approval::channel_route::parse_approval_route(route)
+            else {
+                return false;
+            };
+            channel_route_keys
+                .iter()
+                .any(|channel_key| channel_key == route_channel_key)
+                && route_recipient == reply_target
+        })
+}
+
+/// Resolve a SOP gate answered from a chat channel. Two answer forms converge
+/// here, per the channel-agnostic gate-prompt seam:
+///
+/// - a component click: the channel's OWN interaction producer stamps the
+///   internal `sop.gate:<choice>:<reference>` marker (unforgeable from message
+///   text, same guarantee as the git producer's SOP-event marker);
+/// - a plain `<choice> <reference>` text reply (the fallback prompt tells the
+///   operator to send exactly this) — consumed ONLY when the reference matches a
+///   run actually parked on a human AND the run's current policy can deliver its
+///   approval prompt to this same channel route. Ordinary conversation and
+///   unauthorised channel traffic never get swallowed.
+///
+/// Returns `true` when the message was consumed as a gate answer.
+async fn dispatch_channel_sop_gate(
+    router: &AgentRouter,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    config: &zeroclaw_config::schema::Config,
+    gate_prompt_channels: &[Arc<dyn Channel>],
+    gate_channel_route_keys: &[String],
+) -> bool {
+    const MARKER_PREFIX: &str = "sop.gate:";
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Form {
+        Marker,
+        Text,
+    }
+    let (form, choice, reference) = if let Some(rest) = msg
+        .internal_sop_event
+        .as_deref()
+        .and_then(|s| s.strip_prefix(MARKER_PREFIX))
+    {
+        match rest.split_once(':') {
+            // Any known gate-choice token is a valid marker; unknown tokens are
+            // dropped, never coerced (the enum is the single vocabulary).
+            Some((c, r))
+                if !r.is_empty() && zeroclaw_api::channel::GateChoiceKind::from_id(c).is_some() =>
+            {
+                (Form::Marker, c.to_ascii_lowercase(), r.to_string())
+            }
+            _ => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"marker": rest})),
+                    "dropping malformed or unknown channel SOP-gate marker"
+                );
+                return true;
+            }
+        }
+    } else if msg.internal_sop_event.is_none() {
+        // Text form: exactly two tokens, and the first must be a text-free
+        // choice. Edit/Revise stay marker-only (they carry a text payload a
+        // two-token reply cannot); approve/deny remain universally answerable.
+        let mut words = msg.content.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (Some(c), Some(r), None)
+                if zeroclaw_api::channel::GateChoiceKind::from_id(c)
+                    .is_some_and(|k| !k.collects_text()) =>
+            {
+                (Form::Text, c.to_ascii_lowercase(), r.to_string())
+            }
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+
+    let Some(engine) = router.sop_engine.as_ref() else {
+        // A marker message exists only to answer a gate — consume it either way.
+        return matches!(form, Form::Marker);
+    };
+
+    let (ref_run, ref_rev) = parse_gate_reference(&reference);
+    let channel_key = channel_key_for_message(msg);
+    let mut channel_route_keys = gate_channel_route_keys.to_vec();
+    if !channel_route_keys
+        .iter()
+        .any(|route_key| route_key == &channel_key)
+    {
+        channel_route_keys.push(channel_key.clone());
+    }
+
+    // Resolve against runs actually parked on a human. Both marker and plain text
+    // replies must carry the full run id minted in the prompt. For the TEXT form
+    // a non-match means "not a gate answer" — fall through to the agent; a marker
+    // non-match is consumed (stale buttons after the run ended). A matched run
+    // whose CURRENT revision differs from the reference's is superseded only
+    // after that replacement park is durable. While persistence retries, the
+    // prior prompt stays visible and is not finalized as stale. Text replies
+    // must first prove they came through a policy route that can present fallback
+    // instructions.
+    let resolved = {
+        let Ok(guard) = engine.lock() else {
+            return matches!(form, Form::Marker);
+        };
+        let mut candidates = guard.active_runs().values().filter(|r| {
+            matches!(
+                r.status,
+                zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval
+                    | zeroclaw_runtime::sop::types::SopRunStatus::PausedCheckpoint
+            )
+        });
+        let matched: Vec<(String, u32, bool, bool)> = candidates
+            .by_ref()
+            .filter(|r| r.run_id == ref_run)
+            .map(|r| {
+                let text_admissible = matches!(form, Form::Marker)
+                    || text_gate_reply_matches_approval_route(
+                        &guard,
+                        &r.run_id,
+                        &channel_route_keys,
+                        &msg.reply_target,
+                    );
+                let superseded = guard.is_gate_reference_superseded(&r.run_id, ref_rev);
+                (r.run_id.clone(), r.revision, text_admissible, superseded)
+            })
+            .collect();
+        match matched.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    };
+    if let Some((run_id, _, false, _)) = &resolved {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "run_id": run_id,
+                    "reference": reference,
+                    "channel": channel_key,
+                    "reply_target": msg.reply_target.as_str(),
+                })
+            ),
+            "channel SOP-gate text reply did not match a gate approval route"
+        );
+        return false;
+    }
+    if let Some((run_id, current_rev, _, true)) = &resolved {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "run_id": run_id,
+                    "reference": reference,
+                    "current_revision": current_rev,
+                    "channel": msg.channel.as_str(),
+                })
+            ),
+            "channel SOP-gate answer targeted a superseded prompt revision"
+        );
+        finalize_gate_prompts(
+            gate_prompt_channels,
+            &reference,
+            "\u{1f501} This prompt was superseded by a newer draft \u{2014} \
+             answer the latest prompt instead.",
+        )
+        .await;
+        // Consumed for both forms: it named a real parked gate, just an old
+        // presentation of it — never a message for the agent.
+        return true;
+    }
+    let resolved_run_id = resolved.map(|(run_id, _, _, _)| run_id);
+    let Some(run_id) = resolved_run_id else {
+        return match form {
+            Form::Marker => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "reference": reference,
+                            "channel": msg.channel.as_str(),
+                        })),
+                    "channel SOP-gate click did not match a parked run (stale or finished)"
+                );
+                // Name the state correctly on the prompt itself: this gate's
+                // approval window has passed.
+                finalize_gate_prompts(
+                    gate_prompt_channels,
+                    &reference,
+                    "\u{23f0} The approval window for this gate has passed \
+                     (the run already resolved or finished).",
+                )
+                .await;
+                true
+            }
+            Form::Text => false,
+        };
+    };
+
+    use zeroclaw_api::channel::GateChoiceKind;
+    use zeroclaw_runtime::sop::approval::ApprovalDecision;
+    // `choice` already passed `GateChoiceKind::from_id` at parse time; this
+    // match is exhaustive over the enum, so a new choice is a compile error
+    // here (not a silent fall-through to Deny).
+    let decision = match GateChoiceKind::from_id(&choice) {
+        Some(GateChoiceKind::Approve) => ApprovalDecision::Approve,
+        Some(GateChoiceKind::Deny) | None => ApprovalDecision::Deny {
+            reason: Some(format!("denied by {} via {channel_key}", msg.sender)),
+        },
+        // Edit / Revise carry their text in the marker message's content (the
+        // connector puts the modal's typed field there). Empty text cannot
+        // amend or steer anything — consume without resolving (the connector's
+        // required-field modal makes this unreachable in practice).
+        Some(kind @ (GateChoiceKind::Edit | GateChoiceKind::Revise)) => {
+            let text = msg.content.trim().to_string();
+            if text.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "choice": choice,
+                        })),
+                    "channel SOP-gate edit/revise arrived without text; ignored"
+                );
+                return true;
+            }
+            if kind == GateChoiceKind::Edit {
+                ApprovalDecision::Amend { text }
+            } else {
+                ApprovalDecision::Revise { guidance: text }
+            }
+        }
+    };
+    let is_edit = matches!(decision, ApprovalDecision::Amend { .. });
+    let principal = zeroclaw_runtime::sop::approval::ApprovalPrincipal::channel(
+        channel_key.clone(),
+        Some(msg.sender.clone()),
+    );
+    let outcome = match engine.lock() {
+        Ok(mut guard) => guard.resolve_via_broker(&run_id, decision, principal),
+        Err(_) => return true,
+    };
+    match outcome {
+        Ok(outcome) => {
+            zeroclaw_runtime::sop::drive_resumed_broker_action(
+                config,
+                Arc::clone(engine),
+                router.sop_audit.clone(),
+                &outcome,
+            );
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "choice": choice,
+                        "sender": msg.sender,
+                        "channel": channel_key,
+                        "outcome": outcome.label(),
+                    })),
+                "channel SOP-gate answer resolved"
+            );
+            // Finalize the prompt (strip buttons, show the decision in place)
+            // ONLY on terminal outcomes. Non-terminal ones — pending quorum, a
+            // failed slot re-acquire — leave the buttons alive so the decision
+            // can be retried or CHANGED while the run is still parked.
+            use zeroclaw_runtime::sop::approval::{BrokerOutcome, ResolveOutcome};
+            let final_text = match &outcome {
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) if is_edit => Some(format!(
+                    "\u{2705} Approved with edits by <@{}> \u{2014} run resumed with the \
+                     amended text.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => Some(format!(
+                    "\u{2705} Approved by <@{}> \u{2014} run resumed.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::Denied) => Some(format!(
+                    "\u{1f6ab} Denied by <@{}> \u{2014} run cancelled.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::Revised) => Some(format!(
+                    "\u{1f501} Revision requested by <@{}> \u{2014} a new draft prompt is \
+                     on its way.",
+                    msg.sender
+                )),
+                BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved) => Some(
+                    "\u{23f0} The approval window for this gate has passed \
+                     (already resolved)."
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            // Finalize by the prompt's CANONICAL reference (revision-qualified
+            // when > 0): the prompt registry is keyed by what was sent.
+            let finalize_reference = if ref_rev == 0 {
+                run_id.clone()
+            } else {
+                format!("{run_id}#{ref_rev}")
+            };
+            if let Some(text) = final_text {
+                finalize_gate_prompts(gate_prompt_channels, &finalize_reference, &text).await;
+            }
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run_id,
+                        "error": e.to_string(),
+                    })),
+                "channel SOP-gate resolution failed"
+            );
+        }
+    }
+    true
 }
 
 async fn dispatch_channel_sop_event(
@@ -6362,48 +6767,19 @@ async fn dispatch_channel_sop_event(
         return false;
     };
 
-    let Some(engine) = router.sop_engine.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP engine is not available"
-        );
-        return true;
-    };
-    let Some(audit) = router.sop_audit.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP audit logger is not available"
-        );
-        return true;
-    };
-
-    let event = zeroclaw_runtime::sop::types::SopEvent {
-        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-        topic: Some(topic.to_string()),
-        payload: Some(msg.content.clone()),
-        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
-    };
     let target_sop = channel_sop_target(msg);
-    let results = if let Some(sop_name) = target_sop.as_deref() {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
-    } else {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
-    };
-    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    zeroclaw_runtime::sop::dispatch::SopIngress::new(
+        router.sop_engine.as_ref(),
+        router.sop_audit.as_deref(),
+    )
+    .dispatch(
+        zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        Some(topic),
+        Some(&msg.content),
+        target_sop.as_deref(),
+        None,
+    )
+    .await;
     true
 }
 
@@ -6454,10 +6830,59 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Gate answers (button-click markers / `approve <ref>` text replies)
+        // resolve a PARKED run and must never start one, so they are consumed
+        // BEFORE agent ownership lookup. A configured approval route may be
+        // intentionally unowned by an agent; it can present gate prompts but
+        // must never receive ordinary agent traffic. All live contexts share
+        // this global channel registry and prompt config.
+        let gate_ctx = router
+            .single_ctx
+            .as_ref()
+            .cloned()
+            .or_else(|| router.by_agent.values().next().cloned());
+        if let Some(gate_ctx) = gate_ctx {
+            let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
+            let gate_channel_route_keys = gate_channel
+                .as_ref()
+                .map(|target| {
+                    let mut keys: Vec<String> = gate_ctx
+                        .channels_by_name
+                        .iter()
+                        .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
+                        .map(|(key, _channel)| key.clone())
+                        .collect();
+                    let inbound_key = channel_key_for_message(&msg);
+                    if !keys.iter().any(|key| key == &inbound_key) {
+                        keys.push(inbound_key);
+                    }
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                })
+                .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
+            let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
+            if dispatch_channel_sop_gate(
+                &router,
+                &msg,
+                gate_ctx.prompt_config.as_ref(),
+                &gate_prompt_channels,
+                &gate_channel_route_keys,
+            )
+            .await
+            {
+                continue;
+            }
+        }
+
         let Some(ctx) = router.resolve(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
+
+        // Gate answers were already considered against the global approval
+        // channel registry above. The remaining path only dispatches events and
+        // ordinary messages to an agent-owned runtime.
         if dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
@@ -6833,6 +7258,28 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+/// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
+///
+/// One-off callers match on this sentinel instead of the error text so the
+/// builder stays the single source of truth for which ids it resolves; a family
+/// added or removed there changes the fallback automatically.
+#[derive(Debug)]
+struct UnknownChannelId(String);
+
+impl std::fmt::Display for UnknownChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(channel_id) = self;
+        write!(
+            f,
+            "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
+            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
+            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+        )
+    }
+}
+
+impl std::error::Error for UnknownChannelId {}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -6991,7 +7438,8 @@ fn build_channel_by_id(
                     mm.mention_only.unwrap_or(false),
                 )
                 .with_team_ids(mm.team_ids.clone())
-                .with_discover_dms(mm.discover_dms.unwrap_or(true)),
+                .with_discover_dms(mm.discover_dms.unwrap_or(true))
+                .with_listen_mode(mm.listen_mode),
             ))
         }
         #[cfg(not(feature = "channel-mattermost"))]
@@ -7306,7 +7754,18 @@ fn build_channel_by_id(
             Ok(Arc::new(
                 NextcloudTalkChannel::new_with_proxy(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias,
                     peer_resolver,
@@ -7630,11 +8089,7 @@ fn build_channel_by_id(
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
-        other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
-        ),
+        other => Err(anyhow::Error::new(UnknownChannelId(other.to_string()))),
     }
 }
 
@@ -7648,7 +8103,24 @@ pub async fn send_channel_message(
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let channel = build_channel_by_id(&config_arc, channel_id)?;
+    // The builder gets first refusal so families it already resolves natively
+    // (notably `linq.<alias>`) keep their established route and their own
+    // configuration errors. Only a dotted id the builder does not claim at all
+    // falls through to the announcement dispatcher, which resolves any
+    // `<type>.<alias>` it supports.
+    let channel = match build_channel_by_id(&config_arc, channel_id) {
+        Ok(channel) => channel,
+        Err(err)
+            if channel_id.contains('.') && err.downcast_ref::<UnknownChannelId>().is_some() =>
+        {
+            deliver_announcement(config, channel_id, recipient, None, message)
+                .await
+                .with_context(|| format!("Failed to send message via {channel_id}"))?;
+            println!("Message sent via {channel_id}.");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let msg = SendMessage::new(message, recipient);
     channel
         .send(&msg)
@@ -7794,9 +8266,11 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
             .is_some_and(|(channel_type, _)| channel_type == message_base)
 }
 
-/// Active `<type>.<alias>` channel references from enabled agents.
-/// An empty set means no enabled agent declared channel bindings, so
-/// collection falls back to legacy behavior and accepts all enabled channels.
+/// Active `<type>.<alias>` channel references from enabled agents and SOP
+/// approval routes.
+///
+/// When no agent declares channel bindings, collection falls back to legacy
+/// behavior and accepts all enabled channels.
 struct ActiveChannelAliases {
     /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
     /// explicit-binding mode: only enabled owners' bindings count.
@@ -7804,14 +8278,20 @@ struct ActiveChannelAliases {
     /// Bindings declared by all agents, including disabled owners. Their
     /// presence prevents legacy fallback from activating disabled channels.
     all_known_bindings: HashSet<String>,
+    /// `<type>.<alias>` named by an approval request or escalation route.
+    /// These channels are live to deliver and receive SOP gate replies, but
+    /// they remain absent from the agent ownership map for ordinary traffic.
+    approval_route_bindings: HashSet<String>,
 }
 
 impl ActiveChannelAliases {
-    /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings anywhere and legacy "accept all enabled channels"
-    /// mode applies.
+    /// Returns true when `channel_ref` is agent-bound, named by an approval
+    /// route, or when no explicit agent bindings exist and legacy "accept all
+    /// enabled channels" mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+        self.all_known_bindings.is_empty()
+            || self.enabled_bindings.contains(channel_ref)
+            || self.approval_route_bindings.contains(channel_ref)
     }
 
     /// True when bindings exist somewhere in the config but every owner is
@@ -7821,8 +8301,41 @@ impl ActiveChannelAliases {
     }
 
     /// Computes the canonical channel-binding view used by collection and
-    /// startup checks; disabled owners never make their channels active.
+    /// startup checks. Disabled owners never activate channels, while an
+    /// explicit SOP approval route keeps its delivery channel live without
+    /// assigning it to an agent.
     fn compute(config: &Config) -> Self {
+        let configured_channel_aliases = config.channels_by_alias();
+        let approval_route_bindings = config
+            .sop
+            .approval
+            .policies
+            .values()
+            .flat_map(|policy| {
+                [
+                    policy.request_route.as_deref(),
+                    policy.escalation_route.as_deref(),
+                ]
+            })
+            .filter_map(|route| {
+                route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
+            })
+            .flat_map(|(channel_key, _)| {
+                if channel_key.contains('.') {
+                    return vec![channel_key.to_string()];
+                }
+
+                let enabled_aliases: Vec<_> = configured_channel_aliases
+                    .iter()
+                    .filter(|channel| channel.enabled && channel.channel_type == channel_key)
+                    .collect();
+                match enabled_aliases.as_slice() {
+                    [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
+                    _ => vec![channel_key.to_string()],
+                }
+            })
+            .collect();
+
         Self {
             enabled_bindings: config
                 .agents
@@ -7835,6 +8348,7 @@ impl ActiveChannelAliases {
                 .values()
                 .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
                 .collect(),
+            approval_route_bindings,
         }
     }
 }
@@ -8186,7 +8700,8 @@ fn collect_configured_channels(
                     .with_team_ids(mm.team_ids.clone())
                     .with_discover_dms(mm.discover_dms.unwrap_or(true))
                     .with_proxy_url(mm.proxy_url.clone())
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription(config.transcription.clone())
+                    .with_listen_mode(mm.listen_mode),
                 ),
                 mm,
             ),
@@ -8587,7 +9102,15 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
-                nc.app_token.clone(),
+                nc.resolve_bot_secret().unwrap_or_else(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    None
+                }),
                 nc.bot_name.clone().unwrap_or_default(),
                 alias.clone(),
                 peer_resolver,
@@ -9749,6 +10272,10 @@ async fn assemble_channel_agent_tools(
                         connect_mcp: true,
                         connect_peripherals: true,
                         exclude_memory: false,
+                        // Channel listeners (Telegram, Slack, ...) do not transport an
+                        // ACP file attachment, so `deliver_file` is dropped here; only
+                        // the ACP turn path (Agent::from_*_backchannel) opts it in.
+                        acp_delivery: false,
                         // Channel startup is an execution surface (the agent actually runs),
                         // so deferral behaves as normal; the dashboard-only per-spec listing
                         // is off, matching `run`/`process_message`.
@@ -11109,8 +11636,96 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    /// Upper bound for "this must not deadlock" waits in the assembly tests.
+    ///
+    /// These guards exist to fail a genuine hang, not to assert how fast
+    /// assembly is. `scripts/ci/parallel_runtime_test_gate.sh` runs the suite
+    /// at 16 threads; under that contention the previous budgets stopped being
+    /// deadlock guards and became scheduling assertions. Assembly is
+    /// sub-second when it is not hung, so 30s cannot be reached by ordinary
+    /// runner load.
+    const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[test]
+    fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
+        // `config_path` and `data_dir` deliberately live under unrelated
+        // temp roots, so `config_path.parent()` (the old install-root-derived
+        // path) cannot accidentally coincide with `data_dir`. This proves the
+        // reader follows the canonical data directory, matching the writer
+        // in `zeroclaw-runtime::doctor::persist_model_cache`.
+        let config_root = TempDir::new().unwrap();
+        let data_root = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let state_dir = data_root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache = zeroclaw_config::schema::ModelCacheState {
+            entries: vec![zeroclaw_config::schema::ModelCacheEntry {
+                model_provider: "ollama.default".to_string(),
+                models: vec!["llama3".to_string()],
+            }],
+        };
+        std::fs::write(
+            state_dir.join(MODEL_CACHE_FILE),
+            serde_json::to_string_pretty(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let found =
+            load_cached_model_preview(data_root.path(), agent_workspace.path(), "ollama.default");
+        assert_eq!(found, vec!["llama3".to_string()]);
+
+        // The stale install-root-derived path (config_path's parent) must
+        // NOT be where the cache is found, since it differs from `data_dir`.
+        let not_found =
+            load_cached_model_preview(config_root.path(), agent_workspace.path(), "ollama.default");
+        assert!(
+            not_found.is_empty(),
+            "cache must not be visible under config_path's parent when it differs from data_dir"
+        );
+    }
+
+    #[test]
+    fn refresh_then_model_preview_joins_the_real_writer_and_reader() {
+        // Joins the two production halves of the refresh-to-preview contract
+        // directly, rather than exercising each in isolation: the actual
+        // `zeroclaw-runtime::doctor::persist_model_cache` writer (what
+        // `zeroclaw models refresh` calls), then this crate's actual
+        // `load_cached_model_preview` reader (what `/model` calls) — for an
+        // undotted provider ref (canonicalized to `openrouter.default` on both
+        // sides) and a custom, non-default agent workspace.
+        let data_root = TempDir::new().unwrap();
+        let custom_agent_workspace = TempDir::new().unwrap();
+
+        let config = Config {
+            config_path: data_root.path().join("config.toml"),
+            data_dir: data_root.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        zeroclaw_runtime::doctor::persist_model_cache(
+            &config,
+            "openrouter",
+            &["model-a".to_string(), "model-b".to_string()],
+        )
+        .unwrap();
+
+        let found = load_cached_model_preview(
+            data_root.path(),
+            custom_agent_workspace.path(),
+            "openrouter",
+        );
+
+        assert_eq!(
+            found,
+            vec!["model-a".to_string(), "model-b".to_string()],
+            "a refresh written by the real writer must be visible through the real reader \
+             for a non-default agent's custom workspace"
+        );
+    }
 
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
@@ -11552,6 +12167,98 @@ temperature = 0.3
             sop_engine: None,
             sop_audit: None,
         })
+    }
+
+    #[test]
+    fn stamp_session_routing_context_persists_message_metadata() {
+        struct Case {
+            history_key: &'static str,
+            channel: &'static str,
+            alias: Option<&'static str>,
+            thread: Option<&'static str>,
+            reply_target: &'static str,
+            sender: &'static str,
+            expected_channel: Option<&'static str>,
+            expected_room: Option<&'static str>,
+            expected_sender: Option<&'static str>,
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let ctx = ChannelRuntimeContext {
+            session_store: Some(Arc::clone(&session_store)),
+            ..(*router_test_ctx()).clone()
+        };
+        let cases = [
+            Case {
+                history_key: "threaded",
+                channel: "discord",
+                alias: Some("primary"),
+                thread: Some("thread-987654"),
+                reply_target: "channel-123",
+                sender: "thread-user",
+                expected_channel: Some("discord.primary"),
+                expected_room: Some("thread-987654"),
+                expected_sender: Some("thread-user"),
+            },
+            Case {
+                history_key: "reply-target",
+                channel: "discord",
+                alias: Some("secondary"),
+                thread: None,
+                reply_target: "dm-channel-555",
+                sender: "user42",
+                expected_channel: Some("discord.secondary"),
+                expected_room: Some("dm-channel-555"),
+                expected_sender: Some("user42"),
+            },
+            Case {
+                history_key: "no-alias",
+                channel: "cli",
+                alias: None,
+                thread: None,
+                reply_target: "stdin",
+                sender: "cli-user",
+                expected_channel: None,
+                expected_room: Some("stdin"),
+                expected_sender: Some("cli-user"),
+            },
+            Case {
+                history_key: "empty-sender",
+                channel: "matrix",
+                alias: Some("default"),
+                thread: None,
+                reply_target: "!room:matrix.org",
+                sender: "",
+                expected_channel: Some("matrix.default"),
+                expected_room: Some("!room:matrix.org"),
+                expected_sender: None,
+            },
+        ];
+
+        for case in cases {
+            let msg = ChannelMessage {
+                id: "msg-1".into(),
+                sender: case.sender.into(),
+                reply_target: case.reply_target.into(),
+                content: "hi".into(),
+                channel: case.channel.into(),
+                channel_alias: case.alias.map(String::from),
+                timestamp: 0,
+                thread_ts: case.thread.map(String::from),
+                ..Default::default()
+            };
+
+            stamp_session_routing_context(&ctx, &msg, case.history_key);
+
+            let metadata = session_store
+                .get_session_metadata(case.history_key)
+                .unwrap();
+            assert_eq!(metadata.channel_id.as_deref(), case.expected_channel);
+            assert_eq!(metadata.room_id.as_deref(), case.expected_room);
+            assert_eq!(metadata.sender_id.as_deref(), case.expected_sender);
+        }
     }
 
     #[tokio::test]
@@ -12995,6 +13702,7 @@ api_key = "anthropic-key"
         stop_typing_calls: AtomicUsize,
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
+        finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[derive(Default)]
@@ -13344,6 +14052,18 @@ api_key = "anthropic-key"
             ));
             Ok(())
         }
+
+        async fn finalize_gate_prompt(
+            &self,
+            reference: &str,
+            outcome: &str,
+        ) -> anyhow::Result<bool> {
+            self.finalized_gate_prompts
+                .lock()
+                .await
+                .push((reference.to_string(), outcome.to_string()));
+            Ok(true)
+        }
     }
 
     fn test_runtime_ctx_with_config_agent_and_provider_ref(
@@ -13519,22 +14239,6 @@ api_key = "anthropic-key"
         );
     }
 
-    /// Serializes tests that interact with the process-wide model-switch
-    /// request (`MODEL_SWITCH_REQUEST` in zeroclaw-runtime's agent loop).
-    /// While a pending request exists, ANY concurrently running
-    /// `process_channel_message` turn can observe it, short-circuit to the
-    /// switch handler, and clear it — so the test that sets it AND tests
-    /// whose assertions are sensitive to an unexpected switch retry must
-    /// hold this guard. `tokio::sync::Mutex` because it is held across
-    /// awaits; the `OnceLock` wrapper gives a `'static` initializer in a
-    /// `static` context without `lazy_static`.
-    static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-
-    fn model_switch_test_guard() -> &'static tokio::sync::Mutex<()> {
-        MODEL_SWITCH_TEST_GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     /// Observer that records every event, for turn-lifecycle assertions.
     #[derive(Default)]
     struct RecordingObserver {
@@ -13644,10 +14348,6 @@ api_key = "anthropic-key"
     /// all sharing one `turn_id` and carrying the channel + agent alias.
     #[tokio::test]
     async fn process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
-        // The exactly-one-AgentStart assertion is sensitive to a leaked
-        // process-wide model-switch request (the switch retry emits an
-        // extra re-attributing AgentStart), so serialize on the guard.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
@@ -13715,8 +14415,6 @@ api_key = "anthropic-key"
     /// and one `AgentEnd`, same `turn_id`.
     #[tokio::test]
     async fn process_channel_message_emits_brackets_when_llm_errors() {
-        // See the guard note on the success-turn bracket test.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
@@ -13752,8 +14450,6 @@ api_key = "anthropic-key"
     /// `AgentStart`.
     #[tokio::test]
     async fn process_channel_message_emits_brackets_when_cancelled_mid_turn() {
-        // See the guard note on the success-turn bracket test.
-        let _guard = model_switch_test_guard().lock().await;
         let token = CancellationToken::new();
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -14486,6 +15182,76 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[derive(Default)]
+    struct ModelSwitchRequestProvider {
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ModelSwitchRequestProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "switch-call".to_string(),
+                        name: "model_switch".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "set",
+                            "model_provider": "openrouter.default",
+                            "model": "switched-model"
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("original-provider-should-not-be-reused".to_string()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ModelSwitchRequestProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ModelSwitchRequestProvider"
+        }
+    }
+
+    #[derive(Default)]
     struct PrecheckProbeModelProvider {
         precheck_calls: AtomicUsize,
         main_calls: AtomicUsize,
@@ -14760,11 +15526,18 @@ BTC is currently around $65,000 based on latest tool output."#
             .await;
         Mock::given(method("POST"))
             .and(body_partial_json(serde_json::json!({"method":"resources/read"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc":"2.0","id":4,"result":{"contents":[
-                    {"uri":"file:///handbook.md","mimeType":"text/plain","text":"Pinned handbook body"}
-                ]}
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("resources/read request should be JSON")
+                    .get("id")
+                    .cloned()
+                    .expect("resources/read request should carry an id");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0","id":id,"result":{"contents":[
+                        {"uri":"file:///handbook.md","mimeType":"text/plain","text":"Pinned handbook body"}
+                    ]}
+                }))
+            })
             .mount(&server)
             .await;
         server
@@ -14823,7 +15596,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let assembled = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            ASSEMBLY_HANG_GUARD,
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
@@ -14935,7 +15708,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let _assembled = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            ASSEMBLY_HANG_GUARD,
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
@@ -14950,7 +15723,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .expect("assemble must not hang");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + ASSEMBLY_HANG_GUARD;
         let mut assembly_event = None;
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
@@ -16600,26 +17373,20 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_persists_model_switch_with_route_credential() {
-        // Serialize on the process-wide model-switch state so this test
-        // doesn't race other tests that also touch the same static.
-        let _guard = model_switch_test_guard().lock().await;
-        clear_model_switch_request();
-
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let default_model_provider_impl = Arc::new(ModelSwitchRequestProvider::default());
         let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
         let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
 
-        // The switch handler resolves the requested provider `openrouter` to
-        // a configured `<type>.<alias>` ref via
-        // `resolve_provider_ref_for_runtime_switch`, so the provider that is
-        // built, cached, and persisted is the dotted form.
+        // The model_switch tool requests the configured dotted provider ref;
+        // the switch handler must preserve it through provider construction,
+        // caching, and route persistence.
         let switched_provider_ref = "openrouter.default";
         let switched_key = Some("route-specific-key");
 
@@ -16639,14 +17406,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "fast".to_string(),
-            model_provider: "openrouter".to_string(),
+            model_provider: switched_provider_ref.to_string(),
             model: "switched-model".to_string(),
             api_key: Some("route-specific-key".to_string()),
         }];
 
-        // `resolve_provider_ref_for_runtime_switch` resolves `openrouter`
-        // against the configured providers, so the prompt config must define
-        // the `openrouter.default` entry for the switch to resolve and build.
+        // The prompt config owns the profile accepted by ModelSwitchTool and
+        // later resolved by the channel switch handler.
         let prompt_config = {
             let mut cfg = zeroclaw_config::schema::Config::default();
             {
@@ -16661,13 +17427,10 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::new(cfg)
         };
 
-        // Pre-set the model_switch request — simulates the tool having
-        // been called on a previous turn and waiting to be consumed.
-        {
-            let state = get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
-        }
+        let model_switch_tool = zeroclaw_runtime::tools::ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::clone(&prompt_config),
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -16683,7 +17446,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(vec![Box::new(model_switch_tool)]),
             observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -16726,7 +17489,10 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    auto_approve: vec!["model_switch".to_string()],
+                    ..zeroclaw_config::schema::RiskProfileConfig::default()
+                },
             )),
             activated_tools: None,
             cost_tracking: None,
@@ -16855,9 +17621,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 assert_eq!(start, end, "each logical turn must keep one matched pair");
             }
         }
-
-        // Clean up shared global state so we don't leak into other tests.
-        clear_model_switch_request();
     }
 
     #[tokio::test]
@@ -16997,6 +17760,10 @@ BTC is currently around $65,000 based on latest tool output."#
                         .get("message")
                         .and_then(|v| v.as_str())
                         .is_some_and(|m| m == "reply-intent precheck completed")
+                        && value
+                            .pointer("/attributes/message_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| id == "msg-precheck-log")
                     {
                         precheck_event = Some(value);
                         break;
@@ -20948,6 +21715,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             false,
+            zeroclaw_runtime::agent::TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("test-agent"),
+                turn_id: "test-turn",
+                channel_name: "test-channel",
+            },
         )
         .await
     }
@@ -21376,7 +22149,8 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        process_channel_message(
+        // Keep all three futures heap-backed to fit the Windows test-thread stack.
+        Box::pin(process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-before-new".to_string(),
@@ -21394,7 +22168,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         let skill_dir = workspace.path().join("skills").join("refresh-test");
@@ -21414,7 +22188,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "fresh-session prompt should pick up skills added after startup"
         );
 
-        process_channel_message(
+        Box::pin(process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-new-session".to_string(),
@@ -21432,7 +22206,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         {
@@ -21457,7 +22231,7 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
 
-        process_channel_message(
+        Box::pin(process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-after-new".to_string(),
@@ -21475,7 +22249,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         {
@@ -22161,13 +22935,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_persists_image_payload_verbatim() {
-        // `calls.len() == 1` below is sensitive to a leaked process-wide
-        // model-switch request (a pending request makes this turn
-        // short-circuit and retry, doubling the provider calls), so
-        // serialize on the shared guard. Observed colliding with
-        // `process_channel_message_persists_model_switch_with_route_credential`
-        // in parallel runs.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22913,6 +23680,7 @@ This is an example JSON object for profile settings."#;
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
                 proxy_url: None,
+                listen_mode: zeroclaw_config::schema::MattermostListenMode::default(),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
@@ -22961,6 +23729,7 @@ This is an example JSON object for profile settings."#;
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
                 proxy_url: None,
+                listen_mode: zeroclaw_config::schema::MattermostListenMode::default(),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
@@ -23109,6 +23878,125 @@ This is an example JSON object for profile settings."#;
             discord_channels[0].alias.as_deref(),
             Some("a"),
             "only the enabled owner's channel should be active"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn approval_route_collects_unowned_channel_without_agent_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.sop.approval.policies.insert(
+            "prod".to_string(),
+            zeroclaw_config::schema::ApprovalPolicyConfig {
+                request_route: Some("discord.ops:room-1".to_string()),
+                escalation_route: Some("discord.ops:room-2".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(
+            channel_map.contains_key("discord.ops"),
+            "the approval route's configured channel must be live for adapter delivery"
+        );
+
+        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
+        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        assert!(
+            !owners.contains_key("discord.ops"),
+            "approval-route liveness must not create an agent owner"
+        );
+
+        let worker_ctx = router_test_ctx();
+        let router = AgentRouter::multi(
+            HashMap::from([("worker".to_string(), worker_ctx)]),
+            owners,
+            None,
+            None,
+        );
+        assert!(
+            router
+                .resolve(&channel_message("discord", Some("ops")))
+                .is_none(),
+            "ordinary traffic on the approval-only alias must not reach the worker"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn bare_approval_route_collects_the_sole_enabled_alias() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: false,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.sop.approval.policies.insert(
+            "prod".to_string(),
+            zeroclaw_config::schema::ApprovalPolicyConfig {
+                request_route: Some("discord:room-1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(channel_map.contains_key("discord.ops"));
+        assert!(
+            channel_map.contains_key("discord"),
+            "the route adapter can resolve the bare singleton key"
+        );
+        assert!(
+            !channel_map.contains_key("discord.worker"),
+            "a disabled channel must not be revived just because a sibling route is active"
         );
     }
 
@@ -26792,6 +27680,44 @@ Done."#;
     }
 
     #[tokio::test]
+    #[cfg(feature = "channel-discord")]
+    async fn one_off_send_resolves_dotted_discord_alias() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "discord.governance", "123456789", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.discord.governance] not configured"),
+            "dotted alias should reach named channel resolution; got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-linq")]
+    async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
+        // `linq.<alias>` predates the announcement delegation and is resolved by
+        // the one-off builder itself. Delegating every dotted id would route it
+        // to an arm that does not exist, so assert it still lands on the
+        // builder's own alias lookup rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "linq.governance", "+15550100", "test message")
+            .await
+            .expect_err("unconfigured alias should fail at the builder's linq arm");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Linq alias 'governance' not configured"),
+            "dotted linq id should stay on the one-off builder; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted linq id must not be delegated to deliver_announcement; got: {message}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_routes_lark_to_lark_arm() {
         // Both names must enter the merged lark|feishu arm. Falling through
@@ -26976,6 +27902,142 @@ Done."#;
         }
     }
 
+    fn manual_sop_event() -> zeroclaw_runtime::sop::types::SopEvent {
+        zeroclaw_runtime::sop::types::SopEvent {
+            source: zeroclaw_runtime::sop::types::SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn channel_gate_sop(policy: Option<&str>) -> zeroclaw_runtime::sop::types::Sop {
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopStepKind,
+            SopTrigger,
+        };
+
+        Sop {
+            name: "channel-gate".to_string(),
+            description: "channel gate test".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Approve me".to_string(),
+                body: "Do the gated work".to_string(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::Execute,
+                schema: None,
+                policy: policy.map(str::to_string),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    fn channel_gate_config_with_routes(
+        request_route: Option<&str>,
+        escalation_route: Option<&str>,
+    ) -> zeroclaw_config::schema::SopConfig {
+        let mut config = zeroclaw_config::schema::SopConfig::default();
+        if request_route.is_some() || escalation_route.is_some() {
+            config.approval.policies.insert(
+                "prod".to_string(),
+                zeroclaw_config::schema::ApprovalPolicyConfig {
+                    request_route: request_route.map(str::to_string),
+                    escalation_route: escalation_route.map(str::to_string),
+                    ..zeroclaw_config::schema::ApprovalPolicyConfig::default()
+                },
+            );
+        }
+        config
+    }
+
+    fn parked_channel_gate_router(
+        policy: Option<&str>,
+        request_route: Option<&str>,
+    ) -> (
+        AgentRouter,
+        Arc<Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        parked_channel_gate_router_with_routes(policy, request_route, None)
+    }
+
+    fn parked_channel_gate_router_with_routes(
+        policy: Option<&str>,
+        request_route: Option<&str>,
+        escalation_route: Option<&str>,
+    ) -> (
+        AgentRouter,
+        Arc<Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        let mut engine = zeroclaw_runtime::sop::SopEngine::new(channel_gate_config_with_routes(
+            request_route,
+            escalation_route,
+        ));
+        engine.set_sops_for_test(vec![channel_gate_sop(policy)]);
+        let action = engine
+            .start_run("channel-gate", manual_sop_event())
+            .unwrap();
+        let run_id = match action {
+            zeroclaw_runtime::sop::types::SopRunAction::WaitApproval { run_id, .. } => run_id,
+            other => panic!("expected waiting approval, got {other:?}"),
+        };
+        let engine = Arc::new(Mutex::new(engine));
+        let router = AgentRouter {
+            by_agent: Arc::new(HashMap::new()),
+            owner_by_channel_key: Arc::new(HashMap::new()),
+            single_ctx: None,
+            sop_engine: Some(Arc::clone(&engine)),
+            sop_audit: None,
+        };
+        (router, engine, run_id)
+    }
+
+    fn active_run_status(
+        engine: &Arc<Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        run_id: &str,
+    ) -> Option<zeroclaw_runtime::sop::types::SopRunStatus> {
+        engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_run(run_id)
+            .map(|run| run.status)
+    }
+
+    async fn dispatch_test_channel_sop_gate(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        gate_channel: Option<Arc<dyn Channel>>,
+    ) -> bool {
+        let route_keys = vec![channel_key_for_message(msg)];
+        let gate_prompt_channels = gate_channel.into_iter().collect::<Vec<_>>();
+        let config = zeroclaw_config::schema::Config::default();
+        dispatch_channel_sop_gate(router, msg, &config, &gate_prompt_channels, &route_keys).await
+    }
+
+    async fn dispatch_test_channel_sop_gate_with_route_keys(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        route_keys: &[&str],
+    ) -> bool {
+        let route_keys: Vec<String> = route_keys.iter().map(|key| (*key).to_string()).collect();
+        let config = zeroclaw_config::schema::Config::default();
+        dispatch_channel_sop_gate(router, msg, &config, &[], &route_keys).await
+    }
+
     #[tokio::test]
     async fn dispatch_channel_sop_event_ignores_user_controlled_subject() {
         // An email-shaped message: the reserved prefix sits in the
@@ -27068,6 +28130,464 @@ Done."#;
             !raw_agent.resolved.parallel_tools,
             "raw agent resolved.parallel_tools should be false (serde-skipped default)"
         );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_marker_is_consumed_even_without_an_engine() {
+        // A `sop.gate:` marker message exists ONLY to answer a gate; it must be
+        // consumed (never fall through to an agent turn) even when no SOP
+        // engine is available to resolve it.
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("gnosis".to_string()),
+            sender: "111222333".to_string(),
+            content: "approve det-1-0001".to_string(),
+            internal_sop_event: Some("sop.gate:approve:det-1-0001".to_string()),
+            ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a gate-click marker must be consumed, not become an agent turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_falls_through_when_nothing_is_parked() {
+        // A bare "approve <ref>" text message with NO matching parked run is
+        // ordinary conversation — it must NOT be consumed as a gate answer.
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("gnosis".to_string()),
+            sender: "111222333".to_string(),
+            content: "approve det-9999-0001".to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a text reply with no parked-run match must fall through to the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_does_not_clear_unpoliced_parked_run() {
+        let (router, engine, run_id) = parked_channel_gate_router(None, None);
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "text replies must not clear parked runs that never emitted a request-route prompt"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_requires_matching_request_route() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-2".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-2", "", "discord", 0)
+        };
+
+        assert!(
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a text reply from the wrong room must fall through instead of resolving the gate"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_rejects_request_route_that_delivery_would_not_target() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some(" discord.ops:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "text replies must not normalize a configured request_route differently from delivery"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_rejects_short_suffix_reference() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        assert!(
+            run_id.ends_with('1'),
+            "the deterministic test run id should exercise the old one-character suffix match: {run_id}"
+        );
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: "approve 1".to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            !dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "plain text replies must carry the full prompt reference, not a short run-id suffix"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_marker_rejects_short_suffix_reference() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        assert!(
+            run_id.ends_with('1'),
+            "the deterministic test run id should exercise the old one-character suffix match: {run_id}"
+        );
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: String::new(),
+            internal_sop_event: Some("sop.gate:approve:1".to_string()),
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a stale marker is consumed, but must not resolve by short run-id suffix"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_resolves_bare_singleton_request_route() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_route_keys(
+                &router,
+                &msg,
+                &["discord.ops", "discord"],
+            )
+            .await,
+            "a bare singleton route should resolve when it maps to the same channel instance"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_resolves_matching_request_route() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a text reply from the request route remains a valid fallback answer"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_gate_approval_drives_resumed_execute_step() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("ops".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
+        };
+        let config = zeroclaw_config::schema::Config::default();
+
+        assert!(
+            dispatch_channel_sop_gate(&router, &msg, &config, &[], &["discord.ops".to_string()],)
+                .await,
+            "the channel approval must resolve the parked gate"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_run_status(&engine, &run_id)
+                    == Some(zeroclaw_runtime::sop::types::SopRunStatus::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("channel approval must schedule the resumed ExecuteStep");
+    }
+
+    #[tokio::test]
+    async fn approval_only_channel_gate_reply_bypasses_agent_ownership() {
+        let (mut router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("test-channel:room-1"));
+        let gate_channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let gate_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            gate_channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        router.by_agent = Arc::new(HashMap::from([("worker".to_string(), gate_ctx)]));
+
+        let msg = ChannelMessage {
+            channel: "test-channel".to_string(),
+            sender: "111222333".to_string(),
+            reply_target: "room-1".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-1", "", "test-channel", 0)
+        };
+        assert!(
+            router.resolve(&msg).is_none(),
+            "the configured approval route must not need an agent owner"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(msg).await.expect("queue gate reply");
+        drop(tx);
+        run_message_dispatch_loop(rx, router, 1).await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if active_run_status(&engine, &run_id)
+                    == Some(zeroclaw_runtime::sop::types::SopRunStatus::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the approval-only channel reply must drive the resumed action");
+    }
+
+    #[tokio::test]
+    async fn sop_gate_resolution_finalizes_request_and_escalation_channels() {
+        let (router, engine, run_id) = parked_channel_gate_router_with_routes(
+            Some("prod"),
+            Some("discord.ops:room-1"),
+            Some("discord.oncall:room-2"),
+        );
+        let request_channel = Arc::new(RecordingChannel::default());
+        let escalation_channel = Arc::new(RecordingChannel::default());
+        let prompt_channels: Vec<Arc<dyn Channel>> =
+            vec![request_channel.clone(), escalation_channel.clone()];
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("oncall".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-2".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-2", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_channel_sop_gate(
+                &router,
+                &msg,
+                &zeroclaw_config::schema::Config::default(),
+                &prompt_channels,
+                &["discord.oncall".to_string()],
+            )
+            .await,
+            "an approval on the escalation route should resolve the gate"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
+        for finalized in [
+            request_channel.finalized_gate_prompts.lock().await,
+            escalation_channel.finalized_gate_prompts.lock().await,
+        ] {
+            assert_eq!(finalized.len(), 1, "every active route channel finalizes");
+            assert_eq!(finalized[0].0, run_id);
+            assert!(finalized[0].1.contains("Approved"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_resolves_matching_escalation_route() {
+        let (router, engine, run_id) = parked_channel_gate_router_with_routes(
+            Some("prod"),
+            Some("discord.ops:room-1"),
+            Some("discord.oncall:room-2"),
+        );
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            channel_alias: Some("oncall".to_string()),
+            sender: "111222333".to_string(),
+            reply_target: "room-2".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "111222333", "room-2", "", "discord", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "a text reply from the route that receives escalation instructions must resolve"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
+    }
+
+    #[test]
+    fn gate_reference_parsing_defaults_bare_to_revision_zero() {
+        // Bare = revision 0 (the original presentation), NOT "current": a click
+        // on a superseded prompt must never resolve a newer draft.
+        assert_eq!(parse_gate_reference("det-1-0001"), ("det-1-0001".into(), 0));
+        assert_eq!(
+            parse_gate_reference("det-1-0001#2"),
+            ("det-1-0001".into(), 2)
+        );
+        // Malformed suffix: the whole string is the run part (matches nothing).
+        assert_eq!(
+            parse_gate_reference("det-1-0001#zz"),
+            ("det-1-0001#zz".into(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_edit_and_revise_markers_are_consumed() {
+        // Edit/Revise markers exist only to answer a gate — consumed even when
+        // no engine is available, exactly like approve/deny markers.
+        for (choice, content) in [
+            ("edit", "my rewritten draft"),
+            ("revise", "make it shorter"),
+        ] {
+            let msg = ChannelMessage {
+                channel: "discord".to_string(),
+                channel_alias: Some("gnosis".to_string()),
+                sender: "111222333".to_string(),
+                content: content.to_string(),
+                internal_sop_event: Some(format!("sop.gate:{choice}:det-1-0001#1")),
+                ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+            };
+            let router = router_without_sop_engine();
+            assert!(
+                dispatch_test_channel_sop_gate(&router, &msg, None).await,
+                "a {choice} marker must be consumed, not become an agent turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_gate_unknown_marker_choice_is_dropped() {
+        // An unknown choice in a marker is malformed — consumed (it can only be
+        // a gate artifact), never resolved as a decision. Guards the old
+        // behavior where any non-"approve" choice silently became a DENY.
+        let msg = ChannelMessage {
+            channel: "discord".to_string(),
+            sender: "111222333".to_string(),
+            content: "frobnicate det-1-0001".to_string(),
+            internal_sop_event: Some("sop.gate:frobnicate:det-1-0001".to_string()),
+            ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_test_channel_sop_gate(&router, &msg, None).await,
+            "an unknown-choice marker must still be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_ordinary_chat_never_matches() {
+        // Ordinary messages — even ones containing the word "approve" — must
+        // never be consumed by the gate intercept.
+        for content in [
+            "please approve my PR when you can",
+            "deny",
+            "approve",
+            "approve run 12 thanks",
+        ] {
+            let msg = ChannelMessage {
+                channel: "discord".to_string(),
+                sender: "111222333".to_string(),
+                content: content.to_string(),
+                internal_sop_event: None,
+                ..ChannelMessage::new("1", "111222333", "chan", "", "discord", 0)
+            };
+            let router = router_without_sop_engine();
+            assert!(
+                !dispatch_test_channel_sop_gate(&router, &msg, None).await,
+                "ordinary chat must fall through: {content:?}"
+            );
+        }
     }
 }
 

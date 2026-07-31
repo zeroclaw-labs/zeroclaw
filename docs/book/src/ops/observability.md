@@ -102,6 +102,23 @@ otel_tool_io_max_chars = 1000        # per-field truncation limit
 - Default `off` is a privacy-first change from previous behavior (feature-gated but always-on when enabled).
 - The content policy is bound to the observer/config instance, not to the process. There is no process-global OTel content policy: each `OtelObserver` derives an immutable content config from `ObservabilityConfig` at construction and consults it at the OTel export boundary. Multiple observers in the same process keep independent policies: a later observer cannot override or silence an earlier one's privacy setting (no last-writer-wins, no cross-observer drift).
 
+### Turn-nested memory and RAG spans (`observability-otel`)
+
+`memory.recall`, `memory.store`, and `rag.retrieve` spans nest under the
+`gen_ai.agent.invoke` turn span whenever the operation runs inside an
+attributed agent turn, so a full turn (memory recall, autosave store,
+LLM calls, tool calls) renders as one trace in Langfuse/Tempo. The three
+events carry the same `channel` / `agent_alias` / `turn_id` triple as LLM
+and tool events, exposed as `zeroclaw.channel`, `gen_ai.agent.name`, and
+`zeroclaw.turn_id` span attributes.
+
+Memory operations outside a correlated turn keep producing root spans: the
+gateway REST memory store, and the `process_message` hardware-RAG
+retrieval, which runs before the turn bracket opens and therefore stays a
+root span carrying the matching `zeroclaw.turn_id` attribute (full nesting
+of that span is tracked in #8844). A `turn_id` that no longer matches a
+live turn also degrades to a root span rather than guessing a parent.
+
 ### LLM request payload capture (`log_llm_request_payload`)
 
 `log_llm_request_payload` controls whether the `llm_request` event records the

@@ -160,6 +160,8 @@ api_key  = "..."
 endpoint = "intl"                            # variants: cn, intl
 ```
 
+For MiniMax's Anthropic-compatible API, use `[providers.models.anthropic.minimax]` with `uri = "https://api.minimax.io/anthropic"` (Global) or `uri = "https://api.minimaxi.com/anthropic"` (China) instead.
+
 ### Z.AI: slot `zai`
 
 For Z.AI's Anthropic-compatible API, use `[providers.models.anthropic.zai]` with `uri = "https://api.z.ai/api/anthropic"` instead.

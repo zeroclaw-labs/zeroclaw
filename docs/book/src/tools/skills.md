@@ -16,7 +16,7 @@ Use bundles for skills an agent should load during runtime. A bundle is configur
 
 For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` for instructions plus simple metadata. Use `SKILL.toml` when the skill needs structured prompts or tool definitions. ZeroClaw also understands `manifest.toml` for registry-style skill packages, but `SKILL.md` and `SKILL.toml` are the recommended local authoring formats.
 
-To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md).
+To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md). Note that those ride the plugin system, which prebuilt release binaries do not include; on a stock binary, the shared bundles on this page are the supported mechanism.
 
 ## Create a Markdown skill
 
@@ -140,7 +140,7 @@ zeroclaw skills audit ./release-check
 
 </div>
 
-Install a skill from a local directory, Git URL, registry name, or ClawHub source:
+Install a skill from a local directory, Git URL, or registry name:
 
 <div class="os-tabs-src">
 
@@ -150,7 +150,18 @@ Install a skill from a local directory, Git URL, registry name, or ClawHub sourc
 zeroclaw skills install ./release-check --bundle ops
 zeroclaw skills install https://example.com/zeroclaw-release-check.git --bundle ops
 zeroclaw skills install release-check --agent default
-zeroclaw skills install clawhub:release-check --bundle ops
+```
+
+</div>
+
+Install one skill by name from a Git catalog repository (a repo whose skills live under `skills/<name>/`):
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills install https://github.com/vercel-labs/skills --skill find-skills
 ```
 
 </div>
