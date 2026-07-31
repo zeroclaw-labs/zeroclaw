@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -29,6 +29,14 @@ pub struct ActionTracker {
     actions: Mutex<Vec<Instant>>,
 }
 
+const ACTION_WINDOW: Duration = Duration::from_secs(3600);
+
+fn retain_actions_after(actions: &mut Vec<Instant>, cutoff: Option<Instant>) {
+    if let Some(cutoff) = cutoff {
+        actions.retain(|timestamp| *timestamp > cutoff);
+    }
+}
+
 impl Default for ActionTracker {
     fn default() -> Self {
         Self::new()
@@ -45,21 +53,16 @@ impl ActionTracker {
     /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
-        actions.push(Instant::now());
+        let now = Instant::now();
+        retain_actions_after(&mut actions, now.checked_sub(ACTION_WINDOW));
+        actions.push(now);
         actions.len()
     }
 
     /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3600))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
+        retain_actions_after(&mut actions, Instant::now().checked_sub(ACTION_WINDOW));
         actions.len()
     }
 }
@@ -1803,6 +1806,36 @@ impl SecurityPolicy {
         false
     }
 
+    /// Return the canonical allowlisted root directory that authorizes reading
+    /// `resolved`: the workspace first, then read-write roots, then read-only
+    /// roots. Callers bind a directory-handle-scoped open (cap-std beneath/
+    /// no-follow) to this boundary instead of re-walking a pathname that could be
+    /// swapped between the readability check and the open. Returns `None` when no
+    /// bounded allowlist root contains the path (e.g. a fully permissive,
+    /// non-`workspace_only` policy, or a device path) — there is then no
+    /// confinement boundary to bind to. Assumes `resolved` is already canonical
+    /// and has passed [`Self::is_resolved_path_readable`].
+    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
+        let workspace_root = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        if resolved.starts_with(&workspace_root) {
+            return Some(workspace_root);
+        }
+        for root in self
+            .allowed_roots
+            .iter()
+            .chain(self.allowed_roots_read_only.iter())
+        {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return Some(canonical);
+            }
+        }
+        None
+    }
+
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         if is_null_device(resolved) {
             return true;
@@ -3285,6 +3318,15 @@ mod tests {
         assert_eq!(tracker.record(), 2);
         assert_eq!(tracker.record(), 3);
         assert_eq!(tracker.count(), 3);
+    }
+
+    #[test]
+    fn action_tracker_retains_actions_when_cutoff_is_unavailable() {
+        let mut actions = vec![Instant::now(), Instant::now()];
+
+        retain_actions_after(&mut actions, None);
+
+        assert_eq!(actions.len(), 2);
     }
 
     #[test]
@@ -5462,6 +5504,41 @@ mod tests {
         };
         assert!(p.is_command_allowed("diff <(ls dir1) <(ls dir2)"));
         assert!(p.is_command_allowed("tee >(grep error > errors.log)"));
+    }
+
+    #[test]
+    fn approved_read_root_returns_workspace_for_contained_paths() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws_canon = ws.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        };
+        // A path inside the workspace binds to the canonical workspace root.
+        assert_eq!(
+            policy.approved_read_root(&ws_canon.join("sub").join("a.txt")),
+            Some(ws_canon.clone())
+        );
+        // A path outside every allowlist has no bounded root.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_canon = outside.path().canonicalize().unwrap();
+        assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
+    }
+
+    #[test]
+    fn approved_read_root_honors_read_only_allowlist() {
+        let ws = tempfile::tempdir().unwrap();
+        let ro = tempfile::tempdir().unwrap();
+        let ro_canon = ro.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws.path().to_path_buf(),
+            allowed_roots_read_only: vec![ro.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            policy.approved_read_root(&ro_canon.join("doc.pdf")),
+            Some(ro_canon.clone())
+        );
     }
 
     #[test]

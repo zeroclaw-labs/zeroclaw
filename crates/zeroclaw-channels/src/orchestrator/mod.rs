@@ -1,6 +1,8 @@
 //! Channel subsystem for messaging platform integrations.
 
 #[cfg(feature = "channel-acp-server")]
+pub mod acp_embedded;
+#[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
@@ -96,7 +98,7 @@ use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
-use serde::Deserialize;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::ops::Range;
@@ -324,16 +326,8 @@ enum ChannelRuntimeCommand {
     InvalidThinking(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheState {
-    entries: Vec<ModelCacheEntry>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheEntry {
-    model_provider: String,
-    models: Vec<String>,
-}
+// ModelCacheState / ModelCacheEntry are defined in zeroclaw-config::schema
+// as the single source of truth for the on-disk cache contract.
 
 #[derive(Debug, Clone)]
 struct ChannelRuntimeDefaults {
@@ -2221,27 +2215,44 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
-fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
-    let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
-    let Ok(raw) = std::fs::read_to_string(cache_path) else {
-        return Vec::new();
-    };
-    let Ok(state) = serde_json::from_str::<ModelCacheState>(&raw) else {
-        return Vec::new();
+fn load_cached_model_preview(
+    data_dir: &Path,
+    agent_workspace_dir: &Path,
+    provider_name: &str,
+) -> Vec<String> {
+    // Canonicalize undotted names so lookup matches the cache key.
+    let canonical = if provider_name.contains('.') {
+        provider_name.to_string()
+    } else {
+        format!("{provider_name}.default")
     };
 
-    state
-        .entries
-        .into_iter()
-        .find(|entry| entry.model_provider == provider_name)
-        .map(|entry| {
-            entry
+    // Check the shared cache location first (written by `zeroclaw models refresh`),
+    // then fall back to the agent workspace for backward compatibility.
+    let shared_path = data_dir.join("state").join(MODEL_CACHE_FILE);
+    let agent_path = agent_workspace_dir.join("state").join(MODEL_CACHE_FILE);
+
+    for cache_path in [&shared_path, &agent_path] {
+        let Ok(raw) = std::fs::read_to_string(cache_path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<zeroclaw_config::schema::ModelCacheState>(&raw)
+        else {
+            continue;
+        };
+        if let Some(entry) = state
+            .entries
+            .into_iter()
+            .find(|e| e.model_provider == canonical)
+        {
+            return entry
                 .models
                 .into_iter()
                 .take(MODEL_CACHE_PREVIEW_LIMIT)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// Build a cache key that includes the runtime-defaults generation, the
@@ -2377,7 +2388,8 @@ async fn create_resilient_model_provider_nonblocking(
 
 fn build_models_help_response(
     current: &ChannelRouteSelection,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
@@ -2409,7 +2421,8 @@ fn build_models_help_response(
         }
     }
 
-    let cached_models = load_cached_model_preview(workspace_dir, &current.model_provider);
+    let cached_models =
+        load_cached_model_preview(data_dir, agent_workspace_dir, &current.model_provider);
     if cached_models.is_empty() {
         response.push('\n');
         response.push_str(&channel_runtime_cli_string_with_args(
@@ -2507,7 +2520,8 @@ fn build_config_text_response(
 /// Build a Slack Block Kit JSON payload for the `/config` interactive UI.
 fn build_config_block_kit(
     current: &ChannelRouteSelection,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    agent_workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let provider_options: Vec<serde_json::Value> = zeroclaw_providers::list_model_providers()
@@ -2536,7 +2550,7 @@ fn build_config_block_kit(
         })
         .collect();
 
-    let cached = load_cached_model_preview(workspace_dir, &current.model_provider);
+    let cached = load_cached_model_preview(data_dir, agent_workspace_dir, &current.model_provider);
     for model_id in cached {
         if !model_options.iter().any(|o| {
             o.get("value")
@@ -2777,6 +2791,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::ShowModel => {
             let mut resp = build_models_help_response(
                 &current,
+                ctx.prompt_config.data_dir.as_path(),
                 ctx.workspace_dir.as_path(),
                 &ctx.model_routes,
             );
@@ -2886,6 +2901,7 @@ async fn handle_runtime_command_if_needed(
             if msg.channel == "slack" {
                 let blocks_json = build_config_block_kit(
                     &current,
+                    ctx.prompt_config.data_dir.as_path(),
                     ctx.workspace_dir.as_path(),
                     &ctx.model_routes,
                 );
@@ -4539,26 +4555,23 @@ async fn process_channel_message_body(
         }
     }
 
-    if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
-        let wants = engine
-            .lock()
-            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
-            .unwrap_or(false);
-        if wants {
-            let topic = match &msg.channel_alias {
-                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
-                _ => msg.channel.clone(),
-            };
-            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
-                engine,
-                audit,
-                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-                Some(&topic),
-                Some(&msg.content),
-                None,
-            )
-            .await;
-        }
+    if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
+        let topic = match &msg.channel_alias {
+            Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+            _ => msg.channel.clone(),
+        };
+        zeroclaw_runtime::sop::dispatch::SopIngress::new(
+            ctx.sop_engine.as_ref(),
+            ctx.sop_audit.as_deref(),
+        )
+        .dispatch(
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some(&topic),
+            Some(&msg.content),
+            None,
+            None,
+        )
+        .await;
     }
 
     let history_key = conversation_history_key(&msg);
@@ -5346,7 +5359,7 @@ async fn process_channel_message_body(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 };
-            let tool_loop = run_tool_call_loop(ToolLoop {
+            let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -5428,7 +5441,7 @@ async fn process_channel_message_body(
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                 }),
-            });
+            }));
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
@@ -6754,48 +6767,19 @@ async fn dispatch_channel_sop_event(
         return false;
     };
 
-    let Some(engine) = router.sop_engine.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP engine is not available"
-        );
-        return true;
-    };
-    let Some(audit) = router.sop_audit.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP audit logger is not available"
-        );
-        return true;
-    };
-
-    let event = zeroclaw_runtime::sop::types::SopEvent {
-        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-        topic: Some(topic.to_string()),
-        payload: Some(msg.content.clone()),
-        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
-    };
     let target_sop = channel_sop_target(msg);
-    let results = if let Some(sop_name) = target_sop.as_deref() {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
-    } else {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
-    };
-    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    zeroclaw_runtime::sop::dispatch::SopIngress::new(
+        router.sop_engine.as_ref(),
+        router.sop_audit.as_deref(),
+    )
+    .dispatch(
+        zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        Some(topic),
+        Some(&msg.content),
+        target_sop.as_deref(),
+        None,
+    )
+    .await;
     true
 }
 
@@ -7274,6 +7258,28 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+/// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
+///
+/// One-off callers match on this sentinel instead of the error text so the
+/// builder stays the single source of truth for which ids it resolves; a family
+/// added or removed there changes the fallback automatically.
+#[derive(Debug)]
+struct UnknownChannelId(String);
+
+impl std::fmt::Display for UnknownChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(channel_id) = self;
+        write!(
+            f,
+            "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
+            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
+            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+        )
+    }
+}
+
+impl std::error::Error for UnknownChannelId {}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -7748,7 +7754,18 @@ fn build_channel_by_id(
             Ok(Arc::new(
                 NextcloudTalkChannel::new_with_proxy(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias,
                     peer_resolver,
@@ -8072,11 +8089,7 @@ fn build_channel_by_id(
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
-        other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
-        ),
+        other => Err(anyhow::Error::new(UnknownChannelId(other.to_string()))),
     }
 }
 
@@ -8090,7 +8103,24 @@ pub async fn send_channel_message(
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let channel = build_channel_by_id(&config_arc, channel_id)?;
+    // The builder gets first refusal so families it already resolves natively
+    // (notably `linq.<alias>`) keep their established route and their own
+    // configuration errors. Only a dotted id the builder does not claim at all
+    // falls through to the announcement dispatcher, which resolves any
+    // `<type>.<alias>` it supports.
+    let channel = match build_channel_by_id(&config_arc, channel_id) {
+        Ok(channel) => channel,
+        Err(err)
+            if channel_id.contains('.') && err.downcast_ref::<UnknownChannelId>().is_some() =>
+        {
+            deliver_announcement(config, channel_id, recipient, None, message)
+                .await
+                .with_context(|| format!("Failed to send message via {channel_id}"))?;
+            println!("Message sent via {channel_id}.");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let msg = SendMessage::new(message, recipient);
     channel
         .send(&msg)
@@ -9072,7 +9102,15 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
-                nc.app_token.clone(),
+                nc.resolve_bot_secret().unwrap_or_else(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    None
+                }),
                 nc.bot_name.clone().unwrap_or_default(),
                 alias.clone(),
                 peer_resolver,
@@ -10234,6 +10272,10 @@ async fn assemble_channel_agent_tools(
                         connect_mcp: true,
                         connect_peripherals: true,
                         exclude_memory: false,
+                        // Channel listeners (Telegram, Slack, ...) do not transport an
+                        // ACP file attachment, so `deliver_file` is dropped here; only
+                        // the ACP turn path (Agent::from_*_backchannel) opts it in.
+                        acp_delivery: false,
                         // Channel startup is an execution surface (the agent actually runs),
                         // so deferral behaves as normal; the dashboard-only per-spec listing
                         // is off, matching `run`/`process_message`.
@@ -11594,8 +11636,96 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    /// Upper bound for "this must not deadlock" waits in the assembly tests.
+    ///
+    /// These guards exist to fail a genuine hang, not to assert how fast
+    /// assembly is. `scripts/ci/parallel_runtime_test_gate.sh` runs the suite
+    /// at 16 threads; under that contention the previous budgets stopped being
+    /// deadlock guards and became scheduling assertions. Assembly is
+    /// sub-second when it is not hung, so 30s cannot be reached by ordinary
+    /// runner load.
+    const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[test]
+    fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
+        // `config_path` and `data_dir` deliberately live under unrelated
+        // temp roots, so `config_path.parent()` (the old install-root-derived
+        // path) cannot accidentally coincide with `data_dir`. This proves the
+        // reader follows the canonical data directory, matching the writer
+        // in `zeroclaw-runtime::doctor::persist_model_cache`.
+        let config_root = TempDir::new().unwrap();
+        let data_root = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let state_dir = data_root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let cache = zeroclaw_config::schema::ModelCacheState {
+            entries: vec![zeroclaw_config::schema::ModelCacheEntry {
+                model_provider: "ollama.default".to_string(),
+                models: vec!["llama3".to_string()],
+            }],
+        };
+        std::fs::write(
+            state_dir.join(MODEL_CACHE_FILE),
+            serde_json::to_string_pretty(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let found =
+            load_cached_model_preview(data_root.path(), agent_workspace.path(), "ollama.default");
+        assert_eq!(found, vec!["llama3".to_string()]);
+
+        // The stale install-root-derived path (config_path's parent) must
+        // NOT be where the cache is found, since it differs from `data_dir`.
+        let not_found =
+            load_cached_model_preview(config_root.path(), agent_workspace.path(), "ollama.default");
+        assert!(
+            not_found.is_empty(),
+            "cache must not be visible under config_path's parent when it differs from data_dir"
+        );
+    }
+
+    #[test]
+    fn refresh_then_model_preview_joins_the_real_writer_and_reader() {
+        // Joins the two production halves of the refresh-to-preview contract
+        // directly, rather than exercising each in isolation: the actual
+        // `zeroclaw-runtime::doctor::persist_model_cache` writer (what
+        // `zeroclaw models refresh` calls), then this crate's actual
+        // `load_cached_model_preview` reader (what `/model` calls) — for an
+        // undotted provider ref (canonicalized to `openrouter.default` on both
+        // sides) and a custom, non-default agent workspace.
+        let data_root = TempDir::new().unwrap();
+        let custom_agent_workspace = TempDir::new().unwrap();
+
+        let config = Config {
+            config_path: data_root.path().join("config.toml"),
+            data_dir: data_root.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        zeroclaw_runtime::doctor::persist_model_cache(
+            &config,
+            "openrouter",
+            &["model-a".to_string(), "model-b".to_string()],
+        )
+        .unwrap();
+
+        let found = load_cached_model_preview(
+            data_root.path(),
+            custom_agent_workspace.path(),
+            "openrouter",
+        );
+
+        assert_eq!(
+            found,
+            vec!["model-a".to_string(), "model-b".to_string()],
+            "a refresh written by the real writer must be visible through the real reader \
+             for a non-default agent's custom workspace"
+        );
+    }
 
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
@@ -15396,11 +15526,18 @@ BTC is currently around $65,000 based on latest tool output."#
             .await;
         Mock::given(method("POST"))
             .and(body_partial_json(serde_json::json!({"method":"resources/read"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc":"2.0","id":4,"result":{"contents":[
-                    {"uri":"file:///handbook.md","mimeType":"text/plain","text":"Pinned handbook body"}
-                ]}
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("resources/read request should be JSON")
+                    .get("id")
+                    .cloned()
+                    .expect("resources/read request should carry an id");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0","id":id,"result":{"contents":[
+                        {"uri":"file:///handbook.md","mimeType":"text/plain","text":"Pinned handbook body"}
+                    ]}
+                }))
+            })
             .mount(&server)
             .await;
         server
@@ -15459,7 +15596,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let assembled = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            ASSEMBLY_HANG_GUARD,
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
@@ -15571,7 +15708,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..SecurityPolicy::default()
         });
         let _assembled = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            ASSEMBLY_HANG_GUARD,
             assemble_channel_agent_tools(
                 &config,
                 "channel-agent",
@@ -15586,7 +15723,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .expect("assemble must not hang");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + ASSEMBLY_HANG_GUARD;
         let mut assembly_event = None;
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
@@ -22012,7 +22149,8 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        process_channel_message(
+        // Keep all three futures heap-backed to fit the Windows test-thread stack.
+        Box::pin(process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-before-new".to_string(),
@@ -22030,7 +22168,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         let skill_dir = workspace.path().join("skills").join("refresh-test");
@@ -22050,7 +22188,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "fresh-session prompt should pick up skills added after startup"
         );
 
-        process_channel_message(
+        Box::pin(process_channel_message(
             runtime_ctx.clone(),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-new-session".to_string(),
@@ -22068,7 +22206,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         {
@@ -22093,7 +22231,7 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
 
-        process_channel_message(
+        Box::pin(process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-after-new".to_string(),
@@ -22111,7 +22249,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..Default::default()
             },
             CancellationToken::new(),
-        )
+        ))
         .await;
 
         {
@@ -27538,6 +27676,44 @@ Done."#;
         assert!(
             !preamble.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {preamble}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-discord")]
+    async fn one_off_send_resolves_dotted_discord_alias() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "discord.governance", "123456789", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.discord.governance] not configured"),
+            "dotted alias should reach named channel resolution; got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-linq")]
+    async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
+        // `linq.<alias>` predates the announcement delegation and is resolved by
+        // the one-off builder itself. Delegating every dotted id would route it
+        // to an arm that does not exist, so assert it still lands on the
+        // builder's own alias lookup rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "linq.governance", "+15550100", "test message")
+            .await
+            .expect_err("unconfigured alias should fail at the builder's linq arm");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Linq alias 'governance' not configured"),
+            "dotted linq id should stay on the one-off builder; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted linq id must not be delegated to deliver_announcement; got: {message}"
         );
     }
 

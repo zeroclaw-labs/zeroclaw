@@ -8,6 +8,18 @@ instructions, prompts, and workflows rather than code, and you want plugin
 distribution semantics (signing, registry install, versioning) instead of
 loose files in a skills directory.
 
+> **Check your binary first.** Skill bundles ride the plugin machinery, and
+> the prebuilt release binaries the installer ships are built without the
+> `plugins-wasm` feature: on a stock binary `zeroclaw plugin ...` is an
+> unrecognized subcommand and plugin-shipped skills do not load. To use the
+> bundles on this page, build from source with a plugin execution backend,
+> e.g. `cargo build --release --features plugins-wasm-cranelift`. If you
+> just want a shared directory of skills on a stock binary, use the native
+> bundles described in [Skills](../tools/skills.md) instead:
+> `zeroclaw skills bundle add <alias>` creates one and
+> `zeroclaw skills install <source> --bundle <alias>` installs into it,
+> giving you the same skills without plugin distribution semantics.
+
 This guide is checked against the validation path in
 `crates/zeroclaw-plugins/src/host.rs` (`validate_skill_bundle`,
 `validate_skill_md_frontmatter`) and the loader in

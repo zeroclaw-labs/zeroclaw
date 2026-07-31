@@ -208,11 +208,11 @@ impl Tool for ClaudeCodeRunnerTool {
         }
         // Pass session metadata via env vars so the hook can correlate events
         use std::fmt::Write;
-        let _ = write!(env_exports, "CLAUDE_CODE_SESSION_ID={} ", &session_id);
+        let _ = write!(env_exports, "CLAUDE_CODE_SESSION_ID={} ", session_id);
         if let Some(ref ch) = slack_channel {
             let _ = write!(env_exports, "CLAUDE_CODE_SLACK_CHANNEL={} ", ch);
         }
-        let _ = write!(env_exports, "CLAUDE_CODE_HOOK_URL={} ", &hook_url);
+        let _ = write!(env_exports, "CLAUDE_CODE_HOOK_URL={} ", hook_url);
 
         // Create tmux session
         let create_result = Command::new("tmux")
@@ -472,15 +472,21 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_path_outside_workspace() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
         let tool = ClaudeCodeRunnerTool::new(
-            test_security(AutonomyLevel::Full),
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
             test_config(),
             "http://localhost:3000".into(),
         );
         let result = tool
             .execute(json!({
                 "prompt": "hello",
-                "working_directory": "/etc"
+                "working_directory": outside.path()
             }))
             .await
             .expect("should return a result for path validation");

@@ -258,16 +258,28 @@ fn normalize_models_with_pricing(
         .map(|e| ModelInfo {
             id: e.id.trim().to_string(),
             pricing: e.pricing,
+            // OpenAI-compatible `/v1/models` has no context-window field.
+            context_window: None,
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models
 }
 
-fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+/// Map a models.dev listing into `ModelInfo`, carrying through the catalog's
+/// context window. A model the catalog gives no `limit.context` for stays
+/// `None` — "unknown", never a stub value.
+fn models_dev_to_model_info(
+    models: Vec<(String, Option<usize>)>,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
-    ids.into_iter()
-        .map(|id| ModelInfo { id, pricing: None })
+    models
+        .into_iter()
+        .map(|(id, context_window)| ModelInfo {
+            id,
+            pricing: None,
+            context_window,
+        })
         .collect()
 }
 
@@ -2110,6 +2122,7 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
     ) -> Vec<NativeMessage> {
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
+        let requires_string_tool_call_content = self.requires_string_tool_call_content();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
@@ -2159,7 +2172,11 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
 
                     let content = crate::request_payload::non_empty_string_field(&value, "content")
-                        .map(MessageContent::Text);
+                        .map(MessageContent::Text)
+                        .or_else(|| {
+                            requires_string_tool_call_content
+                                .then(|| MessageContent::Text(String::new()))
+                        });
 
                     let (reasoning_content, reasoning) =
                         self.assistant_reasoning_pair_for_replay(&value);
@@ -2351,6 +2368,27 @@ impl OpenAiCompatibleModelProvider {
         }
 
         modified_messages
+    }
+
+    /// Whether this backend requires `content` to be a string on assistant
+    /// tool-call messages.
+    ///
+    /// OpenAI accepts the field absent or null there, and omitting it is the
+    /// default. Cloudflare Workers AI validates against a stricter schema and
+    /// rejects the whole request with HTTP 400 (`AiError: Bad input ...
+    /// required properties at '/messages/N' are 'role,content'`). The failure
+    /// is intermittent in practice: a model that emits text alongside its tool
+    /// call produces a non-empty content and succeeds, while the far more
+    /// common no-text tool call fails.
+    fn requires_string_tool_call_content(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
+            .is_some_and(|host| {
+                host == "api.cloudflare.com"
+                    || host == "gateway.ai.cloudflare.com"
+                    || host.ends_with(".cloudflare.com")
+            })
     }
 
     fn targets_mistral_tool_call_contract(&self) -> bool {
@@ -2582,7 +2620,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // No credential — try models.dev first (no pricing from that source),
         // then fall back to OpenRouter which does include pricing.
         if let Some(key) = &self.models_dev_key {
-            match crate::models_dev::list_models_for(key).await {
+            match crate::models_dev::list_models_with_context_for(key).await {
                 Ok(models) if !models.is_empty() => {
                     return Ok(models_dev_to_model_info(models));
                 }
@@ -6239,6 +6277,46 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_for_native_sends_string_tool_call_content_on_cloudflare() {
+        // Cloudflare Workers AI rejects an assistant tool-call message whose
+        // `content` is absent or null (HTTP 400, AiError 5006). Measured:
+        // content=null -> 400, content omitted -> 400, content="" -> 200.
+        // Every other backend keeps the omitting behaviour pinned by
+        // convert_messages_for_native_omits_empty_tool_call_content.
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "realms_proposal_firewall",
+                "arguments": "{}"
+            }]
+        });
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+
+        let cloudflare = make_model_provider(
+            "workers_ai",
+            "https://api.cloudflare.com/client/v4/accounts/acct/ai/v1/chat/completions",
+            None,
+        );
+        let native = cloudflare.convert_messages_for_native(&messages, true);
+        let json = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(
+            json.get("content"),
+            Some(&serde_json::Value::String(String::new())),
+            "Cloudflare must receive content as a string, not an omitted field"
+        );
+
+        let other = make_model_provider("test", "https://example.com", None);
+        let native = other.convert_messages_for_native(&messages, true);
+        let json = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(
+            json.get("content"),
+            None,
+            "non-Cloudflare backends keep the existing omitting behaviour"
+        );
+    }
+
+    #[test]
     fn convert_messages_for_native_reasoning_content_serialized_only_when_present() {
         // Verify skip_serializing_if works: reasoning_content omitted from JSON when None
         let msg_without = NativeMessage {
@@ -6729,8 +6807,8 @@ mod tests {
         // The models.dev catalog does not serve pricing data; every entry
         // must have `pricing: None`. This documents the intentional contract.
         let ids = vec![
-            "openai/gpt-4o".to_string(),
-            "anthropic/claude-sonnet-4-6".to_string(),
+            ("openai/gpt-4o".to_string(), None),
+            ("anthropic/claude-sonnet-4-6".to_string(), None),
         ];
         let models = models_dev_to_model_info(ids);
         assert_eq!(models.len(), 2);
@@ -6739,6 +6817,19 @@ mod tests {
         assert!(models[0].pricing.is_none());
         assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
         assert!(models[1].pricing.is_none());
+    }
+
+    #[test]
+    fn models_dev_to_model_info_carries_context_window() {
+        // The catalog's `limit.context` must survive the mapping, and a model
+        // the catalog gives no limit for must stay `None` — not a stub value.
+        let ids = vec![
+            ("anthropic/claude-opus-4-8".to_string(), Some(1_000_000)),
+            ("some/unknown-model".to_string(), None),
+        ];
+        let models = models_dev_to_model_info(ids);
+        assert_eq!(models[0].context_window, Some(1_000_000));
+        assert_eq!(models[1].context_window, None);
     }
 
     #[test]

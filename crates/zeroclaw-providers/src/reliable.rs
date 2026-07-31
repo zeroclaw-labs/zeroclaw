@@ -628,11 +628,25 @@ fn provider_exhausted_attrs(
     })
 }
 
-/// Truncate conversation history by dropping the oldest non-system messages.
-/// Returns the number of messages dropped. Keeps at least the system message
-/// (if any) and the most recent user message.
+fn is_context_turn_boundary(message: &ChatMessage) -> bool {
+    message.role == "user"
+        && !crate::multimodal::is_prompt_tool_result_message(message)
+        && !message.is_pruned_context_separator()
+}
+
+fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
+    if messages.iter().any(is_context_turn_boundary) {
+        "only one complete user turn remains"
+    } else {
+        "history contains no complete user turn"
+    }
+}
+
+/// Truncate conversation history at a user-turn boundary near the oldest half.
+/// Returns the number of non-system messages dropped while keeping at least the
+/// most recent complete turn and preserving tool calls with all of their
+/// results.
 fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
-    // Find all non-system message indices
     let non_system: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -640,21 +654,36 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
         .map(|(i, _)| i)
         .collect();
 
-    // Keep at least the last non-system message (most recent user turn)
-    if non_system.len() <= 1 {
+    let turn_boundaries: Vec<usize> = non_system
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &message_index)| {
+            is_context_turn_boundary(&messages[message_index]).then_some(position)
+        })
+        .collect();
+    if turn_boundaries.len() <= 1 {
         return 0;
     }
 
-    // Drop the oldest half of non-system messages
-    let drop_count = non_system.len() / 2;
-    let indices_to_remove: Vec<usize> = non_system[..drop_count].to_vec();
+    let target_drop = non_system.len() / 2;
+    let Some(&last_boundary) = turn_boundaries.last() else {
+        return 0;
+    };
+    let first_kept_position = turn_boundaries
+        .iter()
+        .copied()
+        .skip(1)
+        .find(|&position| position >= target_drop)
+        .unwrap_or(last_boundary);
+    let first_kept_index = non_system[first_kept_position];
+    let mut original_index = 0usize;
+    messages.retain(|message| {
+        let keep = message.role == "system" || original_index >= first_kept_index;
+        original_index += 1;
+        keep
+    });
 
-    // Remove in reverse order to preserve indices
-    for &idx in indices_to_remove.iter().rev() {
-        messages.remove(idx);
-    }
-
-    drop_count
+    first_kept_position
 }
 
 fn push_failure(
@@ -1280,10 +1309,10 @@ impl ModelProvider for ReliableModelProvider {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
-                                // Nothing to truncate (system prompt alone exceeds
-                                // the model's context window) — bail immediately
-                                // instead of wasting retry attempts.
+                                // No complete older turn can be removed safely.
                                 let error_detail = compact_error_detail(&e);
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
                                     provider_name,
@@ -1295,7 +1324,8 @@ impl ModelProvider for ReliableModelProvider {
                                     None,
                                 );
                                 anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced further. \
+                                    "Request exceeds model context window and cannot be reduced without \
+                                     breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
@@ -1529,10 +1559,10 @@ impl ModelProvider for ReliableModelProvider {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
-                                // Nothing to truncate (system prompt alone exceeds
-                                // the model's context window) — bail immediately
-                                // instead of wasting retry attempts.
+                                // No complete older turn can be removed safely.
                                 let error_detail = compact_error_detail(&e);
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
                                     provider_name,
@@ -1544,7 +1574,8 @@ impl ModelProvider for ReliableModelProvider {
                                     None,
                                 );
                                 anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced further. \
+                                    "Request exceeds model context window and cannot be reduced without \
+                                     breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
@@ -1739,10 +1770,10 @@ impl ModelProvider for ReliableModelProvider {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
-                                // Nothing to truncate (system prompt alone exceeds
-                                // the model's context window) — bail immediately
-                                // instead of wasting retry attempts.
+                                // No complete older turn can be removed safely.
                                 let error_detail = compact_error_detail(&e);
+                                let truncation_limit =
+                                    context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
                                     provider_name,
@@ -1754,7 +1785,8 @@ impl ModelProvider for ReliableModelProvider {
                                     None,
                                 );
                                 anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced further. \
+                                    "Request exceeds model context window and cannot be reduced without \
+                                     breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
@@ -4055,6 +4087,219 @@ mod tests {
         assert_eq!(messages.len(), 1);
     }
 
+    fn native_tool_call(ids: &[&str]) -> ChatMessage {
+        let tool_calls = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "name": "shell",
+                    "arguments": "{}",
+                })
+            })
+            .collect::<Vec<_>>();
+        ChatMessage::assistant(
+            serde_json::json!({
+                "content": "",
+                "tool_calls": tool_calls,
+            })
+            .to_string(),
+        )
+    }
+
+    fn native_tool_result(id: &str) -> ChatMessage {
+        ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": id,
+                "content": format!("result for {id}"),
+            })
+            .to_string(),
+        )
+    }
+
+    fn context_overflow_native_tool_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("run both tools"),
+            native_tool_call(&["call_1", "call_2"]),
+            native_tool_result("call_1"),
+            native_tool_result("call_2"),
+            ChatMessage::assistant("tool summary"),
+            ChatMessage::user("recent request"),
+            ChatMessage::assistant("recent response"),
+            ChatMessage::user("current question"),
+        ]
+    }
+
+    #[test]
+    fn truncate_for_context_drops_complete_parallel_native_tool_turn() {
+        let mut messages = context_overflow_native_tool_history();
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 7);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].content, "recent request");
+        assert_eq!(messages[2].content, "recent response");
+        assert_eq!(messages[3].content, "current question");
+        assert!(messages.iter().all(|message| message.role != "tool"));
+    }
+
+    #[test]
+    fn truncate_for_context_retains_complete_latest_parallel_native_tool_turn() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("run both tools"),
+            native_tool_call(&["call_1", "call_2"]),
+            native_tool_result("call_1"),
+            native_tool_result("call_2"),
+        ];
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 2);
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1].content, "run both tools");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[4].role, "tool");
+    }
+
+    #[test]
+    fn truncate_for_context_does_not_split_only_native_tool_turn() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("current request"),
+            native_tool_call(&["call_1", "call_2"]),
+            native_tool_result("call_1"),
+            native_tool_result("call_2"),
+        ];
+        let original = messages.clone();
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn truncate_for_context_treats_prompt_tool_results_as_part_of_turn() {
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("run a prompt tool"),
+            ChatMessage::assistant("<tool_call>...</tool_call>"),
+            ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
+            ChatMessage::assistant("tool summary"),
+            ChatMessage::user("current question"),
+        ];
+
+        let dropped = truncate_for_context(&mut messages);
+
+        assert_eq!(dropped, 6);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].content, "current question");
+    }
+
+    struct NativeContextOverflowMock {
+        calls: Arc<AtomicUsize>,
+        histories: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for NativeContextOverflowMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.histories.lock().push(request.messages.to_vec());
+            if attempt == 1 {
+                anyhow::bail!("maximum context length exceeded");
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NativeContextOverflowMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NativeContextOverflowMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_context_overflow_retry_sends_complete_native_tool_turns() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let histories = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mock = NativeContextOverflowMock {
+            calls: Arc::clone(&calls),
+            histories: Arc::clone(&histories),
+        };
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+            2,
+            1,
+        );
+        let messages = context_overflow_native_tool_history();
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let response = model_provider
+            .chat(request, "local-model", Some(0.0))
+            .await
+            .unwrap();
+
+        assert_eq!(response.text.as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let histories = histories.lock();
+        assert_eq!(histories.len(), 2);
+        assert_eq!(histories[1][1].content, "recent request");
+        assert!(histories[1].iter().all(|message| message.role != "tool"));
+    }
+
     /// Mock that fails with context error on first N calls, then succeeds.
     /// Tracks the number of messages received on each call.
     struct ContextOverflowMock {
@@ -4166,7 +4411,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("cannot be reduced further"),
+            err_msg.contains("without breaking message/tool pairing"),
             "Should bail with actionable message, got: {err_msg}"
         );
         // Should only be called once — no useless retries
