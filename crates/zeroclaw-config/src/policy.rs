@@ -227,6 +227,25 @@ impl SecurityPolicy {
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name))
     }
+
+    /// Effective admissibility as the runtime enforces it, mirroring
+    /// `ToolAccessPolicy::is_tool_allowed` (zeroclaw-tools): the deny list wins,
+    /// then a `None` allowlist admits everything, an empty allowlist admits
+    /// nothing, and a non-empty allowlist admits its listed names PLUS every
+    /// namespaced MCP `<server>__<tool>` name (the implicit MCP grant). This
+    /// differs from [`is_tool_allowed`](Self::is_tool_allowed), which is the
+    /// literal config-layer predicate with no MCP auto-admission, so escalation
+    /// comparisons must use this method to match runtime authorization.
+    fn effective_tool_allowed(&self, name: &str) -> bool {
+        if self.is_tool_excluded(name) {
+            return false;
+        }
+        match self.allowed_tools.as_ref() {
+            None => true,
+            Some(list) if list.is_empty() => false,
+            Some(list) => list.iter().any(|t| t == name) || is_mcp_tool_name(name),
+        }
+    }
 }
 
 /// Default allowed commands for Unix platforms.
@@ -430,6 +449,12 @@ pub enum EscalationViolation {
     /// An unrestricted child drops an `excluded_tools` entry from an
     /// unrestricted parent, making that tool newly reachable.
     ExcludedToolDroppedByChild { tool: String },
+    /// The child has a non-empty allowlist, which at runtime implicitly
+    /// admits every namespaced MCP `<server>__<tool>` tool, while the parent
+    /// is deny-all (`allowed_tools = Some([])`) and admits none. The implicit
+    /// MCP grant escalates beyond the parent even when every explicit entry is
+    /// self-excluded, so no ordinary allowlist entry trips the ceiling.
+    McpToolsUnrestrictedByChild,
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -497,6 +522,10 @@ impl std::fmt::Display for EscalationViolation {
             Self::ExcludedToolDroppedByChild { tool } => write!(
                 f,
                 "subagent drops excluded_tools entry {tool:?} that the parent enforces"
+            ),
+            Self::McpToolsUnrestrictedByChild => write!(
+                f,
+                "subagent's non-empty allowlist implicitly admits namespaced MCP tools, but the parent's deny-all allowlist admits none"
             ),
         }
     }
@@ -2144,38 +2173,47 @@ impl SecurityPolicy {
             return Err(EscalationViolation::RequireApprovalDisabledByChild);
         }
 
-        // Compare effective authorization, not the raw allow/deny fields:
-        // excluded_tools subtracts from allowed_tools in is_tool_allowed().
+        // Compare effective authorization, not the raw allow/deny fields.
+        // `effective_tool_allowed` mirrors the runtime `ToolAccessPolicy`
+        // (zeroclaw-tools): excluded_tools subtracts, and a non-empty allowlist
+        // implicitly admits every namespaced MCP `<server>__<tool>` name.
         match &self.allowed_tools {
             Some(child_allowed) => {
                 for tool in child_allowed {
-                    if self.is_tool_allowed(tool) && !parent.is_tool_allowed(tool) {
+                    if self.effective_tool_allowed(tool) && !parent.effective_tool_allowed(tool) {
                         return Err(EscalationViolation::ToolNotInParent { tool: tool.clone() });
                     }
                 }
 
-                // A nonempty allowlist does NOT restrict MCP tools: the runtime
-                // authorization policy (ToolAccessPolicy::is_tool_allowed in
-                // zeroclaw-tools) auto-admits every `<server>__<tool>` name once
-                // the allowlist is nonempty, gated only by the deny list. So for
-                // those namespaced tools the parent's exclusions are the sole
-                // ceiling and the child must retain them. An empty allowlist is
-                // deny-all and auto-admits nothing, so it needs no such check.
-                if !child_allowed.is_empty()
-                    && let Some(parent_excluded) = &parent.excluded_tools
-                {
-                    for tool in parent_excluded {
-                        if !is_mcp_tool_name(tool) {
-                            continue;
-                        }
-                        let child_keeps = self
-                            .excluded_tools
-                            .as_ref()
-                            .is_some_and(|c| c.iter().any(|ct| ct == tool));
-                        if !child_keeps {
-                            return Err(EscalationViolation::ExcludedToolDroppedByChild {
-                                tool: tool.clone(),
-                            });
+                // A non-empty allowlist implicitly admits the entire namespaced
+                // MCP universe at runtime, regardless of which explicit entries
+                // it lists (they may even be self-excluded). An empty allowlist
+                // is deny-all and admits nothing, so it needs no MCP checks.
+                if !child_allowed.is_empty() {
+                    // The child auto-admits MCP tools, so the parent must admit
+                    // them too. A deny-all parent (`Some([])`) admits none, so
+                    // any MCP-capable child escalates beyond it. (A `None` or
+                    // non-empty parent also auto-admits the MCP universe.)
+                    if matches!(&parent.allowed_tools, Some(p) if p.is_empty()) {
+                        return Err(EscalationViolation::McpToolsUnrestrictedByChild);
+                    }
+
+                    // For those auto-admitted MCP names the parent's exclusions
+                    // are the sole ceiling, so the child must retain them.
+                    if let Some(parent_excluded) = &parent.excluded_tools {
+                        for tool in parent_excluded {
+                            if !is_mcp_tool_name(tool) {
+                                continue;
+                            }
+                            let child_keeps = self
+                                .excluded_tools
+                                .as_ref()
+                                .is_some_and(|c| c.iter().any(|ct| ct == tool));
+                            if !child_keeps {
+                                return Err(EscalationViolation::ExcludedToolDroppedByChild {
+                                    tool: tool.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -5477,6 +5515,48 @@ mod tests {
         let child = SecurityPolicy {
             allowed_tools: Some(vec!["file_read".into()]),
             excluded_tools: None,
+            ..parent.clone()
+        };
+
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_deny_all_parent_under_self_excluded_mcp_child() {
+        // The implicit MCP grant escalates even when every explicit allowlist
+        // entry is self-excluded, so no ordinary allowlist entry trips the
+        // ceiling: `is_tool_allowed("sentinel")` is false, the ordinary loop
+        // skips it, and the deny-all parent has no MCP exclusion to retain. The
+        // child's non-empty allowlist nonetheless auto-admits MCP tools the
+        // parent denies, so the dedicated deny-all guard must catch it.
+        let parent = SecurityPolicy {
+            allowed_tools: Some(Vec::new()),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_tools: Some(vec!["sentinel".into()]),
+            excluded_tools: Some(vec!["sentinel".into()]),
+            ..parent.clone()
+        };
+
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("self-excluded MCP-capable child under a deny-all parent must be rejected");
+        assert_eq!(err, EscalationViolation::McpToolsUnrestrictedByChild);
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_child_mcp_allowlist_narrower_than_parent() {
+        // Both non-empty allowlists auto-admit the same namespaced MCP universe,
+        // so a child that lists only an MCP name while dropping the parent's
+        // plain grant is strictly narrower. The comparison must model the parent
+        // MCP auto-admission and not reject the child's `filesystem__read_file`.
+        let parent = SecurityPolicy {
+            allowed_tools: Some(vec!["spawn_subagent".into()]),
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            allowed_tools: Some(vec!["filesystem__read_file".into()]),
             ..parent.clone()
         };
 
