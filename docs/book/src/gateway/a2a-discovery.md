@@ -76,7 +76,7 @@ Response:
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.2",
+    "version": "0.8.3",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -147,7 +147,7 @@ Response:
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.2",
+    "version": "0.8.3",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -208,7 +208,7 @@ curl http://localhost:42617/a2a/agent_beta/.well-known/agent-card.json
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.2",
+    "version": "0.8.3",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,

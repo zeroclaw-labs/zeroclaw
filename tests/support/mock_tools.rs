@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use zeroclaw::tools::{Tool, ToolResult};
+use zeroclaw::tools::{Tool, ToolOutput, ToolResult};
 
 zeroclaw_api::mock_tool_attribution!(EchoTool, CountingTool, FailingTool, RecordingTool);
 
@@ -35,7 +35,7 @@ impl Tool for EchoTool {
             .to_string();
         Ok(ToolResult {
             success: true,
-            output: msg,
+            output: msg.into(),
             error: None,
         })
     }
@@ -74,7 +74,7 @@ impl Tool for CountingTool {
         *c += 1;
         Ok(ToolResult {
             success: true,
-            output: format!("call #{}", *c),
+            output: format!("call #{}", *c).into(),
             error: None,
         })
     }
@@ -97,7 +97,7 @@ impl Tool for FailingTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("Service unavailable: connection timeout".into()),
         })
     }
@@ -147,7 +147,7 @@ impl Tool for RecordingTool {
             .to_string();
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

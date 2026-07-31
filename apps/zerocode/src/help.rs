@@ -38,11 +38,6 @@ pub fn entries_for<A: RebindableActions>(actions: impl IntoIterator<Item = A>) -
         .collect()
 }
 
-/// Source guard: help rows must source their keys from the keybinding
-/// registry (`help_entries` / `entries_for` / `action_key_labels`), never
-/// from a hand-written key literal. A literal key in a help row drifts from
-/// user rebinds and silently omits new actions — exactly the class of bug
-/// this module exists to kill.
 #[cfg(test)]
 mod source_guard {
     use std::path::Path;

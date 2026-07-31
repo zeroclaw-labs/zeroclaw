@@ -1,5 +1,4 @@
 //! MCP (Model Context Protocol) client — connects to external tool servers.
-//!
 //! Supports multiple transports: stdio (spawn local process), HTTP, and SSE.
 
 use std::collections::HashMap;
@@ -12,14 +11,17 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
 use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
-use crate::mcp_transport::{McpTransportConn, McpTransportError, create_transport};
-use zeroclaw_config::schema::McpServerConfig;
+use crate::mcp_transport::{
+    McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
+    create_shared_transport,
+};
+use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
 /// Timeout for receiving a response from an MCP server during init/list.
 /// Prevents a hung server from blocking the daemon indefinitely.
@@ -31,19 +33,17 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 /// Maximum allowed tool call timeout (seconds) — hard safety ceiling.
 const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
-/// Maximum automatic reconnect attempts on a stale session or dropped
-/// transport before the tool-call error is surfaced to the caller.
+/// Maximum automatic reconnect attempts when a request is known not to have
+/// been written. Outcome-unknown requests are never replayed.
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
-
-/// Fixed backoff between reconnect attempts (milliseconds).
-const RECONNECT_BACKOFF_MS: u64 = 500;
 
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
 /// transport. Shared by the initial [`McpServer::connect`] and the
 /// reconnect-after-stale-session path in [`McpServer::call_tool`].
 async fn handshake(
-    transport: &mut dyn McpTransportConn,
+    transport: &dyn SharedMcpTransportConn,
     server_name: &str,
+    epoch: u64,
 ) -> Result<McpServerCapabilities> {
     let init_req = JsonRpcRequest::new(
         1,
@@ -58,9 +58,10 @@ async fn handshake(
         }),
     );
 
+    let init_lifecycle = McpRequestLifecycle::uncoordinated(epoch);
     let init_resp = timeout(
         Duration::from_secs(RECV_TIMEOUT_SECS),
-        transport.send_and_recv(&init_req),
+        transport.send_and_recv(&init_req, &init_lifecycle),
     )
     .await
     .with_context(|| {
@@ -86,7 +87,8 @@ async fn handshake(
     // Notify the server the client is initialized (notifications expect no
     // response). Best effort — ignore errors.
     let notif = JsonRpcRequest::notification("notifications/initialized", json!({}));
-    let _ = transport.send_and_recv(&notif).await;
+    let notif_lifecycle = McpRequestLifecycle::uncoordinated(epoch);
+    let _ = transport.send_and_recv(&notif, &notif_lifecycle).await;
 
     Ok(capabilities)
 }
@@ -121,14 +123,6 @@ impl McpServerCapabilities {
     }
 }
 
-/// Inspect an MCP method `result` for an `isError: true` envelope (HTTP 200 +
-/// error detail in `content[].text`, per the MCP spec) and convert it to an
-/// `Err`. The server-controlled detail is scrubbed for secrets and
-/// length-bounded via `sanitize_api_error` before it reaches logs or the
-/// returned error. Shared by `call_tool` and `dispatch_method`.
-///
-/// `op` is the human-readable operation label (tool name or RPC method) used in
-/// the log line and error message.
 fn check_result_is_error(result: &serde_json::Value, op: &str, server_name: &str) -> Result<()> {
     if result.get("isError").and_then(serde_json::Value::as_bool) != Some(true) {
         return Ok(());
@@ -163,7 +157,6 @@ fn check_result_is_error(result: &serde_json::Value, op: &str, server_name: &str
 
 struct McpServerInner {
     config: McpServerConfig,
-    transport: Box<dyn McpTransportConn>,
     #[cfg(target_has_atomic = "64")]
     next_id: AtomicU64,
     #[cfg(not(target_has_atomic = "64"))]
@@ -172,35 +165,181 @@ struct McpServerInner {
     capabilities: McpServerCapabilities,
 }
 
+// ── Recovery barrier ────────────────────────────────────────────────────────
+
+/// Synchronously-published gate that blocks new writes while a post-write
+/// outcome-unknown request is being recovered.
+///
+/// When a request's outcome becomes unknown after its bytes may have reached
+/// the server, `arm` is called *synchronously* — before any lock the failing
+/// request held is released — so that a second write already queued on the
+/// serial/epoch gate observes the recovery-needed state and waits, instead of
+/// racing ahead onto the ambiguous session. `finish` clears the gate once
+/// reset + re-handshake succeed; `poison` leaves it permanently closed after a
+/// failed recovery so later writes fail closed rather than proceeding without a
+/// successful MCP handshake.
+struct RecoveryBarrier {
+    /// The epoch that must be recovered before writes may resume. `None` means
+    /// no recovery is pending.
+    needed_epoch: std::sync::Mutex<Option<u64>>,
+    /// Set once recovery has permanently failed; the connection is unusable.
+    poisoned: std::sync::atomic::AtomicBool,
+    /// Pulsed whenever the recovery-needed state changes (cleared or poisoned)
+    /// so writers waiting in `wait_ready` wake up.
+    notify: tokio::sync::Notify,
+}
+
+impl RecoveryBarrier {
+    fn new() -> Self {
+        Self {
+            needed_epoch: std::sync::Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Publish that the observed epoch now needs recovery before any further
+    /// write. Idempotent for a given epoch; a newer epoch supersedes an older
+    /// pending one. This is intentionally synchronous (no `.await`) so it takes
+    /// effect the instant an outcome becomes unknown.
+    fn arm(&self, epoch: u64) {
+        let mut needed = self.needed_epoch.lock().unwrap();
+        match *needed {
+            Some(existing) if existing >= epoch => {}
+            _ => *needed = Some(epoch),
+        }
+    }
+
+    /// Clear the recovery-needed state after a successful reset + re-handshake
+    /// for `recovered_epoch`, then wake any waiting writers.
+    fn finish(&self, recovered_epoch: u64) {
+        {
+            let mut needed = self.needed_epoch.lock().unwrap();
+            if matches!(*needed, Some(pending) if pending <= recovered_epoch) {
+                *needed = None;
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Mark recovery as permanently failed. Subsequent writers fail closed.
+    fn poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recovery_pending(&self) -> bool {
+        self.needed_epoch.lock().unwrap().is_some()
+    }
+}
+
+impl McpRecoveryGate for RecoveryBarrier {
+    fn arm(&self, epoch: u64) {
+        RecoveryBarrier::arm(self, epoch);
+    }
+
+    fn write_blocked(&self) -> bool {
+        self.is_poisoned() || self.recovery_pending()
+    }
+}
+
+/// RAII guard that arms the recovery barrier synchronously if a write's outcome
+/// became unknown, at the moment its `send_request` future completes or is
+/// cancelled. Held under the serial gate and dropped before it, so a queued
+/// writer observes the armed barrier before it can acquire the gate.
+struct WriteBarrierArm<'a> {
+    recovery: &'a RecoveryBarrier,
+    lifecycle: &'a McpRequestLifecycle,
+}
+
+impl Drop for WriteBarrierArm<'_> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.lifecycle.outcome_unknown_epoch() {
+            self.recovery.arm(epoch);
+        }
+    }
+}
+
 // ── McpServer ──────────────────────────────────────────────────────────────
 
 /// A live connection to one MCP server (any transport).
 #[derive(Clone)]
 pub struct McpServer {
     inner: Arc<Mutex<McpServerInner>>,
+    transport: Arc<dyn SharedMcpTransportConn>,
+    epoch_gate: Arc<RwLock<u64>>,
+    /// Preserves the existing single-request behavior for HTTP/SSE while
+    /// allowing stdio requests to multiplex by response id.
+    serial_gate: Option<Arc<Mutex<()>>>,
+    /// Synchronously-published gate that holds back new writes until an
+    /// outcome-unknown request has been recovered (or fails them closed after a
+    /// failed recovery).
+    recovery: Arc<RecoveryBarrier>,
+}
+
+struct OutcomeUnknownGuard {
+    server: McpServer,
+    lifecycle: Arc<McpRequestLifecycle>,
+    operation: String,
+    armed: bool,
+}
+
+impl OutcomeUnknownGuard {
+    fn new(server: McpServer, lifecycle: Arc<McpRequestLifecycle>, operation: String) -> Self {
+        Self {
+            server,
+            lifecycle,
+            operation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutcomeUnknownGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(epoch) = self.lifecycle.outcome_unknown_epoch()
+        {
+            self.server.spawn_recovery(epoch, self.operation.clone());
+        }
+    }
 }
 
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the tool list.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
         // Create transport based on config
-        let mut transport = create_transport(&config).with_context(|| {
-            format!(
-                "failed to create transport for MCP server `{}`",
-                config.name
-            )
-        })?;
+        let transport: Arc<dyn SharedMcpTransportConn> =
+            Arc::from(create_shared_transport(&config).with_context(|| {
+                format!(
+                    "failed to create transport for MCP server `{}`",
+                    config.name
+                )
+            })?);
+        let epoch_gate = Arc::new(RwLock::new(0));
+        let serial_gate =
+            (config.transport != McpTransport::Stdio).then(|| Arc::new(Mutex::new(())));
 
         // Initialize handshake (initialize + initialized notification)
-        let capabilities = handshake(transport.as_mut(), &config.name).await?;
+        let capabilities = handshake(transport.as_ref(), &config.name, 0).await?;
 
         // Fetch available tools
         let id = 2u64;
         let list_req = JsonRpcRequest::new(id, "tools/list", json!({}));
 
+        let list_lifecycle = McpRequestLifecycle::uncoordinated(0);
         let list_resp = timeout(
             Duration::from_secs(RECV_TIMEOUT_SECS),
-            transport.send_and_recv(&list_req),
+            transport.send_and_recv(&list_req, &list_lifecycle),
         )
         .await
         .with_context(|| {
@@ -230,7 +369,6 @@ impl McpServer {
 
         let inner = McpServerInner {
             config,
-            transport,
             #[cfg(target_has_atomic = "64")]
             next_id: AtomicU64::new(3), // Start at 3 since we used 1 and 2
             #[cfg(not(target_has_atomic = "64"))]
@@ -250,6 +388,10 @@ impl McpServer {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate,
+            serial_gate,
+            recovery: Arc::new(RecoveryBarrier::new()),
         })
     }
 
@@ -268,112 +410,336 @@ impl McpServer {
         self.inner.lock().await.capabilities.clone()
     }
 
+    /// Health-check the underlying transport without sending a real request.
+    /// Returns `true` when the transport is alive, `false` otherwise.
+    ///
+    /// This reads transport-owned atomic connection state and does not acquire
+    /// the async server metadata lock.
+    pub fn health_check(&self) -> bool {
+        self.transport.health_check()
+    }
+
+    /// Identity comparison on the underlying transport handle. Two
+    /// `McpServer` values share the same connection iff `ptr_eq`
+    /// returns `true` — i.e. their inner `Arc<Mutex<McpServerInner>>`
+    /// points to the same allocation. Cheap Arc-level comparison, no
+    /// async, no lock.
+    ///
+    /// Used by the daemon's reconciliation layer to verify that a
+    /// "preserved" healthy server's live connection survives a
+    /// recovery tick without being silently disconnected and
+    /// respawned (the additive merge contract: a healthy handle
+    /// covers its name and is reused verbatim via `Arc::clone`).
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    async fn send_request(
+        &self,
+        request: &JsonRpcRequest,
+        lifecycle: &McpRequestLifecycle,
+    ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+        loop {
+            // Fail closed / wait for recovery before touching the write path. A
+            // request whose outcome became unknown publishes the recovery-needed
+            // state synchronously, so any writer that reaches here after that point
+            // must not POST/write on the ambiguous session until reset +
+            // re-handshake succeed.
+            self.wait_recovery_ready().await?;
+            let serial_guard = match &self.serial_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            // Re-check under the serial gate. A concurrent HTTP/SSE writer may have
+            // been queued on this gate when the outcome-unknown state was armed;
+            // acquiring the gate serializes us behind it, so this second check
+            // guarantees we never write on a session that still needs recovery.
+            if self.recovery.is_poisoned() || self.recovery.recovery_pending() {
+                drop(serial_guard);
+                continue;
+            }
+            // Arm the recovery barrier synchronously the instant this write's
+            // outcome becomes unknown — *before* the serial gate is released.
+            // Declared after `serial_guard` so it drops first: the next queued
+            // writer therefore observes the armed barrier under the gate and waits,
+            // instead of racing onto the ambiguous session.
+            let barrier_arm = WriteBarrierArm {
+                recovery: &self.recovery,
+                lifecycle,
+            };
+            let result = self.transport.send_and_recv(request, lifecycle).await;
+            drop(barrier_arm);
+            drop(serial_guard);
+
+            if matches!(
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.downcast_ref::<McpTransportError>()),
+                Some(McpTransportError::RecoveryPending)
+            ) {
+                continue;
+            }
+            return result;
+        }
+    }
+
+    /// Block until no recovery is pending, or fail closed if recovery has
+    /// permanently failed. Returns immediately when the connection is healthy.
+    async fn wait_recovery_ready(&self) -> Result<()> {
+        loop {
+            if self.recovery.is_poisoned() {
+                let server_name = self.inner.lock().await.config.name.clone();
+                bail!(
+                    "MCP server `{server_name}` is unavailable: a prior request's outcome became \
+                     unknown and recovery failed; not writing on an unrecovered session"
+                );
+            }
+            if !self.recovery.recovery_pending() {
+                return Ok(());
+            }
+            // Register for a wakeup *before* re-checking so we cannot miss a
+            // concurrent `finish`/`poison` pulse.
+            let notified = self.recovery.notify.notified();
+            if self.recovery.is_poisoned() {
+                continue;
+            }
+            if !self.recovery.recovery_pending() {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    fn start_recovery(
+        &self,
+        observed_epoch: u64,
+        operation: String,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let server = self.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let result = server.reestablish(observed_epoch).await;
+            if let Err(error) = &result {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reconnect)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "operation": operation,
+                            "error": format!("{error:#}"),
+                        })),
+                    "mcp_client: asynchronous recovery failed after outcome-unknown request"
+                );
+            }
+            result
+        })
+    }
+
+    fn spawn_recovery(&self, observed_epoch: u64, operation: String) {
+        // Publish the recovery-needed state synchronously so any writer that
+        // queues after this point waits for reset + re-handshake instead of
+        // racing onto the ambiguous session. This runs before the detached
+        // recovery task is scheduled and before the failing request releases
+        // its locks.
+        self.recovery.arm(observed_epoch);
+        // Dropping a Tokio JoinHandle detaches the task. Recovery therefore
+        // continues even if the request future that initiated it is cancelled.
+        drop(self.start_recovery(observed_epoch, operation));
+    }
+
+    async fn reestablish(&self, observed_epoch: u64) -> Result<()> {
+        // Keep HTTP/SSE reset ordering consistent with ordinary calls:
+        // serial gate first, then the epoch write gate.
+        let serial_guard = match &self.serial_gate {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        let mut epoch = self.epoch_gate.write().await;
+        if *epoch != observed_epoch {
+            // Another recovery already advanced past this epoch; the connection
+            // is live again, so release any writers still waiting on the
+            // barrier for this (or an older) epoch.
+            self.recovery.finish(observed_epoch);
+            return Ok(());
+        }
+        let server_name = self.inner.lock().await.config.name.clone();
+
+        if let Err(reset_error) = self.transport.reset().await {
+            // A failed reset leaves the session unrecoverable: fail closed so
+            // later writes do not proceed without a successful handshake.
+            self.recovery.poison();
+            let close_result = self.transport.close().await;
+            return match close_result {
+                Ok(()) => Err(reset_error).with_context(|| {
+                    format!("MCP server `{server_name}` failed to reset transport during recovery")
+                }),
+                Err(close_error) => Err(anyhow::Error::msg(format!(
+                    "MCP server `{server_name}` failed to reset transport during recovery: \
+                     {reset_error:#}; cleanup also failed: {close_error:#}"
+                ))),
+            };
+        }
+
+        let refreshed = match handshake(self.transport.as_ref(), &server_name, *epoch).await {
+            Ok(capabilities) => capabilities,
+            Err(handshake_error) => {
+                // A failed re-handshake leaves the connection without a live
+                // MCP session; poison the barrier so later tool calls fail
+                // closed instead of writing on an unhandshaken transport.
+                self.recovery.poison();
+                let close_result = self.transport.close().await;
+                return match close_result {
+                    Ok(()) => Err(handshake_error).with_context(|| {
+                        format!("MCP server `{server_name}` failed to re-handshake during recovery")
+                    }),
+                    Err(close_error) => Err(anyhow::Error::msg(format!(
+                        "MCP server `{server_name}` failed to re-handshake during recovery: \
+                         {handshake_error:#}; cleanup also failed: {close_error:#}"
+                    ))),
+                };
+            }
+        };
+
+        self.inner.lock().await.capabilities = refreshed;
+        *epoch = epoch.wrapping_add(1);
+        // Reset + re-handshake succeeded: clear the recovery-needed state and
+        // release any writers waiting on the barrier.
+        self.recovery.finish(observed_epoch);
+        drop(serial_guard);
+        Ok(())
+    }
+
+    async fn dispatch_rpc(
+        &self,
+        rpc_method: &str,
+        params: serde_json::Value,
+        timeout_secs: u64,
+        operation: &str,
+    ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut pre_write_retries = 0;
+
+        loop {
+            let (id, server_name) = {
+                let inner = self.inner.lock().await;
+                (
+                    inner.next_id.fetch_add(1, Ordering::Relaxed),
+                    inner.config.name.clone(),
+                )
+            };
+            let request = JsonRpcRequest::new(id, rpc_method, params.clone());
+            let recovery_gate: Arc<dyn McpRecoveryGate> = self.recovery.clone();
+            let lifecycle = Arc::new(McpRequestLifecycle::coordinated(
+                Arc::clone(&self.epoch_gate),
+                Some(recovery_gate),
+            ));
+            let mut cancellation_guard = OutcomeUnknownGuard::new(
+                self.clone(),
+                Arc::clone(&lifecycle),
+                operation.to_string(),
+            );
+
+            let send_result = timeout_at(deadline, self.send_request(&request, &lifecycle)).await;
+            match send_result {
+                Err(_) => {
+                    let unknown_epoch = lifecycle.outcome_unknown_epoch();
+                    cancellation_guard.disarm();
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "mcp_server": &server_name,
+                                "rpc_method": rpc_method,
+                                "timeout_secs": timeout_secs,
+                                "outcome_unknown": unknown_epoch.is_some(),
+                            })),
+                        "mcp_client: MCP request timed out"
+                    );
+                    if let Some(epoch) = unknown_epoch {
+                        self.spawn_recovery(epoch, operation.to_string());
+                        bail!(
+                            "MCP server `{server_name}` timed out after {timeout_secs}s during \
+                             {operation}; outcome unknown and request was not replayed"
+                        );
+                    }
+                    bail!(
+                        "MCP server `{server_name}` timed out after {timeout_secs}s before writing \
+                         {operation}"
+                    );
+                }
+                Ok(Ok(response)) => {
+                    cancellation_guard.disarm();
+                    return Ok(response);
+                }
+                Ok(Err(error)) => {
+                    if let Some(epoch) = lifecycle.outcome_unknown_epoch() {
+                        cancellation_guard.disarm();
+                        self.spawn_recovery(epoch, operation.to_string());
+                        return Err(error).with_context(|| {
+                            format!(
+                                "MCP server `{server_name}` failed during {operation}; outcome \
+                                 unknown and request was not replayed"
+                            )
+                        });
+                    }
+
+                    cancellation_guard.disarm();
+                    let recoverable = error.downcast_ref::<McpTransportError>().is_some();
+                    if recoverable && pre_write_retries < MAX_RECONNECT_ATTEMPTS {
+                        pre_write_retries += 1;
+                        let observed_epoch = lifecycle.pre_write_epoch().unwrap_or(0);
+                        let recovery = self.start_recovery(observed_epoch, operation.to_string());
+                        match timeout_at(deadline, recovery).await {
+                            Ok(Ok(result)) => result?,
+                            Ok(Err(join_error)) => {
+                                return Err(anyhow::Error::new(join_error)).with_context(|| {
+                                    format!(
+                                        "MCP server `{server_name}` recovery task failed before \
+                                         writing {operation}"
+                                    )
+                                });
+                            }
+                            Err(_) => {
+                                bail!(
+                                    "MCP server `{server_name}` exhausted the {timeout_secs}s \
+                                     budget recovering before writing {operation}"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("MCP server `{server_name}` error during {operation}")
+                    });
+                }
+            }
+        }
+    }
+
     /// Call a tool on this server. Returns the raw JSON result.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let mut inner = self.inner.lock().await;
-
-        // Use per-server tool timeout if configured, otherwise default.
-        // Cap at MAX_TOOL_TIMEOUT_SECS for safety.
-        let tool_timeout = inner
-            .config
-            .tool_timeout_secs
-            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
-            .min(MAX_TOOL_TIMEOUT_SECS);
-
-        // Bounded reconnect loop: a stale session (server restart) or a dropped
-        // transport (SSE stream EOF) is recovered by resetting the session and
-        // re-running the handshake, then retrying the call. Genuine tool errors
-        // (including `isError`) and timeouts are surfaced immediately and never
-        // retried.
-        let mut attempt = 0u32;
-        let resp = loop {
-            let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-            let req = JsonRpcRequest::new(
-                id,
+        let tool_timeout = {
+            let inner = self.inner.lock().await;
+            inner
+                .config
+                .tool_timeout_secs
+                .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
+                .min(MAX_TOOL_TIMEOUT_SECS)
+        };
+        let operation = format!("tool call `{tool_name}`");
+        let resp = self
+            .dispatch_rpc(
                 "tools/call",
                 json!({ "name": tool_name, "arguments": arguments }),
-            );
-
-            let send_result = timeout(
-                Duration::from_secs(tool_timeout),
-                inner.transport.send_and_recv(&req),
+                tool_timeout,
+                &operation,
             )
-            .await
-            .map_err(|_| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "mcp_server": &inner.config.name,
-                            "tool": tool_name,
-                            "timeout_secs": tool_timeout,
-                        })),
-                    "mcp_client: tool call timed out"
-                );
-                anyhow::Error::msg(format!(
-                    "MCP server `{}` timed out after {}s during tool call `{tool_name}`",
-                    inner.config.name, tool_timeout
-                ))
-            })?;
-
-            match send_result {
-                Ok(resp) => break resp,
-                Err(err) => {
-                    // Reconnect only on recoverable transport errors, within budget.
-                    let recoverable_reason = err
-                        .downcast_ref::<McpTransportError>()
-                        .map(|te| te.to_string());
-                    if let Some(reason) = recoverable_reason
-                        && attempt < MAX_RECONNECT_ATTEMPTS
-                    {
-                        attempt += 1;
-                        let server_name = inner.config.name.clone();
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Reconnect
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "mcp_server": &server_name,
-                                "tool": tool_name,
-                                "attempt": attempt,
-                                "max_attempts": MAX_RECONNECT_ATTEMPTS,
-                                "reason": &reason,
-                            })),
-                            "mcp_client: reconnecting after transport error and retrying tool call"
-                        );
-                        tokio::time::sleep(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
-                        inner.transport.reset().await.with_context(|| {
-                            format!(
-                                "MCP server `{server_name}` failed to reset transport during reconnect"
-                            )
-                        })?;
-                        let refreshed = handshake(inner.transport.as_mut(), &server_name)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "MCP server `{server_name}` failed to re-handshake during reconnect"
-                                )
-                            })?;
-                        inner.capabilities = refreshed;
-                        continue;
-                    }
-                    return Err(err).with_context(|| {
-                        format!(
-                            "MCP server `{}` error during tool call `{tool_name}`",
-                            inner.config.name
-                        )
-                    });
-                }
-            }
-        };
+            .await?;
 
         if let Some(err) = resp.error {
             bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
@@ -385,7 +751,8 @@ impl McpServer {
         // protocol errors) with HTTP 200 + `result.isError: true` and the detail
         // in `result.content[].text`, per the MCP spec. Surface it (scrubbed and
         // length-bounded) so the failure is visible to the model and the log.
-        check_result_is_error(&result, tool_name, &inner.config.name)?;
+        let server_name = self.inner.lock().await.config.name.clone();
+        check_result_is_error(&result, tool_name, &server_name)?;
 
         Ok(result)
     }
@@ -398,78 +765,25 @@ impl McpServer {
         rpc_method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let mut inner = self.inner.lock().await;
-
-        let tool_timeout = inner
-            .config
-            .tool_timeout_secs
-            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
-            .min(MAX_TOOL_TIMEOUT_SECS);
-
-        let mut attempt = 0u32;
-        let resp = loop {
-            let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
-            let req = JsonRpcRequest::new(id, rpc_method, params.clone());
-
-            let send_result = timeout(
-                Duration::from_secs(tool_timeout),
-                inner.transport.send_and_recv(&req),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::Error::msg(format!(
-                    "MCP server `{}` timed out after {}s during `{rpc_method}`",
-                    inner.config.name, tool_timeout
-                ))
-            })?;
-
-            match send_result {
-                Ok(resp) => break resp,
-                Err(err) => {
-                    let recoverable_reason = err
-                        .downcast_ref::<McpTransportError>()
-                        .map(|te| te.to_string());
-                    if let Some(_reason) = recoverable_reason
-                        && attempt < MAX_RECONNECT_ATTEMPTS
-                    {
-                        attempt += 1;
-                        let server_name = inner.config.name.clone();
-                        tokio::time::sleep(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
-                        inner.transport.reset().await.with_context(|| {
-                            format!(
-                                "MCP server `{server_name}` failed to reset transport during reconnect"
-                            )
-                        })?;
-                        let refreshed = handshake(inner.transport.as_mut(), &server_name)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "MCP server `{server_name}` failed to re-handshake during reconnect"
-                                )
-                            })?;
-                        inner.capabilities = refreshed;
-                        continue;
-                    }
-                    return Err(err).with_context(|| {
-                        format!(
-                            "MCP server `{}` error during `{rpc_method}`",
-                            inner.config.name
-                        )
-                    });
-                }
-            }
+        let tool_timeout = {
+            let inner = self.inner.lock().await;
+            inner
+                .config
+                .tool_timeout_secs
+                .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
+                .min(MAX_TOOL_TIMEOUT_SECS)
         };
+        let operation = format!("`{rpc_method}`");
+        let resp = self
+            .dispatch_rpc(rpc_method, params, tool_timeout, &operation)
+            .await?;
 
         if let Some(err) = resp.error {
             bail!("MCP `{rpc_method}` error {}: {}", err.code, err.message);
         }
         let result = resp.result.unwrap_or(serde_json::Value::Null);
-        // Surface MCP `result.isError: true` envelopes (HTTP 200 + error detail
-        // in `content[].text`) the same way `call_tool` does, with the detail
-        // scrubbed and length-bounded. resources/* and prompts/* can return
-        // these envelopes per the MCP spec, so the dispatch path must honor them
-        // instead of handing the model an error envelope dressed as success.
-        check_result_is_error(&result, rpc_method, &inner.config.name)?;
+        let server_name = self.inner.lock().await.config.name.clone();
+        check_result_is_error(&result, rpc_method, &server_name)?;
         Ok(result)
     }
 
@@ -604,6 +918,225 @@ impl McpRegistry {
         })
     }
 
+    /// Build a registry with `n` placeholder servers, each backed by a no-op
+    /// transport. The server names are `stub_0`, `stub_1`, ..., `stub_{n-1}`.
+    ///
+    /// Test-only: gated behind the `test-helpers` feature so it is NOT
+    /// available in production builds. Downstream test suites (e.g.
+    /// `zeroclaw-runtime::daemon`) enable the feature via their
+    /// `[dev-dependencies]` declaration and use this helper to build an
+    /// `Arc<McpRegistry>` whose `server_count() == n` without spawning a
+    /// real stdio child, so unit tests can exercise
+    /// "registry-completeness" decisions purely on `server_count()`. The
+    /// transport is a local no-op so the registry is safe to drop in tests
+    /// without leaking any OS resources — but it MUST NOT be used in
+    /// production code: any real MCP tool call on the resulting registry
+    /// will panic in the `unreachable!()` branch.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_count(n: usize) -> Self {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        /// No-op transport: never contacted in the daemon-side tests that
+        /// exercise `server_count`-driven decisions. Returning `Err` would
+        /// panic any caller that actually tries to use the registry; the
+        /// daemon tests only read `server_count` and compare Arc pointers,
+        /// so the unreachable body is acceptable.
+        struct NoopTransport;
+
+        #[async_trait]
+        impl SharedMcpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &self,
+                _request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_with_server_count registry is only used for server_count/Arc equality"
+                )
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn stub_server(name: &str) -> McpServer {
+            let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(NoopTransport);
+            let inner = McpServerInner {
+                config: McpServerConfig {
+                    name: name.to_string(),
+                    ..McpServerConfig::default()
+                },
+                #[cfg(target_has_atomic = "64")]
+                next_id: AtomicU64::new(0),
+                #[cfg(not(target_has_atomic = "64"))]
+                next_id: AtomicU32::new(0),
+                tools: Vec::new(),
+                capabilities: McpServerCapabilities::default(),
+            };
+            McpServer {
+                inner: Arc::new(Mutex::new(inner)),
+                transport,
+                epoch_gate: Arc::new(RwLock::new(0)),
+                serial_gate: None,
+                recovery: Arc::new(RecoveryBarrier::new()),
+            }
+        }
+
+        let mut servers = Vec::with_capacity(n);
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index = HashMap::new();
+        for i in 0..n {
+            let name = format!("stub_{i}");
+            let server_idx = servers.len();
+            server_index.insert(name.clone(), server_idx);
+            servers.push(stub_server(&name));
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Snapshot the live `(server_name, McpServer)` pairs registered
+    /// in this registry. Returned pairs are sorted by `server_name`
+    /// for deterministic ordering across ticks. Each `McpServer` is
+    /// a cheap `Arc` clone of the registered handle — re-inserting it
+    /// into another `McpRegistry` shares the underlying transport
+    /// (no disconnect, no new stdio child).
+    ///
+    /// Used by the daemon heartbeat's additive reconciliation layer
+    /// to preserve a healthy live connection across recovery ticks:
+    /// when `current` has a healthy server whose
+    /// identity still matches `fresh`, the daemon re-uses that
+    /// handle instead of forcing `connect_all` to spawn a duplicate
+    /// stdio child for the same endpoint.
+    pub fn server_handles(&self) -> Vec<(String, McpServer)> {
+        let mut out: Vec<(String, McpServer)> = self
+            .server_index
+            .iter()
+            .map(|(name, &idx)| (name.clone(), self.servers[idx].clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Build a new registry from a list of pre-existing `McpServer`
+    /// handles. The handles are cheaply Arc-cloned; transports
+    /// remain alive across the move. The internal `tool_index` and
+    /// `server_index` are rebuilt from each handle's advertised
+    /// capabilities (synchronous `tools()` call).
+    ///
+    /// Companion to [`Self::server_handles`]: callers wanting to
+    /// carry a healthy live connection into a fresh registry (the
+    /// additive recovery path) read the handle via `server_handles`
+    /// and rebuild via `from_servers`.
+    pub async fn from_servers(servers: Vec<McpServer>) -> Self {
+        let mut tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index: HashMap<String, usize> = HashMap::with_capacity(servers.len());
+        for (idx, server) in servers.iter().enumerate() {
+            let name = server.name().await;
+            let tools = server.tools().await;
+            for tool in &tools {
+                let prefixed = format!("{}__{}", name, tool.name);
+                tool_index.insert(prefixed, (idx, tool.name.clone()));
+            }
+            server_index.insert(name, idx);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Test-only: build a registry from pre-existing `(name, handle)`
+    /// pairs. Used by regression tests that need to assert the
+    /// daemon's reconciliation layer preserves a healthy server's
+    /// `McpServer` identity (cheap Arc pointer) across a recovery
+    /// tick. The handles are not re-validated — caller is responsible
+    /// for ensuring each `McpServer`'s `inner.config.name` matches the
+    /// paired name.
+    ///
+    /// Tool index is left empty: callers in regression tests
+    /// exercise identity / `server_count` / `server_names` only,
+    /// never tool lookup. Use [`Self::from_servers`] in production
+    /// paths where tool routing must remain valid.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_server_handles(handles: Vec<(String, McpServer)>) -> Self {
+        let mut servers: Vec<McpServer> = Vec::with_capacity(handles.len());
+        let tool_index: HashMap<String, (usize, String)> = HashMap::new();
+        let mut server_index: HashMap<String, usize> = HashMap::with_capacity(handles.len());
+        for (idx, (name, server)) in handles.into_iter().enumerate() {
+            server_index.insert(name, idx);
+            servers.push(server);
+        }
+        Self {
+            servers,
+            tool_index,
+            server_index,
+        }
+    }
+
+    /// Test-only: build a single stub `McpServer` handle with the
+    /// given `name`. The transport is a no-op (any actual call
+    /// panics in `unreachable!()`); only safe to use in regression
+    /// tests that exercise identity (`ptr_eq`) / `server_count` /
+    /// `server_names` / `health_check_all` and never make a real
+    /// tool call.
+    ///
+    /// Used to construct test registries where two registry builders
+    /// share a server handle — e.g. a healthy A handle that must
+    /// survive across a recovery tick into a freshly-merged registry.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_make_stub_server(name: &str) -> McpServer {
+        use crate::mcp_protocol::JsonRpcResponse;
+        use async_trait::async_trait;
+
+        struct NoopTransport;
+
+        #[async_trait]
+        impl SharedMcpTransportConn for NoopTransport {
+            async fn send_and_recv(
+                &self,
+                _request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                unreachable!(
+                    "for_test_make_stub_server is only used for identity / \
+                     ptr_eq / server_count assertions — never for actual tool calls"
+                )
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(NoopTransport);
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: name.to_string(),
+                ..McpServerConfig::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(0),
+            tools: Vec::new(),
+            capabilities: McpServerCapabilities::default(),
+        };
+        McpServer {
+            inner: std::sync::Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()
@@ -653,6 +1186,69 @@ impl McpRegistry {
 
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
+    }
+
+    /// Names of all connected servers.
+    pub fn server_names(&self) -> Vec<String> {
+        self.server_index.keys().cloned().collect()
+    }
+
+    /// Check health of every connected server. Returns names of dead servers.
+    pub fn health_check_all(&self) -> Vec<String> {
+        let names = self.server_names();
+        let mut dead = Vec::new();
+        for name in names {
+            if let Some(&idx) = self.server_index.get(&name)
+                && !self.servers[idx].health_check()
+            {
+                dead.push(name);
+            }
+        }
+        dead
+    }
+
+    /// Remove servers whose transport is dead.
+    /// Returns the names of servers that were removed.
+    ///
+    /// This is a no-op for the `for_test_with_server_count` registries used in
+    /// unit tests — those have no-op transports that always report alive, so
+    /// no server will ever be removed.
+    pub async fn kill_dead_connections(&mut self) -> Vec<String> {
+        let dead = self.health_check_all();
+        if dead.is_empty() {
+            return dead;
+        }
+
+        // Rebuild the registry without dead servers, updating indices
+        // so tool_index references remain valid.
+        let dead_set: std::collections::HashSet<_> = dead.iter().cloned().collect();
+
+        let mut new_servers = Vec::with_capacity(self.servers.len());
+        let mut new_server_index = HashMap::with_capacity(self.server_index.len());
+        let mut old_to_new_idx = HashMap::with_capacity(self.server_index.len());
+
+        for (name, &old_idx) in &self.server_index {
+            if dead_set.contains(name) {
+                continue;
+            }
+            let new_idx = new_servers.len();
+            new_servers.push(self.servers[old_idx].clone());
+            old_to_new_idx.insert(old_idx, new_idx);
+            new_server_index.insert(name.clone(), new_idx);
+        }
+
+        let mut new_tool_index = HashMap::with_capacity(self.tool_index.len());
+        for (prefixed, (old_srv_idx, tool_name)) in &self.tool_index {
+            if let Some(&new_srv_idx) = old_to_new_idx.get(old_srv_idx) {
+                new_tool_index.insert(prefixed.clone(), (new_srv_idx, tool_name.clone()));
+            }
+        }
+
+        self.servers = new_servers;
+        self.server_index = new_server_index;
+        self.tool_index = new_tool_index;
+
+        dead
     }
 
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.
@@ -798,7 +1394,70 @@ impl McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_transport::create_transport;
+    #[cfg(unix)]
+    use crate::mcp_transport::{StdioTransport, StdioWriteTestHook};
     use zeroclaw_config::schema::McpTransport;
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &std::path::Path, body: &[u8]) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut script = std::fs::File::create(path).expect("create script");
+        script.write_all(body).expect("write script");
+        drop(script);
+        let mut permissions = std::fs::metadata(path)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod script");
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn read_fifo(path: &std::path::Path) -> String {
+        tokio::time::timeout(Duration::from_secs(5), tokio::fs::read_to_string(path))
+            .await
+            .expect("fifo writer timed out")
+            .expect("read fifo")
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn stdio_test_config(
+        name: &str,
+        script: &std::path::Path,
+        args: Vec<String>,
+        timeout_secs: u64,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: script.display().to_string(),
+            args,
+            tool_timeout_secs: Some(timeout_secs),
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn tool_name_prefix_format() {
@@ -885,10 +1544,17 @@ mod tests {
         // prompts/list returns a bare name plus a nextCursor.
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method":"prompts/list"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "jsonrpc":"2.0","id":3,
-                "result":{"prompts":[{"name":"summarize"}],"nextCursor":"page2"}
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("JSON-RPC request")
+                    .get("id")
+                    .cloned()
+                    .expect("request id");
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc":"2.0","id":id,
+                    "result":{"prompts":[{"name":"summarize"}],"nextCursor":"page2"}
+                }))
+            })
             .mount(&server)
             .await;
 
@@ -1029,45 +1695,42 @@ mod tests {
         assert!(registry.is_empty());
     }
 
-    // ── McpServer::call_tool isError handling ──────────────────────────────
-    //
-    // These exercise the `result.isError == true` branch added to the
-    // *inherent* `McpServer::call_tool` (the one that talks to the transport,
-    // not the `McpRegistry::call_tool` wrapper). A fake transport returns a
-    // canned result so no live server is needed.
-
     /// Transport that ignores the request and always returns one preset result.
     struct FakeTransport {
         result: serde_json::Value,
     }
 
     #[async_trait::async_trait]
-    impl McpTransportConn for FakeTransport {
+    impl SharedMcpTransportConn for FakeTransport {
         async fn send_and_recv(
-            &mut self,
-            _request: &JsonRpcRequest,
+            &self,
+            request: &JsonRpcRequest,
+            _lifecycle: &McpRequestLifecycle,
         ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
             Ok(crate::mcp_protocol::JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
-                id: Some(serde_json::json!(1)),
+                id: request.id.clone(),
                 result: Some(self.result.clone()),
                 error: None,
             })
         }
 
-        async fn close(&mut self) -> Result<()> {
+        async fn close(&self) -> Result<()> {
             Ok(())
         }
     }
 
-    /// Build an `McpServer` whose transport yields `result` on every call.
-    fn server_returning(result: serde_json::Value) -> McpServer {
+    fn server_with_transport(
+        name: &str,
+        transport: Arc<dyn SharedMcpTransportConn>,
+        timeout_secs: u64,
+    ) -> McpServer {
         let inner = McpServerInner {
             config: McpServerConfig {
-                name: "fake".into(),
+                name: name.into(),
+                tool_timeout_secs: Some(timeout_secs),
                 ..Default::default()
             },
-            transport: Box::new(FakeTransport { result }),
             #[cfg(target_has_atomic = "64")]
             next_id: AtomicU64::new(3),
             #[cfg(not(target_has_atomic = "64"))]
@@ -1077,6 +1740,496 @@ mod tests {
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        }
+    }
+
+    struct PreWriteBlockingTransport {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        resets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for PreWriteBlockingTransport {
+        async fn send_and_recv(
+            &self,
+            _request: &JsonRpcRequest,
+            _lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err(McpTransportError::TransportClosed.into())
+        }
+
+        async fn reset(&self) -> Result<()> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_write_does_not_reset_or_replay() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(PreWriteBlockingTransport {
+            entered: Arc::clone(&entered),
+            release,
+            resets: Arc::clone(&resets),
+        });
+        let server = server_with_transport("pre-write", transport, 5);
+        let call_server = server.clone();
+        let call =
+            zeroclaw_spawn::spawn!(async move { call_server.call_tool("test", json!({})).await });
+        entered.notified().await;
+        call.abort();
+        assert!(
+            call.await
+                .expect_err("call must be cancelled")
+                .is_cancelled()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
+    }
+
+    struct CancellationSafeRecoveryTransport {
+        tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+        resets: Arc<std::sync::atomic::AtomicUsize>,
+        handshake_entered: Arc<tokio::sync::Notify>,
+        release_handshake: Arc<tokio::sync::Notify>,
+        handshake_completed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for CancellationSafeRecoveryTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            _lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            match request.method.as_str() {
+                "tools/call" if self.tool_calls.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    Err(McpTransportError::TransportClosed.into())
+                }
+                "initialize" => {
+                    self.handshake_entered.notify_one();
+                    self.release_handshake.notified().await;
+                    Ok(crate::mcp_protocol::JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id.clone(),
+                        result: Some(json!({
+                            "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "recovery", "version": "1"}
+                        })),
+                        error: None,
+                    })
+                }
+                "notifications/initialized" => {
+                    self.handshake_completed.notify_one();
+                    Ok(crate::mcp_protocol::JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: None,
+                        result: None,
+                        error: None,
+                    })
+                }
+                "tools/call" => Ok(crate::mcp_protocol::JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id.clone(),
+                    result: Some(json!({"ok": true})),
+                    error: None,
+                }),
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_recovery_does_not_abandon_rehandshake() {
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handshake_entered = Arc::new(tokio::sync::Notify::new());
+        let release_handshake = Arc::new(tokio::sync::Notify::new());
+        let handshake_completed = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> =
+            Arc::new(CancellationSafeRecoveryTransport {
+                tool_calls: Arc::clone(&tool_calls),
+                resets: Arc::clone(&resets),
+                handshake_entered: Arc::clone(&handshake_entered),
+                release_handshake: Arc::clone(&release_handshake),
+                handshake_completed: Arc::clone(&handshake_completed),
+            });
+        let server = server_with_transport("cancel-recovery", transport, 5);
+
+        let call_server = server.clone();
+        let call =
+            zeroclaw_spawn::spawn!(
+                async move { call_server.call_tool("side_effect", json!({})).await }
+            );
+        handshake_entered.notified().await;
+        call.abort();
+        assert!(
+            call.await
+                .expect_err("call must be cancelled")
+                .is_cancelled()
+        );
+
+        release_handshake.notify_one();
+        timeout(Duration::from_secs(2), handshake_completed.notified())
+            .await
+            .expect("detached recovery must finish its handshake");
+
+        let result = timeout(Duration::from_secs(2), server.call_tool("probe", json!({})))
+            .await
+            .expect("next call must not hang behind abandoned recovery")
+            .expect("next call must use recovered connection");
+        assert_eq!(result, json!({"ok": true}));
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct FailedResetTransport;
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for FailedResetTransport {
+        async fn send_and_recv(
+            &self,
+            _request: &JsonRpcRequest,
+            _lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            unreachable!("failed-reset test never sends a request")
+        }
+
+        async fn reset(&self) -> Result<()> {
+            bail!("reset/reap failed")
+        }
+
+        async fn close(&self) -> Result<()> {
+            bail!("cleanup failed")
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_surfaces_reset_and_cleanup_failures() {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FailedResetTransport);
+        let server = server_with_transport("broken", transport, 5);
+        let error = server
+            .reestablish(0)
+            .await
+            .expect_err("failed reset and cleanup must surface");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("reset/reap failed"), "got: {detail}");
+        assert!(detail.contains("cleanup failed"), "got: {detail}");
+    }
+
+    struct TimeoutThenRecoverTransport {
+        tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+        recovered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for TimeoutThenRecoverTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            if request.method == "tools/call" {
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                lifecycle.mark_outcome_unknown(0);
+                std::future::pending().await
+            }
+            Ok(crate::mcp_protocol::JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id.clone(),
+                result: Some(json!({})),
+                error: None,
+            })
+        }
+
+        async fn reset(&self) -> Result<()> {
+            self.recovered.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_recovers_without_replaying_outcome_unknown_tool() {
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(TimeoutThenRecoverTransport {
+            tool_calls: Arc::clone(&tool_calls),
+            recovered: Arc::clone(&recovered),
+        });
+        let server = server_with_transport("timeout", transport, 1);
+
+        let error = timeout(
+            Duration::from_secs(2),
+            server.call_tool("side_effect", json!({})),
+        )
+        .await
+        .expect("configured timeout must return promptly")
+        .expect_err("tool must time out");
+        assert!(
+            error.to_string().contains("outcome unknown")
+                && error.to_string().contains("not replayed"),
+            "got: {error:#}"
+        );
+        timeout(Duration::from_secs(2), async {
+            while !recovered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery did not run");
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Like `server_with_transport` but with an HTTP/SSE-style serial gate so a
+    /// second concurrent write queues behind the first.
+    fn server_with_serialized_transport(
+        name: &str,
+        transport: Arc<dyn SharedMcpTransportConn>,
+        timeout_secs: u64,
+    ) -> McpServer {
+        let mut server = server_with_transport(name, transport, timeout_secs);
+        server.serial_gate = Some(Arc::new(Mutex::new(())));
+        server
+    }
+
+    /// Transport whose first `tools/call` marks the outcome unknown after
+    /// "writing" and then hangs (the caller cancels it). A later `reset` +
+    /// re-handshake succeeds. Records the exact ordering of writes vs. reset so
+    /// tests can prove a queued second call never writes on the ambiguous
+    /// session before recovery completes.
+    struct QueuedAfterUnknownTransport {
+        tool_writes: Arc<std::sync::atomic::AtomicUsize>,
+        reset_done: Arc<std::sync::atomic::AtomicBool>,
+        wrote_before_reset: Arc<std::sync::atomic::AtomicBool>,
+        first_entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for QueuedAfterUnknownTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            match request.method.as_str() {
+                "tools/call" => {
+                    let n = self.tool_writes.fetch_add(1, Ordering::SeqCst);
+                    if !self.reset_done.load(Ordering::SeqCst) && n > 0 {
+                        // A write reached the transport while recovery had not
+                        // yet reset the session — the exact bug we guard.
+                        self.wrote_before_reset.store(true, Ordering::SeqCst);
+                    }
+                    if n == 0 {
+                        // First call: outcome becomes unknown after the write,
+                        // then the future hangs until the caller cancels it.
+                        lifecycle.mark_outcome_unknown(0);
+                        self.first_entered.notify_one();
+                        std::future::pending::<()>().await;
+                        unreachable!("cancelled before resuming");
+                    }
+                    Ok(crate::mcp_protocol::JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id.clone(),
+                        result: Some(json!({"ok": true})),
+                        error: None,
+                    })
+                }
+                "initialize" => Ok(crate::mcp_protocol::JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id.clone(),
+                    result: Some(json!({
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "queued", "version": "1"}
+                    })),
+                    error: None,
+                }),
+                "notifications/initialized" => Ok(crate::mcp_protocol::JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: None,
+                    result: None,
+                    error: None,
+                }),
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            self.reset_done.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A second serialized call queued while the first call's outcome is
+    /// unknown must wait for reset + re-handshake and must never write on the
+    /// ambiguous session before recovery completes.
+    #[tokio::test]
+    async fn queued_write_waits_for_recovery_after_outcome_unknown() {
+        let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reset_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote_before_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(QueuedAfterUnknownTransport {
+            tool_writes: Arc::clone(&tool_writes),
+            reset_done: Arc::clone(&reset_done),
+            wrote_before_reset: Arc::clone(&wrote_before_reset),
+            first_entered: Arc::clone(&first_entered),
+        });
+        let server = server_with_serialized_transport("queued", transport, 5);
+
+        // First call writes, marks outcome-unknown, then hangs; cancel it.
+        let first_server = server.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        first_entered.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        // The queued second call must not resolve until recovery reset the
+        // session, and must never write before that reset.
+        let second = timeout(Duration::from_secs(3), server.call_tool("probe", json!({})))
+            .await
+            .expect("second call must not hang behind recovery")
+            .expect("second call must succeed on the recovered session");
+        assert_eq!(second, json!({"ok": true}));
+        assert!(
+            !wrote_before_reset.load(Ordering::SeqCst),
+            "second call wrote on the ambiguous session before reset/re-handshake"
+        );
+        assert!(
+            reset_done.load(Ordering::SeqCst),
+            "recovery must have reset the session before the second write"
+        );
+        // Two tool writes total: the cancelled first and the recovered second.
+        assert_eq!(tool_writes.load(Ordering::SeqCst), 2);
+    }
+
+    /// Transport whose first `tools/call` becomes outcome-unknown after writing,
+    /// but whose recovery re-handshake permanently fails.
+    struct FailedRehandshakeTransport {
+        tool_writes: Arc<std::sync::atomic::AtomicUsize>,
+        first_entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for FailedRehandshakeTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            match request.method.as_str() {
+                "tools/call" => {
+                    self.tool_writes.fetch_add(1, Ordering::SeqCst);
+                    lifecycle.mark_outcome_unknown(0);
+                    self.first_entered.notify_one();
+                    std::future::pending::<()>().await;
+                    unreachable!("cancelled before resuming");
+                }
+                // Re-handshake fails: `initialize` errors during recovery.
+                "initialize" => bail!("re-handshake refused"),
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// After a post-write outcome-unknown request whose recovery re-handshake
+    /// fails, later calls must fail closed instead of writing on an
+    /// unrecovered/unhandshaken session.
+    #[tokio::test]
+    async fn failed_rehandshake_fails_closed_for_later_calls() {
+        let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FailedRehandshakeTransport {
+            tool_writes: Arc::clone(&tool_writes),
+            first_entered: Arc::clone(&first_entered),
+        });
+        let server = server_with_serialized_transport("failing", transport, 5);
+
+        let first_server = server.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        first_entered.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        // Recovery (detached) must poison the barrier once its re-handshake
+        // fails; the next call then fails closed without writing.
+        let error = timeout(Duration::from_secs(3), server.call_tool("probe", json!({})))
+            .await
+            .expect("later call must not hang behind a failed recovery")
+            .expect_err("later call must fail closed after failed re-handshake");
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("unavailable") || detail.contains("recovery failed"),
+            "expected fail-closed error, got: {detail}"
+        );
+        // Only the first (cancelled) call ever wrote a tool request.
+        assert_eq!(tool_writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Build an `McpServer` whose transport yields `result` on every call.
+    fn server_returning(result: serde_json::Value) -> McpServer {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FakeTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: "fake".into(),
+                ..Default::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![],
+            capabilities: McpServerCapabilities::default(),
+        };
+        McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
         }
     }
 
@@ -1085,12 +2238,12 @@ mod tests {
         capabilities: McpServerCapabilities,
         result: serde_json::Value,
     ) -> McpServer {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FakeTransport { result });
         let inner = McpServerInner {
             config: McpServerConfig {
                 name: "fake".into(),
                 ..Default::default()
             },
-            transport: Box::new(FakeTransport { result }),
             #[cfg(target_has_atomic = "64")]
             next_id: AtomicU64::new(3),
             #[cfg(not(target_has_atomic = "64"))]
@@ -1100,6 +2253,10 @@ mod tests {
         };
         McpServer {
             inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
         }
     }
 
@@ -1260,16 +2417,6 @@ mod tests {
         use std::path::Path;
         use tokio::time::{Duration, sleep};
 
-        fn process_is_alive(pid: u32) -> bool {
-            std::process::Command::new("kill")
-                .arg("-0")
-                .arg(pid.to_string())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        }
-
         async fn read_pid(path: &Path) -> u32 {
             for _ in 0..50 {
                 if let Ok(raw) = tokio::fs::read_to_string(path).await
@@ -1345,6 +2492,305 @@ done
         panic!("stdio MCP child process {child_pid} survived after registry drop");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_concurrent_calls_route_mismatched_and_out_of_order_replies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("multiplex-mcp.sh");
+        let first_received = temp.path().join("first-received.fifo");
+        make_fifo(&first_received);
+        write_executable_script(
+            &script_path,
+            br#"#!/bin/sh
+first_id=
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"multiplex\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"A\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"B\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      ;;
+    *'"method":"tools/call"'*'"name":"A"'*)
+      first_id=$id
+      printf '%s\n' ready > "$1"
+      ;;
+    *'"method":"tools/call"'*'"name":"B"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"3","result":{"which":"wrong-shape"}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":999999,"result":{"which":"wrong-id"}}'
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"which\":\"B\"}}"
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$first_id,\"result\":{\"which\":\"A\"}}"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let server = McpServer::connect(stdio_test_config(
+            "multiplex",
+            &script_path,
+            vec![first_received.display().to_string()],
+            5,
+        ))
+        .await
+        .expect("connect");
+        let first_server = server.clone();
+        let first =
+            zeroclaw_spawn::spawn!(async move { first_server.call_tool("A", json!({})).await });
+        assert_eq!(read_fifo(&first_received).await.trim(), "ready");
+        let second_server = server.clone();
+        let second =
+            zeroclaw_spawn::spawn!(async move { second_server.call_tool("B", json!({})).await });
+
+        let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("multiplexed calls timed out");
+        assert_eq!(
+            first_result.expect("first task").expect("first response"),
+            json!({"which":"A"})
+        );
+        assert_eq!(
+            second_result
+                .expect("second task")
+                .expect("second response"),
+            json!({"which":"B"})
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_post_write_cancellation_reaps_rehandshakes_and_never_replays() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("cancel-mcp.sh");
+        let effect_ready = temp.path().join("effect-ready.fifo");
+        let recovered = temp.path().join("recovered.fifo");
+        let generations = temp.path().join("generations.log");
+        let effects = temp.path().join("effects.log");
+        make_fifo(&effect_ready);
+        make_fifo(&recovered);
+        write_executable_script(
+            &script_path,
+            br#"#!/bin/sh
+printf '%s\n' "$$" >> "$3"
+generation=$(wc -l < "$3" | tr -d ' ')
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"cancel\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"notifications/initialized"'*)
+      if [ "$generation" -gt 1 ]; then printf '%s\n' recovered > "$2"; fi
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"side_effect\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"probe\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+      ;;
+    *'"method":"tools/call"'*'"name":"side_effect"'*)
+      printf '%s\n' effect >> "$4"
+      if [ "$generation" -eq 1 ]; then
+        printf '%s\n' ready > "$1"
+        exec tail -f /dev/null
+      fi
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"replayed\":true}}"
+      ;;
+    *'"method":"tools/call"'*'"name":"probe"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let server = McpServer::connect(stdio_test_config(
+            "cancel",
+            &script_path,
+            vec![
+                effect_ready.display().to_string(),
+                recovered.display().to_string(),
+                generations.display().to_string(),
+                effects.display().to_string(),
+            ],
+            5,
+        ))
+        .await
+        .expect("connect");
+        let call_server = server.clone();
+        let call =
+            zeroclaw_spawn::spawn!(
+                async move { call_server.call_tool("side_effect", json!({})).await }
+            );
+        assert_eq!(read_fifo(&effect_ready).await.trim(), "ready");
+        call.abort();
+        assert!(
+            call.await
+                .expect_err("call must be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(read_fifo(&recovered).await.trim(), "recovered");
+
+        let effects_text = tokio::fs::read_to_string(&effects)
+            .await
+            .expect("read effects");
+        assert_eq!(effects_text.lines().count(), 1, "tool call was replayed");
+        let pids = tokio::fs::read_to_string(&generations)
+            .await
+            .expect("read generation pids");
+        assert_eq!(pids.lines().count(), 2, "expected exactly one respawn");
+        let first_pid = pids
+            .lines()
+            .next()
+            .expect("first generation pid")
+            .parse::<u32>()
+            .expect("numeric first generation pid");
+        assert!(
+            !process_is_alive(first_pid),
+            "old child must be reaped before recovery completes"
+        );
+        let result = server
+            .call_tool("probe", json!({}))
+            .await
+            .expect("fresh child should accept subsequent call");
+        assert_eq!(result, json!({"ok":true}));
+    }
+
+    /// A stdio writer already queued on the transport state must re-check a
+    /// recovery published by the cancelled writer before emitting any bytes.
+    /// This exercises the real stdio boundary without an HTTP/SSE serial gate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_queued_writer_waits_for_recovery_at_writer_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("queued-writer-mcp.sh");
+        let requests = temp.path().join("requests.log");
+        let generations = temp.path().join("generations.log");
+        write_executable_script(
+            &script_path,
+            br#"#!/bin/sh
+printf '%s\n' "$$" >> "$2"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$1"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"queued-writer\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let config = stdio_test_config(
+            "queued-writer",
+            &script_path,
+            vec![
+                requests.display().to_string(),
+                generations.display().to_string(),
+            ],
+            5,
+        );
+        let transport = Arc::new(StdioTransport::new(&config).expect("build transport"));
+        let hook = Arc::new(StdioWriteTestHook::new());
+        hook.pause_next_payload();
+        transport.set_write_test_hook(Arc::clone(&hook));
+        let shared_transport: Arc<dyn SharedMcpTransportConn> = transport.clone();
+        let server = server_with_transport("queued-writer", shared_transport, 5);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::fs::read_to_string(&generations)
+                    .await
+                    .is_ok_and(|log| log.lines().count() == 1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial stdio child did not start");
+
+        // Pause the first request after its JSON payload has crossed the OS
+        // stdin boundary but before newline/flush completes. `state` remains
+        // locked and the request outcome is unknown.
+        let first_server = server.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        timeout(Duration::from_secs(3), hook.wait_for_payload_pause())
+            .await
+            .expect("first stdio write did not reach the post-payload pause");
+
+        // Enter a second call before cancellation and prove it reached the
+        // transport, where it is queued on the same stdio state lock.
+        let second_server = server.clone();
+        let second =
+            zeroclaw_spawn::spawn!(
+                async move { second_server.call_tool("probe", json!({})).await }
+            );
+        timeout(Duration::from_secs(3), hook.wait_for_attempts(2))
+            .await
+            .expect("second stdio writer did not queue on transport state");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("first call must be cancelled")
+                .is_cancelled()
+        );
+
+        let second_result = timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second call hung behind recovery")
+            .expect("second task failed")
+            .expect("second call failed after recovery");
+        assert_eq!(second_result, json!({"ok": true}));
+
+        let request_log = tokio::fs::read_to_string(&requests)
+            .await
+            .expect("read request log");
+        let tool_writes = request_log
+            .lines()
+            .filter(|line| line.contains(r#""method":"tools/call""#))
+            .count();
+        assert_eq!(
+            tool_writes, 1,
+            "queued writer reached the ambiguous child before recovery"
+        );
+        let request_lines = request_log.lines().collect::<Vec<_>>();
+        let initialized_index = request_lines
+            .iter()
+            .position(|line| line.contains(r#""method":"notifications/initialized""#))
+            .expect("recovery handshake notification missing");
+        let tool_index = request_lines
+            .iter()
+            .position(|line| line.contains(r#""method":"tools/call""#))
+            .expect("recovered tool write missing");
+        assert!(
+            initialized_index < tool_index,
+            "queued tool write occurred before recovery handshake completed"
+        );
+
+        let generation_log = tokio::fs::read_to_string(&generations)
+            .await
+            .expect("read generation log");
+        assert_eq!(
+            generation_log.lines().count(),
+            2,
+            "expected exactly one recovery respawn"
+        );
+
+        drop(server);
+        SharedMcpTransportConn::close(transport.as_ref())
+            .await
+            .expect("close transport");
+    }
+
     // ── Server capabilities parsing ──────────────────────────────────────────
 
     #[test]
@@ -1388,7 +2834,7 @@ done
     }
 
     #[tokio::test]
-    async fn call_tool_reconnects_on_stale_session() {
+    async fn call_tool_recovers_stale_session_without_replaying_tool() {
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1426,8 +2872,9 @@ done
             .mount(&server)
             .await;
 
-        // First tools/call → 404 (stale session). Highest priority, single use,
-        // so after it is exhausted the success mock below takes over.
+        // tools/call → 404 (stale session). Even though the response indicates
+        // a stale session, the request crossed the write boundary, so the
+        // client recovers the connection but does not replay the tool.
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "tools/call"})))
             .respond_with(ResponseTemplate::new(404))
@@ -1437,24 +2884,27 @@ done
             .mount(&server)
             .await;
 
-        // Retried tools/call after reconnect → success.
-        Mock::given(method("POST"))
-            .and(body_partial_json(json!({"method": "tools/call"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "jsonrpc": "2.0", "id": 3, "result": {"ok": true}
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
         let srv = McpServer::connect(http_server_config(server.uri()))
             .await
             .expect("connect");
-        let result = srv
+        let error = srv
             .call_tool("echo", json!({}))
             .await
-            .expect("call_tool should succeed after reconnect");
-        assert_eq!(result, json!({"ok": true}));
+            .expect_err("outcome-unknown tool call must not be replayed");
+        assert!(
+            error.to_string().contains("request was not replayed"),
+            "got: {error:#}"
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if *srv.epoch_gate.read().await == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stale-session recovery did not complete");
         server.verify().await;
     }
 

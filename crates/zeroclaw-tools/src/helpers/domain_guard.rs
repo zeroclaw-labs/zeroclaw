@@ -1,20 +1,5 @@
 //! Shared domain/URL validation and allowlist helpers.
-//!
-//! Every network-capable tool uses these functions for:
-//! - normalizing allowlist entries (domain / IP / IPv6)
-//! - checking host-vs-allowlist membership
-//! - blocking private/local hosts (SSRF guard)
 
-/// Normalize a single domain or allowlist entry to its canonical form.
-///
-/// Returns `None` for invalid entries (empty, whitespace, userinfo, unmatched
-/// IPv6 brackets).
-///
-/// # Bracket rules (maintainer requirement)
-///
-/// IPv6 brackets are only stripped when **both** `[` and `]` are present.
-/// Unmatched brackets (e.g. `[::1`, `::1]`, `[127.0.0.1`, `127.0.0.1]`)
-/// are rejected.
 pub fn normalize_domain(raw: &str) -> Option<String> {
     let input = raw.trim();
     if input.is_empty() || input.chars().any(char::is_whitespace) {
@@ -55,12 +40,6 @@ pub fn normalize_domain(raw: &str) -> Option<String> {
     Some(normalized.to_lowercase())
 }
 
-/// Normalize and validate a list of allowed domains.
-///
-/// Rejects the entire list if **any** entry is invalid, reporting the
-/// offending entries in the error message.
-///
-/// `label` is used in the error message, e.g. `"browser.allowed_domains"`.
 pub fn normalize_allowed_domains(domains: Vec<String>, label: &str) -> anyhow::Result<Vec<String>> {
     let mut rejected = Vec::new();
     let mut normalized = domains
@@ -83,14 +62,6 @@ pub fn normalize_allowed_domains(domains: Vec<String>, label: &str) -> anyhow::R
     Ok(normalized)
 }
 
-/// Check whether `host` matches the allowlist.
-///
-/// Matching rules:
-/// - `"*"` allows everything.
-/// - `"*.example.com"` matches `foo.example.com` and `example.com` itself.
-/// - IP addresses are only matched **exactly** — no suffix/subdomain logic.
-/// - Domain names are matched exactly, or as a subdomain suffix
-///   (e.g. `"example.com"` matches `foo.example.com`).
 pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
     if allowed.iter().any(|d| d == "*") {
         return true;
@@ -117,7 +88,6 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 
 /// Check whether `host` is a private, loopback, link-local, or otherwise
 /// non-globally-routable address (SSRF guard).
-///
 /// Handles both IPv4 and IPv6, as well as `localhost` and `.local` domains.
 pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 

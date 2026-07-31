@@ -24,7 +24,8 @@ default_provider = "openrouter"
 [model_providers.openrouter]
 name = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
-# API key is picked up from OPENROUTER_API_KEY environment variable.
+# The launchers inject OPENROUTER_API_KEY into the openrouter.agent_demo alias
+# synthesized from [agents.demo] below without storing the key in this file.
 temperature = 0.3
 max_tokens = 1024
 

@@ -1,5 +1,4 @@
 //! Raspberry Pi GPIO peripheral — native rppal access.
-//!
 //! Only compiled when `peripheral-rpi` feature is enabled and target is Linux.
 //! Uses BCM pin numbering (e.g. GPIO 17, 27).
 
@@ -116,7 +115,7 @@ impl Tool for RpiGpioReadTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("pin {} = {}", pin, value),
+            output: format!("pin {} = {}", pin, value).into(),
             error: None,
         })
     }
@@ -189,7 +188,7 @@ impl Tool for RpiGpioWriteTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("pin {} = {}", pin, value),
+            output: format!("pin {} = {}", pin, value).into(),
             error: None,
         })
     }

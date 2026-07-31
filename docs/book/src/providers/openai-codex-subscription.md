@@ -18,7 +18,23 @@ see [Configuration](./configuration.md); for the one-line catalog entry see the
 Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"`
 to route through `POST /v1/responses` (the Codex backend, not the chat
 completions API) and `requires_openai_auth = true` to pull credentials from
-`~/.codex/auth.json` instead of an `api_key` field:
+ZeroClaw's stored `openai-codex` auth profile instead of an `api_key` field:
+
+```bash
+# Reuse an existing Codex CLI login:
+zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json
+
+# Or start ZeroClaw's own OpenAI Codex login flow:
+zeroclaw auth login --model-provider openai-codex
+```
+
+Quickstart can write the provider entry for you:
+
+```bash
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
+```
+
+Manual config uses the same canonical OpenAI slot:
 
 ```toml
 [providers.models.openai.coding]

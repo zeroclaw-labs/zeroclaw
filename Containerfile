@@ -184,7 +184,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
     # Release build — zeroclawlabs (daemon)
     # >>> generated:container-standard by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:container-standard <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -215,7 +215,7 @@ COPY --from=config-gen /rootfs/ /rootfs/
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
 # ── Stage: package (minimal runtime) ─────────────────────────
-FROM docker.io/stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS package
+FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build /rootfs/ /
@@ -301,7 +301,7 @@ COPY --from=config-gen /rootfs/ /rootfs/
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
 # ── Stage: package-fat (full-channel runtime) ────────────────
-FROM docker.io/stagex/core-filesystem@sha256:cd3a66471ce1f630fa77d5c9bd9829f9f9fab6302a1aaa64d67b74f1f069b750 AS package-fat
+FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package-fat
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build-fat /rootfs/ /

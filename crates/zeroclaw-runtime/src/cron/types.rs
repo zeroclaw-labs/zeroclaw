@@ -1,11 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Try to deserialize a `serde_json::Value` as `T`.  If the value is a JSON
-/// string that looks like an object (i.e. the LLM double-serialized it), parse
-/// the inner string first and then deserialize the resulting object.  This
-/// provides backward-compatible handling for both `Value::Object` and
-/// `Value::String` representations.
 pub fn deserialize_maybe_stringified<T: serde::de::DeserializeOwned>(
     v: &serde_json::Value,
 ) -> Result<T, serde_json::Error> {
@@ -108,11 +103,6 @@ pub struct DeliveryConfig {
     pub channel: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
-    /// Optional thread/conversation identifier carried into the outbound send.
-    /// Used by channels whose recipient and thread-of-conversation are distinct
-    /// (notably webhook, where a callback service routes on `thread_id`).
-    /// Persisted via the `delivery` JSON column, so existing rows without this
-    /// field deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default = "default_true")]
@@ -159,11 +149,6 @@ pub struct CronJob {
     pub enabled: bool,
     pub delivery: DeliveryConfig,
     pub delete_after_run: bool,
-    /// Optional allowlist of tool names this cron job may use.
-    /// When `Some(list)`, only tools whose name is in the list are available.
-    /// When `None`, this job does not add an allowlist. Agent cron jobs may
-    /// still receive scheduler-level default exclusions for scheduler mutation
-    /// tools unless they opt back in with an explicit allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
     /// Whether to recall and inject memory context before this agent job runs.

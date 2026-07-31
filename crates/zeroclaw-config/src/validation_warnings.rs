@@ -2,23 +2,6 @@
 //! successfully (i.e. `Config::validate()` returns `Ok(())`) but will fail
 //! at agent runtime because of a logical inconsistency the schema can't
 //! enforce structurally.
-//!
-//! The CLI surfaces these via `zeroclaw_log::record!` so operators see them on
-//! stderr. The gateway HTTP API surfaces them via the `warnings` field on
-//! `PropResponse` / `PatchResponse` so dashboard callers see the same
-//! signal — closing the parity gap that previously left a dashboard user
-//! with no indication their config would fail at runtime.
-//!
-//! Each warning carries:
-//! - a stable `code` (machine-friendly, matches across releases for a
-//!   given check)
-//! - a human-readable `message` (suitable for direct display to operators)
-//! - the dotted property `path` the warning concerns (so the dashboard
-//!   can highlight the offending field)
-//!
-//! Adding a new warning: append the check to `Config::collect_warnings`
-//! in `schema.rs` and pick a stable `code`. `Config::validate` emits each
-//! collected warning via `zeroclaw_log::record!` so logs continue to show them.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +10,14 @@ use serde::{Deserialize, Serialize};
 /// Stable codes (extend as new warnings are added):
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
+/// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
+///   value but has no runtime consumer yet, so it currently has no effect
+///   (see `validate_memory_semantics` in `schema.rs` for the current list).
+/// - `context_compression_unsupported`: a `runtime_profiles.<alias>.context_compression`
+///   knob (`enabled = true`, or any other field set to a non-default value)
+///   has no runtime consumer — the context compressor was removed —
+///   so it currently has no effect. One warning per non-default field (see
+///   `collect_context_compression_ignored_warnings` in `schema.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

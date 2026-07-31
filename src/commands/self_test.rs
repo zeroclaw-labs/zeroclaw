@@ -293,19 +293,6 @@ fn check_version() -> CheckResult {
     CheckResult::pass("version", format!("v{version}"))
 }
 
-/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
-/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
-/// verbatim and never invokes a shell, so values like `~/web-dist` or
-/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
-/// find the bundled assets — surface that here at `zeroclaw self-test`
-/// time instead of at runtime.
-///
-/// User-facing strings (check name + detail) go through Fluent
-/// (`cli-self-test-web-dist-dir-*` keys) per AGENTS.md § Localization —
-/// no bare Rust literals for CLI output. The check `name` field is
-/// `&'static str`, so we resolve the Fluent string once into a leaked
-/// static at first call. Reason phrases are Fluent keys too
-/// (`cli-web-dist-dir-reason-{tilde,dollar}`).
 fn check_web_dist_dir(config: &crate::config::Config) -> CheckResult {
     let name = web_dist_dir_check_name();
     match config.gateway.web_dist_dir.as_deref() {
@@ -364,12 +351,6 @@ fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     }
 }
 
-/// Resolve a wildcard bind address (`0.0.0.0`, `[::]`) to a concrete
-/// loopback target so the probe can actually connect — and report the
-/// configured value alongside so the user isn't confused about why the
-/// output says `127.0.0.1` when their `config.toml` says `0.0.0.0`
-///. Returns `(probe_host, display_host)` where `display_host`
-/// is `Some(_)` only when a rewrite happened.
 fn resolve_probe_host(configured: &str) -> (&str, Option<&str>) {
     match configured {
         "0.0.0.0" => ("127.0.0.1", Some("0.0.0.0")),
@@ -412,7 +393,7 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
+    let mem = match crate::memory::create_memory_from_config(config, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };
@@ -480,10 +461,10 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
     let request = match probe_url.as_str().into_client_request() {
         Ok(mut req) => {
-            if let Some(token) = token {
-                if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
-                    req.headers_mut().insert(header::AUTHORIZATION, value);
-                }
+            if let Some(token) = token
+                && let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}"))
+            {
+                req.headers_mut().insert(header::AUTHORIZATION, value);
             }
             req
         }
@@ -504,14 +485,6 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
     }
 }
 
-/// Build the websocket probe URL for the self-test handshake.
-///
-/// When `require_pairing` is true, the resolved plaintext token (if any) is
-/// appended as a query parameter so the browser-compatible query-token path
-/// is exercised alongside the `Authorization: Bearer` header. The separator
-/// is `?` when the URL has no query string yet (no-agent fallback) and `&`
-/// when `?agent=` is already present, so the appended segment is always a
-/// valid query pair on the `/ws/chat` route.
 #[cfg(feature = "gateway")]
 fn build_websocket_probe_url(
     probe_host: &str,
@@ -524,19 +497,16 @@ fn build_websocket_probe_url(
         Some(alias) => format!("ws://{probe_host}:{port}/ws/chat?agent={alias}"),
         None => format!("ws://{probe_host}:{port}/ws/chat"),
     };
-    if require_pairing {
-        if let Some(token) = token {
-            let sep = if url.contains('?') { '&' } else { '?' };
-            url.push(sep);
-            url.push_str("token=");
-            url.push_str(token);
-        }
+    if require_pairing && let Some(token) = token {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str("token=");
+        url.push_str(token);
     }
     url
 }
 
 /// Resolve a plaintext gateway bearer token for local diagnostics.
-///
 /// Precedence: `ZEROCLAW_GATEWAY_TOKEN`, then `ZEROCLAW_ACP_BRIDGE_TOKEN`,
 /// then the first plaintext (`zc_*`) entry in `gateway.paired_tokens`.
 #[cfg(feature = "gateway")]
@@ -563,13 +533,62 @@ mod tests {
     #[cfg(feature = "gateway")]
     use super::{build_websocket_probe_url, resolve_gateway_bearer_token};
     use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
-    #[cfg(feature = "gateway")]
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+    #[cfg(any(feature = "gateway", unix))]
     use zeroclaw_config::schema::Config;
+    #[cfg(unix)]
+    use zeroclaw_config::schema::LucidStorageConfig;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_roundtrip_uses_selected_lucid_alias() {
+        let tmp = TempDir::new().unwrap();
+        let calls_path = tmp.path().join("self-test-lucid.log");
+        let script_path = tmp.path().join("selected-lucid.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{}"
+if [ "${{1:-}}" = "context" ]; then
+  printf '<lucid-context>\n</lucid-context>\n'
+fi
+"#,
+            calls_path.display()
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "lucid.selected".into();
+        config.storage.lucid.insert(
+            "selected".into(),
+            LucidStorageConfig {
+                binary_path: Some(script_path.display().to_string()),
+                recall_timeout_ms: Some(500),
+                store_timeout_ms: Some(500),
+            },
+        );
+
+        let result = super::check_memory_roundtrip(&config).await;
+
+        assert!(result.passed, "memory self-test failed: {}", result.detail);
+        let calls = fs::read_to_string(&calls_path)
+            .expect("the selected Lucid executable must be invoked by self-test");
+        assert!(calls.contains("store __selftest_probe__: selftest_ok"));
+    }
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
-        // Issue #6079: `~/web-dist` is read verbatim and silently fails.
-        // #6961 Round 3: predicate now returns Fluent key, not bare phrase.
+        // `~/web-dist` is read verbatim and silently fails.
+        // The predicate returns a Fluent key, not a bare phrase.
         assert_eq!(
             web_dist_dir_expansion_reason_key("~/web-dist"),
             Some("cli-web-dist-dir-reason-tilde")
@@ -582,7 +601,7 @@ mod tests {
 
     #[test]
     fn web_dist_dir_with_env_var_resolves_to_dollar_reason_key() {
-        // Issue #6079: `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
+        // `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
         assert_eq!(
             web_dist_dir_expansion_reason_key("$HOME/web-dist"),
             Some("cli-web-dist-dir-reason-dollar")
@@ -602,7 +621,7 @@ mod tests {
 
     #[test]
     fn check_web_dist_dir_emits_localized_fail_for_tilde() {
-        // #6961 Round 3: the failure detail goes through Fluent
+        // The failure detail goes through Fluent
         // (cli-self-test-web-dist-dir-fail-expansion) — assert the
         // resolved English string contains the inlined path + reason.
         let mut config = crate::config::Config::default();
@@ -744,11 +763,6 @@ mod tests {
     #[cfg(feature = "gateway")]
     #[test]
     fn build_websocket_probe_url_uses_question_mark_when_no_alias() {
-        // Regression for PR #7732: previously the no-alias fallback appended
-        // `&token=` to a URL with no `?`, producing
-        // `ws://.../ws/chat&token=...` which is not a valid query string and
-        // would fail the handshake for the wrong reason on instances that
-        // have no configured agents but do require pairing.
         let url = build_websocket_probe_url("127.0.0.1", 42617, None, true, Some("zc_test"));
         assert_eq!(url, "ws://127.0.0.1:42617/ws/chat?token=zc_test");
     }

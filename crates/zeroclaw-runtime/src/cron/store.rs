@@ -122,6 +122,7 @@ pub fn add_agent_job(
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
     allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -140,8 +141,9 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13)",
+                enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
+                uses_memory
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 expression,
@@ -156,6 +158,7 @@ pub fn add_agent_job(
                 agent_alias,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                if uses_memory { 1 } else { 0 },
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -212,13 +215,6 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
-/// Resolve a job by UUID or by name (case-insensitive). Returns the resolved
-/// job ID. Errors if the name matches zero or multiple jobs.
-///
-/// Name resolution is scoped to `agent_alias`: names are only unique within an
-/// agent's own jobs, so matching across all agents would let one agent mutate
-/// another's job by name and would raise false "ambiguous" errors when two
-/// agents happen to share a name.
 pub fn resolve_job_id_or_name(
     config: &Config,
     id_or_name: &str,
@@ -268,7 +264,7 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
 }
 
 /// Cron jobs owned by `agent_alias`, for the agent-deletion export-then-delete
-/// archive (#7175).
+/// archive
 pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -292,7 +288,7 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
 
 /// Delete every cron job owned by `agent_alias`, returning the row count
 /// (`cron_runs` cascade via their `job_id` FK). A job whose owning agent is gone
-/// can never run, so the agent-deletion cascade removes it (#7175).
+/// can never run, so the agent-deletion cascade removes it
 pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
     let changed = with_initialized_connection(config, |conn| {
         conn.execute(
@@ -305,7 +301,7 @@ pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize>
 }
 
 /// Re-point every cron job owned by `from` to `to`, returning the row count.
-/// Called by the agent-rename cascade (#7468): the job keeps running, just
+/// Called by the agent-rename cascade the job keeps running, just
 /// under the renamed owner. `agent_alias` is plain TEXT (not a UUID), so this
 /// is a direct column update.
 pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
@@ -357,11 +353,6 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     Ok(jobs)
 }
 
-/// Return **all** enabled overdue jobs without the `max_tasks` limit.
-///
-/// Used by the scheduler startup catch-up to ensure every missed job is
-/// executed at least once after a period of downtime (late boot, daemon
-/// restart, etc.).
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -557,14 +548,6 @@ pub fn reschedule_after_run_with_status(
     }
 }
 
-/// Advance `next_run` of an overdue recurring job to its next future
-/// occurrence without executing the missed run.  For one-shot `At` jobs
-/// there is no future occurrence, so the job is disabled and its last
-/// status is recorded as `skipped`.
-///
-/// Called at scheduler startup when `catch_up_on_startup` is disabled,
-/// so the subsequent normal polling loop won't pick up jobs whose
-/// `next_run` is still in the past.
 pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
     if matches!(job.schedule, Schedule::At { .. }) {
         // One-shot job whose scheduled moment has already passed —
@@ -594,16 +577,6 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
     }
 }
 
-/// Atomically claim a due job for execution.
-///
-/// Sets `locked_at` to `now` only if the row is currently unlocked. The
-/// conditional `WHERE … AND locked_at IS NULL` makes the claim a single atomic
-/// step: at most one caller can transition a job from idle to in-flight. Returns
-/// `true` when this caller won the claim, `false` when the job was already locked
-/// (in flight from an earlier poll, the startup catch-up, or a concurrent
-/// trigger). Combined with the `locked_at IS NULL` filter in `due_jobs` /
-/// `all_overdue_jobs`, this prevents a job that runs longer than the scheduler
-/// poll interval from being launched repeatedly (issue #6037).
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
     with_initialized_connection(config, |conn| {
         let claimed = conn
@@ -616,11 +589,6 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
     })
 }
 
-/// Release a job's in-flight lock once its run has completed.
-///
-/// Best-effort: a row that is missing (deleted one-shot) or already unlocked
-/// simply affects zero rows. `next_run` advancement happens separately in the
-/// reschedule path; this only clears the lock so the job is eligible again.
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
@@ -632,12 +600,6 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
-/// Clear every in-flight lock, returning the number of rows cleared.
-///
-/// Called once at scheduler startup: any lock present at boot is stale because its
-/// owning run died with the previous process. Clearing it lets the job be
-/// scheduled again instead of staying wedged until manual intervention. Uses the
-/// non-creating read helper so an empty workspace (no cron DB yet) stays untouched.
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
@@ -765,11 +727,6 @@ pub(crate) fn persist_run_result(
     })
 }
 
-/// Persist only the job-state side of a completed cron run.
-///
-/// This is intentionally separate from `persist_run_result` so the scheduler
-/// can recover job state even when run-history persistence fails. The SQL
-/// mutation itself stays in the store layer.
 pub(crate) fn persist_run_completion_state(
     config: &Config,
     job: &CronJob,
@@ -1006,14 +963,6 @@ fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
     Ok(None)
 }
 
-/// Synchronize declarative cron job definitions from config into the database.
-///
-/// For each declarative job (identified by `id`):
-/// - If the job exists in DB: update it to match the config definition.
-/// - If the job does not exist: insert it.
-///
-/// Jobs created imperatively (via CLI/API) are never modified or deleted.
-/// Declarative jobs that are no longer present in config are removed.
 pub fn sync_declarative_jobs(
     config: &Config,
     decls: &std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
@@ -1403,11 +1352,6 @@ fn with_initialized_connection<T>(
     f(&conn)
 }
 
-/// Apply the completion state change for a cron job inside an existing connection.
-///
-/// This keeps the scheduler's normal path and the fallback path using the same
-/// SQL mutation logic while allowing the caller to decide whether the
-/// run-history write should be attempted first.
 fn apply_run_completion_state(
     conn: &Connection,
     job: &CronJob,
@@ -1530,7 +1474,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // In-flight execution lock: RFC3339 timestamp of when a run claimed this job,
     // or NULL when idle. `due_jobs`/`all_overdue_jobs` skip locked rows so a job that
     // runs longer than the poll interval cannot be launched again while still in
-    // flight (see `claim_job`/`release_job` and issue #6037).
+    // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
 
     Ok(())
@@ -1666,7 +1610,7 @@ mod tests {
 
     #[test]
     fn due_jobs_skips_claimed_jobs() {
-        // Regression for #6037: a job that is in flight must not be selected
+        // a job that is in flight must not be selected
         // again by the scheduler while its previous run is still running.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -1924,6 +1868,7 @@ mod tests {
             }),
             false,
             None,
+            true,
         )
         .unwrap_err();
 
@@ -2092,6 +2037,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into(), "web_search".into()]),
+            true,
         )
         .unwrap();
 
@@ -2120,6 +2066,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 

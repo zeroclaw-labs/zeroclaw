@@ -175,13 +175,6 @@ fn plain_line_spans(text: &str, bg: Color, fg: Color) -> Vec<Vec<Span<'static>>>
         .collect()
 }
 
-/// Syntax-highlight `code` for a markdown fence language token (e.g. `rust`,
-/// `python`, `sh`), returning one span vector per line. Colours come from the
-/// active theme via [`hl_colors`]; `plain_fg` styles tokens with no scope and is
-/// also the whole-line fallback when the token is unknown or highlighting
-/// fails. No background is forced, so the caller's code-block backdrop shows
-/// through. Returns `None` only when the token does not resolve to a built-in
-/// language, letting the caller render its existing plain code styling.
 pub fn highlight_code(
     code: &str,
     fence_token: &str,
@@ -253,15 +246,6 @@ fn plain_line_spans_no_bg(text: &str, fg: Color) -> Vec<Vec<Span<'static>>> {
 
 // ── Public diff API ──────────────────────────────────────────────
 
-/// Build ratatui `Line`s for a unified diff of `old` vs `new`.
-///
-/// `lang` is an optional file extension (e.g. `"rs"`, `"py"`) used for
-/// syntax highlighting. Pass `None` to get plain colored diffs.
-///
-/// `start_line` is the 1-based line number where `old` begins in the
-/// underlying file. The gutter is offset so the displayed numbers match
-/// the file on disk. Callers without a known file location (or write
-/// diffs that always begin at line 1) should pass `1`.
 pub fn diff_lines(
     old: &str,
     new: &str,
@@ -371,11 +355,6 @@ pub fn diff_lines(
     out
 }
 
-/// Build ratatui `Line`s showing `content` as entirely new (file_write).
-///
-/// `lang` is an optional file extension for syntax highlighting.
-/// Capped at `MAX_WRITE_LINES`; a `⋯ N more lines` trailer is appended
-/// when the file is larger.
 pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
     let all: Vec<&str> = content.lines().collect();
     let show = all.len().min(MAX_WRITE_LINES);

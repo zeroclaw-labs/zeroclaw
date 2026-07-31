@@ -41,3 +41,7 @@ before = ["links"]
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
+
+[preprocessor.placeholders]
+command = "../../target/release/mdbook placeholders"
+after = ["gettext", "mermaid"]
