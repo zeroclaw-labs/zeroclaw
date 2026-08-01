@@ -54,9 +54,9 @@ pub(crate) async fn consume_provider_streaming_response(
     let mut text_guard = StreamTextGuard::new(request_tools);
     let mut think_stripper = StreamThinkTagStripper::default();
     // Streaming-safe stripper for trailing provider/model end-of-message
-    // markers like `<eom>` / `<|eom|>` (issue #9006). Sits between the think
-    // stripper and the text guard so transcript display, persisted history,
-    // and forwarded live deltas all observe a single canonical clean text.
+    // markers like `<eom>` / `<|eom|>`. Sits between the think stripper and
+    // the text guard so transcript display, persisted history, and forwarded
+    // live deltas all observe a single canonical clean text.
     let mut terminal_marker_stripper = StreamTerminalMarkerStripper::default();
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
