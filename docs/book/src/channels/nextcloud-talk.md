@@ -9,16 +9,47 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 ## What this integration does
 
 - Receives inbound Talk events via `POST /nextcloud-talk/<alias>` on the gateway (bare `/nextcloud-talk` still works as a deprecated fallback)
-- Verifies webhook signatures (HMAC-SHA256) when a secret is configured
-- Sends replies back to Talk rooms via the Nextcloud OCS API
+- Requires and verifies webhook signatures (HMAC-SHA256) with the installed bot secret
+- Sends replies back to Talk rooms via the signed Nextcloud Talk Bot API
 
 ## Prerequisites
 
-- **Nextcloud server** with the Talk app enabled (v17 or later recommended)
-- **Bot account** in Talk settings, give it a display name (e.g. `zeroclaw-bot`)
-- **Bot app token** from the Talk admin UI for OCS API bearer auth (used for outbound replies)
-- **Webhook secret** from the Talk admin UI if you want signature verification (strongly recommended)
+- **Nextcloud server 27.1 or later with Talk 17.1 or later.** This is a hard
+  minimum, not a recommendation: the signed Talk Bot API this integration uses to
+  send replies was introduced in Talk 17.1, and `occ talk:bot:install` below is
+  unavailable on earlier releases.
+- **Bot installed** with both the `webhook` and `response` features, which let
+  Nextcloud deliver room messages to ZeroClaw and let ZeroClaw send replies:
+
+  ```sh
+  sudo -u www-data php occ talk:bot:install \
+    -f webhook -f response \
+    zeroclaw-bot '<shared-secret>' \
+    'https://<your-public-url>/nextcloud-talk/<alias>'
+  ```
+- **Bot secret** from that installation. Nextcloud issues **one** shared secret per
+  bot, used both to verify inbound webhook signatures and to sign outbound bot-API
+  replies. Set it as `webhook_secret`, which is canonical. `bot_token` is a
+  **deprecated alias for the same value**: if both are set they must be identical.
+  It cannot hold a different outbound secret. Conflicting non-empty values are
+  **not** silently resolved in favour of one; the conflict is logged and the alias
+  resolves to no secret, so the channel then behaves exactly as if unconfigured:
+  inbound `401`, no outbound send.
 - **Publicly-reachable gateway**: see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
+
+Both directions fail closed on a missing secret, and there is no unauthenticated
+mode:
+
+- **Inbound**: signature verification is **mandatory**. With no resolved secret the
+  webhook endpoint returns `401` and never reaches the agent. There is no
+  "public" mode that accepts unverified webhooks.
+- **Outbound**: no request is sent at all, so misconfiguration never puts an
+  unsigned or wrongly-signed request on the wire.
+
+> **Upgrading is a breaking change.** A deployment that previously ran without a
+> secret accepted webhooks; it now rejects every one of them with `401`. Install
+> the bot with `occ talk:bot:install`, then set that secret as `webhook_secret`
+> before upgrading, or inbound messages stop being processed.
 
 ## Configuration
 
@@ -29,6 +60,8 @@ The channel is read from the `default` alias. Set it through any config surface:
 {{#config-where channels nextcloud_talk}}
 
 `webhook_secret` can also be supplied at runtime via the generic env override {{#env-var-name channels.nextcloud_talk.default.webhook_secret}}, useful for rotating it without editing the config.
+
+`app_token` is deprecated and unused (replies no longer go through OCS bearer auth); it's only still accepted so old configs that set it don't fail to parse.
 
 ## Gateway endpoint
 
@@ -60,7 +93,7 @@ Local development? Configure `[tunnel]` in your config (ngrok, Cloudflare, or Ta
 
 ## Signature verification
 
-When `webhook_secret` is set, inbound requests must carry:
+Inbound requests must carry:
 
 - `X-Nextcloud-Talk-Random` header
 - `X-Nextcloud-Talk-Signature` header
@@ -73,7 +106,8 @@ if X-Nextcloud-Talk-Signature != expected_sig:
     return 401
 ```
 
-Without a secret, no verification: don't expose this endpoint publicly in that mode.
+Without a resolved secret, ZeroClaw returns `401` before parsing or dispatching
+the webhook. There is no mode that accepts an unverified request.
 
 ## Message routing
 
@@ -104,7 +138,7 @@ Nextcloud Talk does not support message edits via the Bot API, so streaming draf
 ## Self-hosting notes
 
 - TLS: terminate at your reverse proxy; webhook signature verification works over HTTP-to-container loopback
-- The OCS API is authenticated via Bearer token: use the bot app token from the Talk admin UI
+- Outbound replies authenticate via the Bot API's HMAC signature (`webhook_secret`/`bot_token`), not a bearer token; there is no separate OCS bearer credential to manage
 - Rate limits are Nextcloud-server dependent; the default bot doesn't run into them in normal conversation cadences
 - Per-channel proxy: set `proxy_url` to override the global `[proxy]` setting for Nextcloud Talk only (`http://`, `https://`, `socks5://`, `socks5h://`)
 

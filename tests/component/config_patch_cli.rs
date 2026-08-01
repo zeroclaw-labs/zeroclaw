@@ -135,6 +135,52 @@ fn run_cli_patch_output(config_dir: &std::path::Path, patch_doc: &[u8]) -> Outpu
         .expect("run zeroclaw config patch")
 }
 
+/// Run `zeroclaw config patch - ` **without** `--json`, exercising the
+/// human-readable failure branch of `config_patch_fail_json_or_human`.
+fn run_cli_patch_output_human(config_dir: &std::path::Path, patch_doc: &[u8]) -> Output {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "patch", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("child stdin")
+                    .write_all(patch_doc)?;
+            }
+            child.wait_with_output()
+        })
+        .expect("run zeroclaw config patch (human mode)")
+}
+
+/// Drive a failing patch in human mode and return stderr. Asserts the
+/// no-`--json` contract: nonzero exit, empty stdout, and stderr that is
+/// human-readable text rather than a JSON error envelope.
+fn run_cli_patch_human(config_dir: &std::path::Path, patch_doc: &[u8]) -> String {
+    let output = run_cli_patch_output_human(config_dir, patch_doc);
+    assert!(!output.status.success(), "patch should fail");
+    assert!(
+        output.stdout.is_empty(),
+        "failed human-mode patch should not emit success stdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stderr.trim()).is_err(),
+        "human-mode stderr must NOT be a JSON envelope: {stderr}"
+    );
+    stderr
+}
+
 fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
     let output = run_cli_patch_output(config_dir, patch_doc);
     assert!(!output.status.success(), "patch should fail");
@@ -274,6 +320,108 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
             .expect("message")
             .contains("gateway.host must not be empty"),
         "message should describe validation failure: {envelope}"
+    );
+}
+
+#[test]
+fn config_patch_json_missing_value_field_emits_structured_error_envelope() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/gateway/host"}]"#,
+    );
+
+    assert_eq!(envelope["code"], "value_type_mismatch");
+    assert_eq!(envelope["path"], "gateway.host");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("missing `value` field"),
+        "message should describe the missing `value` field: {envelope}"
+    );
+}
+
+#[test]
+fn config_patch_json_value_coercion_failure_emits_structured_error_envelope() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // `enabled` is a bool field; a JSON array is the wrong shape and must be
+    // rejected by `coerce_for_set_prop` before ever reaching `set_prop`.
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/channels/telegram/coercebot/enabled","value":["not","a","bool"]}]"#,
+    );
+
+    assert_eq!(envelope["code"], "value_type_mismatch");
+    assert_eq!(envelope["path"], "channels.telegram.coercebot.enabled");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("bool field requires"),
+        "message should describe the bool coercion failure: {envelope}"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("coercebot"),
+        "a coercion failure must not leave a phantom alias on disk: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_human_missing_value_field_emits_readable_error_without_json_envelope() {
+    // Mirrors `config_patch_json_missing_value_field_emits_structured_error_envelope`
+    // but on the no-`--json` branch: the compatibility half of the
+    // machine-readable/human-readable output contract.
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let stderr = run_cli_patch_human(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/gateway/host"}]"#,
+    );
+
+    assert!(
+        stderr.contains("op[0]")
+            && stderr.contains("gateway.host")
+            && stderr.contains("missing `value` field"),
+        "human stderr should describe the missing `value` field: {stderr}"
+    );
+    // The structured field names must NOT leak into human output.
+    assert!(
+        !stderr.contains("\"code\"") && !stderr.contains("value_type_mismatch"),
+        "human stderr must not contain JSON envelope fields: {stderr}"
+    );
+}
+
+#[test]
+fn config_patch_human_value_coercion_failure_emits_readable_error_without_json_envelope() {
+    // Mirrors `config_patch_json_value_coercion_failure_emits_structured_error_envelope`
+    // on the no-`--json` branch, and re-asserts the no-phantom-alias guarantee.
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let stderr = run_cli_patch_human(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/channels/telegram/coercebot/enabled","value":["not","a","bool"]}]"#,
+    );
+
+    assert!(
+        stderr.contains("bool field requires"),
+        "human stderr should describe the bool coercion failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("\"code\"") && !stderr.contains("\"op_index\""),
+        "human stderr must not contain JSON envelope fields: {stderr}"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        !cfg.channels.telegram.contains_key("coercebot"),
+        "a coercion failure must not leave a phantom alias on disk: {saved}"
     );
 }
 

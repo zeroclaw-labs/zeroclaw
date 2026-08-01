@@ -1089,7 +1089,7 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
@@ -1109,6 +1109,10 @@ impl RpcDispatcher {
             Arc::clone(&self.ctx.approval_pending),
             self.client_elicitation_caps,
         ));
+        // Align agent.channel_name with the registered back-channel key so
+        // ask_user/poll/escalate default to this conversation (not an arbitrary
+        // external channel from the seeded channel map).
+        agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         self.ctx
@@ -1549,7 +1553,7 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
@@ -1569,6 +1573,9 @@ impl RpcDispatcher {
             Arc::clone(&self.ctx.approval_pending),
             self.client_elicitation_caps,
         ));
+        // See session/new: channel_name must match the registered back-channel
+        // key so interactive tools default to this conversation.
+        agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
@@ -4755,12 +4762,7 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens: _,
-            output_tokens: _,
-            ..
-        } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
