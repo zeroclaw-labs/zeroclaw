@@ -8814,6 +8814,19 @@ fn collect_configured_channels(
         if !sig.enabled {
             continue;
         }
+        if !sig.has_required_credentials() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Signal channel '{alias}' is enabled but missing required fields \
+                     (channels.signal.{alias}.http_url, channels.signal.{alias}.account); \
+                     skipping Signal to avoid a connect-fail crashloop."
+                )
+            );
+            continue;
+        }
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
@@ -9942,6 +9955,20 @@ fn collect_configured_channels(
             continue;
         }
         if !vc.enabled {
+            continue;
+        }
+        if !vc.has_required_credentials() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Voice Call channel '{alias}' is enabled but missing required fields \
+                     (channels.voice_call.{alias}.account_id, channels.voice_call.{alias}.auth_token, \
+                     channels.voice_call.{alias}.from_number); skipping Voice Call to avoid a \
+                     connect-fail crashloop."
+                )
+            );
             continue;
         }
         channels.push(ConfiguredChannel {
@@ -24174,6 +24201,105 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Voice Call"),
             "voice-call with no agent reference should not be collected"
+        );
+    }
+
+    // Regression: an enabled Signal or Voice Call channel with
+    // empty required credentials was built anyway, then its listener
+    // failed to connect and the per-channel supervisor restarted it
+    // forever (crashloop). The orchestrator must skip-with-warn instead of
+    // building it, mirroring the WhatsApp Cloud `is_cloud_config()` gate.
+    #[cfg(feature = "channel-signal")]
+    #[test]
+    fn collect_configured_channels_skips_enabled_signal_without_credentials() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SignalConfig {
+                enabled: true,
+                http_url: "   ".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Signal"),
+            "enabled Signal without credentials must not be collected (would crashloop)"
+        );
+    }
+
+    #[cfg(feature = "channel-signal")]
+    #[test]
+    fn collect_configured_channels_builds_signal_with_credentials() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SignalConfig {
+                enabled: true,
+                http_url: "http://127.0.0.1:8686".into(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        assert!(
+            channels.iter().any(|entry| entry.display_name == "Signal"),
+            "enabled Signal with credentials must be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn collect_configured_channels_builds_voice_call_with_credentials() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "default".to_string(),
+            zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "tok".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "Voice Call"),
+            "enabled Voice Call with credentials must be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn collect_configured_channels_skips_enabled_voice_call_without_credentials() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "default".to_string(),
+            zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "   ".into(),
+                auth_token: "   ".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "Voice Call"),
+            "enabled Voice Call without credentials must not be collected (would crashloop)"
         );
     }
 

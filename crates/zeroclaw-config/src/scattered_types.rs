@@ -751,6 +751,20 @@ impl crate::traits::ChannelConfig for VoiceCallConfig {
     }
 }
 
+impl VoiceCallConfig {
+    /// Whether all required credentials (`account_id`, `auth_token`,
+    /// `from_number`) are present. Mirrors `WhatsAppConfig::is_cloud_config`'s
+    /// role: the channel orchestrator uses this bool to decide whether to
+    /// build the channel at all, skipping (with a warning) an
+    /// enabled-but-uncredentialed alias instead of building a listener that
+    /// can never connect and crashloops its per-channel supervisor.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.account_id)
+            && !crate::traits::is_unset_display_value(&self.auth_token)
+            && !crate::traits::is_unset_display_value(&self.from_number)
+    }
+}
+
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
@@ -773,6 +787,50 @@ impl Default for VoiceCallConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_call_has_required_credentials_true_when_all_set() {
+        let vc = VoiceCallConfig {
+            account_id: "AC123".into(),
+            auth_token: "tok".into(),
+            from_number: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(vc.has_required_credentials());
+    }
+
+    #[test]
+    fn voice_call_has_required_credentials_false_when_any_blank() {
+        let base = VoiceCallConfig {
+            account_id: "AC123".into(),
+            auth_token: "tok".into(),
+            from_number: "+15551234567".into(),
+            ..Default::default()
+        };
+
+        assert!(
+            !VoiceCallConfig {
+                account_id: "   ".into(),
+                ..base.clone()
+            }
+            .has_required_credentials()
+        );
+        assert!(
+            !VoiceCallConfig {
+                auth_token: "   ".into(),
+                ..base.clone()
+            }
+            .has_required_credentials()
+        );
+        assert!(
+            !VoiceCallConfig {
+                from_number: "   ".into(),
+                ..base
+            }
+            .has_required_credentials()
+        );
+        assert!(!VoiceCallConfig::default().has_required_credentials());
+    }
 
     #[test]
     fn thinking_level_from_str_canonical_aliases() {

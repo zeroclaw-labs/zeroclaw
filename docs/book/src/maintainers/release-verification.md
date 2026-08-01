@@ -8,8 +8,7 @@ provenance.
 Attestation proves where and how an artifact was built. It does not prove that a
 human reviewed the source, that dependencies are safe, or that a maintainer
 account, GitHub-hosted runner, or GitHub control plane was not compromised. See
-[SLSA provenance attestation](../../../security/slsa-provenance.md) for the full
-threat model.
+`docs/security/slsa-provenance.md` in the repository for the full threat model.
 
 The release workflow currently treats attestations as best-effort Phase A
 output. Check the release notes before relying on verification material; they
