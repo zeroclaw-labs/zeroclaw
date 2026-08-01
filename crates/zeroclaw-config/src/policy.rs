@@ -1222,6 +1222,48 @@ impl SecurityPolicy {
     // `ls && rm -rf /` from being classified as Low just because `ls` is safe.
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
+    /// Resolve the real `git` subcommand, skipping leading global options:
+    /// `-C <path>`, `-c <cfg>`, `--git-dir[=]<p>`, `--work-tree[=]<p>`,
+    /// `--namespace <n>`, `--super-prefix <p>`, `--config-env <n>`,
+    /// `--exec-path[=<p>]`, the `--opt=value` glued form, and value-less flags
+    /// (`-p`/`--paginate`/`--no-pager`/`--bare`/…).
+    ///
+    /// Agents have no `cd`, so they address repositories with
+    /// `git -C <path> <verb>`. Reading the verb as `args.first()` then returns
+    /// the global option instead of the subcommand, which misclassifies
+    /// write-git as Low and lets it skip the medium-risk approval gate.
+    fn git_subcommand(args: &[String]) -> Option<&str> {
+        // Options that consume the NEXT token as a value (space-separated form).
+        // `-C` folds to `-c` under the case-insensitive check below; both take
+        // a value, so either way the value token is skipped.
+        const TAKES_VALUE: &[&str] = &[
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--super-prefix",
+            "--config-env",
+            "--exec-path",
+        ];
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if !a.starts_with('-') {
+                return Some(a); // first non-option token is the subcommand
+            }
+            if a.contains('=') {
+                i += 1; // `--opt=value` / `-C=...` glued form consumes nothing extra
+                continue;
+            }
+            if TAKES_VALUE.contains(&a.to_ascii_lowercase().as_str()) {
+                i += 2; // skip the option and its value
+                continue;
+            }
+            i += 1; // value-less flag
+        }
+        None
+    }
+
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
         let mut saw_medium = false;
 
@@ -1300,9 +1342,9 @@ impl SecurityPolicy {
 
             // Medium-risk commands (state-changing, but not inherently destructive)
             let medium = match base {
-                "git" => args.first().is_some_and(|verb| {
+                "git" => Self::git_subcommand(&args).is_some_and(|verb| {
                     matches!(
-                        verb.as_str(),
+                        verb,
                         "commit"
                             | "push"
                             | "reset"
@@ -2998,6 +3040,54 @@ mod tests {
             p.command_risk_level("touch file.txt"),
             CommandRiskLevel::Medium
         );
+    }
+
+    #[test]
+    fn command_risk_medium_for_write_git_behind_global_options() {
+        // Regression: agents address repos via `git -C <path> <verb>`
+        // (no `cd`), so the verb must be resolved past leading global options.
+        // Otherwise write-git slips from Medium to Low and skips the approval gate.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+        for cmd in [
+            "git -C /repo commit -m x",
+            "git -C /repo push",
+            "git --git-dir=/r/.git push",
+            "git --git-dir /r/.git reset --hard HEAD~1",
+            "git --no-pager -C /repo branch -D dev",
+        ] {
+            assert_eq!(
+                p.command_risk_level(cmd),
+                CommandRiskLevel::Medium,
+                "write-git behind global options must stay Medium: {cmd}"
+            );
+        }
+        // Read-git behind the same global options stays Low.
+        assert_eq!(
+            p.command_risk_level("git -C /repo status"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn git_subcommand_skips_global_options() {
+        let v = |s: &str| {
+            let args: Vec<String> = s
+                .split_whitespace()
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
+            SecurityPolicy::git_subcommand(&args).map(str::to_string)
+        };
+        assert_eq!(v("commit -m x").as_deref(), Some("commit"));
+        assert_eq!(v("-C /repo commit").as_deref(), Some("commit"));
+        assert_eq!(v("--git-dir=/r/.git push").as_deref(), Some("push"));
+        assert_eq!(v("--git-dir /r/.git push").as_deref(), Some("push"));
+        assert_eq!(v("-c user.name=x status").as_deref(), Some("status"));
+        assert_eq!(v("--no-pager -C /repo log").as_deref(), Some("log"));
+        assert_eq!(v("-C /repo").as_deref(), None); // options only, no subcommand
+        assert_eq!(v("").as_deref(), None);
     }
 
     #[test]
