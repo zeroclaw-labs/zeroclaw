@@ -82,6 +82,13 @@ use zeroclaw_providers::{ChatMessage, ModelProvider};
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 
+/// Number of remaining tool-call rounds at which the model starts receiving
+/// explicit budget guidance. Three rounds leave room to finish the requested
+/// work and perform one essential validation step before graceful shutdown.
+const ITERATION_BUDGET_WARNING_THRESHOLD: usize = 3;
+
+const ITERATION_BUDGET_WARNING_MARKER: &str = "<tool-iteration-budget>";
+
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
@@ -270,6 +277,47 @@ impl<'a> TurnState<'a> {
         }
         *self.history = history;
         result
+    }
+}
+
+/// Add a provider-only warning when the tool-loop budget is nearly exhausted.
+///
+/// Callers pass the per-iteration prepared-message clone so the warning guides
+/// the active response without becoming part of canonical session history.
+fn inject_iteration_budget_warning(messages: &mut Vec<ChatMessage>, remaining: usize) {
+    if remaining == 0 || remaining > ITERATION_BUDGET_WARNING_THRESHOLD {
+        return;
+    }
+
+    let guidance = if remaining == 1 {
+        "Only 1 tool-call round remains, including the current response. \
+         If the requested work is complete or available validation is blocked, do not call \
+         another tool; return the final answer now. Use a tool only if it is required to \
+         complete the request."
+            .to_string()
+    } else {
+        format!(
+            "Only {remaining} tool-call rounds remain, including the current response. \
+             Prioritize completing the user's request and essential validation. Do not repeat \
+             blocked actions or spend the remaining rounds on optional discovery."
+        )
+    };
+    let warning = format!(
+        "{ITERATION_BUDGET_WARNING_MARKER}\n\
+         {guidance}\n\
+         </tool-iteration-budget>"
+    );
+
+    if let Some(system_message) = messages.iter_mut().find(|message| message.role == "system") {
+        if !system_message
+            .content
+            .contains(ITERATION_BUDGET_WARNING_MARKER)
+        {
+            system_message.content.push_str("\n\n");
+            system_message.content.push_str(&warning);
+        }
+    } else {
+        messages.insert(0, ChatMessage::system(warning));
     }
 }
 
@@ -491,6 +539,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Err(ToolLoopCancelled.into());
         }
 
+        let mut remaining_iterations = max_iterations.saturating_sub(iteration);
+
         // Shared iteration budget: parent + subagents share a global counter
         if let Some(ref budget) = shared_budget {
             let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
@@ -505,6 +555,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 );
                 break;
             }
+            remaining_iterations = remaining_iterations.min(remaining);
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
@@ -656,13 +707,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         refresh_prompt_anchor(turn_state.history, use_native_tools);
 
-        let prepared_messages = prepare_messages_for_iteration(
+        let mut prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
         )
         .await?;
+        inject_iteration_budget_warning(&mut prepared_messages.messages, remaining_iterations);
 
         let llm_started_at = announce_llm_request(
             &ctx,
@@ -2232,6 +2284,59 @@ mod surface3_tests {
         let mut history: Vec<ChatMessage> = Vec::new();
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
+    }
+
+    #[test]
+    fn iteration_budget_warning_starts_with_three_rounds_remaining() {
+        let original = make_system_prompt(NATIVE_TOOLS_TASK_FRAMING);
+        let mut messages = vec![original.clone(), ChatMessage::user("task")];
+
+        inject_iteration_budget_warning(&mut messages, 4);
+        assert_eq!(messages[0].content, original.content);
+
+        inject_iteration_budget_warning(&mut messages, 3);
+        assert!(
+            messages[0]
+                .content
+                .contains("Only 3 tool-call rounds remain")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("Do not repeat blocked actions")
+        );
+    }
+
+    #[test]
+    fn iteration_budget_warning_counts_down_to_final_round() {
+        let mut messages = vec![
+            make_system_prompt(NATIVE_TOOLS_TASK_FRAMING),
+            ChatMessage::user("task"),
+        ];
+
+        inject_iteration_budget_warning(&mut messages, 1);
+
+        assert!(
+            messages[0]
+                .content
+                .contains("Only 1 tool-call round remains")
+        );
+        assert!(messages[0].content.contains("return the final answer now"));
+    }
+
+    #[test]
+    fn iteration_budget_warning_can_prepare_user_only_history() {
+        let mut messages = vec![ChatMessage::user("task")];
+
+        inject_iteration_budget_warning(&mut messages, 1);
+
+        assert_eq!(messages[0].role, "system");
+        assert!(
+            messages[0]
+                .content
+                .contains(ITERATION_BUDGET_WARNING_MARKER)
+        );
+        assert_eq!(messages[1].role, "user");
     }
 }
 

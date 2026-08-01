@@ -5167,14 +5167,27 @@ mod tests {
             .lock()
             .expect("recorded requests lock should be valid");
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].len(), 1);
+        assert_eq!(requests[0].len(), 2);
+        let system_message = requests[0]
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("iteration budget warning should be present");
         assert!(
-            requests[0][0]
+            system_message
+                .content
+                .contains("Only 3 tool-call rounds remain")
+        );
+        let user_message = requests[0]
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("degraded user message should be present");
+        assert!(
+            user_message
                 .content
                 .contains("1 attached image(s) could not be loaded")
         );
-        assert!(!requests[0][0].content.contains("[IMAGE:"));
-        assert!(!requests[0][0].content.contains(&oversized_payload));
+        assert!(!user_message.content.contains("[IMAGE:"));
+        assert!(!user_message.content.contains(&oversized_payload));
     }
 
     #[tokio::test]
