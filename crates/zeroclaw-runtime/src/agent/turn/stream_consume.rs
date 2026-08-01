@@ -400,8 +400,8 @@ mod tests {
     }
 
     /// Provider fixture that emits a fragmented `<eom>` tail across four
-    /// chunks. Used to pin the streaming-safe contract for issue #9006:
-    /// the marker must never reach `response_text` or any forwarded
+    /// chunks. Used to pin the streaming-safe contract for terminal marker
+    /// stripping: the marker must never reach `response_text` or any forwarded
     /// chunk even when split across delta boundaries.
     struct SplitTerminalMarkerProvider;
 
