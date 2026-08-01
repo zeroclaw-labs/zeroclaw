@@ -322,6 +322,38 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
+/// Body for `setMessageReaction`. `emoji: None` sends an empty `reaction`
+/// array, which is how Bot API 7.0 clears the reaction a bot has set.
+fn build_telegram_set_reaction_request(
+    chat_id: &str,
+    message_id: i64,
+    emoji: Option<&str>,
+) -> serde_json::Value {
+    match emoji {
+        Some(emoji) => build_telegram_ack_reaction_request(chat_id, message_id, emoji),
+        None => serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [],
+        }),
+    }
+}
+
+/// Split a `ChannelMessage::id` minted by this channel back into its
+/// `(chat_id, message_id)` parts.
+///
+/// Inbound ids are built as `telegram_{chat_id}_{message_id}`; `chat_id` is
+/// itself negative for groups (`-100…`), so the split has to come from the
+/// right, not the left.
+fn parse_telegram_message_id(id: &str) -> Option<(String, i64)> {
+    let rest = id.strip_prefix("telegram_")?;
+    let (chat_id, message_id) = rest.rsplit_once('_')?;
+    if chat_id.is_empty() {
+        return None;
+    }
+    Some((chat_id.to_string(), message_id.parse().ok()?))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
@@ -856,6 +888,47 @@ impl TelegramChannel {
             .get("message_id")
             .and_then(serde_json::Value::as_i64)?;
         Some((chat_id, message_id))
+    }
+
+    /// Set or clear this bot's reaction on a message, via Bot API
+    /// `setMessageReaction`.
+    ///
+    /// `channel_id` is accepted for trait symmetry but is not the source of the
+    /// chat: the chat is decoded from `message_id`, which this channel minted as
+    /// `telegram_{chat_id}_{message_id}`, so a reaction cannot be misrouted to a
+    /// different chat than the message lives in.
+    async fn set_message_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some((chat_id, numeric_id)) = parse_telegram_message_id(message_id) else {
+            anyhow::bail!(
+                "not a Telegram message id: {message_id} (expected telegram_<chat>_<id>)"
+            );
+        };
+
+        let body = build_telegram_set_reaction_request(&chat_id, numeric_id, emoji);
+        let response = self
+            .http_client()
+            .post(self.api_url("setMessageReaction"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMessageReaction failed ({status}): {err_body}");
+        }
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("set reaction on {channel_id} message {message_id}")
+        );
+        Ok(())
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
@@ -4063,6 +4136,29 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.set_message_reaction(channel_id, message_id, Some(emoji))
+            .await
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        // Bot API 7.0 `setMessageReaction` has no per-emoji removal: an empty
+        // `reaction` array clears what the bot set. Since a bot may hold only one
+        // reaction per message, clearing is equivalent to removing `_emoji`.
+        self.set_message_reaction(channel_id, message_id, None)
+            .await
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -4283,6 +4379,49 @@ mod tests {
             !vc.contains("@alice"),
             "live-resolved peers must not pollute the session voice_chats set"
         );
+    }
+
+    #[test]
+    fn parse_telegram_message_id_round_trips_a_dm_id() {
+        let id = format!("telegram_{}_{}", 12345, 678);
+        assert_eq!(
+            parse_telegram_message_id(&id),
+            Some(("12345".to_string(), 678))
+        );
+    }
+
+    #[test]
+    fn parse_telegram_message_id_keeps_negative_group_chat_id() {
+        // Supergroup chat ids are negative and contain the separator's
+        // neighbours; splitting from the left would truncate the chat id.
+        let id = format!("telegram_{}_{}", -1001234567890i64, 42);
+        assert_eq!(
+            parse_telegram_message_id(&id),
+            Some(("-1001234567890".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn parse_telegram_message_id_rejects_foreign_ids() {
+        // A UUID or another channel's id must not be coerced into a chat target.
+        assert_eq!(parse_telegram_message_id("whatsapp_3EB0F1C2"), None);
+        assert_eq!(
+            parse_telegram_message_id("f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            None
+        );
+        assert_eq!(parse_telegram_message_id("telegram_123_notanumber"), None);
+        assert_eq!(parse_telegram_message_id("telegram__7"), None);
+    }
+
+    #[test]
+    fn build_telegram_set_reaction_request_clears_with_empty_array() {
+        let clear = build_telegram_set_reaction_request("-100123", 7, None);
+        assert_eq!(clear["reaction"], serde_json::json!([]));
+
+        let set = build_telegram_set_reaction_request("-100123", 7, Some("\u{1F440}"));
+        assert_eq!(set["reaction"][0]["emoji"], "\u{1F440}");
+        assert_eq!(set["chat_id"], "-100123");
+        assert_eq!(set["message_id"], 7);
     }
 
     #[test]
