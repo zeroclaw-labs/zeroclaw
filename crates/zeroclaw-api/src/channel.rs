@@ -736,6 +736,46 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Archive or unarchive a conversation.
+    ///
+    /// These conversation-management methods bail by default rather than
+    /// returning `Ok(())`: a silent success would tell the agent it had
+    /// archived or muted a chat that in fact stayed untouched.
+    async fn set_chat_archived(&self, _channel_id: &str, _archived: bool) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support archiving chats")
+    }
+
+    /// Mute a conversation, optionally until a unix-millisecond deadline.
+    /// `None` mutes indefinitely.
+    async fn set_chat_muted(
+        &self,
+        _channel_id: &str,
+        _muted: bool,
+        _until_unix_ms: Option<i64>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support muting chats")
+    }
+
+    /// Pin or unpin a conversation in the chat list.
+    async fn set_chat_pinned(&self, _channel_id: &str, _pinned: bool) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support pinning chats")
+    }
+
+    /// Mark a whole conversation read or unread.
+    async fn set_chat_read(&self, _channel_id: &str, _read: bool) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support marking chats read")
+    }
+
+    /// Star or unstar a single message.
+    async fn set_message_starred(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _starred: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support starring messages")
+    }
+
     /// Create a new platform room/conversation when the channel supports it.
     async fn create_room(&self, _options: &RoomCreationOptions) -> anyhow::Result<String> {
         anyhow::bail!("channel does not support room creation")

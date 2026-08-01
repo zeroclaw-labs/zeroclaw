@@ -1081,6 +1081,21 @@ impl WhatsAppWebChannel {
         passive_group_context && is_group && !addressed_to_bot
     }
 
+    /// Resolve the connected client and chat JID for a conversation-level
+    /// action, so each action method does not repeat the same two failures.
+    #[cfg(feature = "whatsapp-web")]
+    fn chat_action_target(
+        &self,
+        channel_id: &str,
+    ) -> Result<(Arc<whatsapp_rust::Client>, wacore_binary::jid::Jid)> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        let jid = self.recipient_to_jid(channel_id)?;
+        Ok((client, jid))
+    }
+
     /// Send a reaction to a message this channel delivered. An empty `emoji`
     /// revokes the account's previous reaction (WA Web's sender-revoke).
     ///
@@ -2884,6 +2899,133 @@ impl Channel for WhatsAppWebChannel {
             &format!("start typing for {}", recipient)
         );
         Ok(())
+    }
+
+    async fn set_chat_archived(&self, channel_id: &str, archived: bool) -> Result<()> {
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        let actions = client.chat_actions();
+        if archived {
+            actions.archive_chat(&jid, None).await
+        } else {
+            actions.unarchive_chat(&jid, None).await
+        }
+        .map_err(|e| anyhow::Error::msg(format!("Failed to archive chat: {e}")))
+    }
+
+    async fn set_chat_muted(
+        &self,
+        channel_id: &str,
+        muted: bool,
+        until_unix_ms: Option<i64>,
+    ) -> Result<()> {
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        let actions = client.chat_actions();
+        match (muted, until_unix_ms) {
+            (true, Some(until)) => actions.mute_chat_until(&jid, until).await,
+            (true, None) => actions.mute_chat(&jid).await,
+            (false, _) => actions.unmute_chat(&jid).await,
+        }
+        .map_err(|e| anyhow::Error::msg(format!("Failed to mute chat: {e}")))
+    }
+
+    async fn set_chat_pinned(&self, channel_id: &str, pinned: bool) -> Result<()> {
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        let actions = client.chat_actions();
+        if pinned {
+            actions.pin_chat(&jid).await
+        } else {
+            actions.unpin_chat(&jid).await
+        }
+        .map_err(|e| anyhow::Error::msg(format!("Failed to pin chat: {e}")))
+    }
+
+    async fn set_chat_read(&self, channel_id: &str, read: bool) -> Result<()> {
+        let (client, jid) = self.chat_action_target(channel_id)?;
+        client
+            .chat_actions()
+            .mark_chat_as_read(&jid, read, None)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to mark chat: {e}")))
+    }
+
+    async fn set_message_starred(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        starred: bool,
+    ) -> Result<()> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        let Some(message_ref) = WhatsAppMessageRef::decode(message_id) else {
+            anyhow::bail!("not a WhatsApp message id: {message_id}");
+        };
+
+        let chat = self.recipient_to_jid(&message_ref.chat)?;
+        let participant = message_ref
+            .participant
+            .as_deref()
+            .map(|p| self.recipient_to_jid(p))
+            .transpose()?;
+
+        let actions = client.chat_actions();
+        if starred {
+            actions
+                .star_message(
+                    &chat,
+                    participant.as_ref(),
+                    &message_ref.stanza_id,
+                    message_ref.from_me,
+                )
+                .await
+        } else {
+            actions
+                .unstar_message(
+                    &chat,
+                    participant.as_ref(),
+                    &message_ref.stanza_id,
+                    message_ref.from_me,
+                )
+                .await
+        }
+        .map_err(|e| anyhow::Error::msg(format!("Failed to star message: {e}")))
+    }
+
+    /// Delete a message for everyone.
+    ///
+    /// The trait default returns `Ok(())` without acting, which would report a
+    /// successful deletion while the message stayed visible to everyone.
+    async fn redact_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        _reason: Option<String>,
+    ) -> Result<()> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let Some(message_ref) = WhatsAppMessageRef::decode(message_id) else {
+            anyhow::bail!("not a WhatsApp message id: {message_id}");
+        };
+
+        // Revoking someone else's message needs group-admin rights and a
+        // different wire form, so refuse rather than silently no-op.
+        if !message_ref.from_me {
+            anyhow::bail!("WhatsApp can only delete messages sent by this account");
+        }
+
+        let chat = self.recipient_to_jid(&message_ref.chat)?;
+        client
+            .revoke_message(
+                chat,
+                message_ref.stanza_id.clone(),
+                whatsapp_rust::RevokeType::Sender,
+            )
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("Failed to delete message: {e}")))
     }
 
     async fn add_reaction(&self, _channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
