@@ -2194,16 +2194,14 @@ pub fn strip_trailing_terminal_markers(s: &str) -> String {
             for ws_len in (1..=10.min(result.len())).rev() {
                 if result.len() > marker.len() + ws_len {
                     let suffix_start = result.len() - ws_len;
-                    if let Some(suffix) = result.get(suffix_start..) {
-                        if suffix.chars().all(|c| c.is_whitespace()) {
-                            if let Some(before_ws) = result.get(..suffix_start) {
-                                if let Some(stripped) = before_ws.strip_suffix(marker) {
-                                    result = stripped.to_string();
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
+                    if let Some(suffix) = result.get(suffix_start..)
+                        && suffix.chars().all(|c| c.is_whitespace())
+                        && let Some(before_ws) = result.get(..suffix_start)
+                        && let Some(stripped) = before_ws.strip_suffix(marker)
+                    {
+                        result = stripped.to_string();
+                        found = true;
+                        break;
                     }
                 }
             }
