@@ -52,6 +52,19 @@ pub fn install_global_subscriber(
         .with(fmt_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    // Bridge the `log` crate into tracing. Several dependencies emit
+    // through `log` rather than `tracing` — notably `whatsapp-rust`,
+    // which reports the WhatsApp Web pair code that way. Without this
+    // bridge those records are dropped before any layer sees them, so
+    // the operator watches a silent daemon and concludes the pairing
+    // never ran. `set_global_default` above does not capture `log`
+    // records on its own; only this logger install does.
+    //
+    // The `Err` case means a logger was already installed (e.g. a
+    // second call in the same process), which is not a failure worth
+    // aborting a daemon over.
+    let _ = tracing_log::LogTracer::init();
 }
 
 #[doc(hidden)]
@@ -346,6 +359,25 @@ mod tests {
         assert!(
             !out.contains(F_EPHEMERAL_ATTRS),
             "bool-recorded ephemeral field leaked: {out:?}"
+mod log_bridge_tests {
+    /// Dependencies that emit through the `log` crate must reach the
+    /// tracing subscriber. `whatsapp-rust` reports the WhatsApp Web pair
+    /// code via `log::info!`; before the bridge existed those records
+    /// were dropped before any layer saw them, so the daemon looked as
+    /// though it had never attempted pairing at all. A silent logging
+    /// regression is invisible in normal operation, which is exactly why
+    /// it needs a test rather than a comment.
+    #[test]
+    fn log_records_reach_tracing() {
+        // `LogTracer::init` installs the process-wide `log` logger and is
+        // idempotent-by-error: a second call returns Err rather than
+        // panicking, so this is safe alongside `install_global_subscriber`.
+        let _ = tracing_log::LogTracer::init();
+
+        assert!(
+            log::logger().enabled(&log::Metadata::builder().level(log::Level::Info).build()),
+            "the log->tracing bridge must be installed, otherwise `log`-emitting \
+             dependencies (whatsapp-rust's pair code) are silently discarded"
         );
     }
 }
