@@ -37,6 +37,10 @@ pub struct SqliteMemory {
     embedder: Arc<RwLock<Arc<dyn EmbeddingProvider>>>,
     vector_weight: f32,
     keyword_weight: f32,
+    /// Share of the recall score owned by stored importance. Policy lives in
+    /// `memory.importance_weight`; the importance values themselves stay in
+    /// the `memories.importance` column.
+    importance_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
 }
@@ -49,6 +53,7 @@ impl SqliteMemory {
             Arc::new(super::embeddings::NoopEmbedding),
             0.7,
             0.3,
+            0.2,
             10_000,
             None,
             SearchMode::default(),
@@ -84,6 +89,7 @@ impl SqliteMemory {
             embedder: Arc::new(RwLock::new(Arc::new(super::embeddings::NoopEmbedding))),
             vector_weight: 0.7,
             keyword_weight: 0.3,
+            importance_weight: 0.2,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
         })
@@ -95,6 +101,7 @@ impl SqliteMemory {
         embedder: Arc<dyn EmbeddingProvider>,
         vector_weight: f32,
         keyword_weight: f32,
+        importance_weight: f32,
         cache_max: usize,
         open_timeout_secs: Option<u64>,
         search_mode: SearchMode,
@@ -127,6 +134,7 @@ impl SqliteMemory {
             embedder: Arc::new(RwLock::new(embedder)),
             vector_weight,
             keyword_weight,
+            importance_weight,
             cache_max,
             search_mode,
         })
@@ -1072,6 +1080,7 @@ impl SqliteMemory {
         let until_owned = until.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
+        let importance_weight = self.importance_weight;
         let search_mode = self.search_mode.clone();
         let allowed = allowed_agent_ids;
 
@@ -1157,12 +1166,21 @@ impl SqliteMemory {
                     })
                     .collect::<Vec<_>>()
             } else {
+                // Widen the candidate pool when importance participates:
+                // truncating to `limit` on relevance alone would discard an
+                // important memory ranked just outside it before its
+                // importance could count.
+                let merge_limit = if importance_weight > 0.0 {
+                    limit.saturating_mul(3)
+                } else {
+                    limit
+                };
                 vector::hybrid_merge(
                     &vector_results,
                     &keyword_results,
                     vector_weight,
                     keyword_weight,
-                    limit,
+                    merge_limit,
                 )
             };
 
@@ -1292,6 +1310,27 @@ impl SqliteMemory {
                         results.push(entry);
                     }
                 }
+            }
+
+            // Importance is only known after the entry rows are fetched, so the
+            // blend and the final cut happen here rather than inside the merge.
+            if importance_weight > 0.0 {
+                for entry in &mut results {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let relevance = entry.score.unwrap_or(0.0) as f32;
+                    entry.score = Some(f64::from(vector::blend_importance(
+                        relevance,
+                        entry.importance,
+                        importance_weight,
+                    )));
+                }
+                results.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                results.truncate(limit);
             }
 
             // If hybrid returned nothing, fall back to LIKE search.
@@ -2911,6 +2950,7 @@ mod tests {
             embedder,
             0.7,
             0.3,
+            0.2,
             1000,
             Some(5),
             SearchMode::default(),
@@ -2931,6 +2971,7 @@ mod tests {
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             Some(2),
             SearchMode::default(),
@@ -2977,6 +3018,7 @@ mod tests {
             Arc::new(FailingEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::default(),
@@ -3069,6 +3111,7 @@ mod tests {
             first,
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::default(),
@@ -3553,6 +3596,7 @@ mod tests {
             embedder,
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::default(),
@@ -3652,6 +3696,7 @@ mod tests {
             Arc::new(FixedEmbedding(4)),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::default(),
@@ -3785,6 +3830,7 @@ mod tests {
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::Embedding,
@@ -3811,6 +3857,7 @@ mod tests {
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::Embedding,
@@ -5113,6 +5160,7 @@ mod tests {
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::Bm25,
@@ -5148,6 +5196,7 @@ mod tests {
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
+            0.2,
             1000,
             None,
             SearchMode::Embedding,

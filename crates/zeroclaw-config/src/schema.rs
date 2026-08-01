@@ -10615,6 +10615,13 @@ pub struct MemoryConfig {
     /// How heavily BM25 (keyword) overlap counts when `search_mode = hybrid`. Raise toward 1.0 for exact-term matching; lower it when paraphrases should still score well.
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
+    /// Share of the final recall score owned by a memory's stored importance,
+    /// with relevance keeping the remainder. Relevance answers "does this match
+    /// the query" but not "does this matter"; without this, marking a memory
+    /// important has no effect on what gets recalled. `0.0` disables the blend
+    /// and reproduces relevance-only ranking.
+    #[serde(default = "default_importance_weight")]
+    pub importance_weight: f64,
     /// How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding model_provider); `hybrid` = blended keyword + vector score using the weights above (most robust).
     #[serde(default)]
     pub search_mode: SearchMode,
@@ -11132,6 +11139,9 @@ fn default_vector_weight() -> f64 {
 fn default_keyword_weight() -> f64 {
     0.3
 }
+fn default_importance_weight() -> f64 {
+    0.2
+}
 fn default_min_relevance_score() -> f64 {
     0.4
 }
@@ -11171,6 +11181,7 @@ impl Default for MemoryConfig {
             embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
+            importance_weight: default_importance_weight(),
             search_mode: SearchMode::default(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),

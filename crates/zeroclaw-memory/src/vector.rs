@@ -146,6 +146,29 @@ pub fn hybrid_merge(
     results
 }
 
+/// Blend a retrieval score with the memory's stored importance.
+///
+/// Relevance alone answers "does this match the query"; it cannot answer "does
+/// this matter". A user's stated preference and a passing remark can phrase
+/// alike, so without this an operator marking something important has no effect
+/// on what actually gets recalled.
+///
+/// `importance_weight` is the share of the final score importance owns; the
+/// relevance score keeps the remainder. A weight of 0.0 reproduces the previous
+/// relevance-only behaviour exactly. Missing importance is treated as neutral
+/// (`0.5`) rather than 0.0, so entries stored before importance was recorded
+/// are not pushed below entries explicitly marked unimportant.
+#[must_use]
+pub fn blend_importance(relevance: f32, importance: Option<f64>, importance_weight: f32) -> f32 {
+    if importance_weight <= 0.0 {
+        return relevance;
+    }
+    let w = importance_weight.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation)]
+    let imp = importance.unwrap_or(0.5).clamp(0.0, 1.0) as f32;
+    (1.0 - w) * relevance + w * imp
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
@@ -155,6 +178,57 @@ pub fn hybrid_merge(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_importance_weight_leaves_relevance_untouched() {
+        // The default must be a no-op for anyone who has not opted in.
+        assert_eq!(blend_importance(0.8, Some(0.1), 0.0), 0.8);
+        assert_eq!(blend_importance(0.3, None, 0.0), 0.3);
+    }
+
+    #[test]
+    fn importance_reorders_equally_relevant_memories() {
+        // Two memories the query matches equally: the one marked important
+        // must win, which is the whole point of storing importance.
+        let w = 0.2;
+        let important = blend_importance(0.6, Some(0.95), w);
+        let trivial = blend_importance(0.6, Some(0.1), w);
+        assert!(
+            important > trivial,
+            "importance must break ties: {important} vs {trivial}"
+        );
+    }
+
+    #[test]
+    fn missing_importance_is_neutral_not_zero() {
+        // Entries stored before importance was recorded must not rank below
+        // entries explicitly marked unimportant.
+        let w = 0.2;
+        let unknown = blend_importance(0.5, None, w);
+        let explicitly_low = blend_importance(0.5, Some(0.0), w);
+        assert!(unknown > explicitly_low);
+        assert_eq!(unknown, blend_importance(0.5, Some(0.5), w));
+    }
+
+    #[test]
+    fn relevance_still_dominates_at_the_default_weight() {
+        // At 0.2 importance must not let an irrelevant memory outrank a
+        // strongly matching one, or recall becomes "show me favourites".
+        let w = 0.2;
+        let relevant_unimportant = blend_importance(0.9, Some(0.0), w);
+        let irrelevant_important = blend_importance(0.1, Some(1.0), w);
+        assert!(relevant_unimportant > irrelevant_important);
+    }
+
+    #[test]
+    fn weight_and_importance_are_clamped() {
+        // Out-of-range config or stored values must not produce scores
+        // outside [0, 1] that would corrupt the ordering.
+        let s = blend_importance(0.5, Some(9.0), 5.0);
+        assert!((0.0..=1.0).contains(&s), "score out of range: {s}");
+        let s2 = blend_importance(0.5, Some(-3.0), 0.5);
+        assert!((0.0..=1.0).contains(&s2), "score out of range: {s2}");
+    }
 
     #[test]
     fn cosine_identical_vectors() {
