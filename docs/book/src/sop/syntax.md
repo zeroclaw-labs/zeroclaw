@@ -28,13 +28,20 @@ checked-in SOP, validate it with `zeroclaw sop validate <name>`.
 `triggers`, its owning `agent`, and its execution knobs.
 
 `agent` names the configured agent alias that `execute` steps run as; an
-individual step's own `agent` overrides it. **A SOP with any headless trigger
+individual step's own `agent` overrides it, and the resolved alias must be a
+configured agent with `enabled = true`. **A SOP with any headless trigger
 (cron, mqtt, webhook, amqp, filesystem, calendar, peripheral, channel) must
 resolve an owner for every `execute` step**, from one level or the other:
 validation blocks the save otherwise. Those triggers fire with no agent turn to
 inherit an identity from, and an unowned step is refused at dispatch rather than
-run as an unrelated agent. `manual` triggers are exempt: `sop_execute` runs
-inside an agent turn, which owns the run.
+run as an unrelated agent.
+
+`manual` triggers are the one case validation only warns about, because they
+start from both sides: through `sop_execute` the calling agent owns the run, so
+no `agent` is needed, while the dashboard's run endpoint starts the same
+procedure with no agent behind it. That endpoint refuses an unowned procedure
+(see [Manual](./fan-in/manual.md)), so declare `agent` on any SOP you intend to
+start from the dashboard.
 
 The concurrency-admission fields govern what happens when a trigger arrives
 while this SOP's execution slots are full:

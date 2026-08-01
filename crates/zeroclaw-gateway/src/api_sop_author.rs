@@ -193,6 +193,30 @@ pub async fn handle_sop_run(
             .into_response();
     };
 
+    // A dashboard run emits a Manual event but has no agent turn behind it: the
+    // driver below executes the step, so an unowned procedure would start, burn
+    // a run id, and fail its first step. Refuse before dispatch, on the same
+    // ownership rule the driver and the authoring gate apply.
+    let ownership_refusal = match engine.lock() {
+        Ok(guard) => guard
+            .get_sop(&name)
+            .and_then(zeroclaw_runtime::sop::headless_ownership_refusal),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "SOP engine lock poisoned" })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(refusal) = ownership_refusal {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": refusal })),
+        )
+            .into_response();
+    }
+
     let payload = body
         .payload
         .as_deref()
@@ -793,6 +817,108 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
         }
+    }
+
+    /// A Manual SOP whose one `execute` step resolves an owner only when
+    /// `owner` is set. `sop_execute` would run it under the calling agent; the
+    /// dashboard has no such agent.
+    fn manual_execute_sop(owner: Option<&str>) -> Sop {
+        Sop {
+            name: "nightly".into(),
+            description: "t".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "collect".into(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: owner.map(str::to_string),
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    fn manual_run_state(sop: Sop) -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop).unwrap();
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        state.sop_audit = Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
+            Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+        )));
+        (tmp, state)
+    }
+
+    /// A dashboard run drives the SOP through the headless driver, which has no
+    /// agent turn to inherit an owner from. Starting an unowned procedure here
+    /// would burn a run id and fail its first step, so the surface refuses it up
+    /// front — the authoring gate lets the SOP save because `sop_execute` can
+    /// still run it under the calling agent.
+    #[tokio::test]
+    async fn manual_run_refuses_an_unowned_procedure_before_starting_it() {
+        let (_tmp, state) = manual_run_state(manual_execute_sop(None));
+
+        let resp = handle_sop_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("nightly".to_string()),
+            Json(SopRunBody { payload: None }),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a dashboard-started run with no owning agent must be refused"
+        );
+        assert!(
+            state
+                .sop_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .active_runs()
+                .is_empty(),
+            "the refusal must land before a run is started"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_run_starts_an_owned_procedure() {
+        let (_tmp, state) = manual_run_state(manual_execute_sop(Some("ops")));
+
+        let resp = handle_sop_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("nightly".to_string()),
+            Json(SopRunBody { payload: None }),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an owned procedure must still start from the dashboard"
+        );
     }
 
     fn authoring_checkpoint_sop(name: &str) -> Sop {

@@ -206,9 +206,9 @@ pub fn drive_resumed_broker_action(
 /// owning agent at all. Headless triggers have no ambient agent turn to borrow
 /// an identity from, and borrowing an arbitrary configured agent would run an
 /// unattended procedure under that agent's provider, workspace, tool surface,
-/// and risk profile. An alias naming an unconfigured agent fails the same way,
-/// with a message that names the SOP's own declaration rather than the generic
-/// turn-assembly error.
+/// and risk profile. An alias naming an unconfigured — or configured but
+/// disabled — agent fails the same way, with a message that names the SOP's own
+/// declaration rather than the generic turn-assembly error.
 fn headless_step_agent<'a>(
     config: &zeroclaw_config::schema::Config,
     step: &'a SopStep,
@@ -225,9 +225,19 @@ fn headless_step_agent<'a>(
                 step.number
             ))
         })?;
-    if !config.agents.contains_key(alias) {
+    let Some(agent) = config.agents.get(alias) else {
         anyhow::bail!(
             "SOP step {} names agent '{alias}', which is not a configured agent",
+            step.number
+        );
+    };
+    // `enabled = false` is the operator withdrawing an agent from service.
+    // The agent lookup this alias feeds does not filter on it, so a disabled
+    // owner would otherwise keep running unattended procedures — the one class
+    // of run with nobody watching it happen.
+    if !agent.enabled {
+        anyhow::bail!(
+            "SOP step {} names agent '{alias}', which is disabled",
             step.number
         );
     }
@@ -283,24 +293,33 @@ async fn drive_headless_run(
                     Ok(agent_alias) => {
                         let session_path =
                             std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
-                        Box::pin(crate::agent::run(
-                            config.clone(),
-                            agent_alias,
-                            Some(context),
-                            None,
-                            None,
-                            config
-                                .model_provider_for_agent(agent_alias)
-                                .and_then(|e| e.temperature),
-                            vec![],
-                            false,
-                            Some(session_path),
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::Daemon,
-                            crate::agent::loop_::AgentRunOverrides {
-                                sop_step_scope: Some(headless_step_scope(&engine, &run_id, &step)),
-                                ..Default::default()
-                            },
+                        let scope = headless_step_scope(&engine, &run_id, &step);
+                        // The scope is both handed to this run and published on
+                        // the task: a tool that starts a child run (child-agent
+                        // spawning) inherits the same boundary, so the child
+                        // cannot regain tools this step denies — including the
+                        // SOP control surface the step turn always drops.
+                        Box::pin(crate::sop::active_scope::with_active_headless_step_scope(
+                            scope.clone(),
+                            crate::agent::run(
+                                config.clone(),
+                                agent_alias,
+                                Some(context),
+                                None,
+                                None,
+                                config
+                                    .model_provider_for_agent(agent_alias)
+                                    .and_then(|e| e.temperature),
+                                vec![],
+                                false,
+                                Some(session_path),
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::Daemon,
+                                crate::agent::loop_::AgentRunOverrides {
+                                    sop_step_scope: Some(scope),
+                                    ..Default::default()
+                                },
+                            ),
                         ))
                         .await
                     }
@@ -752,5 +771,65 @@ mod tests {
         assert_eq!(outer_calls[0].output, "outer");
         assert_eq!(inner_calls.len(), 1);
         assert_eq!(inner_calls[0].output, "inner");
+    }
+
+    fn config_with_agent(alias: &str, enabled: bool) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled,
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn owned_step(alias: Option<&str>) -> SopStep {
+        SopStep {
+            number: 1,
+            agent: alias.map(str::to_string),
+            ..SopStep::default()
+        }
+    }
+
+    /// An operator who disables an agent has withdrawn it from service. The
+    /// agent lookup behind this alias does not filter on `enabled`, so without
+    /// this check an unattended SOP would keep running under it.
+    #[test]
+    fn headless_step_agent_refuses_a_disabled_owner() {
+        let config = config_with_agent("ops", false);
+
+        let err = headless_step_agent(&config, &owned_step(Some("ops")))
+            .expect_err("a disabled owner must not run an unattended step");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ops") && message.contains("disabled"),
+            "the refusal should name the disabled alias, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn headless_step_agent_accepts_an_enabled_owner() {
+        let config = config_with_agent("ops", true);
+
+        assert_eq!(
+            headless_step_agent(&config, &owned_step(Some("ops"))).expect("enabled owner resolves"),
+            "ops"
+        );
+    }
+
+    #[test]
+    fn headless_step_agent_refuses_missing_and_unconfigured_owners() {
+        let config = config_with_agent("ops", true);
+
+        let unowned = headless_step_agent(&config, &owned_step(None))
+            .expect_err("an unowned step must be refused");
+        assert!(unowned.to_string().contains("no owning agent"));
+
+        let unknown = headless_step_agent(&config, &owned_step(Some("ghost")))
+            .expect_err("an unconfigured owner must be refused");
+        assert!(unknown.to_string().contains("not a configured agent"));
     }
 }

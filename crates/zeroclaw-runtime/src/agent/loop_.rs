@@ -1094,7 +1094,9 @@ pub struct AgentRunOverrides {
     /// other non-agent-loop trigger surfaces). `Some` narrows every turn of
     /// this run to the step's active scope and removes the SOP control tools,
     /// matching what the live nested-step driver enforces inside an enclosing
-    /// turn. `None` for every ordinary agent run.
+    /// turn. Also `Some` on a child run started from inside such a step, which
+    /// inherits the step's boundary rather than rebuilding the agent's full
+    /// surface. `None` for every ordinary agent run.
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
 }
 

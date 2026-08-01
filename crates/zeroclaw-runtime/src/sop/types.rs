@@ -233,13 +233,19 @@ impl SopTrigger {
         SopTriggerSource::from(self)
     }
 
-    /// True when this trigger starts a run with no ambient agent turn.
+    /// True when this trigger can *only* start a run with no ambient agent turn.
     ///
     /// Every fan-in source except `Manual` fires from a listener, poller, or
     /// the maintenance tick, none of which carry an agent identity a step could
-    /// borrow. `Manual` is agent-initiated through the `sop_execute` tool, so
-    /// the calling turn's agent owns the run. A procedure reachable by a
-    /// headless trigger must declare its own owning agent (see [`Sop::agent`]).
+    /// borrow, so a procedure reachable by one must declare its own owning
+    /// agent (see [`Sop::agent`]).
+    ///
+    /// `Manual` is false because it is reachable from both sides: through the
+    /// `sop_execute` tool the calling turn's agent owns the run, while the
+    /// dashboard run endpoint emits the same event from outside any agent turn.
+    /// The trigger alone cannot tell those apart, so ownership for a Manual
+    /// start is enforced by the surface that starts it
+    /// (`sop::headless_ownership_refusal`) rather than by this flag.
     pub fn is_headless(&self) -> bool {
         !matches!(self, Self::Manual)
     }

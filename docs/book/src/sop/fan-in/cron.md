@@ -14,10 +14,10 @@ A cron-started run is driven to completion without an agent loop attached. The m
 
 Two constraints apply to the step turn, both of them fail-closed:
 
-- **The SOP must name its owning agent.** Set `agent` in `SOP.toml` (or `agent` on an individual step, which overrides it) to a configured agent alias. A cron run has no ambient agent turn to inherit an identity from, so an unowned procedure is rejected when it is authored, and the driver refuses the step rather than running it as some other configured agent. The step runs with that agent's provider, workspace, tools, and risk profile.
-- **The step's tool scope is enforced.** The SOP control tools (`sop_execute`, `sop_advance`, `sop_approve`) are always removed from a step turn, so an automatic run cannot drive itself. When `sop.step_scope_enforce` is set, the step's declared `scope` narrows the surface further.
+- **The SOP must name its owning agent, and that agent must be enabled.** Set `agent` in `SOP.toml` (or `agent` on an individual step, which overrides it) to a configured agent alias. A cron run has no ambient agent turn to inherit an identity from, so an unowned procedure is rejected when it is authored, and the driver refuses the step rather than running it as some other configured agent. An alias that is unconfigured, or configured with `enabled = false`, is refused the same way: disabling an agent withdraws it from unattended work too. The step runs with that agent's provider, workspace, tools, and risk profile.
+- **The step's tool scope is enforced, including in child runs.** The SOP control tools (`sop_execute`, `sop_advance`, `sop_approve`) are always removed from a step turn, so an automatic run cannot drive itself. When `sop.step_scope_enforce` is set, the step's declared `scope` narrows the surface further. A child agent the step spawns inherits the same exclusions, so spawning one is not a way around the step's boundary.
 
-In-flight cron drivers belong to the daemon generation that started them. On reload the daemon stops the maintenance tick, lets running drivers finish under the configuration they started with (up to 30 seconds, then aborts them), and only then rebuilds the config and SOP engine, so no step straddles two configurations.
+In-flight cron drivers belong to the daemon generation that started them. On reload the daemon stops the maintenance tick, lets running drivers finish under the configuration they started with (up to 30 seconds), then aborts the stragglers and waits for them to actually stop before rebuilding the config and SOP engine, so no step straddles two configurations.
 
 ## See also
 

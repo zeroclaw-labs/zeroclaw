@@ -1541,10 +1541,18 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // Captured here and restored inside the task: a background delegation
+        // leaves the caller's task, and with it the SOP step scope this call was
+        // made under. Backgrounding the work must not widen what it may do.
+        let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, async move {
+            scope_delegate_session_key(
+                parent_session_key,
+                crate::sop::active_scope::with_inherited_headless_step_scope(
+                    parent_step_scope,
+                    async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1649,11 +1657,13 @@ impl DelegateTool {
                         .await;
                 }
 
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels()
-                    .lock()
-                    .remove(&task_id_clone);
-            })
+                        // Drop the live cancel token now the task has settled.
+                        Self::background_task_cancels()
+                            .lock()
+                            .remove(&task_id_clone);
+                    }
+                )
+            )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
@@ -2509,7 +2519,7 @@ impl DelegateTool {
         // describes exactly the assembled skill tools rather than the local bundle resolver's
         // narrower view. None for bounded delegation (local resolution).
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
-        let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
+        let mut sub_tools: Vec<Box<dyn Tool>> = match target_mode {
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
@@ -2578,6 +2588,22 @@ impl DelegateTool {
                     .collect()
             }
         };
+
+        // A delegation from inside a headless SOP step carries that step's tool
+        // boundary onto the target. Both modes reach it: bounded starts from the
+        // caller's registry, independent assembles the target's own, and neither
+        // knows about the step. Handing work to another agent is not a way to
+        // run what the step denied — including the SOP control tools, which
+        // would otherwise let the target drive the very run it is a step of.
+        if let Some(scope) = crate::sop::active_scope::active_headless_step_scope() {
+            let names: Vec<String> = sub_tools.iter().map(|t| t.name().to_string()).collect();
+            let excluded = scope.excluded(&names);
+            sub_tools.retain(|tool| {
+                !excluded
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
+            });
+        }
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
 
@@ -4442,6 +4468,69 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("tool count matched: 1"));
+    }
+
+    /// A delegation made from inside a headless SOP step carries that step's
+    /// tool boundary onto the target. Both modes converge on the same assembled
+    /// target registry, so neither bounded (which starts from the caller's
+    /// tools) nor independent (which builds the target's own) can hand the
+    /// target something the step gave up.
+    #[tokio::test]
+    async fn execute_agentic_narrows_the_target_to_the_active_sop_step_scope() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        // Control: outside a step, the target keeps the one admitted tool.
+        let unscoped = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &ToolCountModelProvider { expected_tools: 1 },
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(unscoped.success, "got: {:?}", unscoped.error);
+
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["read_file".into()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+        };
+
+        // Under a step that allows only `read_file`, the delegated target must
+        // not receive `echo_tool` either.
+        let scoped = crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "run",
+                Some(0.2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(scoped.success, "got: {:?}", scoped.error);
     }
 
     #[tokio::test]
