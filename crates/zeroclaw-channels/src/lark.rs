@@ -6021,7 +6021,10 @@ mod tests {
             .await
             .expect("unknown approval id should not error");
     }
-    async fn mount_lark_token_and_send_mocks(mock_server: &wiremock::MockServer) {
+    async fn mount_lark_token_and_send_mocks(
+        mock_server: &wiremock::MockServer,
+        receive_id_type: &'static str,
+    ) {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -6037,7 +6040,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/im/v1/messages"))
-            .and(query_param("receive_id_type", "chat_id"))
+            .and(query_param("receive_id_type", receive_id_type))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "code": 0,
                 "data": { "message_id": "om_test_message_id" }
@@ -6049,6 +6052,7 @@ mod tests {
 
     async fn assert_send_body_matches_recipient_and_text(
         mock_server: &wiremock::MockServer,
+        expected_receive_id_type: &str,
         expected_recipient: &str,
         expected_text: &str,
     ) {
@@ -6062,8 +6066,8 @@ mod tests {
             .expect("expected at least one POST /im/v1/messages");
         assert_eq!(
             send_request.url.query(),
-            Some("receive_id_type=chat_id"),
-            "send URL must carry receive_id_type=chat_id query param"
+            Some(format!("receive_id_type={expected_receive_id_type}").as_str()),
+            "send URL must carry the expected receive_id_type query param"
         );
         let body: serde_json::Value =
             serde_json::from_slice(&send_request.body).expect("send body should be valid JSON");
@@ -6089,7 +6093,7 @@ mod tests {
     #[tokio::test]
     async fn lark_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
-        mount_lark_token_and_send_mocks(&mock_server).await;
+        mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
 
         let config = zeroclaw_config::schema::LarkConfig {
             enabled: true,
@@ -6115,6 +6119,7 @@ mod tests {
 
         assert_send_body_matches_recipient_and_text(
             &mock_server,
+            "chat_id",
             "oc_test_chat_id",
             "hi from cron",
         )
@@ -6124,7 +6129,7 @@ mod tests {
     #[tokio::test]
     async fn feishu_send_via_from_config_emits_post_to_messages_endpoint() {
         let mock_server = wiremock::MockServer::start().await;
-        mount_lark_token_and_send_mocks(&mock_server).await;
+        mount_lark_token_and_send_mocks(&mock_server, "chat_id").await;
 
         let config = zeroclaw_config::schema::LarkConfig {
             enabled: true,
@@ -6151,7 +6156,38 @@ mod tests {
 
         assert_send_body_matches_recipient_and_text(
             &mock_server,
+            "chat_id",
             "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lark_send_uses_open_id_for_open_id_recipient() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server, "open_id").await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        let message = SendMessage::new("hi from cron", "ou_test_user_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed for an open_id recipient");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "open_id",
+            "ou_test_user_id",
             "hi from cron",
         )
         .await;
