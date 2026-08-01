@@ -25,7 +25,7 @@ use zeroclaw_api::jsonrpc::{
     RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
     SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 
 /// Wire protocol version. Bump on breaking changes.
@@ -348,6 +348,59 @@ fn skill_prompt_failure_content(error: &JsonRpcError) -> String {
     }
 }
 
+struct SkillPromptExpansionError {
+    rpc: JsonRpcError,
+    reason: &'static str,
+}
+
+impl SkillPromptExpansionError {
+    fn new(code: i32, message: impl Into<String>, reason: &'static str) -> Self {
+        Self {
+            rpc: rpc_err(code, message),
+            reason,
+        }
+    }
+}
+
+struct ExpandedSkillPrompt {
+    prompt: SessionPromptParams,
+    invocation: String,
+}
+
+fn split_invocation_head(input: &str) -> (&str, &str) {
+    let trimmed = input.trim();
+    if let Some(index) = trimmed.find(char::is_whitespace) {
+        let (head, rest) = trimmed.split_at(index);
+        (head, rest.trim())
+    } else {
+        (trimmed, "")
+    }
+}
+
+fn validate_skill_invocation(
+    invocation: &str,
+    skill: &str,
+    arguments: &str,
+) -> Result<String, JsonRpcError> {
+    let invocation = invocation.trim();
+    let command = invocation
+        .strip_prefix('/')
+        .ok_or_else(|| rpc_err(INVALID_PARAMS, "skill invocation must start with `/`"))?;
+    let (head, tail) = split_invocation_head(command);
+    let (invoked_skill, invoked_arguments) = if head == "skill" {
+        split_invocation_head(tail)
+    } else {
+        (head, tail)
+    };
+    if invoked_skill != skill || invoked_arguments != arguments.trim() {
+        return Err(rpc_err(
+            INVALID_PARAMS,
+            "skill invocation does not match `skill` and `arguments`",
+        ));
+    }
+    Ok(invocation.to_string())
+}
+
 fn expand_skill_template(template: &str, arguments: &str) -> String {
     let indexed = split_command_arguments(arguments);
     let mut rendered = expand_skill_template_placeholders(template, arguments, &indexed);
@@ -467,27 +520,29 @@ fn split_command_arguments(input: &str) -> Vec<String> {
     let mut current = String::new();
     let mut quote = None;
     let mut escaped = false;
+    let mut token_started = false;
     for ch in input.chars() {
         if escaped {
-            // Only treat as escape if followed by a quote or another backslash
-            if ch == '\\' || ch == '\'' || ch == '"' {
+            // Quotes may be escaped. Other backslashes are data, including
+            // repeated leading backslashes in UNC paths.
+            if ch == '\'' || ch == '"' {
                 current.push(ch);
             } else {
                 current.push('\\');
                 current.push(ch);
             }
             escaped = false;
+            token_started = true;
             continue;
         }
         if ch == '\\' {
             escaped = true;
+            token_started = true;
             continue;
         }
         if let Some(q) = quote {
             if ch == q {
                 quote = None;
-                // Preserve empty quoted position
-                args.push(std::mem::take(&mut current));
             } else {
                 current.push(ch);
             }
@@ -495,18 +550,21 @@ fn split_command_arguments(input: &str) -> Vec<String> {
         }
         if ch == '\'' || ch == '"' {
             quote = Some(ch);
+            token_started = true;
         } else if ch.is_whitespace() {
-            if !current.is_empty() {
+            if token_started {
                 args.push(std::mem::take(&mut current));
+                token_started = false;
             }
         } else {
             current.push(ch);
+            token_started = true;
         }
     }
     if escaped {
         current.push('\\');
     }
-    if !current.is_empty() {
+    if token_started {
         args.push(current);
     }
     args
@@ -1854,7 +1912,7 @@ impl RpcDispatcher {
         match method {
             Method::SessionPrompt => {
                 let req = parse_params(params)?;
-                self.handle_session_prompt(req).await
+                self.handle_session_prompt(req, None).await
             }
             Method::SessionSkillPrompt => self.handle_session_skill_prompt(params).await,
             _ => unreachable!("session prompt dispatcher received non-prompt method"),
@@ -1865,22 +1923,20 @@ impl RpcDispatcher {
         let req: SessionSkillPromptParams = parse_params(params)?;
         let session_id = req.session_id.clone();
         match self.expand_session_skill_prompt(req).await {
-            Ok(req) => self.handle_session_prompt(req).await,
+            Ok(expanded) => {
+                self.handle_session_prompt(expanded.prompt, Some(expanded.invocation))
+                    .await
+            }
             Err(error) => {
-                let failure_reason = if error.code == SESSION_NOT_FOUND {
-                    "session-not-found"
-                } else {
-                    "skill-prompt-failure"
-                };
-                let content = skill_prompt_failure_content(&error);
+                let content = skill_prompt_failure_content(&error.rpc);
                 self.emit_turn_complete(
                     &session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     content,
-                    Some(failure_reason),
+                    Some(error.reason),
                 )
                 .await;
-                Err(error)
+                Err(error.rpc)
             }
         }
     }
@@ -1888,14 +1944,20 @@ impl RpcDispatcher {
     async fn expand_session_skill_prompt(
         &self,
         req: SessionSkillPromptParams,
-    ) -> Result<SessionPromptParams, JsonRpcError> {
+    ) -> Result<ExpandedSkillPrompt, SkillPromptExpansionError> {
         let skill_name = req.skill.trim();
         if skill_name.is_empty() {
-            return Err(rpc_err(
+            return Err(SkillPromptExpansionError::new(
                 INVALID_PARAMS,
                 "session/skill_prompt requires a non-empty `skill`",
+                "skill-prompt-failure",
             ));
         }
+        let invocation = validate_skill_invocation(&req.invocation, skill_name, &req.arguments)
+            .map_err(|error| SkillPromptExpansionError {
+                rpc: error,
+                reason: "skill-prompt-failure",
+            })?;
         let agent_alias = match self.ctx.sessions.get_agent_alias(&req.session_id).await {
             Some(alias) => alias,
             None => match self.rehydrate_reaped_session(&req.session_id).await {
@@ -1904,8 +1966,20 @@ impl RpcDispatcher {
                     .sessions
                     .get_agent_alias(&req.session_id)
                     .await
-                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?,
-                None => return Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+                    .ok_or_else(|| {
+                        SkillPromptExpansionError::new(
+                            SESSION_NOT_FOUND,
+                            "Session not found",
+                            "session-not-found",
+                        )
+                    })?,
+                None => {
+                    return Err(SkillPromptExpansionError::new(
+                        SESSION_NOT_FOUND,
+                        "Session not found",
+                        "session-not-found",
+                    ));
+                }
             },
         };
         let config = self.ctx.config.read().clone();
@@ -1913,34 +1987,37 @@ impl RpcDispatcher {
             .into_iter()
             .find(|skill| skill.name == skill_name)
             .ok_or_else(|| {
-                rpc_err(
+                SkillPromptExpansionError::new(
                     INVALID_PARAMS,
                     format!("Skill not found for agent `{agent_alias}`: {skill_name}"),
+                    "skill-not-found",
                 )
             })?;
         let prompt = render_skill_prompt(&skill, &req.arguments);
         if prompt.trim().is_empty() && req.attachments.is_empty() {
-            return Err(rpc_err(
+            return Err(SkillPromptExpansionError::new(
                 INVALID_PARAMS,
                 format!("Skill `{skill_name}` rendered an empty prompt"),
+                "empty-prompt",
             ));
         }
-        let arguments = req.arguments.trim();
-        let original_text = if arguments.is_empty() {
-            Some(format!("/{}", skill_name))
-        } else {
-            Some(format!("/{} {}", skill_name, arguments))
-        };
-        Ok(SessionPromptParams {
-            session_id: req.session_id,
-            prompt,
-            attachments: req.attachments,
-            original_text,
+        Ok(ExpandedSkillPrompt {
+            prompt: SessionPromptParams {
+                session_id: req.session_id,
+                prompt,
+                attachments: req.attachments,
+            },
+            invocation,
         })
     }
 
-    async fn handle_session_prompt(&self, req: SessionPromptParams) -> RpcResult {
+    async fn handle_session_prompt(
+        &self,
+        req: SessionPromptParams,
+        skill_invocation: Option<String>,
+    ) -> RpcResult {
         let sid = &req.session_id;
+        let is_skill_turn = skill_invocation.is_some();
 
         if req.prompt.trim().is_empty() && req.attachments.is_empty() {
             return Err(rpc_err(
@@ -1949,10 +2026,22 @@ impl RpcDispatcher {
             ));
         }
 
-        let agent = match self.ctx.sessions.get_agent(sid).await {
-            Some(a) => a,
+        let (agent, agent_alias) = match self.ctx.sessions.get_agent_binding(sid).await {
+            Some(binding) => binding,
             None => match self.rehydrate_reaped_session(sid).await {
-                Some(a) => a,
+                Some(_) => match self.ctx.sessions.get_agent_binding(sid).await {
+                    Some(binding) => binding,
+                    None => {
+                        self.emit_turn_complete(
+                            sid,
+                            crate::rpc::types::TurnCompletionOutcome::Failed,
+                            SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string(),
+                            is_skill_turn.then_some("session-not-found"),
+                        )
+                        .await;
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                },
                 None => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -1966,7 +2055,7 @@ impl RpcDispatcher {
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
                         SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string(),
-                        None,
+                        is_skill_turn.then_some("session-not-found"),
                     )
                     .await;
                     return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -1979,12 +2068,6 @@ impl RpcDispatcher {
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
-            let agent_alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             let upload_root = self
                 .ctx
                 .config
@@ -2008,7 +2091,7 @@ impl RpcDispatcher {
                                 sid,
                                 crate::rpc::types::TurnCompletionOutcome::Failed,
                                 content,
-                                Some("attachment-failure"),
+                                is_skill_turn.then_some("attachment-failure"),
                             )
                             .await;
                             return Err(rpc_err(
@@ -2032,7 +2115,7 @@ impl RpcDispatcher {
                     sid,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     content.clone(),
-                    Some("session-busy"),
+                    is_skill_turn.then_some("session-busy"),
                 )
                 .await;
                 return Err(rpc_err(SESSION_BUSY, content));
@@ -2062,18 +2145,8 @@ impl RpcDispatcher {
         // max_context_tokens`), not the provider model-window helper (which
         // falls back to 32_000 when `context_window` is unset).
         let (agent_alias, model_provider, model, max_ctx) = {
-            let alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .unwrap_or_default();
-            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-                let (_, model_provider, model) = agent.lock().await.attribution_fields();
-                (model_provider, model)
-            } else {
-                (String::new(), String::new())
-            };
+            let alias = agent_alias;
+            let (_, mp, m) = agent.lock().await.attribution_fields();
             let max_ctx = {
                 let cfg = self.ctx.config.read();
                 Some(context_usage_max_tokens(&cfg, &alias))
@@ -2231,7 +2304,8 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
+                    && let Some(detail) =
+                        persist_acp_turn(store, sid, &outcome, skill_invocation.as_deref()).await
                 {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -2245,7 +2319,7 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let key = format!("rpc_{sid}");
-                    let user_text = req.original_text.as_deref().unwrap_or(&prompt);
+                    let user_text = skill_invocation.as_deref().unwrap_or(&prompt);
                     let _ = backend.append(&key, &ChatMessage::user(user_text));
                     match &outcome {
                         Ok(TurnOutcome::Completed { text, .. }) => {
@@ -2341,7 +2415,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     format!("turn failed: {e}"),
-                    None,
+                    is_skill_turn.then_some("skill-prompt-failure"),
                 )
                 .await;
                 Err(rpc_err(INTERNAL_ERROR, e.to_string()))
@@ -5004,8 +5078,9 @@ async fn persist_acp_turn(
     store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     session_id: &str,
     outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+    skill_invocation: Option<&str>,
 ) -> Option<String> {
-    let messages = match outcome {
+    let mut messages = match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
         | Ok(TurnOutcome::Cancelled { messages, .. })
             if !messages.is_empty() =>
@@ -5014,6 +5089,14 @@ async fn persist_acp_turn(
         }
         _ => return None,
     };
+    if let Some(invocation) = skill_invocation
+        && let Some(message) = messages.iter_mut().find_map(|entry| match entry {
+            ConversationMessage::Chat(chat) if chat.role == "user" => Some(chat),
+            _ => None,
+        })
+    {
+        message.content = invocation.to_string();
+    }
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
     match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
@@ -5176,6 +5259,42 @@ mod tests {
     fn split_command_arguments_handles_trailing_backslash() {
         let args = split_command_arguments(r"foo\");
         assert_eq!(args, vec![r"foo\"], "trailing backslash must be preserved");
+    }
+
+    #[test]
+    fn split_command_arguments_concatenates_quoted_and_unquoted_segments() {
+        assert_eq!(
+            split_command_arguments(r#""foo"bar baz"#),
+            vec!["foobar", "baz"]
+        );
+        assert_eq!(split_command_arguments(r#"pre""post"#), vec!["prepost"]);
+    }
+
+    #[test]
+    fn split_command_arguments_preserves_unc_path() {
+        let input = r"\\server\share";
+        assert_eq!(split_command_arguments(input), vec![input]);
+    }
+
+    #[test]
+    fn validate_skill_invocation_accepts_direct_and_explicit_forms() {
+        assert_eq!(
+            validate_skill_invocation("/review inspect", "review", "inspect")
+                .expect("direct invocation must validate"),
+            "/review inspect"
+        );
+        assert_eq!(
+            validate_skill_invocation("/skill model inspect", "model", "inspect")
+                .expect("explicit invocation must validate"),
+            "/skill model inspect"
+        );
+    }
+
+    #[test]
+    fn validate_skill_invocation_rejects_mismatched_display_text() {
+        let error = validate_skill_invocation("/other inspect", "review", "inspect")
+            .expect_err("display text must describe the requested skill");
+        assert_eq!(error.code, INVALID_PARAMS);
     }
 
     fn parse(s: &str) -> Value {
@@ -7698,7 +7817,7 @@ mod tests {
             messages: new_messages.clone(),
         });
 
-        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+        assert_eq!(persist_acp_turn(&store, sid, &outcome, None).await, None);
 
         let restored = store.load_session(sid).unwrap().unwrap();
         assert_eq!(restored.messages.len(), 52);
@@ -7720,10 +7839,10 @@ mod tests {
             partial_text: String::new(),
             messages: Vec::new(),
         });
-        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+        assert_eq!(persist_acp_turn(&store, sid, &empty, None).await, None);
 
         let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
-        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert_eq!(persist_acp_turn(&store, sid, &failed, None).await, None);
         assert!(
             store
                 .load_session(sid)
@@ -9496,6 +9615,7 @@ mod tests {
         session_id: &str,
         agent_alias: &str,
         workspace: &str,
+        chat_mode: crate::rpc::types::ChatMode,
     ) {
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
@@ -9506,12 +9626,8 @@ mod tests {
             .workspace_dir(std::path::PathBuf::from(workspace))
             .build()
             .expect("minimal Agent should build");
-        let session = crate::rpc::session::RpcSession::new(
-            agent,
-            agent_alias,
-            workspace,
-            crate::rpc::types::ChatMode::Chat,
-        );
+        let session =
+            crate::rpc::session::RpcSession::new(agent, agent_alias, workspace, chat_mode);
         sessions
             .insert(session_id.to_string(), session)
             .await
@@ -9525,12 +9641,14 @@ mod tests {
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
 
         let result = dispatcher
-            .handle_session_prompt(SessionPromptParams {
-                session_id: "gone-id".to_string(),
-                prompt: "anything".to_string(),
-                attachments: Vec::new(),
-                original_text: None,
-            })
+            .handle_session_prompt(
+                SessionPromptParams {
+                    session_id: "gone-id".to_string(),
+                    prompt: "anything".to_string(),
+                    attachments: Vec::new(),
+                },
+                None,
+            )
             .await;
         assert!(
             result.is_err(),
@@ -9542,6 +9660,10 @@ mod tests {
             .expect("missing session must emit TurnComplete before returning");
         let value = captured_turn_complete(&raw);
         assert_eq!(value["params"]["session_id"], "gone-id");
+        assert!(
+            value["params"].get("failure_reason").is_none(),
+            "ordinary prompt failures must not use skill-localization keys"
+        );
     }
 
     #[test]
@@ -9628,6 +9750,7 @@ mod tests {
                 &json!({
                     "session_id": "gone-skill-session",
                     "skill": "not-installed",
+                    "invocation": "/not-installed",
                 }),
             )
             .await
@@ -9639,6 +9762,7 @@ mod tests {
             .expect("missing skill session must emit TurnComplete before returning");
         let value = captured_turn_complete(&raw);
         assert_eq!(value["params"]["session_id"], "gone-skill-session");
+        assert_eq!(value["params"]["failure_reason"], "session-not-found");
         assert_eq!(
             value["params"]["content"],
             SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT
@@ -9651,7 +9775,14 @@ mod tests {
         let config = make_acp_test_config(&tmp);
         let workspace = tmp.path().to_string_lossy().to_string();
         let (dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
-        insert_minimal_session(&sessions, "live-skill-session", "test-agent", &workspace).await;
+        insert_minimal_session(
+            &sessions,
+            "live-skill-session",
+            "test-agent",
+            &workspace,
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .await;
 
         let error = dispatcher
             .handle_session_prompt_method(
@@ -9659,6 +9790,7 @@ mod tests {
                 &json!({
                     "session_id": "live-skill-session",
                     "skill": "not-installed",
+                    "invocation": "/not-installed",
                 }),
             )
             .await
@@ -9670,10 +9802,47 @@ mod tests {
             .expect("missing skill must emit TurnComplete before returning");
         let value = captured_turn_complete(&raw);
         assert_eq!(value["params"]["session_id"], "live-skill-session");
+        assert_eq!(value["params"]["failure_reason"], "skill-not-found");
         let content = value["params"]["content"]
             .as_str()
             .expect("turn_complete content must be text");
         assert!(content.contains("Skill not found for agent `test-agent`: not-installed"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_rejects_mismatched_invocation_text() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let (dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        insert_minimal_session(
+            &sessions,
+            "mismatched-invocation",
+            "test-agent",
+            &workspace,
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .await;
+
+        let error = dispatcher
+            .handle_session_prompt_method(
+                Method::SessionSkillPrompt,
+                &json!({
+                    "session_id": "mismatched-invocation",
+                    "skill": "review",
+                    "arguments": "inspect",
+                    "invocation": "/different inspect",
+                }),
+            )
+            .await
+            .expect_err("mismatched invocation must be rejected");
+        assert_eq!(error.code, INVALID_PARAMS);
+
+        let value = captured_turn_complete(
+            &rx.try_recv()
+                .expect("mismatched invocation must emit TurnComplete"),
+        );
+        assert_eq!(value["params"]["failure_reason"], "skill-prompt-failure");
     }
 
     #[tokio::test]
@@ -9683,7 +9852,14 @@ mod tests {
         let workspace = tmp.path().to_string_lossy().to_string();
         let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
         dispatcher.authenticated = true;
-        insert_minimal_session(&sessions, "notify-skill-session", "test-agent", &workspace).await;
+        insert_minimal_session(
+            &sessions,
+            "notify-skill-session",
+            "test-agent",
+            &workspace,
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .await;
 
         dispatcher
             .process_line_for_test(
@@ -9692,7 +9868,8 @@ mod tests {
                     "method": "session/skill_prompt",
                     "params": {
                         "session_id": "notify-skill-session",
-                        "skill": "not-installed"
+                        "skill": "not-installed",
+                        "invocation": "/not-installed"
                     }
                 })
                 .to_string(),
@@ -9701,6 +9878,7 @@ mod tests {
 
         let value = captured_turn_complete_from_rx(&mut rx).await;
         assert_eq!(value["params"]["session_id"], "notify-skill-session");
+        assert_eq!(value["params"]["failure_reason"], "skill-not-found");
         let content = value["params"]["content"]
             .as_str()
             .expect("turn_complete content must be text");
@@ -9730,6 +9908,7 @@ mod tests {
             "notify-installed-skill",
             "test-agent",
             &workspace,
+            crate::rpc::types::ChatMode::Chat,
         )
         .await;
 
@@ -9741,7 +9920,8 @@ mod tests {
                     "params": {
                         "session_id": "notify-installed-skill",
                         "skill": "echo-skill",
-                        "arguments": "hello"
+                        "arguments": "hello",
+                        "invocation": "/echo-skill hello"
                     }
                 })
                 .to_string(),
@@ -9752,6 +9932,139 @@ mod tests {
         assert_eq!(value["params"]["session_id"], "notify-installed-skill");
         assert_eq!(value["params"]["outcome"], "completed");
         assert_eq!(value["params"]["content"], "ok");
+    }
+
+    #[tokio::test]
+    async fn acp_skill_turn_persists_exact_invocation_and_restores_it() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let skills_dir = config.agent_workspace_dir("test-agent").join("skills");
+        for (name, description) in [
+            ("echo-skill", "Expanded echo: $ARGUMENTS"),
+            ("no-arg", "Expanded no arguments"),
+            ("model", "Expanded reserved: $ARGUMENTS"),
+        ] {
+            let skill_dir = skills_dir.join(name);
+            std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+            std::fs::write(
+                skill_dir.join("SKILL.toml"),
+                format!("[skill]\nname = \"{name}\"\ndescription = \"{description}\"\n"),
+            )
+            .expect("write skill");
+        }
+        crate::skills::cache::invalidate();
+
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-exact-skill-history";
+        acp_store
+            .create_session(sid, "test-agent", &workspace)
+            .expect("create durable ACP session");
+        insert_minimal_session(
+            &sessions,
+            sid,
+            "test-agent",
+            &workspace,
+            crate::rpc::types::ChatMode::Acp,
+        )
+        .await;
+
+        for (skill, arguments, invocation) in [
+            ("echo-skill", "hello", "/echo-skill hello"),
+            ("no-arg", "", "/no-arg"),
+            ("model", "inspect", "/skill model inspect"),
+        ] {
+            dispatcher
+                .handle_session_prompt_method(
+                    Method::SessionSkillPrompt,
+                    &json!({
+                        "session_id": sid,
+                        "skill": skill,
+                        "arguments": arguments,
+                        "invocation": invocation,
+                    }),
+                )
+                .await
+                .expect("skill turn must complete");
+        }
+
+        let live_messages = sessions
+            .history_slice_from(sid, 0)
+            .await
+            .expect("live session history");
+        let live_user_text = live_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "user" => {
+                    Some(chat.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(live_user_text.len(), 3);
+        for (actual, expected) in live_user_text.iter().zip([
+            "Expanded echo: hello",
+            "Expanded no arguments",
+            "Expanded reserved: inspect",
+        ]) {
+            assert!(
+                actual.ends_with(expected),
+                "the provider-facing live history must keep expanded skill prompts: {actual}"
+            );
+        }
+
+        let durable = acp_store
+            .load_session(sid)
+            .expect("load durable ACP session")
+            .expect("durable ACP session exists");
+        let durable_user_text = durable
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "user" => {
+                    Some(chat.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            durable_user_text,
+            ["/echo-skill hello", "/no-arg", "/skill model inspect"],
+            "durable history must retain the exact user-visible slash text"
+        );
+
+        assert!(
+            sessions.remove(sid).await,
+            "remove live session before resume"
+        );
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("resume durable ACP session");
+        let restored_messages = sessions
+            .history_slice_from(sid, 0)
+            .await
+            .expect("restored live history");
+        let restored_user_text = restored_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "user" => {
+                    Some(chat.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_user_text,
+            ["/echo-skill hello", "/no-arg", "/skill model inspect"],
+            "resumed history must show the exact slash invocations"
+        );
     }
 
     #[tokio::test]
@@ -9772,7 +10085,14 @@ mod tests {
         crate::skills::cache::invalidate();
         let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
         dispatcher.authenticated = true;
-        insert_minimal_session(&sessions, "notify-empty-skill", "test-agent", &workspace).await;
+        insert_minimal_session(
+            &sessions,
+            "notify-empty-skill",
+            "test-agent",
+            &workspace,
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .await;
 
         dispatcher
             .process_line_for_test(
@@ -9781,7 +10101,8 @@ mod tests {
                     "method": "session/skill_prompt",
                     "params": {
                         "session_id": "notify-empty-skill",
-                        "skill": "blank-skill"
+                        "skill": "blank-skill",
+                        "invocation": "/blank-skill"
                     }
                 })
                 .to_string(),
@@ -9790,6 +10111,7 @@ mod tests {
 
         let value = captured_turn_complete_from_rx(&mut rx).await;
         assert_eq!(value["params"]["session_id"], "notify-empty-skill");
+        assert_eq!(value["params"]["failure_reason"], "empty-prompt");
         let content = value["params"]["content"]
             .as_str()
             .expect("turn_complete content must be text");
@@ -9810,7 +10132,8 @@ mod tests {
                     "method": "session/skill_prompt",
                     "params": {
                         "session_id": "notify-gone-skill-session",
-                        "skill": "not-installed"
+                        "skill": "not-installed",
+                        "invocation": "/not-installed"
                     }
                 })
                 .to_string(),
@@ -9819,6 +10142,7 @@ mod tests {
 
         let value = captured_turn_complete_from_rx(&mut rx).await;
         assert_eq!(value["params"]["session_id"], "notify-gone-skill-session");
+        assert_eq!(value["params"]["failure_reason"], "session-not-found");
         assert_eq!(
             value["params"]["content"],
             SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT

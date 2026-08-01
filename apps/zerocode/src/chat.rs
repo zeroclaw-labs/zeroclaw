@@ -24,8 +24,7 @@ use crate::client::{
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{
-    InputBarAction, InputBarState, SkillInvocation, SlashCommandKind,
-    format_skill_invocation_for_input, slash_command_name,
+    InputBarAction, InputBarState, SkillInvocation, SlashCommandKind, slash_command_name,
 };
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
@@ -40,6 +39,37 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+
+fn build_prompt_notification(
+    sid: String,
+    prompt: String,
+    attachments_json: Vec<serde_json::Value>,
+    skill: Option<SkillInvocation>,
+) -> (&'static str, serde_json::Value) {
+    let (method, mut params) = if let Some(skill) = skill {
+        (
+            method::SESSION_SKILL_PROMPT,
+            serde_json::json!({
+                "session_id": sid,
+                "skill": skill.name,
+                "arguments": skill.arguments,
+                "invocation": skill.input,
+            }),
+        )
+    } else {
+        (
+            method::SESSION_PROMPT,
+            serde_json::json!({
+                "session_id": sid,
+                "prompt": prompt,
+            }),
+        )
+    };
+    if !attachments_json.is_empty() {
+        params["attachments"] = serde_json::Value::Array(attachments_json);
+    }
+    (method, params)
+}
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -870,27 +900,7 @@ impl Chat {
     ) {
         let rpc_arc = self.rpc_out.clone();
         tokio::spawn(async move {
-            let (method, mut params) = if let Some(skill) = skill {
-                (
-                    method::SESSION_SKILL_PROMPT,
-                    serde_json::json!({
-                        "session_id": sid,
-                        "skill": skill.name,
-                        "arguments": skill.arguments,
-                    }),
-                )
-            } else {
-                (
-                    method::SESSION_PROMPT,
-                    serde_json::json!({
-                        "session_id": sid,
-                        "prompt": prompt,
-                    }),
-                )
-            };
-            if !attachments_json.is_empty() {
-                params["attachments"] = serde_json::Value::Array(attachments_json);
-            }
+            let (method, params) = build_prompt_notification(sid, prompt, attachments_json, skill);
             rpc_arc.notify(method, params).await;
         });
     }
@@ -5161,7 +5171,7 @@ pub(crate) struct QueuedMessage {
 impl QueuedMessage {
     fn display_text(&self) -> Option<String> {
         if let Some(skill) = &self.skill {
-            return Some(format_skill_invocation_for_input(&skill.name, &self.text));
+            return Some(skill.input.clone());
         }
         if self.text.is_empty() {
             None
@@ -6674,10 +6684,7 @@ impl ChatState {
         let msg = self.message_queue.remove(pos)?;
         self.queue_sel = self.editable_ids().first().copied();
         self.mark_dirty_full();
-        let text = msg
-            .skill
-            .map(|skill| format_skill_invocation_for_input(&skill.name, &msg.text))
-            .unwrap_or(msg.text);
+        let text = msg.skill.map(|skill| skill.input).unwrap_or(msg.text);
         Some((text, msg.attachments))
     }
 
@@ -9115,9 +9122,9 @@ mod tests {
         );
 
         let mut s = state();
-        s.enqueue_message("what's happening".to_string(), Vec::new())
+        s.enqueue_message("what's happening".to_string(), Vec::new(), None)
             .expect("queue message");
-        s.enqueue_message("second queued message".to_string(), Vec::new())
+        s.enqueue_message("second queued message".to_string(), Vec::new(), None)
             .expect("queue message");
         s.ensure_queue_selection();
 
@@ -9983,6 +9990,7 @@ mod tests {
         SkillInvocation {
             name: name.to_string(),
             arguments: arguments.to_string(),
+            input: crate::input_bar::format_skill_invocation_for_input(name, arguments),
         }
     }
 
@@ -10164,7 +10172,7 @@ mod tests {
     fn skill_queue_display_uses_explicit_form_for_reserved_names() {
         let msg = QueuedMessage {
             id: 1,
-            text: "inspect".to_string(),
+            text: String::new(),
             attachments: Vec::new(),
             skill: Some(skill("model", "inspect")),
             status: QueueItemStatus::Pending,
@@ -10174,6 +10182,41 @@ mod tests {
             slash_command_name(SlashCommandKind::Skill)
         );
         assert_eq!(msg.display_text().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn skill_queue_carries_exact_input_to_wire_and_returns_idle() {
+        let mut state = state();
+        let invocation = SkillInvocation {
+            name: "model".to_string(),
+            arguments: "inspect".to_string(),
+            input: "/skill model inspect".to_string(),
+        };
+        state
+            .enqueue_message(String::new(), Vec::new(), Some(invocation))
+            .expect("skill invocation must enqueue");
+        let queued = state
+            .take_next_dispatchable()
+            .expect("idle skill invocation must dispatch");
+        let display = queued.display_text();
+        assert_eq!(display.as_deref(), Some("/skill model inspect"));
+
+        let (method, params) =
+            build_prompt_notification("sess-1".to_string(), queued.text, Vec::new(), queued.skill);
+        assert_eq!(method, crate::client::method::SESSION_SKILL_PROMPT);
+        assert_eq!(params["skill"], "model");
+        assert_eq!(params["arguments"], "inspect");
+        assert_eq!(params["invocation"], "/skill model inspect");
+
+        state.push_user_message(display, Vec::new());
+        state.apply_update(SessionUpdate::TurnComplete {
+            session_id: "sess-1".to_string(),
+            outcome: TurnEndOutcome::Completed,
+            content: "ok".to_string(),
+            failure_reason: None,
+        });
+        assert!(!state.turn_in_flight);
+        assert!(matches!(state.turn_status, TurnStatus::Idle));
     }
 
     #[test]

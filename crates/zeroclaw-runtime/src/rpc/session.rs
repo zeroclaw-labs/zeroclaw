@@ -129,6 +129,16 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
     }
 
+    /// Return the live agent and its canonical session alias from one store
+    /// snapshot so callers cannot observe a half-removed session binding.
+    pub async fn get_agent_binding(&self, id: &str) -> Option<(Arc<Mutex<Agent>>, String)> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| (session.agent.clone(), session.agent_alias.clone()))
+    }
+
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
@@ -585,6 +595,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_binding_returns_agent_and_alias_from_one_session() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(
+                    make_agent(),
+                    "canonical-agent",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (agent, alias) = store
+            .get_agent_binding("s1")
+            .await
+            .expect("binding must exist");
+        assert_eq!(alias, "canonical-agent");
+        assert!(store.remove("s1").await);
+        assert!(store.get_agent_binding("s1").await.is_none());
+        assert_eq!(Arc::strong_count(&agent), 1);
+        let _agent_guard = agent.lock().await;
     }
 
     #[tokio::test]

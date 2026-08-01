@@ -218,11 +218,6 @@ rpc_type! {
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub attachments: Vec<FileEntry>,
-        /// Original user-visible text to persist instead of the expanded prompt.
-        /// When set, session history stores this text rather than `prompt`,
-        /// so the user sees their original invocation on replay.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub original_text: Option<String>,
     }
 }
 
@@ -232,6 +227,9 @@ rpc_type! {
         pub skill: String,
         #[serde(default)]
         pub arguments: String,
+        /// Exact slash invocation entered by the user. The runtime validates
+        /// it against `skill` and `arguments` before using it for history.
+        pub invocation: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub attachments: Vec<FileEntry>,
     }

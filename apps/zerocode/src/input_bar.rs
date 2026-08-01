@@ -142,8 +142,10 @@ pub(crate) enum InputBarAction {
 pub(crate) struct SkillInvocation {
     pub name: String,
     pub arguments: String,
+    pub input: String,
 }
 
+#[cfg(test)]
 pub(crate) fn format_skill_invocation_for_input(name: &str, arguments: &str) -> String {
     let command = if is_reserved_slash_command_name(name) {
         format!("{} {name}", slash_command_name(SlashCommandKind::Skill))
@@ -188,10 +190,11 @@ fn is_skill_shortcut_autocomplete_choice(choice: &str, skills: &[String]) -> boo
         .any(|skill| is_skill_shortcut_choice(choice, skill))
 }
 
-fn skill_invocation(name: &str, arguments: &str) -> SkillInvocation {
+fn skill_invocation(name: &str, arguments: &str, input: &str) -> SkillInvocation {
     SkillInvocation {
         name: name.to_string(),
         arguments: arguments.to_string(),
+        input: input.to_string(),
     }
 }
 
@@ -1459,7 +1462,7 @@ impl InputBarState {
             SlashCommand::ModelProvider(name) => InputBarAction::SetModelProvider(name.to_string()),
             SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
             SlashCommand::Skill(name, arguments) => {
-                self.handle_explicit_skill_submit(name, arguments)
+                self.handle_explicit_skill_submit(name, arguments, msg.trim())
             }
             SlashCommand::NotACommand => self.handle_normal_or_shortcut_submit(msg),
         }
@@ -1480,7 +1483,7 @@ impl InputBarState {
             SlashCommand::ModelProvider(name) => InputBarAction::SetModelProvider(name.to_string()),
             SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
             SlashCommand::Skill(name, arguments) => {
-                self.handle_explicit_skill_inject(name, arguments)
+                self.handle_explicit_skill_inject(name, arguments, msg.trim())
             }
             SlashCommand::NotACommand => self.handle_normal_or_shortcut_inject(msg),
         }
@@ -1553,27 +1556,37 @@ impl InputBarState {
         ))
     }
 
-    fn handle_explicit_skill_submit(&mut self, name: &str, arguments: &str) -> InputBarAction {
+    fn handle_explicit_skill_submit(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        input: &str,
+    ) -> InputBarAction {
         if let Some(error) = self.validate_explicit_skill(name) {
             return error;
         }
         let attachments = self.take_attachments();
         InputBarAction::Submit {
-            text: Some(arguments.to_string()),
+            text: None,
             attachments,
-            skill: Some(skill_invocation(name, arguments)),
+            skill: Some(skill_invocation(name, arguments, input)),
         }
     }
 
-    fn handle_explicit_skill_inject(&mut self, name: &str, arguments: &str) -> InputBarAction {
+    fn handle_explicit_skill_inject(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        input: &str,
+    ) -> InputBarAction {
         if let Some(error) = self.validate_explicit_skill(name) {
             return error;
         }
         let attachments = self.take_attachments();
         InputBarAction::Inject {
-            text: Some(arguments.to_string()),
+            text: None,
             attachments,
-            skill: Some(skill_invocation(name, arguments)),
+            skill: Some(skill_invocation(name, arguments, input)),
         }
     }
 
@@ -1598,9 +1611,9 @@ impl InputBarState {
         {
             let attachments = self.take_attachments();
             return InputBarAction::Submit {
-                text: Some(arguments.to_string()),
+                text: None,
                 attachments,
-                skill: Some(skill_invocation(name, arguments)),
+                skill: Some(skill_invocation(name, arguments, msg.trim())),
             };
         }
         let attachments = self.take_attachments();
@@ -1616,9 +1629,9 @@ impl InputBarState {
         {
             let attachments = self.take_attachments();
             return InputBarAction::Inject {
-                text: Some(arguments.to_string()),
+                text: None,
                 attachments,
-                skill: Some(skill_invocation(name, arguments)),
+                skill: Some(skill_invocation(name, arguments, msg.trim())),
             };
         }
         let attachments = self.take_attachments();
@@ -2383,12 +2396,13 @@ mod tests {
         let action = bar.handle_enter();
         match action {
             InputBarAction::Submit { text, skill, .. } => {
-                assert_eq!(text.as_deref(), Some("inspect this diff"));
+                assert_eq!(text, None);
                 assert_eq!(
                     skill,
                     Some(SkillInvocation {
                         name: "code-review".into(),
                         arguments: "inspect this diff".into(),
+                        input: "/code-review inspect this diff".into(),
                     })
                 );
             }
@@ -2416,12 +2430,13 @@ mod tests {
         let action = bar.handle_enter();
         match action {
             InputBarAction::Submit { text, skill, .. } => {
-                assert_eq!(text.as_deref(), Some("inspect this"));
+                assert_eq!(text, None);
                 assert_eq!(
                     skill,
                     Some(SkillInvocation {
                         name: "model".into(),
                         arguments: "inspect this".into(),
+                        input: "/skill model inspect this".into(),
                     })
                 );
             }
@@ -2620,12 +2635,13 @@ mod tests {
         let action = bar.handle_inject();
         match action {
             InputBarAction::Inject { text, skill, .. } => {
-                assert_eq!(text.as_deref(), Some("inspect"));
+                assert_eq!(text, None);
                 assert_eq!(
                     skill,
                     Some(SkillInvocation {
                         name: "code-review".into(),
                         arguments: "inspect".into(),
+                        input: "/skill code-review inspect".into(),
                     })
                 );
             }
