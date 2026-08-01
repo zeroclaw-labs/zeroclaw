@@ -933,44 +933,25 @@ impl Observer for OtelObserver {
     }
 }
 
+fn strip_first_complete_block(content: &mut String, start_marker: &str, end_marker: &str) {
+    let Some(start) = content.find(start_marker) else {
+        return;
+    };
+    let end_search_start = start + start_marker.len();
+    let Some(relative_end) = content[end_search_start..].find(end_marker) else {
+        return;
+    };
+    let end = end_search_start + relative_end + end_marker.len();
+    content.replace_range(start..end, "");
+}
+
 fn clean_for_display(content: &str) -> String {
     let mut cleaned = content.to_string();
 
-    // Remove memory context blocks - only if both start and end tags present
-    let memory_start = "[Memory context]";
-    let memory_end = "[/Memory context]";
-    if let Some(start) = cleaned.find(memory_start)
-        && let Some(end) = cleaned.find(memory_end)
-    {
-        cleaned.replace_range(start..(end + memory_end.len()), "");
-    }
-
-    // Remove tool result blocks - only if both start and end tags present
-    let tool_result_start = "<tool_result";
-    let tool_result_end = "</tool_result>";
-    if let Some(start) = cleaned.find(tool_result_start)
-        && let Some(end) = cleaned.find(tool_result_end)
-    {
-        cleaned.replace_range(start..(end + tool_result_end.len()), "");
-    }
-
-    // Remove thinking blocks (<thinking>...</thinking>) - only if both tags present
-    let thinking_start = "<thinking>";
-    let thinking_end = "</thinking>";
-    if let Some(start) = cleaned.find(thinking_start)
-        && let Some(end) = cleaned.find(thinking_end)
-    {
-        cleaned.replace_range(start..(end + thinking_end.len()), "");
-    }
-
-    // Remove think blocks (<think>...</think>`) - only if both tags present
-    let think_start = "<think>";
-    let think_end = "</think>";
-    if let Some(start) = cleaned.find(think_start)
-        && let Some(end) = cleaned.find(think_end)
-    {
-        cleaned.replace_range(start..(end + think_end.len()), "");
-    }
+    strip_first_complete_block(&mut cleaned, "[Memory context]", "[/Memory context]");
+    strip_first_complete_block(&mut cleaned, "<tool_result", "</tool_result>");
+    strip_first_complete_block(&mut cleaned, "<thinking>", "</thinking>");
+    strip_first_complete_block(&mut cleaned, "<think>", "</think>");
 
     // Remove timestamp patterns like [2026-06-30 16:44:51 +08:00]
     let timestamp_regex =
@@ -2094,5 +2075,45 @@ mod tests {
         let input = "Result<tool_result>some tool output";
         let cleaned = clean_for_display(input);
         assert_eq!(cleaned, "Result<tool_result>some tool output");
+    }
+
+    #[test]
+    fn clean_for_display_preserves_openings_without_later_closings() {
+        let cases = [
+            "before[/Memory context]keep[Memory context]after",
+            "before</tool_result>keep<tool_result>after",
+            "before</thinking>keep<thinking>after",
+            "before</think>keep<think>after",
+        ];
+
+        for input in cases {
+            assert_eq!(clean_for_display(input), input);
+        }
+    }
+
+    #[test]
+    fn clean_for_display_pairs_openings_with_later_closings() {
+        let cases = [
+            (
+                "before[/Memory context]keep[Memory context]hidden[/Memory context]after",
+                "before[/Memory context]keepafter",
+            ),
+            (
+                "before</tool_result>keep<tool_result>hidden</tool_result>after",
+                "before</tool_result>keepafter",
+            ),
+            (
+                "before</thinking>keep<thinking>hidden</thinking>after",
+                "before</thinking>keepafter",
+            ),
+            (
+                "before</think>keep<think>hidden</think>after",
+                "before</think>keepafter",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(clean_for_display(input), expected);
+        }
     }
 }

@@ -1246,6 +1246,8 @@ impl Agent {
             initialize_mcp,
             false,
             false,
+            // Non-ACP construction path: `deliver_file` has no transport here.
+            false,
             None,
             None,
             None,
@@ -1261,6 +1263,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        acp_delivery: bool,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
@@ -1272,6 +1275,7 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            acp_delivery,
             None,
             sop_engine,
             sop_audit,
@@ -1289,6 +1293,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        acp_delivery: bool,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
@@ -1301,6 +1306,7 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            acp_delivery,
             None,
             sop_engine,
             sop_audit,
@@ -1331,6 +1337,8 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
             tui_env,
             sop_engine,
             sop_audit,
@@ -1360,6 +1368,8 @@ impl Agent {
             initialize_mcp,
             true,
             exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
             tui_env,
             sop_engine,
             sop_audit,
@@ -1377,6 +1387,7 @@ impl Agent {
         initialize_mcp: bool,
         approval_backchannel: bool,
         exclude_memory: bool,
+        acp_delivery: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
@@ -1532,6 +1543,7 @@ impl Agent {
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
+                acp_delivery,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
                 // `from_config` is the Agent (gateway / library) construction
@@ -1916,17 +1928,15 @@ impl Agent {
         Ok(())
     }
 
-    fn try_apply_pending_model_switch(&mut self, current_effective_model: &str) -> Option<String> {
-        let pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())?;
-        let (new_model_provider, new_model) = pending;
-
-        // Same-provider, same-model: nothing to do. Still clear the
-        // request so a stale equal-value entry does not linger.
+    fn try_apply_model_switch(
+        &mut self,
+        current_effective_model: &str,
+        new_model_provider: String,
+        new_model: String,
+    ) -> Option<String> {
+        // Same-provider, same-model: nothing to do. The request is owned by
+        // the completed tool-loop scope, so there is no persistent slot to clear.
         if new_model_provider == self.model_provider_name && new_model == current_effective_model {
-            crate::agent::loop_::clear_model_switch_request();
             return None;
         }
 
@@ -1992,7 +2002,7 @@ impl Agent {
             )),
         };
 
-        let result = match switch_outcome {
+        match switch_outcome {
             Ok(new_prov) => {
                 // Commit state only after the provider was built
                 // successfully.
@@ -2014,9 +2024,7 @@ impl Agent {
                 );
                 None
             }
-        };
-        crate::agent::loop_::clear_model_switch_request();
-        result
+        }
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -2277,8 +2285,16 @@ impl Agent {
             });
         }
 
-        let mut loop_history = provider_messages;
-        let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+        // Split provider_messages: loop_history gets past turns only,
+        // loop_new_messages gets this turn's user message so the hook
+        // can observe/modify it. Seed loop_history with the user message so
+        // the provider sees it without clone-and-append.
+        let split_idx = provider_messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(provider_messages.len());
+        let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
 
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2403,6 +2419,10 @@ impl Agent {
                 None,
             );
         }
+        // Pop the original user message (pushed before the loop) so the
+        // replayed version — which includes the user message, possibly
+        // modified by the hook.
+        self.history.pop();
         for replayed in Self::replay_loop_messages(&loop_new_messages) {
             self.history.push(replayed);
         }
@@ -2420,8 +2440,10 @@ impl Agent {
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
-            && loop_new_messages.len() == 1
-            && loop_new_messages[0].role == "assistant"
+            && loop_new_messages.len() == 2
+            && loop_new_messages
+                .last()
+                .is_some_and(|m| m.role == "assistant")
         {
             #[allow(clippy::cast_possible_truncation)]
             let _ = cache.put(key, &effective_model, &response, usage.output_tokens as u32);
@@ -2513,7 +2535,7 @@ impl Agent {
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
-        // `try_apply_pending_model_switch`) can rebind it for later rounds
+        // `try_apply_model_switch`) can rebind it for later rounds
         let mut effective_model = self.classify_model(user_message);
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -2600,7 +2622,14 @@ impl Agent {
             });
         }
 
-        let mut loop_history = provider_messages;
+        // Split provider_messages: loop_history gets past turns, user_msg_for_loop
+        // seeds round 0's round_added so the hook can observe/modify the user message.
+        let split_idx = provider_messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(provider_messages.len());
+        let mut loop_history = provider_messages[..split_idx].to_vec();
+        let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
 
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
@@ -2655,25 +2684,42 @@ impl Agent {
                 });
             }
 
+            let mut round_added: Vec<ChatMessage> = if round == 0 {
+                user_msg_for_loop.clone()
+            } else {
+                Vec::new()
+            };
+
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(
-                    &steering_message,
-                    &mut new_msgs,
-                    &turn_id,
-                )
-                .await;
-                if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
-                    loop_history.push(user_msg.clone());
+                // Mirror the enrichment logic from append_streamed_user_message_to_history
+                // but route through round_added instead of self.history/new_msgs.
+                if self.auto_save {
+                    let store_start = std::time::Instant::now();
+                    let store_result = self
+                        .memory
+                        .store(
+                            "user_msg",
+                            &steering_message,
+                            MemoryCategory::Conversation,
+                            self.memory_session_id.as_deref(),
+                        )
+                        .await;
+                    self.observer.record_event(&ObserverEvent::MemoryStore {
+                        category: MemoryCategory::Conversation.to_string(),
+                        backend: self.memory.name().to_string(),
+                        duration: store_start.elapsed(),
+                        success: store_result.is_ok(),
+                        channel: Some(self.channel_name.clone()),
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.clone()),
+                    });
                 }
+                let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
+                let enriched = format!("[{now}] {steering_message}");
+                round_added.push(ChatMessage::user(enriched));
             }
-
-            // Per-round append-log: the loop mirrors every message it adds to
-            // `loop_history` into this capture at push time, on success AND
-            // error exits — never derived from history indices, which the
-            // loop's own preflight pruning can invalidate.
-            let mut round_added: Vec<ChatMessage> = Vec::new();
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
@@ -2700,9 +2746,13 @@ impl Agent {
                                     .and_then(|c| c.config.as_deref()),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
-                                model_switch_callback: Some(
-                                    crate::agent::loop_::get_model_switch_state(),
-                                ),
+                                // `None` here (rather than a shared global) is
+                                // deliberate: `run_tool_call_loop` mints a fresh,
+                                // task-local switch state for this round when it
+                                // sees `None`, so a `model_switch` requested this
+                                // round can never leak into a sibling round or a
+                                // concurrently running turn/agent.
+                                model_switch_callback: None,
                                 receipt_generator: receipt_scope
                                     .as_ref()
                                     .map(crate::agent::tool_receipts::ReceiptScope::generator),
@@ -2797,10 +2847,17 @@ impl Agent {
                 );
             }
 
-            // Replay everything the loop appended this round into the
-            // conversation history and the persistence capture.
-            let single_text_exchange =
-                round == 0 && round_added.len() == 1 && round_added[0].role == "assistant";
+            // round_added now contains the user message for round 0;
+            // a single tool-free exchange is [user, assistant].
+            let single_text_exchange = round == 0
+                && round_added.len() == 2
+                && round_added.first().is_some_and(|m| m.role == "user")
+                && round_added.last().is_some_and(|m| m.role == "assistant");
+
+            if round == 0 {
+                self.history.pop();
+                new_msgs.pop();
+            }
             for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
@@ -2848,16 +2905,20 @@ impl Agent {
                 Err(error) => {
                     // Model switch requested mid-turn: the unified loop
                     // signals a pending `model_switch` by returning
-                    // `ModelSwitchRequested` without clearing the request. The
+                    // `ModelSwitchRequested`. The
                     // round's tool call + result are already replayed into
                     // history/new_msgs above; rebuild the provider from the
                     // captured `ProviderSwitchConfig` and continue the round
                     // loop so the next provider call uses the switched
                     // provider/model. A failed rebuild (no switch config / build
                     // error) falls through to the normal error handling below.
-                    if crate::agent::loop_::is_model_switch_requested(&error).is_some()
-                        && let Some(new_effective_model) =
-                            self.try_apply_pending_model_switch(&effective_model)
+                    if let Some((new_model_provider, new_model)) =
+                        crate::agent::loop_::is_model_switch_requested(&error)
+                        && let Some(new_effective_model) = self.try_apply_model_switch(
+                            &effective_model,
+                            new_model_provider,
+                            new_model,
+                        )
                     {
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
@@ -8991,8 +9052,6 @@ mod tests {
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
     }
 
-    use crate::agent::loop_::MODEL_SWITCH_TEST_LOCK as MODEL_SWITCH_TEST_GUARD;
-
     fn build_test_agent(
         initial_provider_name: &str,
         initial_model_name: &str,
@@ -9026,61 +9085,27 @@ mod tests {
     }
 
     #[test]
-    fn try_apply_pending_model_switch_noop_when_no_pending_request() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
+    fn try_apply_model_switch_noop_when_identical_to_current() {
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
-        assert_eq!(result, None);
-        assert_eq!(agent.model_provider_name, "openai");
-        assert_eq!(agent.model_name, "gpt-4o-mini");
-    }
-
-    #[test]
-    fn try_apply_pending_model_switch_noop_when_identical_to_current() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Pre-set an "equal" switch request.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
-        }
-
-        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
-        assert_eq!(result, None, "same-provider/same-model is a no-op");
-        // State must be cleared so a stale equal entry does not linger.
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "equal switch request must be cleared after observation"
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "openai".to_string(),
+            "gpt-4o-mini".to_string(),
         );
+        assert_eq!(result, None, "same-provider/same-model is a no-op");
     }
 
     #[test]
-    fn try_apply_pending_model_switch_preserves_state_without_switch_config() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Pre-set a real switch request.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("anthropic".to_string(), "claude-haiku".to_string()));
-        }
-
+    fn try_apply_model_switch_preserves_agent_without_switch_config() {
         // Agent has NO provider_switch_config — cannot rebuild provider.
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "anthropic".to_string(),
+            "claude-haiku".to_string(),
+        );
 
-        // Returns None (failed switch), state unchanged on the agent,
-        // pending request cleared so we don't retry forever.
+        // Returns None (failed switch) and leaves the agent unchanged.
         assert_eq!(result, None);
         assert_eq!(
             agent.model_provider_name, "openai",
@@ -9090,29 +9115,10 @@ mod tests {
             agent.model_name, "gpt-4o-mini",
             "model_name must NOT change when provider rebuild is not possible"
         );
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "pending switch must be cleared even when rebuild fails, \
-             so it does not retrigger on the next iteration"
-        );
     }
 
     #[test]
-    fn try_apply_pending_model_switch_succeeds_with_switch_config() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Pre-set a real switch request to a different provider AND model.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama".to_string(), "llama3".to_string()));
-        }
-
+    fn try_apply_model_switch_succeeds_with_switch_config() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
@@ -9120,7 +9126,8 @@ mod tests {
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result =
+            agent.try_apply_model_switch("gpt-4o-mini", "ollama".to_string(), "llama3".to_string());
 
         assert_eq!(
             result.as_deref(),
@@ -9135,28 +9142,10 @@ mod tests {
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
         );
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "pending switch must be cleared after a successful switch"
-        );
     }
 
     #[test]
-    fn try_apply_pending_model_switch_succeeds_on_provider_only_change() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        // Same model id, different provider.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama".to_string(), "shared-name".to_string()));
-        }
-
+    fn try_apply_model_switch_succeeds_on_provider_only_change() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
@@ -9164,7 +9153,11 @@ mod tests {
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
-        let result = agent.try_apply_pending_model_switch("shared-name");
+        let result = agent.try_apply_model_switch(
+            "shared-name",
+            "ollama".to_string(),
+            "shared-name".to_string(),
+        );
 
         assert_eq!(
             result.as_deref(),
@@ -9179,16 +9172,7 @@ mod tests {
     }
 
     #[test]
-    fn try_apply_pending_model_switch_prefers_route_api_key() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama".to_string(), "tinyllama".to_string()));
-        }
-
+    fn try_apply_model_switch_prefers_route_api_key() {
         let route = zeroclaw_config::schema::ModelRouteConfig {
             model_provider: "ollama".to_string(),
             model: "tinyllama".to_string(),
@@ -9205,7 +9189,11 @@ mod tests {
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama".to_string(),
+            "tinyllama".to_string(),
+        );
 
         assert_eq!(
             result.as_deref(),
@@ -9354,7 +9342,7 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
         async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-            let state = crate::agent::loop_::get_model_switch_state();
+            let state = crate::agent::turn::current_model_switch_state()?;
             *state.lock().unwrap() =
                 Some((self.target_provider.clone(), self.target_model.clone()));
             Ok(crate::tools::ToolResult {
@@ -9367,13 +9355,6 @@ mod tests {
 
     #[test]
     fn turn_streamed_applies_pending_model_switch_for_next_call() {
-        // Serialize with the other tests that touch the process-wide
-        // `MODEL_SWITCH_REQUEST`. The async work runs inside a manually built
-        // current-thread runtime so the `std::sync` guard is never held across
-        // an `.await` in this (synchronous) test body.
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
         let initial_calls = Arc::new(Mutex::new(0usize));
         let provider = Box::new(StreamSwitchTriggerProvider {
             call_count: Arc::clone(&initial_calls),
@@ -9469,19 +9450,6 @@ mod tests {
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
-
-        // The pending switch must be cleared after consumption so it does not
-        // retrigger on a later iteration or turn.
-        let still_pending = crate::agent::loop_::get_model_switch_state()
-            .lock()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            still_pending, None,
-            "pending switch must be cleared after turn_streamed consumes it"
-        );
-
-        crate::agent::loop_::clear_model_switch_request();
     }
 }
 
