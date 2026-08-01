@@ -1883,7 +1883,7 @@ impl SopEngine {
                     Some(step_result_value(&result)),
                 );
             }
-            let piped = step_result_value(&result);
+            let piped = declared_step_output_value(&current_step, &result.output);
             return self.advance_deterministic_step(
                 run_id,
                 piped,
@@ -1893,7 +1893,7 @@ impl SopEngine {
 
         let mut recorded = result.clone();
         if result.status == SopStepStatus::Completed {
-            let output = step_result_value(&result);
+            let output = declared_step_output_value(&current_step, &result.output);
             if let Err(reason) = self.validate_step_output(&current_step, &output) {
                 let full_reason = format!(
                     "Step {} output schema validation failed: {reason}",
@@ -1910,6 +1910,13 @@ impl SopEngine {
                 );
                 recorded.status = SopStepStatus::Failed;
                 recorded.output = full_reason;
+            } else if serde_json::from_str::<Value>(&result.output).is_err()
+                && output != Value::String(result.output.clone())
+            {
+                // Canonicalize a schema-validated recovery at the model-output
+                // boundary. Downstream piping, retry, replay, and persisted run
+                // data can then keep their exact JSON-or-string parser.
+                recorded.output = output.to_string();
             }
         }
 
@@ -4582,9 +4589,7 @@ impl SopEngine {
         let mut last_completed_step = 0;
         for result in &run.step_results {
             if result.status == SopStepStatus::Completed {
-                // Try to parse output as JSON, fall back to string value.
-                let value = serde_json::from_str(&result.output)
-                    .unwrap_or_else(|_| serde_json::Value::String(result.output.clone()));
+                let value = jsonish_value(&result.output);
                 step_outputs.insert(result.step_number, value);
                 last_completed_step = result.step_number;
             }
@@ -5619,6 +5624,14 @@ fn step_result_value(result: &SopStepResult) -> Value {
     jsonish_value(&result.output)
 }
 
+fn declared_step_output_value(step: &SopStep, raw: &str) -> Value {
+    let schema = step
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.output.as_ref());
+    super::rundata::parse_step_output_value(raw, schema)
+}
+
 fn forge_comment_input_matches_checkpoint_output(
     input: &Value,
     checkpoint_result: &SopStepResult,
@@ -5654,7 +5667,7 @@ fn forge_comment_input_matches_checkpoint_output(
 }
 
 fn jsonish_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 // ── Utilities ───────────────────────────────────────────────────
@@ -6804,6 +6817,105 @@ mod tests {
         }));
         assert!(engine.active_runs().is_empty());
         assert_eq!(engine.finished_runs(None)[0].status, SopRunStatus::Failed);
+    }
+
+    #[test]
+    fn wrapped_step_output_validates_and_pipes_as_declared_object() {
+        let mut sop = test_sop(
+            "schema-wrapped-output",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].schema = Some(StepSchema {
+            input: Some(required_object_schema("ok")),
+            output: None,
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run("schema-wrapped-output", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "Result:\n```json\n{\"ok\":true}\n```\nDone.".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2),
+            "the recovered object must satisfy step 1 output and step 2 input schemas"
+        );
+        assert_eq!(
+            engine.active_runs()[&run_id].step_results[0].output,
+            r#"{"ok":true}"#,
+            "recovery is canonicalized once at the model-output boundary"
+        );
+    }
+
+    #[test]
+    fn prose_trigger_with_json_example_stays_raw_for_first_input_retry_and_replay() {
+        let payload = "Review this example {\"ok\":true}, then follow the prose.";
+        let mut sop = test_sop(
+            "raw-trigger-json-example",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        sop.steps[0].on_failure = StepFailure::Retry { max: 1 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run(
+                "raw-trigger-json-example",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: Some(payload.into()),
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        assert_eq!(
+            step_input_value(&engine.active_runs()[&run_id], 1),
+            Value::String(payload.into())
+        );
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "try again".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            action,
+            SopRunAction::ExecuteStep { ref step, .. } if step.number == 1
+        ));
+
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(retry_input_value(run, 1), Value::String(payload.into()));
+        assert_eq!(replay_input_for_step(run, 1), Value::String(payload.into()));
     }
 
     #[test]

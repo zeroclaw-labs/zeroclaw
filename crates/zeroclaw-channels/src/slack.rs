@@ -67,6 +67,11 @@ impl Drop for ThreadBackfillReservationGuard<'_> {
 /// handle that addresses one Slack installation.
 type MethodCooldowns = Arc<AsyncMutex<HashMap<&'static str, Instant>>>;
 
+/// Installation digest -> weak handle on that installation's cooldown state.
+/// Aliased so the registry type stays readable (`clippy::type_complexity`).
+type InstallationCooldownRegistry =
+    HashMap<String, Weak<AsyncMutex<HashMap<&'static str, Instant>>>>;
+
 /// Cooldowns for every Slack installation this process talks to, keyed by a
 /// digest of the bot token.
 ///
@@ -81,9 +86,8 @@ type MethodCooldowns = Arc<AsyncMutex<HashMap<&'static str, Instant>>>;
 /// dead entry is pruned on the next lookup. A strong map would otherwise
 /// accumulate one permanent entry per token ever constructed, which token
 /// rotation or repeated channel construction turns into a real leak.
-static INSTALLATION_METHOD_COOLDOWNS: LazyLock<
-    Mutex<HashMap<String, Weak<AsyncMutex<HashMap<&'static str, Instant>>>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static INSTALLATION_METHOD_COOLDOWNS: LazyLock<Mutex<InstallationCooldownRegistry>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve the shared cooldown state for the installation `bot_token` addresses.
 ///

@@ -15810,6 +15810,107 @@ Let me check the result."#;
         (starts, ends)
     }
 
+    /// The target alias's own `AgentStart`/`AgentEnd` events, in capture order.
+    ///
+    /// The `run()` lifecycle tests install a *process-wide* broadcast hook, so
+    /// the raw capture can interleave events emitted by other agents —
+    /// including other tests executing concurrently under the parallel runtime
+    /// gate. Ordering assertions (first is `AgentStart`, last is `AgentEnd`)
+    /// must therefore scope to the target alias before inspecting the ends of
+    /// the sequence; asserting on the raw stream's `first()`/`last()` is a
+    /// cross-talk flake.
+    fn alias_lifecycle_sequence<'a>(
+        events: &'a [ObserverEvent],
+        alias: &str,
+    ) -> Vec<&'a ObserverEvent> {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        | ObserverEvent::AgentEnd { agent_alias, .. }
+                        if agent_alias.as_deref() == Some(alias)
+                )
+            })
+            .collect()
+    }
+
+    /// Regression guard for the parallel-gate flake: the `run()` lifecycle tests
+    /// capture through a process-wide hook, so unrelated observer traffic (e.g. a
+    /// concurrent runtime test) can land at the head or tail of the raw stream.
+    /// `alias_lifecycle_sequence` must scope ordering to the target alias so
+    /// foreign `AgentStart`/`AgentEnd` events cannot invalidate the first/last
+    /// assertions. This is deterministic (no scheduling dependence), unlike the
+    /// intermittent CI failure it guards against.
+    #[test]
+    fn alias_lifecycle_sequence_scopes_out_foreign_observer_traffic() {
+        fn start(alias: &str) -> ObserverEvent {
+            ObserverEvent::AgentStart {
+                model_provider: "p".into(),
+                model: "m".into(),
+                channel: None,
+                agent_alias: Some(alias.into()),
+                turn_id: Some("t".into()),
+            }
+        }
+        fn end(alias: &str) -> ObserverEvent {
+            ObserverEvent::AgentEnd {
+                model_provider: "p".into(),
+                model: "m".into(),
+                duration: std::time::Duration::from_millis(0),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: Some(alias.into()),
+                turn_id: Some("t".into()),
+            }
+        }
+
+        // Foreign events bracket the target's own pair on both ends — exactly
+        // the interleaving that made the raw first()/last() assertions flake.
+        let events = vec![
+            end("other-agent"), // foreign AgentEnd at the head
+            start("target-agent"),
+            start("other-agent"),
+            end("target-agent"),
+            start("other-agent"), // foreign AgentStart at the tail
+        ];
+
+        // Counts stay scoped to the target alias (unchanged behavior).
+        assert_eq!(lifecycle_events_for_alias(&events, "target-agent"), (1, 1));
+
+        // The raw stream's ends are foreign, so the old unscoped assertions
+        // would fail here — which is the bug.
+        assert!(!matches!(
+            events.first(),
+            Some(ObserverEvent::AgentStart { .. })
+        ));
+        assert!(!matches!(
+            events.last(),
+            Some(ObserverEvent::AgentEnd { .. })
+        ));
+
+        // The alias-scoped sequence is exactly [AgentStart, AgentEnd] regardless
+        // of the foreign cross-talk.
+        let lifecycle = alias_lifecycle_sequence(&events, "target-agent");
+        assert!(matches!(
+            lifecycle.as_slice(),
+            [
+                ObserverEvent::AgentStart { .. },
+                ObserverEvent::AgentEnd { .. }
+            ]
+        ));
+        assert!(matches!(
+            lifecycle.first(),
+            Some(ObserverEvent::AgentStart { .. })
+        ));
+        assert!(matches!(
+            lifecycle.last(),
+            Some(ObserverEvent::AgentEnd { .. })
+        ));
+    }
+
     /// A `Config::default()` rooted under a fresh temp dir instead of the
     /// real `$HOME/.zeroclaw`. `Config::default()` points `data_dir` (the
     /// sqlite memory db, `{data_dir}/memory/brain.db`) and `config_path`
@@ -15906,13 +16007,18 @@ Let me check the result."#;
         let (starts, ends) = lifecycle_events_for_alias(&events, "run-lifecycle-success-agent");
         assert_eq!(starts, 1, "exactly one AgentStart, got {events:?}");
         assert_eq!(ends, 1, "exactly one AgentEnd, got {events:?}");
+        // Scope ordering to the target agent: the process-wide hook can capture
+        // unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-success-agent");
         assert!(
-            matches!(events.first(), Some(ObserverEvent::AgentStart { .. })),
-            "first event must be AgentStart, got {events:?}"
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
         );
         assert!(
-            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
-            "last event must be AgentEnd, got {events:?}"
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd, \
+             got {lifecycle:?} (full captured stream: {events:?})"
         );
     }
 
@@ -16003,13 +16109,18 @@ Let me check the result."#;
             "AgentEnd must still fire via Drop on the early-return error path \
              (the regression this fix closes), got {events:?}"
         );
+        // Scope ordering to the target agent: the process-wide hook can
+        // capture unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-error-agent");
         assert!(
-            matches!(events.first(), Some(ObserverEvent::AgentStart { .. })),
-            "first event must be AgentStart, got {events:?}"
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
         );
         assert!(
-            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
-            "last event must be AgentEnd even on the error path, got {events:?}"
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd even on the \
+             error path, got {lifecycle:?} (full captured stream: {events:?})"
         );
     }
 
@@ -16138,13 +16249,18 @@ Let me check the result."#;
             ends, 1,
             "a model switch must still close with exactly one AgentEnd, got {events:?}"
         );
+        // Scope ordering to the target agent: the process-wide hook can
+        // capture unrelated events from concurrently executing tests.
+        let lifecycle = alias_lifecycle_sequence(&events, "run-lifecycle-switch-agent");
         assert!(
-            matches!(events.first(), Some(ObserverEvent::AgentStart { .. })),
-            "first event must be AgentStart, got {events:?}"
+            matches!(lifecycle.first(), Some(ObserverEvent::AgentStart { .. })),
+            "the target agent's first lifecycle event must be AgentStart, \
+             got {lifecycle:?} (full captured stream: {events:?})"
         );
         assert!(
-            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
-            "last event must be AgentEnd, got {events:?}"
+            matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "the target agent's last lifecycle event must be AgentEnd, \
+             got {lifecycle:?} (full captured stream: {events:?})"
         );
 
         let end_route = events

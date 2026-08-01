@@ -258,16 +258,28 @@ fn normalize_models_with_pricing(
         .map(|e| ModelInfo {
             id: e.id.trim().to_string(),
             pricing: e.pricing,
+            // OpenAI-compatible `/v1/models` has no context-window field.
+            context_window: None,
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models
 }
 
-fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+/// Map a models.dev listing into `ModelInfo`, carrying through the catalog's
+/// context window. A model the catalog gives no `limit.context` for stays
+/// `None` — "unknown", never a stub value.
+fn models_dev_to_model_info(
+    models: Vec<(String, Option<usize>)>,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
-    ids.into_iter()
-        .map(|id| ModelInfo { id, pricing: None })
+    models
+        .into_iter()
+        .map(|(id, context_window)| ModelInfo {
+            id,
+            pricing: None,
+            context_window,
+        })
         .collect()
 }
 
@@ -2608,7 +2620,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // No credential — try models.dev first (no pricing from that source),
         // then fall back to OpenRouter which does include pricing.
         if let Some(key) = &self.models_dev_key {
-            match crate::models_dev::list_models_for(key).await {
+            match crate::models_dev::list_models_with_context_for(key).await {
                 Ok(models) if !models.is_empty() => {
                     return Ok(models_dev_to_model_info(models));
                 }
@@ -6795,8 +6807,8 @@ mod tests {
         // The models.dev catalog does not serve pricing data; every entry
         // must have `pricing: None`. This documents the intentional contract.
         let ids = vec![
-            "openai/gpt-4o".to_string(),
-            "anthropic/claude-sonnet-4-6".to_string(),
+            ("openai/gpt-4o".to_string(), None),
+            ("anthropic/claude-sonnet-4-6".to_string(), None),
         ];
         let models = models_dev_to_model_info(ids);
         assert_eq!(models.len(), 2);
@@ -6805,6 +6817,19 @@ mod tests {
         assert!(models[0].pricing.is_none());
         assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
         assert!(models[1].pricing.is_none());
+    }
+
+    #[test]
+    fn models_dev_to_model_info_carries_context_window() {
+        // The catalog's `limit.context` must survive the mapping, and a model
+        // the catalog gives no limit for must stay `None` — not a stub value.
+        let ids = vec![
+            ("anthropic/claude-opus-4-8".to_string(), Some(1_000_000)),
+            ("some/unknown-model".to_string(), None),
+        ];
+        let models = models_dev_to_model_info(ids);
+        assert_eq!(models[0].context_window, Some(1_000_000));
+        assert_eq!(models[1].context_window, None);
     }
 
     #[test]

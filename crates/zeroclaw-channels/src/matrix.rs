@@ -1994,12 +1994,11 @@ mod inbound {
             let encrypted: matrix_sdk::ruma::events::room::EncryptedFile =
                 serde_json::from_value(file.clone()).ok()?;
             matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(encrypted))
-        } else if let Some(url) = content.get("url").and_then(|u| u.as_str()) {
+        } else {
+            let url = content.get("url").and_then(|u| u.as_str())?;
             matrix_sdk::ruma::events::room::MediaSource::Plain(matrix_sdk::ruma::OwnedMxcUri::from(
                 url,
             ))
-        } else {
-            return None;
         };
         Some(MediaInfo::new(source, file_name, mime, kind))
     }
